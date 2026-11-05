@@ -4548,6 +4548,12 @@ mod publication_progress_tests {
         /// Latch the stop while this 1-based scan's collection runs (the
         /// trailing-discard fixture): earlier scans apply normally.
         stop_on_scan: Option<usize>,
+        /// Pids live at the lane stop (the stop-diff fixture): the
+        /// terminal disclosure diffs these against enumeration memory.
+        stopped_pids: Vec<u32>,
+        /// Stop-time enumeration members that could not be listed (the
+        /// stop-diff loss fixture).
+        stop_lost: usize,
     }
 
     impl Driver {
@@ -4589,6 +4595,8 @@ mod publication_progress_tests {
                 commit_failures: VecDeque::new(),
                 stop_in_collector: false,
                 stop_on_scan: None,
+                stopped_pids: Vec::new(),
+                stop_lost: 0,
             }
         }
 
@@ -4840,7 +4848,9 @@ mod publication_progress_tests {
         }
         fn on_lane_stopped(&mut self) {
             self.lane_stops += 1;
-            self.scene.coordinator.note_post_pass_exec_newcomers();
+            self.scene
+                .coordinator
+                .note_post_pass_newcomers(&self.stopped_pids, self.stop_lost);
         }
     }
 
@@ -7239,6 +7249,10 @@ mod publication_progress_tests {
 
         const POST_PASS_GAP_SUBJECT: &str = "discovery coverage ended before stop";
 
+        const STOP_DIFF_GAP_SUBJECT: &str = "processes missed by every scan";
+
+        const STOP_ENUMERATION_LOST_SUBJECT: &str = "stop-time enumeration incomplete";
+
         const DROPPED_COVERAGE_SUBJECT: &str = "dropped collection coverage";
 
         fn post_pass_gap_reason(pids: &[u32]) -> String {
@@ -7803,6 +7817,182 @@ mod publication_progress_tests {
             assert!(
                 reason.contains("pids 9"),
                 "the gap names the reused pid, got: {reason}"
+            );
+        }
+
+        // A process live at stop that no completed pass ever enumerated
+        // is a stop-diff newcomer: the terminal disclosure names it, so
+        // a starter that never execs cannot stay invisible.
+        #[test]
+        fn stop_diff_names_a_never_enumerated_live_process() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID, 99];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("a never-enumerated live process must mark unknown coverage");
+            assert!(
+                reason.contains("(pids 99)"),
+                "the gap names exactly the newcomer, got: {reason}"
+            );
+        }
+
+        // An enumerated task live at stop stays silent: the diff reports
+        // only what no completed pass saw.
+        #[test]
+        fn stop_diff_stays_silent_for_enumerated_tasks() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_DIFF_GAP_SUBJECT),
+                "an enumerated task live at stop stays silent: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // A post-pass exec newcomer is named once, by the exec gap: the
+        // stop diff never double-reports a pid the exec set already holds.
+        #[test]
+        fn stop_diff_skips_exec_newcomers() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![9];
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back(vec![9]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                has_post_pass_gap(&driver.scene, &[9]),
+                "the exec gap names the newcomer: {:?}",
+                driver.scene.gap_subjects(),
+            );
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_DIFF_GAP_SUBJECT),
+                "the stop diff never double-reports an exec newcomer: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // A stop-time enumeration that lost members says so: late
+        // starters among the unlisted are invisible, never silently
+        // covered.
+        #[test]
+        fn stop_diff_reports_lost_enumeration_members() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID];
+            driver.stop_lost = 3;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == STOP_ENUMERATION_LOST_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("lost stop-time enumeration members must mark incomplete coverage");
+            assert!(
+                reason.starts_with("3 /proc member(s)"),
+                "the gap counts the unlisted members, got: {reason}"
+            );
+        }
+
+        // A repeated terminal disclosure stays silent: the stop diff
+        // fires once.
+        #[test]
+        fn stop_diff_fires_once_across_repeated_terminal_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![99];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let diff_gaps = || {
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .filter(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                    .count()
+            };
+            let fired = diff_gaps();
+            assert_eq!(fired, 1, "the stop diff fires at the stop");
+            let _ = diff_gaps;
+            // A repeat restates newcomers and loss alike, yet stages
+            // nothing: the latch covers the loss mark too.
+            let restaged = driver.scene.coordinator.note_post_pass_newcomers(&[99], 7);
+            assert!(!restaged, "a repeated terminal call stages nothing");
+            let rerun = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                .count();
+            assert_eq!(rerun, 1, "a repeated terminal call stays silent");
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_ENUMERATION_LOST_SUBJECT),
+                "the latch covers the loss mark too: {:?}",
+                driver.scene.gap_subjects(),
             );
         }
 

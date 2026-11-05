@@ -1697,23 +1697,31 @@ fn run_with_terminal_budget(
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
     // Terminal pre-arm close for the scan lane only (no `on_lane_stopped`):
-    // the native lane already closed before its final commit. Uses the
+    // the native lane already closed before its final commit. The scan
+    // tail also discloses post-pass newcomers here (the native lane did
+    // in `on_lane_stopped`): starters no completed pass saw would
+    // otherwise stay invisible in scan mode. The pre-arm close uses the
     // frozen probe result from `on_stop_requested` plus any capture failure,
     // never a re-read past retirement: an operator stop or failure ends
     // `Stop`, a deadline `ScopeEnd`. The guarded lane-aware commit publishes
     // the staged changed-identity gap; runs without pre-arm commit nothing
     // extra, and a pending publication still keeps its prior view.
-    if stopped.is_none() && driver.coordinator.has_prearm() {
-        let stop = driver.prearm_probe_stop.unwrap_or(false)
-            || capture_error.is_some()
-            || driver.coordinator.capture_failed();
-        let cause = if stop {
-            crate::render::PrearmWatchEnd::Stop
-        } else {
-            crate::render::PrearmWatchEnd::ScopeEnd
-        };
-        driver.coordinator.finish_prearm_watches(cause, None);
-        let _ = driver.commit(false);
+    if stopped.is_none() {
+        let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        if driver.coordinator.has_prearm() {
+            let stop = driver.prearm_probe_stop.unwrap_or(false)
+                || capture_error.is_some()
+                || driver.coordinator.capture_failed();
+            let cause = if stop {
+                crate::render::PrearmWatchEnd::Stop
+            } else {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            };
+            driver.coordinator.finish_prearm_watches(cause, None);
+            let _ = driver.commit(false);
+        } else if terminal_newcomers {
+            let _ = driver.commit(false);
+        }
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
@@ -2950,6 +2958,17 @@ impl ClassicDriver<'_> {
     /// for stderr past the screen.
     fn warn(&mut self, warning: &str) {
         Self::warn_recorded(&mut self.display, warning);
+    }
+
+    /// Scan-lane terminal newcomer disclosure, shared by both run tails
+    /// (the native lane discloses in `on_lane_stopped`, which scan mode
+    /// skips): diff the stop-time enumeration against the completed
+    /// passes. True when anything staged, so the tail can publish it;
+    /// silent runs commit nothing extra.
+    fn disclose_scan_terminal_newcomers(&mut self) -> bool {
+        let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
+        self.coordinator
+            .note_post_pass_newcomers(&live_at_stop, stop_lost.len())
     }
 
     /// One warning through a split display borrow (the stop
@@ -6161,9 +6180,14 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
-        // Terminal coverage disclosure first: post-last-pass EXEC
-        // newcomers stage before the final commit publishes them.
-        self.coordinator.note_post_pass_exec_newcomers();
+        // Terminal coverage disclosure first: post-last-pass newcomers
+        // (exec hooks plus the stop-time diff over starters no
+        // completed pass saw) stage before the final commit publishes
+        // them. Unlisted stop-time members count against the diff,
+        // never silently covered.
+        let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
+        self.coordinator
+            .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
         // Terminal pre-arm close, staged before the loop's final commit so
         // the staged changed-identity gap publishes with it (no extra plain
         // commit). Uses the frozen probe result and stop boundary from
@@ -7591,18 +7615,24 @@ fn run_dashboard(
     // Terminal pre-arm close for the scan lane only, as on the classic
     // path (the dashboard quit flag is an operator-initiated end): the
     // native lane already closed before its final commit. Frozen probe
-    // plus failure, never a re-read; guarded lane-aware commit.
-    if stopped.is_none() && driver.coordinator.has_prearm() {
-        let stop = driver.prearm_probe_stop.unwrap_or(false)
-            || capture_error.is_some()
-            || driver.coordinator.capture_failed();
-        let cause = if stop {
-            crate::render::PrearmWatchEnd::Stop
-        } else {
-            crate::render::PrearmWatchEnd::ScopeEnd
-        };
-        driver.coordinator.finish_prearm_watches(cause, None);
-        let _ = driver.commit(false);
+    // plus failure, never a re-read; guarded lane-aware commit. The scan
+    // tail also discloses post-pass newcomers, as on the classic path.
+    if stopped.is_none() {
+        let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        if driver.coordinator.has_prearm() {
+            let stop = driver.prearm_probe_stop.unwrap_or(false)
+                || capture_error.is_some()
+                || driver.coordinator.capture_failed();
+            let cause = if stop {
+                crate::render::PrearmWatchEnd::Stop
+            } else {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            };
+            driver.coordinator.finish_prearm_watches(cause, None);
+            let _ = driver.commit(false);
+        } else if terminal_newcomers {
+            let _ = driver.commit(false);
+        }
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());

@@ -274,6 +274,17 @@ pub(crate) struct PrearmReportRow {
     pub unobserved_windows: Option<Vec<crate::render::UnobservedWindow>>,
 }
 
+/// A recorded start-time still names the live task: equal proven
+/// generations match, while an unknown generation on either side
+/// matches conservatively (without positive start-time mismatch
+/// evidence nothing is dropped).
+fn same_task_generation(recorded: Option<u64>, live: Option<u64>) -> bool {
+    match (recorded, live) {
+        (Some(was), Some(is)) => was == is,
+        _ => true,
+    }
+}
+
 /// Prune cross-pass task memory to the latest enumeration: drop
 /// entries for departed pids and for pid reuse (same number, new start
 /// time), keep tasks still present with an unchanged generation. Unknown
@@ -285,12 +296,18 @@ fn retain_current_tasks(
 ) {
     tasks.retain(|(pid, start)| match current.get(pid) {
         None => false,
-        Some(now) => match (start, now) {
-            (Some(was), Some(is)) => was == is,
-            _ => true,
-        },
+        Some(now) => same_task_generation(*start, *now),
     });
 }
+
+/// Enumeration memory holds this many distinct tasks at most; past it
+/// departed tasks evict first (one bounded sweep per pass), so a fork
+/// storm cannot grow the observer without bound.
+const EVER_ENUMERATED_CAP: usize = 65_536;
+
+/// Liveness checks per overflow sweep: enough to drain churn (departed
+/// tasks are plentiful past the cap) without stalling a pass.
+const EVER_ENUMERATED_SWEEP: usize = 4_096;
 
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
@@ -461,6 +478,14 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// passes. Discarded passes record nothing (their outcomes never
     /// applied); pid reuse drops the stale task by start-time mismatch.
     scan_freshness: BTreeSet<(u32, Option<u64>)>,
+    /// Every task identity enumerated by an applied pass, across passes:
+    /// the terminal stop diff reports live tasks this never saw, so a
+    /// starter that never execs cannot stay invisible. Capped (departed
+    /// tasks evict first); discarded passes record nothing.
+    ever_enumerated: BTreeSet<(u32, Option<u64>)>,
+    /// The terminal stop diff already disclosed: a repeated terminal
+    /// call stays silent.
+    stop_diff_done: bool,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -817,6 +842,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
             scan_freshness: BTreeSet::new(),
+            ever_enumerated: BTreeSet::new(),
+            stop_diff_done: false,
             completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -2443,6 +2470,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn scan_freshness_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
         self.scan_freshness.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ever_enumerated_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
+        self.ever_enumerated.clone()
     }
 
     /// Refuse the final receiver only after its actual disposal is retained.
@@ -8322,10 +8354,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         rendered
     }
 
-    /// Record an applied pass's examined tasks for next-pass freshness:
-    /// prune to the pass enumeration, then insert deep-scanned and
-    /// maps-matched members. Memory-unavailable, unreadable, exited
-    /// and not-selected members stay fresh so the next pass retries them.
+    /// Record an applied pass's tasks: examined members (deep-scanned
+    /// and maps-matched) join next-pass freshness after pruning to the
+    /// pass enumeration, while every enumerated member joins cross-pass
+    /// enumeration memory for the terminal stop diff. Memory-unavailable,
+    /// unreadable, exited and not-selected members stay fresh so the
+    /// next pass retries them. Discarded passes record nothing.
     fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
         let current: BTreeMap<u32, Option<u64>> = catalog
             .processes
@@ -8342,19 +8376,45 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect();
         retain_current_tasks(&mut self.scan_freshness, &current);
         for process in &catalog.processes {
+            let task = (
+                process.pid,
+                process
+                    .generation
+                    .as_ref()
+                    .and_then(|member| member.start_time),
+            );
+            self.ever_enumerated.insert(task);
             if matches!(
                 process.status,
                 crate::inspect_system::MemberStatus::Scanned
                     | crate::inspect_system::MemberStatus::MapsMatched
             ) {
-                self.scan_freshness.insert((
-                    process.pid,
-                    process
-                        .generation
-                        .as_ref()
-                        .and_then(|member| member.start_time),
-                ));
+                self.scan_freshness.insert(task);
             }
+        }
+        self.evict_enumerated_overflow();
+    }
+
+    /// Keep enumeration memory capped: one bounded sweep evicts departed
+    /// tasks first; if the set still overflows (more live tasks than the
+    /// cap holds), the lowest identities evict, and a live evicted task
+    /// over-reports as unknown at the stop — the safe direction, and the
+    /// gap list stays bounded.
+    fn evict_enumerated_overflow(&mut self) {
+        if self.ever_enumerated.len() <= EVER_ENUMERATED_CAP {
+            return;
+        }
+        let source = self.adapter.source();
+        let mut checked = 0;
+        self.ever_enumerated.retain(|(pid, _)| {
+            if checked >= EVER_ENUMERATED_SWEEP {
+                return true;
+            }
+            checked += 1;
+            !source.gone(*pid)
+        });
+        while self.ever_enumerated.len() > EVER_ENUMERATED_CAP {
+            self.ever_enumerated.pop_first();
         }
     }
 
@@ -8449,31 +8509,119 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
-    /// EXEC hooks for never-admitted pids that drained after the last
-    /// completed scan pass: those processes started too late to be
-    /// scanned, so one scope gap names their unknown provider
-    /// mappings. Silent when nothing drained post-pass or no scan
-    /// completed (the zero-pass diagnostic owns that run). Cgroup
-    /// scope stays unjudged (transaction coverage, not scan passes).
-    /// Drains the set, so a repeated terminal call stays silent.
-    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
-        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
-        if !self.completed_scan_pass || pending.is_empty() {
-            return;
+    /// In-scope tasks live at the stop that no completed pass
+    /// enumerated: never-seen pids, and pids whose live generation
+    /// matches no recorded one (pid reuse reads as its own newcomer,
+    /// never as its predecessor). Unknown generations match
+    /// conservatively, and pids the exec set already names stay out
+    /// (the exec gap reports them instead). Sorted ascending; cgroup
+    /// scope reports nothing (transaction coverage, not scan passes).
+    fn stop_diff_newcomers(
+        &self,
+        live_at_stop: &[u32],
+        exec_newcomers: &BTreeSet<(u32, Option<u64>)>,
+    ) -> Vec<u32> {
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            return Vec::new();
         }
-        // Name the unscanned processes, not just their count; the
-        // list is bounded so a fork storm cannot flood the report.
-        let mut unique: Vec<u32> = pending.iter().map(|(pid, _)| *pid).collect();
-        unique.sort();
-        unique.dedup();
-        let pids = Self::bounded_pid_list(pending.len(), &unique);
+        let exec_pids: BTreeSet<u32> = exec_newcomers.iter().map(|(pid, _)| *pid).collect();
+        let mut newcomers = Vec::new();
+        for pid in live_at_stop {
+            if exec_pids.contains(pid) {
+                continue;
+            }
+            if matches!(self.engine.scope, Scope::Pid(target) if *pid != target) {
+                continue;
+            }
+            let recorded: Vec<Option<u64>> = self
+                .ever_enumerated
+                .range((*pid, None)..=(*pid, Some(u64::MAX)))
+                .map(|(_, start)| *start)
+                .collect();
+            if recorded.is_empty() {
+                newcomers.push(*pid);
+                continue;
+            }
+            let live = self.adapter.source().start_time(*pid);
+            if !recorded
+                .iter()
+                .any(|start| same_task_generation(*start, live))
+            {
+                newcomers.push(*pid);
+            }
+        }
+        newcomers.sort_unstable();
+        newcomers.dedup();
+        newcomers
+    }
+
+    /// Post-pass newcomers: EXEC hooks for never-admitted pids that
+    /// drained after the last completed scan pass, plus the stop-diff
+    /// over tasks live at the stop that no completed pass enumerated
+    /// (starters that never exec leave no hook, so only the diff sees
+    /// them). Each population gets its own scope gap naming the unknown
+    /// provider mappings; a pid the exec gap names never double-reports
+    /// in the diff. Silent when nothing is owed or no scan completed
+    /// (the zero-pass diagnostic owns that run). Cgroup scope stays
+    /// unjudged (transaction coverage, not scan passes). Drains the exec
+    /// set and latches the diff (loss mark included), so a repeated
+    /// terminal call stays silent. `stop_lost` counts stop-time
+    /// enumeration members that could not be listed at all: late
+    /// starters among them are invisible, so a nonzero count marks the
+    /// diff incomplete. True when anything staged, so a tail that
+    /// discloses outside the lane stop can publish it.
+    pub(crate) fn note_post_pass_newcomers(
+        &mut self,
+        live_at_stop: &[u32],
+        stop_lost: usize,
+    ) -> bool {
+        let mut staged = false;
+        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
+        if self.completed_scan_pass && !pending.is_empty() {
+            // Name the unscanned processes, not just their count; the
+            // list is bounded so a fork storm cannot flood the report.
+            let mut unique: Vec<u32> = pending.iter().map(|(pid, _)| *pid).collect();
+            unique.sort();
+            unique.dedup();
+            let pids = Self::bounded_pid_list(pending.len(), &unique);
+            self.note_scope_gap(
+                "discovery coverage ended before stop".into(),
+                format!(
+                    "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown ({pids})",
+                    pending.len()
+                ),
+            );
+            staged = true;
+        }
+        if !self.completed_scan_pass
+            || matches!(self.engine.scope, Scope::Cgroup { .. })
+            || self.stop_diff_done
+        {
+            return staged;
+        }
+        self.stop_diff_done = true;
+        if stop_lost > 0 {
+            self.note_scope_gap(
+                "stop-time enumeration incomplete".into(),
+                format!(
+                    "{stop_lost} /proc member(s) could not be listed at stop; late starters among them are invisible to the stop diff"
+                ),
+            );
+            staged = true;
+        }
+        let newcomers = self.stop_diff_newcomers(live_at_stop, &pending);
+        if newcomers.is_empty() {
+            return staged;
+        }
+        let pids = Self::bounded_pid_list(newcomers.len(), &newcomers);
         self.note_scope_gap(
-            "discovery coverage ended before stop".into(),
+            "processes missed by every scan".into(),
             format!(
-                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown ({pids})",
-                pending.len()
+                "{} process(es) live at stop were never enumerated by a completed pass; their provider mappings are unknown ({pids})",
+                newcomers.len()
             ),
         );
+        true
     }
 
     /// The physical tail and registry share the actual publication boundary.
@@ -26492,7 +26640,7 @@ mod scan_freshness_tests {
         .unwrap()
     }
 
-    fn unexamined_application() -> crate::inspect_identity::InspectApplicationResult {
+    pub(super) fn unexamined_application() -> crate::inspect_identity::InspectApplicationResult {
         crate::inspect_identity::InspectApplicationResult::Unknown(
             crate::inspect_identity::InspectIdentityUnknown::NotExamined,
         )
@@ -26585,6 +26733,168 @@ mod scan_freshness_tests {
             project(&[(u32::MAX, None)]),
             BTreeSet::from([u32::MAX]),
             "an unknown generation stays scanned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_diff_tests {
+    use super::*;
+    use crate::discovery::caller_registry::OsProcessSource;
+
+    /// A pid `/proc` can never hold: reads fail, so generation checks
+    /// against it are deterministic without fixtures.
+    const NO_SUCH_PID: u32 = u32::MAX;
+
+    fn stop_diff_coordinator(scope: Scope) -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            scope,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn seed(scope: Scope, tasks: &[(u32, Option<u64>)]) -> InventoryCoordinator<OsProcessSource> {
+        let mut coordinator = stop_diff_coordinator(scope);
+        coordinator.ever_enumerated.extend(tasks.iter().copied());
+        coordinator
+    }
+
+    /// The stop diff covers what a completed pass enumerated (exact
+    /// generation match, or recorded without a generation), and flags a
+    /// never-seen pid, a reused pid (same number, new start-time) and an
+    /// unreadable-at-stop pid alike as newcomers — except pids the exec
+    /// gap already names, which are never double-reported.
+    #[test]
+    fn stop_diff_covers_enumerated_tasks_and_flags_reuse() {
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let empty_exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::new();
+        assert!(
+            seed(Scope::System, &[(me, Some(live))])
+                .stop_diff_newcomers(&[me], &empty_exec)
+                .is_empty(),
+            "the live enumerated incarnation is covered"
+        );
+        assert!(
+            seed(Scope::System, &[(me, None)])
+                .stop_diff_newcomers(&[me], &empty_exec)
+                .is_empty(),
+            "a task recorded without a generation is covered"
+        );
+        assert_eq!(
+            seed(Scope::System, &[]).stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec),
+            vec![NO_SUCH_PID],
+            "a never-seen pid is a newcomer"
+        );
+        assert_eq!(
+            seed(Scope::System, &[(me, Some(live.wrapping_add(1)))])
+                .stop_diff_newcomers(&[me], &empty_exec),
+            vec![me],
+            "a reused pid reads as a newcomer, never as its predecessor"
+        );
+        assert!(
+            seed(Scope::System, &[(NO_SUCH_PID, Some(7))])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "an unreadable-at-stop pid with a recorded start stays covered"
+        );
+        let exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::from([(NO_SUCH_PID, None)]);
+        assert!(
+            seed(Scope::System, &[])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &exec)
+                .is_empty(),
+            "a pid the exec gap names is never double-reported"
+        );
+    }
+
+    /// The stop diff only considers in-scope tasks: a pid-scoped run
+    /// never reports foreign pids (even unseen ones), and cgroup scope
+    /// runs no stop diff (transaction coverage, not scan passes).
+    #[test]
+    fn stop_diff_respects_scope() {
+        let me = std::process::id();
+        let empty_exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::new();
+        assert!(
+            seed(Scope::Pid(me), &[])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "a pid-scoped run ignores foreign pids"
+        );
+        assert_eq!(
+            seed(Scope::Pid(me), &[]).stop_diff_newcomers(&[me], &empty_exec),
+            vec![me],
+            "an unseen scope target is still a newcomer"
+        );
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/stop-diff-test".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        };
+        assert!(
+            seed(cgroup, &[])
+                .stop_diff_newcomers(&[me, NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "cgroup scope runs no stop diff"
+        );
+    }
+
+    /// Enumeration memory is capped: past the cap departed tasks evict
+    /// first, so a live enumerated task survives a storm of dead ones
+    /// and the set stays bounded.
+    #[test]
+    fn ever_enumerated_cap_evicts_departed_tasks_first() {
+        use crate::inspect_system::{MemberGeneration, MemberStatus, ProcessRecord};
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            me,
+            Some(MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        // One live scanned member plus more departed never-admitted
+        // members than the cap holds; none of the fabricated pids can
+        // exist, so every sweep check is a deterministic eviction.
+        for index in 0..=EVER_ENUMERATED_CAP {
+            catalog.processes.push(ProcessRecord {
+                pid: NO_SUCH_PID - index as u32,
+                status: MemberStatus::NotSelected { loss: None },
+                objects: Vec::new(),
+                generation: Some(MemberGeneration {
+                    start_time: Some(7_000 + index as u64),
+                    exe: None,
+                }),
+                complete_scan: None,
+                application: super::scan_freshness_tests::unexamined_application(),
+                hints_examined: true,
+            });
+        }
+        let mut coordinator = stop_diff_coordinator(Scope::System);
+        coordinator.note_applied_scan_tasks(&catalog);
+        let remembered = coordinator.ever_enumerated_for_test();
+        assert!(
+            remembered.len() <= EVER_ENUMERATED_CAP,
+            "enumeration memory stays capped: {}",
+            remembered.len()
+        );
+        assert!(
+            remembered.contains(&(me, Some(live))),
+            "the live enumerated task survives the cap"
+        );
+        assert!(
+            !remembered.contains(&(
+                NO_SUCH_PID - EVER_ENUMERATED_CAP as u32,
+                Some(7_000 + EVER_ENUMERATED_CAP as u64)
+            )),
+            "departed tasks evict first"
         );
     }
 }

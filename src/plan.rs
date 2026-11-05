@@ -4563,10 +4563,11 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
 }
 
 /// Scan lowering for the no-manifest semantic subset (DEMO-4): when
-/// `scan_authorized`, targets of name-authorized tables (publication
-/// evidence per [`table_name_authorized`]) carry semantic authority
-/// inside this lowering only. Every other lowering keeps scan
-/// targets count-only, exactly as before.
+/// `scan_authorized`, targets of name-authorized tables whose
+/// publication evidence is interface linkage, a live function-list
+/// return or manifest corroboration (never export agreement alone)
+/// carry semantic authority inside this lowering only. Every other
+/// lowering keeps scan targets count-only, exactly as before.
 fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -4606,6 +4607,14 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
             &exports,
         );
         let authorized = table_name_authorized(&score);
+        // Argument-read (semantic) authority from a scan needs the
+        // table a caller actually reaches: standard interface
+        // linkage, a live function-list return, or manifest
+        // corroboration. Export-name agreement alone proves names,
+        // not the table in use, so it stays count-only here.
+        let scan_semantic = scan_authorized
+            && authorized
+            && (score.linked || score.live_return || score.manifest);
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -4650,7 +4659,7 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
                 object_path: &entry.object_path,
                 file_offset: entry.file_offset,
                 fork_safe,
-                semantic_authorized: scan_authorized && authorized,
+                semantic_authorized: scan_semantic,
                 name_authorized: authorized,
                 table: Some(index),
                 ordinal: standard_ordinal(entry.name).map(|ordinal| SlotOrdinal {

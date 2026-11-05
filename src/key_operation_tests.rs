@@ -20361,3 +20361,104 @@ fn key_operation_joint_ordered_fallback_names_its_cause() {
         "the unsealable fallback is named once, for its caller"
     );
 }
+
+/// Joint never stops as a whole for an info call: a staged call, then
+/// a proved-irrelevant info call (`C_GetSlotInfo`) before the seal,
+/// then sign. The info call touches nothing the proof relies on
+/// (its endpoint class says so), so it must not force the ordered
+/// fallback: the feed stays Joint, the staged init and the sign
+/// settle through their seals, and no fallback ending is named.
+#[test]
+fn key_operation_info_call_before_seal_keeps_joint_feed() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+
+    // Stage the init; it stays queued (no seal yet).
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (init_facts, init_pos) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, init_pos, init_facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+
+    // The info call arrives before the seal. It rides a
+    // fixture-minted H0 ordinal (info calls are not attested
+    // shapes); its S1 facts mirror the async carve-out fixture.
+    let info_pos = guarded.scene.fixture.admit_function("C_SignInit").h0_ordinal();
+    assert!(info_pos > init_pos, "non-vacuous: info call after the queue");
+    let info_facts = SemanticCall {
+        function: "C_GetSlotInfo".into(),
+        session: SESSION,
+        capture: op_capture(),
+        ts_ns: 999,
+        rv: CkRv::OK.0,
+        authorized: true,
+        unambiguous: true,
+        attributable: true,
+        ..SemanticCall::default()
+    };
+    guarded.observe(&joint_key, info_pos, info_facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "a proved-irrelevant info call never ends the Joint feed"
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        1,
+        "the queued init stays staged for its seal"
+    );
+
+    // The init and the sign settle through their seals as usual.
+    ingest_call(&mut guarded.scene, &init, init_pos);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            guarded.scene.adapter.ledger_mut(),
+        ),
+        SealApplyOutcome::ReplayedOne
+    );
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    let observations = guarded.registry.joint_observations(21);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(
+        completed + proved,
+        1,
+        "the sign completes exactly once through the Joint path"
+    );
+}

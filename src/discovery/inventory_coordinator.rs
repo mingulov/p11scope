@@ -329,9 +329,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
     /// DEMO-4: the latest catalog lowering's reconciled scan
-    /// modules and aggregate pins, stashed at absorb time for one
-    /// no-manifest scan-seal attempt (consumed by
-    /// `prepare_scan_semantic_subset`; the next absorb refills it).
+    /// modules and aggregate pins, stashed at absorb time for
+    /// no-manifest scan-seal attempts (cloned by
+    /// `prepare_scan_semantic_subset`; the next absorb replaces it).
     scan_mint_sources: Option<(
         Vec<crate::discovery::identity::ReconciledModule>,
         crate::discovery::identity::PinnedObjects,
@@ -1527,7 +1527,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// The no-manifest scan mint (DEMO-4), over the same retained
     /// engine facts as [`Self::prepare_semantic_subset`].
     pub(crate) fn prepare_scan_semantic_subset(&mut self) -> semantics::SubsetPreparation {
-        let sources = self.scan_mint_sources.take();
+        // Cloned, never consumed: one lane start mints twice
+        // (attach + convert subsets must agree), and a refused
+        // start retries on a later pass whose absorb refills the
+        // stash with fresher tables anyway.
+        let sources = self.scan_mint_sources.clone();
         self.semantic_inputs.prepare_scan(&self.engine, sources)
     }
 

@@ -8729,6 +8729,40 @@ mod tests {
         );
     }
 
+    /// Item 11: the header and the processes line use one count for
+    /// "checked in detail" (deep-scanned members only; memory-unreadable
+    /// members are named separately, never folded in).
+    #[test]
+    fn header_and_processes_line_agree_on_checked_in_detail() {
+        let mut catalog = catalog_with(Vec::new());
+        catalog.processes[1].status = MemberStatus::MemoryUnavailable { reason: "denied" };
+        // Stale inventoried total: the header must count processes, not it.
+        catalog.scanned = 2;
+        catalog.maps_matched = 0;
+        let concise =
+            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("1 checked in detail, 0 matched from maps, 1 memory unreadable"),
+            "{concise}"
+        );
+        assert!(
+            concise.contains("processes: 1 memory unreadable, 1 checked in detail"),
+            "{concise}"
+        );
+        assert!(!concise.contains("2 checked in detail"), "{concise}");
+    }
+
+    /// Item 11: the header labels the summed deep-scan time as deep scans,
+    /// never "scan took" (the command's wall time is longer).
+    #[test]
+    fn header_labels_deep_scan_time_not_scan_took() {
+        let catalog = catalog_with(Vec::new());
+        let concise =
+            render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(concise.contains("deep scans 7 ms"), "{concise}");
+        assert!(!concise.contains("scan took"), "{concise}");
+    }
+
     /// Item 31: concise object headers name the provider file without an
     /// index; verbose keeps `object[N]` for cross-references.
     #[test]

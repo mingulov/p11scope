@@ -366,9 +366,54 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
 /// exec between them) retire one generation's slots and arm the
 /// next, and the aggregate table must show the function once with
 /// summed counts, not once per generation. Rows for different files
-/// stay apart: sharing a name never merges two modules.
+/// stay apart: sharing a name never merges two modules. First-seen
+/// order is kept; a merged row keeps the first row's identity fields
+/// and sums every counter, bucket and return tally.
 pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
-    reports
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Key {
+        names: Vec<String>,
+        aliased: bool,
+        target: Option<((u64, u64), u64, Option<String>)>,
+        file_offset: u64,
+    }
+    let mut index: BTreeMap<Key, usize> = BTreeMap::new();
+    let mut merged: Vec<SlotReport> = Vec::with_capacity(reports.len());
+    for report in reports {
+        let key = Key {
+            names: report.names.clone(),
+            aliased: report.aliased,
+            target: report
+                .target_object
+                .as_ref()
+                .map(|target| (target.dev, target.ino, target.sha256.clone())),
+            file_offset: report.file_offset,
+        };
+        let Some(position) = index.get(&key).copied() else {
+            index.insert(key, merged.len());
+            merged.push(report);
+            continue;
+        };
+        let row = &mut merged[position];
+        row.calls = row.calls.saturating_add(report.calls);
+        row.errors = row.errors.saturating_add(report.errors);
+        row.in_flight = row.in_flight.saturating_add(report.in_flight);
+        row.total_ns = row.total_ns.saturating_add(report.total_ns);
+        row.max_ns = row.max_ns.max(report.max_ns);
+        for (slot, extra) in row.buckets.iter_mut().zip(report.buckets.iter()) {
+            *slot = slot.saturating_add(*extra);
+        }
+        for (rv, count) in report.rv_counts {
+            row.rv_counts
+                .entry(rv)
+                .and_modify(|total| *total = total.saturating_add(count))
+                .or_insert(count);
+        }
+        row.ordinals.extend(report.ordinals);
+        row.ordinals.sort();
+        row.ordinals.dedup();
+    }
+    merged
 }
 
 /// Events the kernel side could not reserve ring buffer space for,
@@ -1444,8 +1489,22 @@ mod tests {
     /// unlabeled rows.
     #[test]
     fn merge_slot_reports_folds_same_function_same_file_rows() {
-        let first = merge_fixture("C_DigestUpdate", 0x1234, 4242, 5625, 1, buckets_with(10, 20));
-        let second = merge_fixture("C_DigestUpdate", 0x1234, 4242, 1494, 2, buckets_with(30, 40));
+        let first = merge_fixture(
+            "C_DigestUpdate",
+            0x1234,
+            4242,
+            5625,
+            1,
+            buckets_with(10, 20),
+        );
+        let second = merge_fixture(
+            "C_DigestUpdate",
+            0x1234,
+            4242,
+            1494,
+            2,
+            buckets_with(30, 40),
+        );
         let merged = merge_slot_reports(vec![first, second]);
         assert_eq!(merged.len(), 1, "one function reads one row");
         let row = &merged[0];

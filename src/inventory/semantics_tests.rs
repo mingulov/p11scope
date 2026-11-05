@@ -679,6 +679,50 @@ fn native_semantic_reachable_selection_preserves_demand_and_rivals() {
     );
 }
 
+/// DEMO-4: with no manifest requested, the scan preparation mints
+/// a subset from scan-discovered tables whose names are authorized
+/// by publication evidence (here: a live return). The manifest
+/// preparation beside it keeps refusing scan-only authority. A
+/// scan table with no name evidence mints nothing.
+#[test]
+fn native_semantic_scan_subset_mints_without_manifest() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let scan = fixture.source(["C_SignInit", "C_Sign"]);
+    let engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("name-authorized scan tables mint a subset without a manifest");
+    assert_eq!(subset.required().len(), 1);
+    assert_eq!(subset.plan().slots.len(), 2);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "scan-derived slots carry semantics, never count-only"
+    );
+    // The manifest preparation over the same engine is unchanged.
+    let manifest_prepared = prepare_attested_subset(&engine, &[]);
+    assert!(manifest_prepared.subset.is_none());
+    assert_eq!(
+        manifest_prepared.refusals,
+        vec![SemanticRefusal::Unattested]
+    );
+    // No name evidence (no live return, no linkage, no exports):
+    // nothing mints.
+    let mut bare = fixture.source(["C_SignInit", "C_Sign"]);
+    bare.scanned.tables[0].live_return = false;
+    let engine = engine_for_test(Vec::new(), vec![bare], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "bare decode without publication evidence cannot attest names"
+    );
+}
+
 #[test]
 fn native_semantic_names_never_attest() {
     let fixture = ProviderFixture::new();

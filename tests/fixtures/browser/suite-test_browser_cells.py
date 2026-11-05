@@ -192,6 +192,31 @@ class NssSeedCells(unittest.TestCase):
             check=True, capture_output=True, text=True)
         self.assertIn("g33-nss-client", certs.stdout)
 
+    def test_chrome_auto_select_policy_document_and_patterns(self):
+        """DEMO-4 (fedora certprobe15/16): Chrome for Testing 156 has
+        no `--auto-select-certificate-for-urls` switch; it reads the
+        AutoSelectCertificateForUrls policy from
+        /etc/opt/chrome_for_testing/policies/managed. The document
+        carries one JSON string per pattern, and a plain flow URL
+        derives loopback patterns that also cover a fresh port."""
+        import json
+        doc = json.loads(profiles.chrome_auto_select_policy_document(
+            ["https://127.0.0.1:*/*"]))
+        entries = doc["AutoSelectCertificateForUrls"]
+        self.assertEqual(
+            [json.loads(e) for e in entries],
+            [{"pattern": "https://127.0.0.1:*/*", "filter": {}}])
+        self.assertEqual(
+            str(profiles.CHROME_POLICY_DIR),
+            "/etc/opt/chrome_for_testing/policies/managed")
+        derived = profiles.chrome_auto_select_patterns(
+            "https://127.0.0.1:8443/")
+        self.assertIn("https://127.0.0.1:*/*", derived)
+        self.assertIn("https://127.0.0.1:8443/", derived)
+        from_json = profiles.chrome_auto_select_patterns(
+            '[{"pattern": "https://127.0.0.1:*/*", "filter": {}}]')
+        self.assertEqual(from_json, ["https://127.0.0.1:*/*"])
+
 
 class BrowserCells(unittest.TestCase):
     maxDiff = 4096

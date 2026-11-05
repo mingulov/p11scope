@@ -8266,14 +8266,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// A bounded `pids a, b, ...` list for coverage gaps: names the
+    /// first ten pids in ascending order and counts the rest, so a fork
+    /// storm cannot flood the report while the count stays exact.
+    fn bounded_pid_list(pids: &BTreeSet<u32>) -> String {
+        const PIDS_SHOWN: usize = 10;
+        let listed: Vec<String> = pids
+            .iter()
+            .take(PIDS_SHOWN)
+            .map(|pid| pid.to_string())
+            .collect();
+        let mut rendered = format!("pids {}", listed.join(", "));
+        if pids.len() > PIDS_SHOWN {
+            rendered.push_str(&format!(", and {} more", pids.len() - PIDS_SHOWN));
+        }
+        rendered
+    }
+
     /// A collection the stop discarded before apply: inspect the dropped
-    /// catalog, read-only over admission, for attributable members the
-    /// coordinator never admitted that map a provider — deep-scan
-    /// provider tables or interfaces, or a maps-match against a pinned
-    /// provider — and leave one named gap for their unobserved calls.
-    /// Provider-free and newcomer-free discards stay silent. Cgroup
-    /// retained collections carry transaction state rather than final
-    /// scan verdicts, so provider mappings there stay unjudged.
+    /// catalog, read-only over admission, for members the coordinator
+    /// never admitted. Attributable members that map a provider —
+    /// deep-scan provider tables or interfaces, or a maps-match against
+    /// a pinned provider — leave one named gap for their unobserved
+    /// calls; unscanned members (`NotSelected` past the cap, or
+    /// `Unreadable` whose member gaps drop with the catalog) leave one
+    /// bounded gap naming their unknown provider mappings, so an
+    /// in-window process enumerated only in a discarded collection is
+    /// never silent. Provider-free and newcomer-free discards stay
+    /// silent. Cgroup retained collections carry transaction state
+    /// rather than final scan verdicts, so provider mappings there stay
+    /// unjudged.
     pub(crate) fn note_discarded_collection(
         &mut self,
         collected: &crate::inventory_capture::CollectedPass,
@@ -8306,8 +8328,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     "live inventory transaction".into(),
                     "a process mapping a provider was dropped before it was admitted, while the capture was stopping; its calls were not observed".into(),
                 );
-                return;
+                break;
             }
+        }
+        let mut unscanned: BTreeSet<u32> = BTreeSet::new();
+        for process in &catalog.processes {
+            if self.adapter.live_id(process.pid).is_some() {
+                continue;
+            }
+            if !matches!(
+                process.status,
+                crate::inspect_system::MemberStatus::NotSelected { .. }
+                    | crate::inspect_system::MemberStatus::Unreadable { .. }
+            ) {
+                continue;
+            }
+            unscanned.insert(process.pid);
+        }
+        if !unscanned.is_empty() {
+            let pids = Self::bounded_pid_list(&unscanned);
+            self.note_scope_gap(
+                "dropped collection coverage".into(),
+                format!(
+                    "{} process(es) in the dropped collection were not scanned; their provider mappings are unknown ({pids})",
+                    unscanned.len()
+                ),
+            );
         }
     }
 
@@ -8325,16 +8371,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         // Name the unscanned processes, not just their count; the
         // list is bounded so a fork storm cannot flood the report.
-        const PIDS_SHOWN: usize = 10;
-        let listed: Vec<String> = pending
-            .iter()
-            .take(PIDS_SHOWN)
-            .map(|pid| pid.to_string())
-            .collect();
-        let mut pids = format!("pids {}", listed.join(", "));
-        if pending.len() > PIDS_SHOWN {
-            pids.push_str(&format!(", and {} more", pending.len() - PIDS_SHOWN));
-        }
+        let pids = Self::bounded_pid_list(&pending);
         self.note_scope_gap(
             "discovery coverage ended before stop".into(),
             format!(

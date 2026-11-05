@@ -185,6 +185,20 @@ pub(crate) fn application_label(result: &InspectApplicationResult, pid: u32) -> 
 }
 
 /// Pure detail for the same receipt as the label; no process or file lookup.
+#[cfg(test)]
+pub(crate) fn validated_for_test(path: &str, dev: u64, ino: u64) -> ValidatedInspectApplication {
+    ValidatedInspectApplication {
+        exe: ExeIdentity {
+            dev,
+            ino,
+            mtime_secs: 1,
+            mtime_nanos: 2,
+            path: Some(path.into()),
+        },
+        start_time: 99,
+    }
+}
+
 pub(crate) fn application_detail(result: &InspectApplicationResult) -> Option<String> {
     let InspectApplicationResult::Observed(application) = result else {
         return None;

@@ -801,7 +801,9 @@ fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedModule, ScannedTable};
+    use crate::discovery::scan::{
+        ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped,
+    };
     use p11scope_manifest::maps::{Device, ObjectKey};
 
     fn key(inode: u64) -> ObjectKey {
@@ -1815,6 +1817,116 @@ mod tests {
             verbose.contains("(NULL: C_GetFunctionStatus)"),
             "NULL annotation kept: {verbose}"
         );
+    }
+
+    /// Item 30: concise shows the executable path but not the image
+    /// identity line; quiet shows neither; verbose shows both.
+    #[test]
+    fn concise_and_quiet_hide_image_identity_line() {
+        let application = InspectApplicationResult::Observed(
+            crate::inspect_identity::validated_for_test("/bin/tool", 47, 9134),
+        );
+        for (verbosity, want_exe, want_image) in [
+            (crate::cli::TextVerbosity::Concise, true, false),
+            (crate::cli::TextVerbosity::Quiet, false, false),
+            (crate::cli::TextVerbosity::Verbose, true, true),
+        ] {
+            let out = render_text_with_application(
+                4242,
+                &sample(),
+                &PinnedObjects::empty(),
+                &application,
+                &[],
+                &[],
+                verbosity,
+            );
+            assert_eq!(
+                out.contains("executable  /bin/tool"),
+                want_exe,
+                "{verbosity:?}: {out}"
+            );
+            assert_eq!(
+                out.contains("image       dev"),
+                want_image,
+                "{verbosity:?}: {out}"
+            );
+            assert_eq!(
+                out.contains("start-time"),
+                want_image,
+                "{verbosity:?}: {out}"
+            );
+        }
+    }
+
+    /// Item 30: concise states an unreadable-memory cause once, in the
+    /// coverage line; verbose keeps the paragraph, the mem skip and
+    /// coverage.
+    #[test]
+    fn concise_unavailable_states_cause_once_in_coverage() {
+        let outcome = ScanOutcome::Unavailable {
+            reason: "ptrace",
+            modules: vec![],
+            skipped: vec![Skipped {
+                subject: "/proc/4242/mem".into(),
+                reason: "Permission denied (os error 13)".into(),
+            }],
+        };
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            concise.contains(
+                "coverage: partial — cannot read process memory without root (sudo); \
+                 providers listed from its memory map only"
+            ),
+            "{concise}"
+        );
+        assert!(!concise.contains("table scan unavailable"), "{concise}");
+        assert!(!concise.contains("skipped: /proc/4242/mem"), "{concise}");
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(verbose.contains("table scan unavailable"), "{verbose}");
+        assert!(verbose.contains("skipped: /proc/4242/mem"), "{verbose}");
+        assert!(verbose.contains("coverage: partial"), "{verbose}");
+    }
+
+    /// Item 30: a module with no walked tables reads as unscanned, not as
+    /// having no functions.
+    #[test]
+    fn concise_module_without_tables_reads_unscanned() {
+        let outcome = ScanOutcome::Unavailable {
+            reason: "ptrace",
+            modules: vec![ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                view: crate::process::ProcessViewId(0),
+                mount_namespace: crate::process::MountNamespaceId { device: 1, inode: 1 },
+                key: key(11),
+                path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                decoder_abi: None,
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![],
+                interfaces: vec![],
+            }],
+            skipped: vec![],
+        };
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!concise.contains("0 functions (0 tables)"), "{concise}");
+        assert!(concise.contains("not deep-scanned"), "{concise}");
     }
 
     /// F6: a `known_prefix` walk (newer functions unknown) downgrades

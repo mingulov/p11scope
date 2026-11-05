@@ -2050,6 +2050,40 @@ fn label(r: &SlotReport) -> String {
     }
 }
 
+/// The function table's provider cell: the owning module's file name,
+/// `two providers` when two files claim the row, or `unknown` when no
+/// file is proven. Escaped and truncated to the column width, so long
+/// paths never break the table's alignment.
+fn provider_cell(row: &SlotReport, modules: &[DiscoveredModule]) -> String {
+    const WIDTH: usize = 16;
+    let cell = if row.module_ambiguous {
+        "two providers".to_string()
+    } else if let Some(id) = row.module {
+        modules
+            .iter()
+            .find(|module| module.id == id)
+            .map(|module| {
+                module
+                    .path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(&module.path)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    };
+    let escaped = escape_controls(&cell);
+    if escaped.chars().count() <= WIDTH {
+        escaped.into_owned()
+    } else {
+        let mut short: String = escaped.chars().take(WIDTH - 1).collect();
+        short.push('…');
+        short
+    }
+}
+
 pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     match ns {
         None => "—".into(),
@@ -2578,8 +2612,8 @@ pub fn live_scoped_with_verbosity(
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
         s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
         s.push_str(&format!(
-            "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
+            "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+            "FUNCTION", "PROVIDER", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
         ));
         for r in rows {
             let percentiles = if r.mode.has_histogram() {
@@ -2596,8 +2630,9 @@ pub fn live_scoped_with_verbosity(
                 name.push_str(init.text_suffix());
             }
             s.push_str(&format!(
-                "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+                "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
                 escape_controls(&name),
+                provider_cell(r, &ev.discovery.modules),
                 r.calls,
                 r.errors,
                 fmt_ns(percentiles[0]),
@@ -3369,14 +3404,13 @@ enum InitializationOutcome {
 }
 
 impl InitializationOut {
-    /// The live-table marker uses the same words as the JSON row.
+    /// The live-table marker reports the outcome only; the provider
+    /// column beside it names the file.
     fn text_suffix(&self) -> &'static str {
         match self.outcome {
-            InitializationOutcome::Ok => " [init: ok, potential provider]",
-            InitializationOutcome::AlreadyInitialized => {
-                " [init: already_initialized, potential provider]"
-            }
-            InitializationOutcome::Mixed => " [init: mixed, potential provider]",
+            InitializationOutcome::Ok => " [init: ok]",
+            InitializationOutcome::AlreadyInitialized => " [init: already_initialized]",
+            InitializationOutcome::Mixed => " [init: mixed]",
             InitializationOutcome::Error => " [init: error]",
         }
     }
@@ -4202,7 +4236,16 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 fields,
-                ["C_Sign", "25", "3", expected, expected, expected, "2"],
+                [
+                    "C_Sign",
+                    "unknown",
+                    "25",
+                    "3",
+                    expected,
+                    expected,
+                    expected,
+                    "2"
+                ],
                 "{mode:?}"
             );
         }
@@ -5627,15 +5670,19 @@ pub(crate) mod tests {
             .collect();
         assert_eq!(init_lines.len(), 5, "{out}");
         for marker in [
-            "[init: ok, potential provider]",
-            "[init: already_initialized, potential provider]",
-            "[init: mixed, potential provider]",
+            "[init: ok]",
+            "[init: already_initialized]",
+            "[init: mixed]",
         ] {
             assert!(
                 init_lines.iter().any(|line| line.contains(marker)),
                 "missing {marker} in:\n{out}"
             );
         }
+        assert!(
+            !out.contains("potential provider"),
+            "no row claims a provider: {out}"
+        );
         let error_line = init_lines
             .iter()
             .find(|line| line.contains("[init: error]"))
@@ -7429,6 +7476,81 @@ pub(crate) mod tests {
             1,
             "{out}"
         );
+    }
+
+    /// CLI text: the function table names each row's provider file, so
+    /// identical function names from two providers stay distinct;
+    /// shared and unknown rows say so instead of guessing.
+    #[test]
+    fn function_table_names_each_rows_provider() {
+        fn module(id: u32, path: &str) -> DiscoveredModule {
+            let mut module = discovered_fixture();
+            module.id = crate::plan::ModuleId(id);
+            module.path = path.into();
+            module
+        }
+        let mut ev = evidence();
+        ev.discovery.modules = vec![module(0, "/opt/a.so"), module(1, "/opt/b.so")];
+        ev.verdict();
+        let mut first = report("C_Initialize", 188, 0, false);
+        first.module = Some(crate::plan::ModuleId(0));
+        let mut second = report("C_Initialize", 2, 0, false);
+        second.module = Some(crate::plan::ModuleId(1));
+        let mut shared = report("C_Sign", 30, 0, false);
+        shared.module_ambiguous = true;
+        let unknown = report("C_Digest", 4001, 0, false);
+        let out = live_scoped_with_verbosity(
+            &[first, second, shared, unknown],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "system",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("PROVIDER"), "{out}");
+        let line_for = |text: &str| {
+            out.lines()
+                .find(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("missing {text} in:\n{out}"))
+                .to_string()
+        };
+        assert!(line_for("188").contains("a.so"), "{out}");
+        assert!(line_for("C_Sign").contains("two providers"), "{out}");
+        assert!(line_for("C_Digest").contains("unknown"), "{out}");
+        let twins: Vec<String> = out
+            .lines()
+            .filter(|line| line.contains("C_Initialize"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(twins.len(), 2, "{out}");
+        assert!(twins.iter().any(|line| line.contains("a.so")), "{out}");
+        assert!(twins.iter().any(|line| line.contains("b.so")), "{out}");
+    }
+
+    /// CLI text: the Initialize marker reports the outcome only; the
+    /// provider column beside it names the file.
+    #[test]
+    fn initialization_suffix_never_claims_a_provider() {
+        let mut ok = report("C_Initialize", 2, 0, false);
+        ok.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[ok],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("[init: ok]"), "{out}");
+        assert!(!out.contains("potential provider"), "{out}");
     }
 
     /// F2: with lost events, concise and verbose show coverage once —

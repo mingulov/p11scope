@@ -2517,6 +2517,17 @@ int main(int argc, char **argv) {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert!(stat.contains("(a) Z 1 (b) "), "comm not applied: {stat}");
+        // Settle to a live read within the same spawn deadline: under
+        // parallel load a first post-exec read can tear (comm present but
+        // the comm-embedded "Z" misparsed as the state). No new deadline,
+        // no retry past it — the same 5 s covers comm and liveness.
+        let stat = loop {
+            let stat = read_proc_stat(pid).unwrap();
+            if !process_is_zombie(pid) || Instant::now() > deadline {
+                break stat;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        };
         let own_start = process_start_time(std::process::id()).unwrap();
         let start = process_start_time(pid).unwrap();
         assert!(start >= own_start, "{start} < {own_start}: {stat}");

@@ -3480,16 +3480,17 @@ def validate_lane02_owned_run_metrics(document, expected, pause):
         else {"eligible": 0, "none": 1, "pause_protected": 0}
     )
     require(loader["initial_set_capture"] == capture, loader["initial_set_capture"])
-    attempts, confirmed, partial = (evidence[name] for name in PAUSE_COUNTERS)
+    attempts, confirmed, partial, unavailable = (evidence[name] for name in PAUSE_COUNTERS)
     if pause == "never":
         require(
-            (evidence["pause"], attempts, confirmed, partial) == ("none", 0, 0, 0),
-            f"Lane02 never pause tuple: {(evidence['pause'], attempts, confirmed, partial)}",
+            (evidence["pause"], attempts, confirmed, partial, unavailable) == ("none", 0, 0, 0, 0),
+            f"Lane02 never pause tuple: {(evidence['pause'], attempts, confirmed, partial, unavailable)}",
         )
     else:
         require(evidence["pause"] == "sigstop", evidence["pause"])
         require(attempts == confirmed and confirmed >= 1, (attempts, confirmed))
         require(partial == 0, partial)
+        require(unavailable == 0, unavailable)
 
 
 def validate_shared_layer_metrics(document, expected, multiplier=1, uncertainties=1):
@@ -4348,7 +4349,8 @@ def self_test():
         )
         if pause != "never":
             owned["evidence"].update(
-                pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0
+                pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0,
+                pause_unavailable=0,
             )
         settle_fixture_verdict(owned)
         validate_lane02_owned_run_metrics(owned, {"C_Initialize": 1}, pause)
@@ -4384,6 +4386,20 @@ def self_test():
         rejected(
             lambda bad=bad, pause=pause: validate_lane02_owned_run_metrics(
                 bad, {"C_Initialize": 1}, pause
+            )
+        )
+        # pause_unavailable is part of the closed pause tuple in both
+        # branches: a lattice-consistent unavailable attempt is still not
+        # an exact Lane02 owned run.
+        unavail = copy.deepcopy(owned)
+        unavail["evidence"].update(
+            pause="partial", pause_attempts=1, pause_confirmed=0,
+            pause_partial=0, pause_unavailable=1,
+        )
+        settle_fixture_verdict(unavail)
+        rejected(
+            lambda unavail=unavail, pause=pause: validate_lane02_owned_run_metrics(
+                unavail, {"C_Initialize": 1}, pause
             )
         )
         rejected(

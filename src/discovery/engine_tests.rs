@@ -628,16 +628,28 @@ fn bounded_terminal_drain_applies_a_consumed_prefix_before_dequeue_failure() {
 }
 
 #[test]
-fn a_real_dequeue_failure_still_aborts_the_generic_route() {
+fn a_real_dequeue_failure_gaps_the_generic_route_with_its_prefix() {
     let (mut engine, _scope) = engine_over_cgroup_naming(&[]);
     let mut session = ScriptedSession::default();
     session
         .dequeues
         .push_back(Err(anyhow!("scripted ring read failed")));
 
-    let error = engine.drain_discovery_from(&mut session).unwrap_err();
-
-    assert_eq!(error.to_string(), "scripted ring read failed");
+    // Never-stop: the generic route applies the (here empty) prefix,
+    // records a transport gap, and continues instead of aborting.
+    let changed = engine
+        .drain_discovery_from(&mut session)
+        .expect("transport failure gaps the generic route");
+    assert!(!changed);
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.starts_with("discovery transport unavailable")),
+        "{:?}",
+        engine.counters.object_skips
+    );
 }
 
 /// Every dequeue is capture-wide work, charged at the sink the records
@@ -32634,9 +32646,29 @@ fn discovery_complementary_partial_tables_do_not_cover_one_stale_surface() {
     );
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered)
-        .expect_err("two partial tables cannot manufacture one complete proof");
-    assert!(error.to_string().contains("object 0"), "{error:#}");
+    // Never-stop: uncovered stale surfaces gap instead of aborting the
+    // rebuild; the partial tables still prove nothing.
+    rebuild_discovered(&mut discovered)
+        .expect("two partial tables cannot manufacture one complete proof, so the surface gaps");
+    assert!(
+        !discovered.counters.object_skips.is_empty(),
+        "the uncovered stale surface is a recorded gap"
+    );
+    assert!(
+        !discovered.plan.modules.is_empty()
+            && discovered.plan.modules.iter().all(|m| !m.corroborated),
+        "the partial tables prove nothing: no corroborated module: {:?}",
+        discovered.plan.modules
+    );
+    assert!(
+        discovered
+            .plan
+            .modules
+            .iter()
+            .all(|m| !m.source.contains("manifest")),
+        "the skipped manifest lends no claim to the plan: {:?}",
+        discovered.plan.modules
+    );
 }
 
 #[test]
@@ -32715,9 +32747,29 @@ fn discovery_one_duplicate_table_cannot_prove_two_manifest_surfaces() {
     );
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered)
-        .expect_err("one table cannot be reused for two manifest surfaces");
-    assert!(error.to_string().contains("object 0"), "{error:#}");
+    // Never-stop: a table that cannot cover two surfaces gaps the stale
+    // surface instead of aborting the rebuild; reuse still proves nothing.
+    rebuild_discovered(&mut discovered)
+        .expect("one table cannot be reused for two manifest surfaces, so the surface gaps");
+    assert!(
+        !discovered.counters.object_skips.is_empty(),
+        "the uncovered stale surface is a recorded gap"
+    );
+    assert!(
+        !discovered.plan.modules.is_empty()
+            && discovered.plan.modules.iter().all(|m| !m.corroborated),
+        "the reused table proves nothing: no corroborated module: {:?}",
+        discovered.plan.modules
+    );
+    assert!(
+        discovered
+            .plan
+            .modules
+            .iter()
+            .all(|m| !m.source.contains("manifest")),
+        "the skipped manifest lends no claim to the plan: {:?}",
+        discovered.plan.modules
+    );
 }
 
 #[test]
@@ -32747,9 +32799,29 @@ fn discovery_stale_module_requires_coverage_for_unresolved_claims() {
     );
     discovered.manifest_inputs.push(input);
 
-    let error = rebuild_discovered(&mut discovered)
-        .expect_err("discarded unresolved records still require table coverage");
-    assert!(error.to_string().contains("object 0"), "{error:#}");
+    // Never-stop: an uncovered stale module gaps instead of aborting
+    // the rebuild; the discarded records still prove nothing.
+    rebuild_discovered(&mut discovered)
+        .expect("discarded unresolved records still require table coverage, so the module gaps");
+    assert!(
+        !discovered.counters.object_skips.is_empty(),
+        "the uncovered stale module is a recorded gap"
+    );
+    assert!(
+        !discovered.plan.modules.is_empty()
+            && discovered.plan.modules.iter().all(|m| !m.corroborated),
+        "the discarded records prove nothing: no corroborated module: {:?}",
+        discovered.plan.modules
+    );
+    assert!(
+        discovered
+            .plan
+            .modules
+            .iter()
+            .all(|m| !m.source.contains("manifest")),
+        "the skipped manifest lends no claim to the plan: {:?}",
+        discovered.plan.modules
+    );
 }
 
 #[test]
@@ -63379,9 +63451,13 @@ fn stamped_legacy_fixture_reports_no_surface_gap() {
 
 #[test]
 fn named_pid_race_reports_partial_instead_of_aborting() {
-    // Never-stop: a named --pid that exits before discovery (or never
-    // existed) reports an empty PARTIAL plan like the cgroup path, not an
-    // abort with no report. RED: currently Err, dropping the report.
+    // Never-stop, view-open-gone subcase: a named --pid with no retained
+    // view that is provably gone reports an empty PARTIAL plan like the
+    // cgroup path, not an abort with no report. A provably gone pid is
+    // the ordinary end of a process, so no member skip and no
+    // `scan_unavailable` is recorded; PARTIAL comes from the
+    // empty-discovery/slots causes at the evidence seam.
+    // RED: currently Err, dropping the report.
     let pid = u32::MAX;
     let args = CaptureArgs {
         track_short_lived: false,
@@ -63408,6 +63484,90 @@ fn named_pid_race_reports_partial_instead_of_aborting() {
     let scope = Scope::Pid(pid);
     let engine = Engine::discover(&args, &scope, None).expect("exited pid gaps, not aborts");
     assert!(engine.plan.modules.is_empty());
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a provably gone pid is an ordinary end, not a recorded skip: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.scan_unavailable.is_none(),
+        "the view-open-gone subcase never scans: {:?}",
+        engine.counters.scan_unavailable
+    );
+    let evidence = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
+    assert_eq!(evidence.completeness, "PARTIAL");
+    let causes = evidence.gap_classes(false).observation.causes;
+    assert!(
+        causes.contains(&"discovery") && causes.contains(&"slots"),
+        "PARTIAL comes from the empty-discovery/slots causes: {causes:?}"
+    );
+    assert!(
+        !causes.contains(&"scan_unavailable") && !causes.contains(&"skipped"),
+        "no scan or skip cause for a pid that was never scanned: {causes:?}"
+    );
+}
+
+#[test]
+fn named_pid_scan_failure_after_exit_gaps_instead_of_aborting() {
+    // Never-stop, listing-to-scan race subcase: the named view was
+    // retained while the process lived, but the process exits before the
+    // scan reads it. The scan arm gaps like a cgroup member instead of
+    // aborting; the provably exited generation records no member skip,
+    // and the failed scan records no `scan_unavailable` (it never
+    // produced an unavailable outcome), so PARTIAL again comes from the
+    // empty-discovery/slots causes.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(42), pid).unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    let args = CaptureArgs {
+        track_short_lived: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Pid(pid),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = Scope::Pid(pid);
+    let engine =
+        Engine::discover(&args, &scope, Some(view)).expect("exited pid gaps at scan, not aborts");
+    assert!(engine.plan.modules.is_empty());
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a provably exited generation is an ordinary end: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine.counters.scan_unavailable.is_none(),
+        "the failed scan produced no unavailable outcome: {:?}",
+        engine.counters.scan_unavailable
+    );
+    let evidence = evidence_verdict(&engine.plan, &engine.pinned, &engine.counters);
+    assert_eq!(evidence.completeness, "PARTIAL");
+    let causes = evidence.gap_classes(false).observation.causes;
+    assert!(
+        causes.contains(&"discovery") && causes.contains(&"slots"),
+        "PARTIAL comes from the empty-discovery/slots causes: {causes:?}"
+    );
 }
 
 #[test]

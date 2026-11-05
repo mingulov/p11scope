@@ -25016,8 +25016,9 @@ impl Engine {
     /// items hold credits like records until the batch accounts them. A
     /// quantum stop is backlog, never failure; excess records stay unread
     /// in ring order for the next frame, and any overflow they cause is the
-    /// producer's `ring_loss`. A real dequeue failure aborts the route as
-    /// before. `fresh_blocked` reports stopping for capacity without
+    /// producer's `ring_loss`. A real dequeue failure applies the pulled
+    /// prefix, records a transport gap, and continues to the next tick
+    /// (never-stop). `fresh_blocked` reports stopping for capacity without
     /// observing an empty queue — capacity-blocked, never empty — and is
     /// also latched sticky so the scheduler services backlog instead of a
     /// full sleep.

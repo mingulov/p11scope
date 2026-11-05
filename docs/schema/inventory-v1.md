@@ -1040,7 +1040,12 @@ without an R2-D1-6 proof always disclose their
 inventory has no exactness producer, so a quiet pre-armed interval is
 a stated watch interval, not proven-exact coverage. Refusals and
 replacement ride the existing gap subjects (`inventory attach set
-refused module`, `inventory attach target changed identity`).
+refused module`, `inventory attach target changed identity`). An input
+that cannot be pinned at all (unresolvable locator, unreadable file)
+carries no `prearm[]` row — it resolved to no retained object — and
+instead publishes one scope-level gap (`subject` `inventory prearm
+input unavailable`, `reason` `{operator path}: {pin cause}`) while
+sibling inputs pin and report normally.
 
 Declared-set scope: inventory freezes each watch's declared endpoint
 set from proved offsets only (no manifest claims), while the Detailed

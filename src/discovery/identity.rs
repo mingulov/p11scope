@@ -9847,12 +9847,11 @@ mod tests {
         let (_dir, path, manifest, _) = count_manifest_file();
         let mut budget = count_manifest_read_budget();
         assert!(std::fs::metadata(path).unwrap().len() > budget.limits().total_bytes);
-        let result =
-            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0);
-        assert!(
-            result.is_err(),
-            "a cold identity hash cannot bypass the read allowance"
-        );
+        let pinning =
+            pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
+                .expect("a cold identity hash past the allowance gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
         assert!(budget.attempted_io_bytes() <= budget.limits().total_bytes);
     }
 
@@ -10014,15 +10013,16 @@ mod tests {
             0,
             MAX_TOTAL_OBJECT_BYTES - size + 1,
         );
-        assert!(result.is_err(), "one byte past the shared cap refuses");
+        let pinning = result.expect("one byte past the shared cap gaps the object");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
         let limit = format!("{MAX_TOTAL_OBJECT_BYTES}-byte limit");
         assert!(
-            result
-                .unwrap_err()
-                .problems()
+            pinning
+                .skipped
                 .iter()
-                .any(|problem| problem.contains(&limit)),
-            "refusal names the combined byte cap"
+                .any(|skip| skip.reason.contains(&limit)),
+            "gap names the combined byte cap"
         );
     }
 
@@ -10067,11 +10067,11 @@ mod tests {
         manifest.provenance_objects[0].device_major = key.device.major;
         manifest.provenance_objects[0].device_minor = key.device.minor;
         manifest.provenance_objects[0].inode = key.inode;
-        assert!(
+        let pinning =
             pin_count_manifest_objects_in_views_with_prior(&manifest, &[], &mut budget, 0, 0)
-                .is_err(),
-            "digest equality is not an exact opened-file cache witness"
-        );
+                .expect("a non-witnessed file gaps instead of reusing the inspection");
+        assert_eq!(pinning.pins.pinned().count(), 0);
+        assert_eq!(pinning.skipped.len(), 1);
     }
 
     #[test]

@@ -237,6 +237,13 @@ struct PendingExecSuccessor<Pin> {
     transition: ExecTransition,
 }
 
+/// Subject of the scope gap staged per unpinnable `--prearm-module`
+/// path (never-stop): the path resolved to no retained object, so it
+/// carries no `prearm[]` row; the gap's reason names it as
+/// `{operator path}: {pin cause}`. Inventory has no PARTIAL verdict —
+/// `gaps[]` is the incompleteness signal.
+pub(crate) const PREARM_UNAVAILABLE_SUBJECT: &str = "inventory prearm input unavailable";
+
 /// One `--prearm-module` input's assembled report row: operator spelling
 /// plus file identity, whether any scope member maps it, and the 6.13
 /// interval keys (`watch`, `attached_at_ns`, `unobserved_windows`) merged
@@ -830,6 +837,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
         self.prearm_prior = usage;
         self.semantic_inputs.set_prearm_prior(usage.0, usage.1);
+        // Never-stop: each unpinnable path publishes one scope gap while
+        // good pins continue. Staged at retention, before the first
+        // commit, so the first pass already carries it (like the plan
+        // refusals `absorb_prearm_plan` stages below).
+        for skip in &pinning.skipped {
+            self.note_scope_gap(
+                PREARM_UNAVAILABLE_SUBJECT.to_string(),
+                format!("{}: {}", skip.subject, skip.reason),
+            );
+        }
         self.prearm = Some(pinning);
     }
 

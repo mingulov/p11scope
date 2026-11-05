@@ -12387,6 +12387,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pause_attempts: 0,
         pause_confirmed: 0,
         pause_partial: 0,
+        pause_unavailable: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -12645,6 +12646,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "pause_attempts: pause.attempts",
         "pause_confirmed: pause.confirmed",
         "pause_partial: pause.partial",
+        "pause_unavailable: pause.unavailable",
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }

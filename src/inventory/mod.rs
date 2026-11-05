@@ -1126,9 +1126,11 @@ fn primary_alias_conflict(report: &Path, kind: &str, other: &Path) -> anyhow::Er
 
 /// Pins `--prearm-module` inputs for supported auto/native Inventory capture
 /// (packet 6.13 round-2, F5): open-first, `(ino, size, ctime)` bracket,
-/// whole-file hash, all-or-nothing `Fatal` on one bad path. `--pid` resolves
-/// against a temporary retained view of the named pid; system/cgroup resolve
-/// against the observer root. The pins live in the coordinator for the run.
+/// whole-file hash; one bad path gaps (a scope gap per path, staged when
+/// the coordinator retains the pinning) while good pins continue.
+/// `--pid` resolves against a temporary retained view of the named pid;
+/// system/cgroup resolve against the observer root. The pins live in the
+/// coordinator for the run.
 fn pin_inventory_prearm(
     prearm_modules: &[PathBuf],
     scope: InventoryRunScope,
@@ -8774,6 +8776,41 @@ mod tests {
                 .contains("prearm object unavailable"),
             "{:?}",
             mixed.skipped
+        );
+    }
+
+    /// Never-stop run-level twin: a mixed `--prearm-module` batch under
+    /// auto publishes one scope gap naming the bad path in the finished
+    /// inventory document while the good provider keeps its `prearm[]`
+    /// row (the pinning seam alone cannot see the publication).
+    #[test]
+    fn inventory_run_publishes_gap_for_bad_prearm_path_and_keeps_good_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let provider = prearm_provider_with_proved_exports_for_test(dir.path());
+        let bad = PathBuf::from("/nonexistent-prearm-provider.so");
+        let (code, document) =
+            inventory_prearm_run_json(std::process::id(), &[provider.clone(), bad], None, None);
+        assert_eq!(code, 0);
+        assert_scan_fallback(&document);
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        assert!(
+            gaps.iter().any(|gap| {
+                gap["subject"] == "inventory prearm input unavailable"
+                    && gap["reason"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("/nonexistent-prearm-provider.so")
+            }),
+            "the bad prearm path publishes one scope gap naming it: {gaps:?}"
+        );
+        let rows = document["prearm"]
+            .as_array()
+            .expect("the unified prearm[] section");
+        assert_eq!(rows.len(), 1, "only the good pin carries a row: {rows:?}");
+        assert_eq!(
+            rows[0]["path"].as_str().unwrap(),
+            provider.to_string_lossy(),
+            "the good pin keeps its row: {rows:?}"
         );
     }
 

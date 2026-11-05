@@ -37827,31 +37827,30 @@ fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
     engine.publish_current_capture_facts().unwrap();
 }
 
-/// Audit F5 (round-1 vehicle retired): five heuristic tables are a closure
-/// array by the classifier, so round 1 admits the fitting five whole rather
-/// than spilling the fifth past K=4 — a K=4 spill is unrepresentable for a
-/// scan-only module this size, and spill-history retention stays covered by
-/// the growth-omission (G-03) tests. What remains here is the live half: a
-/// later live publication settles through the same stable-ID extension path
-/// with no spill at any point, and upgrades the table's linkage.
-/// PA-9/C1: whole needs a provider beside the closure in the first plan;
-/// the pair holds a sidecar provider, so six slots admit, none spill.
+/// Route A: five heuristic tables are a Detailed closure array, so
+/// they take no slots beside the sidecar provider (one slot); the five
+/// stay uncorroborated evidence. A later live publication then settles
+/// through the same stable-ID extension path — the published table
+/// attaches, the rest stay evidence — and upgrades its linkage.
 #[test]
 fn whole_closure_module_settles_live_publication_without_spill() {
     let (mut engine, raw) = spill_history_engine();
-    assert_eq!(engine.plan.uncorroborated_candidates, 0);
-    assert_eq!(engine.discovery.uncorroborated_candidates, 0);
-    assert_eq!(engine.plan.slots.len(), 6);
+    assert_eq!(engine.plan.uncorroborated_candidates, 5);
+    assert_eq!(engine.discovery.uncorroborated_candidates, 5);
+    assert_eq!(engine.plan.slots.len(), 1, "only the sidecar attaches");
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    assert_eq!(engine.plan.slots.len(), 6);
+    // One publication leaves four unresolved tables, at the classifier
+    // cap: the object is no longer a closure array, so the extension
+    // admits it whole beside the sidecar (6 slots).
+    assert_eq!(engine.plan.slots.len(), 6, "sidecar plus now-corroborated module");
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
-        "the live merge settles with no spill"
+        "whole admission leaves no uncorroborated tables"
     );
     assert_eq!(
-        engine.discovery.uncorroborated_candidates, 0,
-        "lifetime evidence carries no spill that never happened"
+        engine.discovery.uncorroborated_candidates, 5,
+        "lifetime evidence retains the earlier unpublished count"
     );
     let current = engine
         .plan

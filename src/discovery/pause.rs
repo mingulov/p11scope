@@ -1766,6 +1766,12 @@ impl PauseCoordinator {
         self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
+        // An engine-incomplete cycle under `auto` is a counted named gap,
+        // not the end of the chain: the cleanup below resumes the child,
+        // so a later loader hit arms and is serviced like any other.
+        let rearm_after_incomplete = !lifecycle
+            && self.policy == PausePolicy::Auto
+            && self.pending_diagnostic == Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
         io.note_unconfirmed_cycle();
         if !lifecycle {
             self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
@@ -1875,6 +1881,7 @@ impl PauseCoordinator {
         self.active_deadline = None;
         self.failure_deadline = None;
         self.failure_items = 0;
+        self.rearming_enabled = rearm_after_incomplete;
         self.finish_nonconfirmed(message)
     }
 
@@ -7135,13 +7142,14 @@ mod tests {
             coordinator.rearming_enabled(),
             "an incomplete cycle must not retire the pause chain"
         );
+        io.fallback_now = 15;
         assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
 
         io.required_complete = true;
         io.apply_outcome_diagnostic = None;
         io.authorization = Some(PAUSE_REQUESTED);
         io.queue
-            .push_back(Ok(Some(DiscoveryItem::Record(record(20, 0, false)))));
+            .push_back(Ok(Some(DiscoveryItem::Record(record(18, 0, false)))));
         coordinator.service(&mut io).unwrap();
 
         assert_eq!(

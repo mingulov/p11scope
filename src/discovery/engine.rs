@@ -30229,6 +30229,26 @@ impl Engine {
     }
 
     /// Batch-tail publications executed vs skipped as provably redundant.
+    /// Current scan-discovered modules reconciled against the
+    /// aggregated per-view pins (DEMO-4 scan mint). `self.modules`
+    /// is the creation-time snapshot `rebuild_discovered` froze;
+    /// in a live `--system` capture it stays empty while passes
+    /// maintain `scan_inputs`, so consumers that need *current*
+    /// scanned tables read them here, through the same
+    /// aggregation + overlay canonicalization + binding steps
+    /// `rebuild_discovered` uses.
+    pub(crate) fn scan_reconciled_snapshot(&self) -> (Vec<ReconciledModule>, PinnedObjects) {
+        let mut scan_modules = Vec::new();
+        for input in self.scan_inputs.values() {
+            scan_modules.extend(input.modules.clone());
+        }
+        let (mut pinned, _aggregation_skips) =
+            PinnedObjects::aggregate_views(self.scan_inputs.values().map(|input| &input.pins));
+        let _ = canonicalize_scanned_overlays(&mut pinned);
+        let (modules, _binding_skips) = bind_scanned_modules(&scan_modules, &mut pinned);
+        (modules, pinned)
+    }
+
     pub(crate) fn tail_stats(&self) -> (u64, u64) {
         (self.tail_publishes, self.tail_skips)
     }

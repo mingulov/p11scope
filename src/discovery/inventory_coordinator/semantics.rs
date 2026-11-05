@@ -360,6 +360,11 @@ struct AcceptedRetainedInputs {
     accepted: BTreeSet<PinnedObjectId>,
     refusals: Vec<SemanticRefusal>,
     requested: bool,
+    /// DEMO-4 scan mint only: modules reconciled from the current
+    /// per-view scan inputs, replacing the creation-time
+    /// `engine.modules` snapshot (empty in live `--system`
+    /// captures) as the subset's source set.
+    scan_modules: Option<Vec<ReconciledModule>>,
 }
 
 fn accept_retained_inputs(
@@ -434,14 +439,29 @@ fn accept_retained_inputs(
             Err(_) => refusals.push(SemanticRefusal::ManifestInput),
         }
     }
-    // DEMO-4 scan seed: with no manifest requested, every pinned
-    // scan-discovered provider is a candidate; completeness in
+    // DEMO-4 scan seed: with no manifest requested, every provider
+    // in the *current* scan inputs is a candidate; completeness in
     // `build_subset_from_accepted` still decides which ones mint.
+    // The creation-time `engine.modules` snapshot is empty in live
+    // `--system` captures, so the modules and their pins come from
+    // the engine's current scan snapshot (falling back to the
+    // snapshot modules already retained when no scan input exists,
+    // as in unit fixtures).
+    let mut scan_modules = None;
     if seed_scan && !inputs.requested {
-        for module in &engine.modules {
-            if pins.file_for(module.object).is_some() {
+        let (modules, scan_pins) = engine.scan_reconciled_snapshot();
+        if modules.is_empty() {
+            for module in &engine.modules {
+                if pins.file_for(module.object).is_some() {
+                    accepted.insert(module.object);
+                }
+            }
+        } else {
+            for module in &modules {
                 accepted.insert(module.object);
             }
+            pins = scan_pins;
+            scan_modules = Some(modules);
         }
     }
     AcceptedRetainedInputs {
@@ -450,6 +470,7 @@ fn accept_retained_inputs(
         accepted,
         refusals,
         requested: inputs.requested,
+        scan_modules,
     }
 }
 
@@ -472,7 +493,15 @@ fn build_subset_from_accepted(
         accepted,
         mut refusals,
         requested,
+        scan_modules,
     } = accepted;
+    // The scan mint builds over the current scan-input modules
+    // when it seeded them; every other mint keeps the retained
+    // creation-time snapshot.
+    let source_modules: &[ReconciledModule] = match &scan_modules {
+        Some(modules) => modules,
+        None => &engine.modules,
+    };
     if accepted.is_empty() {
         // The scan mint retries per discovery pass: no provider
         // discovered yet is quiet, never a per-pass refusal.
@@ -486,8 +515,8 @@ fn build_subset_from_accepted(
     }
     let (claims, plan) = if scan_authorized {
         (
-            plan::semantic_source_claims_scan_authorized(&engine.modules, &manifests, &pins),
-            plan::build_from_sources_scan_authorized(&engine.modules, &manifests, &pins),
+            plan::semantic_source_claims_scan_authorized(source_modules, &manifests, &pins),
+            plan::build_from_sources_scan_authorized(source_modules, &manifests, &pins),
         )
     } else {
         (

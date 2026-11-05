@@ -734,8 +734,18 @@ fn native_semantic_scan_subset_mints_from_current_scan_inputs() {
     use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
     let fixture = ProviderFixture::new();
     let scan = fixture.source(["C_SignInit", "C_Sign"]);
+    // Real scan-style pins for the scanned module, exactly as a
+    // pass's scan_and_pin retains them (manifest pins bind under a
+    // different raw instance and cannot stand in here).
+    let (scan_pins, skipped) = crate::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        std::slice::from_ref(&scan.scanned),
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
     let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
-    engine.seed_scan_input_for_test(vec![scan.scanned.clone()], fixture.pins.clone());
+    engine.seed_scan_input_for_test(vec![scan.scanned.clone()], scan_pins);
     let prepared = prepare_scan_attested_subset(&engine);
     let subset = prepared
         .subset

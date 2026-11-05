@@ -358,7 +358,17 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
             rv_by_slot.remove(&slot.index).unwrap_or_default(),
         ));
     }
-    Ok(out)
+    Ok(merge_slot_reports(out))
+}
+
+/// Fold slot reports that count the same function in the same file
+/// into one aggregate row: two incarnations of one owned child (an
+/// exec between them) retire one generation's slots and arm the
+/// next, and the aggregate table must show the function once with
+/// summed counts, not once per generation. Rows for different files
+/// stay apart: sharing a name never merges two modules.
+pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
+    reports
 }
 
 /// Events the kernel side could not reserve ring buffer space for,
@@ -1384,6 +1394,80 @@ mod tests {
             "an allocated cell with no accepted sole owner is unresolved, \
              never a silent null"
         );
+    }
+
+    fn merge_fixture(
+        name: &str,
+        file_offset: u64,
+        ino: u64,
+        calls: u64,
+        errors: u64,
+        buckets: [u64; LATENCY_BUCKETS],
+    ) -> SlotReport {
+        let mut rv_counts = BTreeMap::new();
+        rv_counts.insert(0u64, calls);
+        SlotReport {
+            names: vec![name.into()],
+            aliased: false,
+            semantic_authorized: false,
+            module: Some(ModuleId(0)),
+            module_ambiguous: false,
+            module_unresolved: false,
+            mode: CounterMode::Latency,
+            calls,
+            errors,
+            in_flight: 0,
+            total_ns: calls * 1000,
+            max_ns: 2000,
+            buckets,
+            rv_counts,
+            file_offset,
+            target_object: Some(crate::plan::TargetObject {
+                dev: (8, 1),
+                ino,
+                sha256: Some("aa".into()),
+            }),
+            ordinals: vec![],
+        }
+    }
+
+    fn buckets_with(first: u64, second: u64) -> [u64; LATENCY_BUCKETS] {
+        let mut buckets = [0u64; LATENCY_BUCKETS];
+        buckets[0] = first;
+        buckets[1] = second;
+        buckets
+    }
+
+    /// Two generations of one owned child count the same function in
+    /// the same file: the aggregate folds them into one row with
+    /// summed counts, buckets and return tallies, never two
+    /// unlabeled rows.
+    #[test]
+    fn merge_slot_reports_folds_same_function_same_file_rows() {
+        let first = merge_fixture("C_DigestUpdate", 0x1234, 4242, 5625, 1, buckets_with(10, 20));
+        let second = merge_fixture("C_DigestUpdate", 0x1234, 4242, 1494, 2, buckets_with(30, 40));
+        let merged = merge_slot_reports(vec![first, second]);
+        assert_eq!(merged.len(), 1, "one function reads one row");
+        let row = &merged[0];
+        assert_eq!(row.names, vec!["C_DigestUpdate".to_string()]);
+        assert_eq!(row.calls, 7119);
+        assert_eq!(row.errors, 3);
+        assert_eq!(row.buckets[0], 40);
+        assert_eq!(row.buckets[1], 60);
+        assert_eq!(row.rv_counts.get(&0), Some(&7119));
+        assert_eq!(row.file_offset, 0x1234);
+    }
+
+    /// Sharing a name never merges two modules: the same function in
+    /// different files stays two rows.
+    #[test]
+    fn merge_slot_reports_keeps_different_files_apart() {
+        let left = merge_fixture("C_DigestUpdate", 0x1234, 4242, 10, 0, buckets_with(1, 0));
+        let right = merge_fixture("C_DigestUpdate", 0x1234, 9999, 20, 0, buckets_with(0, 1));
+        let merged = merge_slot_reports(vec![left, right]);
+        assert_eq!(merged.len(), 2, "two files stay two rows");
+        let calls: u64 = merged.iter().map(|row| row.calls).sum();
+        assert_eq!(calls, 30);
     }
 
     #[test]

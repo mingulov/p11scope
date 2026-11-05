@@ -7330,6 +7330,22 @@ fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
     })
 }
 
+/// Whether a count-only seed with no plan owner is terminal for this
+/// pause cycle. A module admitted only through tables it later publishes
+/// has no plan owner until then, by construction: its gap is already named
+/// in the candidate, and its export hooks still attach below, so a later
+/// return can publish it. Its seed is terminal for this cycle, not
+/// incomplete work.
+fn seed_without_owner_is_terminal(candidate: &LiveCandidate, seed: &CountOnlySeedWork) -> bool {
+    candidate.modules.iter().any(|scanned| {
+        scanned.object == seed.object
+            && candidate.plan.modules_skipped.iter().any(|skipped| {
+                (skipped.subject == scanned.scanned.path || skipped.subject == seed.object_path)
+                    && plan::is_closure_awaiting_publication(&skipped.reason)
+            })
+    })
+}
+
 /// The `discovery[]` record: what was found, where it was found, and how well
 /// the two sources agreed. Identity is `{dev, ino, sha256}` — a path here is
 /// only the label the source that saw it used, and for anything the scan found
@@ -16894,20 +16910,7 @@ impl Engine {
                 .iter()
                 .filter(|module| module.object == seed.object);
             let Some(module) = owners.next() else {
-                // A module admitted only through tables it later publishes
-                // has no plan owner until then, by construction: its gap is
-                // already named in the candidate, and its export hooks
-                // still attach below, so a later return can publish it.
-                // Its seed is terminal for this cycle, not incomplete work.
-                let awaiting_publication = candidate.modules.iter().any(|scanned| {
-                    scanned.object == seed.object
-                        && candidate.plan.modules_skipped.iter().any(|skipped| {
-                            (skipped.subject == scanned.scanned.path
-                                || skipped.subject == seed.object_path)
-                                && plan::is_closure_awaiting_publication(&skipped.reason)
-                        })
-                });
-                if awaiting_publication {
+                if seed_without_owner_is_terminal(&candidate, seed) {
                     continue;
                 }
                 required_seed_complete = false;

@@ -3561,7 +3561,7 @@ impl ClassicDriver<'_> {
         if let Some(trip) = lane.joint_finish_no_progress_trip() {
             // Staged calls left unsealed across the trip count
             // once as `watchdog_no_progress` at publication.
-            coordinator.registry_mut().note_joint_watchdog_trip();
+            coordinator.note_joint_watchdog_trip();
             warn.emit(&format!(
                 "joint finish made no progress for {}s across {} polls; the lane is held for exit",
                 trip.stalled.as_secs(),
@@ -3590,7 +3590,7 @@ impl ClassicDriver<'_> {
         if running_trip.is_some() {
             // Same watchdog count for a running (audit) trip: the
             // lane stops, so its staged calls never seal.
-            coordinator.registry_mut().note_joint_watchdog_trip();
+            coordinator.note_joint_watchdog_trip();
         }
         let abandoned = publication_stood && !coordinator.publication_pending();
         if let Some(line) = Self::held_live_publication_line(

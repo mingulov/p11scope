@@ -2074,6 +2074,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Note the no-progress watchdog trip on every retained Joint
+    /// feed, so staged calls left unsealed count once as
+    /// `watchdog_no_progress` in the next publication.
+    pub(crate) fn note_joint_watchdog_trip(&mut self) {
+        self.registry.note_joint_watchdog_trip();
+    }
+
     /// Observe the actual engine tail attempts without adding counters or
     /// changing the publication path.
     #[cfg(test)]

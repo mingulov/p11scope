@@ -443,7 +443,7 @@ usage:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers. --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots. A full path excludes exactly that file by identity; a bare name excludes every file with that basename or ELF soname. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is corroborated against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and pre-arms its proved offsets. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+scan-only discovery is semantics-unverified and count-only; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach. Inventory rescans in passes; a process that starts after its last pass is reported, not scanned.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
 selects what run may do to its own child while it observes loading: never (default) touches
 nothing, auto only when the child would otherwise load unobserved, always on every load.
@@ -4552,11 +4552,12 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 9837 / 0xcea2c312cf4e75b8 (inventory `--quiet`): USAGE diff vs
-        // the 9807/0xdce0388309268c5c pin is exactly the +30 `[--quiet]`
-        // synopsis insertions (3 sites: inventory x3); no other drift.
-        assert_eq!(USAGE.len(), 9837);
-        assert_eq!(hash, 0xcea2c312cf4e75b8);
+        // 9934 / 0x99bf35fea86eb91f (late-process bound): USAGE diff vs
+        // the 9837/0xcea2c312cf4e75b8 pin is exactly the +97 scan-promise
+        // qualification (inventory rescans in passes; post-last-pass
+        // starters are reported, not scanned); no other drift.
+        assert_eq!(USAGE.len(), 9934);
+        assert_eq!(hash, 0x99bf35fea86eb91f);
         assert_eq!(HelpTopic::Global.text(), USAGE);
     }
 

@@ -8323,10 +8323,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !self.completed_scan_pass || pending.is_empty() {
             return;
         }
+        // Name the unscanned processes, not just their count; the
+        // list is bounded so a fork storm cannot flood the report.
+        const PIDS_SHOWN: usize = 10;
+        let listed: Vec<String> = pending
+            .iter()
+            .take(PIDS_SHOWN)
+            .map(|pid| pid.to_string())
+            .collect();
+        let mut pids = format!("pids {}", listed.join(", "));
+        if pending.len() > PIDS_SHOWN {
+            pids.push_str(&format!(", and {} more", pending.len() - PIDS_SHOWN));
+        }
         self.note_scope_gap(
             "discovery coverage ended before stop".into(),
             format!(
-                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown",
+                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown ({pids})",
                 pending.len()
             ),
         );

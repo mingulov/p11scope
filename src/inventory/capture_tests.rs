@@ -7212,14 +7212,19 @@ mod publication_progress_tests {
 
         const POST_PASS_GAP_SUBJECT: &str = "discovery coverage ended before stop";
 
-        fn post_pass_gap_reason(newcomers: usize) -> String {
+        fn post_pass_gap_reason(pids: &[u32]) -> String {
             format!(
-                "{newcomers} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown"
+                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown (pids {})",
+                pids.len(),
+                pids.iter()
+                    .map(|pid| pid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
 
-        fn has_post_pass_gap(scene: &Scene, newcomers: usize) -> bool {
-            let reason = post_pass_gap_reason(newcomers);
+        fn has_post_pass_gap(scene: &Scene, pids: &[u32]) -> bool {
+            let reason = post_pass_gap_reason(pids);
             scene
                 .coordinator
                 .registry()
@@ -7530,7 +7535,7 @@ mod publication_progress_tests {
                 "post-pass newcomers are never admitted"
             );
             assert!(
-                has_post_pass_gap(&driver.scene, 2),
+                has_post_pass_gap(&driver.scene, &[9, 10]),
                 "two post-pass EXEC newcomers must mark unknown coverage: {:?}",
                 driver.scene.gap_subjects(),
             );
@@ -7564,6 +7569,40 @@ mod publication_progress_tests {
             assert!(
                 reason.contains("pids 9, 10"),
                 "the gap must name the unscanned pids, got: {reason}"
+            );
+        }
+
+        // The pid list is bounded: twelve newcomers name ten and count
+        // the rest, so a fork storm cannot flood the report.
+        #[test]
+        fn post_pass_exec_newcomers_bound_a_long_pid_list() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back((20..32).collect::<Vec<u32>>());
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("twelve post-pass EXEC newcomers must mark unknown coverage");
+            assert!(
+                reason.starts_with("12 process(es)"),
+                "the count stays exact, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, and 2 more"),
+                "the list names ten and counts the rest, got: {reason}"
             );
         }
 
@@ -7613,7 +7652,7 @@ mod publication_progress_tests {
                 "the discarded pass never admits its joiner"
             );
             assert!(
-                has_post_pass_gap(&driver.scene, 1),
+                has_post_pass_gap(&driver.scene, &[8]),
                 "a provider-free post-pass newcomer must mark unknown coverage: {:?}",
                 driver.scene.gap_subjects(),
             );

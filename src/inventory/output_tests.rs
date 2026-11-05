@@ -230,6 +230,10 @@ fn stalled_document_counts_exact_prefix() {
     assert_eq!(failure.total - failure.accepted, 61440);
     assert!(start.elapsed() >= SHORT_IDLE && start.elapsed() < Duration::from_secs(2));
     drop(writer);
+    // The stall was detected on a nonblocking pipe; the drain below expects
+    // the exact prefix plus EOF, so it runs blocking. A nonblocking drain
+    // flakes with WouldBlock under load instead of the proven bytes.
+    blocking(reader.as_raw_fd());
     let mut drained = Vec::new();
     reader.read_to_end(&mut drained).unwrap();
     assert_eq!(drained.len(), failure.accepted);

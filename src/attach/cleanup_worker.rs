@@ -1637,6 +1637,10 @@ mod tests {
                 );
                 drop(payload.take());
                 assert!(closing_guard.upgrade().is_none());
+                // The close above proves EOF; the final read runs blocking so
+                // it observes the proven close instead of flaking WouldBlock
+                // under load on the nonblocking peer.
+                peer.set_nonblocking(false).unwrap();
                 assert_eq!(peer.read(&mut [0u8; 1]).unwrap(), 0);
                 Ok(())
             }),

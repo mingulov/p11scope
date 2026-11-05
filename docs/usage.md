@@ -949,8 +949,8 @@ Limits that matter in pods:
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.
 - `run --kill-on-timeout` — when `--duration` expires, terminate and reap the
-  owned child. Without it the default is to hand a still-running child back
-  and exit 0.
+  owned child, and exit 0. Without it the default is to hand a still-running
+  child back and exit 0.
 - `inspect --json` — print the inspection as JSON instead of the human-readable
   text table. A scan that fails soft (the target changed mid-scan) still
   prints JSON: the success schema with `scan.status` failed and the
@@ -1372,7 +1372,8 @@ changing capture behavior, it joins the table above and the `--help` list.
 ### Exit codes
 
 - `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
-  or when a still-running child is handed back (without `--kill-on-timeout`).
+  when a still-running child is handed back (without `--kill-on-timeout`),
+  or when a requested `--kill-on-timeout` kill reaped the child at timeout.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure

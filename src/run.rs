@@ -3363,6 +3363,11 @@ fn settle_owned_child(
     let child = retained
         .as_mut()
         .context("owned child missing during settlement")?;
+    // A requested timeout kill of a live child is a normal end. Probe
+    // liveness before the reap: a child that already exited keeps its
+    // own status unmarked, and only a signal death counts as our kill.
+    let requested = end == CaptureEnd::DurationExpired && kill_on_timeout;
+    let was_alive = requested && child.still_running();
     let settled: Result<ChildOutcome> =
         if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
             settle_after_signal(child, signals)
@@ -3372,6 +3377,9 @@ fn settle_owned_child(
                 .map(ChildOutcome::Exited)
                 .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
         };
+    if let Ok(ChildOutcome::Exited(code)) = &settled {
+        *requested_kill = was_alive && *code > 128;
+    }
     record_settlement_result(child, settled, exit_code, still_running)
 }
 
@@ -11696,6 +11704,38 @@ mod tests {
         assert!(
             !requested_kill,
             "a child that exited on its own keeps its status unmarked"
+        );
+    }
+
+    /// The run's process exit code: a requested timeout kill and a
+    /// handed-back child are observer success; otherwise the child's
+    /// own status, as a shell would report it.
+    #[test]
+    fn run_exit_code_maps_requested_kills_and_handoffs_to_success() {
+        let outcome =
+            |child_exit_code: Option<i32>, requested_timeout_kill: bool| OwnedRunOutcome {
+                child_exit_code,
+                requested_timeout_kill,
+                child_still_running: child_exit_code.is_none(),
+                child_pid: 4242,
+                evidence: render::tests::evidence(),
+            };
+        assert_eq!(
+            outcome(Some(128 + libc::SIGTERM), true).exit_code(),
+            0,
+            "a requested timeout kill is a normal end"
+        );
+        assert_eq!(
+            outcome(None, false).exit_code(),
+            0,
+            "a handed-back child stays success"
+        );
+        assert_eq!(outcome(Some(0), false).exit_code(), 0);
+        assert_eq!(outcome(Some(1), false).exit_code(), 1);
+        assert_eq!(
+            outcome(Some(128 + libc::SIGTERM), false).exit_code(),
+            128 + libc::SIGTERM,
+            "an unrequested signal death keeps the child's status"
         );
     }
 

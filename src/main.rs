@@ -72,8 +72,9 @@ fn run() -> Result<i32> {
             capture(&a).map(|()| 0)
         }
         // `run` owns its child from fork to reap and reports the status a shell
-        // would. A child deliberately handed back still running is a success
-        // for the observer, so it exits 0.
+        // would. A child deliberately handed back still running, or reaped
+        // by a requested `--kill-on-timeout` kill, is a success for the
+        // observer, so it exits 0.
         Ok(Command::Run(a)) => {
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))

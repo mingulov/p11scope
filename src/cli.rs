@@ -248,6 +248,8 @@ pub struct DoctorArgs {
     pub pid: Option<u32>,
     pub cgroup: Option<PathBuf>,
     pub extra_strict: bool,
+    pub verbose: bool,
+    pub quiet: bool,
 }
 
 /// What `p11scope inventory` observes: one process, a retained cgroup and
@@ -451,16 +453,16 @@ impl HelpTopic {
         }
     }
 
-    pub fn text(self) -> &'static str {
+    pub fn text(self) -> String {
         match self {
-            HelpTopic::Global => USAGE,
-            HelpTopic::Profile => PROFILE_HELP,
-            HelpTopic::Trace => TRACE_HELP,
-            HelpTopic::Run => RUN_HELP,
-            HelpTopic::Inspect => INSPECT_HELP,
-            HelpTopic::Doctor => DOCTOR_HELP,
-            HelpTopic::Inventory => INVENTORY_HELP,
-            HelpTopic::InventoryDiff => INVENTORY_DIFF_HELP,
+            HelpTopic::Global => USAGE.to_string(),
+            HelpTopic::Profile => PROFILE_HELP.to_string(),
+            HelpTopic::Trace => TRACE_HELP.to_string(),
+            HelpTopic::Run => RUN_HELP.to_string(),
+            HelpTopic::Inspect => INSPECT_HELP.to_string(),
+            HelpTopic::Doctor => DOCTOR_HELP.to_string(),
+            HelpTopic::Inventory => inventory_help(),
+            HelpTopic::InventoryDiff => INVENTORY_DIFF_HELP.to_string(),
         }
     }
 }
@@ -490,12 +492,13 @@ impl CliError {
     }
 }
 
-pub const USAGE: &str = "Choose a task:
-  doctor: check observation capability for the requested target.
+pub const USAGE: &str = "p11scope observes PKCS#11 provider use without changing the target.
+
+Choose a task:
+  doctor: check host and target readiness before capture.
   inspect: list mapped providers; mapping is not evidence of calls.
-  profile: summarize aggregate completed calls, return values and latency.
-  profile --mode metrics: collect lighter aggregate counter maps.
-  trace: show completed call events and diagnostic PID/TID.
+  profile: summarize aggregate completed calls and latency.
+  trace: show completed call events.
   run: start and observe your own command after --.
   inventory: separate mapped modules from observed usage entries.
   inventory diff: compare two saved inventory files offline.
@@ -503,98 +506,31 @@ Use p11scope <command> --help for examples and mode-specific guidance.
 
 usage:
   p11scope --version
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
-                   [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
-                   [--unsafe-unvalidated-metadata]
-                   [--allow-uretprobe-on-confined-target]
-                   [--track-short-lived]
-                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
-                   [--attach-backend auto|multi|singles]
-                   [--max-scan-pids <n>]
-                   [-v] [--quiet]
-  p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
-                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
-                   [--attach-backend auto|multi|singles]
-                   [-v] [--quiet]
-  p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
-                   [--attach-backend auto|multi|singles]
-                   [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
-  p11scope inspect --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json]
-                   [-v] [--quiet]
-  p11scope inspect --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--hook-symbol <…>]... [--json] [--max-scan-pids <n>]
-                   [-v] [--quiet]
-  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
-                   [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
-                   [--attach-backend auto|multi|singles] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
-                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
-                   [--attach-backend auto|multi|singles] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
-                   [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
-                   [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
-                   [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
-                   [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
+  p11scope help [command]
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--mode profile|metrics] [--duration <…>] [-o <out.json>] [-v] [--quiet]
+  p11scope trace [--pid <n> | --cgroup <path> | --system] [--duration <…>] [--max-events <n>] [-o <out.file>] [-v] [--quiet]
+  p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [-v] [--quiet] -- CMD [ARGS...]
+  p11scope inspect --pid <n> [--json] [-v] [--quiet]
+  p11scope inspect --system [--json] [-v] [--quiet]
+  p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
+  p11scope inventory --cgroup <path> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
+  p11scope inventory --system [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json]
-  p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
+  p11scope doctor [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
-notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
---module narrows the scan to named providers. --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots. A full path excludes exactly that file by identity; a bare name excludes every file with that basename or ELF soname. --manifest is explicit operator attestation of exact accepted function-name/offset claims; it is checked against the scan when possible.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach. Inventory rescans in passes; a process that starts after its last pass is reported, not scanned (system and pid scopes).
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system. --pause
-selects what run may do to its own child while it observes loading: never (default) touches
-nothing, auto only when the child would otherwise load unobserved, always on every load.
---kill-on-timeout ends the child when --duration expires instead of leaving it running.
---track-short-lived (profile/run, default off) also records short-lived processes (extra detail; off by default): the kernel records
-exec-time executable identity and unmatched exits are grouped by linkage, never moving call or attribution shares.
-Refused beside --counter-mode: it arms Detailed captures only.
-Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
-Live capture requires usable uprobe_multi host capability (normally Linux 6.6+;
-working backports qualify by probe), including with --attach-backend singles.
-Offline inspect/diff and inventory --capture scan do not require live capability.
---attach-backend selects the static probe backend: auto (default) uses one
-multi-uprobe link per attach group wherever a functional probe links one (under
---pid, only where the kernel pid filter covers every thread; the links then name
-the target) and safe per-offset fallback on an eligible host, multi forces multi (under
---pid also a proven pid filter), singles forces per-offset. Dynamic loader and
-export probes always use per-offset links. inventory --attach-backend auto picks multi
-wherever a functional probe links one (under --pid, only where the kernel pid filter covers every thread).
-inventory --identity-backend selects the system sweep identity proof backend: auto (default)
-defers any identity load until the first nonempty proof plan, userspace never loads identity
-BPF, kernel validates numbering/BTF, strict load and functional probe before capture starts
-(system scope only; explicit use under --pid/--cgroup is refused).
---mode defaults to profile; --mode metrics is the lighter maps-only level. Ctrl-C or SIGTERM
-ends a capture cleanly (final frame printed, -o written). --cgroup matches that cgroup and
-every descendant. --system requests whole-machine capture with
-no cgroup path. Aggregate across the selected scope; counts are not per application.
-Inventory usage entries and trace completed events have separate attribution rules.
---counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
-counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
-Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop helper support, on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
---select-endpoint <FUNCTION> names one endpoint for full detail while aggregate counters continue; it requires --mode metrics
-with --counter-mode on profile or run. The name must match exactly one watched function (narrow with --module if it matches several);
-it resolves once at start, and a provider loaded after start needs --prearm-module <provider.so> (with run, usually required). An unknown or ambiguous name refuses by name and the
-capture continues aggregate-only. The detail is the function's own counter values between selection and close; if the
-watched process replaces itself (exec) in between, the detail is withheld with a named reason, a leader exit that is the
-last lifecycle record ends the window cleanly, and --cgroup/--system refuse the selection by name (no single process to detail).
-The selection attempt is recorded in the report; aggregate and detail counts are never summed.
-Provider identity is pinned by SHA-256 at attach and
-checked for in-place change during capture (evidence.provider_changed).
-trace without --max-events still stops at a 10,000,000-event default cap; the TRUNCATED line cites the effective cap.
-Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail (every gap and reason, per-function data, timing) plus informational stderr notes; --quiet prints only the summary head. --json and -o are always complete.
-Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT=1 enables experiment-only broad provider admission (anything else keeps the narrow default).
-P11SCOPE_LOADER_ENV_SANITIZED is the offline discover helper's loader-environment marker (forged values are rejected).
-capture evidence records the active value of each (evidence.p11scope_env); docs/usage.md documents every P11SCOPE_* input.
+discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
+Live capture needs root; inspect, inventory diff and inventory --capture scan do not.
+Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head. --json and -o are always complete.
+--help and --version also answer to -h and -V.
+Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
+
+examples:
+  sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
+  sudo p11scope profile --pid 4242 --duration 30s -o profile.json
+  sudo p11scope inventory --system --duration 30s
+
+exit codes: 0 ok; 1 the command failed; 2 wrong arguments. run exits with its command's status.
 ";
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
@@ -616,24 +552,32 @@ examples (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
---manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
+--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
+counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
+Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop helper support, on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
 detail while aggregate counters continue; the name must match exactly one watched function (narrow with --module if it matches several), once at
 start (a provider loaded after start needs --prearm-module <provider.so>). The detail is the function's
 own counter values between selection and close; an exec of the watched process in between withholds it with a named
 reason, a leader exit that is the last lifecycle record ends the window cleanly, and
 --cgroup/--system refuse by name.
+The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
---track-short-lived (default off) also records short-lived processes (extra detail; off by default): the kernel records exec-time
+--track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
 executable identity and unmatched exits are grouped by linkage.
 Refused beside --counter-mode: it arms Detailed captures only.
 Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
+--attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
+Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions.
+exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
 ";
 
 /// `p11scope trace --help`: scoped syntax, examples and evidence limits.
@@ -649,48 +593,58 @@ example (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
---manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
+--attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
+Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Without --max-events, trace stops at a 10,000,000-event default cap; TRUNCATED names the effective cap.
 -o copies the trace to a file; -o - uses stdout only.
+Ctrl-C or SIGTERM ends capture cleanly.
 Trace events print the same at every verbosity; -v, --verbose additionally shows informational stderr notes (discovery, timing).
+exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong arguments.
 ";
 
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--track-short-lived]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
 
-example (replace the example program path with your command):
-  p11scope run --trace -- /absolute/path/to/program
+example:
+  sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
---manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation.
+--manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available.
+scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
+--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
+counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
+Omit --counter-mode to keep existing metrics behavior. Selections can refuse with a named reason, including on kernels without bpf_loop helper support, on builds without counter objects, past the mode's endpoint ceiling, and where the kernel verifier rejects the counter programs.
 --select-endpoint <FUNCTION> with --mode metrics and --counter-mode names one endpoint for full
 detail while aggregate counters continue; the name must match exactly one watched function (narrow with --module if it matches several), once at
 start (a provider loaded after start needs --prearm-module <provider.so>; with run it is usually
 required). The detail is the function's own counter values between selection and close; an exec of the owned child in between withholds it with a named reason
 while a leader exit that is the last lifecycle record ends the window cleanly.
+The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
---track-short-lived (default off) also records short-lived processes (extra detail; off by default): the kernel records exec-time
-executable identity and unmatched exits are grouped by linkage.
-Refused beside --counter-mode: it arms Detailed captures only.
-Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
+--attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
+Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
+Ctrl-C or SIGTERM ends the capture cleanly.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
+exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
 ";
 
 /// `p11scope inspect --help`: scoped syntax, examples and evidence limits.
@@ -709,23 +663,28 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
 Choose --pid or --system. --json preserves the same discovery facts for scripts.
 Unreadable or unexamined identities remain unknown.
+Inspect reads mappings without live capture and needs no BPF capability.
 Default text output is concise: the mapped providers, one coverage line, and a hint. -v, --verbose shows every gap and reason with per-table data. --quiet prints only the summary head.
+exit codes: 0 ok (partial results still exit 0); 1 the target could not be read; 2 wrong arguments.
 ";
 
 /// `p11scope doctor --help`: scoped syntax, examples and evidence limits.
 const DOCTOR_HELP: &str = "usage:
-  p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict]
+  p11scope doctor  [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope doctor --pid 4242
 
 Check host and requested-target capability before capture.
 Without --pid or --cgroup, target readiness is unassessed.
+Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+); this command only checks.
 --extra-strict also treats warnings as failure; see docs/usage.md for privilege requirements.
+Default text output is concise: the verdict, the failing and warning rows, and the next step. -v, --verbose shows every row; --quiet prints only the Doctor line.
+exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--extra-strict: any warning fails too); 2 wrong arguments.
 ";
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
-const INVENTORY_HELP: &str = "usage:
+const INVENTORY_HELP_HEAD: &str = "usage:
   p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
@@ -749,21 +708,35 @@ const INVENTORY_HELP: &str = "usage:
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
   p11scope inventory --cgroup <path> --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
-  p11scope inventory --system --capture native --duration 30s --diagnostics inventory-debug.jsonl --diagnostics-pid 4242 -o inventory.json
+  sudo p11scope inventory --system --duration 30s
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 Choose exactly one of --pid, --cgroup, or --system; --cgroup includes descendants.
-Quiet cgroup usage remains unknown: endpoint samples do not prove continuous membership.
+Idle cgroup usage remains unknown: endpoint samples do not prove continuous membership.
 Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, not the cgroup tree.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
---prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads through the inventory lane, with one interval row per input in `prearm[]`; requires auto or native.
+--prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads through the inventory lane, with one interval row per input; requires auto or native.
 --key-operations also tracks which key each operation used (needs --capture auto or native; start the observer before the application for best coverage). Without it you still get per-provider function and mechanism counts.
 Per-key results appear under object_observations in --json and in the key operations: line.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
---max-endpoints selects capture-lifetime physical endpoint IDs: 1..=131072, default 32768; unloading does not refund IDs.
---capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+";
+
+/// The `--max-endpoints` line carries the live budget constants, never a
+/// hard-coded copy: the numbers below follow
+/// [`crate::capacity::DEFAULT_INVENTORY_ENDPOINT_LIMIT`] and
+/// [`crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT`].
+fn inventory_max_endpoints_line() -> String {
+    format!(
+        "--max-endpoints selects capture-lifetime physical endpoint IDs: 1–{}, default {}; unloading does not refund IDs.\n",
+        crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT,
+        crate::capacity::DEFAULT_INVENTORY_ENDPOINT_LIMIT,
+    )
+}
+
+const INVENTORY_HELP_TAIL: &str = "--capture scan disables usage BPF and leaves usage unknown. auto prefers native and reports fallback gaps; native fails if unavailable.
+Inventory rescans in passes; a process that starts after its last pass is reported, not scanned (system and pid scopes).
 System inventory selects its identity backend separately; --identity-backend auto may load identity BPF even with --capture scan.
 For system inventory that loads no BPF, use: p11scope inventory --system --capture scan --identity-backend userspace
 --identity-backend selects the system sweep identity proof backend: auto (default) defers any
@@ -777,7 +750,19 @@ Default text output is concise: the summary head plus the limits line. -v, --ver
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
 A missing observation or incomplete retained history does not establish zero activity.
 Compare saved files offline with inventory diff; see docs/usage.md.
+--attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
+Live capture (auto/native) needs root and usable uprobe_multi host capability (normally Linux 6.6+); --capture scan does not.
+exit codes: 0 ok (partial results still exit 0); 1 nothing could be observed; 2 wrong arguments.
 ";
+
+/// The assembled inventory help: head, the live `--max-endpoints` line,
+/// and tail.
+fn inventory_help() -> String {
+    format!(
+        "{INVENTORY_HELP_HEAD}{}{INVENTORY_HELP_TAIL}",
+        inventory_max_endpoints_line()
+    )
+}
 
 /// Offline diff help is separate from capture scope and privileges.
 const INVENTORY_DIFF_HELP: &str = "usage:
@@ -787,7 +772,7 @@ Compare saved p11scope/inventory/v1 files offline, without privileges.
 Default stdout is readable text; --json writes one inventory-diff/v1 JSON document.
 -o saves the same JSON atomically before stdout. Use -- before dash-prefixed inputs.
 Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
-Differences and unknown evidence exit 0; input/output failures exit 1; usage exits 2.
+exit codes: differences and unknown evidence exit 0; input/output failures exit 1; usage exits 2.
 Counts describe independent windows; absence does not prove removal.
 Per input: 64 MiB read, 250,000 rows, 16,384 decoded bytes per string/key,
 nesting depth 64, and 2,000,000 JSON values plus object keys.
@@ -1356,9 +1341,38 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
             "`p11scope discover` was removed: run `p11scope-discover --module <provider.so> \
              -o <manifest.json>` (offline helper; executes provider code)",
         )),
+        Some("help") => Err(parse_help_topic(argv)),
         Some(other) => Err(usage_err(format!("unknown subcommand: {other}"))),
-        None => Err(usage_err("missing subcommand")),
+        None => Err(CliError::Help(HelpTopic::Global)),
     }
+}
+
+/// `p11scope help [topic]`: the task list, or one command's scoped help.
+/// Pure like `parse`: an unknown topic is a usage error, never a panic.
+fn parse_help_topic(argv: impl Iterator<Item = OsString>) -> CliError {
+    let words: Vec<String> = argv.map(|arg| word(&arg).into_owned()).collect();
+    let topic = match words
+        .iter()
+        .map(String::as_str)
+        .collect::<Vec<_>>()
+        .as_slice()
+    {
+        [] | ["--help"] | ["-h"] => HelpTopic::Global,
+        ["profile"] => HelpTopic::Profile,
+        ["trace"] => HelpTopic::Trace,
+        ["run"] => HelpTopic::Run,
+        ["inspect"] => HelpTopic::Inspect,
+        ["doctor"] => HelpTopic::Doctor,
+        ["inventory"] => HelpTopic::Inventory,
+        ["inventory", "diff"] => HelpTopic::InventoryDiff,
+        [unknown] => {
+            return usage_err(format!("unknown help topic: {unknown}"));
+        }
+        [_, _, ..] => {
+            return usage_err("help takes one topic (`help inventory diff` for diff)");
+        }
+    };
+    CliError::Help(topic)
 }
 
 /// `p11scope inspect`: one target or the whole machine, discovery options
@@ -1828,6 +1842,8 @@ fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, 
         pid: None,
         cgroup: None,
         extra_strict: false,
+        verbose: false,
+        quiet: false,
     };
     while let Some(a) = args.next() {
         match word(&a).as_ref() {
@@ -1845,21 +1861,24 @@ fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, 
                 doctor.cgroup = Some(require_path(&mut args, "--cgroup")?);
             }
             "--extra-strict" => doctor.extra_strict = true,
+            "-v" | "--verbose" => doctor.verbose = true,
+            "--quiet" => doctor.quiet = true,
             "--module" => {
                 return Err(usage_err(
                     "doctor --module is not supported; use inspect --pid <n> --module \
-                     <provider.so> for module-specific discovery",
+                     <provider.so> to list mapped providers",
                 ));
             }
             "--system" => {
                 return Err(usage_err(
-                    "doctor --system is not supported; doctor checks this host \
-                     and takes no capture scope",
+                    "doctor --system is not supported; use --pid <n> or --cgroup <path> \
+                     to check a target",
                 ));
             }
             other => return Err(unknown_arg(other)),
         }
     }
+    TextVerbosity::resolve(doctor.verbose, doctor.quiet)?;
     Ok(doctor)
 }
 
@@ -2003,6 +2022,15 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         }
     }
 
+    // Beside an owned run the flag records nothing (6.14 Option B
+    // authorizes it only on Detailed profile --cgroup/--system
+    // captures), so taking it silently would lie about coverage.
+    if common.track_short_lived {
+        return Err(usage_err(
+            "--track-short-lived records nothing beside run; remove it \
+             (it arms only Detailed profile --cgroup/--system captures)",
+        ));
+    }
     // No `--`, nothing after it, and an empty program name are the same
     // refusal: there is no command for this observer to start and own.
     if command.first().is_none_or(|program| program.is_empty()) {
@@ -2091,11 +2119,11 @@ pub fn parse_duration(s: &str) -> Result<Duration, String> {
         _ => (s, 1u64),
     };
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return Err(format!("invalid duration {s:?}"));
+        return Err(format!("invalid duration {s:?} (use 30, 30s, 5m or 1h)"));
     }
     let secs: u64 = digits
         .parse()
-        .map_err(|_| format!("invalid duration {s:?}"))?;
+        .map_err(|_| format!("invalid duration {s:?} (use 30, 30s, 5m or 1h)"))?;
     let secs = secs
         .checked_mul(mult)
         .ok_or_else(|| format!("duration {s:?} overflows"))?;
@@ -2184,12 +2212,15 @@ mod tests {
             panic!("profile --track-short-lived must parse");
         };
         assert!(armed.track_short_lived);
-        let Command::Run(run_armed) =
-            parse(args(&["run", "--track-short-lived", "--", "true"])).unwrap()
+        // Beside an owned run the flag records nothing, so run refuses
+        // it with a message instead of taking it silently.
+        let Err(CliError::Usage { message, topic }) =
+            parse(args(&["run", "--track-short-lived", "--", "true"]))
         else {
-            panic!("run --track-short-lived must parse");
+            panic!("run --track-short-lived must be refused");
         };
-        assert!(run_armed.track_short_lived);
+        assert!(message.contains("--track-short-lived"), "{message}");
+        assert_eq!(topic, HelpTopic::Run);
         let Command::Run(run_plain) = parse(args(&["run", "--", "true"])).unwrap() else {
             panic!("run must parse");
         };
@@ -2266,9 +2297,10 @@ mod tests {
         let help = HelpTopic::Inventory.text();
         assert!(help.contains("--cgroup <path>"), "{help}");
         assert!(help.contains("descendants"), "{help}");
+        assert!(help.contains("Idle cgroup usage remains unknown"), "{help}");
         assert!(
-            help.contains("Quiet cgroup usage remains unknown"),
-            "{help}"
+            !help.contains("Quiet cgroup"),
+            "cgroup idleness must not read as --quiet: {help}"
         );
     }
 
@@ -2662,8 +2694,19 @@ mod tests {
             parse(args(&["run", "--max-endpoints", "8192", "--", "/bin/true"])),
             Err(CliError::Usage { message, .. }) if message.contains("--max-endpoints")
         ));
-        assert!(INVENTORY_HELP.contains("[--max-endpoints <n>]"));
-        assert!(INVENTORY_HELP.contains("1..=131072") && INVENTORY_HELP.contains("32768"));
+        let help = HelpTopic::Inventory.text();
+        assert!(help.contains("[--max-endpoints <n>]"), "{help}");
+        // The line carries the live budget constants, never a hard-coded
+        // copy, so a limit change moves the help with it.
+        assert!(
+            help.contains(&format!(
+                "1–{}, default {}",
+                crate::capacity::MAX_INVENTORY_ENDPOINT_LIMIT,
+                crate::capacity::DEFAULT_INVENTORY_ENDPOINT_LIMIT
+            )),
+            "{help}"
+        );
+        assert!(!help.contains("1..=8192"), "{help}");
     }
 
     #[test]
@@ -2683,8 +2726,9 @@ mod tests {
             Err(CliError::Usage { message, .. })
                 if message.contains("--max-endpoints") && message.contains("1..=131072")
         ));
+        let help = HelpTopic::Inventory.text();
         assert!(
-            INVENTORY_HELP.contains("1..=131072") && INVENTORY_HELP.contains("32768"),
+            help.contains("1–131072") && help.contains("32768"),
             "help must name the raised policy"
         );
     }
@@ -2779,20 +2823,21 @@ mod tests {
         ));
     }
 
-    /// The global scan promise bounds its late edge: inventory
+    /// The inventory scan promise bounds its late edge: inventory
     /// rescans in passes, and a process that starts after its last
     /// pass is reported, not scanned. The promise names its scopes:
     /// cgroup coverage is transactional, not pass-based, so the
     /// reported-not-scanned bound holds for system and pid scopes.
     #[test]
-    fn global_help_bounds_late_process_scanning() {
+    fn inventory_help_bounds_late_process_scanning() {
+        let help = HelpTopic::Inventory.text();
         assert!(
-            USAGE.contains("a process that starts after its last pass is reported, not scanned"),
-            "{USAGE}"
+            help.contains("a process that starts after its last pass is reported, not scanned"),
+            "{help:.500}"
         );
         assert!(
-            USAGE.contains("is reported, not scanned (system and pid scopes)"),
-            "the late-process bound must name the scopes it covers: {USAGE}"
+            help.contains("is reported, not scanned (system and pid scopes)"),
+            "the late-process bound must name the scopes it covers: {help:.500}"
         );
     }
 
@@ -2834,8 +2879,8 @@ mod tests {
     /// inventory scope usage line carries it, in global and scoped help alike.
     #[test]
     fn inventory_usage_lines_carry_the_capture_flag() {
-        for text in [USAGE, INVENTORY_HELP] {
-            let blocks = inventory_usage_blocks(text);
+        for text in [USAGE.to_string(), HelpTopic::Inventory.text()] {
+            let blocks = inventory_usage_blocks(&text);
             assert_eq!(blocks.len(), 3, "{text}");
             for prefix in [
                 "  p11scope inventory --pid ",
@@ -3029,20 +3074,22 @@ mod tests {
             ])),
             Err(CliError::Usage { message: m, .. }) if m.contains("given twice")
         ));
-        for help in [USAGE, INVENTORY_HELP] {
-            let blocks = inventory_usage_blocks(help);
-            assert_eq!(blocks.len(), 3);
-            for prefix in [
-                "  p11scope inventory --pid ",
-                "  p11scope inventory --cgroup ",
-                "  p11scope inventory --system ",
-            ] {
-                let block = inventory_usage_block_for(&blocks, prefix);
-                assert!(
-                    block.contains("[--attach-backend auto|multi|singles]"),
-                    "{block}"
-                );
-            }
+        // Global help shows one short line per scope; the scoped help
+        // carries the full per-scope synopsis.
+        let global_blocks = inventory_usage_blocks(USAGE);
+        assert_eq!(global_blocks.len(), 3, "{USAGE}");
+        let scoped_blocks = inventory_usage_blocks(&HelpTopic::Inventory.text());
+        assert_eq!(scoped_blocks.len(), 3);
+        for prefix in [
+            "  p11scope inventory --pid ",
+            "  p11scope inventory --cgroup ",
+            "  p11scope inventory --system ",
+        ] {
+            let block = inventory_usage_block_for(&scoped_blocks, prefix);
+            assert!(
+                block.contains("[--attach-backend auto|multi|singles]"),
+                "{block}"
+            );
         }
     }
 
@@ -3514,6 +3561,7 @@ mod tests {
             HelpTopic::Trace,
             HelpTopic::Run,
             HelpTopic::Inspect,
+            HelpTopic::Doctor,
             HelpTopic::Inventory,
         ] {
             let help = topic.text();
@@ -3561,17 +3609,19 @@ mod tests {
 
     #[test]
     fn inventory_diagnostics_help_names_options_and_limits_scope() {
-        for text in [USAGE, INVENTORY_HELP] {
-            for block in inventory_usage_blocks(text) {
-                assert!(
-                    block.contains("[--diagnostics <f.jsonl> [--diagnostics-pid <n>]]"),
-                    "{block}"
-                );
-            }
+        // Global help shows one short line per scope; the full synopsis
+        // lives in the scoped help.
+        assert_eq!(inventory_usage_blocks(USAGE).len(), 3, "{USAGE}");
+        let help = HelpTopic::Inventory.text();
+        for block in inventory_usage_blocks(&help) {
+            assert!(
+                block.contains("[--diagnostics <f.jsonl> [--diagnostics-pid <n>]]"),
+                "{block}"
+            );
         }
-        assert!(INVENTORY_HELP.contains("without changing capture scope"));
-        assert!(INVENTORY_HELP.contains("auto or native"));
-        assert!(INVENTORY_HELP.contains("after capture stops"));
+        assert!(help.contains("without changing capture scope"), "{help}");
+        assert!(help.contains("auto or native"), "{help}");
+        assert!(help.contains("after capture stops"), "{help}");
         assert!(!INVENTORY_DIFF_HELP.contains("--diagnostics"));
     }
 
@@ -3981,10 +4031,16 @@ mod tests {
             parse(args(&["profile", "--pid", "42", "--max-scan-pids", "0"])),
             Err(CliError::Usage { message: m, .. }) if m.contains("must be greater than zero")
         ));
-        assert!(
-            USAGE.contains("--max-scan-pids"),
-            "help names the scan cap flag"
-        );
+        for help in [
+            PROFILE_HELP.to_string(),
+            INSPECT_HELP.to_string(),
+            HelpTopic::Inventory.text(),
+        ] {
+            assert!(
+                help.contains("--max-scan-pids"),
+                "help names the scan cap flag"
+            );
+        }
     }
 
     #[test]
@@ -4475,11 +4531,7 @@ mod tests {
 
     #[test]
     fn select_endpoint_is_documented_on_profile_and_run_help() {
-        for (topic, help) in [
-            ("global", USAGE),
-            ("profile", PROFILE_HELP),
-            ("run", RUN_HELP),
-        ] {
+        for (topic, help) in [("profile", PROFILE_HELP), ("run", RUN_HELP)] {
             assert!(
                 help.contains("--select-endpoint"),
                 "{topic} help must document the endpoint-selection flag"
@@ -4529,10 +4581,17 @@ mod tests {
             parse(args(&["profile", "--pid", "42", "--attach-backend", "uprobe-multi"])),
             Err(CliError::Usage { message: m, .. }) if m.contains("--attach-backend: invalid value")
         ));
-        assert!(
-            USAGE.contains("--attach-backend"),
-            "help names the backend flag"
-        );
+        for help in [
+            PROFILE_HELP.to_string(),
+            TRACE_HELP.to_string(),
+            RUN_HELP.to_string(),
+            HelpTopic::Inventory.text(),
+        ] {
+            assert!(
+                help.contains("--attach-backend"),
+                "help names the backend flag"
+            );
+        }
     }
 
     #[test]
@@ -4796,9 +4855,12 @@ mod tests {
     }
 
     #[test]
-    fn scoped_help_syntax_lines_are_verbatim_from_global_usage() {
-        let global: Vec<&str> = USAGE.lines().collect();
-        for topic in [
+    fn every_flag_is_documented_in_some_help() {
+        // Global help shows short usage lines; scoped help carries the
+        // full synopsis and notes. Every usable flag must appear in at
+        // least one help text, so shortening one help cannot orphan it.
+        let all = [
+            HelpTopic::Global,
             HelpTopic::Profile,
             HelpTopic::Trace,
             HelpTopic::Run,
@@ -4806,18 +4868,63 @@ mod tests {
             HelpTopic::Doctor,
             HelpTopic::Inventory,
             HelpTopic::InventoryDiff,
+        ]
+        .iter()
+        .map(|topic| topic.text())
+        .collect::<Vec<_>>()
+        .join("\n");
+        for flag in [
+            "--help",
+            "-h",
+            "--version",
+            "-V",
+            "--pid",
+            "--cgroup",
+            "--system",
+            "--module",
+            "--exclude-module",
+            "--manifest",
+            "--prearm-module",
+            "--hook-symbol",
+            "--mode",
+            "--counter-mode",
+            "--select-endpoint",
+            "--duration",
+            "--max-events",
+            "--max-scan-pids",
+            "--max-gaps",
+            "--max-endpoints",
+            "--ring-bytes",
+            "--drain-interval-ms",
+            "--attach-backend",
+            "--identity-backend",
+            "--capture",
+            "--caller-metadata",
+            "--key-operations",
+            "--dashboard",
+            "--event-log",
+            "--event-rotate-bytes",
+            "--event-max-files",
+            "--diagnostics",
+            "--diagnostics-pid",
+            "--trace",
+            "--pause",
+            "--kill-on-timeout",
+            "--unsafe-unvalidated-metadata",
+            "--allow-uretprobe-on-confined-target",
+            "--track-short-lived",
+            "--extra-strict",
+            "-v",
+            "--verbose",
+            "--quiet",
+            "--json",
+            "-o",
         ] {
-            for line in topic
-                .text()
-                .lines()
-                .skip(1)
-                .take_while(|line| !line.is_empty())
-            {
-                assert!(
-                    global.contains(&line),
-                    "{topic:?}: {line:?} is not verbatim from USAGE"
-                );
-            }
+            assert!(all.contains(flag), "no help documents {flag}");
+        }
+        // Removed flags stay refused by name, never documented as usable.
+        for dead in ["--provenance-module", "--trusted-workload"] {
+            assert!(!all.contains(dead), "help documents removed {dead}");
         }
     }
 
@@ -4829,28 +4936,30 @@ mod tests {
             hash ^= u64::from(byte);
             hash = hash.wrapping_mul(1099511628211);
         }
-        // 10718 / 0xbe49d069bdf88642 (F4 plain-words help plus the
-        // late-process scope sentence): USAGE diff vs the
-        // 10678/0xb0ec5d13d144e1bf pin is exactly the HELP-3 jargon
-        // replacements (checked-against-scan, counted-but-not-named,
-        // short-lived wording, bpf_loop helper, watched function,
-        // counter values, report recording, Environment prefix); the
-        // scope sentence is unchanged. No other drift.
-        assert_eq!(USAGE.len(), 10718);
-        assert_eq!(hash, 0xbe49d069bdf88642);
-        assert_eq!(HelpTopic::Global.text(), USAGE);
+        // Short global help (description, task list, short usage lines,
+        // three examples): notes moved into scoped help, every flag kept
+        // somewhere (see every_flag_is_documented_in_some_help). The
+        // late-process scope bound moved with the notes into
+        // inventory help (see inventory_help_bounds_late_process_scanning).
+        assert_eq!(USAGE.len(), 2705);
+        assert_eq!(hash, 0xec545c3dc707163b);
+        assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 
     /// F4: help uses plain words (HELP-3/KEY-6), not internal names.
     /// No parser change; JSON keeps the machine tokens.
     #[test]
     fn help_uses_plain_words_without_internal_names() {
+        let inventory = HelpTopic::Inventory.text();
         let helps = [
             ("USAGE", USAGE),
             ("PROFILE_HELP", PROFILE_HELP),
             ("TRACE_HELP", TRACE_HELP),
             ("RUN_HELP", RUN_HELP),
-            ("INVENTORY_HELP", INVENTORY_HELP),
+            ("INSPECT_HELP", INSPECT_HELP),
+            ("DOCTOR_HELP", DOCTOR_HELP),
+            ("INVENTORY_HELP", inventory.as_str()),
+            ("INVENTORY_DIFF_HELP", INVENTORY_DIFF_HELP),
         ];
         for (name, help) in helps {
             for jargon in [
@@ -4876,81 +4985,87 @@ mod tests {
                 );
             }
         }
-        // The plain replacements land where the jargon was.
-        assert!(USAGE.contains("checked against the scan when possible"));
-        for help in [USAGE, PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+        // The plain replacements land where the jargon was. Notes live in
+        // scoped help; global help stays short.
+        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+            assert!(
+                help.contains("checked against the scan when possible"),
+                "{help:.200}"
+            );
             assert!(help.contains("counted but not named"), "{help:.200}");
             assert!(
                 help.contains("watches the file from before it loads"),
                 "{help:.200}"
             );
         }
-        for help in [USAGE, PROFILE_HELP, RUN_HELP] {
-            assert!(
-                help.contains("also records short-lived processes"),
-                "{help:.200}"
-            );
+        assert!(
+            PROFILE_HELP.contains("also records short-lived processes"),
+            "profile documents the flag run refuses"
+        );
+        for help in [PROFILE_HELP, RUN_HELP] {
             assert!(help.contains("exactly one watched function"), "{help:.200}");
             assert!(help.contains("counter values"), "{help:.200}");
+            assert!(help.contains("bpf_loop helper"), "{help:.200}");
+            assert!(!help.contains("helper 181"), "{help:.200}");
+            assert!(help.contains("recorded in the report;"), "{help:.200}");
+            assert!(!help.contains("counter-mode-unwired"), "{help:.200}");
         }
-        assert!(USAGE.contains("bpf_loop helper"));
-        assert!(!USAGE.contains("helper 181"));
-        assert!(USAGE.contains("recorded in the report;"));
         assert!(USAGE.contains("Environment (advanced; normally unset)"));
+        assert!(!USAGE.contains("helper 181"));
         assert!(
-            INVENTORY_HELP.contains("also tracks which key each operation used"),
-            "{INVENTORY_HELP:.500}"
+            inventory.contains("also tracks which key each operation used"),
+            "{inventory:.500}"
         );
         assert!(
-            INVENTORY_HELP.contains("Per-key results appear under object_observations"),
-            "{INVENTORY_HELP:.500}"
+            inventory.contains("Per-key results appear under object_observations"),
+            "{inventory:.500}"
         );
     }
 
     #[test]
     fn help_states_manifest_attestation_and_scan_only_limits() {
-        for statement in [
-            "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
-            "scan-only discovery is counted but not named",
-            "aggregate counts/RVs/latency remain available",
-        ] {
-            assert!(
-                USAGE.contains(statement),
-                "missing help statement: {statement}"
-            );
+        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+            for statement in [
+                "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
+                "scan-only discovery is counted but not named",
+                "aggregate counts/RVs/latency remain available",
+            ] {
+                assert!(
+                    help.contains(statement),
+                    "missing help statement: {statement}"
+                );
+            }
         }
     }
 
     #[test]
     fn help_names_counter_mode_availability() {
-        for statement in [
-            "--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.",
-            "counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.",
-            "Omit --counter-mode to keep existing metrics behavior.",
-            "can refuse with a named reason, including on kernels without bpf_loop helper support",
-            "where the kernel verifier rejects the counter programs",
-        ] {
+        for help in [PROFILE_HELP, RUN_HELP] {
+            for statement in [
+                "--counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.",
+                "counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.",
+                "Omit --counter-mode to keep existing metrics behavior.",
+                "can refuse with a named reason, including on kernels without bpf_loop helper support",
+                "where the kernel verifier rejects the counter programs",
+            ] {
+                assert!(
+                    help.contains(statement),
+                    "missing help statement: {statement}"
+                );
+            }
             assert!(
-                USAGE.contains(statement),
-                "missing help statement: {statement}"
+                !help.contains("counter-mode-unwired"),
+                "help still states the removed refusal"
+            );
+            // The refusal list is non-exhaustive: the old exhaustive sentence
+            // also overclaimed by omitting the verifier refusal.
+            assert!(
+                !help.contains(
+                    "Selections refuse with a named reason on kernels without bpf_loop (helper 181), on builds without counter objects, and past the mode's endpoint ceiling."
+                ),
+                "help still states the exhaustive refusal list"
             );
         }
-        assert!(
-            !USAGE.contains("counter-mode-unwired"),
-            "help still states the removed refusal"
-        );
-        // The refusal list is non-exhaustive: the old exhaustive sentence
-        // also overclaimed by omitting the verifier refusal.
-        assert!(
-            !USAGE.contains(
-                "Selections refuse with a named reason on kernels without bpf_loop (helper 181), on builds without counter objects, and past the mode's endpoint ceiling."
-            ),
-            "help still states the exhaustive refusal list"
-        );
-        assert!(
-            USAGE.contains("[--counter-mode counts|timestamps|latency]"),
-            "profile/run synopsis never names --counter-mode"
-        );
         assert!(
             PROFILE_HELP.contains("[--counter-mode counts|timestamps|latency]"),
             "profile --help never names --counter-mode"
@@ -5081,8 +5196,10 @@ mod tests {
 
     #[test]
     fn help_documents_the_new_capture_flags() {
-        for statement in ["--ring-bytes", "--drain-interval-ms"] {
-            assert!(USAGE.contains(statement), "missing help text: {statement}");
+        for help in [PROFILE_HELP, TRACE_HELP, RUN_HELP] {
+            for statement in ["--ring-bytes", "--drain-interval-ms"] {
+                assert!(help.contains(statement), "missing help text: {statement}");
+            }
         }
     }
 
@@ -5091,11 +5208,11 @@ mod tests {
     #[test]
     fn help_surfaces_default_trace_event_cap() {
         assert!(
-            USAGE.contains("10,000,000"),
+            TRACE_HELP.contains("10,000,000"),
             "help never names the default trace event cap"
         );
         assert!(
-            USAGE.contains("TRUNCATED"),
+            TRACE_HELP.contains("TRUNCATED"),
             "help never explains the TRUNCATED line"
         );
     }
@@ -5377,5 +5494,179 @@ mod tests {
         let broken = dir.path().join("broken.json");
         std::fs::write(&broken, b"not json").unwrap();
         assert!(validate_manifest_excludes(slice_of(&broken), slice_of(&provider)).is_ok());
+    }
+
+    #[test]
+    fn bare_argv_prints_global_help() {
+        assert_eq!(parse(args(&[])), Err(CliError::Help(HelpTopic::Global)));
+    }
+
+    #[test]
+    fn help_routes_to_topics() {
+        for (words, topic) in [
+            (vec!["help"], HelpTopic::Global),
+            (vec!["help", "profile"], HelpTopic::Profile),
+            (vec!["help", "trace"], HelpTopic::Trace),
+            (vec!["help", "run"], HelpTopic::Run),
+            (vec!["help", "inspect"], HelpTopic::Inspect),
+            (vec!["help", "doctor"], HelpTopic::Doctor),
+            (vec!["help", "inventory"], HelpTopic::Inventory),
+            (vec!["help", "inventory", "diff"], HelpTopic::InventoryDiff),
+        ] {
+            assert_eq!(parse(args(&words)), Err(CliError::Help(topic)), "{words:?}");
+        }
+        let Err(CliError::Usage { message, topic }) = parse(args(&["help", "frobnicate"])) else {
+            panic!("unknown help topic must be a usage error");
+        };
+        assert!(message.contains("unknown help topic"), "{message}");
+        assert_eq!(topic, HelpTopic::Global);
+    }
+
+    #[test]
+    fn run_refuses_track_short_lived() {
+        let Err(CliError::Usage { message, topic }) =
+            parse(args(&["run", "--track-short-lived", "--", "true"]))
+        else {
+            panic!("run must refuse --track-short-lived");
+        };
+        assert!(message.contains("--track-short-lived"), "{message}");
+        assert!(message.contains("run"), "{message}");
+        assert_eq!(topic, HelpTopic::Run);
+        let Command::Profile(armed) =
+            parse(args(&["profile", "--pid", "4242", "--track-short-lived"])).unwrap()
+        else {
+            panic!("profile --track-short-lived must parse");
+        };
+        assert!(armed.track_short_lived);
+    }
+
+    #[test]
+    fn invalid_duration_names_examples() {
+        let error = parse_duration("5x").expect_err("5x is not a duration");
+        assert!(error.contains("(use 30, 30s, 5m or 1h)"), "{error}");
+        for argv in [
+            vec!["profile", "--pid", "4242", "--duration", "5x"],
+            vec!["inventory", "--pid", "4242", "--duration", "5x"],
+        ] {
+            let Err(CliError::Usage { message, .. }) = parse(args(&argv)) else {
+                panic!("{argv:?} must be a usage error");
+            };
+            assert!(
+                message.contains("--duration: invalid value \"5x\""),
+                "{message}"
+            );
+            assert!(message.contains("(use 30, 30s, 5m or 1h)"), "{message}");
+            assert!(!message.contains('\n'), "{message}");
+        }
+    }
+
+    #[test]
+    fn doctor_system_names_pid_or_cgroup() {
+        let Err(CliError::Usage { message, topic }) = parse(args(&["doctor", "--system"])) else {
+            panic!("doctor --system must be a usage error");
+        };
+        assert!(
+            message.contains("--pid") && message.contains("--cgroup"),
+            "{message}"
+        );
+        assert!(!message.contains("takes no capture scope"), "{message}");
+        assert_eq!(topic, HelpTopic::Doctor);
+    }
+
+    #[test]
+    fn doctor_module_names_mapped_providers() {
+        let Err(CliError::Usage { message, .. }) = parse(args(&["doctor", "--module", "x.so"]))
+        else {
+            panic!("doctor --module must be a usage error");
+        };
+        assert!(message.contains("to list mapped providers"), "{message}");
+        assert!(!message.contains("module-specific discovery"), "{message}");
+    }
+
+    #[test]
+    fn doctor_accepts_verbose_and_quiet() {
+        let Command::Doctor(verbose) = parse(args(&["doctor", "-v"])).unwrap() else {
+            panic!("doctor -v must parse");
+        };
+        assert!(verbose.verbose && !verbose.quiet);
+        let Command::Doctor(quiet) = parse(args(&["doctor", "--quiet"])).unwrap() else {
+            panic!("doctor --quiet must parse");
+        };
+        assert!(quiet.quiet && !quiet.verbose);
+        let Command::Doctor(plain) = parse(args(&["doctor"])).unwrap() else {
+            panic!("doctor must parse");
+        };
+        assert!(!plain.verbose && !plain.quiet);
+        assert!(
+            matches!(
+                parse(args(&["doctor", "-v", "--quiet"])),
+                Err(CliError::Usage { .. })
+            ),
+            "doctor must refuse -v with --quiet"
+        );
+    }
+
+    #[test]
+    fn global_help_is_short_with_examples_and_exit_line() {
+        assert!(USAGE.lines().count() < 45, "{}", USAGE.lines().count());
+        for line in USAGE.lines() {
+            assert!(line.len() < 200, "overlong global help line: {line}");
+        }
+        assert!(USAGE.contains("p11scope help [command]"), "{USAGE}");
+        for example in [
+            "sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "sudo p11scope profile --pid 4242 --duration 30s -o profile.json",
+            "sudo p11scope inventory --system --duration 30s",
+        ] {
+            assert!(USAGE.contains(example), "{USAGE}");
+        }
+        assert_eq!(USAGE.matches("exit codes:").count(), 1, "{USAGE}");
+    }
+
+    #[test]
+    fn every_help_carries_one_exit_code_line() {
+        for topic in [
+            HelpTopic::Global,
+            HelpTopic::Profile,
+            HelpTopic::Trace,
+            HelpTopic::Run,
+            HelpTopic::Inspect,
+            HelpTopic::Doctor,
+            HelpTopic::Inventory,
+            HelpTopic::InventoryDiff,
+        ] {
+            let help = topic.text();
+            assert_eq!(
+                help.matches("exit codes:").count(),
+                1,
+                "{topic:?} must carry exactly one exit-code line"
+            );
+        }
+    }
+
+    #[test]
+    fn capture_examples_show_sudo_and_parse() {
+        let run = HelpTopic::Run.text();
+        assert!(
+            run.contains(
+                "sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L"
+            ),
+            "{run}"
+        );
+        assert!(!run.contains("/absolute/path/to/program"), "{run}");
+        assert!(!run.contains("--track-short-lived"), "{run}");
+        let inventory = HelpTopic::Inventory.text();
+        assert!(
+            inventory.contains("sudo p11scope inventory --system --duration 30s"),
+            "{inventory}"
+        );
+        // The sudo examples parse once the privilege prefix is stripped.
+        for words in [
+            "p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "p11scope inventory --system --duration 30s",
+        ] {
+            parse(args(&words.split_whitespace().skip(1).collect::<Vec<_>>()))
+                .unwrap_or_else(|error| panic!("{words} must parse: {error:?}"));
+        }
     }
 }

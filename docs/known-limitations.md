@@ -159,16 +159,18 @@ profile/trace capture stays fixed at 512 attach slots (2,112 only in
 the WIDE source build). A recognized forwarding layer (such as
 p11-kit's proxy closure array, about 6,530 endpoints per copy) is
 decided after all providers in every scope and admitted by what it
-publishes: only tables the application actually received attach,
-taking no heuristic slots, so the layer can never crowd out a real
-provider and is never refused outright. Calls it forwards are counted
-at the attached backend providers, named with counts on the gap line;
-calls the layer answers itself are not counted. When nothing is
-published yet, a named gap says so and the capture continues. An
-operator-named layer (`--module <path>`) is the sole exception: it
-keeps a reserve-capped leading-templates prefix, because a remote
-client's tables are handed out before any export probe can observe the
-return (costs of covering the layer are measured in
+publishes: only tables with publication evidence (a live
+`C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
+a manifest, or export agreement) attach, taking no heuristic slots, so
+the layer can never crowd out a real provider and is never refused
+outright. Calls it forwards are counted at the attached backend
+providers, named with counts on the gap line; calls the layer answers
+itself are not counted. When nothing is published yet, a named gap says
+so and the capture continues. An operator-named layer (`--module
+<path>`) is the sole exception: it keeps a reserve-capped
+leading-templates prefix, because a remote client's tables are handed
+out before any export probe can observe the return (costs of covering
+the layer are measured in
 `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
 An ordinary provider that does not fit whole in a shared-scope Detailed
 capture is admitted on the leading-tables prefix that fits,

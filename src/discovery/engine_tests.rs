@@ -3865,7 +3865,7 @@ fn awaiting_layer_seed_from_real_export_collects_and_stays_terminal() {
     closure.exports = provider_module.exports.clone();
     closure.view = provider_module.view;
     closure.mount_namespace = provider_module.mount_namespace;
-    closure.mapped_identity = provider_module.mapped_identity.clone();
+    closure.mapped_identity = provider_module.mapped_identity;
     let mut engine = Engine::empty();
     let candidate = engine
         .live_candidate(provider_pins, vec![closure.clone()], Vec::new())
@@ -3950,8 +3950,10 @@ fn capacity_refused_provider_seed_without_owner_stays_incomplete() {
 fn start_gate_falls_back_to_gap_text_for_hand_built_plans() {
     let mut plan = plan_with(0, 1);
     assert_eq!(plan.refused_modules_typed().count(), 0);
-    plan.modules_skipped[0].reason =
-        format!("none is published yet {}", plan::CLOSURE_ARRAY_NOTE_DETAILED);
+    plan.modules_skipped[0].reason = format!(
+        "none is published yet {}",
+        plan::CLOSURE_ARRAY_NOTE_DETAILED
+    );
     assert!(
         plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
         "awaiting text: {}",

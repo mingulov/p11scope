@@ -185,9 +185,10 @@ the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
 it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
 attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
 layer was captured. A live Detailed capture admits a forwarding layer (such
-as the p11-kit proxy) only through its published tables — the tables a live
-`C_GetFunctionList` / `C_GetInterface(List)` return actually handed to the
-application — in every scope and arrival order. Unpublished templates take
+as the p11-kit proxy) only through its published tables — publication
+evidence (a live `C_GetFunctionList` / `C_GetInterface(List)` return,
+interface linkage, a manifest, or export agreement) — in every scope and
+arrival order. Unpublished templates take
 no slots, so the layer can never crowd out a real provider and is never
 refused outright. Calls it forwards are counted at the attached backend
 providers, named with counts on the gap line; calls the layer answers
@@ -575,7 +576,11 @@ If the run is stopped or times out while the
 command is still being handed to the child, the child is killed at once,
 never resumed, so a command that had not already started never runs. A stop
 still waiting for its pause cycle when the capture ends is reported as
-`pause: partial`. Under `--pause always` the run fails instead: no profile
+`pause: partial`. Under `--pause auto` an engine-incomplete cycle re-arms
+after resuming the child, so a later loader hit is paused like any other;
+each incomplete cycle stays a counted partial attempt while the chain
+continues, and four straight incompletes retire the chain with a counted
+named gap. Under `--pause always` the run fails instead: no profile
 report is published (a trace `-o` stream keeps only the lines already
 written), and a `--duration` child is terminated rather than handed back. A
 signal that lands inside an active pause cycle (which has a 500 ms deadline)

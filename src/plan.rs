@@ -339,20 +339,22 @@ const CLOSURE_UNPUBLISHED: &str = "is published yet";
 /// still starts on it, PARTIAL, and admits the providers below it as
 /// they load.
 ///
-/// Text oracle only: the wording pins above stay byte-stable for stored
-/// captures, but production decisions never re-derive the kind from the
-/// wording — they read [`RefusalKind`], set once at merge time beside the
-/// reason. A reworded reason keeps its kind.
+/// Text oracle: the wording pins above stay byte-stable for stored
+/// captures. Pause-seed completeness and the awaiting-replacement history
+/// leg read [`RefusalKind`], set once at merge time beside the reason (a
+/// reworded reason keeps its kind); the named-capture start gate and the
+/// whole/prefix/growth ranking still read the reason text.
 pub(crate) fn is_closure_awaiting_publication(reason: &str) -> bool {
     is_closure_array_refusal(reason) && reason.contains(CLOSURE_UNPUBLISHED)
 }
 
 /// The typed kind of one refused-module record, set at merge time beside
-/// its display reason and shared with the engine. The kind is what pause
-/// completeness and history ranking decide by; the reason is what users
-/// read. The two agree at construction (see the merge `debug_assert!`)
-/// and never meet again. The named-capture start gate keeps reading the
-/// public gap list, which also serves hand-built plans.
+/// its display reason and shared with the engine. Pause completeness and
+/// the awaiting-replacement history leg decide by the kind; the reason is
+/// what users read. The two agree at construction (see the merge
+/// `debug_assert!`). The named-capture start gate keeps reading the public
+/// gap list, which also serves hand-built plans, and the
+/// whole/prefix/growth ranking still reads the reason text.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RefusalKind {
     /// A Detailed closure limited to its published tables, with none

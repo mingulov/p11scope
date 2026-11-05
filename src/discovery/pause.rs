@@ -36,6 +36,10 @@ const MAX_SETTLE_SAMPLES: u64 = CYCLE_NS / SAMPLE_NS;
 /// the child runs unpaused until the next frame re-arms, and a table still
 /// unpublished then is reported as a gap (`PauseIo::note_unpaused_publication`).
 pub(crate) const MAX_SUCCESSORS_PER_ARM: u8 = 16;
+/// Consecutive engine-incomplete re-arms before the chain retires with a
+/// counted named gap. The run continues (never-stop); only the pause chain
+/// ends, loudly, instead of re-arming once per loader hit without bound.
+const MAX_CONSECUTIVE_ENGINE_INCOMPLETE: u32 = 3;
 const MSG_UNPAUSED_PUBLICATION: &str = "the owned pause chain ended while a provider's function table was still unpublished; calls before its probes attach may be unobserved";
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
@@ -86,6 +90,13 @@ fn render_pause_diagnostic(diagnostic: PauseDiagnostic) -> String {
     format!(
         "p11scope: pause: partial [pause_diag={}]",
         diagnostic.token()
+    )
+}
+
+fn render_pause_incomplete_retirement(consecutive: u64) -> String {
+    format!(
+        "p11scope: pause: partial [pause_diag={}] (retired after {consecutive} consecutive incomplete cycles)",
+        PauseDiagnostic::EngineIncompleteWithinDeadline.token()
     )
 }
 
@@ -480,6 +491,13 @@ pub(crate) struct PauseCoordinator {
     terminal_batch: Option<TerminalBatch>,
     pending_diagnostic: Option<PauseDiagnostic>,
     diagnostic_annotated: bool,
+    /// Consecutive engine-incomplete cycles. Reset on every confirmed
+    /// cycle; reaching the cap retires the chain with a counted named
+    /// gap instead of re-arming again.
+    consecutive_engine_incomplete: u32,
+    /// Engine-incomplete cap retirements this run. Each is one counted
+    /// partial with a named retirement line.
+    engine_incomplete_retirements: u64,
     /// Successors this arm may still install (`MAX_SUCCESSORS_PER_ARM`).
     successors_left: u8,
     cleaning: bool,
@@ -595,6 +613,8 @@ impl PauseCoordinator {
             terminal_batch: None,
             pending_diagnostic: None,
             diagnostic_annotated: false,
+            consecutive_engine_incomplete: 0,
+            engine_incomplete_retirements: 0,
             successors_left: MAX_SUCCESSORS_PER_ARM,
             cleaning: false,
             cleaned: false,
@@ -1204,7 +1224,14 @@ impl PauseCoordinator {
             self.set_diagnostic(diagnostic);
         }
         if !outcome.required_complete {
-            return self.fail_cycle(io, "one or more frozen required attachments failed", false);
+            let engine_incomplete =
+                outcome.diagnostic == Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+            return self.fail_cycle_inner(
+                io,
+                "one or more frozen required attachments failed",
+                false,
+                engine_incomplete,
+            );
         }
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
@@ -1315,6 +1342,7 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, true);
         }
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
+        self.consecutive_engine_incomplete = 0;
         self.attempt_open = false;
         self.active_deadline = None;
         self.failure_deadline = None;
@@ -1763,15 +1791,31 @@ impl PauseCoordinator {
         message: impl Into<String>,
         lifecycle: bool,
     ) -> Result<(), PauseError> {
+        self.fail_cycle_inner(io, message, lifecycle, false)
+    }
+
+    fn fail_cycle_inner(
+        &mut self,
+        io: &mut impl PauseIo,
+        message: impl Into<String>,
+        lifecycle: bool,
+        engine_incomplete: bool,
+    ) -> Result<(), PauseError> {
         self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
         // An engine-incomplete cycle under `auto` is a counted named gap,
         // not the end of the chain: the cleanup below resumes the child,
-        // so a later loader hit arms and is serviced like any other.
-        let rearm_after_incomplete = !lifecycle
-            && self.policy == PausePolicy::Auto
-            && self.pending_diagnostic == Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+        // so a later loader hit arms and is serviced like any other. The
+        // cause arrives typed from the incomplete-apply call site, never
+        // from the sticky first-cause diagnostic (an earlier unowned apply
+        // may have set that for a different failure). Consecutive
+        // incompletes retire after the cap with a counted named gap.
+        let incomplete_candidate =
+            !lifecycle && self.policy == PausePolicy::Auto && engine_incomplete;
+        let rearm_after_incomplete = incomplete_candidate
+            && self.consecutive_engine_incomplete < MAX_CONSECUTIVE_ENGINE_INCOMPLETE;
+        let retire_after_incomplete = incomplete_candidate && !rearm_after_incomplete;
         io.note_unconfirmed_cycle();
         if !lifecycle {
             self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
@@ -1882,7 +1926,22 @@ impl PauseCoordinator {
         self.failure_deadline = None;
         self.failure_items = 0;
         self.rearming_enabled = rearm_after_incomplete;
-        self.finish_nonconfirmed(message)
+        if rearm_after_incomplete {
+            self.consecutive_engine_incomplete =
+                self.consecutive_engine_incomplete.saturating_add(1);
+        }
+        let result = self.finish_nonconfirmed(message);
+        if retire_after_incomplete {
+            self.consecutive_engine_incomplete =
+                self.consecutive_engine_incomplete.saturating_add(1);
+            self.engine_incomplete_retirements =
+                self.engine_incomplete_retirements.saturating_add(1);
+            eprintln!(
+                "{}",
+                render_pause_incomplete_retirement(u64::from(self.consecutive_engine_incomplete))
+            );
+        }
+        result
     }
 
     fn finish_nonconfirmed(&mut self, message: String) -> Result<(), PauseError> {
@@ -7221,8 +7280,10 @@ mod tests {
     /// non-lifecycle failure with a different cause.
     #[test]
     fn an_unowned_engine_incomplete_must_not_rearm_a_later_non_lifecycle_failure() {
-        let mut io = FakeIo::default();
-        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+        let mut io = FakeIo {
+            apply_outcome_diagnostic: Some(PauseDiagnostic::EngineIncompleteWithinDeadline),
+            ..FakeIo::default()
+        };
         let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
         coordinator.begin_attempt();
         coordinator.pending_records.push(record(1, 0, false));
@@ -7254,14 +7315,15 @@ mod tests {
         coordinator.set_diagnostic(PauseDiagnostic::EngineIncompleteWithinDeadline);
 
         let error = coordinator
-            .fail_cycle(&mut io, "one or more frozen required attachments failed", false)
+            .fail_cycle(
+                &mut io,
+                "one or more frozen required attachments failed",
+                false,
+            )
             .unwrap_err();
 
         assert!(error.required());
-        assert!(
-            !coordinator.rearming_enabled(),
-            "Always must not re-arm"
-        );
+        assert!(!coordinator.rearming_enabled(), "Always must not re-arm");
     }
 
     /// Lifecycle failures never re-arm, even with an EngineIncomplete
@@ -9137,6 +9199,15 @@ mod tests {
             );
             assert_eq!(line.matches("pause_diag=").count(), 1);
         }
+    }
+
+    #[test]
+    fn incomplete_retirement_renders_once_with_a_count() {
+        assert_eq!(
+            render_pause_incomplete_retirement(4),
+            "p11scope: pause: partial [pause_diag=engine_incomplete_within_deadline] \
+             (retired after 4 consecutive incomplete cycles)"
+        );
     }
 
     #[test]

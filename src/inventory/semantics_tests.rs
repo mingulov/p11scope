@@ -891,7 +891,9 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
     let host = ProviderFixture::new();
     let mut good = complete.source(["C_SignInit", "C_Sign"]);
     let mut bad = cross.source(["C_SignInit", "C_Sign"]);
-    let host_key = host.pins.raw_keys_for(host.pins.pinned().next().unwrap().id)[0];
+    let host_key = host
+        .pins
+        .raw_keys_for(host.pins.pinned().next().unwrap().id)[0];
     fn grow(
         module: &mut ReconciledModule,
         key: p11scope_manifest::maps::ObjectKey,
@@ -920,7 +922,14 @@ fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
         }
     }
     let good_key = good.scanned.tables[0].entries[0].object;
-    grow(&mut bad, host_key, Some(host.manifest.module_path.clone()), host.offsets[0], 4, 100);
+    grow(
+        &mut bad,
+        host_key,
+        Some(host.manifest.module_path.clone()),
+        host.offsets[0],
+        4,
+        100,
+    );
     grow(&mut good, good_key, None, complete.offsets[0], 1, 212);
     let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
     engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);

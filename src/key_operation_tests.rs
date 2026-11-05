@@ -21723,7 +21723,10 @@ fn assert_no_birth_counts_only(
     );
     assert_eq!(after.sessions, before.sessions, "no session invented");
     assert_eq!(after.objects, before.objects, "no object invented");
-    assert_eq!(after.key_operations, before.key_operations, "no key row invented");
+    assert_eq!(
+        after.key_operations, before.key_operations,
+        "no key row invented"
+    );
     assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
 }
 
@@ -21751,7 +21754,10 @@ fn assert_fallback_counts_only(
     );
     assert_eq!(after.sessions, before.sessions, "no session invented");
     assert_eq!(after.objects, before.objects, "no object invented");
-    assert_eq!(after.key_operations, before.key_operations, "no key row invented");
+    assert_eq!(
+        after.key_operations, before.key_operations,
+        "no key row invented"
+    );
     assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
 }
 

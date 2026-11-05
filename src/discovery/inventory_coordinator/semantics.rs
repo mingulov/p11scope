@@ -3651,19 +3651,49 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if bound || stopped {
                 let held = state.pre_binding.take();
                 if !held.is_empty() {
-                    let forgiven = bound
-                        && held.images.iter().all(|(cookie, _)| {
-                            self.semantic_bindings.proves_unbound_caller(
+                    // Each held cookie resolves at the first binding:
+                    // the bound caller's own (a binding or admission
+                    // history holds it) dispose without barrier or
+                    // refusal — the journal already disposed those
+                    // records as fenced loss before any key existed;
+                    // a provably other caller's dispose and refuse its
+                    // image; anything else (unknown against this
+                    // binding set) still barriers, fail closed.
+                    let mut resolved = bound;
+                    let mut any_own = false;
+                    let mut other_images: Vec<(u64, u64)> = Vec::new();
+                    if bound {
+                        for (cookie, exec) in &held.images {
+                            let own = self.semantic_bindings.has_ticket(domain, *cookie)
+                                || self.semantic_bindings.admission_images.values().any(
+                                    |history| {
+                                        history.domain == domain
+                                            && history.image.task_cookie == *cookie
+                                    },
+                                );
+                            if own {
+                                any_own = true;
+                            } else if self.semantic_bindings.proves_unbound_caller(
                                 domain,
                                 ImageIdentity {
                                     task_cookie: *cookie,
                                     exec_id: 0,
                                 },
-                            )
-                        });
-                    if forgiven {
-                        refuse_images.extend(held.images.iter().copied());
-                        resolved_other = Some(held);
+                            ) {
+                                other_images.push((*cookie, *exec));
+                            } else {
+                                resolved = false;
+                            }
+                        }
+                    }
+                    if resolved {
+                        refuse_images.extend(other_images);
+                        // The resolution NOTE keeps its exact
+                        // other-caller meaning (and count) only when
+                        // the whole hold was other callers'.
+                        if !any_own {
+                            resolved_other = Some(held);
+                        }
                     } else {
                         shed_min = Some(shed_min.map_or(held.min, |floor| floor.min(held.min)));
                     }

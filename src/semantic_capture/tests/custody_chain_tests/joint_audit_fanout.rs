@@ -3188,15 +3188,17 @@ fn joint_machine_refused_image_production_binding_stays_s1_named() {
     );
 }
 
-/// JK-18 resolve-before-seal at machine level: an own-cookie unrouted
-/// shed finalized before any binding is provisionally disposed, and the
-/// first finalize that sees the owner's binding still barriers the match,
-/// so the first bound seal degrades with a named history loss instead of
-/// certifying the held position. No Joint feed or rows for the owner, no
-/// resolution NOTE (a match never forgives), and the bound call that made
-/// the seal attempt still joins S1.
+/// JK-18 resolution at machine level: an own-cookie unrouted shed
+/// finalized before any binding is provisionally disposed, and the
+/// first finalize that sees the owner's binding disposes the match
+/// (the journal already fenced those records before any key
+/// existed), so the first bound seal certifies above the fence
+/// instead of degrading on a late barrier. No resolution NOTE (that
+/// keeps its other-caller meaning), the owner's own image is never
+/// refused, and the bound call that made the seal attempt still
+/// joins S1.
 #[test]
-fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() {
+fn joint_machine_own_cookie_pre_binding_shed_disposes_at_the_first_bound_seal() {
     let mut fixture = MachineScene::new(1);
     let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
     // Quantum 1 must prepare with zero bindings so the shed populates
@@ -3272,10 +3274,9 @@ fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() 
         "quantum 2 binds the mapped main pid before its own prepare: {:?}",
         fixture.scene.real.scene.coordinator.registry().gaps()
     );
-    // The H3Loss seal failure stages its gap for the next publication,
-    // so a third quantum publishes it.
+    // A third quantum seals again above the disposed position.
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
-    fixture.published_labeled("history-loss-named", None);
+    fixture.published_labeled("seal-above-disposed", None);
     let coordinator = &fixture.scene.real.scene.coordinator;
     assert!(
         coordinator
@@ -3283,7 +3284,7 @@ fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() 
             .gaps()
             .iter()
             .all(|gap| gap.subject != "pre-binding unrouted calls resolved to other callers"),
-        "the match never forgives: {:?}",
+        "an own-cookie match is never noted as another caller's: {:?}",
         coordinator.registry().gaps()
     );
     let main = coordinator.adapter().live_id(std::process::id()).unwrap();
@@ -3292,12 +3293,16 @@ fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() 
             .registry()
             .gaps()
             .iter()
-            .any(|gap| gap.caller == Some(main)
-                && gap.subject == "Joint key operations unavailable; retained S1"
-                && gap.reason == "joint_seal_h3_loss_history_loss"),
-        "the first bound seal degrades on the late barrier: {:?}",
+            .all(|gap| gap.reason != "joint_seal_h3_loss_history_loss"),
+        "no bound seal degrades on the disposed shed: {:?}",
         coordinator.registry().gaps()
     );
+    assert_eq!(
+        coordinator.registry().joint_feeds(),
+        1,
+        "the main caller's Joint feed seals above the fence"
+    );
+    let _ = main;
     let mut owner_feeds = coordinator
         .registry()
         .instance_semantic_edges()
@@ -3306,7 +3311,7 @@ fn joint_machine_own_cookie_pre_binding_shed_barriers_at_the_first_bound_seal() 
     assert_eq!(
         owner_feeds.next(),
         Some(crate::semantics_key_use::FeedMode::S1Only),
-        "the owner gains no Joint feed with the hole its refused history left"
+        "the owner made no post-binding call, so no birth was offered for it"
     );
     assert!(owner_feeds.next().is_none(), "the owner keeps one S1 edge");
     assert_eq!(

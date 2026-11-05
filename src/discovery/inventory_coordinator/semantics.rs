@@ -5934,14 +5934,43 @@ mod finalizer_history_tests {
     }
 
     #[test]
-    fn pre_binding_unrouted_calls_matching_the_first_binding_still_barrier() {
+    fn pre_binding_unrouted_calls_matching_the_first_binding_dispose_without_barrier() {
         use crate::semantics_objects::journal::H3DispositionEvidence;
+        // The bound caller's own pre-binding sheds were already
+        // disposed as fenced loss in the journal before any key
+        // existed; at its binding they dispose here too (never a
+        // barrier, never a refusal of its own image). The other
+        // caller's sheds in the same hold still resolve as other
+        // callers'. Shed totals are unchanged: both calls stay
+        // disclosed under the blocking subject from shed time.
         let (coordinator, _lane, _before, after) = pre_binding_case([77, 41], 41, None);
         assert!(
-            matches!(after, H3DispositionEvidence::StagedLoss { barrier: 2 }),
-            "the bound caller's own pre-birth loss is never forgiven: {after:?}"
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "own pre-binding sheds dispose at the binding: {after:?}"
         );
         assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+        // Pure own-cookie hold: same disposal, and the other-caller
+        // subject never sees the bound caller's own sheds.
+        let (coordinator, _lane, _before, after) = pre_binding_case([41, 41], 41, None);
+        assert!(
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "pure own pre-binding sheds dispose at the binding: {after:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, OTHER), 0);
         assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
     }
 

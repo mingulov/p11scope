@@ -54,12 +54,14 @@ it does not assert an atomic snapshot. Cached display ticks keep the original
 read window and do not acquire another native read.
 
 `status: "fresh"` has null failure and accepted health
-`{saturated: false, contended: false}`. A failed attempt retains the previous
-accepted rows, mode, generation, and window with `status: "stale"`, null health,
-and a finite failure cause; observed saturation or contention remains explicit
-as `saturated` or `contended`. A generation change sets sticky `discontinuity`.
-Either failure or discontinuity adds `counter_collection` to the observation
-gap causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
+`{saturated: false, contended: false}`, except a fresh read with a health
+gap reports null health (the health read itself failed). A failed attempt
+retains the previous accepted rows, mode, generation, and window with
+`status: "stale"`, null health, and a finite failure cause; observed
+saturation or contention remains explicit as `saturated` or `contended`.
+A generation change sets sticky `discontinuity`. A failure, discontinuity,
+or `bank_gaps` object adds `counter_collection` to the observation gap
+causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
 An unavailable initial read cannot produce zero measurements. A failed
 terminal read publishes the last good snapshot as stale with `PARTIAL`;
 only a capture that never acquired a snapshot fails. This metadata

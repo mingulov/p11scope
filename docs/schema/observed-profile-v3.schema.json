@@ -117,13 +117,45 @@
               "read_kernel_evidence", "bank_routing", "bank_quarantined", "topology",
               "mode", "generation_rollback", "limits", "saturated", "contended",
               "kernel_evidence", "fold_overflow", "regressed", "projection"
-            ]}
+            ]},
+            "bank_gaps": {
+              "description": "Optional per-bank gap disclosure, present only when the acquisition was partial.",
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["failed_slots", "health_failed", "kernel_failed"],
+              "properties": {
+                "failed_slots": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+                "health_failed": {"type": "boolean"},
+                "kernel_failed": {"type": "boolean"}
+              },
+              "not": {
+                "properties": {
+                  "failed_slots": {"const": 0},
+                  "health_failed": {"const": false},
+                  "kernel_failed": {"const": false}
+                }
+              }
+            }
           },
           "allOf": [
             {
               "if": {"properties": {"status": {"const": "fresh"}}},
-              "then": {"properties": {"failure": {"type": "null"}, "health": {"type": "object"}}},
+              "then": {"properties": {"failure": {"type": "null"}}},
               "else": {"properties": {"failure": {"type": "string"}, "health": {"type": "null"}}}
+            },
+            {
+              "if": {
+                "properties": {
+                  "status": {"const": "fresh"},
+                  "bank_gaps": {"properties": {"health_failed": {"const": true}}, "required": ["health_failed"]}
+                },
+                "required": ["status", "bank_gaps"]
+              },
+              "then": {"properties": {"health": {"type": "null"}}},
+              "else": {
+                "if": {"properties": {"status": {"const": "fresh"}}, "required": ["status"]},
+                "then": {"properties": {"health": {"type": "object"}}}
+              }
             }
           ]
         },
@@ -203,6 +235,34 @@
             "hits": {"type": "integer", "minimum": 0},
             "benign_hits": {"type": "integer", "minimum": 0},
             "state_read_failures": {"type": "integer", "minimum": 0}
+          }
+        },
+        "legacy_collection": {
+          "description": "Optional legacy gap disclosure, present only when the legacy aggregate read was partial.",
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["unread_stats", "rv_failed", "unknown_evidence"],
+          "properties": {
+            "unread_stats": {"type": "integer", "minimum": 0, "maximum": 18446744073709551615},
+            "rv_failed": {"type": "boolean"},
+            "unknown_evidence": {
+              "type": "array",
+              "uniqueItems": true,
+              "items": {"enum": [
+                "ring_loss", "start_insert_failures", "unmatched_returns",
+                "rv_update_failures", "cgroup_scope_failures",
+                "semantic_capture_failures", "template_tail_failures",
+                "unregistered_mechanisms", "abi_refusals",
+                "owner", "cookie", "root"
+              ]}
+            }
+          },
+          "not": {
+            "properties": {
+              "unread_stats": {"const": 0},
+              "rv_failed": {"const": false},
+              "unknown_evidence": {"maxItems": 0}
+            }
           }
         },
         "malformed_records": {"type": "integer", "minimum": 0},

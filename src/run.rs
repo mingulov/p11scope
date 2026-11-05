@@ -4218,7 +4218,10 @@ fn format_total_attach_refusal(failed: usize, attempted: usize, first: &str) -> 
 fn load_mech_shapes(state: &mut semantics::State) -> Result<()> {
     let registry = crate::vendor_mechanisms::load_registry()
         .map_err(|e| anyhow!("loading mechanism registry: {e}"))?;
-    state.set_mech_shapes(crate::shapes::expected_shapes(&registry));
+    // Render may only claim a published shape for ids the publication
+    // actually fit: approved-but-unpublished ids read "no diagnostic
+    // shape", never "decode failed".
+    state.set_mech_shapes(crate::shapes::published_expected_shapes(&registry));
     Ok(())
 }
 
@@ -5824,6 +5827,7 @@ fn capture_profile(
                     .as_deref()
                     .and_then(|owned| owned.still_running.then_some(owned.pid)),
                 None,
+                session.unpublished_mechanisms(),
             );
             render::apply_counter_snapshot(&mut ev, &snapshot);
             let frame = render::live_snapshot_scoped(
@@ -6528,6 +6532,7 @@ fn capture_profile(
                 .as_deref()
                 .and_then(|owned| owned.still_running.then_some(owned.pid)),
             None,
+            context.1.unpublished_mechanisms(),
         );
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
@@ -7402,6 +7407,7 @@ fn capture_trace(
                             .as_deref()
                             .and_then(|owned| owned.still_running.then_some(owned.pid)),
                         None,
+                        context.1.unpublished_mechanisms(),
                     );
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
@@ -8853,6 +8859,7 @@ pub(crate) fn evidence_for(
     uretprobe_override: Option<render::UretprobeOverride>,
     handoff_child_pid: Option<u32>,
     reload_ledger: Option<&InventoryCoordinator<OsProcessSource>>,
+    unpublished_mechanisms: u64,
 ) -> render::Evidence {
     let semantic = state.semantic_evidence();
     // The frozen consumer map (plan Task 8 Step 2), in one place:
@@ -8925,6 +8932,7 @@ pub(crate) fn evidence_for(
         semantic_capture_failures: kernel_evidence.semantic_capture_failures
             + semantic.semantic_capture_failures,
         unregistered_mechanisms: kernel_evidence.unregistered_mechanisms,
+        unpublished_mechanisms,
         template_tail_failures: kernel_evidence.template_tail_failures,
         process_tracking_fallbacks: tracking_evidence.fallbacks,
         process_tracking_failures: tracking_evidence
@@ -9054,6 +9062,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         None,
         None,
         None,
+        0,
     );
     let mut capture = render::CaptureMeta {
         started: "t0",
@@ -9883,6 +9892,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         assert_eq!(
             evidence.attach_failures,
@@ -17363,6 +17373,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         evidence.mark_terminal_drain_unproven();
         evidence
@@ -19390,6 +19401,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             )
         };
 
@@ -19491,6 +19503,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    0,
                 );
                 assert_eq!(evidence.pause, status);
                 assert_eq!(evidence.unprotected_live_windows, unprotected);
@@ -19565,6 +19578,7 @@ mod tests {
                 None,
                 None,
                 None,
+                0,
             );
             assert_eq!(
                 evidence.unprotected_live_windows, unprotected,
@@ -19606,6 +19620,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
         let capture = render::CaptureMeta {
             started: "t0",
@@ -19661,6 +19676,7 @@ mod tests {
             None,
             None,
             None,
+            0,
         );
 
         assert_eq!(evidence.pid_descendant_gaps, 0);

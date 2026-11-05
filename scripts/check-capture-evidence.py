@@ -21,6 +21,7 @@ COUNTERS = (
     "abi_refusals",
     "semantic_capture_failures",
     "unregistered_mechanisms",
+    "unpublished_mechanisms",
     "template_tail_failures",
     "process_tracking_fallbacks",
     "process_tracking_failures",
@@ -61,12 +62,18 @@ COUNTERS = (
 )
 
 # v2-metrics is retained only for historical fixtures and compatibility reads;
-# it predates the task-uprobe link-loss, ABI-refusal, and semantic-history-drop
-# evidence added to v3.
+# it predates the task-uprobe link-loss, ABI-refusal, semantic-history-drop,
+# and unpublished-mechanism evidence added to v3.
 HISTORICAL_METRICS_SCHEMA = "p11scope/observed-profile/v2-metrics"
 HISTORICAL_COUNTERS = tuple(
     counter for counter in COUNTERS
-    if counter not in {"abi_refusals", "task_uprobe_link_losses", "semantic_history_drops"}
+    if counter
+    not in {
+        "abi_refusals",
+        "task_uprobe_link_losses",
+        "semantic_history_drops",
+        "unpublished_mechanisms",
+    }
 )
 
 # `evidence.loader_discovery` (design §9.2): finite, aggregate, and closed.
@@ -1746,6 +1753,7 @@ def expected_gap_classes(evidence):
             ("module_ambiguous", evidence["module_ambiguous"] > 0),
             ("module_unresolved_slots", evidence["module_unresolved_slots"] > 0),
             ("unregistered_mechanisms", evidence["unregistered_mechanisms"] > 0),
+            ("unpublished_mechanisms", evidence["unpublished_mechanisms"] > 0),
             ("discovery_conflicts", evidence["discovery_conflicts"] > 0),
             ("discovery_uncorroborated", evidence["discovery_uncorroborated"] > 0),
         ],
@@ -4092,6 +4100,7 @@ def document_fixture(evidence, *, schema=PROFILE_SCHEMA, mode="profile", privacy
             evidence.pop("task_uprobe_link_losses", None)
             evidence.pop("abi_refusals", None)
             evidence.pop("semantic_history_drops", None)
+            evidence.pop("unpublished_mechanisms", None)
             evidence.pop("scheduling", None)
             evidence.pop("active_slots", None)
             evidence.pop("kernel_control", None)

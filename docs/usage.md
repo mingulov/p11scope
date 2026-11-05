@@ -1349,8 +1349,9 @@ changing capture behavior, it joins the table above and the `--help` list.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure
-  in any assessed lane instead); `inspect` exits 1 when the target cannot
-  be read.
+  in any assessed lane instead); `inspect --pid` exits 1 when the target
+  cannot be read, while `inspect --system` renders a partial catalog
+  (exit 0) unless the `/proc` listing itself fails.
 - `2` — a CLI usage error (unknown flag, missing value, mutually exclusive
   options, removed subcommand).
 

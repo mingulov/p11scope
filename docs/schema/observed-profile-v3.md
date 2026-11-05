@@ -258,6 +258,17 @@ result (a null table output) is handled uniformly with nonzero `rv`: null
 `uprobe-multi`, derived only from successfully owned links. Before the
 uprobe-multi attachment slice, a nonempty array can contain only `per-offset`.
 
+`unpublished_mechanisms` is a u64 count, always present: approved mechanism
+ids the `MECH_SHAPE` publication could not fit. When the approval union
+(the official PKCS#11 3.2 catalog plus the configured registry) exceeds
+the map's 1,024 entries, the session publishes the official catalog first
+and then registered ids in ascending order up to the cap, instead of
+refusing to start; this count gaps the unpublished tail. Unpublished ids
+count through the existing unregistered path (counted, never decoded),
+and render-side shape notes are computed over the published subset only.
+With the shipped registry the count is 0. Nonzero forces `PARTIAL` with
+the `unpublished_mechanisms` attribution cause.
+
 `attach_backend` is always present in both v3 lanes and says how the session
 chose its static attach backend, as
 the inventory document's `observation.attach` does. The backend is chosen by

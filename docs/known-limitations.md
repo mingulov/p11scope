@@ -1151,6 +1151,23 @@ The old bounds are measurements, not a product startup SLA.
 - Workaround: none needed for ordinary loaders.
 - Planned: none.
 
+### Mechanism approval union past 1,024 publishes an official-first subset (v0.6.0)
+
+- What the user sees: the `MECH_SHAPE` map holds 1,024 mechanism ids. When
+  the approval union (the official PKCS#11 3.2 catalog plus the configured
+  registry) exceeds that, the session publishes the official catalog first
+  and then registered ids in ascending order up to the cap, instead of
+  refusing to start. Unpublished ids count through the existing unregistered
+  path (counted, never decoded). With the shipped registry (465 approved)
+  nothing is unpublished.
+- Kernels/conditions: all; a registry-growth event, not reachable today.
+- Disclosure: `evidence.unpublished_mechanisms` (count, 0 when nothing was
+  shed), the `unpublished mechanisms` gap, and `PARTIAL` when nonzero.
+  Render-side shape notes are computed over the published subset only.
+- Workaround: none needed; the capture continues with the subset.
+- Planned: the cap follows the map; growth past it stays a count-gapped
+  subset, never a refusal.
+
 ### Settlement always `unsettled`
 
 - What the user sees: every native inventory document reads

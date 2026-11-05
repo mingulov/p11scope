@@ -236,6 +236,7 @@ fn document(
         None,
         None,
         None,
+        session.unpublished_mechanisms(),
     );
     evidence.mark_terminal_drain_unproven();
     let kernel_release = std::fs::read_to_string("/proc/sys/kernel/osrelease")?;

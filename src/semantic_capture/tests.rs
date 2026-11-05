@@ -7445,6 +7445,7 @@ mod b17_wire_projection {
             None,
             None,
             ledger,
+            0,
         )
     }
 

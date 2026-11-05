@@ -81,7 +81,8 @@ pub(crate) const COUNT_MANIFEST_NOTE: &str =
 
 /// `p11scope inspect --system` — enumerate, sweep, deep-scan, pin, lower
 /// admission scan-only, render. Exit 0 when the loop ran (even with zero
-/// objects); a fully-unreadable machine is a hard error like pid-inspect.
+/// objects); a fully-unreadable machine renders a partial catalog with
+/// per-process reasons, and only a failed `/proc` listing is a hard error.
 pub fn run(
     hints: &[PathBuf],
     excludes: &[PathBuf],
@@ -355,13 +356,6 @@ impl Collection {
             .iter()
             .filter(|member| matches!(member.status, MemberStatus::Unreadable { .. }))
             .count()
-    }
-
-    fn first_unreadable_reason(&self) -> Option<&str> {
-        self.members.iter().find_map(|member| match &member.status {
-            MemberStatus::Unreadable { reason } => Some(reason.as_str()),
-            _ => None,
-        })
     }
 }
 
@@ -844,10 +838,11 @@ fn member_not_scanned(
     }
 }
 
-/// The fully-unreadable rule (A3), pure over the collection counts so the
-/// branches are unit-testable: a machine is unreadable when processes were
-/// enumerated but not one could be inventoried and at least one loss is
-/// not a proven exit. All-exited is an empty machine, not an error.
+/// The render rule (A3, ruling JK-22a), pure over the collection counts
+/// so the branches are unit-testable: enumerated processes are rendered
+/// however unreadable they are — each unreadability is a named, countable
+/// gap with its per-process reason, and the catalog reads partial. Only a
+/// failed `/proc` listing (no data source at all) is a hard error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SystemOutcome {
     Render,
@@ -857,49 +852,25 @@ enum SystemOutcome {
 #[derive(Debug, Clone, Copy)]
 struct OutcomeStats {
     enumerated: usize,
-    scanned: usize,
-    unreadable: usize,
     proc_list_failed: bool,
 }
 
 fn decide_system_outcome(stats: OutcomeStats) -> SystemOutcome {
-    if stats.scanned > 0 {
-        return SystemOutcome::Render;
+    if stats.enumerated == 0 && stats.proc_list_failed {
+        return SystemOutcome::HardError;
     }
-    if stats.enumerated == 0 {
-        return if stats.proc_list_failed {
-            SystemOutcome::HardError
-        } else {
-            SystemOutcome::Render
-        };
-    }
-    if stats.unreadable > 0 {
-        SystemOutcome::HardError
-    } else {
-        SystemOutcome::Render
-    }
+    SystemOutcome::Render
 }
 
-fn unreadable_system_error(collection: &Collection) -> anyhow::Error {
-    let unreadable = collection.unreadable();
+fn proc_list_system_error(collection: &Collection) -> anyhow::Error {
     let first = collection
-        .first_unreadable_reason()
+        .scope_gaps
+        .iter()
+        .map(|gap| gap.reason.as_str())
+        .find(|reason| reason.contains("no process was discovered"))
+        .or_else(|| collection.scope_gaps.first().map(|gap| gap.reason.as_str()))
         .unwrap_or("unknown reason");
-    let denied = first.contains("Permission denied")
-        || first.contains("not permitted")
-        || collection
-            .scope_gaps
-            .iter()
-            .any(|gap| gap.reason.contains("Permission denied"));
-    let fix = if denied {
-        "; their modules are unknown, not absent. Processes owned by other users need \
-         root: run `sudo p11scope inspect --system`"
-    } else {
-        "; their modules are unknown, not absent"
-    };
-    anyhow::anyhow!(
-        "cannot inspect system: no process could be read ({unreadable} unreadable): {first}{fix}"
-    )
+    anyhow::anyhow!("cannot inspect system: {first}")
 }
 
 /// Per-object admission: the plan's verdict for a pinned object, or the
@@ -1121,8 +1092,8 @@ pub(crate) struct CatalogLowering {
 
 /// Collect the machine, lower scan-only admission under `policy`, assemble
 /// the catalog. `inspect --system` lowers Detailed; the inventory command
-/// lowers Inventory. The only `Err` is the fully-unreadable machine
-/// (stdout stays empty).
+/// lowers Inventory. The only `Err` is a failed `/proc` listing
+/// (stdout stays empty); unreadable members render as gaps.
 pub(crate) fn collect(
     hints: &[PathBuf],
     excludes: &[PathBuf],
@@ -1232,12 +1203,10 @@ fn collect_identity(
     };
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
-        scanned: collection.scanned(),
-        unreadable: collection.unreadable(),
         proc_list_failed: collection.proc_list_failed,
     };
     if decide_system_outcome(stats) == SystemOutcome::HardError {
-        return Err(unreadable_system_error(&collection));
+        return Err(proc_list_system_error(&collection));
     }
     progress!("p11scope: lowering scan-only admission and rendering...");
     let bind_start = monotonic_ns();
@@ -2668,6 +2637,20 @@ fn empty_explanation(collection: &Collection, matched: usize, skipped: &[PidGap]
             if skipped.len() == 1 { "" } else { "s" }
         ));
     }
+    let denied = collection.members.iter().any(|member| {
+        matches!(&member.status, MemberStatus::Unreadable { reason }
+            if reason.contains("Permission denied") || reason.contains("not permitted"))
+    }) || collection
+        .scope_gaps
+        .iter()
+        .any(|gap| gap.reason.contains("Permission denied"));
+    if denied {
+        parts.push(
+            "some processes could not be read (permission denied); their modules are unknown, \
+             not absent — rerun with `sudo p11scope inspect --system` for full coverage"
+                .to_string(),
+        );
+    }
     parts.push(
         "where next: load a PKCS#11 provider in a process, then re-run `p11scope inspect \
          --system`; `p11scope doctor` checks host readiness"
@@ -4027,12 +4010,10 @@ pub(crate) fn collect_system_with_identity(
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
-        scanned: collection.scanned(),
-        unreadable: collection.unreadable(),
         proc_list_failed: collection.proc_list_failed,
     };
     if decide_system_outcome(stats) == SystemOutcome::HardError {
-        return Err(unreadable_system_error(&collection));
+        return Err(proc_list_system_error(&collection));
     }
     progress!("p11scope: lowering scan-only admission and rendering...");
     let bind_start = monotonic_ns();
@@ -7225,16 +7206,115 @@ mod tests {
                     .any(|note| note.subject == "discovery capped")
             );
         }
+
+        fn unreadable(pid: u32, view: u32, detail: &str) -> MemberResult {
+            let mut noise = DiscoveryNoiseAggregator::default();
+            let skip = unreadable_member_skip(pid, false, detail, &mut noise)
+                .expect("a live pid earns a gap");
+            MemberResult {
+                mapping_scan_completed: false,
+                application: InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
+                complete_scan: None,
+                hints_examined: false,
+                pid,
+                view: ProcessViewId(view),
+                status: MemberStatus::Unreadable {
+                    reason: detail.to_string(),
+                },
+                generation: None,
+                modules: Vec::new(),
+                examined: Vec::new(),
+                pins: PinnedObjects::empty(),
+                gaps: vec![PidGap::generic_member(pid, skip)],
+                scan_ms: 0,
+            }
+        }
+
+        #[test]
+        fn fully_unreadable_collection_assembles_zero_objects_with_sudo_hint() {
+            let denied =
+                "the process generation could not be pinned: Permission denied (os error 13)";
+            let collection = Collection {
+                enumerated: vec![7, 9],
+                selected: vec![7, 9],
+                cap: MAX_SCAN_PIDS,
+                cap_hit: false,
+                members: vec![unreadable(7, 0, denied), unreadable(9, 1, denied)],
+                scope_gaps: Vec::new(),
+                proc_list_failed: false,
+                sweep: Vec::new(),
+                sweep_unavailable: BTreeSet::new(),
+                budget: CaptureWorkBudget::default(),
+            };
+            let catalog = catalog_of(collection, HashMap::new(), false);
+            assert!(catalog.objects.is_empty(), "no object was proven");
+            assert_eq!(catalog.scan_status, "partial");
+            assert!(
+                !catalog.skipped.is_empty(),
+                "the unreadable loss is a skipped gap"
+            );
+            assert!(
+                catalog
+                    .processes
+                    .iter()
+                    .all(|process| process.status.label() == "unreadable"
+                        && process.status.reason().is_some()),
+                "every process keeps its own reason"
+            );
+            let explanation = catalog
+                .explanation
+                .as_deref()
+                .expect("the empty catalog explains itself");
+            assert!(
+                explanation.contains("sudo p11scope inspect --system"),
+                "an unprivileged user is told to rerun with sudo: {explanation}"
+            );
+            let document = render_json(&catalog);
+            assert_eq!(document["scan"]["status"], "partial");
+            assert_eq!(document["objects"].as_array().map(Vec::len), Some(0));
+            assert!(
+                document["explanation"]
+                    .as_str()
+                    .is_some_and(|text| text.contains("sudo p11scope inspect --system")),
+                "the JSON carries the same hint: {document}"
+            );
+        }
+
+        #[test]
+        fn fully_scanned_empty_machine_stays_complete_without_sudo_hint() {
+            let collection = Collection {
+                enumerated: vec![7],
+                selected: vec![7],
+                cap: MAX_SCAN_PIDS,
+                cap_hit: false,
+                members: vec![scanned(7, 0, Vec::new(), PinnedObjects::empty())],
+                scope_gaps: Vec::new(),
+                proc_list_failed: false,
+                sweep: Vec::new(),
+                sweep_unavailable: BTreeSet::new(),
+                budget: CaptureWorkBudget::default(),
+            };
+            let catalog = catalog_of(collection, HashMap::new(), false);
+            assert!(catalog.objects.is_empty(), "no provider was mapped");
+            assert_eq!(catalog.scan_status, "complete");
+            assert!(catalog.skipped.is_empty(), "{:?}", catalog.skipped);
+            let explanation = catalog
+                .explanation
+                .as_deref()
+                .expect("the empty catalog explains itself");
+            assert!(
+                !explanation.contains("sudo"),
+                "full coverage needs no sudo hint: {explanation}"
+            );
+        }
     }
 
     #[test]
-    fn fully_unreadable_rule_needs_a_loss_besides_proven_exits() {
+    fn system_outcome_renders_unless_the_proc_listing_failed() {
         // Nothing enumerated and the listing itself failed: hard error.
         assert_eq!(
             decide_system_outcome(OutcomeStats {
                 enumerated: 0,
-                scanned: 0,
-                unreadable: 0,
                 proc_list_failed: true,
             }),
             SystemOutcome::HardError
@@ -7243,38 +7323,15 @@ mod tests {
         assert_eq!(
             decide_system_outcome(OutcomeStats {
                 enumerated: 0,
-                scanned: 0,
-                unreadable: 0,
                 proc_list_failed: false,
             }),
             SystemOutcome::Render
         );
-        // Enumerated, nothing inventoried, all exits proven: empty, not error.
+        // Enumerated, nothing inventoried: gaps with per-process reasons,
+        // not a stop — ruling JK-22a.
         assert_eq!(
             decide_system_outcome(OutcomeStats {
                 enumerated: 9,
-                scanned: 0,
-                unreadable: 0,
-                proc_list_failed: false,
-            }),
-            SystemOutcome::Render
-        );
-        // Enumerated, nothing inventoried, one real loss: hard error.
-        assert_eq!(
-            decide_system_outcome(OutcomeStats {
-                enumerated: 9,
-                scanned: 0,
-                unreadable: 1,
-                proc_list_failed: false,
-            }),
-            SystemOutcome::HardError
-        );
-        // One inventoried member renders whatever else happened.
-        assert_eq!(
-            decide_system_outcome(OutcomeStats {
-                enumerated: 9,
-                scanned: 1,
-                unreadable: 8,
                 proc_list_failed: false,
             }),
             SystemOutcome::Render
@@ -7282,63 +7339,42 @@ mod tests {
     }
 
     #[test]
-    fn unreadable_system_error_names_the_cause_and_the_sudo_fix() {
+    fn fully_unreadable_machine_renders_a_partial_catalog() {
+        // Ruling JK-22a: enumerated but unreadable processes are gaps with
+        // per-process reasons, not a stop. Only a failed /proc listing
+        // (no data source at all) stays a hard error.
+        assert_eq!(
+            decide_system_outcome(OutcomeStats {
+                enumerated: 9,
+                proc_list_failed: false,
+            }),
+            SystemOutcome::Render
+        );
+    }
+
+    #[test]
+    fn proc_list_error_names_the_failed_listing() {
+        // The only remaining hard error: /proc could not be listed, so no
+        // data source exists. Unreadable members render as gaps instead
+        // (see fully_unreadable_collection_assembles_zero_objects_with_sudo_hint).
         let collection = Collection {
-            enumerated: vec![1, 2],
-            selected: vec![1, 2],
+            enumerated: Vec::new(),
+            selected: Vec::new(),
             cap: MAX_SCAN_PIDS,
             cap_hit: false,
-            members: vec![
-                MemberResult {
-                    mapping_scan_completed: false,
-                    application: InspectApplicationResult::Unknown(
-                        InspectIdentityUnknown::NotExamined,
-                    ),
-                    complete_scan: None,
-                    hints_examined: false,
-                    pid: 1,
-                    view: ProcessViewId(0),
-                    generation: None,
-                    status: MemberStatus::Unreadable {
-                        reason: "the process generation could not be pinned: Permission denied \
-                                 (os error 13)"
-                            .into(),
-                    },
-                    modules: Vec::new(),
-                    examined: Vec::new(),
-                    pins: PinnedObjects::empty(),
-                    gaps: Vec::new(),
-                    scan_ms: 0,
-                },
-                MemberResult {
-                    mapping_scan_completed: false,
-                    application: InspectApplicationResult::Unknown(
-                        InspectIdentityUnknown::NotExamined,
-                    ),
-                    complete_scan: None,
-                    hints_examined: false,
-                    pid: 2,
-                    view: ProcessViewId(1),
-                    status: MemberStatus::Exited,
-                    generation: None,
-                    modules: Vec::new(),
-                    examined: Vec::new(),
-                    pins: PinnedObjects::empty(),
-                    gaps: Vec::new(),
-                    scan_ms: 0,
-                },
-            ],
-            scope_gaps: Vec::new(),
-            proc_list_failed: false,
+            members: Vec::new(),
+            scope_gaps: vec![PidGap::scope(Skipped {
+                subject: "system".into(),
+                reason: "/proc could not be listed (os error 5); no process was discovered".into(),
+            })],
+            proc_list_failed: true,
             sweep: Vec::new(),
             sweep_unavailable: BTreeSet::new(),
             budget: CaptureWorkBudget::default(),
         };
-        let error = format!("{:#}", unreadable_system_error(&collection));
-        assert!(error.contains("no process could be read"), "{error}");
-        assert!(error.contains("Permission denied"), "{error}");
-        assert!(error.contains("unknown, not absent"), "{error}");
-        assert!(error.contains("sudo p11scope inspect --system"), "{error}");
+        let error = format!("{:#}", proc_list_system_error(&collection));
+        assert!(error.contains("cannot inspect system"), "{error}");
+        assert!(error.contains("no process was discovered"), "{error}");
     }
 
     #[test]

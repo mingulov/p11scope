@@ -12355,6 +12355,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         abi_refusals: 0,
         semantic_capture_failures: 0,
         unregistered_mechanisms: 0,
+        unpublished_mechanisms: 0,
         template_tail_failures: 0,
         process_tracking_fallbacks: 0,
         process_tracking_failures: 0,

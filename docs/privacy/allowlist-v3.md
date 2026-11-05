@@ -38,7 +38,11 @@ publishes no new field,
 and [reload-disclosure linkage publication](#reload-disclosure-linkage-publication-b17-leg-2-2026-11-04),
 which names the `instance_reload_not_excluded` labels-and-counts projection,
 and [gap-admission prefix publication](#gap-admission-prefix-publication-jk-22a),
-which names the admitted-prefix counts in module gaps.**
+which names the admitted-prefix counts in module gaps,
+and [detach-quarantine refusal publication](#detach-quarantine-refusal-publication-ruling-jk-22a-2026-11-05),
+which names refused slots with their recorded detach reason and no new capture,
+and [unpublished mechanism approval count](#unpublished-mechanism-approval-count-ruling-jk-22a-2026-11-05),
+which gaps shed approval ids by count only.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1512,3 +1516,36 @@ the gap-reason text itself.
 | --- | --- | --- | --- |
 | Closure prefix gap (`closure_prefix`) | A pure projection of the planner's prefix decision: the count of leading template tables attached and the count of distinct tables decoded for that closure-array object. No target-memory, argument, pointer or file read happens for this field; the tables were decoded by the existing scan. The record exists only when at least one table attached and at least one did not. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` ends with the `(closure_prefix)` name beside the `N of M template tables attached` counts, in every scope. Terminal text carries the same reason through the `Module gaps` section. A zero-table outcome stays a whole refusal, never a `0 of M` partial. | No address, offset, entry name, table content, key or payload value reaches output. A refused whole closure keeps its existing refusal text. Required evidence: the shared-scope prefix test with its `(closure_prefix)` pin, the named-scope prefix tests, the whole-admission healthy twin, and the start-anchored `N of M` reader pins in `scripts/check-capture-evidence.py` and `scripts/verify-p11kit-remote.sh`. |
 | Provider prefix gap (`provider_prefix`) | A pure projection of the planner's prefix decision: the count of leading endpoints attached and the count of fresh endpoints the shared-scope Detailed provider needed. No target-memory, argument, pointer or file read happens for this field; the endpoints were decoded by the existing scan. The record exists only when at least one endpoint attached and at least one did not; a provider whose strongest table does not fit within its reserve-aware budget, or whose corroborated (published) tables together do not fit, stays a whole refusal — published tables stay atomic and never prefix. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` carries the `A of N endpoints attached` counts with the `(provider_prefix)` name, plus the reserve clause when the module was held out of the shared-scope reserve. Terminal text carries the same reason through the `Module gaps` section with `partially covered` status. | No address, offset, entry name, table content, key or payload value reaches output. Operator (manifest), Inventory, counter and broad modules keep their whole-only rule and existing refusal text. Required evidence: the shared-scope provider-prefix test with its `(provider_prefix)` pin, the exact-fit healthy twin, the strongest-table whole-refusal pins, the published-union whole-refusal pin, and the catalog prefix-gap test. |
+
+## Detach-quarantine refusal publication (ruling JK-22a, 2026-11-05)
+
+**Status: IMPLEMENTED in v0.6.0 under ruling JK-22a (never-stop partial
+coverage, owner rule 2026-11-05): a refused slot names its quarantine and
+the recorded detach reason. No new capture exists; allowlist-v1 bytes are
+unchanged.** A static slot whose detach failed refuses re-attachment while
+unrelated slots keep admitting. The refusal carries only the capture-local
+slot index, the fixed `quarantined after detach failure` name, and the
+recorded detach reason (a static BPF program name plus a kernel/libbpf
+error string). Dynamic-hook and diagnostic refusals return the same
+vocabulary to the caller; their JSON mark stays the existing generic
+partial record.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Slot quarantine refusal (`evidence.attach_failures[]`) | The Session's existing per-slot attach-failure record, written only when `attachment_admission_for` refuses a proposed slot index already in the detach quarantine. The slot index is the existing capture-local plan allocation; the reason is the first recorded detach message for that unit (static program names such as `p11_return` plus aya/libbpf error text — no path, PID, address, handle, payload or key material). Control bytes are escaped at the existing attach-failures publication boundary. No target-memory, argument, pointer, map or file read happens for this record. | The existing `evidence.attach_failures` array (profile/metrics/trace lanes) and the matching terminal `attach failed (slot N)` diagnostic; the existing `attach_failures` gap cause forces `PARTIAL`. | A global (unattributed) quarantine refuses without per-slot records; the terminal detach story stays in the existing detach-failure evidence. Required evidence: slot/dynamic/global/empty quarantine twins at the admission seam. |
+
+## Unpublished mechanism approval count (ruling JK-22a, 2026-11-05)
+
+**Status: IMPLEMENTED in v0.6.0 under ruling JK-22a (never-stop partial
+coverage, owner rule 2026-11-05): an oversized approval union publishes
+its official-first subset and gaps the rest by count. No new capture
+exists; allowlist-v1 bytes are unchanged.** The count is a pure function
+of the compiled-in mechanism registry (official catalog size plus
+configured vendor overlay minus map capacity): it names no observed call,
+mechanism id, process, path or handle. No unpublished id is published
+anywhere; the tail is visible only as this count plus the existing
+unregistered counting for ids that are actually observed.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Approval shed count (`evidence.unpublished_mechanisms`) | The Session's retained `MECH_SHAPE` publication count: approved-union size minus published-subset size, computed once at session preparation from the same registry the publication used (never recomputed at render). A u64, 0 unless the union exceeded 1,024 entries. No target-memory, argument, pointer, map or file read happens for this record. | `evidence.unpublished_mechanisms` (profile/metrics/trace lanes) with the `unpublished mechanisms` gap line; the `unpublished_mechanisms` attribution cause forces `PARTIAL` when nonzero. | Render-side shape notes are computed over the published subset only, so an unpublished id reads "no diagnostic shape", never "decode failed". Required evidence: the official-first overflow twin, the exact-partition twin, and the within-capacity whole-union twin at the selection seam. |

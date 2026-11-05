@@ -1021,6 +1021,12 @@ pub struct Evidence {
     pub abi_refusals: u64,
     pub semantic_capture_failures: u64,
     pub unregistered_mechanisms: u64,
+    /// Approved mechanism ids the `MECH_SHAPE` publication could not fit
+    /// (ruling JK-22a): the official-first subset published instead of
+    /// refusing the session, and these stayed unpublished, counting
+    /// through the unregistered path. Zero unless the approval union
+    /// exceeded the map.
+    pub unpublished_mechanisms: u64,
     pub template_tail_failures: u64,
     pub process_tracking_fallbacks: u64,
     pub process_tracking_failures: u64,
@@ -1841,6 +1847,7 @@ impl Evidence {
             "unregistered_mechanisms",
             self.unregistered_mechanisms > 0,
         );
+        cause(a, "unpublished_mechanisms", self.unpublished_mechanisms > 0);
         cause(a, "discovery_conflicts", self.discovery.conflicts > 0);
         cause(
             a,
@@ -2617,6 +2624,7 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
             "unregistered_mechanisms" => {
                 count(ev.unregistered_mechanisms, "unregistered mechanisms")
             }
+            "unpublished_mechanisms" => count(ev.unpublished_mechanisms, "unpublished mechanisms"),
             "discovery_conflicts" => count(ev.discovery.conflicts, "discovery conflicts"),
             "discovery_uncorroborated" => {
                 count(ev.discovery.uncorroborated, "uncorroborated modules")
@@ -3796,6 +3804,7 @@ pub(crate) mod tests {
             abi_refusals: 0,
             semantic_capture_failures: 0,
             unregistered_mechanisms: 0,
+            unpublished_mechanisms: 0,
             template_tail_failures: 0,
             process_tracking_fallbacks: 0,
             process_tracking_failures: 0,
@@ -5174,6 +5183,7 @@ pub(crate) mod tests {
             ("unregistered_mechanisms", |ev| {
                 ev.unregistered_mechanisms = 1
             }),
+            ("unpublished_mechanisms", |ev| ev.unpublished_mechanisms = 1),
         ] {
             let mut ev = evidence();
             mutate(&mut ev);

@@ -9925,6 +9925,50 @@ mod tests {
         assert!(reason.contains("sudo"), "{reason}");
     }
 
+    /// Item 6: the auto PID fallback advises sudo only when the typed
+    /// host cause is `Denied` (sudo cannot help an old kernel or a
+    /// verifier-shaped refusal).
+    #[test]
+    fn auto_pid_fallback_advises_sudo_only_for_denied() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        for (stage, errno, sudo) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EPERM), true),
+            (MultiHostStage::SelfLink, Some(libc::EACCES), true),
+            (MultiHostStage::ProgramLoad, Some(libc::EACCES), false),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS), false),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL), false),
+            (MultiHostStage::Anchor, None, false),
+        ] {
+            let mut coordinator = coordinator();
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let lane = open_native_lane_with(
+                CaptureMode::Auto,
+                BackendSelection::Auto,
+                Scope::Pid(std::process::id()),
+                &mut coordinator,
+                |_, _, _| Err(refusal.into()),
+            )
+            .expect("auto PID capture falls back to scan on host refusal");
+            assert!(lane.is_none(), "fallback leaves no native lane");
+            coordinator.registry_mut().publish();
+            let gaps: Vec<(String, String)> = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                .collect();
+            let (_, reason) = gaps
+                .iter()
+                .find(|(subject, _)| subject == "native usage feed unavailable")
+                .expect("fallback records a named gap");
+            assert_eq!(
+                reason.contains("sudo"),
+                sudo,
+                "{stage:?}/{errno:?}: {reason}"
+            );
+        }
+    }
+
     /// Extract one top-level function body from this file's source for the
     /// wiring pin below (the uretprobe loader-contract shape).
     fn pin_body<'a>(

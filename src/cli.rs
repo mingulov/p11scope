@@ -3861,6 +3861,40 @@ mod tests {
         ));
     }
 
+    /// Item 31: the `doctor --module` refusal names the runnable
+    /// `p11scope` command, like every sibling refusal.
+    #[test]
+    fn doctor_module_refusal_names_runnable_p11scope_command() {
+        let Err(CliError::Usage { message, .. }) =
+            parse(args(&["doctor", "--module", "/opt/provider.so"]))
+        else {
+            panic!("doctor --module must be refused");
+        };
+        assert_eq!(
+            message,
+            "doctor --module is not supported; use 'p11scope inspect --pid <n> --module \
+             <provider.so>' to list mapped providers"
+        );
+    }
+
+    /// Item 17: profile/trace/run helps say scan-only discovery names
+    /// functions from the standard table without confirming them (the
+    /// output names them; "counted but not named" contradicts it).
+    #[test]
+    fn scan_only_help_names_unconfirmed_standard_table_names() {
+        let trace = trace_help();
+        for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
+            assert!(
+                help.contains(
+                    "scan-only discovery names functions from the standard table without \
+                     confirming them"
+                ),
+                "{help:.300}"
+            );
+            assert!(!help.contains("counted but not named"), "{help:.300}");
+        }
+    }
+
     #[test]
     fn doctor_extra_strict_defaults_off_and_parses() {
         let Command::Doctor(d) = parse(args(&["doctor"])).unwrap() else {

@@ -48,6 +48,20 @@ def trace_fixture(*, lost_values=(), truncated=False, functions=(),
 
 
 class TraceIdentityConsumerTests(unittest.TestCase):
+    def test_singular_human_tail_after_evidence_is_accepted(self):
+        text = trace_fixture(functions=["C_Sign"])
+        text += ("1 completed call; 0 returned errors; 1 entry without an observed return.\n"
+                 "coverage: partial — 1 entry without an observed return\n"
+                 "run with -v for details\n")
+        result = MEASURE["parse_trace_stream"](text.splitlines())
+        self.assertEqual(result["per_function"], {"C_Sign": 1})
+
+    def test_malformed_tail_after_evidence_is_rejected(self):
+        text = trace_fixture(functions=["C_Sign"])
+        text += "one completed call; none returned errors; nothing else\n"
+        with self.assertRaisesRegex(ValueError, "unrecognized trace tail line"):
+            MEASURE["parse_trace_stream"](text.splitlines())
+
     def test_unknown_and_legacy_rows_keep_exact_stream_counts(self):
         text = trace_fixture(functions=["C_Sign", "C_Sign"])
         text = text.replace("pid 111 tid 111", "Unknown executable (PID 111, TID 111)", 1)

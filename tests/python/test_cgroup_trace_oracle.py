@@ -471,5 +471,27 @@ class OracleTests(unittest.TestCase):
         self.assertFalse(ORACLE['evaluate'](named, ledger, receipt)['pass'])
 
 
+class TraceTailTests(unittest.TestCase):
+    HEADERS = ("Trace — completed call events in arrival order\n"
+               "Executable labels use verified observed paths; "
+               "event PID/TID remain diagnostic identifiers.\n"
+               "CAPTURE privacy=allowlisted\n"
+               "COUNT_EVIDENCE {}\n"
+               "EVIDENCE {}\n")
+
+    def test_singular_totals_are_accepted(self):
+        for totals in ("2 completed calls; 0 returned errors; 0 entries without an observed return.",
+                       "1 completed call; 1 returned error; 1 entry without an observed return."):
+            with self.subTest(totals=totals):
+                text = self.HEADERS + totals + "\n"
+                _, _, _, errors = ORACLE["parse_trace"](text)
+                self.assertEqual(errors, [])
+
+    def test_malformed_totals_are_still_an_error(self):
+        text = self.HEADERS + "one completed call; none returned errors; nothing else\n"
+        _, _, _, errors = ORACLE["parse_trace"](text)
+        self.assertTrue(any("unexpected trace record" in error for error in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()

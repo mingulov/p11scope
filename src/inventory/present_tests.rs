@@ -929,6 +929,47 @@ fn overview_observations_preserve_evidence_meaning() {
     }
 }
 
+/// Item 38: a watched edge whose mapping predates the watch discloses
+/// the pre-watch window: calls before the watch started are not
+/// counted. A zero (unknown) or post-watch first sighting keeps the
+/// plain covered-interval line.
+#[test]
+fn watched_no_use_with_pre_watch_mapping_discloses_window() {
+    for (first_seen, expected) in [
+        (
+            40,
+            "No entries observed during the covered interval; mapped at least 60ns before the \
+             watch started, earlier calls are not counted",
+        ),
+        (
+            0,
+            "No entries observed during the covered interval",
+        ),
+        (
+            100,
+            "No entries observed during the covered interval",
+        ),
+        (
+            150,
+            "No entries observed during the covered interval",
+        ),
+    ] {
+        let harness = varied_harness();
+        let mut presentation = capture_for(&harness, &harness.render());
+        presentation.edges.truncate(1);
+        let edge = &mut presentation.edges[0];
+        edge.entry_count = 0;
+        edge.entry_saturated = false;
+        edge.coverage = UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: None,
+        };
+        edge.mapping_first_seen_ns = first_seen;
+        let label = observation_label_at(&presentation.edges[0], presentation.ended_ns);
+        assert_eq!(label, expected, "first_seen {first_seen}");
+    }
+}
+
 #[test]
 fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     let harness = varied_harness();

@@ -1678,6 +1678,41 @@ mod tests {
         assert!(!capless_root.contains("lockdown"), "{capless_root}");
     }
 
+    /// The privilege refusal shares the host-gate wording (`needs`,
+    /// `refused to load`, `run with sudo`), not a parallel vocabulary.
+    #[test]
+    fn not_permitted_wording_matches_host_gate() {
+        assert_not_permitted_wording_matches_host_gate();
+    }
+
+    fn assert_not_permitted_wording_matches_host_gate() {
+        let why = "loading the BPF object: Operation not permitted (os error 1)";
+        let user = not_permitted_message(why, facts(false, false, Some(2)));
+        assert!(
+            user.contains("the kernel refused to load p11scope's BPF programs"),
+            "{user}"
+        );
+        assert!(user.contains("needs root"), "{user}");
+        assert!(user.contains("run with sudo"), "{user}");
+        assert!(!user.contains("requires root"), "{user}");
+        assert!(!user.contains("run it with sudo"), "{user}");
+        assert!(!user.contains("cannot load"), "{user}");
+        for message in [
+            not_permitted_message(why, facts(true, true, Some(2))),
+            not_permitted_message(why, facts(true, false, Some(2))),
+            not_permitted_message(
+                why,
+                PrivilegeFacts {
+                    init_user_ns: Some(false),
+                    ..facts(true, true, Some(4))
+                },
+            ),
+        ] {
+            assert!(!message.contains("requires "), "{message}");
+            assert!(!message.contains("cannot load"), "{message}");
+        }
+    }
+
     /// DR-K8S-3: the self-probe attaches through `perf_event_open`, which
     /// `perf_event_paranoid >= 3` refuses to anything without CAP_SYS_ADMIN
     /// (CAP_PERFMON does not lift it). That refusal must name the sysctl

@@ -1078,6 +1078,20 @@ class ReadinessGateTests(unittest.TestCase):
                             os.close(fd)
 
 
+class ReadinessPatternTests(unittest.TestCase):
+    def test_readiness_matches_pluralized_probe_counts(self):
+        readiness = HARNESS.get("READINESS_RE")
+        self.assertIsNotNone(readiness, "the oracle exposes its readiness pattern")
+        for text in (b"p11scope: capturing: 136 probes attached; stop with Ctrl-C\n",
+                     b"p11scope: capturing: 1 probe attached; stop with Ctrl-C\n"):
+            self.assertIsNotNone(readiness.search(text), text)
+        self.assertIsNone(
+            readiness.search(b"p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n"))
+        self.assertIsNone(
+            readiness.search(b"p11scope: capturing: waiting for the command to load a provider; "
+                             b"stop with Ctrl-C\n"))
+
+
 class InventorySavedCaptureTests(unittest.TestCase):
     def test_only_committed_owned_positive_milestones_release_calls(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))

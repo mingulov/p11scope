@@ -419,3 +419,45 @@ fn actual_trace_formatter_is_accepted_by_canary_privacy_consumer() {
         String::from_utf8_lossy(&result.stderr)
     );
 }
+
+// The header note plus the human tail (with singular totals) must pass
+// the same privacy consumer: every line is a frozen shape.
+#[test]
+fn singular_trace_tail_is_accepted_by_canary_privacy_consumer() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let event = Event {
+        pid_tgid: (111u64 << 32) | 112,
+        duration_ns: 12000,
+        ..Event::default()
+    };
+    let line = trace::format_line(&event, 0, "C_Sign", None);
+    // The singular totals line the producer emits for (1, 0, 1) (pinned
+    // by `totals_line_singularizes_one`); the consumer must accept it.
+    let text = format!(
+        "{}\n{}\n{}\n{line}\nCOUNT_EVIDENCE {{\"stats_entered\": 1}}\nEVIDENCE \
+         {{\"privacy_mode\": \"allowlisted\"}}\n1 completed call; 0 returned errors; 1 entry \
+         without an observed return.\ncoverage: partial — nothing known was \
+         lost\nrun with -v for details\n",
+        trace::capture_line(CapturePolicy::Allowlisted),
+        trace::identity_note(),
+        trace::unverified_note(),
+    );
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-canary-evidence.py");
+    let mut child = Command::new("python3").args(["-I", "-c",
+        "import runpy,sys; n=runpy.run_path(sys.argv[1]); rest=n['trace_scannable']('renderer',sys.stdin.read()); n['assert_no_loader_pause_identity']('renderer',rest)"])
+        .arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}

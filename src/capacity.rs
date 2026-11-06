@@ -2640,6 +2640,18 @@ mod tests {
         );
     }
 
+    /// The `--max-endpoints` refusal spells the range the way the help
+    /// does (`1–8192`), since the error points at that help.
+    #[test]
+    fn max_endpoints_refusal_uses_help_range_notation() {
+        let refusal = inventory_endpoint_budget(Some(99_999)).unwrap_err();
+        assert_eq!(
+            refusal,
+            "--max-endpoints must be in 1–8192 (requested 99999)"
+        );
+        assert!(!refusal.contains("1..=8192"), "{refusal}");
+    }
+
     #[test]
     fn inventory_default_covers_a_twenty_thousand_endpoint_host() {
         let default = inventory_endpoint_budget(None).unwrap();

@@ -65,6 +65,32 @@ fn application_and_module_paths_are_resolved_and_basename_collisions_stay_separa
     assert!(!output.contains("exe_path_ref"));
 }
 
+/// Item 20: no bare `Top changed applications:` header when the
+/// application section is empty (a module-path-only diff still names
+/// its path line).
+#[test]
+fn empty_application_section_omits_the_applications_header() {
+    let before = document();
+    let mut after = before.clone();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let mut report = report(&before, &after);
+    assert!(
+        !report.module_path_changes.is_empty(),
+        "the fixture flip must move a module path"
+    );
+    report.application_changes.clear();
+    let output = text(&report);
+    assert!(
+        !output.contains("Top changed applications:"),
+        "no bare header without rows: {output}"
+    );
+    assert!(
+        output.contains("module path changed (--json lists each)")
+            || output.contains("module paths changed (--json lists each)"),
+        "the path line survives: {output}"
+    );
+}
+
 #[test]
 fn independent_counts_loss_and_saturation_agree_with_the_typed_report() {
     let mut before = document();

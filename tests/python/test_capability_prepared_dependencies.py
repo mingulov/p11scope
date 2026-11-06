@@ -113,6 +113,10 @@ class CapabilityFixture:
 
 
 class CapabilityPreparedDependenciesTests(unittest.TestCase):
+    def test_full_run_requests_verbose_doctor_for_the_tier_line(self):
+        text = (ROOT / "scripts/verify-capability-tier.sh").read_text(encoding="utf-8")
+        self.assertIn("doctor -v --pid", text)
+        self.assertNotIn("exec '$BIN' doctor --pid '$TARGET_PID'", text)
     def fixture(self, name):
         temporary = tempfile.TemporaryDirectory(prefix="capability-prepared-")
         self.addCleanup(temporary.cleanup)

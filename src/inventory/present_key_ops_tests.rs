@@ -307,6 +307,99 @@ fn key_ops_line_journal_unavailable_names_tracking_off() {
 }
 
 #[test]
+fn key_ops_line_requested_without_manifest_names_manifest() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.key_operations_requested = true;
+    presentation.manifests_present = false;
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: requested, but per-key tracking needs --manifest on this build",
+        "requested without a manifest never reads 'off':\n{snapshot}"
+    );
+}
+
+#[test]
+fn key_ops_line_requested_with_manifest_and_no_gap_stays_off() {
+    // Requested with a manifest but no start was recorded and no gap
+    // exists (no start was refused): the conservative fallthrough is
+    // "off", and only the manifest-less request names --manifest.
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.key_operations_requested = true;
+    presentation.manifests_present = true;
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: not reported (per-key tracking is off)",
+        "manifested request without a gap stays off:\n{snapshot}"
+    );
+}
+
+/// Item 6: concise folds a denied live-capture refusal to one short
+/// clause; the full host summary stays verbose-only.
+#[test]
+fn concise_gap_summary_folds_denied_capture_refusal() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    let stored = "live capture refused (live capture needs root: the kernel refused to load \
+        p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope \
+        inspect --pid N' for a scan without capture.); run with sudo for full capture";
+    presentation.gaps.push(named_gap(
+        "native usage feed unavailable",
+        stored,
+    ));
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let gaps = concise
+        .lines()
+        .find(|line| line.starts_with("gaps: "))
+        .expect("the concise gaps line");
+    assert_eq!(
+        gaps,
+        "gaps: 1 × native usage feed unavailable — live capture refused (needs root); run \
+         with sudo for full capture (--json has every item)"
+    );
+    assert!(!concise.contains("Operation not permitted"), "{concise}");
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains(stored), "{verbose}");
+}
+
+/// Item 6: a non-denied refusal (old kernel, verifier) folds without
+/// sudo advice; sudo cannot help there.
+#[test]
+fn concise_gap_summary_folds_unproven_capture_refusal() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    let stored = "live capture refused (live capture did not start: loading p11scope's BPF \
+        programs failed (Permission denied); run 'p11scope doctor' for host readiness, or use \
+        'p11scope inspect --pid N' for a scan without capture.)";
+    presentation.gaps.push(named_gap(
+        "native usage feed unavailable",
+        stored,
+    ));
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let gaps = concise
+        .lines()
+        .find(|line| line.starts_with("gaps: "))
+        .expect("the concise gaps line");
+    assert_eq!(
+        gaps,
+        "gaps: 1 × native usage feed unavailable — live capture refused (see 'p11scope \
+         doctor') (--json has every item)"
+    );
+    assert!(!concise.contains("sudo"), "{concise}");
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains(stored), "{verbose}");
+}
+
+#[test]
 fn key_ops_line_populated_counts_primary_once() {
     let mut observations = populated(3);
     observations.sessions.push(SessionRow {

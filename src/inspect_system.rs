@@ -8858,6 +8858,80 @@ mod tests {
         assert!(!text.contains("admission  watched"), "{text}");
     }
 
+    /// Item 12: the admission summary uses the JSON-aligned verdict
+    /// terms (admitted/refused/unresolved), never "watched": inspect
+    /// watches nothing.
+    #[test]
+    fn admission_summary_uses_json_aligned_terms() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        for (verbosity, summary) in [
+            (
+                crate::cli::TextVerbosity::Concise,
+                "admission: 1 admitted, 0 refused, 0 unresolved (scan only: names below come \
+                 from the files themselves)",
+            ),
+            (
+                crate::cli::TextVerbosity::Verbose,
+                "admission: 1 admitted, 0 refused, 0 unresolved (0 possible functions not yet \
+                 confirmed from a second source (uncorroborated_candidates); 0 functions \
+                 claimed by two providers (module_ambiguous); scan only: names below come \
+                 from the files themselves)",
+            ),
+        ] {
+            let text = render_text_with_verbosity(&catalog, verbosity);
+            let line = text.lines().find(|line| line.starts_with("admission: "));
+            assert_eq!(line, Some(summary), "{text}");
+            for line in text.lines() {
+                for (at, _) in line.match_indices("watch") {
+                    let context = &line[at.saturating_sub(6)..];
+                    assert!(
+                        context.starts_with("would watch"),
+                        "every watch claim is a would-watch prediction: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Item 12 adjacent: an admitted record with zero endpoints from
+    /// this scan qualifies the prediction instead of asserting
+    /// "would watch 0 functions" (an unscanned module deep-scans on
+    /// capture; a genuinely empty table admits nothing).
+    #[test]
+    fn admitted_zero_endpoints_qualifies_scan_prediction() {
+        let catalog = catalog_with(vec![object(
+            "/opt/unreadable.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "heuristic",
+                endpoints: 0,
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("admission  0 functions admitted from this scan"),
+            "{concise}"
+        );
+        assert!(!concise.contains("would watch 0"), "{concise}");
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains("admission  0 functions admitted from this scan (class heuristic;"),
+            "{verbose}"
+        );
+        assert!(!verbose.contains("would watch 0"), "{verbose}");
+    }
+
     /// Item 10: concise capacity refusal is one plain budget line; verbose
     /// keeps the full planner reason.
     #[test]

@@ -7625,6 +7625,23 @@ pub(crate) mod tests {
         assert!(!out.contains("Module gaps"), "{out}");
     }
 
+    /// Item 25: the shared totals line singularizes one of each count.
+    #[test]
+    fn totals_line_singularizes_one() {
+        assert_eq!(
+            totals_line(1, 1, 1),
+            "1 completed call; 1 returned error; 1 entry without an observed return."
+        );
+        assert_eq!(
+            totals_line(2, 1, 0),
+            "2 completed calls; 1 returned error; 0 entries without an observed return."
+        );
+        assert_eq!(
+            totals_line(0, 0, 0),
+            "0 completed calls; 0 returned errors; 0 entries without an observed return."
+        );
+    }
+
     /// CLI-1: a COMPLETE verdict reads `coverage: complete`.
     #[test]
     fn complete_coverage_reads_complete() {

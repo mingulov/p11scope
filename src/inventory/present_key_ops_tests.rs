@@ -306,6 +306,87 @@ fn key_ops_line_journal_unavailable_names_tracking_off() {
     );
 }
 
+/// The remedy gap the seal path notes when `--key-operations` was
+/// requested but no semantic subset minted.
+fn subset_refused_gap(reason: &str) -> GapView {
+    GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "key operations unavailable".into(),
+        reason: reason.into(),
+        budget: None,
+        repeats: 1,
+    }
+}
+
+#[test]
+fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
+    // Requested tracking, refused subset, one SoftHSM module: the
+    // line names the provider and the rerun, never tracking-off.
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.modules[0].paths = vec!["/usr/lib64/pkcs11/libsofthsm2.so".into()];
+    presentation.gaps.push(subset_refused_gap(
+        "subset refused (incomplete_provider); provider function tables cannot be verified \
+         without operator attestation: rerun with --manifest <manifest.json> for per-key rows; \
+         broad inventory continues with S1 mechanisms and API results",
+    ));
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: SoftHSM's function table cannot be verified \
+         without --manifest; rerun with --manifest",
+        "the SoftHSM line names provider and rerun:\n{snapshot}"
+    );
+}
+
+#[test]
+fn key_ops_line_subset_refused_names_basename_for_other_providers() {
+    // Same refusal, an unfamiliar provider file: the line names the
+    // file's basename, never a guessed product.
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.modules[0].paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
+    presentation.gaps.push(subset_refused_gap(
+        "subset refused (incomplete_provider); rerun with --manifest <manifest.json>",
+    ));
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: libfoo-pkcs11.so's function table cannot be verified \
+         without --manifest; rerun with --manifest",
+        "generic providers read by basename:\n{snapshot}"
+    );
+}
+
+#[test]
+fn key_ops_line_subset_refused_without_single_module_stays_generic() {
+    // Same refusal, zero or several modules: no single provider is
+    // nameable, so the line stays generic but still remedies.
+    for extra in [false, true] {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+        if extra {
+            let mut second = presentation.modules[0].clone();
+            second.paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
+            presentation.modules.push(second);
+        } else {
+            presentation.modules.clear();
+        }
+        presentation.gaps.push(subset_refused_gap(
+            "subset refused (incomplete_provider); rerun with --manifest <manifest.json>",
+        ));
+        let snapshot = render_snapshot(&presentation);
+        assert_eq!(
+            key_ops_line(&snapshot),
+            "key operations: provider function tables cannot be verified \
+             without --manifest; rerun with --manifest",
+            "extra={extra}: generic but remedied:\n{snapshot}"
+        );
+    }
+}
+
 #[test]
 fn key_ops_line_requested_without_manifest_names_manifest() {
     let mut presentation =

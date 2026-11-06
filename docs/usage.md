@@ -1028,11 +1028,17 @@ Limits that matter in pods:
   physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
   `--key-operations` (default off) opts in to per-key tracking through a linked
-  journal session; it requires `--capture auto` or `native`. No manifest is
-  required: without one, the semantic lane seals from scan-discovered,
-  name-authorized tables after the first discovery pass (the report carries
-  a `semantic subset scan-derived` gap naming that provenance; a manifest
-  still adds operator attestation when supplied). A build without the
+  journal session; it requires `--capture auto` or `native`. Without a manifest,
+  the semantic lane seals only from scan-discovered tables whose publication is
+  proved by standard interface linkage or by an observed live function-list
+  return; tables with export-name agreement alone never qualify (for example
+  SoftHSM, which publishes no standard interface, when the observer attached
+  after the application fetched the list). Then the subset refuses with
+  `incomplete_provider`, the summary reads `key operations: <provider>'s
+  function table cannot be verified without --manifest; rerun with --manifest`,
+  and per-key rows need a rerun with `--manifest <manifest.json>`. A sealed
+  scan lane carries a `semantic subset scan-derived` gap naming that provenance;
+  a manifest still adds operator attestation when supplied. A build without the
   journal object, or a refused journal start, keeps the S1 capture with a
   finite reason instead of refusing the inventory. Attaching to an
   already-running application needs no restart: operations that start
@@ -1067,7 +1073,11 @@ Limits that matter in pods:
   key can be named yet` (with `-v`, the machine reason follows in
   parentheses; `--json` keeps it as `object_observations.reason`).
   Without the opt-in, or on a build without the journal object, the line
-  reads `key operations: not reported (per-key tracking is off)`.
+  reads `key operations: not reported (per-key tracking is off)`. With the
+  opt-in but a refused semantic subset (unverifiable scan tables, see
+  above), it names the rerun instead: `key operations: <provider>'s
+  function table cannot be verified without --manifest; rerun with
+  --manifest`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.

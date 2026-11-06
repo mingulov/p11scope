@@ -5241,8 +5241,17 @@ fn start_semantic_lane(
         let spec = crate::attach::journal::JournalSpec;
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
-        // *start* retries ordinary, never a refused subset.
-        let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator, scan_subset)?;
+        // *start* retries ordinary, never a refused subset. The
+        // subset refusal additionally names the manifest remedy,
+        // since the flag asked for rows no subset can serve.
+        let (attach_subset, convert_subset) =
+            match seal_mint_start_subsets(coordinator, scan_subset) {
+                Ok(pair) => pair,
+                Err(refusals) => {
+                    note_key_operations_subset_refused(coordinator, &refusals);
+                    return None;
+                }
+            };
         match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
             Ok(lane) => {
                 note_semantic_lane_sealed();
@@ -5263,7 +5272,10 @@ fn start_semantic_lane(
             }
         }
     }
-    let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator, scan_subset)?;
+    let Ok((attach_subset, convert_subset)) = seal_mint_start_subsets(coordinator, scan_subset)
+    else {
+        return None;
+    };
     match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
         Ok(lane) => {
             note_semantic_lane_sealed();
@@ -5280,17 +5292,20 @@ fn start_semantic_lane(
 }
 
 /// Mint the attach + conversion subset pair over the same retained
-/// accepted sources, disclosing subset refusals; `None` when either
-/// mint fails (the retained inputs moved under the startup). The
-/// flag-on ordinary retry re-mints through this after the refused
-/// journal start consumed its subsets.
+/// accepted sources, disclosing subset refusals; `Err` with the
+/// failing mint's codes when either mint fails (the retained inputs
+/// moved under the startup). The flag-on ordinary retry re-mints
+/// through this after the refused journal start consumed its subsets.
 fn seal_mint_start_subsets(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scan_subset: bool,
-) -> Option<(
-    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
-    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
-)> {
+) -> Result<
+    (
+        crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+        crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+    ),
+    Vec<crate::inventory_semantics::SemanticRefusal>,
+> {
     let preparation = seal_prepare_subset(coordinator, scan_subset);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
@@ -5298,7 +5313,10 @@ fn seal_mint_start_subsets(
             format!("{refusal}; broad inventory continues without instance semantics"),
         );
     }
-    let attach_subset = preparation.subset?;
+    let attach_subset = match preparation.subset {
+        Some(subset) => subset,
+        None => return Err(preparation.refusals),
+    };
     // The second mint over the same retained sources stays the lane's
     // conversion envelope; it fails only when the retained inputs
     // moved under the startup.
@@ -5312,10 +5330,44 @@ fn seal_mint_start_subsets(
                     format!("{refusal}; broad inventory continues without instance semantics"),
                 );
             }
-            return None;
+            return Err(second.refusals);
         }
     };
-    Some((attach_subset, convert_subset))
+    Ok((attach_subset, convert_subset))
+}
+
+/// `--key-operations` was requested but no semantic subset minted:
+/// disclose the failing mint's codes with the manifest remedy, since
+/// the flag asked for rows no subset can serve. Quiet when the mint
+/// refused silently (nothing discovered yet — the scan mint retries
+/// per pass by design). The gap repeats per attempt like its subset
+/// sibling; the stderr line speaks only on its first appearance.
+fn note_key_operations_subset_refused(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    refusals: &[crate::inventory_semantics::SemanticRefusal],
+) {
+    if refusals.is_empty() {
+        return;
+    }
+    let codes = refusals
+        .iter()
+        .map(|refusal| refusal.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = format!(
+        "subset refused ({codes}); provider function tables cannot be verified \
+         without operator attestation: rerun with --manifest <manifest.json> \
+         for per-key rows; broad inventory continues with S1 mechanisms and API results"
+    );
+    let fresh = !coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .any(|gap| gap.subject == "key operations unavailable" && gap.reason == reason);
+    coordinator.note_scope_gap("key operations unavailable".into(), reason.clone());
+    if fresh {
+        inventory_diagnostic(&format!("p11scope: key operations unavailable: {reason}"));
+    }
 }
 
 /// Finite reason for a refused journal start. The build gate's own
@@ -25732,6 +25784,78 @@ mod seal_readiness_tests {
             gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
             1,
             "the refusal's own disclosure stays"
+        );
+    }
+
+    #[test]
+    fn key_operations_subset_refusal_names_manifest_remedy() {
+        // Flag on, subset refused with codes (the SoftHSM shape:
+        // export-only scan tables refuse `incomplete_provider`):
+        // no lane seats, and beside the subset gap a key-operations
+        // gap names the refusal with the manifest remedy.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::IncompleteProvider],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    true,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the remedy gap is noted once");
+        assert!(
+            gaps[0]
+                .1
+                .starts_with("subset refused (incomplete_provider)"),
+            "the gap names the refusal: {}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0].1.contains("rerun with --manifest"),
+            "the gap names the remedy: {}",
+            gaps[0].1
+        );
+    }
+
+    #[test]
+    fn key_operations_silent_mint_stays_quiet() {
+        // Flag on, subset refused with no codes (nothing discovered
+        // yet — the scan mint retries per pass by design): no lane
+        // seats and no remedy gap is noted; there is nothing to
+        // verify yet, so no manifest advice either.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    true,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        assert!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
+            "a silent mint notes no remedy gap"
         );
     }
 

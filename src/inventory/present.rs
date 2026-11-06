@@ -1436,6 +1436,46 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
     render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
+/// The key-operations summary when `--key-operations` was requested
+/// but the semantic subset refused: the scan-derived tables the
+/// observer found cannot be verified (export-name agreement alone
+/// never grants argument-read authority), so per-key rows need a
+/// rerun with `--manifest`. Visible only beside the `key operations
+/// unavailable` subset gap the seal path notes; without that gap the
+/// tracking-off line stands. One module names its file (SoftHSM by
+/// its product name, anything else by basename); zero or several
+/// modules stay generic, since no single provider is nameable.
+fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
+    let refused = presentation.gaps.iter().any(|gap| {
+        gap.subject == "key operations unavailable" && gap.reason.starts_with("subset refused (")
+    });
+    if !refused {
+        return None;
+    }
+    if let [single] = presentation.modules.as_slice()
+        && let Some(base) = single
+            .paths
+            .first()
+            .and_then(|path| path.rsplit('/').next())
+            .filter(|base| !base.is_empty())
+    {
+        let display = if base.to_lowercase().contains("softhsm") {
+            "SoftHSM".to_string()
+        } else {
+            base.to_string()
+        };
+        return Some(format!(
+            "key operations: {display}'s function table cannot be verified \
+             without --manifest; rerun with --manifest"
+        ));
+    }
+    Some(
+        "key operations: provider function tables cannot be verified \
+         without --manifest; rerun with --manifest"
+            .to_string(),
+    )
+}
+
 /// The concise gap summary (F1): one line grouping gaps by plain
 /// subject/reason with counts, top three plus "and K more". Plain
 /// words only (reusing `gap_plain_*`); per-gap `gap [` lines stay
@@ -1800,14 +1840,17 @@ fn render_snapshot_inner(
             // Other reasons name the cause in plain words, with the
             // machine reason beside it in verbose text (JSON keeps it).
             if observations.reason == "journal_unavailable" {
-                // A refused journal start leaves a "key operations
+                // A refused semantic subset names its rerun remedy first;
+                // a refused journal start leaves a "key operations
                 // unavailable" scope gap: --key-operations was requested
                 // but per-key tracking never started. Name the request and
                 // the cause; a request without --manifest never attempts
                 // a start (no gap exists), so it names the missing flag
                 // instead of reading "off"; without that gap tracking is
                 // simply off.
-                if let Some(cause) = key_operations_refusal_cause(presentation) {
+                if let Some(line) = key_operations_manifest_line(presentation) {
+                    let _ = writeln!(out, "{line}");
+                } else if let Some(cause) = key_operations_refusal_cause(presentation) {
                     let _ = writeln!(
                         out,
                         "key operations: requested, but per-key tracking did not start ({cause})"

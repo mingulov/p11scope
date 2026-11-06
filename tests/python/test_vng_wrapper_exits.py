@@ -34,6 +34,15 @@ while [ $# -gt 0 ]; do
         *) shift;;
     esac
 done
+write_minimal() {
+    mkdir -p "$out/minimal-cells"
+    echo '{"cell":"stub","pass":true,"qualification":"qualified","detail":"stub"}' > "$out/minimal-cells/results.jsonl"
+    echo "minimal_exit=$1" > "$out/minimal.log"
+}
+write_qual() {
+    mkdir -p "$out/cells"; echo "SUMMARY pass=1 fail=0" > "$out/cells/summary.txt"
+    echo "qual_exit=$1" > "$out/qual.log"
+}
 mode="${FAKE_WRAPPER_MODE:-cli-pass-0}"
 case "$mode" in
     vng-fail) echo "vng: unknown kernel"; exit 1;;
@@ -41,19 +50,24 @@ esac
 echo "6.6.157" > "$out/uname.txt"
 case "$mode" in
     cli-pass-*) n="${mode#cli-pass-}";;
+    cli-minimal-fail) n=0;;
+    cli-smoke-minimal-fail) n=2;;
+    cli-minimal-missing) n=0;;
     cli-no-summary) echo "qual_exit=0" > "$out/qual.log"; exit 0;;
     cli-no-qual-exit)
         mkdir -p "$out/cells"; echo "SUMMARY pass=1 fail=0" > "$out/cells/summary.txt"
-        echo "no exit recorded" > "$out/qual.log"; exit 0;;
+        echo "no exit recorded" > "$out/qual.log"
+        write_minimal 0; exit 0;;
     c1b-pass-*) n="${mode#c1b-pass-}";;
     c1b-no-cells-log) exit 0;;
     c1b-no-cells-exit) echo "no exit recorded" > "$out/cells.log"; exit 0;;
     *) echo "bad fake mode $mode"; exit 3;;
 esac
 case "$mode" in
-    cli-pass-*)
-        mkdir -p "$out/cells"; echo "SUMMARY pass=1 fail=0" > "$out/cells/summary.txt"
-        echo "qual_exit=$n" > "$out/qual.log";;
+    cli-pass-*) write_qual "$n"; write_minimal 0;;
+    cli-minimal-fail) write_qual 0; write_minimal 1;;
+    cli-smoke-minimal-fail) write_qual 2; write_minimal 1;;
+    cli-minimal-missing) write_qual 0;;
     c1b-pass-*)
         { [ "$n" = 0 ] && echo "VERDICT: PASS" || echo "VERDICT: FAIL"; } > "$out/cells.log"
         echo "cells_exit=$n" >> "$out/cells.log";;
@@ -117,6 +131,20 @@ class VngWrapperExitTests(unittest.TestCase):
     def test_cli_missing_qual_exit_exits_nonzero(self):
         result, _ = self.run_wrapper(CLI_WRAPPER, mode="cli-no-qual-exit")
         self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_cli_minimal_failure_exits_one(self):
+        result, _ = self.run_wrapper(CLI_WRAPPER, mode="cli-minimal-fail")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("minimal setcap leg failed", result.stderr)
+
+    def test_cli_minimal_failure_dominates_smoke(self):
+        result, _ = self.run_wrapper(CLI_WRAPPER, mode="cli-smoke-minimal-fail")
+        self.assertEqual(result.returncode, 1, result.stderr)
+
+    def test_cli_minimal_missing_results_exit_nonzero(self):
+        result, _ = self.run_wrapper(CLI_WRAPPER, mode="cli-minimal-missing")
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn("minimal-cells/results.jsonl", result.stderr)
 
     def test_c1b_pass_and_fail_propagate(self):
         result, _ = self.run_wrapper(C1B_WRAPPER, mode="c1b-pass-0")

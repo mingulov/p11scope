@@ -21,6 +21,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -189,6 +190,29 @@ __attribute__((constructor)) static void ctor(void) {
             } else {
                 fprintf(stderr, "ISOLATION_SUBTREE=denied(errno=%d)\n", errno);
             }
+        }
+    }
+    /* Terminal-injection ioctls on a pipe: a non-device fd Landlock's
+     * IOCTL_DEV does not mediate, so the calls reach the kernel as
+     * ENOTTY unless the seccomp filter denies them with EACCES first. */
+    {
+        int pair[2] = { -1, -1 };
+        if (pipe(pair) != 0) {
+            fprintf(stderr, "ISOLATION_TIOCSTI=unknown(pipe errno=%d)\n", errno);
+            fprintf(stderr, "ISOLATION_TIOCLINUX=unknown(pipe errno=%d)\n", errno);
+        } else {
+            if (ioctl(pair[0], TIOCSTI, "x") == 0) {
+                fprintf(stderr, "ISOLATION_TIOCSTI=allowed\n");
+            } else {
+                fprintf(stderr, "ISOLATION_TIOCSTI=denied(errno=%d)\n", errno);
+            }
+            if (ioctl(pair[0], TIOCLINUX, "x") == 0) {
+                fprintf(stderr, "ISOLATION_TIOCLINUX=allowed\n");
+            } else {
+                fprintf(stderr, "ISOLATION_TIOCLINUX=denied(errno=%d)\n", errno);
+            }
+            close(pair[0]);
+            close(pair[1]);
         }
     }
     fflush(stderr);

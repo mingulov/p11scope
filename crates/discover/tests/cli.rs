@@ -1056,6 +1056,65 @@ fn isolation_nonempty_output_directory_is_refused_before_provider_load() {
     assert!(!outfile.exists(), "a refusal must not create a manifest");
 }
 
+/// Terminal-input-injection ioctls are denied under the fence: on the
+/// non-terminal probe fd the calls reach the kernel as `ENOTTY` when
+/// trusted, while the fence denies them with `EACCES` first.
+#[test]
+fn isolation_terminal_injection_ioctls_are_denied() {
+    let dir = scratch("isolation-tioc");
+    let provider = build_isolation_probe(&dir);
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_TIOCSTI=denied(errno=25)"),
+        "trusted must reach the kernel as ENOTTY: {stderr}"
+    );
+    assert!(
+        stderr.contains("ISOLATION_TIOCLINUX=denied(errno=25)"),
+        "trusted must reach the kernel as ENOTTY: {stderr}"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_TIOCSTI=denied(errno=13)"),
+        "TIOCSTI was not fenced: {stderr}"
+    );
+    assert!(
+        stderr.contains("ISOLATION_TIOCLINUX=denied(errno=13)"),
+        "TIOCLINUX was not fenced: {stderr}"
+    );
+}
+
+/// `--help` names the isolated profile's residuals beside the fence:
+/// the provider still runs as the operator's uid with the operator's
+/// environment and readable files.
+#[test]
+fn help_names_the_isolated_residuals() {
+    let out = Command::new(BIN).arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let fenced = stdout
+        .split("\n\n")
+        .find(|p| p.contains("additionally fences"))
+        .expect("one isolated paragraph");
+    for word in ["uid", "environment", "readable"] {
+        assert!(
+            fenced.contains(word),
+            "the isolated paragraph must name the {word} residual: {fenced:?}"
+        );
+    }
+}
+
 /// The dedicated-directory rule keeps the rename-over case working: a
 /// `-o` parent holding only the target name is accepted and the stale
 /// file is replaced with a private manifest.

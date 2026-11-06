@@ -5,10 +5,16 @@
 //! (task 7.07a, helper-policy part). The fence is Landlock (read-only
 //! filesystem plus denied TCP bind/connect) followed by a seccomp denylist
 //! (no IP networking or socket connect/bind; no exec, mount, ptrace, BPF,
-//! io_uring, keyring or file-metadata syscalls). Every denial fails with
-//! `EACCES`, never kill/trap, so a fenced provider call reads as an
-//! ordinary error. Applied after the shared privilege drop and before
-//! any provider code runs; any failure refuses before `dlopen`.
+//! io_uring, keyring or file-metadata syscalls; no terminal-input-injection
+//! ioctls). Every denial fails with `EACCES`, never kill/trap, so a fenced
+//! provider call reads as an ordinary error. Applied after the shared
+//! privilege drop and before any provider code runs; any failure refuses
+//! before `dlopen`.
+//!
+//! Documented residuals: the provider still runs in-process as the
+//! helper's uid with its environment, supplementary groups, readable
+//! files and signaling; other terminal ioctls pass, as does `AF_UNIX`
+//! datagram `sendto` without `connect`.
 
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -108,10 +114,16 @@ const AUDIT_ARCH_X86_64: u32 = 0xC000_003E;
 const ARCH_OFFSET: u32 = 4;
 const NR_OFFSET: u32 = 0;
 const ARG0_LO_OFFSET: u32 = 16;
+const ARG1_LO_OFFSET: u32 = 24;
 const AF_UNIX: u32 = 1;
 const AF_NETLINK: u32 = 16;
+// Terminal-input-injection commands denied below; every other ioctl
+// stays allowed (device control is Landlock's job).
+const TIOCSTI: u32 = 0x5412;
+const TIOCLINUX: u32 = 0x541C;
 
 // x86-64 syscall numbers in the denylist (contract §5).
+const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
 const SYS_CONNECT: u32 = 42;
 const SYS_BIND: u32 = 49;
@@ -177,8 +189,10 @@ const SYS_UTIMES: u32 = 235;
 const SYS_FUTIMESAT: u32 = 261;
 const SYS_UTIMENSAT: u32 = 280;
 
-/// Unconditional denials. `socket` is handled separately: `AF_UNIX` and
-/// `AF_NETLINK` stay allowed, every other domain is denied.
+/// Unconditional denials. `socket` and `ioctl` are handled separately:
+/// `AF_UNIX` and `AF_NETLINK` socket domains stay allowed while every
+/// other domain is denied, and only the `TIOCSTI`/`TIOCLINUX` ioctl
+/// commands are denied.
 const DENY_ALWAYS: &[u32] = &[
     SYS_CONNECT,
     SYS_BIND,
@@ -329,6 +343,7 @@ impl FilterBuilder {
             deny_jumps.push(self.jeq(*nr));
         }
         let socket_jump = self.jeq(SYS_SOCKET);
+        let ioctl_jump = self.jeq(SYS_IOCTL);
         let allow = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         let deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let x32_deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
@@ -338,6 +353,13 @@ impl FilterBuilder {
         let is_netlink = self.jeq(AF_NETLINK);
         let deny_socket = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_unix = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        // ioctl(fd, cmd, ...): TIOCSTI and TIOCLINUX inject input into
+        // the operator's terminal, so only those two are denied.
+        let ioctl_check = self.emit(stmt(BPF_LD_W_ABS, ARG1_LO_OFFSET));
+        let is_tiocsti = self.jeq(TIOCSTI);
+        let is_tioclinux = self.jeq(TIOCLINUX);
+        let deny_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
+        let allow_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         // Every target is known now; patch the whole chain explicitly.
         // Each `jeq nr`: equal falls into `deny`, else the next check,
         // walked back to front so `next` is always the following check.
@@ -347,9 +369,12 @@ impl FilterBuilder {
             next = *at;
         }
         self.patch(x32, x32_deny, next)?;
-        self.patch(socket_jump, socket_check, allow)?;
+        self.patch(socket_jump, socket_check, ioctl_jump)?;
+        self.patch(ioctl_jump, ioctl_check, allow)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
         self.patch(is_netlink, allow_unix, deny_socket)?;
+        self.patch(is_tiocsti, deny_ioctl, is_tioclinux)?;
+        self.patch(is_tioclinux, deny_ioctl, allow_ioctl)?;
         validate_filter(&self.insns)?;
         Ok(self.insns)
     }
@@ -882,11 +907,12 @@ mod tests {
         assert_eq!(error, "landlock stage failed");
     }
 
-    /// A classic-BPF interpreter over (arch, nr, arg0): the executable
-    /// meaning of the built filter. Every denylisted number below is
-    /// evaluated to its verdict, so a mistargeted jump or a flipped patch
-    /// fails here instead of silently fencing the wrong syscall.
-    fn eval_filter(insns: &[SockFilter], arch: u32, nr: u32, arg0: u32) -> u32 {
+    /// A classic-BPF interpreter over (arch, nr, arg0, arg1): the
+    /// executable meaning of the built filter. Every denylisted number
+    /// below is evaluated to its verdict, so a mistargeted jump or a
+    /// flipped patch fails here instead of silently fencing the wrong
+    /// syscall.
+    fn eval_filter(insns: &[SockFilter], arch: u32, nr: u32, arg0: u32, arg1: u32) -> u32 {
         let mut acc = 0u32;
         let mut pc = 0usize;
         for _ in 0..insns.len() + 16 {
@@ -897,6 +923,7 @@ mod tests {
                         NR_OFFSET => nr,
                         ARCH_OFFSET => arch,
                         ARG0_LO_OFFSET => arg0,
+                        ARG1_LO_OFFSET => arg1,
                         other => panic!("evaluator hit an unexpected load offset {other}"),
                     };
                     pc += 1;
@@ -1019,7 +1046,7 @@ mod tests {
         for (ours, want, name) in keyed {
             assert_eq!(*ours, *want as u32, "wrong number for {name}");
             assert_eq!(
-                eval_filter(&insns, AUDIT_ARCH_X86_64, *ours, 0),
+                eval_filter(&insns, AUDIT_ARCH_X86_64, *ours, 0, 0),
                 denied,
                 "{name} escapes the fence"
             );
@@ -1027,23 +1054,29 @@ mod tests {
         // socket() with an IP domain is denied; AF_UNIX and AF_NETLINK
         // stay allowed for the loader.
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, 2 /* AF_INET */),
+            eval_filter(
+                &insns,
+                AUDIT_ARCH_X86_64,
+                SYS_SOCKET,
+                2, /* AF_INET */
+                0
+            ),
             denied,
             "AF_INET socket escapes the fence"
         );
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_UNIX),
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_UNIX, 0),
             SECCOMP_RET_ALLOW,
             "AF_UNIX socket must stay allowed"
         );
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_NETLINK),
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_NETLINK, 0),
             SECCOMP_RET_ALLOW,
             "AF_NETLINK socket must stay allowed"
         );
         // An ordinary syscall stays allowed.
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, libc::SYS_read as u32, 0),
+            eval_filter(&insns, AUDIT_ARCH_X86_64, libc::SYS_read as u32, 0, 0),
             SECCOMP_RET_ALLOW,
             "read must stay allowed"
         );
@@ -1058,7 +1091,7 @@ mod tests {
             0x4000_0003, // AUDIT_ARCH_I386
         ] {
             assert_eq!(
-                eval_filter(&insns, arch, libc::SYS_read as u32, 0),
+                eval_filter(&insns, arch, libc::SYS_read as u32, 0, 0),
                 enosys,
                 "arch {arch:#x} escapes the gate"
             );
@@ -1121,6 +1154,36 @@ mod tests {
     }
 
     #[test]
+    fn terminal_injection_ioctls_evaluate_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        assert_eq!(SYS_IOCTL, libc::SYS_ioctl as u32, "wrong number for ioctl");
+        assert_eq!(TIOCSTI, libc::TIOCSTI as u32, "wrong TIOCSTI");
+        assert_eq!(TIOCLINUX, libc::TIOCLINUX as u32, "wrong TIOCLINUX");
+        // TIOCSTI/TIOCLINUX inject input into the operator's terminal;
+        // only those two commands are denied, other ioctls stay allowed
+        // (device control is Landlock's job).
+        for cmd in [TIOCSTI, TIOCLINUX] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, cmd),
+                denied,
+                "ioctl {cmd:#x} escapes the fence"
+            );
+        }
+        assert_eq!(
+            eval_filter(
+                &insns,
+                AUDIT_ARCH_X86_64,
+                SYS_IOCTL,
+                0,
+                0x5401 /* TCGETS */
+            ),
+            SECCOMP_RET_ALLOW,
+            "ordinary ioctls must stay allowed"
+        );
+    }
+
+    #[test]
     fn x32_syscall_numbers_get_enosys() {
         let insns = FilterBuilder::new().build().unwrap();
         let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
@@ -1131,7 +1194,7 @@ mod tests {
             u32::MAX,
         ] {
             assert_eq!(
-                eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0),
+                eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),
                 enosys,
                 "x32 nr {nr:#x} escapes the fence"
             );

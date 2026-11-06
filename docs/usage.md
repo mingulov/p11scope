@@ -543,12 +543,20 @@ before it loads the provider: the filesystem stays read-only except the
 rule grants the whole subtree, so anything already there would be
 writable); without `-o` nothing is writable. IP networking, socket
 connect/bind, and exec/mount/ptrace/BPF/io_uring/file-metadata syscalls
-fail with `EACCES`. The fence needs Landlock ABI 5 or newer and an x86-64
-helper; when either is unavailable the helper refuses before loading
-rather than running weaker. A provider that needs a denied access at
-discovery time fails plainly (a loader or getter error, or an acquisition
-error recorded on its surface). The default `trusted` profile keeps
-today's ambient behavior after the standard privilege drop.
+fail with `EACCES`, as do the terminal-input-injection ioctls
+`TIOCSTI`/`TIOCLINUX`. The fence needs Landlock ABI 5 or newer and an
+x86-64 helper; when either is unavailable the helper refuses before
+loading rather than running weaker. A provider that needs a denied access
+at discovery time fails plainly (a loader or getter error, or an
+acquisition error recorded on its surface). The default `trusted` profile
+keeps today's ambient behavior after the standard privilege drop.
+
+The isolated profile is a damage-reduction fence, not a full sandbox.
+Residuals: the provider runs in-process as your uid, reads every file you
+can read, inherits your environment (including any tokens) and
+supplementary groups, and may signal your processes; terminal stdio
+ioctls other than `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX`
+datagram `sendto` without `connect`.
 
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,

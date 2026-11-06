@@ -672,3 +672,139 @@ fn help_prints_usage_on_stdout_and_exits_zero() {
         assert!(out.stderr.is_empty(), "{flag}: {out:?}");
     }
 }
+
+/// Contract §1: `--help` documents each profile in its own paragraph, and
+/// the trusted paragraph never calls trusted "isolated" (D4).
+#[test]
+fn help_documents_each_profile_in_its_own_paragraph() {
+    let out = Command::new(BIN).arg("--help").output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let paragraphs: Vec<&str> = stdout.split("\n\n").collect();
+    let find = |needle: &str| {
+        paragraphs
+            .iter()
+            .filter(|p| p.to_lowercase().contains(needle))
+            .copied()
+            .collect::<Vec<&str>>()
+    };
+    let trusted = find("trusted (default)");
+    assert_eq!(trusted.len(), 1, "one trusted paragraph: {stdout:?}");
+    assert!(
+        !trusted[0].to_lowercase().contains("isolated"),
+        "trusted must never be called isolated: {:?}",
+        trusted[0]
+    );
+    let fenced = find("additionally fences");
+    assert_eq!(fenced.len(), 1, "one isolated paragraph: {stdout:?}");
+    assert_ne!(
+        trusted[0], fenced[0],
+        "each profile needs its own paragraph: {stdout:?}"
+    );
+}
+
+/// A `-o` parent of `/` must refuse before provider load: granting the
+/// whole tree write access would void the read-only promise (contract
+/// §2/D6) while the operator believes the provider is fenced.
+#[test]
+fn isolation_output_directory_filesystem_root_is_refused() {
+    let dir = scratch("isolation-root");
+    let provider = build_isolation_probe(&dir);
+    let outfile = Path::new("/").join(format!(
+        "p11scope-helper-iso-root-test-{}.json",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_file(&outfile);
+    let out = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&outfile)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains(
+            "isolated profile: output directory / is unusable: refusing the filesystem root"
+        ),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the root refusal: {stderr}"
+    );
+    assert!(!outfile.exists(), "a refusal must not create a manifest");
+}
+
+/// An unusable `-o` parent refuses with the contract §3 step-1 shape
+/// `isolated profile: output directory <dir> is unusable: <reason>`,
+/// before provider load.
+#[test]
+fn isolation_missing_output_directory_uses_contract_wording() {
+    let dir = scratch("isolation-missing-wording");
+    let provider = build_isolation_probe(&dir);
+    let missing = dir.join("no-such-dir").join("manifest.json");
+    let out = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let parent = missing.parent().unwrap();
+    assert!(
+        stderr.contains(&format!(
+            "isolated profile: output directory {} is unusable:",
+            parent.display()
+        )),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the output refusal: {stderr}"
+    );
+    assert!(!missing.exists());
+}
+
+/// Overwriting an existing file outside the `-o` directory is denied
+/// (`WRITE_FILE`), not just creation (`MAKE_REG`). Trusted opens the
+/// scratch sibling; the fence denies it with `EACCES` and leaves it
+/// untouched.
+#[test]
+fn isolation_overwrite_of_existing_file_is_denied() {
+    let dir = scratch("isolation-overwrite");
+    let provider = build_isolation_probe(&dir);
+    let sibling = dir.join("isolation-overwrite.tmp");
+    std::fs::write(&sibling, b"overwrite probe").unwrap();
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_OVERWRITE=allowed"),
+        "trusted must open the scratch sibling: {stderr}"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_OVERWRITE=denied(errno=13)"),
+        "overwrite was not fenced: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&sibling).unwrap(),
+        b"overwrite probe",
+        "the probe must not modify the scratch sibling"
+    );
+    std::fs::remove_file(&sibling).unwrap();
+}

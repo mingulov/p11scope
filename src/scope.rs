@@ -14,7 +14,7 @@ use p11scope_ebpf_common::{
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 // The bounded inventory collector is wired by the cgroup integration packages.
@@ -41,6 +41,42 @@ pub fn cgroup(path: &Path) -> Result<Scope> {
 
 /// `CGROUP2_SUPER_MAGIC` from `<linux/magic.h>`.
 const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
+
+/// A cgroup v2 subgroup owned by one `run`: the owned child is placed in
+/// it before its barrier release, so every descendant is born in scope.
+/// Scaffolding: the bodies land with the implementation.
+#[derive(Debug)]
+pub(crate) struct RunCgroup {
+    path: PathBuf,
+}
+
+impl RunCgroup {
+    pub(crate) fn create(base: &Path) -> Result<Self> {
+        let _ = base;
+        anyhow::bail!("run cgroup scaffolding");
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn place(&self, pid: u32) -> Result<()> {
+        let _ = pid;
+        anyhow::bail!("run cgroup scaffolding");
+    }
+}
+
+/// Scaffolding: the random name lands with the implementation.
+pub(crate) fn run_cgroup_name() -> Result<String> {
+    anyhow::bail!("run cgroup scaffolding");
+}
+
+/// Scaffolding: the `/proc/<pid>/cgroup` v2-line parser lands with the
+/// implementation.
+pub(crate) fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
+    let _ = text;
+    None
+}
 
 /// `--cgroup` as an operator names it (M-3): [`cgroup`] plus proof, taken
 /// from the retained directory with `fstatfs`, that it lives on cgroup v2.
@@ -907,6 +943,140 @@ mod tests {
             }
             Err(error) => panic!("unexpected offsets read failure: {error}"),
         }
+    }
+
+    #[test]
+    fn run_cgroup_name_is_hex_suffixed_unique_and_pid_free() {
+        // The run cgroup name carries a random suffix: fixed prefix, 16
+        // lowercase hex digits, unique across calls, and never the
+        // observer's PID (a best-effort cgroup label may publish it).
+        let pid = std::process::id().to_string();
+        let mut names = std::collections::BTreeSet::new();
+        for _ in 0..256 {
+            let name = run_cgroup_name().expect("naming never fails on a live host");
+            assert!(name.starts_with("p11scope-run-"), "{name}");
+            let suffix = name.strip_prefix("p11scope-run-").unwrap();
+            assert_eq!(suffix.len(), 16, "{name}");
+            assert!(
+                suffix
+                    .bytes()
+                    .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')),
+                "{name}"
+            );
+            assert!(
+                !name.contains(&pid),
+                "the name must not leak the PID: {name}"
+            );
+            assert!(
+                names.insert(name.clone()),
+                "duplicate run cgroup name: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_cgroup_create_then_drop_removes_the_empty_dir() {
+        let base = tempfile::tempdir().unwrap();
+        let path = {
+            let group = RunCgroup::create(base.path()).expect("create in a writable dir");
+            assert!(group.path().starts_with(base.path()));
+            assert!(group.path().is_dir());
+            group.path().to_path_buf()
+        };
+        assert!(!path.exists(), "dropping removes the empty run cgroup");
+    }
+
+    #[test]
+    fn run_cgroup_drop_keeps_a_nonempty_dir() {
+        // Handed-back survivors keep the directory alive: Drop only
+        // retries the removal, never forces it.
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).expect("create in a writable dir");
+        let path = group.path().to_path_buf();
+        std::fs::write(path.join("cgroup.procs"), "1\n").unwrap();
+        drop(group);
+        assert!(path.is_dir(), "a nonempty run cgroup must survive Drop");
+    }
+
+    #[test]
+    fn run_cgroup_create_names_its_base_on_failure() {
+        let base = tempfile::tempdir().unwrap();
+        let missing = base.path().join("no-such-base");
+        let error = RunCgroup::create(&missing).expect_err("a missing base must fail");
+        assert!(
+            format!("{error:#}").contains("no-such-base"),
+            "the failure names the base: {error:#}"
+        );
+    }
+
+    #[test]
+    fn run_cgroup_place_reports_a_failed_landing() {
+        // Placement writes the PID then proves the landing via
+        // /proc/<pid>/cgroup: on a tmpfs stand-in the write lands but the
+        // kernel never moves the process, so the readback must refuse loudly.
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).expect("create in a writable dir");
+        let pid = std::process::id();
+        let error = group.place(pid).expect_err("a tmpfs stand-in cannot place");
+        let text = format!("{error:#}");
+        let proc =
+            std::fs::read_to_string(format!("/proc/{pid}/cgroup")).expect("own cgroup reads");
+        let expected = if proc.lines().any(|line| line.starts_with("0::")) {
+            "did not land"
+        } else {
+            "no cgroup v2 entry"
+        };
+        assert!(text.contains(expected), "{text}");
+        assert_eq!(
+            std::fs::read_to_string(group.path().join("cgroup.procs")).unwrap(),
+            format!("{pid}\n"),
+            "the placement write precedes the readback"
+        );
+    }
+
+    #[test]
+    fn run_cgroup_placement_parser_reads_the_v2_line() {
+        for (text, expected) in [
+            (
+                "12:memory:/user.slice\n0::/user.slice/user-1000.slice\n",
+                Some("user.slice/user-1000.slice"),
+            ),
+            ("0::/\n", Some("")),
+            ("0::/p11scope-run-abc\n", Some("p11scope-run-abc")),
+            ("12:memory:/user.slice\n", None),
+            ("", None),
+        ] {
+            assert_eq!(parse_cgroup_v2_relative(text), expected, "{text:?}");
+        }
+    }
+
+    #[test]
+    #[ignore = "privileged: moves a real child into a real run cgroup; run as root with --ignored --test-threads=1"]
+    fn privileged_run_cgroup_place_moves_a_real_child() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root: placement needs cgroup rights"
+        );
+        if filesystem_magic(&File::open("/sys/fs/cgroup").expect("cgroup root opens"))
+            .expect("magic reads")
+            != CGROUP2_SUPER_MAGIC
+        {
+            panic!("run as root on cgroup v2: placement needs a v2 mount");
+        }
+        let group = RunCgroup::create(Path::new("/sys/fs/cgroup")).expect("create the run cgroup");
+        assert!(group.path().starts_with("/sys/fs/cgroup"));
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let placed = group.place(child.id());
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+        placed.expect("a real child lands in the run cgroup");
+        let path = group.path().to_path_buf();
+        drop(group);
+        assert!(!path.exists(), "the emptied run cgroup is removed");
     }
 
     #[test]

@@ -1983,6 +1983,12 @@
       "path": "discovery::sweep_attribution::tests::privileged_tmpfs_inode32_refuses_while_inode64_merges",
       "reason": "root mounting tmpfs inode32/inode64: labels, refusal, and control merge",
       "cell": "privileged"
+    },
+    {
+      "file": "src/scope.rs",
+      "path": "scope::tests::privileged_run_cgroup_place_moves_a_real_child",
+      "reason": "privileged: moves a real child into a real run cgroup; run as root with --ignored --test-threads=1",
+      "cell": "privileged"
     }
   ]
 }

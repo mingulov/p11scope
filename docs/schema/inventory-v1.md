@@ -1085,6 +1085,16 @@ covers any custody loss, including a proven PID-target exit: the exit
 itself is proven, but coverage past it is not, so the watch truncates
 conservatively instead of riding to the run end.
 
+## Forwarding-layer entry totals (additive within v1)
+
+Top-level `layer_totals` (always present) splits entry counts:
+`logical_entries` (provider edges, counted once) and
+`forwarding_entries` (closure-array forwarding-layer edges, never
+summed into logical). One logical entry observed at both layers counts
+once, on its provider edge. `modules[].admission.class` names the
+forwarding layers (`closure_array`); consumers that sum entry counts
+must skip those modules' edges to count logical entries once.
+
 ## Example (abridged)
 
 ```json

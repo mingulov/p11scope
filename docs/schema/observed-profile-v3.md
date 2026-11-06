@@ -618,6 +618,24 @@ Like `selected_detail` and `instance_reload_not_excluded`, this is a
 v3-additive disclosure that introduces no new schema revision: the
 `functions[]` item shape stays open and the key stays optional.
 
+## Forwarding-layer split on `functions[]` rows
+
+Every `functions[]` row carries `forwarding_layer` (boolean, always
+present): true when the row counts calls at a forwarding layer (a
+closure array admitted beside watched providers), false for provider
+rows. One logical call observed at both layers counts once, in the
+provider row; the forwarding row stays explicit beside it. Consumers
+that sum `calls` across rows must skip `forwarding_layer` rows to count
+logical calls once.
+
+Top-level `layer_totals` (always present in both v3 documents, metrics
+and profile) splits the same totals: `logical` (provider calls, errors
+and in-flight, counted once) and `forwarding` (forwarding-layer calls,
+errors and in-flight, never summed into logical). Single-layer captures
+read `forwarding` zeros with both layers' rows labelled. Like
+`selected_detail`, this is a v3-additive disclosure that introduces no
+new schema revision: the `functions[]` item shape stays open.
+
 ## Kernel control evidence
 
 `kernel_control` is always present in every v3 profile, v3-metrics, and

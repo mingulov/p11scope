@@ -8098,7 +8098,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            text.contains("calls it forwards are counted at the attached providers"),
+            text.contains("calls it forwards are counted at the attached provider files"),
             "{text}"
         );
     }

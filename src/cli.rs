@@ -2814,7 +2814,7 @@ mod tests {
         assert!(matches!(
             parse(args(&["inventory", "--system", "--max-endpoints", "131073"])),
             Err(CliError::Usage { message, .. })
-                if message.contains("--max-endpoints") && message.contains("1..=131072")
+                if message.contains("--max-endpoints") && message.contains("1–131072")
         ));
         let help = HelpTopic::Inventory.text();
         assert!(

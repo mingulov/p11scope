@@ -261,7 +261,7 @@ fn key_ops_line_counts_not_attributed_beside_exact_rows() {
     let snapshot = render_snapshot(&presentation);
     let line = key_ops_line(&snapshot);
     assert!(
-        line.contains("sign 4 completed, 0 failed, 0 active operations"),
+        line.contains("sign 4 completed, 0 returned errors, 0 active operations"),
         "exact rows stay: {line}"
     );
     assert!(
@@ -285,7 +285,7 @@ fn key_ops_line_names_unknown_type_not_established_while_observed() {
     let snapshot = render_snapshot(&presentation);
     let line = key_ops_line(&snapshot);
     assert!(
-        line.contains("sign 2 completed, 0 failed, 0 active operations"),
+        line.contains("sign 2 completed, 0 returned errors, 0 active operations"),
         "the tallies stay exact: {line}"
     );
     assert!(

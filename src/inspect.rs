@@ -897,7 +897,7 @@ mod tests {
     /// nothing about its modules. That is the documented hard error — one
     /// stderr line naming the cause (and a permission fix when applicable),
     /// empty stdout, exit 1 — never
-    /// "0 PKCS#11 modules mapped" with `scan.status: scanned` and exit 0.
+    /// "0 provider files mapped" with `scan.status: scanned` and exit 0.
     #[test]
     fn unreadable_target_mappings_are_a_hard_error_not_zero_modules() {
         for (reason, permission_guidance) in [

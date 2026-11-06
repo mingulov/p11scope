@@ -11938,7 +11938,14 @@ mod tests {
             document["modules"][0]["unbound_use"]
         );
         assert_eq!(document["modules"][0]["unbound_use"]["entries"], 0);
-        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        let text = render_text_with_verbosity(
+            &coordinator,
+            "pid:7",
+            90,
+            130,
+            2,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(text.contains("/lib/a.so"), "module detail renders:\n{text}");
         assert!(
             !text.contains("unidentified use"),
@@ -12045,7 +12052,14 @@ mod tests {
             56,
         );
         coordinator.commit_batch(false).unwrap();
-        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        let text = render_text_with_verbosity(
+            &coordinator,
+            "pid:7",
+            90,
+            130,
+            2,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(text.contains("/lib/a.so"), "both modules render:\n{text}");
         assert!(text.contains("/lib/b.so"), "both modules render:\n{text}");
         let line =

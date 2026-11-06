@@ -7432,8 +7432,18 @@ mod tests {
                 .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))
                 .expect("the text catalog names the prefix gap");
             assert!(
-                line.contains("partial (heuristic)"),
+                line.contains("partial:"),
                 "the text verdict must read partial, got: {line}"
+            );
+            let verbose =
+                render_text_with_verbosity(&unaimed, crate::cli::TextVerbosity::Verbose);
+            let vline = verbose
+                .lines()
+                .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))
+                .expect("verbose names the prefix gap");
+            assert!(
+                vline.contains("partial (heuristic)"),
+                "verbose pairs the machine class, got: {vline}"
             );
         }
 
@@ -8893,15 +8903,15 @@ mod tests {
         for (verbosity, summary) in [
             (
                 crate::cli::TextVerbosity::Concise,
-                "admission: 1 admitted, 0 refused, 0 unresolved (scan only: names below come \
-                 from the files themselves)",
+                "admission: 1 admitted, 0 partial, 0 refused, 0 unresolved (scan only: names \
+                 below come from the files themselves)",
             ),
             (
                 crate::cli::TextVerbosity::Verbose,
-                "admission: 1 admitted, 0 refused, 0 unresolved (0 possible functions not yet \
-                 confirmed from a second source (uncorroborated_candidates); 0 functions \
-                 claimed by two providers (module_ambiguous); scan only: names below come \
-                 from the files themselves)",
+                "admission: 1 admitted, 0 partial, 0 refused, 0 unresolved (0 possible \
+                 functions not yet confirmed from a second source \
+                 (uncorroborated_candidates); 0 functions claimed by two providers \
+                 (module_ambiguous); scan only: names below come from the files themselves)",
             ),
         ] {
             let text = render_text_with_verbosity(&catalog, verbosity);

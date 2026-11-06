@@ -37562,10 +37562,21 @@ fn ordered_admission_unnamed_closure_attaches_only_its_published_table() {
     assert!(skipped.is_empty(), "{skipped:?}");
     let plan = plan::build_from_reconciled_modules(&modules);
 
-    assert!(
-        plan.modules_skipped.is_empty(),
-        "published-only admission carries no gap: {:?}",
+    assert_eq!(
+        plan.modules_skipped.len(),
+        1,
+        "published-only admission carries its named partial gap: {:?}",
         plan.modules_skipped
+    );
+    assert!(
+        plan.modules_skipped[0]
+            .reason
+            .contains("1 of 64 template tables attached")
+            && plan.modules_skipped[0]
+                .reason
+                .contains("(closure_published_only)"),
+        "unexpected published-only gap: {:?}",
+        plan.modules_skipped[0]
     );
     assert_eq!(
         plan.slots.len(),

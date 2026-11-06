@@ -377,13 +377,14 @@ pub(crate) enum RefusalKind {
 }
 
 /// Whether a `modules_skipped` reason records a Part 0 prefix-admitted
-/// proxy closure array: some leading templates attached, the rest not
-/// counted. Partially covered, never a whole refusal. The tag is
+/// proxy closure array, or an already-loaded unnamed layer's
+/// published-only spill: some leading templates attached, the rest not
+/// counted. Partially covered, never a whole refusal. A tag is
 /// required beside the counted phrase: whole refusals interpolate
 /// holder paths verbatim, and a path may name the phrase.
 pub(crate) fn is_closure_array_prefix(reason: &str) -> bool {
     reason.contains("template tables attached; calls through the others are not counted")
-        && reason.contains("(closure_prefix)")
+        && (reason.contains("(closure_prefix)") || reason.contains("(closure_published_only)"))
 }
 
 /// Whether a `modules_skipped` reason records a JK-22a prefix-admitted

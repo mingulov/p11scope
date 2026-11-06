@@ -2688,7 +2688,7 @@ mod tests {
         assert!(!refusal.contains("--max-endpoints"), "{refusal}");
         for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
             let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
-            assert!(refusal.contains("1..=131072"), "{refusal}");
+            assert!(refusal.contains("1–131072"), "{refusal}");
         }
     }
 

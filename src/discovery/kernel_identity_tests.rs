@@ -3417,6 +3417,20 @@ struct NestedPidfdObservation {
 /// emits the request pid numerically, so a cross-domain numeric join
 /// would prove by kernel: only the fail-closed gate refuses the run.
 fn nested_pidfd_cell(offer_pidfd: bool, nested: bool) -> NestedPidfdObservation {
+    let numbering = if nested {
+        crate::pidns::test_seam::nested()
+    } else {
+        crate::pidns::PidNumbering::agreeing()
+    };
+    numbered_pidfd_cell(offer_pidfd, numbering)
+}
+
+/// [`nested_pidfd_cell`] under an explicit numbering (foreign-/proc
+/// shapes cannot be named by a bool).
+fn numbered_pidfd_cell(
+    offer_pidfd: bool,
+    numbering: crate::pidns::PidNumbering,
+) -> NestedPidfdObservation {
     const PID: u32 = 6100;
     let world = d3c_world();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -3466,11 +3480,6 @@ fn nested_pidfd_cell(offer_pidfd: bool, nested: bool) -> NestedPidfdObservation 
             imm_base: pass.owner.state_for_test().0[3],
         },
         offer_pidfd,
-    };
-    let numbering = if nested {
-        crate::pidns::test_seam::nested()
-    } else {
-        crate::pidns::PidNumbering::agreeing()
     };
     let confirmation = crate::pidns::test_seam::with_numbering(numbering, || {
         let prepared = super::super::sweep_attribution::prepare_confirmation(
@@ -3592,6 +3601,84 @@ fn nested_confirm_with_pidfd_still_promotes_by_kernel() {
             keys: 0,
             first_reason: None,
         }
+    );
+}
+
+/// pidfd_open resolves in the observer's namespace while request pids
+/// come from the mounted /proc: with a foreign /proc (allowed for
+/// --system scans) the pidfd could bind the wrong task, so even a
+/// pidfd-carrying confirm must fail closed without a target run.
+#[test]
+fn foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
+    let numbering = crate::pidns::PidNumbering {
+        observer: crate::pidns::ObserverPidNs::Initial,
+        proc_view: crate::pidns::ProcView::Foreign("test foreign /proc".into()),
+    };
+    let out = numbered_pidfd_cell(true, numbering);
+    assert_userspace_mapped(&out.confirmation);
+    assert_eq!(
+        out.fallback,
+        [(6100, segment_range(0).0, segment_range(0).1)],
+        "the refused request falls back inside its original pin"
+    );
+    assert!(
+        out.scopes.is_empty(),
+        "a refused foreign-/proc confirm wrote scope: {:?}",
+        out.scopes
+    );
+    assert_eq!(
+        out.concrete_runs, 0,
+        "a refused foreign-/proc confirm ran the iterator"
+    );
+    assert_eq!(out.outcomes, 0, "a refused foreign-/proc confirm recorded a run");
+    assert_eq!(
+        out.attempts, 0,
+        "a refused foreign-/proc confirm counted an attempt"
+    );
+    assert!(out.failed_target.is_none(), "a refusal demoted the pass");
+    assert_eq!(
+        out.per_pid.get(&6100),
+        Some(&KernelFallbackReason::Scope),
+        "the refusal names its cause per request: {:?}",
+        out.per_pid
+    );
+    assert_eq!(
+        out.totals,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Scope),
+        }
+    );
+}
+
+/// The nested-observer twin: a foreign /proc voids the pidfd binding
+/// whichever namespace the observer runs in.
+#[test]
+fn nested_foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
+    let numbering = crate::pidns::PidNumbering {
+        observer: crate::pidns::ObserverPidNs::Nested,
+        proc_view: crate::pidns::ProcView::Foreign("test foreign /proc".into()),
+    };
+    let out = numbered_pidfd_cell(true, numbering);
+    assert_userspace_mapped(&out.confirmation);
+    assert!(
+        out.scopes.is_empty(),
+        "a refused nested foreign-/proc confirm wrote scope: {:?}",
+        out.scopes
+    );
+    assert_eq!(
+        out.concrete_runs, 0,
+        "a refused nested foreign-/proc confirm ran the iterator"
+    );
+    assert_eq!(out.attempts, 0, "a refused nested foreign-/proc confirm counted an attempt");
+    assert!(out.failed_target.is_none(), "a refusal demoted the pass");
+    assert_eq!(
+        out.per_pid.get(&6100),
+        Some(&KernelFallbackReason::Scope),
+        "the refusal names its cause per request: {:?}",
+        out.per_pid
     );
 }
 

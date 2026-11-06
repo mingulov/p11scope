@@ -17168,6 +17168,96 @@ fn key_operation_c5_retirement_truncated_init_rows_no_completion() {
     );
 }
 
+/// HistoryLoss: a seal failure disposing a staged Init+terminal
+/// pair preserves the observed completion as an unknown-key row
+/// (the S1 stands without object proof) beside counted
+/// `record_lost`; live S1 is untouched and the feed still degrades
+/// for its next clean point.
+#[test]
+fn key_operation_history_loss_preserves_observed_pair_as_unknown() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Definite history first (it also retains the projection): one
+    // completed Sign through Joint seals.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // A second pair stages but its seal fails with real loss (a
+    // fault moved under it): both dispose.
+    let (facts_init, pos_init) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, pos_init, facts_init);
+    let (facts_sign, pos_sign) = guarded.admit_shape(&sign);
+    guarded.observe(&joint_key, pos_sign, facts_sign);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::FaultChanged,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    assert_eq!(
+        guarded.registry.deliver_joint_algorithm_failure_for_test(
+            joint_id,
+            &failure,
+            &mut h3,
+            &guarded.scene.model,
+            guarded.scene.adapter.ledger_mut(),
+        ),
+        FailureApplyOutcome::Degraded { disposed: 2 }
+    );
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        2,
+        "loss disposal never reduces through live S1"
+    );
+    assert!(
+        pos_init < pos_sign,
+        "non-vacuous: the pair staged in order"
+    );
+    // The observed completion rows unknown-key beside the counted
+    // proof loss; the proved history stands.
+    let observations = guarded.registry.joint_observations(18);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost")
+    );
+    let preserved = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("the observed Init+terminal pair rows unknown-key");
+    assert_eq!((preserved.completed, preserved.active), (1, 0));
+    assert!(
+        observations
+            .key_operations
+            .iter()
+            .any(|row| row.category == "sign" && row.completed == 1),
+        "the proved history stands beside the preserved row"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 2,
+        }]
+    );
+}
+
 /// The capture owner holds ONE ledger: a staged H9 charge plus its
 /// association mint account together in one census/total, so either
 /// release frees allowance for the other role. Scalar-role charges

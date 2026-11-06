@@ -2300,6 +2300,75 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
     )
 }
 
+/// Modules whose attached counts are forwarding-layer observations, never
+/// logical calls: closure-array layers admitted beside watched providers
+/// (prefix-admitted or refused whole). Identified structurally from the
+/// planner's closure gaps — never by path, name or vendor. A refused
+/// layer holds no slots, so including it here is a no-op; a
+/// prefix-admitted layer's own stub slots are the ones excluded from
+/// logical totals.
+fn forwarding_module_ids(ev: &Evidence) -> std::collections::BTreeSet<ModuleId> {
+    let mut names = std::collections::BTreeSet::new();
+    for skipped in &ev.discovery.modules_skipped {
+        if crate::plan::is_closure_array_prefix(&skipped.reason)
+            || crate::plan::is_closure_array_refusal(&skipped.reason)
+        {
+            names.insert(skipped.name.as_str());
+        }
+    }
+    ev.discovery
+        .modules
+        .iter()
+        .filter(|module| names.contains(module.path.as_str()))
+        .map(|module| module.id)
+        .collect()
+}
+
+/// True when a slot row counts calls at a forwarding layer. Attributed
+/// rows match by module id; unattributed rows (ambiguous or unresolved
+/// ownership) match by the attach target's file identity, since the
+/// counts are real even when the owner was not proven.
+fn row_is_forwarding(
+    report: &SlotReport,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> bool {
+    if forwarding.is_empty() {
+        return false;
+    }
+    if let Some(id) = report.module {
+        return forwarding.contains(&id);
+    }
+    if let Some(target) = &report.target_object {
+        return modules.iter().any(|module| {
+            forwarding.contains(&module.id) && module.dev == target.dev && module.ino == target.ino
+        });
+    }
+    false
+}
+
+/// Per-layer completed/error/in-flight totals over slot rows: logical
+/// (provider) calls first, forwarding-layer calls second. One logical
+/// call observed at both layers counts once, in the logical total.
+fn layer_call_totals(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> [(u64, u64, u64); 2] {
+    let mut totals = [(0u64, 0u64, 0u64); 2];
+    for report in reports {
+        let slot = if row_is_forwarding(report, forwarding, modules) {
+            &mut totals[1]
+        } else {
+            &mut totals[0]
+        };
+        slot.0 = slot.0.saturating_add(report.calls);
+        slot.1 = slot.1.saturating_add(report.errors);
+        slot.2 = slot.2.saturating_add(report.in_flight);
+    }
+    totals
+}
+
 /// True when at least one mapped provider has no manifest source at all.
 fn has_unattested_provider(ev: &Evidence) -> bool {
     !ev.discovery.modules.is_empty()
@@ -2351,6 +2420,64 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
     )
 }
 
+/// Plain-words per-layer split for forwarding-layer activity: each
+/// forwarding layer with its own completed calls, stated separately from
+/// — never summed into — the logical headline above it. Empty when no
+/// forwarding layer recorded activity, so single-layer captures read
+/// exactly as before.
+fn forwarding_layer_lines(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    (fwd_calls, fwd_errors, fwd_open): (u64, u64, u64),
+) -> String {
+    if fwd_calls == 0 && fwd_errors == 0 && fwd_open == 0 {
+        return String::new();
+    }
+    let mut per_layer = std::collections::BTreeMap::<ModuleId, (u64, u64, u64)>::new();
+    for report in reports {
+        if !row_is_forwarding(report, forwarding, &ev.discovery.modules) {
+            continue;
+        }
+        let key = report.module.unwrap_or(ModuleId(u32::MAX));
+        let slot = per_layer.entry(key).or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(report.calls);
+        slot.1 = slot.1.saturating_add(report.errors);
+        slot.2 = slot.2.saturating_add(report.in_flight);
+    }
+    let mut layers: Vec<String> = per_layer
+        .iter()
+        .filter(|(_, (calls, errors, open))| *calls > 0 || *errors > 0 || *open > 0)
+        .map(|(id, (calls, errors, open))| {
+            let path = ev
+                .discovery
+                .modules
+                .iter()
+                .find(|module| module.id == *id)
+                .map(|module| escape_controls(&module.path).into_owned())
+                .unwrap_or_else(|| "an unattributed forwarding target".into());
+            let mut detail = format!("{path} recorded {calls} completed forwarding-layer calls");
+            if *errors > 0 {
+                detail.push_str(&format!(", {errors} returned errors"));
+            }
+            if *open > 0 {
+                detail.push_str(&format!(", {open} entries without an observed return"));
+            }
+            detail
+        })
+        .collect();
+    layers.sort();
+    if layers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Forwarding layers counted separately (not in the totals above): {}.\n\
+         Each forwarding-layer call contains one provider call on the same thread; \
+         the totals above count that logical call once.\n",
+        layers.join("; ")
+    )
+}
+
 /// Human context from aggregate map rows and the existing evidence verdict.
 /// Scope is a kind, never a target PID, path or application identity.
 /// Renders at the run-scoped verbosity; see [`scope_summary_with_verbosity`].
@@ -2376,15 +2503,19 @@ pub fn scope_summary_with_verbosity(
             .iter()
             .fold(0u64, |total, row| total.saturating_add(field(row)))
     };
-    let calls = sum(|row| row.calls);
-    let errors = sum(|row| row.errors);
-    let open = sum(|row| row.in_flight);
+    // Headline totals count logical calls once: a call observed at both
+    // a forwarding layer and the provider it forwards into counts in the
+    // provider (logical) total only. Forwarding-layer calls are stated
+    // separately below, never summed in.
+    let forwarding = forwarding_module_ids(ev);
+    let [(calls, errors, open), (fwd_calls, fwd_errors, fwd_open)] =
+        layer_call_totals(reports, &forwarding, &ev.discovery.modules);
     let mut text = String::new();
     if verbosity != TextVerbosity::Quiet {
         if scope != "pid" {
             text.push_str("Aggregate across the selected scope; counts are not per application.\n");
         }
-        if calls == 0 {
+        if calls == 0 && fwd_calls == 0 {
             text.push_str(if ev.completeness == "COMPLETE" {
                 "No completed calls observed during this window.\n"
             } else {
@@ -2412,6 +2543,12 @@ pub fn scope_summary_with_verbosity(
     }
     text.push_str(&totals_line(calls, errors, open));
     text.push('\n');
+    text.push_str(&forwarding_layer_lines(
+        reports,
+        ev,
+        &forwarding,
+        (fwd_calls, fwd_errors, fwd_open),
+    ));
     text.push_str(&coverage_line(ev, verbose));
     text.push('\n');
     if verbosity != TextVerbosity::Quiet {
@@ -2611,6 +2748,7 @@ pub fn live_scoped_with_verbosity(
     if !rows.is_empty() {
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
         s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
+        let forwarding = forwarding_module_ids(ev);
         s.push_str(&format!(
             "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
             "FUNCTION", "PROVIDER", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
@@ -2628,6 +2766,9 @@ pub fn live_scoped_with_verbosity(
             let mut name = label(r);
             if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
                 name.push_str(init.text_suffix());
+            }
+            if row_is_forwarding(r, &forwarding, &ev.discovery.modules) {
+                name.push_str(" (forwarding layer)");
             }
             s.push_str(&format!(
                 "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
@@ -3332,6 +3473,12 @@ struct FunctionOut {
     /// relabelled as two-module ambiguity. The three fields are an exact
     /// exclusive relation: nonnull/false/false, null/true/false, null/false/true.
     module_unresolved: bool,
+    /// True when this row counts calls at a forwarding layer (a closure
+    /// array admitted beside watched providers): the logical call is the
+    /// provider row it contains, counted once in `layer_totals.logical`.
+    /// Additive within v3: consumers that sum `calls` across rows must
+    /// skip `forwarding_layer` rows to count logical calls once.
+    forwarding_layer: bool,
     calls: u64,
     errors: u64,
     pending_returns: u64,
@@ -3480,7 +3627,11 @@ fn initialization_out(
 /// sourcing in both renderers). `modules` is the current compact
 /// `evidence.discovery[]` snapshot, so stable `ModuleId`s are matched rather
 /// than treated as vector offsets.
-fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<FunctionOut> {
+fn functions_out(
+    reports: &[SlotReport],
+    modules: &[DiscoveredModule],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+) -> Vec<FunctionOut> {
     reports
         .iter()
         .map(|r| FunctionOut {
@@ -3503,6 +3654,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
             // null module must not have to know why it is null.
             module_ambiguous: r.module_ambiguous,
             module_unresolved: r.module_unresolved,
+            forwarding_layer: row_is_forwarding(r, forwarding, modules),
             calls: r.calls,
             errors: r.errors,
             pending_returns: r
@@ -3541,7 +3693,27 @@ fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Additive v3 `layer_totals`: logical (provider) calls count once no
+/// matter how many layers observed them; forwarding-layer calls stay
+/// explicit beside them. Both layers keep their `functions[]` rows with
+/// `forwarding_layer` labels, so the split is reproducible per row.
+fn layer_totals_json(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> serde_json::Value {
+    let [
+        (logical_calls, logical_errors, logical_open),
+        (fwd_calls, fwd_errors, fwd_open),
+    ] = layer_call_totals(reports, forwarding, modules);
+    serde_json::json!({
+        "logical": {"calls": logical_calls, "errors": logical_errors, "in_flight": logical_open},
+        "forwarding": {"calls": fwd_calls, "errors": fwd_errors, "in_flight": fwd_open},
+    })
+}
+
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
+    let forwarding = forwarding_module_ids(ev);
     serde_json::json!({
         "schema": "p11scope/observed-profile/v3-metrics",
         // Machine-readable lane discriminator (SYSPLAN residual F-12): the
@@ -3556,7 +3728,8 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
                      "drain_interval_ms": capture.drain_interval_ms,
                      "modules": capture_modules(ev) },
         "evidence": ev,
-        "functions": functions_out(reports, &ev.discovery.modules),
+        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
+        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
     })
 }
 
@@ -3967,6 +4140,7 @@ pub fn profile_json(
     capture: &CaptureMeta,
 ) -> serde_json::Value {
     let ev = versioned.evidence();
+    let forwarding = forwarding_module_ids(ev);
     let mechanisms: Vec<MechanismOut> = state
         .mechanisms()
         .iter()
@@ -4069,7 +4243,8 @@ pub fn profile_json(
             "modules": capture_modules(ev),
         },
         "evidence": versioned.value().clone(),
-        "functions": functions_out(reports, &ev.discovery.modules),
+        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
+        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
         "mechanisms": mechanisms,
         "sessions": sessions_out,
         "logins": logins,
@@ -5413,7 +5588,7 @@ pub(crate) mod tests {
         let mut report = report("C_Sign", 1, 0, false);
         report.module = Some(crate::plan::ModuleId(1));
 
-        let out = functions_out(&[report], &[b, c]);
+        let out = functions_out(&[report], &[b, c], &std::collections::BTreeSet::new());
 
         assert_eq!(out[0].module.as_ref().unwrap().ino, 22);
     }
@@ -8234,6 +8409,73 @@ pub(crate) mod tests {
             document["layer_totals"]["forwarding"]["calls"], 500,
             "JSON forwarding totals stay explicit"
         );
+    }
+
+    /// Unattributed twin: a forwarding-layer row whose ownership was not
+    /// proven (null module) still leaves the logical total once — the
+    /// attach target's file identity places it at the forwarding layer.
+    #[test]
+    fn unresolved_forwarding_rows_leave_logical_totals_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "unattributed forwarding rows leave the logical headline once: {text}"
+        );
+        assert!(
+            text.contains("forwarding-layer calls"),
+            "unattributed forwarding activity stays visible per layer: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+        // Negative control: the same unattributed row aimed at another
+        // file stays logical — the file-identity match decides.
+        let mut elsewhere = report("unknown#3", 500, 0, false);
+        elsewhere.module = None;
+        elsewhere.module_unresolved = true;
+        elsewhere.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 999,
+            sha256: None,
+        });
+        let mut direct = report("C_Sign", 744, 0, false);
+        direct.module = Some(ModuleId(8));
+        let control = json(&[elsewhere, direct], &ev, &capture_fixture());
+        assert_eq!(control["layer_totals"]["logical"]["calls"], 1244);
+        assert_eq!(control["layer_totals"]["forwarding"]["calls"], 0);
     }
 
     /// JK-22a: a prefix-admitted ordinary provider names its attached

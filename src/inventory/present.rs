@@ -1436,6 +1436,67 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
     render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
+/// Forwarding-layer (closure-array admission) modules with entries on
+/// their edges, each with its entry total. A forwarding entry contains
+/// one provider entry on the same thread, so provider edges are the
+/// logical totals and these stay separate, never summed in. Matches the
+/// planner's `closure_array` label and its hyphenated test spelling.
+pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(String, u64)> {
+    let mut layers: Vec<(String, u64)> = presentation
+        .modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.admission_class.as_deref(),
+                Some("closure_array" | "closure-array")
+            )
+        })
+        .map(|module| {
+            let entries = presentation
+                .edges
+                .iter()
+                .filter(|edge| edge.module == module.id)
+                .map(|edge| edge.entry_count)
+                .fold(0u64, u64::saturating_add);
+            let path = module
+                .paths
+                .first()
+                .cloned()
+                .unwrap_or_else(|| module.id.label());
+            (path, entries)
+        })
+        .filter(|(_, entries)| *entries > 0)
+        .collect();
+    layers.sort();
+    layers
+}
+
+/// Logical vs forwarding-layer entry totals over every edge. Provider
+/// edges are logical; closure-array edges are forwarding observations
+/// of those same calls.
+pub(crate) fn layer_entry_totals(presentation: &Presentation) -> (u64, u64) {
+    let forwarding: std::collections::BTreeSet<ModuleId> = presentation
+        .modules
+        .iter()
+        .filter(|module| {
+            matches!(
+                module.admission_class.as_deref(),
+                Some("closure_array" | "closure-array")
+            )
+        })
+        .map(|module| module.id)
+        .collect();
+    let mut logical = 0u64;
+    let mut forwarding_entries = 0u64;
+    for edge in &presentation.edges {
+        if forwarding.contains(&edge.module) {
+            forwarding_entries = forwarding_entries.saturating_add(edge.entry_count);
+        } else {
+            logical = logical.saturating_add(edge.entry_count);
+        }
+    }
+    (logical, forwarding_entries)
+}
 /// The key-operations summary when `--key-operations` was requested
 /// but the semantic subset refused. The scan path (unverifiable
 /// scan-derived tables; export-name agreement alone never grants
@@ -2014,6 +2075,28 @@ fn render_snapshot_inner(
                 line.push_str(&unknown_type_suffix);
             }
             let _ = writeln!(out, "{line}");
+        }
+    }
+    {
+        let layers = forwarding_entry_layers(presentation);
+        if !layers.is_empty() {
+            let parts: Vec<String> = layers
+                .iter()
+                .map(|(path, entries)| {
+                    format!(
+                        "{} recorded {} forwarding-layer {}",
+                        escape_controls(path),
+                        entries,
+                        if *entries == 1 { "entry" } else { "entries" }
+                    )
+                })
+                .collect();
+            let _ = writeln!(
+                out,
+                "Forwarding-layer entries counted separately (not independent calls): {}. \
+                 Each contains one provider entry on the same thread; provider edges are the logical totals.",
+                parts.join("; ")
+            );
         }
     }
     // Verbose keeps one line per edge with internal ids; concise and

@@ -2062,6 +2062,72 @@ fn quiet_summary_on_empty_edges_keeps_the_absence_line() {
     assert!(!summary.contains("Details:"), "{summary}");
 }
 
+/// Nested-forwarding inventory twin: a closure-array forwarding layer
+/// whose entries each contain one provider entry on the same thread.
+/// Provider edges are the logical totals; the forwarding layer is
+/// stated separately per layer in text, and JSON keeps both layers
+/// explicitly labelled with `layer_totals`.
+#[test]
+fn forwarding_layer_entries_count_separately_with_per_layer_split() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    assert!(
+        presentation.modules.len() >= 2,
+        "the twin needs two modules: {}",
+        presentation.modules.len()
+    );
+    presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
+    presentation.modules[0].admission_class = Some("closure_array".into());
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id)
+        .expect("a forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id)
+        .expect("a provider edge")
+        .entry_count = 744;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("Forwarding-layer entries counted separately"),
+        "forwarding split stated in plain words: {summary}"
+    );
+    assert!(
+        summary.contains("/opt/libforward.so") && summary.contains("500"),
+        "forwarding layer shown per layer: {summary}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let modules = document["modules"].as_array().unwrap();
+    let fwd_json = modules
+        .iter()
+        .find(|module| module["id"] == fwd_id.label())
+        .expect("forwarding module JSON");
+    assert_eq!(fwd_json["admission"]["class"], "closure_array");
+    assert_eq!(document["layer_totals"]["logical_entries"], 744);
+    assert_eq!(document["layer_totals"]["forwarding_entries"], 500);
+    // Negative control: without the closure class the same entries read
+    // as logical and the forwarding line is gone.
+    presentation.modules[0].admission_class = Some("exact".into());
+    let plain = render_snapshot_summary(&presentation);
+    assert!(
+        !plain.contains("Forwarding-layer entries counted separately"),
+        "no forwarding line without a forwarding layer: {plain}"
+    );
+    let plain_json = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(plain_json["layer_totals"]["logical_entries"], 1244);
+    assert_eq!(plain_json["layer_totals"]["forwarding_entries"], 0);
+}
+
 #[test]
 fn f7_snapshot_high_cardinality_allocation_baseline() {
     // Exercise the real renderer with all 4096 edges/children, rather than

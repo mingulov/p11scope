@@ -109,6 +109,7 @@ def owned_metrics_document(bits, calls=30):
         interface_list="ok",
         child_still_running=True,
         handoff_child_pid=123,
+        run_tree_handed_back=0,
     )
     evidence["scheduling"]["phase_mono_ns"] = {
         "attach_mono_ns": 1, "loop_start_mono_ns": 2,
@@ -3624,6 +3625,9 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                     lambda d: d["evidence"].pop("child_still_running"),
                     lambda d: d["evidence"].update(child_still_running=False, handoff_child_pid=None),
                     lambda d: d["evidence"].update(handoff_child_pid=None),
+                    lambda d: d["evidence"].pop("run_tree_handed_back"),
+                    lambda d: d["evidence"].update(run_tree_handed_back="yes"),
+                    lambda d: d["evidence"].update(run_tree_handed_back=True),
                     lambda d: d["evidence"]["scheduling"]["phase_mono_ns"].update(loop_end_reason="target_exit"),
                     lambda d: d["evidence"].update(
                         pause="sigstop", pause_attempts=1, pause_confirmed=1),
@@ -3664,6 +3668,7 @@ class OwnedMetricsOracleTests(unittest.TestCase):
 
         external = copy.deepcopy(owned)
         external["evidence"].pop("child_still_running")
+        external["evidence"].pop("run_tree_handed_back")
         external["evidence"]["handoff_child_pid"] = None
         # The initial-set skip belongs to the owned lane alone: an external
         # `--pid` attach never attempts initial-set discovery, so it has
@@ -3687,6 +3692,11 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             capture.validate_canary(
                 "aggregate-only-metrics", external_owned_evidence, TARGET_BITS)
+        external_handed_back = copy.deepcopy(external)
+        external_handed_back["evidence"]["run_tree_handed_back"] = 0
+        with self.assertRaises(AssertionError):
+            capture.validate_canary(
+                "aggregate-only-metrics", external_handed_back, TARGET_BITS)
 
     def test_owned_metrics_judge_ring_positions_not_the_drained_residue(self):
         """The residue is empty on a healthy owned run, so it cannot be the oracle.

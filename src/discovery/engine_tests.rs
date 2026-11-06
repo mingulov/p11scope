@@ -15648,17 +15648,26 @@ fn engine_retains_pid_reports_live_views_only() {
 #[test]
 fn engine_note_run_tree_gap_publishes_under_the_run_tree_subject() {
     let mut engine = Engine::empty();
-    engine.note_run_tree_gap("the run cgroup could not be created");
+    assert_eq!(engine.run_tree_handed_back(), 0);
+    engine.note_run_tree_gap(crate::render::RUN_TREE_DEGRADED, None);
     assert_eq!(engine.counters.object_skips.len(), 1);
     let skipped = &engine.counters.object_skips[0];
     assert_eq!(skipped.subject, "run process tree");
-    assert_eq!(skipped.reason, "the run cgroup could not be created");
-    engine.note_run_tree_gap("the run cgroup could not be created");
+    assert_eq!(skipped.reason, crate::render::RUN_TREE_DEGRADED);
+    assert_eq!(
+        engine.run_tree_handed_back(),
+        0,
+        "a degradation measures no survivors"
+    );
+    engine.note_run_tree_gap(crate::render::RUN_TREE_DEGRADED, None);
     assert_eq!(
         engine.counters.object_skips.len(),
         1,
         "an identical gap dedups like every other skip"
     );
+    engine.note_run_tree_gap(crate::render::RUN_TREE_SURVIVORS, Some(2));
+    assert_eq!(engine.run_tree_handed_back(), 2);
+    assert_eq!(engine.counters.object_skips.len(), 2);
 }
 
 /// A run cgroup scope missing the held child refuses the prearm by

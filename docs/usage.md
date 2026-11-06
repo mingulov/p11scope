@@ -668,6 +668,28 @@ progress and `p11scope: cleanup incomplete`, exits with status 130, and the
 kernel finishes the remaining closes as the process exits — the report is
 already written and stays intact. Only a second SIGINT does this; a second
 SIGTERM does not escalate.
+
+`run` captures the command with its child processes: before release the
+child is placed in a dedicated cgroup, so every descendant — `fork`/`exec`
+children, `sh -c` and `env` wrappers, `sudo -u` hops, double forks — is
+born in scope and its calls are counted. Only pausing stays with the
+direct child. The run still ends with the direct child's exit: descendants
+still alive are handed back alive, never killed, and disclosed by count
+(`evidence.run_tree_handed_back` with a `run process tree` gap entry;
+`PARTIAL`). A retained nonempty cgroup names itself on stderr so the
+operator can remove it after its members exit. Descendants that retire
+between admission passes count `pid_descendant_gaps` exactly like cgroup
+scope (same bounded ledger, same lossy-by-design rule), so a forking
+workload reports exact counts with `PARTIAL` observation; see the
+[known limitations](known-limitations.md). Without permission to create
+the cgroup, `run` observes only the started command itself and names the
+gap; `capture.scope` reads `cgroup` for the tree scope, `pid` when
+degraded.
+
+sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
+  --prearm-module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -o tree.json -- \
+  sh -c 'pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L'
+
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
 file written) instead of aborting it. A stop that arrives during `profile` or
 `trace` startup, before anything is attached (discovery can take seconds),

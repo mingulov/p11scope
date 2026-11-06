@@ -894,7 +894,8 @@ class SchemaOracleAgreement(unittest.TestCase):
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
-            | {"child_still_running", "counter_collection", "selected_detail",
+            | {"child_still_running", "run_tree_handed_back",
+               "counter_collection", "selected_detail",
                "excluded_modules", "unmatched_excludes", "legacy_collection"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
@@ -1041,7 +1042,9 @@ class SchemaOracleAgreement(unittest.TestCase):
         )
         self.assertEqual(
             skip_reasons,
-            set(CHECKER["ENTRY_REASONS"]) | set(CHECKER["DISCOVERY_REASONS"]),
+            set(CHECKER["ENTRY_REASONS"])
+            | set(CHECKER["DISCOVERY_REASONS"])
+            | set(CHECKER["RUN_TREE_REASONS"]),
         )
         self.assertEqual(
             set(SCHEMA["properties"]["lane"]["enum"]),

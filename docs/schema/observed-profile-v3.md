@@ -677,8 +677,9 @@ this object.
 
 `capture.scope` is exactly `pid`, `cgroup`, or `system`, naming which scope
 selected the capture (`--pid`, `--cgroup`, or `--system`). It carries no PID
-number or cgroup path. The evidence object keeps its closed exact key set;
-this addition touches the `capture` section only.
+number or cgroup path. `run` reports `cgroup` for its dedicated tree scope
+and `pid` when it degraded to its exact child. The evidence object keeps
+its closed exact key set; this addition touches the `capture` section only.
 
 ## Completeness and terminal trace
 
@@ -718,6 +719,26 @@ of:
 - `discovery transport unavailable`: one live discovery-ring dequeue failed
   after a prefix was already pulled. The prefix is applied, the failure is
   counted here, and the capture continues to the next tick.
+
+Run-tree scope gaps file under their own subject. Each record is
+`{name: "run process tree", reason}` with `reason` exactly one of:
+
+- `process-tree members were still present when the command exited;
+  their calls after the run end are out of scope`: the run ended while
+  tree members were still present; they were handed back alive and
+  their later calls are out of scope.
+- `only the started command is observed`: the run cgroup could not be
+  created, placed, or scoped, so the run degraded to its exact child.
+  The failed step and I/O kind print on stderr; the report keeps the
+  fixed reason.
+- `handed-back descendants are unknown`: the run cgroup membership
+  could not be read at run end.
+
+`evidence.run_tree_handed_back` (integer, `run` documents only, required
+there) counts the handed-back survivors: measured zero when the tree
+retired cleanly. It is annotation only — the paired `run process tree`
+skip carries the verdict through the `skipped` cause, like every other
+non-null-pointer skip.
 
 Counts are array lengths; no path, PID, or error chain leaves diagnostics.
 

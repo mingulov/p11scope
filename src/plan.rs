@@ -13406,6 +13406,87 @@ mod tests {
         );
     }
 
+    /// Boundary: a named closure whose prefix is blocked by a refused
+    /// provider ahead of it falls through to published-only with spill —
+    /// and stays silent. The partial gap is briefed unnamed-only, so the
+    /// named layer's covered table is not a gap. Every other gate
+    /// conjunct holds here (a published-only pass, late start via the
+    /// admitted sidecar, 63 spilled templates), pinning `!closure_named`.
+    #[test]
+    fn named_closure_falling_through_to_published_only_stays_silent() {
+        let sidecar = provider_with_tables(32, "/opt/sidecar.so", 1, 1, false);
+        let big = provider_with_tables(33, "/opt/big.so", 1, 600, false);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 103, false);
+        closure.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        closure.scanned.tables[63].live_return = true;
+        let first = scoped_plan(&[sidecar, big, closure], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 32), 1, "sidecar provider beside");
+        assert_eq!(slots_of(&first, 33), 0, "oversized provider refused");
+        assert_eq!(slots_of(&first, 31), 103, "only the published table");
+        assert_eq!(
+            first.uncorroborated_candidates, 63,
+            "63 unpublished templates are evidence only"
+        );
+        assert!(
+            refusal_of(&first, "/opt/big.so").is_some(),
+            "the loss ahead is what blocks the prefix: {:?}",
+            first.modules_skipped
+        );
+        assert!(
+            refusal_of(&first, P11_KIT).is_none(),
+            "no partial for a named fall-through: {:?}",
+            first.modules_skipped
+        );
+        assert_eq!(
+            first.modules_skipped.len(),
+            1,
+            "only the big provider's whole refusal: {:?}",
+            first.modules_skipped
+        );
+    }
+
+    /// Boundary: an already-loaded unnamed closure that re-admits every
+    /// table — kept endpoints re-attached in the kept-only retry after a
+    /// refused growth, nothing spilled — reports no partial. A first-pass
+    /// published-only closure always spills (the classifier only routes
+    /// modules with more than four unresolved tables here), so full
+    /// re-admission is the only no-spill shape; it must never read as an
+    /// "M of M" gap. Pins the spill conjunct.
+    #[test]
+    fn already_loaded_unnamed_closure_readmitting_every_table_reports_no_partial() {
+        let sidecar = provider_with_tables(32, "/opt/sidecar.so", 1, 1, false);
+        let mut named = provider_with_tables(31, P11_KIT, 64, 3, false);
+        named.scanned.module_hint = Some(std::path::PathBuf::from(P11_KIT));
+        let first = scoped_plan(&[sidecar, named], AdmissionScope::Named);
+        assert_eq!(slots_of(&first, 31), 192, "every table attached whole");
+        assert!(
+            first.modules_skipped.is_empty(),
+            "whole admission names no gap: {:?}",
+            first.modules_skipped
+        );
+
+        let sidecar = provider_with_tables(32, "/opt/sidecar.so", 1, 1, false);
+        let unnamed = provider_with_tables(31, P11_KIT, 64, 3, false);
+        let rebuilt = first.rebuild_from_sources(&[sidecar, unnamed], &[], &PinnedObjects::empty());
+        assert_eq!(slots_of(&rebuilt, 32), 1, "sidecar kept");
+        assert_eq!(slots_of(&rebuilt, 31), 192, "every kept table re-admitted");
+        assert_eq!(
+            rebuilt.uncorroborated_candidates, 0,
+            "nothing spilled in the kept-only retry"
+        );
+        assert!(
+            refusal_of(&rebuilt, P11_KIT).is_none(),
+            "no M-of-M partial for a full re-admission: {:?}",
+            rebuilt.modules_skipped
+        );
+        assert!(
+            rebuilt.modules_skipped.is_empty(),
+            "no gap record at all: {:?}",
+            rebuilt.modules_skipped
+        );
+    }
+
     /// Route A: with no prefix holding room, a provider's later growth
     /// is admitted whole instead of omitted behind the closure.
     #[test]

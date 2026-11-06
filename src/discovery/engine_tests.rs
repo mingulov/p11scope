@@ -62886,6 +62886,140 @@ int main(int argc, char **argv) {
     assert!(!table.live_return && !table.manifest_supported);
 }
 
+/// The tables-scan finished flag from a real scan: a default-budget scan
+/// of a loader child finishes the provider module, while a per-object
+/// cap that skips the module leaves it unfinished. A work ceiling cannot
+/// twin the failure leg here: any mid-scan stop fails the maps-B bracket
+/// and drops every module, so no stopped module is observable.
+#[test]
+fn raw_scan_tables_scan_finished_and_skipped_unfinished() {
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("provider.so");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-compatibility.c");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-std=c11", "-O0", "-DCOMPAT_FAT_DATA"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let loader_source = dir.path().join("loader.c");
+    std::fs::write(
+        &loader_source,
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 1;
+    unsigned long (*get)(void **) = dlsym(h, "C_GetFunctionList");
+    void *table = 0;
+    if (!get || get(&table)) return 2;
+    printf("%p\n", table);
+    fflush(stdout);
+    char byte;
+    (void)read(STDIN_FILENO, &byte, 1);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&loader_source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    {
+        use std::io::{BufRead as _, BufReader};
+        let mut address = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+    }
+    let hooks = HookRegistry::builtin();
+    let scan = |budget: &mut CaptureWorkBudget| {
+        let view = ProcessView::open(ProcessViewId(4301), child.0.id()).unwrap();
+        crate::discovery::scan::scan_process_view(
+            &ScanRequest {
+                pid: child.0.id(),
+                hints: &[],
+                hooks: &hooks,
+            },
+            &view,
+            budget,
+        )
+        .unwrap()
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan(&mut budget);
+    let provider = outcome
+        .modules()
+        .iter()
+        .find(|module| module.path.ends_with("provider.so"))
+        .expect("the default scan reaches the provider module");
+    assert_eq!(provider.tables.len(), 1, "the fat BSS adds no table");
+    assert!(
+        provider.tables_scan_finished,
+        "a default-budget scan finishes the provider tables scan"
+    );
+    assert_eq!(budget.stopped_reason(), None);
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 100 * 1024,
+        ..ScanLimits::default()
+    });
+    let outcome = scan(&mut budget);
+    let provider = outcome
+        .modules()
+        .iter()
+        .find(|module| module.path.ends_with("provider.so"))
+        .expect("a skipped module is still reported");
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject.ends_with("provider.so") && skip.reason.contains("too_large")),
+        "the cap skipped the provider module: {:?}",
+        outcome.skipped()
+    );
+    assert!(
+        provider.tables.is_empty(),
+        "a skipped module carries no tables"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "a skipped tables scan reports unfinished"
+    );
+}
+
 #[test]
 fn acquired_interfaces_keep_the_observed_extent_across_version_labels() {
     let fixture = LegacyPrefixBoundaryFixture::new();

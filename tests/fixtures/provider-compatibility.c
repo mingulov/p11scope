@@ -23,6 +23,16 @@ static struct {
 
 static void *published_table = &table;
 
+#ifdef COMPAT_FAT_DATA
+/* 1 MiB of file-backed data after the table, so the object's readable data
+ * dwarfs its ELF headers: a per-object cap between the two skips the
+ * module whole. Fully nonzero (the compiler demotes a mostly-zero array
+ * back to BSS, which the sweep does not group). Every word is
+ * version-major 1, which the decoder reads as data, never a table. */
+static uint64_t compat_fat[131072] = { [0 ... 131071] = 1 };
+static void *compat_fat_anchor = &compat_fat[131071];
+#endif
+
 void compatibility_set_table(void *value) { published_table = value; }
 
 uintptr_t C_GetFunctionList(void **out) {

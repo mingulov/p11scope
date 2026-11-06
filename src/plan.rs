@@ -13190,9 +13190,13 @@ mod tests {
 
     /// Route A: only the publication-authorized table of a closure
     /// attaches; its heuristic templates are counted as uncorroborated
-    /// evidence, never slots, and no prefix partial is reported.
+    /// evidence, never slots. No prefix partial is reported — but an
+    /// already-loaded unnamed layer that spills unpublished templates
+    /// names its covered tables as a published-only partial, never
+    /// silent: templates handed out before the capture started can
+    /// still be called.
     #[test]
-    fn closure_attaches_only_its_authorized_table_without_prefix_partial() {
+    fn closure_attaches_only_its_authorized_table_with_published_only_partial() {
         let filler = provider_with_tables(50, "/opt/filler.so", 1, 200, true);
         let mut closure = provider_with_tables(31, P11_KIT, 65, 68, false);
         closure.scanned.tables[64].live_return = true;
@@ -13204,15 +13208,26 @@ mod tests {
             first.uncorroborated_candidates, 64,
             "64 heuristic templates are evidence only"
         );
+        let partial = refusal_of(&first, P11_KIT).expect("published-only partial reported");
         assert!(
-            refusal_of(&first, P11_KIT).is_none(),
-            "no prefix partial under published-only: {:?}",
-            first.modules_skipped
+            partial.reason.contains("1 of 65 template tables attached")
+                && partial
+                    .reason
+                    .contains("calls through the others are not counted"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            is_closure_array_prefix(&partial.reason),
+            "partial renders partially covered: {}",
+            partial.reason
         );
     }
 
     /// Route A: an authorized table attaches while every heuristic
-    /// template stays evidence only; no "N of M" partial is reported.
+    /// template stays evidence only. An already-loaded unnamed layer
+    /// reports its covered table ("1 of 65"), never a "0 of M"
+    /// partial: a pass that attaches nothing refuses whole instead.
     #[test]
     fn published_only_closure_never_reports_zero_of_m_as_partial() {
         use crate::discovery::scan::{ScannedEntry, ScannedTable};
@@ -13250,9 +13265,80 @@ mod tests {
             68,
             "only the authorized table attaches"
         );
+        let partial = refusal_of(&first, P11_KIT).expect("published-only partial reported");
+        assert!(
+            partial.reason.contains("1 of 65 template tables attached")
+                && partial
+                    .reason
+                    .contains("calls through the others are not counted"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            !partial.reason.contains("0 of "),
+            "never a zero-covered partial: {}",
+            partial.reason
+        );
+    }
+
+    /// An already-loaded unnamed closure with one published table and
+    /// spilled unpublished templates names its covered table — "1 of
+    /// 64 template tables attached" — instead of staying silent:
+    /// templates handed out before the capture started can still be
+    /// called. Slots, spill and the typed kind keep their Route A
+    /// values; only the gap record is new.
+    #[test]
+    fn already_loaded_unnamed_closure_reports_published_only_partial() {
+        let sidecar = provider_with_tables(32, "/opt/sidecar.so", 1, 1, false);
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 104, false);
+        closure.scanned.tables[63].live_return = true;
+        let first = scoped_plan(&[sidecar, closure], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 32), 1, "sidecar provider beside");
+        assert_eq!(slots_of(&first, 31), 104, "only the published table");
+        assert_eq!(
+            first.uncorroborated_candidates, 63,
+            "63 unpublished templates are evidence only"
+        );
+        let partial = refusal_of(&first, P11_KIT).expect("published-only partial reported");
+        assert!(
+            partial.reason.contains("1 of 64 template tables attached")
+                && partial
+                    .reason
+                    .contains("calls through the others are not counted"),
+            "{}",
+            partial.reason
+        );
+        assert!(
+            is_closure_array_prefix(&partial.reason),
+            "partial renders partially covered: {}",
+            partial.reason
+        );
+        let kind = first
+            .refused_modules_typed()
+            .find(|(object, _, _)| object.0 == 31)
+            .map(|(_, _, kind)| kind);
+        assert_eq!(kind, Some(RefusalKind::ClosurePrefix));
+    }
+
+    /// Boundary: a mid-capture unnamed closure (alone in the first
+    /// plan) that spills unpublished templates reports no partial —
+    /// its templates were not handed out before the capture started,
+    /// so only the already-loaded spill is a gap.
+    #[test]
+    fn mid_capture_unnamed_closure_spills_without_a_partial() {
+        let mut closure = provider_with_tables(31, P11_KIT, 64, 104, false);
+        closure.scanned.tables[63].live_return = true;
+        let first = scoped_plan(std::slice::from_ref(&closure), AdmissionScope::Named);
+
+        assert_eq!(slots_of(&first, 31), 104, "only the published table");
+        assert_eq!(
+            first.uncorroborated_candidates, 63,
+            "63 unpublished templates are evidence only"
+        );
         assert!(
             refusal_of(&first, P11_KIT).is_none(),
-            "no partial under published-only: {:?}",
+            "no partial for a mid-capture spill: {:?}",
             first.modules_skipped
         );
     }

@@ -11771,6 +11771,56 @@ mod tests {
         );
     }
 
+    /// A child killed from outside the observer keeps its real signal
+    /// status unmarked: an external SIGKILL stays exit 137 and an
+    /// external SIGTERM stays exit 143, neither claimed as a requested
+    /// timeout kill. The initial probe reaps both before the observer
+    /// sends any signal of its own.
+    #[test]
+    fn requested_timeout_kill_must_not_claim_an_externally_killed_child() {
+        for (signal, want) in [
+            (libc::SIGKILL, 128 + libc::SIGKILL),
+            (libc::SIGTERM, 128 + libc::SIGTERM),
+        ] {
+            let signals = SignalState::new();
+            let mut child = spawn("/bin/sleep", &["10"]);
+            let pid = child.pid();
+            child.release().unwrap();
+            assert!(child.still_running());
+            // SAFETY: signals the exact owned child only, from outside
+            // the observer's own settlement path; the pid cannot be
+            // reused while the child is unreaped.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+            wait_until(
+                || !child.still_running(),
+                "externally killed fixture never reported dead",
+            );
+            let mut retained = Some(child);
+            let mut pending = None;
+            let mut exit_code = None;
+            let mut requested_kill = false;
+            let mut still_running = false;
+            settle_owned_child(
+                &mut retained,
+                CaptureEnd::DurationExpired,
+                true,
+                true,
+                &signals,
+                &mut pending,
+                &mut exit_code,
+                &mut requested_kill,
+                &mut still_running,
+            )
+            .unwrap();
+            assert_eq!(exit_code, Some(want));
+            assert!(!still_running);
+            assert!(
+                !requested_kill,
+                "an external signal death keeps its status unmarked"
+            );
+        }
+    }
+
     /// The run's process exit code: a requested timeout kill and a
     /// handed-back child are observer success; otherwise the child's
     /// own status, as a shell would report it.

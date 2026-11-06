@@ -4761,20 +4761,10 @@ fn sole_complete_table_authorized(
     if scanned.double_loaded || scanned.same_file_loads != 1 {
         return false;
     }
-    let unresolved = scanned
-        .tables
-        .iter()
-        .enumerate()
-        .filter(|(at, table)| {
-            !table_observation_authorized(
-                table,
-                &table_evidence_score(*at, &scanned.tables, &scanned.interfaces, &[], &[], exports),
-            )
-        })
-        .count();
-    if unresolved > MAX_TABLES_PER_OBJECT {
-        return false;
-    }
+    // No unresolved-lookalike count is needed here: (a) above already
+    // requires exactly one table, and a closure array needs more than
+    // `MAX_TABLES_PER_OBJECT` unresolved tables, so any second candidate
+    // — exports-only or otherwise — refuses at the (a) gate.
     true
 }
 

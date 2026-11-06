@@ -1724,8 +1724,19 @@ fn pause_key_for(
             "owned pause generation PID {} does not match selected PID {pid}",
             capability.tgid
         ),
-        (Scope::Cgroup { .. } | Scope::System, Some(_)) => {
-            bail!("owned pause generation requires PID scope")
+        (Scope::Cgroup { .. }, Some(capability)) => {
+            // A run-tree session binds its owned generation to the
+            // run cgroup: the key names the owned child, proven by
+            // live membership through the retained descriptor.
+            crate::scope::scope_names_child(scope, capability.tgid)?;
+            Ok(Some(PauseKey {
+                tgid: capability.tgid,
+                pad: 0,
+                generation_token: capability.generation.get(),
+            }))
+        }
+        (Scope::System, Some(_)) => {
+            bail!("owned pause generation requires PID or run-cgroup scope")
         }
     }
 }
@@ -7683,6 +7694,9 @@ impl Session {
                     } else {
                         None
                     };
+                    // A run-tree session publishes the owned child's
+                    // pause row beside the cgroup filter; unowned
+                    // sessions publish no PID row.
                     crate::scope::publish(
                         &mut ebpf,
                         scope,
@@ -7690,7 +7704,7 @@ impl Session {
                         generation_token,
                         track_short_lived,
                         pid_start,
-                        None,
+                        owned_child.map(|child| child.pid()),
                     )
                     .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));

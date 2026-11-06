@@ -3854,6 +3854,11 @@ struct Owned {
     /// Copied from the child after a proven release; `None` (unreleased or
     /// clock failure) withholds every proof.
     prearm_release_ns: Option<u64>,
+    /// The run's dedicated cgroup (`None` on the degraded exact-PID
+    /// path): held to the run's end so members stay in scope, then
+    /// removed best-effort. A nonempty directory (handed-back
+    /// survivors) survives the removal and is disclosed, never forced.
+    run_cgroup: Option<crate::scope::RunCgroup>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -3929,6 +3934,17 @@ impl Owned {
         end: CaptureEnd,
         signals: &SignalState,
     ) -> Result<()> {
+        // Handed-back survivors first: tree members still present when
+        // the run ends are disclosed by count (never PIDs) before any
+        // settlement below reaps the direct child. The count rides in
+        // the gap reason; `None` (degraded exact-PID path) discloses
+        // nothing on top of the degradation gap.
+        if let Some(group) = self.run_cgroup.as_ref() {
+            let (_, gap) = run_tree_survivors_gap(group.survivors_excluding(self.pid));
+            if let Some(reason) = gap {
+                engine.note_run_tree_gap(&reason);
+            }
+        }
         let Some(child) = self.child.as_ref() else {
             return Ok(());
         };
@@ -4475,44 +4491,83 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
 }
 
 /// One categorical I/O kind word for a run-tree gap reason: names the
-/// denial class, never a path. Scaffolding: the body lands with the
-/// implementation.
-#[cfg(test)]
+/// denial class, never a path.
 fn io_kind_word(kind: std::io::ErrorKind) -> &'static str {
-    let _ = kind;
-    ""
+    match kind {
+        std::io::ErrorKind::PermissionDenied => "permission denied",
+        std::io::ErrorKind::NotFound => "not found",
+        std::io::ErrorKind::ReadOnlyFilesystem => "read-only filesystem",
+        std::io::ErrorKind::AlreadyExists => "already exists",
+        _ => "I/O error",
+    }
 }
 
 /// One run-tree degradation reason: the failed step plus the I/O kind
 /// when the failure carries one, always ending in the honest scope.
-/// Scaffolding: the body lands with the implementation.
-#[cfg(test)]
 fn run_tree_gap_reason(step: &str, error: &anyhow::Error) -> String {
-    let _ = (step, error);
-    String::new()
+    match error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<std::io::Error>())
+        .map(std::io::Error::kind)
+    {
+        Some(kind) => format!(
+            "{step} ({}); only the started command is observed",
+            io_kind_word(kind)
+        ),
+        None => format!("{step}; only the started command is observed"),
+    }
 }
 
 /// Builds the owned capture scope from a placed run cgroup: the cgroup
 /// scope on success, else the exact child PID with the scope-build gap
 /// reason (the group drops and cleans itself up on that path).
-/// Scaffolding: the body lands with the implementation.
-#[cfg(test)]
 fn run_tree_scope_or_exact(
     child_pid: u32,
     group: crate::scope::RunCgroup,
 ) -> (Scope, Option<crate::scope::RunCgroup>, Option<String>) {
-    let _ = group;
-    (Scope::Pid(child_pid), None, None)
+    match crate::scope::capture_cgroup(group.path()) {
+        Ok(scope) => (scope, Some(group), None),
+        Err(error) => (
+            Scope::Pid(child_pid),
+            None,
+            Some(run_tree_gap_reason(
+                "the run cgroup is not a usable scope",
+                &error,
+            )),
+        ),
+    }
 }
 
 /// Turns a run-end membership read into the published fact and gap: the
 /// survivor count when measured, a handed-back gap above zero, and a
 /// fail-closed gap when the membership itself could not be read.
-/// Scaffolding: the body lands with the implementation.
-#[cfg(test)]
 fn run_tree_survivors_gap(read: std::io::Result<u64>) -> (Option<u64>, Option<String>) {
-    let _ = read;
-    (None, None)
+    match read {
+        Ok(0) => (Some(0), None),
+        Ok(1) => (
+            Some(1),
+            Some(
+                "1 process-tree member was still present when the command exited; \
+                 its calls after the run end are out of scope"
+                    .to_string(),
+            ),
+        ),
+        Ok(survivors) => (
+            Some(survivors),
+            Some(format!(
+                "{survivors} process-tree members were still present when the command exited; \
+                 their calls after the run end are out of scope"
+            )),
+        ),
+        Err(_) => (
+            None,
+            Some(
+                "the run cgroup membership could not be read at run end; \
+                 handed-back descendants are unknown"
+                    .to_string(),
+            ),
+        ),
+    }
 }
 
 fn run_owned_inner_with_host(
@@ -4528,8 +4583,9 @@ fn run_owned_inner_with_host(
         args.track_short_lived,
         args.select_endpoint.as_deref(),
     )?;
-    // DR-K8S-1: `run` is a PID scope over its own child, numbered in this
-    // observer's namespace; refuse before anything is forked.
+    // DR-K8S-1: `run` controls its own child by PID, numbered in this
+    // observer's namespace (whatever shape the capture scope takes);
+    // refuse before anything is forked.
     crate::pidns::require_numbering_agrees(crate::pidns::numbering(), "run")?;
     warn_unsafe_policy(policy);
     let mut command = args.command.iter().cloned();
@@ -4570,6 +4626,21 @@ fn run_owned_inner_with_host(
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
+    // The run tree scope: a dedicated cgroup the owned child is placed
+    // in before release, so every descendant is born in scope. Any
+    // failure below degrades to the exact child with a named gap —
+    // never a refusal of a runnable command.
+    let (pre_tree_group, mut run_tree_gap) =
+        match crate::scope::RunCgroup::create(std::path::Path::new("/sys/fs/cgroup")) {
+            Ok(group) => (Some(group), None),
+            Err(error) => (
+                None,
+                Some(run_tree_gap_reason(
+                    "the run cgroup could not be created",
+                    &error,
+                )),
+            ),
+        };
     let mut child = OwnedChild::spawn_verbose_as(
         program,
         command.collect(),
@@ -4578,10 +4649,29 @@ fn run_owned_inner_with_host(
     )
     .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
+    // The barrier still holds the child: placement lands before its
+    // first userspace instruction, and every failure still precedes
+    // discovery, attach and the release.
+    let (scope, run_cgroup) = match pre_tree_group {
+        Some(group) => match group.place(pid) {
+            Ok(()) => {
+                let (scope, group, gap) = run_tree_scope_or_exact(pid, group);
+                run_tree_gap = gap;
+                (scope, group)
+            }
+            Err(error) => {
+                run_tree_gap = Some(run_tree_gap_reason(
+                    "the started command could not be placed in the run cgroup",
+                    &error,
+                ));
+                (Scope::Pid(pid), None)
+            }
+        },
+        None => (Scope::Pid(pid), None),
+    };
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
         combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
     })?;
-    let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
         track_short_lived: args.track_short_lived,
         verbose: false,
@@ -4612,6 +4702,19 @@ fn run_owned_inner_with_host(
     let resource_start = crate::timing::read_resource_sample();
     let mut engine = Engine::discover(&capture_args, &scope, Some(view))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    // On the run-tree scope discovery opens its own member views: the
+    // held child must be among them, or the run would capture an empty
+    // tree believing it is the command. The barrier still holds the
+    // child, so this fails as cleanly as the open above.
+    if matches!(scope, Scope::Cgroup { .. }) && !engine.retains_pid(pid) {
+        return Err(combine_setup_failure(
+            anyhow!("run: the owned child was not retained in the run cgroup scope"),
+            &mut child,
+        ));
+    }
+    if let Some(reason) = run_tree_gap {
+        engine.note_run_tree_gap(&reason);
+    }
     engine.set_scope_start_ns(scope_start_ns);
     engine.retain_return_probe_admission(return_admission);
     // The stop flag arrives from `run_owned`, which keeps its own clone so a
@@ -4682,6 +4785,7 @@ fn run_owned_inner_with_host(
         still_running: false,
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
+        run_cgroup,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -6329,7 +6433,7 @@ fn capture_profile(
             name,
             engine.plan(),
             scope,
-            None,
+            owned.as_ref().map(|owned| owned.pid),
             &mut selection_ledger,
         )
     {

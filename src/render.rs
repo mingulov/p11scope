@@ -1677,6 +1677,15 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: reason.into(),
         };
     }
+    // Run-tree gaps keep their subject and their run-owned reason:
+    // the templates carry only counts and I/O-kind words — no paths,
+    // PIDs, or error chains — and the survivor count is the disclosure.
+    if s.subject == "run process tree" {
+        return SkippedOut {
+            name: s.subject.clone(),
+            reason: s.reason.clone(),
+        };
+    }
     let function = kinds::function_id(&s.subject).is_some();
     // A gated null fact: the mislabel guard renamed an unlinked table's null
     // slot to `unknown`, and the nullness itself is still evidence worth

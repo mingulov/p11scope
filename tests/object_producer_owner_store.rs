@@ -281,7 +281,9 @@ fn object_producer_scalar_scope_flags_preserve_authority_discriminant() {
         ] {
             valid.push(scope | policy);
             valid.push(scope | policy | FLAG_TRACK_SHORT_LIVED);
-            if scope == FLAG_PID_FILTER {
+            // Run-tree sessions pause the owned child beside a cgroup
+            // scope; system scope never pauses.
+            if scope != FLAG_SYSTEM_FILTER {
                 valid.push(scope | policy | FLAG_PAUSE_ENABLED);
                 valid.push(scope | policy | FLAG_PAUSE_ENABLED | FLAG_TRACK_SHORT_LIVED);
             }

@@ -11044,19 +11044,16 @@ impl Engine {
 
     /// Whether discovery retained a live view for `pid`: the owned path
     /// proves its held child survived discovery on the run-tree scope.
-    /// Scaffolding: the body lands with the implementation.
-    #[cfg(test)]
     pub(crate) fn retains_pid(&self, pid: u32) -> bool {
-        let _ = pid;
-        false
+        self.views
+            .iter()
+            .any(|view| view.pid() == pid && view.still_the_same())
     }
 
     /// Publishes a run-tree coverage gap: the command's descendants a
     /// degraded or ended run did not follow.
-    /// Scaffolding: the body lands with the implementation.
-    #[cfg(test)]
     pub(crate) fn note_run_tree_gap(&mut self, reason: &str) {
-        let _ = reason;
+        self.mark_partial("run process tree", reason);
     }
 
     fn cancellation_requested(&self) -> bool {

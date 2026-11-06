@@ -45,7 +45,8 @@ const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 /// A cgroup v2 subgroup owned by one `run`: the owned child is placed in
 /// it before its barrier release, so every descendant is born in scope.
 /// Dropping removes the directory best-effort; a nonempty directory
-/// (handed-back survivors still in it) is left in place, never forced.
+/// (handed-back survivors still in it) is left in place, never forced —
+/// but never silently: the retention notice names it for the operator.
 #[derive(Debug)]
 pub struct RunCgroup {
     path: PathBuf,
@@ -97,16 +98,55 @@ impl RunCgroup {
     /// Members still present in the run cgroup, excluding `pid` (the
     /// direct child, settled separately): the handed-back survivor
     /// count. Presence, not aliveness, is what's measured.
-    /// Scaffolding: the body lands with the implementation.
     pub fn survivors_excluding(&self, pid: u32) -> std::io::Result<u64> {
-        let _ = pid;
-        Ok(999)
+        let members = std::fs::read_to_string(self.path.join("cgroup.procs"))?;
+        Ok(members
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .filter(|member| *member != pid)
+            .count() as u64)
+    }
+
+    /// Removes the directory best-effort, returning the
+    /// operator-facing retention notice when it survives: an empty
+    /// or already-gone directory stays silent.
+    fn remove_best_effort(&self) -> Option<String> {
+        match std::fs::remove_dir(&self.path) {
+            Ok(()) => None,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => Some(self.retention_notice()),
+        }
+    }
+
+    /// Who keeps the directory alive, by count from the membership
+    /// file (never PIDs): the operator removes the named path once
+    /// its members exit. An unreadable file reads as empty rather
+    /// than refusing the notice.
+    fn retention_notice(&self) -> String {
+        let members = std::fs::read_to_string(self.path.join("cgroup.procs"))
+            .map(|text| {
+                text.lines()
+                    .filter_map(|line| line.trim().parse::<u32>().ok())
+                    .count()
+            })
+            .unwrap_or(0);
+        let held = if members == 1 {
+            "1 member is".to_string()
+        } else {
+            format!("{members} members are")
+        };
+        format!(
+            "p11scope: the run cgroup {} is retained: {held} still present; remove it after they exit",
+            self.path.display()
+        )
     }
 }
 
 impl Drop for RunCgroup {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
+        if let Some(notice) = self.remove_best_effort() {
+            eprintln!("{notice}");
+        }
     }
 }
 
@@ -466,15 +506,31 @@ fn publish_detailed_with(
     owned_pid: Option<u32>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
-    // The run-tree wiring consumes the owned child: a cgroup scope
-    // beside a generation publishes the child's pause row. Until
-    // then the parameter rides through untouched.
-    let _ = owned_pid;
     if generation_token == Some(0) {
         bail!("pause generation token must be non-zero");
     }
-    if generation_token.is_some() && !matches!(scope, Scope::Pid(_)) {
-        bail!("pause generation requires PID scope");
+    // The owned child rides beside the scope: a run-tree session
+    // publishes its pause row next to the cgroup filter, a degraded
+    // exact-PID run beside the matching PID. Anything else — an
+    // anonymous cgroup generation, a mismatched PID, any owned child
+    // on system scope — refuses before any map write.
+    match (scope, generation_token, owned_pid) {
+        (Scope::Pid(pid), _, Some(owned)) if *pid != owned => {
+            bail!("owned child PID {owned} does not match selected PID {pid}")
+        }
+        (Scope::Cgroup { .. }, Some(_), None) => {
+            bail!("pause generation on cgroup scope requires the owned child")
+        }
+        (Scope::Cgroup { .. }, Some(_), Some(owned)) => {
+            scope_names_child(scope, owned)?;
+        }
+        (Scope::System, Some(_), _) => {
+            bail!("pause generation requires PID or run-cgroup scope")
+        }
+        (Scope::System, None, Some(_)) => {
+            bail!("system scope never names one owned child")
+        }
+        _ => {}
     }
     // 6.14 Option B: the extensive CONFIG bit publishes for Detailed
     // policies only; a counter policy refuses before any map writes.
@@ -505,7 +561,10 @@ fn publish_detailed_with(
         config,
         false,
         pid_start,
-        owned_pid,
+        // The pause row exists only beside a generation: without one
+        // the owned child rides through untouched and the cgroup
+        // filter publishes bare.
+        owned_pid.filter(|_| generation_token.is_some()),
         io,
     )
 }
@@ -531,8 +590,6 @@ fn publish_validated_scope_with(
     owned_pid: Option<u32>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
-    // See `publish_detailed_with`: the run-tree wiring consumes this.
-    let _ = owned_pid;
     let mut expected_pids = BTreeMap::new();
     let mut expected_starts = BTreeMap::new();
     match scope {
@@ -560,6 +617,14 @@ fn publish_validated_scope_with(
             // successful publication of this retained FD are the content proof.
             publish_cgroup_fd_with(dir, |directory| io.insert_cgroup(directory))
                 .context("publishing CGROUP_FILTER")?;
+            // The run-tree pause row: the owned child's generation
+            // token, proven a member above. The exact readback below
+            // covers the row too.
+            if let Some(owned) = owned_pid {
+                io.insert_pid(owned, token)
+                    .context("publishing PID_FILTER")?;
+                expected_pids.insert(owned, token);
+            }
         }
         Scope::System => {}
     }
@@ -1246,6 +1311,32 @@ mod tests {
         std::fs::write(path.join("cgroup.procs"), "1\n").unwrap();
         drop(group);
         assert!(path.is_dir(), "a nonempty run cgroup must survive Drop");
+    }
+
+    #[test]
+    fn run_cgroup_drop_notices_a_retained_dir() {
+        // The retention notice names the path and counts planted
+        // members (never PIDs); an empty or already-gone directory
+        // stays silent.
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).expect("create in a writable dir");
+        assert_eq!(group.remove_best_effort(), None);
+        assert!(!group.path().exists(), "the empty dir is removed");
+        assert_eq!(
+            group.remove_best_effort(),
+            None,
+            "an already-gone dir stays silent"
+        );
+        let group = RunCgroup::create(base.path()).expect("create in a writable dir");
+        std::fs::write(group.path().join("cgroup.procs"), "11\n22\n").unwrap();
+        let notice = group.remove_best_effort().expect("a retained dir notices");
+        assert!(
+            notice.contains("is retained: 2 members are still present"),
+            "{notice}"
+        );
+        let path = group.path().display().to_string();
+        assert!(notice.contains(path.as_str()), "{notice}");
+        assert!(group.path().is_dir(), "retention still never forces");
     }
 
     #[test]

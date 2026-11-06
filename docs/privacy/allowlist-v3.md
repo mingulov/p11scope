@@ -80,14 +80,14 @@ Semantic authority comes from exactly one of two sources:
   without a manifest (the explicit key-operations opt-in), and only for a
   scanned function table that meets every condition: its publication is
   proved by standard interface linkage (`C_GetInterfaceList` /
-  `C_GetInterface` naming the table), by a live function-list return, or by
-  manifest corroboration — export-name agreement alone never grants it; the
-  table walk is full (a prefix or capped walk makes the provider incomplete);
-  no affecting entry of the provider is unpinned, rival or degraded; and every
-  required key lives in the provider's own object (a provider whose table
-  entries point into another object, such as the p11-kit trust shim, is
-  refused). A provider that fails any condition is refused as a whole and
-  counted; it never gets a partial table.
+  `C_GetInterface` naming the table) or by a live function-list return —
+  export-name agreement alone never grants it; and every required key lives
+  in the provider's own object (a provider whose table entries point into
+  another object, such as the p11-kit trust shim, is refused). A non-full
+  walk or an unpinned affecting entry refuses the provider whole; a rival,
+  aliased or degraded entry, including one reached only through an
+  exports-only table, stays count-only at that entry, with no argument reads
+  there.
 
 Every other scan result, including every ordinary (non-`--key-operations`)
 capture, stays count-only. The read set is the same in both sources: a

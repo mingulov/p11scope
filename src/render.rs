@@ -6664,7 +6664,7 @@ pub(crate) mod tests {
         ev.discovery.modules = vec![layer, backend];
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "3 of 64 template tables attached; calls through the others are not counted"
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
                 .into(),
         });
         ev.verdict();

@@ -4,9 +4,10 @@
 //! Contract: `docs/superpowers/specs/2026-11-06-v070-helper-isolation-contract.md`
 //! (task 7.07a, helper-policy part). The fence is Landlock (read-only
 //! filesystem plus denied TCP bind/connect) followed by a seccomp denylist
-//! (no network, no exec/mount/ptrace/BPF/keyring syscalls). Every denial
-//! fails with `EACCES`, never kill/trap, so a fenced provider call reads as
-//! an ordinary error. Applied after the shared privilege drop and before
+//! (no IP networking or socket connect/bind; no exec, mount, ptrace, BPF,
+//! io_uring, keyring or file-metadata syscalls). Every denial fails with
+//! `EACCES`, never kill/trap, so a fenced provider call reads as an
+//! ordinary error. Applied after the shared privilege drop and before
 //! any provider code runs; any failure refuses before `dlopen`.
 
 use std::fs::File;
@@ -48,7 +49,8 @@ const NET_BIND_TCP: u64 = 1 << 0;
 const NET_CONNECT_TCP: u64 = 1 << 1;
 
 /// Everything the ruleset mediates. Reads and execute are granted on `/`
-/// (§4 needs matrix); writes only on the `-o` parent directory.
+/// (§4 needs matrix); writes only on the `-o` parent directory, which
+/// must be dedicated: the rule covers its whole subtree.
 const HANDLED_FS: u64 = FS_EXECUTE
     | FS_WRITE_FILE
     | FS_READ_FILE
@@ -147,6 +149,33 @@ const SYS_SWAPOFF: u32 = 168;
 const SYS_SETHOSTNAME: u32 = 170;
 const SYS_SETDOMAINNAME: u32 = 171;
 const SYS_ACCT: u32 = 163;
+// io_uring syscalls never hit the seccomp network checks, so the ring
+// itself is denied: otherwise socket/connect run fenced only by Landlock
+// (TCP), leaving UDP and AF_UNIX egress open.
+const SYS_IO_URING_SETUP: u32 = 425;
+const SYS_IO_URING_ENTER: u32 = 426;
+const SYS_IO_URING_REGISTER: u32 = 427;
+// File metadata Landlock cannot restrict (mode, owner, xattr, times).
+const SYS_CHMOD: u32 = 90;
+const SYS_FCHMOD: u32 = 91;
+const SYS_FCHMODAT: u32 = 268;
+const SYS_FCHMODAT2: u32 = 452;
+const SYS_CHOWN: u32 = 92;
+const SYS_FCHOWN: u32 = 93;
+const SYS_LCHOWN: u32 = 94;
+const SYS_FCHOWNAT: u32 = 260;
+const SYS_SETXATTR: u32 = 188;
+const SYS_LSETXATTR: u32 = 189;
+const SYS_FSETXATTR: u32 = 190;
+const SYS_REMOVEXATTR: u32 = 197;
+const SYS_LREMOVEXATTR: u32 = 198;
+const SYS_FREMOVEXATTR: u32 = 199;
+const SYS_SETXATTRAT: u32 = 463;
+const SYS_REMOVEXATTRAT: u32 = 466;
+const SYS_UTIME: u32 = 132;
+const SYS_UTIMES: u32 = 235;
+const SYS_FUTIMESAT: u32 = 261;
+const SYS_UTIMENSAT: u32 = 280;
 
 /// Unconditional denials. `socket` is handled separately: `AF_UNIX` and
 /// `AF_NETLINK` stay allowed, every other domain is denied.
@@ -187,6 +216,29 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_SETHOSTNAME,
     SYS_SETDOMAINNAME,
     SYS_ACCT,
+    SYS_IO_URING_SETUP,
+    SYS_IO_URING_ENTER,
+    SYS_IO_URING_REGISTER,
+    SYS_CHMOD,
+    SYS_FCHMOD,
+    SYS_FCHMODAT,
+    SYS_FCHMODAT2,
+    SYS_CHOWN,
+    SYS_FCHOWN,
+    SYS_LCHOWN,
+    SYS_FCHOWNAT,
+    SYS_SETXATTR,
+    SYS_LSETXATTR,
+    SYS_FSETXATTR,
+    SYS_REMOVEXATTR,
+    SYS_LREMOVEXATTR,
+    SYS_FREMOVEXATTR,
+    SYS_SETXATTRAT,
+    SYS_REMOVEXATTRAT,
+    SYS_UTIME,
+    SYS_UTIMES,
+    SYS_FUTIMESAT,
+    SYS_UTIMENSAT,
 ];
 
 #[repr(C)]
@@ -204,10 +256,16 @@ struct SockFprog {
     filter: *const SockFilter,
 }
 
-// Classic BPF opcodes: ld [k] is LD|W|ABS, jeq #k is JMP|JEQ|K, ret #k.
+// Classic BPF opcodes: ld [k] is LD|W|ABS, jeq #k is JMP|JEQ|K,
+// jge #k is JMP|JGE|K, ret #k.
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
+const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_RET_K: u16 = 0x06;
+
+/// The x32 ABI bit: x32 syscalls arrive with the audit arch of x86-64
+/// but nr | 0x4000_0000, matching no 64-bit equality check.
+const X32_SYSCALL_BIT: u32 = 0x4000_0000;
 
 fn stmt(code: u16, k: u32) -> SockFilter {
     SockFilter {
@@ -238,6 +296,10 @@ impl FilterBuilder {
         self.emit(stmt(BPF_JMP_JEQ_K, k))
     }
 
+    fn jge(&mut self, k: u32) -> usize {
+        self.emit(stmt(BPF_JMP_JGE_K, k))
+    }
+
     /// Point instruction `at` at absolute targets `jt` (equal) and `jf`.
     fn patch(&mut self, at: usize, jt: usize, jf: usize) -> Result<(), String> {
         let here = at + 1;
@@ -259,35 +321,33 @@ impl FilterBuilder {
         self.patch(arch_ok, load_nr, bad_arch)?;
         let _ = arch;
 
+        // x32 numbers share the audit arch but match no 64-bit equality
+        // check; reject them before any of those checks run.
+        let x32 = self.jge(X32_SYSCALL_BIT);
         let mut deny_jumps = Vec::with_capacity(DENY_ALWAYS.len());
         for nr in DENY_ALWAYS {
-            deny_jumps.push((self.jeq(*nr), *nr));
+            deny_jumps.push(self.jeq(*nr));
         }
         let socket_jump = self.jeq(SYS_SOCKET);
         let allow = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         let deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
-        // Each `jeq nr`: equal falls into `deny`, else the next check.
-        let mut next = allow;
-        // Walked back to front so `next` is always the following check.
-        let mut checks: Vec<usize> = deny_jumps.iter().map(|(at, _)| *at).collect();
-        checks.push(socket_jump);
-        for at in checks.iter().rev() {
-            if *at == socket_jump {
-                let socket_check = self.insns.len();
-                self.patch(*at, socket_check, next)?;
-                next = *at;
-                continue;
-            }
-            self.patch(*at, deny, next)?;
-            next = *at;
-        }
+        let x32_deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
         // socket(domain, ...): AF_UNIX and AF_NETLINK stay allowed.
         let socket_check = self.emit(stmt(BPF_LD_W_ABS, ARG0_LO_OFFSET));
-        debug_assert_eq!(socket_check, self.insns.len() - 1);
         let is_unix = self.jeq(AF_UNIX);
         let is_netlink = self.jeq(AF_NETLINK);
         let deny_socket = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_unix = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        // Every target is known now; patch the whole chain explicitly.
+        // Each `jeq nr`: equal falls into `deny`, else the next check,
+        // walked back to front so `next` is always the following check.
+        let mut next = socket_jump;
+        for at in deny_jumps.iter().rev() {
+            self.patch(*at, deny, next)?;
+            next = *at;
+        }
+        self.patch(x32, x32_deny, next)?;
+        self.patch(socket_jump, socket_check, allow)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
         self.patch(is_netlink, allow_unix, deny_socket)?;
         validate_filter(&self.insns)?;
@@ -301,7 +361,7 @@ fn validate_filter(insns: &[SockFilter]) -> Result<(), String> {
         return Err("seccomp program has an invalid length".into());
     }
     for (at, insn) in insns.iter().enumerate() {
-        if insn.code == BPF_JMP_JEQ_K {
+        if insn.code == BPF_JMP_JEQ_K || insn.code == BPF_JMP_JGE_K {
             let jt = at + 1 + insn.jt as usize;
             let jf = at + 1 + insn.jf as usize;
             if jt >= insns.len() || jf >= insns.len() {
@@ -321,46 +381,101 @@ fn os_error(context: &str) -> String {
     format!("{context}: {}", std::io::Error::last_os_error())
 }
 
-/// Open `path` for Landlock rule use (`O_PATH`), refusing non-directories
-/// when `want_dir` so a file can never stand in for the output directory.
-fn open_rule_path(path: &Path, want_dir: bool) -> Result<File, String> {
+/// Open the `/` rule path (`O_PATH`). It keeps its own wording: the tree
+/// rule is not the output directory.
+fn open_rule_path(path: &Path) -> Result<File, String> {
     use std::ffi::CString;
-    // Contract §3 step 1: any unusable `-o` parent refuses as
-    // `isolated profile: output directory <dir> is unusable: <reason>`.
-    // The `/` rule path keeps its own wording: it is not the output dir.
-    let unusable = |reason: String| {
-        if want_dir {
-            format!(
-                "isolated profile: output directory {} is unusable: {reason}",
-                path.display()
-            )
-        } else {
-            format!("isolated profile: {reason}")
-        }
-    };
     let raw = match CString::new(path.as_os_str().as_bytes()) {
         Ok(raw) => raw,
         Err(_) => {
-            return Err(unusable(format!(
-                "cannot open {}: path has a NUL byte",
+            return Err(format!(
+                "isolated profile: cannot open {}: path has a NUL byte",
                 path.display()
-            )));
+            ));
         }
     };
     let fd = unsafe { libc::open(raw.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
-        return Err(unusable(format!(
-            "cannot open {}: {}",
+        return Err(format!(
+            "isolated profile: cannot open {}: {}",
             path.display(),
             std::io::Error::last_os_error()
-        )));
+        ));
+    }
+    Ok(unsafe { File::from_raw_fd(fd) })
+}
+
+/// Open the `-o` parent for Landlock rule use and return the same
+/// descriptor the rule is built on: one open, every check on that fd, so
+/// no later reopen can resolve anywhere else.
+///
+/// A Landlock path rule grants a whole subtree, so the parent must be a
+/// dedicated directory: empty, or holding only `target` (the rename-over
+/// case). A parent that *is* the filesystem root — by device and inode,
+/// which also catches a bind mount of `/` — refuses with the root
+/// wording. Anything else unusable refuses as
+/// `isolated profile: output directory <dir> is unusable: <reason>`.
+fn open_output_dir(dir: &Path, target: &std::ffi::OsStr) -> Result<File, String> {
+    use std::ffi::CString;
+    use std::os::unix::fs::MetadataExt as _;
+    let unusable = |reason: String| {
+        format!(
+            "isolated profile: output directory {} is unusable: {reason}",
+            dir.display()
+        )
+    };
+    let raw = match CString::new(dir.as_os_str().as_bytes()) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Err(unusable(format!(
+                "cannot open {}: path has a NUL byte",
+                dir.display()
+            )));
+        }
+    };
+    let fd = unsafe {
+        libc::open(
+            raw.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let errno = std::io::Error::last_os_error();
+        // `O_DIRECTORY` fails on non-directories: a file (or a symlink to
+        // one) keeps the not-a-directory wording.
+        let not_a_dir = std::fs::symlink_metadata(dir).is_ok_and(|meta| !meta.file_type().is_dir());
+        if not_a_dir {
+            return Err(format!(
+                "isolated profile: output directory {} is unusable: not a directory",
+                dir.display()
+            ));
+        }
+        return Err(unusable(format!("cannot open {}: {errno}", dir.display())));
     }
     let file = unsafe { File::from_raw_fd(fd) };
-    if want_dir && !file.metadata().is_ok_and(|meta| meta.file_type().is_dir()) {
-        return Err(format!(
-            "isolated profile: output directory {} is unusable: not a directory",
-            path.display()
-        ));
+    // The filesystem root by identity, not by spelling: a canonical path
+    // misses bind mounts and races a reopen; this held fd can be neither.
+    let same_as_root = file
+        .metadata()
+        .and_then(|ours| std::fs::metadata("/").map(|root| (ours, root)))
+        .map(|(ours, root)| ours.dev() == root.dev() && ours.ino() == root.ino())
+        .map_err(|error| unusable(format!("cannot stat {}: {error}", dir.display())))?;
+    if same_as_root {
+        return Err(
+            "isolated profile: output directory / is unusable: refusing the filesystem root".into(),
+        );
+    }
+    // The listing runs against the held descriptor (`/proc/self/fd/N`
+    // names the same open file description), so it cannot race a rename.
+    let listing = std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .map_err(|error| unusable(format!("cannot list {}: {error}", dir.display())))?;
+    for entry in listing {
+        let entry =
+            entry.map_err(|error| unusable(format!("cannot list {}: {error}", dir.display())))?;
+        let name = entry.file_name();
+        if name != "." && name != ".." && name != target {
+            return Err(unusable("not empty; use a dedicated directory".into()));
+        }
     }
     Ok(file)
 }
@@ -380,16 +495,27 @@ fn landlock_abi() -> Result<libc::c_long, String> {
     Ok(abi)
 }
 
-fn apply_landlock(writable_dir: Option<&Path>) -> Result<(), String> {
+fn apply_landlock(out: Option<&Path>) -> Result<(), String> {
     let abi = landlock_abi()?;
     if abi < LANDLOCK_ABI_FLOOR {
         return Err(format!(
             "isolated profile: Landlock ABI {abi} below required {LANDLOCK_ABI_FLOOR}"
         ));
     }
-    let root = open_rule_path(Path::new("/"), false)?;
-    let output = writable_dir
-        .map(|dir| open_rule_path(dir, true))
+    let root = open_rule_path(Path::new("/"))?;
+    // The parent rule matches the manifest writer's directory choice (a
+    // bare name means `.`); the target name is the only entry a
+    // dedicated directory may already hold. A `-o` without a file name
+    // leaves no exception: the directory must be empty.
+    let output = out
+        .map(|path| {
+            let parent = match path.parent() {
+                Some(parent) if !parent.as_os_str().is_empty() => parent,
+                _ => Path::new("."),
+            };
+            let target = path.file_name().unwrap_or(std::ffi::OsStr::new(""));
+            open_output_dir(parent, target)
+        })
         .transpose()?;
     let attr = RulesetAttr {
         handled_access_fs: HANDLED_FS,
@@ -468,25 +594,27 @@ fn apply_seccomp() -> Result<(), String> {
 /// syscall numbers (contract R6).
 fn apply_isolated_with(
     is_x86_64: bool,
-    writable_dir: Option<&Path>,
+    out: Option<&Path>,
     landlock: impl FnOnce(Option<&Path>) -> Result<(), String>,
     seccomp: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
     if !is_x86_64 {
         return Err("isolated profile: x86-64 only".into());
     }
-    landlock(writable_dir)?;
+    landlock(out)?;
     seccomp()
 }
 
 /// Apply the isolated fence: the architecture gate, then Landlock, then
-/// seccomp. `writable_dir` is the `-o` parent directory, or `None` for
-/// stdout output. On success the caller may load the provider; on failure
-/// it must exit before `dlopen` — provider code never runs.
-pub fn apply_isolated(writable_dir: Option<&Path>) -> Result<(), String> {
+/// seccomp. `out` is the full `-o` path, or `None` for stdout output
+/// (the whole tree stays read-only). The `-o` parent must be a dedicated
+/// directory, opened once and checked on the same descriptor the Landlock
+/// rule is built on. On success the caller may load the provider; on
+/// failure it must exit before `dlopen` — provider code never runs.
+pub fn apply_isolated(out: Option<&Path>) -> Result<(), String> {
     apply_isolated_with(
         cfg!(target_arch = "x86_64"),
-        writable_dir,
+        out,
         apply_landlock,
         apply_seccomp,
     )
@@ -569,29 +697,33 @@ mod tests {
 
     #[test]
     fn rule_paths_reject_files_for_the_output_directory() {
+        let target = std::ffi::OsStr::new("manifest.json");
         let dir = std::env::temp_dir().join(format!("isolation-rule-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let file = dir.join("file");
         std::fs::write(&file, b"x").unwrap();
-        assert!(open_rule_path(&dir, true).is_ok());
-        let error = open_rule_path(&file, true).unwrap_err();
+        let empty = dir.join("empty");
+        std::fs::create_dir_all(&empty).unwrap();
+        assert!(open_output_dir(&empty, target).is_ok());
+        let error = open_output_dir(&file, target).unwrap_err();
         assert!(error.contains("not a directory"), "{error}");
-        assert!(open_rule_path(&file, false).is_ok());
-        assert!(open_rule_path(&dir.join("missing"), true).is_err());
+        assert!(open_rule_path(&file).is_ok());
+        assert!(open_output_dir(&dir.join("missing"), target).is_err());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
     fn unusable_output_directories_use_the_contract_wording() {
         use std::os::unix::ffi::OsStrExt as _;
+        let target = std::ffi::OsStr::new("manifest.json");
         let dir = std::env::temp_dir().join(format!("isolation-wording-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // Missing, file-as-parent and NUL parents all refuse with the
         // contract §3 step-1 shape; the `/` rule path keeps its own.
         let missing = dir.join("no-such-dir");
-        let error = open_rule_path(&missing, true).unwrap_err();
+        let error = open_output_dir(&missing, target).unwrap_err();
         assert!(
             error.starts_with("isolated profile: output directory ")
                 && error.contains(" is unusable: "),
@@ -599,25 +731,48 @@ mod tests {
         );
         let file = dir.join("file");
         std::fs::write(&file, b"x").unwrap();
-        let error = open_rule_path(&file, true).unwrap_err();
+        let error = open_output_dir(&file, target).unwrap_err();
         assert!(
             error.starts_with("isolated profile: output directory ")
                 && error.contains(" is unusable: "),
             "{error}"
         );
         let nul = std::ffi::OsStr::from_bytes(b"bad\0dir");
-        let error = open_rule_path(Path::new(nul), true).unwrap_err();
+        let error = open_output_dir(Path::new(nul), target).unwrap_err();
         assert!(
             error.starts_with("isolated profile: output directory ")
                 && error.contains(" is unusable: "),
             "{error}"
         );
-        let error = open_rule_path(&missing, false).unwrap_err();
+        let error = open_rule_path(&missing).unwrap_err();
         assert!(error.contains("cannot open"), "{error}");
         assert!(
             !error.contains("output directory"),
             "the tree rule is not the output dir: {error}"
         );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_nonempty_output_directory_names_dedication() {
+        let target = std::ffi::OsStr::new("manifest.json");
+        let dir = std::env::temp_dir().join(format!("isolation-dedicated-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        let sub = out.join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("victim"), b"keep").unwrap();
+        let error = open_output_dir(&out, target).unwrap_err();
+        assert!(
+            error.contains("not empty; use a dedicated directory"),
+            "{error}"
+        );
+        // Empty, or holding only the target name: accepted.
+        std::fs::remove_dir_all(&out).unwrap();
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(open_output_dir(&out, target).is_ok());
+        std::fs::write(out.join("manifest.json"), b"stale").unwrap();
+        assert!(open_output_dir(&out, target).is_ok());
         std::fs::remove_dir_all(dir).unwrap();
     }
 
@@ -703,6 +858,9 @@ mod tests {
                 BPF_JMP_JEQ_K => {
                     pc += 1 + if acc == insn.k { insn.jt } else { insn.jf } as usize;
                 }
+                BPF_JMP_JGE_K => {
+                    pc += 1 + if acc >= insn.k { insn.jt } else { insn.jf } as usize;
+                }
                 BPF_RET_K => return insn.k,
                 other => panic!("evaluator hit an unexpected opcode {other:#x}"),
             }
@@ -769,6 +927,43 @@ mod tests {
             (SYS_SETHOSTNAME, libc::SYS_sethostname, "sethostname"),
             (SYS_SETDOMAINNAME, libc::SYS_setdomainname, "setdomainname"),
             (SYS_ACCT, libc::SYS_acct, "acct"),
+            (
+                SYS_IO_URING_SETUP,
+                libc::SYS_io_uring_setup,
+                "io_uring_setup",
+            ),
+            (
+                SYS_IO_URING_ENTER,
+                libc::SYS_io_uring_enter,
+                "io_uring_enter",
+            ),
+            (
+                SYS_IO_URING_REGISTER,
+                libc::SYS_io_uring_register,
+                "io_uring_register",
+            ),
+            (SYS_CHMOD, libc::SYS_chmod, "chmod"),
+            (SYS_FCHMOD, libc::SYS_fchmod, "fchmod"),
+            (SYS_FCHMODAT, libc::SYS_fchmodat, "fchmodat"),
+            (SYS_FCHMODAT2, libc::SYS_fchmodat2, "fchmodat2"),
+            (SYS_CHOWN, libc::SYS_chown, "chown"),
+            (SYS_FCHOWN, libc::SYS_fchown, "fchown"),
+            (SYS_LCHOWN, libc::SYS_lchown, "lchown"),
+            (SYS_FCHOWNAT, libc::SYS_fchownat, "fchownat"),
+            (SYS_SETXATTR, libc::SYS_setxattr, "setxattr"),
+            (SYS_LSETXATTR, libc::SYS_lsetxattr, "lsetxattr"),
+            (SYS_FSETXATTR, libc::SYS_fsetxattr, "fsetxattr"),
+            (SYS_REMOVEXATTR, libc::SYS_removexattr, "removexattr"),
+            (SYS_LREMOVEXATTR, libc::SYS_lremovexattr, "lremovexattr"),
+            (SYS_FREMOVEXATTR, libc::SYS_fremovexattr, "fremovexattr"),
+            // setxattrat/removexattrat postdate libc 0.2.189; their
+            // numbers are from asm/unistd_64.h: 463 and 466.
+            (SYS_SETXATTRAT, 463, "setxattrat"),
+            (SYS_REMOVEXATTRAT, 466, "removexattrat"),
+            (SYS_UTIME, libc::SYS_utime, "utime"),
+            (SYS_UTIMES, libc::SYS_utimes, "utimes"),
+            (SYS_FUTIMESAT, libc::SYS_futimesat, "futimesat"),
+            (SYS_UTIMENSAT, libc::SYS_utimensat, "utimensat"),
         ];
         assert_eq!(
             keyed.len(),
@@ -779,42 +974,6 @@ mod tests {
             assert_eq!(*ours, *want as u32, "wrong number for {name}");
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, *ours, 0),
-                denied,
-                "{name} escapes the fence"
-            );
-        }
-        // io_uring, chmod/chown/xattr and timestamp entries, keyed to
-        // libc directly until their named constants land with the fix.
-        // (setxattrat/removexattrat postdate libc 0.2.189; their numbers
-        // are from asm/unistd_64.h: 463 and 466.)
-        let added: &[(u32, &str)] = &[
-            (libc::SYS_io_uring_setup as u32, "io_uring_setup"),
-            (libc::SYS_io_uring_enter as u32, "io_uring_enter"),
-            (libc::SYS_io_uring_register as u32, "io_uring_register"),
-            (libc::SYS_chmod as u32, "chmod"),
-            (libc::SYS_fchmod as u32, "fchmod"),
-            (libc::SYS_fchmodat as u32, "fchmodat"),
-            (libc::SYS_fchmodat2 as u32, "fchmodat2"),
-            (libc::SYS_chown as u32, "chown"),
-            (libc::SYS_fchown as u32, "fchown"),
-            (libc::SYS_lchown as u32, "lchown"),
-            (libc::SYS_fchownat as u32, "fchownat"),
-            (libc::SYS_setxattr as u32, "setxattr"),
-            (libc::SYS_lsetxattr as u32, "lsetxattr"),
-            (libc::SYS_fsetxattr as u32, "fsetxattr"),
-            (libc::SYS_removexattr as u32, "removexattr"),
-            (libc::SYS_lremovexattr as u32, "lremovexattr"),
-            (libc::SYS_fremovexattr as u32, "fremovexattr"),
-            (463, "setxattrat"),
-            (466, "removexattrat"),
-            (libc::SYS_utime as u32, "utime"),
-            (libc::SYS_utimes as u32, "utimes"),
-            (libc::SYS_futimesat as u32, "futimesat"),
-            (libc::SYS_utimensat as u32, "utimensat"),
-        ];
-        for (nr, name) in added {
-            assert_eq!(
-                eval_filter(&insns, AUDIT_ARCH_X86_64, *nr, 0),
                 denied,
                 "{name} escapes the fence"
             );

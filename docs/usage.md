@@ -539,7 +539,10 @@ exits 0.
 
 For providers you do not trust, `--isolation isolated` fences the helper
 before it loads the provider: the filesystem stays read-only except the
-`-o` directory, and network, exec/mount/ptrace/BPF and related syscalls
+`-o` directory, which must be an empty dedicated directory (a Landlock
+rule grants the whole subtree, so anything already there would be
+writable); without `-o` nothing is writable. IP networking, socket
+connect/bind, and exec/mount/ptrace/BPF/io_uring/file-metadata syscalls
 fail with `EACCES`. The fence needs Landlock ABI 5 or newer and an x86-64
 helper; when either is unavailable the helper refuses before loading
 rather than running weaker. A provider that needs a denied access at

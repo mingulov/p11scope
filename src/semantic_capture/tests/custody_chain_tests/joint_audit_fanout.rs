@@ -24703,3 +24703,64 @@ fn joint_s1only_preexisting_image_ordinary_return_delivery_reproducer() {
     fixture.scene.assert_claims(&[]);
     finish_resource_subject_operation(&mut fixture, child.id(), caller);
 }
+
+/// The live Firefox late-attach shape (fedora, 2026-11-06): a caller
+/// born attach-observed whose only call inside the audited frontier
+/// predates its birth cut, and which then stays idle. Its fresh seal
+/// can only be grounded by its own future calls, so the frame must treat
+/// it as waiting for input: the publication completes, nothing latches,
+/// and the lane-wide no-progress bound never trips even past 6 s. The
+/// caller's next real call then reduces through the lane.
+#[test]
+fn joint_machine_idle_fresh_birth_waits_as_future_input() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    fixture.push_quiet();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::AttachObserved)),
+        "precondition: the caller is born attach-observed: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the idle fresh birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    // Past the 6 s bound with the caller still idle: no trip, no latch.
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(7),
+    ));
+    for n in 0..64 {
+        if let Err(reason) = fixture.service(1) {
+            panic!("idle poll {n} past the bound must not stop the lane: {reason:?}");
+        }
+    }
+    assert!(audit_no_progress_gaps(&fixture).is_empty(), "no stop gap");
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    // The browser signs at last: its own call reduces through the lane.
+    let before = fixture.reduced_for(0);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("idle-then-sign", None);
+    assert!(
+        fixture.reduced_for(0) > before,
+        "the caller's later call reduces"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}

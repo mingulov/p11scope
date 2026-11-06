@@ -10186,7 +10186,7 @@ mod tests {
         std::fs::set_permissions(&tmp, permissions).expect("search bit on campaign TMPDIR");
     }
 
-    /// `run` passes `SOFTHSM2_CONF` through its clean child environment, so
+    /// `run` passes `SOFTHSM2_CONF` through to its child environment, so
     /// the direct oracle needs it in the observer's environment. Restored on
     /// drop; privileged cells run `--exact --test-threads=1`.
     struct WrapperEnvGuard {

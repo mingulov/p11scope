@@ -913,28 +913,35 @@ fn validate_account_pair(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
     Ok(())
 }
 
+/// Whether `run` withholds an environment variable from its owned child.
+/// The child otherwise inherits the observer's environment unchanged, so the
+/// workload behaves exactly as without p11scope. Only p11scope's own control
+/// inputs are withheld, by name (values are never inspected here):
+/// - `SUDO_UID`/`SUDO_GID`: consumed as the target-account selection; they
+///   describe the observer's launch, not the workload.
+/// - `SUDO_USER`/`SUDO_COMMAND`: likewise describe the sudo invocation; a
+///   bare execution has none, so keeping them would mislead the child.
+/// - `P11SCOPE_*`: p11scope's own control namespace (observer and test
+///   controls); never workload input, and passing them on would confuse a
+///   nested p11scope run.
+fn child_env_controlled(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = name.as_bytes();
+    matches!(
+        bytes,
+        b"SUDO_UID" | b"SUDO_GID" | b"SUDO_USER" | b"SUDO_COMMAND"
+    ) || bytes.starts_with(b"P11SCOPE_")
+}
+
+/// The owned child's environment: the observer's variables unchanged,
+/// except [`child_env_controlled`]. Names are matched; values pass
+/// through opaquely and are never read or logged.
 fn child_environment(
-    identity: ChildIdentity,
     variables: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> io::Result<Vec<CString>> {
-    let variables: Vec<_> = variables.into_iter().collect();
-    let selected: Vec<(OsString, OsString)> = if identity.clear_groups {
-        let mut selected = vec![
-            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-            (OsString::from("LANG"), OsString::from("C")),
-            (OsString::from("LC_ALL"), OsString::from("C")),
-        ];
-        for allowed in ["TERM", "TZ", "SOFTHSM2_CONF"] {
-            if let Some((name, value)) = variables.iter().find(|(name, _)| name == allowed) {
-                selected.push((name.clone(), value.clone()));
-            }
-        }
-        selected
-    } else {
-        variables
-    };
-    selected
+    variables
         .into_iter()
+        .filter(|(name, _)| !child_env_controlled(name))
         .map(|(name, value)| {
             let mut entry = name.into_vec();
             entry.push(b'=');
@@ -944,6 +951,30 @@ fn child_environment(
             })
         })
         .collect()
+}
+
+/// The one stderr line naming variables withheld from the owned child,
+/// or `None` when nothing was withheld. Names only, sorted; values are
+/// never included (environment values are never captured).
+fn child_env_removal_notice(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<String> {
+    let mut removed: Vec<String> = variables
+        .into_iter()
+        .filter(|(name, _)| child_env_controlled(name))
+        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .collect();
+    removed.sort();
+    removed.dedup();
+    if removed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "p11scope: run: removed {} environment variable{} from the child: {}",
+        removed.len(),
+        if removed.len() == 1 { "" } else { "s" },
+        removed.join(", ")
+    ))
 }
 
 #[repr(C)]
@@ -1513,7 +1544,10 @@ impl OwnedChild {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let environment = child_environment(identity, std::env::vars_os())?;
+        let environment = child_environment(std::env::vars_os())?;
+        if let Some(notice) = child_env_removal_notice(std::env::vars_os()) {
+            eprintln!("{notice}");
+        }
         let envp: Vec<*const libc::c_char> = environment
             .iter()
             .map(|entry| entry.as_ptr())
@@ -10518,25 +10552,27 @@ mod tests {
     }
 
     #[test]
-    fn privileged_child_environment_is_an_allowlist() {
-        let identity = ChildIdentity {
-            uid: 1000,
-            gid: 1000,
-            clear_groups: true,
-        };
-        let environment = child_environment(
-            identity,
-            [
-                (OsString::from("PATH"), OsString::from("/root/bin")),
-                (OsString::from("SSH_AUTH_SOCK"), OsString::from("/secret")),
-                (OsString::from("API_TOKEN"), OsString::from("secret")),
-                (OsString::from("TERM"), OsString::from("xterm")),
-                (
-                    OsString::from("SOFTHSM2_CONF"),
-                    OsString::from("/tmp/softhsm2.conf"),
-                ),
-            ],
-        )
+    fn child_environment_passes_the_user_environment_through_unchanged() {
+        // Identity-independent: the sudo-dropped and the direct child get
+        // the same passthrough, so the workload behaves as without p11scope.
+        let environment = child_environment([
+            (OsString::from("PATH"), OsString::from("/user/bin:/bin")),
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+            (
+                OsString::from("PKCS11_PROVIDER_MODULE"),
+                OsString::from("/usr/lib64/pkcs11/libsofthsm2.so"),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                OsString::from("/home/user/.config"),
+            ),
+            (OsString::from("TERM"), OsString::from("xterm")),
+            (
+                OsString::from("SOFTHSM2_CONF"),
+                OsString::from("/tmp/softhsm2.conf"),
+            ),
+        ])
         .unwrap();
         let environment: Vec<_> = environment
             .iter()
@@ -10545,13 +10581,76 @@ mod tests {
         assert_eq!(
             environment,
             [
-                "PATH=/usr/bin:/bin",
-                "LANG=C",
-                "LC_ALL=C",
+                "PATH=/user/bin:/bin",
+                "HOME=/home/user",
+                "LANG=en_US.UTF-8",
+                "PKCS11_PROVIDER_MODULE=/usr/lib64/pkcs11/libsofthsm2.so",
+                "XDG_CONFIG_HOME=/home/user/.config",
                 "TERM=xterm",
                 "SOFTHSM2_CONF=/tmp/softhsm2.conf",
             ]
         );
+    }
+
+    #[test]
+    fn child_environment_removes_only_p11scope_controlled_variables() {
+        let environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (OsString::from("SUDO_GID"), OsString::from("1000")),
+            (OsString::from("SUDO_USER"), OsString::from("user")),
+            (
+                OsString::from("SUDO_COMMAND"),
+                OsString::from("/usr/bin/p11scope"),
+            ),
+            (
+                OsString::from("P11SCOPE_LOADER_ENV_SANITIZED"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("P11SCOPE_TEST_DISCOVERY_PROVIDER"),
+                OsString::from("/tmp/x.so"),
+            ),
+            (OsString::from("NOT_P11SCOPE"), OsString::from("kept")),
+        ])
+        .unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(environment, ["HOME=/home/user", "NOT_P11SCOPE=kept"]);
+    }
+
+    #[test]
+    fn child_env_removal_notice_names_variables_never_values() {
+        assert_eq!(child_env_removal_notice([]), None);
+        assert_eq!(
+            child_env_removal_notice([
+                (OsString::from("HOME"), OsString::from("/home/user")),
+                (OsString::from("PATH"), OsString::from("/bin")),
+            ]),
+            None
+        );
+        let notice = child_env_removal_notice([
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (
+                OsString::from("P11SCOPE_LOADER_ENV_SANITIZED"),
+                OsString::from("s3cret-value"),
+            ),
+            (OsString::from("SUDO_COMMAND"), OsString::from("s3cret-cmd")),
+        ])
+        .unwrap();
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+        assert!(notice.contains("SUDO_UID"), "{notice:?}");
+        assert!(notice.contains("SUDO_COMMAND"), "{notice:?}");
+        assert!(
+            notice.contains("P11SCOPE_LOADER_ENV_SANITIZED"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains("1000"), "{notice:?}");
+        assert!(!notice.contains("s3cret"), "{notice:?}");
+        assert!(!notice.contains("HOME"), "{notice:?}");
     }
 
     #[test]

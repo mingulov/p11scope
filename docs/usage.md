@@ -347,11 +347,16 @@ are still in progress.
 > without that explicit target and set-id invocations are refused. These
 > environment values select the target account but do not authenticate that
 > the launcher was `sudo`. The child has no capabilities, cannot gain
-> privilege across exec, receives only `PATH`, C locale, optional `TERM`/`TZ`,
-> and `SOFTHSM2_CONF`, and does not inherit unrelated file descriptors. The
+> privilege across exec, inherits the observer's environment unchanged (so
+> the workload behaves as without p11scope), and does not inherit unrelated
+> file descriptors. Only p11scope's own control inputs are withheld from the
+> child by name, with one stderr line naming them: `SUDO_UID`/`SUDO_GID`
+> (consumed as the target-account selection), `SUDO_USER`/`SUDO_COMMAND`
+> (describing the sudo invocation a bare execution has none of), and
+> `P11SCOPE_*` (p11scope's own control namespace). Values are never read or
+> logged. The
 > command is an opened ELF executable; invoke scripts explicitly as
-> `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
-> `--` for other application variables. Owned launch requires procfs mounted
+> `/bin/sh /path/to/script`. Owned launch requires procfs mounted
 > at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
 > later path replacement cannot change the selected inode. If that descriptor
 > path is unavailable, `run` reports the exec failure and refuses to retry the

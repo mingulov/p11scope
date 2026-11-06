@@ -645,6 +645,7 @@ scan-only discovery names functions from the standard table without confirming t
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
+CMD inherits the observer's environment unchanged, except SUDO_UID/SUDO_GID/SUDO_USER/SUDO_COMMAND and P11SCOPE_* (named on stderr when withheld).
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.

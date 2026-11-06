@@ -539,6 +539,34 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("WP-3", self.yml)
         self.assertIn("WP-7", self.yml)
 
+    def test_minimal_setcap_leg_runs_on_host_and_guests(self):
+        job = job_body(self.yml, "public-cli")
+        # Host leg through the template; guests inside the vng wrapper.
+        self.assertIn("run-cell-script.sh minimal-setcap", job)
+        self.assertIn("qualify-public-cli-vng.sh", job)
+        self.assertIn("libcap2-bin", job)
+        # One uniform gate over the minimal results for both legs, with
+        # every row required: a dropped row must fail, not shrink cover.
+        self.assertIn("minimal-cells/results.jsonl", job)
+        for cell in ("doctor-minimal-p4", "doctor-minimal-p3",
+                     "profile-pid-p4", "profile-pid-p3",
+                     "missing-cap-cap_bpf-p4", "missing-cap-cap_bpf-p3",
+                     "missing-cap-cap_perfmon-p4",
+                     "missing-cap-cap_perfmon-p3",
+                     "missing-cap-cap_checkpoint_restore-p4",
+                     "missing-cap-cap_checkpoint_restore-p3",
+                     "missing-cap-cap_dac_read_search-p4",
+                     "missing-cap-cap_dac_read_search-p3",
+                     "missing-cap-cap_sys_ptrace-p4",
+                     "missing-cap-cap_sys_ptrace-p3",
+                     "inventory-system", "run-minimal",
+                     "run-child-drops-caps", "postsetup-drops-sysadmin"):
+            with self.subTest(cell=cell):
+                self.assertIn(f"--require {cell}", job)
+        # Artifacts carry the minimal evidence.
+        self.assertIn("minimal-cells/tmp/out/*.out", job)
+        self.assertIn("minimal.log", job)
+
     def test_witness_cli_matrix_runs_host_and_the_four_pinned_guests(self):
         job = job_body(self.yml, "witness-cli")
         match = re.search(r"kernel:\s*\[(.*?)\]", job)

@@ -1,13 +1,16 @@
 #!/bin/bash
 # SPDX-License-Identifier: GPL-3.0-or-later
 # qualify-public-cli-vng.sh KERNEL P11SCOPE OUTDIR — run scripts/qualify-public-cli.sh as root
-# inside a virtme-ng guest booted on KERNEL (a mainline tag such as v6.1.188, or a vmlinuz path).
+# inside a virtme-ng guest booted on KERNEL (a mainline tag such as v6.1.188, or a vmlinuz path),
+# then the least-privilege cell (scripts/ci/minimal-setcap.sh: the observer as the unprivileged
+# `nobody` user with exactly the minimal setcap set, no sudo, no CAP_SYS_ADMIN).
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp, so the binary and
 # OUTDIR must live under /home. Take the VM lane lock around this script.
 # MODULE, when set, is forwarded to the guest (a provider path under /home or /usr).
 # Exit codes: the guest's qualify exit (0 qualifies, 1 fails, 2 is the
-# documented nonqualifying smoke); 1 when vng itself fails or the results
-# are missing.
+# documented nonqualifying smoke); 1 when vng itself fails, when the results
+# are missing, or when the minimal-setcap leg fails (a minimal failure
+# dominates even a nonqualifying-smoke qualify exit).
 # P11SCOPE_STARTUP_BOUND_S, when set, is forwarded for the startup-to-capturing cell.
 set -u
 K=$1; BIN=$(realpath -e "$2"); OUT=$3
@@ -25,6 +28,9 @@ mkdir -p /tmp/qual && chmod 755 /tmp/qual
 ${MODULE:+MODULE=$MODULE }${P11SCOPE_STARTUP_BOUND_S:+P11SCOPE_STARTUP_BOUND_S=$P11SCOPE_STARTUP_BOUND_S }THREADS=4 $REPO/scripts/qualify-public-cli.sh $BIN /tmp/qual/cells > $OUT/qual.log 2>&1
 echo "qual_exit=\$?" >> $OUT/qual.log
 cp -r /tmp/qual/cells $OUT/cells
+$REPO/scripts/ci/run-cell-script.sh minimal-setcap $BIN /tmp/qual/minimal-cells > $OUT/minimal.log 2>&1
+echo "minimal_exit=\$?" >> $OUT/minimal.log
+cp -r /tmp/qual/minimal-cells $OUT/minimal-cells
 INNER
 s=$(date +%s)
 vng --run "$K" --user root --cpus 4 --memory 4G --rwdir "$OUT" --exec "sh $OUT/inner.sh" > "$OUT/vng-console.log" 2>&1
@@ -32,6 +38,12 @@ vng_exit=$?
 echo "vng_exit=$vng_exit wall=$(( $(date +%s)-s ))s kernel=$(cat "$OUT/uname.txt" 2>/dev/null) $(cat "$OUT/cells/summary.txt" 2>/dev/null)"
 [ "$vng_exit" -eq 0 ] || exit 1
 [ -s "$OUT/cells/summary.txt" ] || { echo "qualify-public-cli-vng: missing cells/summary.txt" >&2; exit 1; }
+[ -s "$OUT/minimal-cells/results.jsonl" ] || { echo "qualify-public-cli-vng: missing minimal-cells/results.jsonl" >&2; exit 1; }
+minimal_exit=$(sed -n 's/^minimal_exit=//p' "$OUT/minimal.log" 2>/dev/null | tail -n 1)
+case "$minimal_exit" in
+    0) ;;
+    *) echo "qualify-public-cli-vng: minimal setcap leg failed (minimal_exit=$minimal_exit)" >&2; exit 1;;
+esac
 qual_exit=$(sed -n 's/^qual_exit=//p' "$OUT/qual.log" 2>/dev/null | tail -n 1)
 case "$qual_exit" in
     0|1|2) exit "$qual_exit";;

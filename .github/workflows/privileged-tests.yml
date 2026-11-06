@@ -874,7 +874,10 @@ jobs:
   # controls) as root: on the runner kernel and in virtme-ng guests. The
   # host leg runs through scripts/ci/run-cell-script.sh as the template
   # proof; WP-4 breadth and WP-5 legacy32 extend here, packed into this
-  # job's matrix, never as new jobs.
+  # job's matrix, never as new jobs. The least-privilege leg
+  # (scripts/ci/minimal-setcap.sh: the observer as the unprivileged
+  # `nobody` user with exactly the minimal setcap set) rides the same
+  # host + guest matrix through the same template.
   public-cli:
     needs: release-build
     runs-on: ubuntu-26.04
@@ -888,7 +891,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 1
-      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq procps python3 softhsm2 util-linux
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq libcap2-bin procps python3 softhsm2 util-linux
       - name: Enable KVM and install pinned virtme-ng
         if: matrix.kernel != 'host'
         shell: bash
@@ -958,12 +961,33 @@ jobs:
               >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
+            # Least-privilege leg on the host kernel: the observer as
+            # `nobody` with exactly the minimal setcap set. Guests run
+            # the same leg inside qualify-public-cli-vng.sh.
+            sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" scripts/ci/run-cell-script.sh minimal-setcap "$in/p11scope" "$out/minimal-cells" \
+              >"$RUNNER_TEMP/minimal.log" 2>&1 || rc=$?
+            sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+            tail -20 "$RUNNER_TEMP/minimal.log"
           else
             scripts/qualify-public-cli-vng.sh "${{ matrix.kernel }}" "$in/p11scope" "$out" || rc=$?
             tail -40 "$out/qual.log" || true
             cat "$out/uname.txt" || true
           fi
           echo "qualify rc=$rc"
+          # The minimal-setcap gate, uniform for the host and guest
+          # legs: every row must pass qualified (the paranoid-parametric
+          # names always cover 3 and 4; the current value adds bonus
+          # rows when it is neither).
+          python3 -I scripts/ci/check-cell-results.py "$out/minimal-cells/results.jsonl" \
+            --require doctor-minimal-p4 --require doctor-minimal-p3 \
+            --require profile-pid-p4 --require profile-pid-p3 \
+            --require missing-cap-cap_bpf-p4 --require missing-cap-cap_bpf-p3 \
+            --require missing-cap-cap_perfmon-p4 --require missing-cap-cap_perfmon-p3 \
+            --require missing-cap-cap_checkpoint_restore-p4 --require missing-cap-cap_checkpoint_restore-p3 \
+            --require missing-cap-cap_dac_read_search-p4 --require missing-cap-cap_dac_read_search-p3 \
+            --require missing-cap-cap_sys_ptrace-p4 --require missing-cap-cap_sys_ptrace-p3 \
+            --require inventory-system --require run-minimal \
+            --require run-child-drops-caps --require postsetup-drops-sysadmin
           # The wrapper translates the documented nonqualifying-smoke exit 2
           # to 0 when results exist; the per-cell checks below still decide.
           python3 -I - "$out/cells/results.jsonl" <<'PY'
@@ -1059,8 +1083,14 @@ jobs:
             ${{ github.workspace }}/cli-out/cells/*.stderr
             ${{ github.workspace }}/cli-out/cells/*.json
             ${{ github.workspace }}/cli-out/qual.log
+            ${{ github.workspace }}/cli-out/minimal.log
+            ${{ github.workspace }}/cli-out/minimal-cells/results.jsonl
+            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.out
+            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.err
+            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.json
             ${{ github.workspace }}/cli-out/vng-console.log
             ${{ runner.temp }}/qual.log
+            ${{ runner.temp }}/minimal.log
           if-no-files-found: warn
           retention-days: 7
   # The two ia32 public-CLI cells with a real i386 provider: this job

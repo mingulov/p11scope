@@ -7666,6 +7666,59 @@ mod tests {
     }
 
     #[test]
+    fn sole_complete_proven_prefix_3x_mints() {
+        // A 3.2 label with the proven complete 68-slot legacy prefix
+        // (decoder `known_prefix` + `extension_impossible`) mints: the
+        // legacy prefix carries the 2.x layout, so the version gate
+        // accepts it exactly like a 2.x table.
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].version = (3, 2);
+        module.scanned.tables[0].walk = "known_prefix";
+        module.scanned.tables[0].extension_impossible = true;
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a proven 3.x legacy prefix mints the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_unproven_3x_refuses() {
+        // The same 3.2 `known_prefix` shape without the prefix proof:
+        // the published walk stays `known_prefix`, so the grant refuses.
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].version = (3, 2);
+        module.scanned.tables[0].walk = "known_prefix";
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unproven 3.x prefix refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_full_walk_3x_without_proof_refuses() {
+        // The version gate's `extension_impossible` conjunct: a 3.x table
+        // reporting a full walk without the prefix proof still refuses.
+        // (The decoder never emits this shape today — 3.x full walks are
+        // 92/104 slots — but the predicate stays conservative on it.)
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].version = (3, 2);
+        assert!(
+            !module.scanned.tables[0].extension_impossible,
+            "the helper carries no prefix proof"
+        );
+        assert!(
+            !sole_scan_semantic(&module),
+            "a full-walk 3.x table without the prefix proof refuses the grant"
+        );
+    }
+
+    #[test]
     fn sole_complete_required_names_match_object_descriptors() {
         let computed: BTreeSet<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()

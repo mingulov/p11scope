@@ -3161,8 +3161,8 @@ mod tests {
     }
 
     /// The doctor names the build's object-capture scope: enabled in
-    /// FULL builds, a by-design warning in P0 (stub) builds that
-    /// extra-strict qualification excuses (no host can clear it).
+    /// FULL builds, a by-design `n/a` build limit in P0 (stub) builds
+    /// that extra-strict qualification excuses (no host can clear it).
     /// OD33/R-50: v0.5.0 reads attributes but reports key operations
     /// only from 0.6.0, so the OK detail says so.
     #[test]
@@ -3179,7 +3179,11 @@ mod tests {
                 "{check:?}"
             ),
             false => {
-                assert!(matches!(check.status, Status::Warn(_)), "{check:?}");
+                assert_eq!(
+                    check.status,
+                    Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into()),
+                    "{check:?}"
+                );
                 assert!(is_build_limit(&check), "{check:?}");
                 let checks = vec![check];
                 assert!(extra_strict_violations(&checks).is_empty());
@@ -3253,7 +3257,10 @@ mod tests {
         }
         let check = object_capture_check();
         assert!(
-            matches!(check.status, Status::Ok(_) | Status::Warn(_)),
+            matches!(
+                check.status,
+                Status::Ok(_) | Status::Warn(_) | Status::NotApplicable(_)
+            ),
             "{check:?}"
         );
         assert_eq!(verdict(&[check]), 0);

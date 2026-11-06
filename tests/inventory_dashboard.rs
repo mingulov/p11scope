@@ -156,7 +156,9 @@ fn dashboard_on_pipe_degrades_to_snapshots_never_ansi() {
     let dir = tmp("inventory-dashboard-degrade");
     let _driver = Driver::spawn(&dir, "degrade", &["dg-p1.so", "dg-p2.so"]);
     // Multi-provider, one caller: both providers map the owned pid.
-    let output = observer(_driver.pid, &["--dashboard"]);
+    // Full detail: the joined overview, presence/capture columns and
+    // budgets below are verbose-only since CLI-1.
+    let output = observer(_driver.pid, &["--dashboard", "-v"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "degraded run exits 0: {stderr}");
     assert!(
@@ -234,7 +236,8 @@ fn dashboard_multi_caller_system_subset_over_owned_fixtures() {
     let _b = Driver::spawn(&dir, "sysb", &["sb-p1.so"]);
     // Whole-machine dashboard, degraded to a snapshot on the pipe:
     // the owned multi-caller subset is asserted, the rest of the
-    // machine may appear freely.
+    // machine may appear freely. Full detail: per-caller pids are
+    // verbose-only since CLI-1.
     let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .arg("inventory")
         .args(["--capture", "scan"])
@@ -242,6 +245,7 @@ fn dashboard_multi_caller_system_subset_over_owned_fixtures() {
         .arg("--max-scan-pids")
         .arg("4096")
         .arg("--dashboard")
+        .arg("-v")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

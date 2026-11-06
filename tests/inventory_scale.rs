@@ -1222,9 +1222,6 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     std::fs::set_permissions(out_dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let file = out_dir.path().join("partial.json");
     let stderr_log = dir.join("stderr.log");
-    // System-wide JSON exceeds the 64 KiB pipe nobody drains mid-run
-    // (see `spawn_with_peak`), so stdout goes to a file like stderr.
-    let stdout_log = dir.join("stdout.log");
     // One small budget, overflowed on purpose: the machine always holds
     // more than one process (the test, its shell, the observer), so a
     // scan cap of 1 always truncates and the run is always partial.
@@ -1250,7 +1247,7 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
         ])
         .arg(&file)
         .stdin(Stdio::null())
-        .stdout(std::fs::File::create(&stdout_log).unwrap());
+        .stdout(Stdio::piped());
         spawn_with_peak(&mut cmd, &stderr_log)
     };
     let stderr = std::fs::read_to_string(&stderr_log).unwrap();
@@ -1260,8 +1257,10 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
         output.status,
     );
     // Both sinks carry the same bytes: the `-o` file and stdout agree.
+    // Piped: `spawn_with_peak` drains stdout mid-run, so the 64 KiB
+    // pipe never deadlocks; a file stdout would panic its contract.
     assert_eq!(
-        std::fs::read(&stdout_log).unwrap(),
+        output.stdout,
         std::fs::read(&file).unwrap(),
         "stdout and the -o report agree byte for byte"
     );

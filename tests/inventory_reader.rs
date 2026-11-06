@@ -229,7 +229,13 @@ fn dance(fixtures: &FixtureSet, json_out: bool, max_gaps: Option<usize>) -> Danc
             "4096".to_string(),
         ]
     } else {
-        vec!["--max-scan-pids".to_string(), "4096".to_string()]
+        // Full detail: the caller/module/edge/gap lines below are
+        // verbose-only since CLI-1.
+        vec![
+            "--max-scan-pids".to_string(),
+            "4096".to_string(),
+            "-v".to_string(),
+        ]
     };
     if let Some(bound) = max_gaps {
         extra.push("--max-gaps".to_string());

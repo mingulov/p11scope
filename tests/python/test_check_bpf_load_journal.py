@@ -77,6 +77,11 @@ p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1
 key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)
 """
 
+#: The linked run under -v with verbose per-process Joint gap detail:
+#: the gate must not mistake the bare phrase for a refused lane.
+LINKED_JOINT_TEXT = LINKED_TEXT + """gap [Joint key operations unavailable; retained S1] joint_seal_batch_history_loss
+"""
+
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
@@ -180,6 +185,7 @@ class JournalGateTests(unittest.TestCase):
             "linked-idle": rows,
             "linked-oldline": rows,
             "linked-zero": rows,
+            "linked-joint": rows,
             "refused-noseal": [row for row in rows if row["btf_id"] == 48],
             # The plain build exits before loading anything: the probe
             # file holds only its summary.
@@ -205,12 +211,17 @@ class JournalGateTests(unittest.TestCase):
             "linked-oldline": {"rc": 0, "text": LINKED_TEXT.replace(
                 "shed 30, lost 0, bindings 1", "shed 30, bindings 1")},
             "linked-zero": {"rc": 0, "text": ZERO_JOINED_TEXT},
+            "linked-joint": {"rc": 0, "text": LINKED_JOINT_TEXT},
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
                 "key operations: not available — per-key tracking never started, so no "
                 "key can be named yet (reason: bootstrap_unavailable)",
                 "key operations: not reported (per-key tracking is off)")},
             "refused-build": {"rc": 0, "text":
+                "p11scope: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"
                 "p11scope: semantic lane ready; mechanisms and API results "
                 "are recorded from now on (key operations: recorded only "
                 "with --key-operations)\n"
@@ -219,6 +230,10 @@ class JournalGateTests(unittest.TestCase):
                 "production journal object; broad inventory continues "
                 "with S1 mechanisms and API results\n"},
             "refused-noseal": {"rc": 0, "text":
+                "p11scope: key operations unavailable: "
+                "journal-pair-unavailable-in-build: this build omits the "
+                "production journal object; broad inventory continues "
+                "with S1 mechanisms and API results\n"
                 "gap [key operations unavailable] "
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object; broad inventory continues "
@@ -382,6 +397,19 @@ class JournalGateTests(unittest.TestCase):
         self.assertTrue(row["pass"])
         self.assertEqual(row["qualification"], "qualified")
         self.assertIn("linked sealed live", row["detail"])
+
+    def test_linked_with_joint_gap_still_passes(self):
+        # Verbose per-process gap detail names "Joint key operations
+        # unavailable" on a live lane; the gate matches only the
+        # "p11scope: key operations unavailable" stderr diagnostic,
+        # so the Joint text never refuses a linked run.
+        result, out = self.run_gate(KERNEL, mode="linked-joint")
+        self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+        (row,) = self.read_rows(out)
+        self.assertTrue(row["pass"])
+        self.assertEqual(row["qualification"], "qualified")
+        self.assertIn("linked sealed live", row["detail"])
+        self.assertIn("observations=bootstrap_unavailable", row["detail"])
 
     def test_sealed_but_idle_fails(self):
         # A seal with no joined calls is vacuous: the lane never
@@ -797,11 +825,13 @@ class ScriptContractTests(unittest.TestCase):
     def test_names_the_finite_refusal_reasons(self):
         self.assertIn("journal-pair-unavailable-in-build", self.text)
         self.assertIn("live capture \\(needs root\\|unavailable\\|did not start\\):", self.text)
+        self.assertIn("p11scope: key operations unavailable", self.text)
 
     def test_runs_one_bounded_guest_per_kernel(self):
         self.assertIn("vng --run", self.text)
         self.assertIn("--duration 60s", self.text)
         self.assertIn("--key-operations", self.text)
+        self.assertIn("inventory -v --system", self.text)
 
     def test_fails_fast_past_the_command_budget(self):
         self.assertIn("-gt 950", self.text)

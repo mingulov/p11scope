@@ -1637,7 +1637,15 @@ fn inspect_renders_a_scanned_fixture_end_to_end() {
     .unwrap();
     let text = p11scope::inspect::render_text(std::process::id(), &outcome, &pinned);
     assert!(text.contains("inspected.so"), "{text}");
-    assert!(text.contains("2.40"), "{text}");
+    // The per-table version is verbose-only since CLI-1 (concise keeps
+    // one line per provider); the same fact through its detail channel.
+    let verbose = p11scope::inspect::render_text_with_verbosity(
+        std::process::id(),
+        &outcome,
+        &pinned,
+        p11scope::cli::TextVerbosity::Verbose,
+    );
+    assert!(verbose.contains("2.40"), "{verbose}");
     let json = p11scope::inspect::render_json(std::process::id(), &outcome, &pinned);
     assert_eq!(json["schema"], "p11scope/inspect/v1");
     assert!(

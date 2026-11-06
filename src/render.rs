@@ -914,6 +914,13 @@ pub struct DiscoveredModule {
     /// deliberately absent from the public report schema.
     #[serde(skip)]
     pub id: ModuleId,
+    /// The deciding admission class label, renderer metadata like `id`:
+    /// `closure_array` marks a forwarding layer even when it was
+    /// admitted whole with no gap (counter/broad policies). Absent from
+    /// the schema; the JSON layer split travels in `functions[]` and
+    /// `layer_totals` instead.
+    #[serde(skip)]
+    pub admission_class: Option<&'static str>,
     pub dev: (u64, u64),
     pub ino: u64,
     /// `None` when nothing pinned the module object itself.
@@ -2301,12 +2308,11 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
 }
 
 /// Modules whose attached counts are forwarding-layer observations, never
-/// logical calls: closure-array layers admitted beside watched providers
-/// (prefix-admitted or refused whole). Identified structurally from the
-/// planner's closure gaps — never by path, name or vendor. A refused
-/// layer holds no slots, so including it here is a no-op; a
-/// prefix-admitted layer's own stub slots are the ones excluded from
-/// logical totals.
+/// logical calls: closure-array layers admitted beside watched providers.
+/// Identified structurally — never by path, name or vendor — from the
+/// deciding admission class first (this also catches whole-admitted
+/// closures under counter/broad policies, which carry no gap) and from
+/// the planner's closure gaps beside it.
 fn forwarding_module_ids(ev: &Evidence) -> std::collections::BTreeSet<ModuleId> {
     let mut names = std::collections::BTreeSet::new();
     for skipped in &ev.discovery.modules_skipped {
@@ -2319,7 +2325,9 @@ fn forwarding_module_ids(ev: &Evidence) -> std::collections::BTreeSet<ModuleId> 
     ev.discovery
         .modules
         .iter()
-        .filter(|module| names.contains(module.path.as_str()))
+        .filter(|module| {
+            module.admission_class == Some("closure_array") || names.contains(module.path.as_str())
+        })
         .map(|module| module.id)
         .collect()
 }
@@ -5535,6 +5543,7 @@ pub(crate) mod tests {
         let sha = "11".repeat(32);
         DiscoveredModule {
             id: ModuleId(0),
+            admission_class: None,
             dev: (8, 1),
             ino: 11,
             sha256: Some(sha.clone()),
@@ -8411,18 +8420,22 @@ pub(crate) mod tests {
         );
     }
 
-    /// Unattributed twin: a forwarding-layer row whose ownership was not
-    /// proven (null module) still leaves the logical total once — the
-    /// attach target's file identity places it at the forwarding layer.
+    /// Unattributed twin: a whole-admitted forwarding layer (counter/broad
+    /// policy: no gap at all) whose row ownership was not proven (null
+    /// module) still leaves the logical total once — the deciding
+    /// admission class marks the layer, and the attach target's file
+    /// identity places the row at it.
     #[test]
     fn unresolved_forwarding_rows_leave_logical_totals_once() {
         let mut layer = discovered_fixture();
         layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
         layer.dev = (8, 1);
         layer.ino = 71;
         layer.path = "/opt/libforward.so".into();
         let mut backend = discovered_fixture();
         backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
         backend.ino = 82;
         backend.path = "/opt/libbackend.so".into();
         let mut outer = report("unknown#3", 500, 0, false);
@@ -8437,11 +8450,7 @@ pub(crate) mod tests {
         inner.module = Some(ModuleId(8));
         let mut ev = evidence();
         ev.discovery.modules = vec![layer, backend];
-        ev.discovery.modules_skipped.push(SkippedOut {
-            name: "/opt/libforward.so".into(),
-            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
-                .into(),
-        });
+        assert!(ev.discovery.modules_skipped.is_empty());
         ev.verdict();
         let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
         assert!(

@@ -937,6 +937,7 @@ mod tests {
             source: "manifest",
             corroborated: false,
             skipped: vec![],
+            admission_class: None,
         }];
         plan
     }
@@ -956,6 +957,7 @@ mod tests {
             source: "manifest",
             corroborated: false,
             skipped: vec![],
+            admission_class: None,
         }
     }
 

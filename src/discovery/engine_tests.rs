@@ -9219,6 +9219,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     let empty_scan = |path: &str| Skipped {
         subject: path.into(),
@@ -14631,6 +14632,7 @@ fn capture_facts_reports_active_slots_separately_from_churned_allocations() {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     let delta = engine.plan.extend_exact(rebuilt).unwrap();
     assert_eq!(
@@ -35120,6 +35122,7 @@ fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     plan.modules_skipped = (0..refused)
         .map(|i| Skipped {
@@ -35954,6 +35957,7 @@ fn merged_object(sources: Vec<&'static str>) -> render::ObjectSummary {
 fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
     render::DiscoveredModule {
         id: plan::ModuleId(0),
+        admission_class: None,
         dev: (0, 30),
         ino: 12_043_768,
         sha256: Some("5f48fcc1".into()),

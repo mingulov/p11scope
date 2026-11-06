@@ -7533,6 +7533,7 @@ fn discovery_evidence(
             let identity = summary_of(m.object, &m.path);
             render::DiscoveredModule {
                 id: m.id,
+                admission_class: m.admission_class,
                 dev: identity.dev,
                 ino: identity.ino,
                 sha256: identity.sha256,

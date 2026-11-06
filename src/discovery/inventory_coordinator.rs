@@ -1091,6 +1091,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     source: "prearm",
                     corroborated: false,
                     skipped: Vec::new(),
+                    admission_class: None,
                 });
             }
         }
@@ -11873,6 +11874,7 @@ pub(crate) mod tests {
             source: "scan",
             corroborated: false,
             skipped: Vec::new(),
+            admission_class: None,
         });
         let pins = coordinator
             .prearm

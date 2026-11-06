@@ -435,6 +435,7 @@ fn native_retirement_replacement_descriptor_retires_the_actual_old_pair() {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     };
     let mut plan = crate::plan::AttachPlan::from_slots(vec![target.slot.clone()]);
     plan.modules = vec![module.clone()];

@@ -14372,6 +14372,7 @@ mod tests {
                 source: "prearm",
                 corroborated: false,
                 skipped: Vec::new(),
+                admission_class: None,
             })
             .collect();
         plan

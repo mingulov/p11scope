@@ -875,6 +875,11 @@ pub struct ModuleSummary {
     /// records as `AttachPlan::skipped`, attributed to the module that
     /// published them so a report can say *which* provider lost entries.
     pub skipped: Vec<Skipped>,
+    /// The deciding admission class label (`operator`, `corroborated`,
+    /// `heuristic`, `closure_array`), so renderers can tell a forwarding
+    /// layer from a provider without reimplementing classification.
+    /// `None` on paths that never classified (count-only replication).
+    pub admission_class: Option<&'static str>,
 }
 
 /// Per-surface discovery provenance, carried through to evidence so a
@@ -3838,6 +3843,7 @@ fn merge(
             source,
             corroborated: false,
             skipped: Vec::new(),
+            admission_class: Some(class.label()),
         });
         let mut seen_skips = BTreeSet::new();
         let mut seen_tables = Vec::new();
@@ -6226,6 +6232,7 @@ impl ConservativePlanCursor {
                     source: piece.source,
                     corroborated: false,
                     skipped: Vec::new(),
+                    admission_class: None,
                 });
                 self.surviving_paths.insert(piece.path.clone());
                 self.replicate_count_only = false;
@@ -8701,6 +8708,7 @@ mod tests {
             source: "manifest",
             corroborated: false,
             skipped: vec![],
+            admission_class: None,
         }
     }
 

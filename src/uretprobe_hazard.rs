@@ -472,9 +472,6 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
     }
 }
 
-/// `CAP_SYS_ADMIN`'s bit in a `CapEff` mask comes from the one `caps`
-/// definition, so the lane's bit numbers cannot drift apart.
-
 /// `PROC_USER_INIT_INO`: the nsfs inode of the initial user namespace
 /// (`include/linux/proc_ns.h`), as `PROC_PID_INIT_INO` is for PIDs.
 const INIT_USER_NS_INODE: u64 = 0xEFFF_FFFD;
@@ -586,7 +583,7 @@ pub(crate) fn perf_open_restricted(facts: PrivilegeFacts) -> bool {
 /// capability, and a self-probe attach refused under a restrictive
 /// `perf_event_paranoid` is that sysctl — neither is a lockdown, an LSM or
 /// seccomp (DR-K8S-3).
-pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, _binary: &str) -> String {
+pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, binary: &str) -> String {
     // Checked first: in a child user namespace no capability this process
     // holds counts, so neither the sysctl nor a lockdown is the story.
     if facts.init_user_ns == Some(false) {
@@ -594,15 +591,15 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, _binary: &
             "the kernel refused to load p11scope's BPF programs ({why}). This process runs in \
              a child user namespace (a rootless or userns-remapped container), and \
              capabilities held there, even as uid 0, do not count for BPF or perf_event_open: \
-             capturing needs CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON in the host's initial \
-             user namespace (for example a container without user-namespace remapping). \
-             `p11scope doctor` shows what this host allows"
+             capturing needs CAP_BPF, CAP_CHECKPOINT_RESTORE, CAP_DAC_READ_SEARCH, CAP_PERFMON \
+             and CAP_SYS_PTRACE in the host's initial user namespace (for example a container \
+             without user-namespace remapping). `p11scope doctor` shows what this host allows"
         );
     }
     // Only genuine perf_event_open failures reach this arm: the self-probe
     // attaches through an uprobe-multi link now, so its failures name the
-    // link creation instead. (The arm goes away with the refusal rewrite,
-    // which moves paranoid guidance to the singles paths that use perf.)
+    // link creation instead. What remains is the singles fallback, which
+    // is exactly what this arm names.
     if why.contains("perf_event_open")
         && perf_open_restricted(facts)
         && let Some(level) = facts.perf_event_paranoid
@@ -616,30 +613,52 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, _binary: &
              kernel.perf_event_paranoid at 2 or below. `p11scope doctor` shows this host's row"
         );
     }
-    match (facts.euid_root, facts.sys_admin) {
-        (true, Some(true)) => format!(
-            "the kernel refused to load p11scope's BPF programs even as root ({why}): a kernel \
-             lockdown, an LSM policy, or a container's seccomp profile is refusing BPF here. \
-             Run `p11scope doctor` to see which"
-        ),
-        (true, Some(false)) => format!(
-            "the kernel refused to load p11scope's BPF programs ({why}). This process runs as \
-             root without CAP_SYS_ADMIN (a container that dropped it): capturing needs \
-             CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope doctor` shows what this host \
-             allows"
-        ),
+    // Load refusals blame the missing load capabilities by name, for a
+    // user and for root alike (DR-K8S-3). CAP_SYS_ADMIN suffices for
+    // load, so its holder is never told to grant the set.
+    match facts.cap_eff {
+        Some(mask) => {
+            let missing_load = crate::caps::missing_in(mask, &crate::caps::LOAD_BITS);
+            if !missing_load.is_empty() && !facts.sys_admin_counts() {
+                return format!(
+                    "the kernel refused to load p11scope's BPF programs ({why}). Live capture \
+                     {}. `p11scope doctor` shows what this host allows",
+                    crate::caps::lacking_line(&missing_load, binary)
+                );
+            }
+            if facts.euid_root {
+                format!(
+                    "the kernel refused to load p11scope's BPF programs even as root ({why}): a kernel \
+                     lockdown, an LSM policy, or a container's seccomp profile is refusing BPF here. \
+                     Run `p11scope doctor` to see which"
+                )
+            } else if missing_load.is_empty() {
+                format!(
+                    "the kernel refused to load p11scope's BPF programs ({why}) with CAP_BPF and \
+                     CAP_PERFMON held: a kernel lockdown, an LSM policy, or a container's seccomp \
+                     profile is refusing BPF here. Run `p11scope doctor` to see which"
+                )
+            } else {
+                format!(
+                    "the kernel refused to load p11scope's BPF programs ({why}) with CAP_SYS_ADMIN \
+                     held: a kernel lockdown, an LSM policy, or a container's seccomp \
+                     profile is refusing BPF here. Run `p11scope doctor` to see which"
+                )
+            }
+        }
         // An unreadable CapEff is not evidence of a dropped capability.
-        (true, None) => format!(
-            "the kernel refused to load p11scope's BPF programs ({why}). This process runs as \
-             root, but its effective capabilities could not be read (/proc/self/status \
-             CapEff): capturing needs CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope \
-             doctor` shows what this host allows"
-        ),
-        (false, _) => format!(
-            "the kernel refused to load p11scope's BPF programs ({why}). Live capture needs \
-             root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON: run with sudo. `p11scope \
-             doctor` shows what this host allows"
-        ),
+        None => {
+            let who = if facts.euid_root {
+                "This process runs as root, but its"
+            } else {
+                "Its"
+            };
+            format!(
+                "the kernel refused to load p11scope's BPF programs ({why}). {who} effective \
+                 capabilities could not be read (/proc/self/status CapEff): capturing needs \
+                 CAP_BPF and CAP_PERFMON. `p11scope doctor` shows what this host allows"
+            )
+        }
     }
 }
 

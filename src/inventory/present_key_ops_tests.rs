@@ -635,22 +635,25 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.gaps.clear();
-    let stored = "live capture refused (live capture needs root: the kernel refused to load \
-        p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope \
-        inspect --pid N' for a scan without capture.); run with sudo for full capture";
+    let stored = "live capture refused (live capture needs CAP_BPF (load BPF programs and attach \
+        probes); needs CAP_PERFMON (load BPF programs alongside CAP_BPF): the kernel refused to load \
+        p11scope's BPF programs (Operation not permitted). Grant the minimal set: sudo setcap \
+        'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
+        /usr/bin/p11scope, or use 'p11scope inspect --pid N' for a scan without capture.); grant \
+        the minimal capability set for full capture (see 'p11scope doctor')";
     presentation
         .gaps
         .push(named_gap("native usage feed unavailable", stored));
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let block = gaps_block(&concise);
     // The group line would run past 100 chars, so the subject truncates
-    // (marked) while the reason and its sudo remedy stay intact.
+    // (marked) while the reason and its doctor remedy stay intact.
     assert_eq!(
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavail… — live capture refused (needs root); run with sudo \
-             for full capture",
+            "  1 × native usage feed unavai… — live capture refused (missing capabilities); run \
+             'p11scope doctor'",
         ],
         "the concise gaps block:\n{concise}"
     );

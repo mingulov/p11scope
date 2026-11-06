@@ -419,6 +419,9 @@ impl<'a> ViewFilesystem<'a> {
                 // unknown, never evidence that this cold path applies.
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
                 Err(error) => {
+                    if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                        crate::caps::note_lacking(&crate::caps::TARGET_READ_BITS);
+                    }
                     return Err(format!("cannot identify process mount namespace: {error}"));
                 }
             }

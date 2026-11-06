@@ -4252,6 +4252,12 @@ pub(crate) fn mapped_file_guard(
                     key.inode
                 ));
             }
+            // An access refusal here is the map_files proof falling
+            // back to mountinfo: name the capability once, then skip
+            // the entry exactly as before.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) => {
+                crate::caps::note_lacking(&crate::caps::MAP_FILES_BITS);
+            }
             Err(_) => {}
         }
     }
@@ -5663,6 +5669,9 @@ fn scan_view_examined_mode(
         };
         let unavailable = mem.as_ref().err().map(|error| {
             let (class, publishes) = mem_unavailable(error);
+            if class == "ptrace" {
+                crate::caps::note_lacking(&crate::caps::TARGET_READ_BITS);
+            }
             if publishes {
                 skipped.push(Skipped {
                     subject: format!("/proc/{pid}/mem"),

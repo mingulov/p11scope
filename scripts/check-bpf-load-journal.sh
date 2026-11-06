@@ -23,7 +23,7 @@
 # the object's BTF groups are the same, only the key prefix differs.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
-# `inventory --system --capture native --key-operations --manifest
+# `inventory -v --system --capture native --key-operations --manifest
 # MANIFEST --duration 60s`, under the probe. Before the observer starts,
 # the guest initializes a guest-local SoftHSM token and starts one
 # persistent ledger caller (eighty mech iterations a second apart,
@@ -371,7 +371,7 @@ else
 fi
 ulimit -n 65536
 RC=0
-timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
+timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory -v --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
 echo "guest-stage=observer-rc=$RC"
 if [ -f "$LEDGER_LOG" ]; then
     cp "$LEDGER_LOG" "./workload-$KERNEL.log"
@@ -551,7 +551,7 @@ PY
     fi
     OBSERVED="unknown"
     if [ -f "$J_TXT" ]; then
-        if grep -q 'key operations: unavailable (bootstrap_unavailable)' "$J_TXT"; then
+        if grep -q 'key operations: not available.*bootstrap_unavailable' "$J_TXT"; then
             OBSERVED="bootstrap_unavailable"
         elif grep -q 'key operations: rev ' "$J_TXT"; then
             OBSERVED="populated"

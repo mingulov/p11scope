@@ -16,7 +16,7 @@
 # every kernel passes; a timeout, a missing count, a refused load, a
 # count over budget or a nonzero doctor exit is FAIL.
 #
-# Per kernel one throwaway guest runs `doctor` under the probe: the
+# Per kernel one throwaway guest runs `doctor -v` under the probe: the
 # gate-1 delta is the Detailed object alone (Inventory and counter
 # objects are byte-identical to gate-0, proven by
 # scripts/check-gate0-identity.py), so only doctor's Detailed BTF
@@ -27,7 +27,8 @@
 # probe rewrites log_level, so doctor's counter-modes footer under the
 # probe is a gate artifact ("probe failed unexpectedly"), never
 # product behaviour: the gate checks only the host program preflight
-# line in doctor output and never scores or quotes that footer.
+# line in doctor output and never scores or quotes that footer. Doctor
+# runs with -v: the concise default hides Ok rows, including that line.
 #
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
 # defaults, p11_image_query, 4 instance hooks), scored from the
@@ -188,7 +189,7 @@ for KERNEL in "$@"; do
     DOCTOR_TXT="$OUTDIR/doctor-$KERNEL.txt"
     VNG_LOG="$OUTDIR/vng-$KERNEL.log"
     rm -f "$PROBE_JSON" "$DOCTOR_TXT" "$VNG_LOG"
-    EXEC1="cd $(q "$OUTDIR") && $STAGE; LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") doctor 9>$(q "probe-$KERNEL.jsonl") >$(q "doctor-$KERNEL.txt") 2>&1; echo doctor-rc=\$?; echo guest-release=\$(uname -r)"
+    EXEC1="cd $(q "$OUTDIR") && $STAGE; LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") doctor -v 9>$(q "probe-$KERNEL.jsonl") >$(q "doctor-$KERNEL.txt") 2>&1; echo doctor-rc=\$?; echo guest-release=\$(uname -r)"
     # Fail fast past the kernel command line: 950 raw bytes encode to
     # ~1270 base64 bytes, which still fits the 2048 budget beside
     # virtme's own arguments; past it the guest silently never runs.

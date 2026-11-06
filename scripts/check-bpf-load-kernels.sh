@@ -17,7 +17,7 @@
 # is FAIL.
 #
 # Per kernel six throwaway guests run one command each under the probe:
-# `doctor` (Detailed plus Inventory objects in one file, probe-K.jsonl,
+# `doctor -v` (Detailed plus Inventory objects in one file, probe-K.jsonl,
 # grouped by BTF id and scored as detailed; the Inventory groups in
 # that file are ignored there), a bounded
 # `inventory --system --capture native` (Inventory object,
@@ -47,7 +47,8 @@
 # The probe rewrites log_level, so doctor's counter-modes footer under
 # the probe is a gate artifact ("probe failed unexpectedly"), never
 # product behaviour: the gate checks only the host program preflight
-# line in doctor output and never scores or quotes that footer.
+# line in doctor output and never scores or quotes that footer. Doctor
+# runs with -v: the concise default hides Ok rows, including that line.
 #
 # Coverage: the 18 Detailed programs doctor loads in the guest (13
 # defaults, p11_image_query, 4 instance hooks), scored from the Detailed
@@ -250,7 +251,7 @@ for KERNEL in "$@"; do
     VNG_LOG="$OUTDIR/vng-$KERNEL.log"
     VNG_INV_LOG="$OUTDIR/vng-inv-$KERNEL.log"
     rm -f "$PROBE_JSON" "$DOCTOR_TXT" "$INV_PROBE_JSON" "$INV_TXT" "$VNG_LOG" "$VNG_INV_LOG"
-    EXEC1="cd $(q "$OUTDIR") && $STAGE; LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") doctor 9>$(q "probe-$KERNEL.jsonl") >$(q "doctor-$KERNEL.txt") 2>&1; echo doctor-rc=\$?; echo guest-release=\$(uname -r)"
+    EXEC1="cd $(q "$OUTDIR") && $STAGE; LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") doctor -v 9>$(q "probe-$KERNEL.jsonl") >$(q "doctor-$KERNEL.txt") 2>&1; echo doctor-rc=\$?; echo guest-release=\$(uname -r)"
     EXEC2="cd $(q "$OUTDIR") && $STAGE; ulimit -n 65536; timeout -k 10 -s INT 20 env LD_PRELOAD=$(q "$PROBE") P11SCOPE_VERIFIER_STATS_FD=9 $(q "$OBSERVER") inventory --system --capture native --attach-backend multi --identity-backend userspace 9>$(q "inventory-probe-$KERNEL.jsonl") >$(q "inventory-$KERNEL.txt") 2>&1; echo inventory-rc=\$?; echo guest-release=\$(uname -r)"
     # Fail fast past the kernel command line: 950 raw bytes encode to
     # ~1270 base64 bytes, which still fits the 2048 budget beside

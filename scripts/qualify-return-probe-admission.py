@@ -182,7 +182,8 @@ class OwnedProcess:
 
 
 def run_doctor(observer, work):
-    with OwnedProcess([str(observer), "doctor"], work / "doctor", DOCTOR_SECONDS) as child:
+    # -v: the concise default hides the Ok rows require_clean_doctor parses.
+    with OwnedProcess([str(observer), "doctor", "-v"], work / "doctor", DOCTOR_SECONDS) as child:
         rc = child.wait()
     # Other doctor rows can affect its aggregate exit; only this functional row
     # grants fixture launch. Signals/usage exits cannot grant a Clean assessment.

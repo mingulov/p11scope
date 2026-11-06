@@ -285,7 +285,8 @@ def run(args):
         (work / "bpf-before.json").write_text(json.dumps(bpf_ids()))
         # A warning-only doctor can return 1 (for example, no selected target).
         # Admit only the same functional safety rows as the hosted capture lane.
-        doctor = command(["sudo", "-n", "env", f"TMPDIR={os.environ.get('TMPDIR', work)}", str(observer), "doctor"],
+        # -v: the concise default hides the Ok rows this gate parses.
+        doctor = command(["sudo", "-n", "env", f"TMPDIR={os.environ.get('TMPDIR', work)}", str(observer), "doctor", "-v"],
                          120, allowed_statuses=(0, 1))
         (work / "doctor.txt").write_text(doctor + "\n")
         admission = runpy.run_path(str(ROOT / "scripts/qualify-return-probe-admission.py"))

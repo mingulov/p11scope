@@ -90,9 +90,13 @@ integration may still move them; the candidate pass confirms the numbers.
   provider before a copy-up reads `unknown` with the
   `original_file_unproven` gap and its later calls are missed; restart
   such processes.
-- The overlay-identity witness proves up to 8 refused callers per scan
-  and per pass: with more than 8, callers take turns across passes
-  while the rest keep the named `original_file_unproven` loss. While a
+- The overlay-identity witness proves up to 8 refused callers per
+  deep-scan scan and per kernel-route sweep pass, and up to 1024
+  refused callers per no-route sweep pass (single-shot
+  inspect/inventory sweeps prove through the same witness under the
+  1024 budget): past each route's budget, callers take turns across
+  passes while the rest keep the named loss (`original_file_unproven`
+  for deep scans, `overlay_kernel_unavailable` for sweeps). While a
   caller waits for its turn, its edge reads uncertain and its in-flight
   operations end as unknown. (verify at candidate: the live turn-taking
   rate is a candidate measurement)
@@ -1664,10 +1668,17 @@ The old bounds are measurements, not a product startup SLA.
   overlay provider (attach-set exclusion, for example a provider
   inside a container) proves through a private witness session with no
   exclusions, one query per watched (pid, key) under a per-pass budget
-  of 8 queries; each pass starts past the queries the previous pass
-  spent, so with more than 8 refused callers every pass proves a
-  different 8 and each caller alternates between joined and the named
-  loss. A same-file verdict joins, anything else (another file,
+  of 8 queries on kernel-route passes; each pass starts past the
+  queries the previous pass spent, so with more than 8 refused callers
+  every pass proves a different 8 and each caller alternates between
+  joined and the named loss. Passes with no kernel route at all (auto
+  fell back: a nested observer's numbering mismatch, missing BTF) prove
+  every refused overlay candidate through the same private session under
+  a per-pass budget of 1024 queries, rotating past them exactly like the
+  kernel-pass window, so turn-taking starts past 1024 there. Single-shot
+  sweeps (`inspect --system` and inventory collection, which run no
+  kernel run at all) prove through the same witness under the 1024
+  budget. A same-file verdict joins, anything else (another file,
   failure, budget exhaustion) keeps the named loss, never a userspace
   join. While a caller waits for its turn, its edge reads uncertain
   and its in-flight operations end as unknown. The witness also
@@ -1728,8 +1739,8 @@ The old bounds are measurements, not a product startup SLA.
   caller with no covering kernel proof surfaces as an
   `overlay_kernel_unavailable` maps-attribution loss (`inventory
   --system` with the kernel identity backend first tries the private
-  witness session, 8 queries per pass; exhaustion keeps the same
-  loss).
+  witness session, 8 queries per kernel-route pass and 1024 per
+  no-route pass; exhaustion keeps the same loss).
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.

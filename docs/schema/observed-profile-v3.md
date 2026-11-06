@@ -655,8 +655,10 @@ Entries cover the attributed subset of the row: observations on slots
 with no sole owner (unclaimed slots, or doubly claimed slots, which
 are count-only and record nothing at all), or whose owner the
 discovery list does not name, count in the row totals but in no entry —
-entry sums never exceed the row. The error rule matches the row (any
-nonzero `rv`), so a fully attributed row partitions exactly. Each
+entry sums never exceed the row. The error rule matches the row
+(nonzero non-PENDING `rv`; PENDING diverts to the async queue
+upstream and its completion is recorded once with the final `rv`),
+so a fully attributed row partitions exactly. Each
 entry takes one key from the capture's shared monotonic
 semantic-state budget; a refused entry records nothing and counts the
 usual `semantic_state_drops` gap.

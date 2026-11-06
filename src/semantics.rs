@@ -56,7 +56,9 @@ pub struct MechStat {
     pub unregistered: bool,
     /// Per-provider partition of this row's `calls`/`errors`: sole-owner
     /// module id -> calls/errors observed on that module's slots, using
-    /// the row's own error rule (any nonzero `rv`). Each new key takes
+    /// the row's own error rule (nonzero non-PENDING `rv`: PENDING
+    /// diverts to the async queue upstream and its completion is
+    /// recorded once with the final `rv`). Each new key takes
     /// one key from the shared monotonic state budget, like
     /// `param_combos` entries; observations on slots with no sole owner
     /// count in the row but in no cell, so the cells sum to at most the
@@ -2596,10 +2598,11 @@ impl State {
     }
 
     /// Removes state attached to the listed modules across every observed
-    /// process without manufacturing close/reconciliation events. The derived
-    /// semantic aggregates are intentionally cleared too: they lack a module
-    /// dimension, so retaining them could preserve facts from a downgraded
-    /// descriptor. Kernel aggregate counters remain in their BPF maps.
+    /// process without manufacturing close/reconciliation events. The
+    /// derived semantic aggregates are intentionally cleared too: they
+    /// are capture-wide aggregates, so retaining them could preserve
+    /// facts from a downgraded descriptor. Kernel aggregate counters
+    /// remain in their BPF maps.
     pub fn purge_modules(&mut self, modules: &BTreeSet<ModuleId>) {
         if modules.is_empty() {
             return;
@@ -3532,8 +3535,10 @@ impl State {
     /// at a provider is never recorded. Each new cell takes one key
     /// from the shared monotonic budget; a refused cell records nothing
     /// and counts the usual disclosed drop. The error rule mirrors
-    /// [`record_call`] (any nonzero `rv`), not the cgroup recorder's
-    /// PENDING exclusion, so the cells partition the row exactly.
+    /// [`record_call`] (any nonzero `rv`), which is observably the
+    /// cgroup recorder's nonzero non-PENDING rule: PENDING diverts to
+    /// the async queue upstream, so it never reaches any recorder and
+    /// the cells partition the row exactly.
     fn record_module_mechanism(
         &mut self,
         mechanism: u64,

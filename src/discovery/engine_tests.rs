@@ -26,8 +26,8 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
-    WORK_CEILING_REASON, order_tables_by_evidence,
+    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScanOutcome, ScannedEntry,
+    ScannedTable, WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
@@ -63017,6 +63017,321 @@ int main(int argc, char **argv) {
     assert!(
         !provider.tables_scan_finished,
         "a skipped tables scan reports unfinished"
+    );
+}
+
+/// Broad-pool stride mismatch clears the finished flag: when the pool's
+/// first table validates short of the 840-byte recipe, the pool
+/// contributes nothing and the sweep's finished verdict must not survive.
+/// The child poisons the page past the 552-byte legacy prefix after the
+/// sweep (two-phase handshake), so the probe reads the prefix alone. The
+/// unpoisoned twin validates the full table and refuses unfinished
+/// through the ordinary added/refused tail instead.
+#[test]
+fn broad_pool_stride_mismatch_clears_tables_scan_finished() {
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    const POOL_SOURCE: &str = r#"
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <stdint.h>
+
+#ifndef POOL_PAD_BYTES
+#define POOL_PAD_BYTES 0
+#endif
+
+/* .data pad the test sizes so the pool's page offset lands a page
+ * boundary inside (pool+551, pool+840]. Fully nonzero: the compiler
+ * demotes a mostly-zero array to BSS, which would not shift the pool. */
+static char pool_pad[POOL_PAD_BYTES + 1] = { [0 ... POOL_PAD_BYTES] = 1 };
+
+static void *slot_target(void) { return 0; }
+
+/* One valid {3,2} table plus zero tables: 64 contiguous 840-byte tables,
+ * the fixed-family pool contract. Slack keeps pool+53760 strictly inside
+ * the load for the symbol lookup. */
+typedef struct {
+    uint64_t header;
+    void *slots[104];
+} PoolTable;
+
+PoolTable p11scope_fixed[64] = {
+    [0] = { .header = UINT64_C(0x0203), .slots = { [0 ... 103] = slot_target } },
+};
+
+static char pool_slack[8192] = { [0 ... 8191] = 2 };
+
+uintptr_t C_GetFunctionList(void **out) {
+    *out = 0;
+    return 0;
+}
+"#;
+    const LOADER_SOURCE: &str = r#"
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc < 3) return 9;
+    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 1;
+    void *pool = dlsym(h, "p11scope_fixed");
+    if (!pool) return 2;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 3;
+    if (!strcmp(argv[2], "phase")) {
+        printf("%p %ld\n", pool, page);
+        return 0;
+    }
+    printf("%p\n", pool);
+    fflush(stdout);
+    char byte;
+    if (read(STDIN_FILENO, &byte, 1) != 1) return 6;
+    if (!strcmp(argv[2], "twophase")) {
+        unsigned long mask = ~((unsigned long)page - 1);
+        unsigned long poison = ((unsigned long)pool + 840) & mask;
+        unsigned long prefix = ((unsigned long)pool + 551) & mask;
+        if (poison <= prefix) return 4;
+        if (mprotect((void *)poison, (size_t)page, PROT_NONE)) return 5;
+        printf("poisoned %p\n", (void *)poison);
+        fflush(stdout);
+        if (read(STDIN_FILENO, &byte, 1) != 1) return 6;
+    }
+    return 0;
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let pool_c = dir.path().join("pool.c");
+    std::fs::write(&pool_c, POOL_SOURCE).unwrap();
+    let loader_c = dir.path().join("loader.c");
+    std::fs::write(&loader_c, LOADER_SOURCE).unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&loader_c)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    assert!(page > 840);
+    // Feasible pool page offsets: a page boundary strictly inside
+    // (pool+551, pool+840], so the poison page holds extent bytes but no
+    // prefix byte.
+    let feasible: Vec<usize> = (0..page)
+        .filter(|offset| (offset + 840) / page > (offset + 551) / page)
+        .collect();
+    assert!(!feasible.is_empty());
+    let target = feasible[feasible.len() / 2];
+    // Tune the .data pad so the pool lands mid-window; the layout is
+    // measured, never assumed. Page offsets survive ASLR (mmap aligns),
+    // so the tuned build serves every child below.
+    let library = dir.path().join("pool.so");
+    let compile = |pad: usize| {
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-std=c11", "-O0"])
+                .arg(format!("-DPOOL_PAD_BYTES={pad}"))
+                .arg(&pool_c)
+                .arg("-o")
+                .arg(&library)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let phase = || -> usize {
+        let output = Command::new(&loader)
+            .arg(&library)
+            .arg("phase")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "phase child failed: {output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut words = text.split_whitespace();
+        let pool =
+            u64::from_str_radix(words.next().unwrap().trim().trim_start_matches("0x"), 16).unwrap();
+        let child_page: usize = words.next().unwrap().trim().parse().unwrap();
+        assert_eq!(child_page, page);
+        (pool as usize) % page
+    };
+    let mut pad = 0;
+    compile(pad);
+    let mut offset = phase();
+    for _ in 0..2 {
+        if feasible.contains(&offset) {
+            break;
+        }
+        pad += ((target + page - offset) % page + 7) & !7;
+        compile(pad);
+        offset = phase();
+    }
+    assert!(
+        feasible.contains(&offset),
+        "the pool phase missed its window: {offset:#x}"
+    );
+    // Experiment: a clean sweep, then the poisoned broad pass.
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .arg("twophase")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    lines.read_line(&mut line).unwrap();
+    let pool = u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).unwrap() as usize;
+    assert!(
+        feasible.contains(&(pool % page)),
+        "the experiment child missed the tuned window"
+    );
+    let view = ProcessView::open(ProcessViewId(4302), child.0.id()).unwrap();
+    let hooks = HookRegistry::builtin();
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = crate::discovery::scan::scan_process_view(
+        &ScanRequest {
+            pid: child.0.id(),
+            hints: &[],
+            hooks: &hooks,
+        },
+        &view,
+        &mut budget,
+    )
+    .unwrap();
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the sweep finds the pool provider");
+    assert_eq!(provider.tables.len(), 1, "the sweep decodes table 0");
+    assert_eq!(provider.tables[0].address, pool as u64);
+    assert!(provider.tables_scan_finished, "the clean sweep finishes");
+    assert_eq!(budget.stopped_reason(), None);
+    // Poison now; the sweep above never saw it.
+    child.0.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    line.clear();
+    lines.read_line(&mut line).unwrap();
+    let poison = u64::from_str_radix(
+        line.trim()
+            .strip_prefix("poisoned ")
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap() as usize;
+    assert!(
+        poison / page > (pool + 551) / page,
+        "the poison page holds no prefix byte"
+    );
+    assert!(
+        (pool + 840) / page == poison / page,
+        "the poison page breaks the 840-byte extent"
+    );
+    let mut counters = DiscoveryCounters::default();
+    broad_fixed_pool_pass(&view, &mut modules, &mut budget, &mut counters);
+    assert!(
+        counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("not the 840-byte recipe")),
+        "the pool probe hit the stride mismatch: {:?}",
+        counters.object_skips
+    );
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the pool provider survives the broad pass");
+    assert!(
+        !provider
+            .tables
+            .iter()
+            .any(|table| table.address == pool as u64),
+        "the stride mismatch drops the pool table"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "a stride mismatch clears the finished flag"
+    );
+    drop(child);
+    // Control: no poison — the full table validates and the ordinary
+    // added/refused tail reports unfinished instead.
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .arg("plain")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    lines.read_line(&mut line).unwrap();
+    let pool = u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).unwrap() as usize;
+    let view = ProcessView::open(ProcessViewId(4303), child.0.id()).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = crate::discovery::scan::scan_process_view(
+        &ScanRequest {
+            pid: child.0.id(),
+            hints: &[],
+            hooks: &hooks,
+        },
+        &view,
+        &mut budget,
+    )
+    .unwrap();
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the sweep finds the pool provider");
+    assert_eq!(provider.tables.len(), 1, "the sweep decodes table 0");
+    assert!(provider.tables_scan_finished, "the clean sweep finishes");
+    let mut counters = DiscoveryCounters::default();
+    broad_fixed_pool_pass(&view, &mut modules, &mut budget, &mut counters);
+    assert!(
+        !counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("not the 840-byte recipe")),
+        "no stride mismatch without the poison: {:?}",
+        counters.object_skips
+    );
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the pool provider survives the broad pass");
+    assert!(
+        provider
+            .tables
+            .iter()
+            .any(|table| table.address == pool as u64),
+        "the validated pool table stays"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "the added/refused tail reports unfinished"
     );
 }
 

@@ -44,8 +44,8 @@ def provider():
 
 
 def profile_report(*, calls, scope="pid", exact=True, hints=None,
-                   loop_end="expiry", causes=None, surfaces=None,
-                   observation_status=None):
+                   target_hints=None, loop_end="expiry", causes=None,
+                   surfaces=None, observation_status=None):
     functions = []
     for name, count in calls.items():
         functions.append({
@@ -69,6 +69,8 @@ def profile_report(*, calls, scope="pid", exact=True, hints=None,
         evidence["surfaces"] = surfaces
     if hints is not None:
         evidence["gap_exe_hints"] = hints
+    if target_hints is not None:
+        evidence["target_exec_hints"] = target_hints
     return {"schema": "p11scope/observed-profile/v3",
             "capture": {"scope": scope, "mode": "profile"},
             "functions": functions, "evidence": evidence}
@@ -258,16 +260,50 @@ class ShortLivedTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertFalse(row["pass"])
 
-    def test_pid_records_nothing(self):
+    def test_pid_target_hints_present_with_zero_execs(self):
+        # 7.10b: the widened --pid cell arms the PID consumer; the
+        # gated workload performs no mid-capture exec, so the split is
+        # present with a zero total. Gap hints stay absent (pinned by
+        # test_pid_with_hints_fails).
+        target = {"label": "STATIC HINT",
+                  "scope": ("D-transitive depth=2 objects<=32 edges<=128 "
+                            "exe-bytes<=1MiB capture-bytes<=64MiB "
+                            "names<=255B verdicts<=1024"),
+                  "links_provider": 0, "links_pkcs11_loader": 0,
+                  "no_static_link_within_scope": 0, "unknown": 0}
         with tempfile.TemporaryDirectory() as raw:
             rc, row = run_oracle(
                 Path(raw), cell="track-short-lived-pid",
                 report=profile_report(calls={"C_GenerateRandom": 100},
-                                      hints=None),
+                                      hints=None, target_hints=target),
                 ledger=cli_ledger({"C_GenerateRandom": 100}),
                 receipt=receipt_for("track-short-lived-pid"))
         self.assertEqual(rc, 0)
         self.assertTrue(row["pass"])
+
+    def test_pid_missing_target_hints_fails(self):
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=None, target_hints=None),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 1)
+        self.assertIn("target_exec_hints", row["detail"])
+
+    def test_pid_malformed_target_hints_fails(self):
+        target = {"links_provider": 0, "links_pkcs11_loader": 0,
+                  "no_static_link_within_scope": 0}  # missing unknown
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=None, target_hints=target),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 1)
+        self.assertIn("target_exec_hints", row["detail"])
 
     def test_pid_with_hints_fails(self):
         hints = {"links_provider": 1, "links_pkcs11_loader": 0,

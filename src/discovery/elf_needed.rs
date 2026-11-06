@@ -286,11 +286,24 @@ fn path_basename(path: &Path) -> Option<&[u8]> {
 #[derive(Debug, Default)]
 pub(crate) struct ExtensiveState {
     enabled: bool,
+    /// 7.10b: the PID target-exec consumer (exact-`--pid` scope and
+    /// owned `run`), complementing the gap consumer on
+    /// generation-admitting scopes. Only one consumer is active per
+    /// capture; both share the caches and the capture budget below.
+    pid_target: bool,
+    /// 7.10b: under aggregate policy (`--mode metrics`) the kernel
+    /// stamps no EXEC ticket, so the gap stash seeds from
+    /// scope-admitted EXEC records without one. Detailed captures
+    /// keep requiring the ticket; PID scope never seeds the stash.
+    seed_without_ticket: bool,
     stash: BTreeMap<u32, StashedExe>,
     path_cache: BTreeMap<ObjectKey, PathBuf>,
     verdicts: BTreeMap<(u64, u64), VerdictEntry>,
     watched: Vec<WatchedProvider>,
     hints: GapExeHints,
+    /// 7.10b: the validated-target-exec split, published as
+    /// `target_exec_hints`. Counts only; never a call or verdict.
+    target_hints: GapExeHints,
     capture_bytes_charged: u64,
     analyses_run: u64,
     /// Test-only mid-analysis mutation hooks (P2-1 stability RED).
@@ -316,12 +329,36 @@ impl ExtensiveState {
         self.enabled = on;
     }
 
+    /// 7.10b: allow the gap stash to seed from scope-admitted EXEC
+    /// records without a kernel ticket (aggregate policy only; the
+    /// kernel stamps no ticket there).
+    pub(crate) fn set_seed_without_ticket(&mut self, on: bool) {
+        self.seed_without_ticket = on;
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
 
+    /// 7.10b: the gap consumer is active on generation-admitting
+    /// scopes only; the PID consumer takes its place under
+    /// exact-`--pid` scope. Scope-complementary by construction.
+    pub(crate) fn gap_active(&self) -> bool {
+        self.enabled && !self.pid_target
+    }
+
+    /// 7.10b: the PID target-exec consumer is active under
+    /// exact-`--pid` scope (profile `--pid`, owned `run`) only.
+    pub(crate) fn pid_active(&self) -> bool {
+        self.enabled && self.pid_target
+    }
+
     pub(crate) fn hints(&self) -> &GapExeHints {
         &self.hints
+    }
+
+    pub(crate) fn target_hints(&self) -> &GapExeHints {
+        &self.target_hints
     }
 
     /// Row A: learn one `(dev, ino)` → path pair from a live scan. First
@@ -3190,5 +3227,66 @@ mod tests {
             (stashed.dev, stashed.ino, stashed.exec_ts_ns),
             (0xD0, 0xE1, 900)
         );
+    }
+
+    // 7.10b: under aggregate policy (`--mode metrics`) the kernel
+    // stamps no EXEC ticket, so an opted-in stash seeds from the
+    // scope-admitted EXEC's exe words and the gap exit classifies a
+    // real hint — the same join strength via admission plus
+    // timestamp ordering and consume-once.
+    #[test]
+    fn aggregate_ticketless_exec_seeds_the_stash() {
+        use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        let dir = tempfile::tempdir().unwrap();
+        let provider = write_elf(
+            dir.path(),
+            "libagg.so.1",
+            &build_elf(&ElfSpec::lib(b"libagg.so.1", &[])),
+        );
+        let exe = write_elf(
+            dir.path(),
+            "aexe",
+            &build_elf(&ElfSpec::exe(&[b"libagg.so.1"])),
+        );
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.set_seed_without_ticket(true);
+        state.set_watched_for_test(vec![watched(&provider, b"libagg.so.1")]);
+        state.learn_scan_path(cache_key_of(&exe), &exe);
+        let (dev, ino) = record_identity_of(&exe);
+        let mut exec = exec_record(4242, DISCOVERY_KIND_EXEC, 0);
+        exec.pointers[0] = dev;
+        exec.pointers[1] = ino;
+        exec.hook_ts_ns = 100;
+        state.note_exec_record(&exec);
+        assert!(
+            state.stash.contains_key(&4242),
+            "ticketless aggregate EXEC must seed"
+        );
+        let mut exit = exec_record(4242, DISCOVERY_KIND_EXEC, 0);
+        exit.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        exit.hook_ts_ns = 200;
+        assert_eq!(state.classify_gap(&exit), StaticHint::LinksProvider);
+        assert_eq!(state.hints().links_provider, 1);
+        assert_eq!(state.hints().total(), 1);
+    }
+
+    // 7.10b guard: without the aggregate opt-in, a ticketless EXEC
+    // still seeds nothing — the qualified Detailed rule is unchanged.
+    #[test]
+    fn detailed_ticketless_exec_still_refuses_the_stash() {
+        use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        let mut state = ExtensiveState::new();
+        state.set_enabled(true);
+        state.note_exec_record(&exec_record(4242, DISCOVERY_KIND_EXEC, 0));
+        assert!(
+            state.stash.is_empty(),
+            "Detailed ticketless EXEC must not seed"
+        );
+        let mut exit = exec_record(4242, DISCOVERY_KIND_EXEC, 0);
+        exit.kind = p11scope_ebpf_common::DISCOVERY_KIND_LEADER_EXIT;
+        exit.hook_ts_ns = 200;
+        assert_eq!(state.classify_gap(&exit), StaticHint::Unknown);
+        assert_eq!(state.analyses_run_for_test(), 0);
     }
 }

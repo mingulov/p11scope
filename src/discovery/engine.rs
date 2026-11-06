@@ -11903,6 +11903,17 @@ impl Engine {
         self.extensive.enabled().then_some(self.extensive.hints())
     }
 
+    /// 7.10b PID-scope target-exec split, present only when the PID
+    /// consumer armed. Like the gap counter it never moves calls or
+    /// attribution; unlike it, the subpopulation is validated target
+    /// execs, and the split is `None` (key omitted) unless armed
+    /// under exact-`--pid` scope.
+    pub(crate) fn target_exec_hints(&self) -> Option<elf_needed::GapExeHints> {
+        self.extensive
+            .pid_active()
+            .then_some(*self.extensive.target_hints())
+    }
+
     /// 6.14 Option A exit-time split, present only when armed. Like
     /// the gap counter it never moves calls or attribution; unlike
     /// it, the split is `None` (key omitted) unless armed.

@@ -1106,6 +1106,7 @@ mod tests {
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             gap_exe_hints: None,
+            target_exec_hints: None,
             instance_reload_not_excluded: None,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,

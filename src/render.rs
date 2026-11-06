@@ -1148,6 +1148,12 @@ pub struct Evidence {
     /// the gap counts; never part of shares or verdicts.
     #[serde(skip)]
     pub gap_exe_hints: Option<GapExeHints>,
+    /// 7.10b extensive-mode split of the validated-target-exec
+    /// subpopulation under exact-`--pid` scope, `None` unless the PID
+    /// consumer armed. Manually serialized beside the gap counts;
+    /// never part of shares or verdicts.
+    #[serde(skip)]
+    pub target_exec_hints: Option<GapExeHints>,
     /// B17 W2 per-identity reload disclosure, `None` without a
     /// producer. Manually serialized beside the gap counts into the
     /// profile lane only; never part of shares or verdicts.
@@ -4831,6 +4837,7 @@ pub(crate) mod tests {
             pid_descendant_gaps: 0,
             multi_rebuild_gaps: 0,
             gap_exe_hints: None,
+            target_exec_hints: None,
             instance_reload_not_excluded: None,
             unprotected_live_windows: 0,
             module_unresolved_slots: 0,
@@ -5202,6 +5209,272 @@ pub(crate) mod tests {
             .as_object_mut()
             .unwrap()
             .remove("gap_exit_mappings");
+        assert_eq!(armed, plain);
+    }
+
+    // 7.10b: the metrics lane carries both armed gap splits in its
+    // evidence object, with the same closed shapes the profile lane
+    // publishes.
+    #[test]
+    fn metrics_json_carries_armed_gap_splits() {
+        let mut ev = evidence();
+        ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 2,
+            links_pkcs11_loader: 1,
+            no_static_link_within_scope: 4,
+            unknown: 3,
+        });
+        ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 5,
+            unknown: 6,
+        });
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert_eq!(
+            metrics["evidence"]["gap_exe_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 2,
+                "links_pkcs11_loader": 1,
+                "no_static_link_within_scope": 4,
+                "unknown": 3,
+            })
+        );
+        assert_eq!(
+            metrics["evidence"]["gap_exit_mappings"],
+            serde_json::json!({"mapped": 5, "unknown": 6})
+        );
+        // Disarmed: both keys absent, never null.
+        let plain = json(&reports_fixture(), &evidence(), &capture_fixture());
+        assert!(plain["evidence"].get("gap_exe_hints").is_none());
+        assert!(plain["evidence"].get("gap_exit_mappings").is_none());
+    }
+
+    // 7.10b: the profile lane carries the armed target-exec split
+    // with the same STATIC HINT shape as the gap split.
+    #[test]
+    fn profile_json_carries_armed_target_exec_hints() {
+        let mut ev = evidence();
+        ev.target_exec_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 0,
+            no_static_link_within_scope: 2,
+            unknown: 0,
+        });
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(
+            profile["evidence"]["target_exec_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 1,
+                "links_pkcs11_loader": 0,
+                "no_static_link_within_scope": 2,
+                "unknown": 0,
+            })
+        );
+        // The gap keys stay independent: arming the PID consumer
+        // publishes no gap split.
+        assert!(profile["evidence"].get("gap_exe_hints").is_none());
+        assert!(profile["evidence"].get("gap_exit_mappings").is_none());
+        // Disarmed: the key absent, never null.
+        let plain = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&evidence()),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert!(plain["evidence"].get("target_exec_hints").is_none());
+    }
+
+    // 7.10b: the metrics lane carries the armed target-exec split,
+    // with the same closed shape as the profile lane.
+    #[test]
+    fn metrics_json_carries_armed_target_exec_hints() {
+        let mut ev = evidence();
+        ev.target_exec_hints = Some(GapExeHints {
+            links_provider: 0,
+            links_pkcs11_loader: 1,
+            no_static_link_within_scope: 0,
+            unknown: 2,
+        });
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        assert_eq!(
+            metrics["evidence"]["target_exec_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 0,
+                "links_pkcs11_loader": 1,
+                "no_static_link_within_scope": 0,
+                "unknown": 2,
+            })
+        );
+        let plain = json(&reports_fixture(), &evidence(), &capture_fixture());
+        assert!(plain["evidence"].get("target_exec_hints").is_none());
+    }
+
+    // 7.10b: the trace lane renders through the shared
+    // `versioned_evidence` hoist, so an armed `Evidence` publishes
+    // the target key in a trace terminal record too.
+    #[test]
+    fn trace_evidence_line_hoists_armed_target_exec_hints() {
+        let line_for = |ev: &Evidence| {
+            let line = crate::trace::evidence_line(ev, crate::attach::CapturePolicy::Allowlisted);
+            serde_json::from_str::<serde_json::Value>(line.strip_prefix("EVIDENCE ").unwrap())
+                .unwrap()
+        };
+        let mut armed = evidence();
+        armed.target_exec_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 1,
+            no_static_link_within_scope: 1,
+            unknown: 1,
+        });
+        assert_eq!(
+            line_for(&armed)["target_exec_hints"],
+            serde_json::json!({
+                "label": "STATIC HINT",
+                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+                "links_provider": 1,
+                "links_pkcs11_loader": 1,
+                "no_static_link_within_scope": 1,
+                "unknown": 1,
+            })
+        );
+        assert!(
+            line_for(&evidence()).get("target_exec_hints").is_none(),
+            "unarmed evidence omits the key in trace too"
+        );
+    }
+
+    // 7.10b twin: arming the gap splits in metrics never moves the
+    // call or layer surfaces. The armed side must carry the keys
+    // first (otherwise this passes by missing the feature), then
+    // every other surface must match the plain twin exactly.
+    #[test]
+    fn metrics_armed_gap_splits_do_not_move_call_or_layer_surfaces() {
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            vec![sign]
+        };
+        let mut plain_ev = evidence();
+        plain_ev.pid_descendant_gaps = 2;
+        let mut armed_ev = evidence();
+        armed_ev.pid_descendant_gaps = 2;
+        armed_ev.gap_exe_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 0,
+            no_static_link_within_scope: 0,
+            unknown: 1,
+        });
+        armed_ev.discovery.gap_exit_mappings = Some(GapExitMappings {
+            mapped: 1,
+            unknown: 1,
+        });
+        let plain = json(&reports(), &plain_ev, &capture_fixture());
+        let mut armed = json(&reports(), &armed_ev, &capture_fixture());
+        // Both controls carry calls, and only the armed side carries
+        // the splits.
+        assert_eq!(plain["functions"][0]["calls"], 25);
+        assert_eq!(armed["evidence"]["gap_exe_hints"]["links_provider"], 1);
+        assert_eq!(armed["evidence"]["gap_exit_mappings"]["mapped"], 1);
+        assert!(plain["evidence"].get("gap_exe_hints").is_none());
+        assert!(plain["evidence"].get("gap_exit_mappings").is_none());
+        for surface in ["functions", "layer_totals"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exe_hints");
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("gap_exit_mappings");
+        assert_eq!(armed, plain);
+    }
+
+    // 7.10b twin: arming the target-exec split in profile never moves
+    // the call or attribution surfaces. The armed side must carry the
+    // key first, then every other surface must match exactly.
+    #[test]
+    fn profile_target_exec_hints_do_not_move_call_or_attribution_surfaces() {
+        use p11scope_ebpf_common::shape;
+
+        let observed_state = || {
+            let mut state =
+                crate::semantics::State::with_policy(&init_plan(), CapturePolicy::Allowlisted);
+            let mut event = init_event(0, 0x0D, shape::NONE, 0, 0, 0);
+            event.cgroup_id = 111;
+            state.observe(&event);
+            state.observe(&event);
+            state.observe(&event);
+            state
+        };
+        let reports = || {
+            let mut sign = report("C_Sign", 25, 2, false);
+            sign.module = Some(crate::plan::ModuleId(0));
+            sign.errors = 3;
+            sign.total_ns = 2_500;
+            sign.max_ns = 100;
+            sign.rv_counts.insert(0, 22);
+            sign.rv_counts.insert(5, 3);
+            vec![sign]
+        };
+        let plain_ev = evidence();
+        let mut armed_ev = evidence();
+        armed_ev.target_exec_hints = Some(GapExeHints {
+            links_provider: 1,
+            links_pkcs11_loader: 0,
+            no_static_link_within_scope: 0,
+            unknown: 0,
+        });
+        let plain = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&plain_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        let mut armed = profile_json(
+            &reports(),
+            VersionedEvidence::wrap(&armed_ev),
+            &observed_state(),
+            &capture_fixture(),
+        );
+        assert_eq!(plain["functions"][0]["calls"], 25);
+        assert_eq!(armed["evidence"]["target_exec_hints"]["links_provider"], 1);
+        assert!(plain["evidence"].get("target_exec_hints").is_none());
+        for surface in ["functions", "mechanisms", "sessions", "logins", "cgroups"] {
+            assert_eq!(armed[surface], plain[surface], "{surface} must not move");
+        }
+        assert_eq!(
+            armed["evidence"]["completeness"], plain["evidence"]["completeness"],
+            "completeness must not move"
+        );
+        assert_eq!(
+            armed["evidence"]["verdict_detail"], plain["evidence"]["verdict_detail"],
+            "verdict must not move"
+        );
+        armed["evidence"]
+            .as_object_mut()
+            .unwrap()
+            .remove("target_exec_hints");
         assert_eq!(armed, plain);
     }
 

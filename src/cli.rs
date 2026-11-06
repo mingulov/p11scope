@@ -2329,15 +2329,14 @@ mod tests {
             panic!("profile --track-short-lived must parse");
         };
         assert!(armed.track_short_lived);
-        // Beside an owned run the flag records nothing, so run refuses
-        // it with a message instead of taking it silently.
-        let Err(CliError::Usage { message, topic }) =
-            parse(args(&["run", "--track-short-lived", "--", "true"]))
+        // 7.10b widening: an owned run arms the PID target-exec
+        // consumer for its child, so the flag parses there.
+        let Command::Run(run_armed) =
+            parse(args(&["run", "--track-short-lived", "--", "true"])).unwrap()
         else {
-            panic!("run --track-short-lived must be refused");
+            panic!("run --track-short-lived must parse");
         };
-        assert!(message.contains("--track-short-lived"), "{message}");
-        assert_eq!(topic, HelpTopic::Run);
+        assert!(run_armed.track_short_lived);
         let Command::Run(run_plain) = parse(args(&["run", "--", "true"])).unwrap() else {
             panic!("run must parse");
         };
@@ -5889,22 +5888,61 @@ mod tests {
         assert_eq!(topic, HelpTopic::Global);
     }
 
+    // 7.10b widening: an owned run arms the PID target-exec
+    // consumer for its child, so the flag parses there (the old
+    // "records nothing beside run" refusal is gone).
     #[test]
-    fn run_refuses_track_short_lived() {
-        let Err(CliError::Usage { message, topic }) =
-            parse(args(&["run", "--track-short-lived", "--", "true"]))
+    fn run_accepts_track_short_lived() {
+        let Command::Run(armed) =
+            parse(args(&["run", "--track-short-lived", "--", "true"])).unwrap()
         else {
-            panic!("run must refuse --track-short-lived");
+            panic!("run --track-short-lived must parse");
         };
-        assert!(message.contains("--track-short-lived"), "{message}");
-        assert!(message.contains("run"), "{message}");
-        assert_eq!(topic, HelpTopic::Run);
-        let Command::Profile(armed) =
+        assert!(armed.track_short_lived);
+        let Command::Profile(profile_armed) =
             parse(args(&["profile", "--pid", "4242", "--track-short-lived"])).unwrap()
         else {
             panic!("profile --track-short-lived must parse");
         };
-        assert!(armed.track_short_lived);
+        assert!(profile_armed.track_short_lived);
+    }
+
+    // 7.10b finding-32 fix: run help documents the flag on its own
+    // surface, so help and the parser agree (no "records nothing"
+    // contradiction). The counter-mode refusal stays.
+    #[test]
+    fn run_help_documents_track_short_lived() {
+        let run = HelpTopic::Run.text();
+        assert!(run.contains("--track-short-lived"), "{run}");
+        assert!(run.contains("child's own execs"), "{run}");
+        assert!(run.contains("--counter-mode"), "{run}");
+    }
+
+    // 7.10b widening: profile help no longer confines the flag to
+    // cgroup/system captures; it names the --pid arming too.
+    #[test]
+    fn profile_help_describes_widened_track_short_lived() {
+        let profile = HelpTopic::Profile.text();
+        assert!(profile.contains("--track-short-lived"), "{profile}");
+        assert!(
+            !profile.contains("elsewhere it records nothing"),
+            "{profile}"
+        );
+        assert!(
+            profile.contains("on --pid it groups the target's own execs"),
+            "{profile}"
+        );
+    }
+
+    // 7.10b widening: trace arms the flag, so trace help documents it.
+    #[test]
+    fn trace_help_documents_track_short_lived() {
+        let trace = HelpTopic::Trace.text();
+        assert!(trace.contains("--track-short-lived"), "{trace}");
+        assert!(
+            trace.contains("on --pid it groups the target's own execs"),
+            "{trace}"
+        );
     }
 
     #[test]
@@ -6021,7 +6059,8 @@ mod tests {
             "{run}"
         );
         assert!(!run.contains("/absolute/path/to/program"), "{run}");
-        assert!(!run.contains("--track-short-lived"), "{run}");
+        // 7.10b: run help documents the flag now (pinned by
+        // run_help_documents_track_short_lived).
         let inventory = HelpTopic::Inventory.text();
         assert!(
             inventory.contains("sudo p11scope inventory --system --duration 30s"),

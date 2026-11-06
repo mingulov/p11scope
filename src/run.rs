@@ -9960,6 +9960,9 @@ pub(crate) fn evidence_for(
         // 6.14 Option B: `None` unless extensive mode armed; the JSON
         // key is then omitted, never null.
         gap_exe_hints: engine.gap_exe_hints().copied(),
+        // 7.10b: `None` unless the PID consumer armed; the JSON key
+        // is then omitted, never null.
+        target_exec_hints: engine.target_exec_hints(),
         // B17: the staged disclosure ledger projects post-hoc below;
         // captures without one keep the key absent, never zero.
         instance_reload_not_excluded: None,
@@ -17423,21 +17426,19 @@ mod tests {
         }
     }
 
-    // 614b P1 narrow authorization: the exe-identity read arms only
-    // where the STATIC HINT split can publish — Detailed profile-kind,
-    // non-metrics captures over generation-admitting scopes. Trace,
-    // metrics, exact-PID and counter captures accept the flag but must
-    // record no exe identity: capture without a possible consumer is
-    // outside the grant.
+    // 7.10b widening: the exe-identity read arms on every Detailed
+    // lane and scope that publishes a hint — trace and metrics as
+    // well as profile, exact-PID (target-exec hints) as well as
+    // cgroup/system (gap splits). Counter policies still never arm.
     #[test]
-    fn extensive_arms_only_on_hint_publishing_captures() {
+    fn extensive_arms_all_detailed_lanes_and_scopes() {
         let cgroup = Scope::Cgroup {
             id: 1,
             path: "/".into(),
             dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
         };
         let detailed = CapturePolicy::Allowlisted;
-        // The publishing shape arms, on either admitting scope.
+        // The 5a publishing shape arms, on either admitting scope.
         assert!(extensive_effective(
             true,
             Kind::Profile,
@@ -17460,25 +17461,25 @@ mod tests {
             &cgroup,
             detailed
         ));
-        // Trace publishes no profile evidence: never arm.
-        assert!(!extensive_effective(
+        // Trace publishes the gap splits in its terminal EVIDENCE.
+        assert!(extensive_effective(
             true,
             Kind::Trace,
             false,
             &cgroup,
             detailed
         ));
-        // Metrics renders no hint split: never arm.
-        assert!(!extensive_effective(
+        // Metrics publishes the gap splits in its evidence object.
+        assert!(extensive_effective(
             true,
             Kind::Profile,
             true,
             &cgroup,
             CapturePolicy::AggregateOnly
         ));
-        // Exact-PID scope classifies no descendant gaps: never arm.
-        // (An owned `run` is this shape.)
-        assert!(!extensive_effective(
+        // Exact-PID scope publishes target-exec hints for the named
+        // target. (An owned `run` is this shape.)
+        assert!(extensive_effective(
             true,
             Kind::Profile,
             false,

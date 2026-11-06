@@ -14534,6 +14534,7 @@ fn evidence_verdict(
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         gap_exe_hints: None,
+        target_exec_hints: None,
         instance_reload_not_excluded: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
@@ -35067,6 +35068,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         pid_descendant_gaps: 0,
         multi_rebuild_gaps: 0,
         gap_exe_hints: None,
+        target_exec_hints: None,
         instance_reload_not_excluded: None,
         unprotected_live_windows: 0,
         module_unresolved_slots: 0,
@@ -64452,28 +64454,146 @@ fn gap_exe_identity_shares_unchanged_twin() {
     assert!(plain.gap_exe_hints().is_none());
 }
 
-// 614b P1 narrow authorization, engine layer: `arm_extensive` itself
-// refuses to enable on a scope that never classifies descendant
-// gaps, so no future caller can arm the exe-identity read (or retain
-// its stash/caches) for an exact-PID capture. A generation-admitting
-// scope arms exactly as before.
+// 7.10b widening, engine layer: `arm_extensive` arms exactly one
+// consumer per scope — the gap consumer on generation-admitting
+// scopes, the PID target-exec consumer on exact-PID scope — and the
+// kernel bit follows either. The two splits never publish together.
 #[test]
-fn extensive_arm_requires_generation_admitting_scope() {
+fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
     let mut pid_engine = Engine::empty();
     pid_engine.arm_extensive(true);
     assert!(
-        pid_engine.gap_exe_hints().is_none(),
-        "exact-PID scope must not arm extensive mode"
+        pid_engine.target_exec_hints().is_some(),
+        "exact-PID scope arms the target-exec consumer"
     );
+    assert!(
+        pid_engine.gap_exe_hints().is_none(),
+        "exact-PID scope classifies no descendant gaps"
+    );
+    assert_eq!(pid_engine.target_exec_hints().unwrap().total(), 0);
     let pid = std::process::id();
     let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
     cgroup_engine.arm_extensive(true);
     assert!(
         cgroup_engine.gap_exe_hints().is_some(),
-        "cgroup scope arms extensive mode"
+        "cgroup scope arms the gap consumer"
+    );
+    assert!(
+        cgroup_engine.target_exec_hints().is_none(),
+        "cgroup scope has no single target"
     );
     cgroup_engine.arm_extensive(false);
     assert!(cgroup_engine.gap_exe_hints().is_none());
+    pid_engine.arm_extensive(false);
+    assert!(pid_engine.target_exec_hints().is_none());
+}
+
+// 7.10b: a validated target EXEC under exact-PID scope classifies
+// exactly one target-exec hint; the gap subpopulation stays empty.
+// PID-scope EXEC records carry no kernel ticket, so validation comes
+// from the retained live view, never from a ticket.
+#[test]
+fn pid_target_exec_validates_a_live_matched_exec_and_counts_one_hint() {
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, dev, ino, 0),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    assert!(engine.gap_exe_hints().is_none());
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+// 7.10b: a validated target EXEC whose pair no scan learned (and no
+// exec-time learn resolves) counts `unknown`, never a guess.
+#[test]
+fn pid_target_exec_without_a_learned_path_counts_unknown() {
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, 0x801, 424242, 0),
+        &mut pending,
+    );
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+// 7.10b: an EXEC that matches no retained view validates nothing —
+// the armed split stays present with zero counts, and no gap appears.
+#[test]
+fn pid_target_exec_ignores_execs_that_match_no_retained_view() {
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true);
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(424242, ts, 0x801, 424243, 0),
+        &mut pending,
+    );
+    let hints = engine
+        .target_exec_hints()
+        .expect("armed target split stays present");
+    assert_eq!(hints.total(), 0);
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+}
+
+// 7.10b: an EXEC against a dead retained view validates nothing —
+// the pidfd generation gate fails closed instead of classifying a
+// possibly reused PID.
+#[test]
+fn pid_target_exec_ignores_execs_against_a_dead_view() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let pid = child.id();
+    let view = ProcessView::open(ProcessViewId(0), pid).unwrap();
+    child.kill().expect("kill sleeper");
+    child.wait().expect("reap sleeper");
+    assert!(!view.still_the_same());
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true);
+    engine.views.push(view);
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, 0x801, 424244, 0),
+        &mut pending,
+    );
+    let hints = engine
+        .target_exec_hints()
+        .expect("armed target split stays present");
+    assert_eq!(hints.total(), 0);
 }
 
 /// Build knobs of the stamped legacy-only fixture

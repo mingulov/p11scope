@@ -401,6 +401,13 @@ fn actual_trace_formatter_is_accepted_by_canary_privacy_consumer() {
         trace::capture_line(CapturePolicy::Allowlisted),
         trace::identity_note()
     );
+    // Production always prints the zone line (`trace::header`
+    // assembles CAPTURE, identity, zone, then the unverified note);
+    // the fixture mirrors it.
+    assert!(
+        text.contains(trace::zone_note()),
+        "the trace zone line is missing: {text}"
+    );
     let script =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-canary-evidence.py");
     let mut child = Command::new("python3").args(["-I", "-c",
@@ -442,6 +449,13 @@ fn singular_trace_tail_is_accepted_by_canary_privacy_consumer() {
         trace::capture_line(CapturePolicy::Allowlisted),
         trace::identity_note(),
         trace::unverified_note(),
+    );
+    // Production always prints the zone line (`trace::header`
+    // assembles CAPTURE, identity, zone, then the unverified note);
+    // the fixture mirrors it.
+    assert!(
+        text.contains(trace::zone_note()),
+        "the trace zone line is missing: {text}"
     );
     let script =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-canary-evidence.py");

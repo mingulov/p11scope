@@ -898,28 +898,39 @@ fn k0_owned_run(
             libc::waitpid(pid, &mut status, 0);
         }
     }
-    if shape != OwnedChild::Held {
-        // The exit lands inside the window: the capture ended on the
-        // child's own exit, before the duration, with no handoff.
-        let ended_on_exit = std::fs::read_to_string(&log).is_ok_and(|text| {
-            text.lines()
-                .any(|line| line.starts_with("p11scope: capture ended: target exited"))
-        });
-        ensure!(
-            handoff.is_none() && ended_on_exit,
-            "the unheld child must exit inside the window and end the capture: {}",
-            observer_evidence(&log, &out, "no target-exit end")
-        );
-    }
     ensure!(
         status.success(),
         "observer exited {status}: {}",
         observer_evidence(&log, &out, &format!("exited {status}"))
     );
-    let (entered, bad) = ledger_main_counts(&log, "C_Sign")?;
-    ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
     let document: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&out).context("reading -o JSON")?)?;
+    if shape != OwnedChild::Held {
+        // The exit lands inside the window: the capture ended on the
+        // child's own exit, before the duration, with no handoff.
+        // Owned runs never print the non-owned `capture ended: target
+        // exited` stderr marker (they name the child's status instead),
+        // so the report is the channel: `loop_end_reason` pins the
+        // target-exit end, `child_still_running: false` with no
+        // `handoff_child_pid` pins the reaped child.
+        let reason = document["evidence"]["scheduling"]["phase_mono_ns"]["loop_end_reason"]
+            .as_str()
+            .unwrap_or("?");
+        let still_running = document["evidence"]["child_still_running"].as_bool();
+        let handoff_pid = document["evidence"]["handoff_child_pid"].as_u64();
+        ensure!(
+            handoff.is_none()
+                && reason == crate::render::LOOP_END_TARGET_EXIT
+                && still_running == Some(false)
+                && handoff_pid.is_none(),
+            "the unheld child must exit inside the window and end the capture \
+             (loop_end_reason={reason:?}, child_still_running={still_running:?}, \
+             handoff_child_pid={handoff_pid:?}): {}",
+            observer_evidence(&log, &out, "no target-exit end")
+        );
+    }
+    let (entered, bad) = ledger_main_counts(&log, "C_Sign")?;
+    ensure!(entered == 4 && bad == 0, "workload did 4 clean signs");
     Ok(document)
 }
 

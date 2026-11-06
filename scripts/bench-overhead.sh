@@ -158,11 +158,11 @@ if [ "${1-}" = "--self-test" ]; then
     trap 'rm -rf "$SELF_TEST_WORK"' EXIT INT TERM
     SPID=
     WPID=
-    printf 'p11scope: discovery: 1 module(s)\np11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n' \
+    printf 'p11scope: discovery: 1 module(s)\np11scope: capturing: 136 probes attached; stop with Ctrl-C\n' \
         > "$SELF_TEST_WORK/attached.log"
     wait_for_observer_attach "$SELF_TEST_WORK/attached.log" 5 \
         || { echo "self-test: attach wait missed the marker" >&2; exit 1; }
-    printf 'p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C\n' > "$SELF_TEST_WORK/zero.log"
+    printf 'p11scope: capturing: waiting for a provider to load; stop with Ctrl-C\n' > "$SELF_TEST_WORK/zero.log"
     if wait_for_observer_attach "$SELF_TEST_WORK/zero.log" 1 2>/dev/null; then
         echo "self-test: zero-probe attach accepted" >&2
         exit 1

@@ -2184,9 +2184,7 @@ fn task4_file_replay_rejects_swapped_physical_calls_and_changed_rendering() -> R
         );
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        rendered.extend_from_slice(
-            format!("owned_{slot} [semantics unverified] → {rv_label} \n").as_bytes(),
-        );
+        rendered.extend_from_slice(format!("owned_{slot} → {rv_label} \n").as_bytes());
     }
     for slot in 0..2 {
         raw.push(
@@ -2685,7 +2683,7 @@ fn task4_highslot_replay_requires_old_worker_start_and_new_image() -> Result<()>
         raw.push(task4_synthetic_terminal(1));
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        let rendered = format!("owned_2048 [semantics unverified] → {rv_label} \n");
+        let rendered = format!("owned_2048 → {rv_label} \n");
         ensure!(
             task4_replay_files(case, &ledger, &lines(&raw)?, rendered.as_bytes(), &offsets)?
                 == (1, 1)
@@ -5277,9 +5275,7 @@ fn task4_replay_files(
             let rv_label = pkcs11_types::CkRv(rv).to_string();
             let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
             ensure!(
-                rendered_lines[position].contains(&format!(
-                    "owned_{slot} [semantics unverified] → {rv_label} "
-                )),
+                rendered_lines[position].contains(&format!("owned_{slot} → {rv_label} ")),
                 "replay rendered slot/RV differs at {position}"
             );
         }

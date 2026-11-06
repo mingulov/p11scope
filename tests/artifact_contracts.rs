@@ -3471,7 +3471,7 @@ set -eu
 log=$(mktemp)
 trap 'rm -f "$log"' EXIT
 printf '%s\n' 'p11scope: discovery: 1 module(s), 68 attach slot(s), scan 8ms, conflicts 0, uncorroborated 0' \
-    'p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C' > "$log"
+    'p11scope: capturing: 136 probes attached; stop with Ctrl-C' > "$log"
 wait_for_capture_ready "$log" aggregate-only metrics
 "#,
         ])

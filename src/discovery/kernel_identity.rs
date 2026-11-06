@@ -441,6 +441,12 @@ pub(crate) struct InstalledAnchorPass<'s, 'p> {
 }
 
 impl InstalledAnchorPass<'_, '_> {
+    /// This pass's terminal target-run failure, if its run was attempted
+    /// and failed. The witness reads it to stage an overdue run.
+    pub(crate) fn failed_target(&self) -> Option<RunFailure> {
+        self.failed_target
+    }
+
     /// A raw target read without a charged batch: custody probing only, not
     /// a proof attempt, so it never consumes the per-pass attempt budget.
     pub(crate) fn read_target(
@@ -2373,6 +2379,19 @@ impl IdentitySession {
     /// the ledger, sticky status and counters stay session-owned.
     pub(crate) fn fallback_totals(&self) -> KernelFallbackTotals {
         self.fallback.totals()
+    }
+
+    /// Reset the deadline streak before one witness query. The witness
+    /// session is process-wide, so three consecutive overdue runs would
+    /// otherwise stick `Deadlines` for the rest of a long inventory — a
+    /// load spike blacking out every later query. Each query starts
+    /// fresh; only the deadline streak resets, never a `StreamInvalid`
+    /// stick (a corrupt stream stays stuck).
+    pub(crate) fn reset_witness_deadline_streak(&mut self) {
+        self.consecutive_deadlines = 0;
+        if self.sticky == Some(KernelSticky::Deadlines) {
+            self.sticky = None;
+        }
     }
 
     /// Install only this pass's observer anchors. Target-range proof belongs

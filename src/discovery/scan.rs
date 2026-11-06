@@ -11,10 +11,10 @@ use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
 #[cfg(test)]
-use crate::discovery::overlay_witness::{GAP_WITNESS_UNAVAILABLE, WitnessDiagnosis, WitnessStage};
+use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
 use crate::discovery::overlay_witness::{
-    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessOutcome, WitnessVerdict,
-    original_file_witness_required, prove_original_file_diagnosed,
+    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessDiagnosis, WitnessFailure, WitnessOutcome,
+    WitnessStage, WitnessVerdict, original_file_witness_required, prove_original_file_diagnosed,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
@@ -1108,6 +1108,10 @@ pub struct CaptureWorkBudget {
     /// encounter. Accumulated across member scans; the caller aggregates by
     /// file identity for process counts after all scans complete.
     excluded: Vec<ExcludedRecord>,
+    /// Explicit `--identity-backend userspace`: the deep-scan witness
+    /// stays off (no BPF load) and refused overlay ranges keep a named
+    /// reason instead of proving.
+    explicit_userspace: bool,
 }
 
 /// One `--exclude-module` hit: a mapped file the scan skipped by operator
@@ -1164,7 +1168,20 @@ impl CaptureWorkBudget {
             scan_stop_reported: false,
             excludes: Vec::new(),
             excluded: Vec::new(),
+            explicit_userspace: false,
         }
+    }
+
+    /// Mark this budget explicit-userspace: the deep-scan witness stays
+    /// off and loads no BPF. Inventory sets it before collecting when
+    /// `--identity-backend userspace` was selected.
+    pub(crate) fn set_explicit_userspace(&mut self) {
+        self.explicit_userspace = true;
+    }
+
+    /// Whether explicit userspace disables the deep-scan witness.
+    pub(crate) fn explicit_userspace(&self) -> bool {
+        self.explicit_userspace
     }
 
     /// Set the capture's `--exclude-module` inputs before scanning.
@@ -5041,6 +5058,16 @@ impl ScanIo for ProcScanIo {
         range: (u64, u64),
         budget: &mut CaptureWorkBudget,
     ) -> WitnessOutcome {
+        // Explicit userspace loads no BPF: the deep-scan witness stays
+        // off with its named reason, spending neither budget nor query.
+        if budget.explicit_userspace() {
+            return WitnessOutcome {
+                verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                diagnosis: Some(WitnessDiagnosis {
+                    stage: WitnessStage::ExplicitUserspace,
+                }),
+            };
+        }
         // The per-scan budget spends before the run: a failed attempt
         // still spends, and exhaustion refuses without running. The
         // deep scan keeps its single trigger range; only the sweep
@@ -14155,6 +14182,98 @@ mod tests {
         assert_eq!(
             io.prove_calls, 1,
             "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn explicit_userspace_deep_scan_witness_stays_off() {
+        // Explicit `--identity-backend userspace` loads no BPF: the
+        // production deep-scan witness refuses with its named reason,
+        // spending neither budget nor query.
+        use crate::discovery::overlay_witness::witness_stats_for_test;
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: k1_red_identity(),
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_explicit_userspace();
+        let mut io = ProcScanIo::new();
+        let (queries_before, _) = witness_stats_for_test();
+        let outcome = io.prove_original_file_diagnosed(
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        );
+        assert_eq!(
+            outcome.verdict,
+            WitnessVerdict::Failed(WitnessFailure::Unavailable)
+        );
+        assert_eq!(
+            outcome.diagnosis.map(|diagnosis| diagnosis.stage),
+            Some(WitnessStage::ExplicitUserspace)
+        );
+        assert_eq!(io.witness_used(), 0, "the refusal spends no budget");
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
+            "the refusal runs no witness query"
+        );
+        let mut join_io = ProcScanIo::new();
+        let reason = witness_join(
+            &mut join_io,
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        )
+        .expect("explicit userspace refuses with a gap");
+        assert_eq!(
+            reason,
+            "original_file_unproven: kernel witness unavailable: \
+             explicit userspace disables the kernel witness"
+        );
+    }
+
+    #[test]
+    fn auto_deep_scan_witness_attempts_a_query() {
+        // Twin: without the explicit flag the production witness
+        // spends its budget and runs a query (which fails at load in
+        // an unprivileged unit test, but still counts).
+        use crate::discovery::overlay_witness::witness_stats_for_test;
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: k1_red_identity(),
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        let mut io = ProcScanIo::new();
+        let (queries_before, _) = witness_stats_for_test();
+        let outcome = io.prove_original_file_diagnosed(
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        );
+        assert_eq!(io.witness_used(), 1, "the attempt spends its budget");
+        let (queries_after, _) = witness_stats_for_test();
+        assert!(
+            queries_after > queries_before,
+            "the attempt runs a witness query"
+        );
+        // The unprivileged load fails, but never at the explicit stage.
+        assert_ne!(
+            outcome.diagnosis.map(|diagnosis| diagnosis.stage),
+            Some(WitnessStage::ExplicitUserspace)
         );
     }
 

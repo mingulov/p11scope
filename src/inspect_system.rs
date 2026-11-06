@@ -4344,6 +4344,12 @@ impl IdentityRunShared {
         (self.sweep_witness_rotation, self.sweep_witness_denominator)
     }
 
+    /// The witness window for tests (privileged cells assert rotation).
+    #[cfg(test)]
+    pub(crate) fn witness_window_for_test(&self) -> (u64, usize) {
+        self.witness_window()
+    }
+
     /// Advance the witness window by this pass's spent queries, and
     /// record this pass's refused count as the next denominator
     /// (`None` when no witness scan ran, or a zero refused count, keeps
@@ -4566,7 +4572,8 @@ impl<P: crate::discovery::confirm_shards::SegmentProof>
 /// Collect `--system` for inventory with D3d identity selection: custody
 /// plus userspace or kernel sweep proof per the capture-owned shared
 /// state, assembled under the Inventory policy. `inspect --system`
-/// keeps using [`collect`] (userspace-only, frozen output).
+/// keeps using [`collect`] (single-shot sweep overlays prove through
+/// the private witness; frozen output otherwise).
 /// `prior_objects` / `prior_bytes` are already-retained capture-level
 /// pins, charged against the shared manifest+pre-arm budget (packet 6.13
 /// round-3, finding 3).
@@ -4577,7 +4584,7 @@ pub(crate) fn collect_system_with_identity(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     shared: IdentityShared,
-    budget: CaptureWorkBudget,
+    mut budget: CaptureWorkBudget,
     scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
@@ -4594,6 +4601,11 @@ pub(crate) fn collect_system_with_identity(
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .selection;
+    // Explicit userspace loads no BPF: the deep-scan witness stays off
+    // for every member scan below.
+    if matches!(selection, crate::cli::IdentityBackendSelection::Userspace) {
+        budget.set_explicit_userspace();
+    }
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = collect_members_identity(
         hints,

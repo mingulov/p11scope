@@ -4229,6 +4229,144 @@ fn d3c_three_attempted_deadlines_become_sticky() {
 }
 
 #[test]
+fn witness_reset_clears_deadlines_but_not_stream_invalid() {
+    // Each witness query resets its deadline streak first: a Deadlines
+    // stick clears, a StreamInvalid stick survives, and the counter
+    // always clears.
+    let mut session = fixture_session();
+    session.consecutive_deadlines = 2;
+    session.sticky = Some(KernelSticky::Deadlines);
+    session.reset_witness_deadline_streak();
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, None);
+    session.consecutive_deadlines = 5;
+    session.sticky = Some(KernelSticky::StreamInvalid);
+    session.reset_witness_deadline_streak();
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, Some(KernelSticky::StreamInvalid));
+}
+
+#[test]
+fn witness_three_overdue_then_proves() {
+    // Twin to the sticky sweep test: three overdue witness queries
+    // (each reset first, like the witness path) never stick, so the
+    // fourth query with valid bytes runs and proves instead of
+    // blacking out.
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let pids: Vec<(u32, Vec<usize>)> = (0..4).map(|i| (5210 + i, vec![0])).collect();
+    let (world_map, identities) = d3c_world_map(&world, &pids);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    for (pass_no, pid) in [5210, 5211, 5212].into_iter().enumerate() {
+        session.reset_witness_deadline_streak();
+        let generation = pass_no as u64 + 1;
+        let (mut installed, pass) = d3c_install(
+            &world,
+            &mut session,
+            generation,
+            16,
+            1,
+            &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+            vec![FixtureTarget::Deadline(gen_target(
+                generation,
+                &[(pid, segment_range(0), 0)],
+            ))],
+            deadline,
+        );
+        let (mut index, _) = d3c_index(&world);
+        let prove_set = index.map_files_keys();
+        let mut budget = CaptureWorkBudget::default();
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            SegmentIo {
+                world: &world_map,
+                identities: &identities,
+                events: events.clone(),
+                runs: pass.runs.clone(),
+                owner: pass.owner.clone(),
+                exe_reads: Cell::new(0),
+                imm_base: pass.owner.state_for_test().0[3],
+            },
+            deadline,
+        );
+        probe.install_expectations(&mut index).unwrap();
+        let late = d3c_packet(
+            probe.segment_proof(),
+            &world_map,
+            &identities,
+            &events,
+            &pass.runs,
+            &pass.owner,
+            &prove_set,
+            pid,
+            &mut budget,
+        );
+        assert_userspace_mapped(&late);
+        drop(probe);
+        assert_eq!(installed.failed_target, Some(RunFailure::Deadline));
+        drop(installed);
+        assert_eq!(session.consecutive_deadlines, 1);
+        assert_eq!(session.sticky, None);
+    }
+    // The fourth query resets like the others, then runs and proves.
+    session.reset_witness_deadline_streak();
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        4,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            4,
+            &[(5213, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let proved = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5213,
+        &mut budget,
+    );
+    assert_kernel_slot(&proved, Slot(0));
+    drop(probe);
+    assert_eq!(installed.failed_target, None);
+    assert_eq!(installed.target_attempts, 1);
+    drop(installed);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        4,
+        "the fourth witness query must run after three overdue"
+    );
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, None);
+}
+
+#[test]
 fn d3c_no_attempt_preserves_deadline_streak() {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Packet {

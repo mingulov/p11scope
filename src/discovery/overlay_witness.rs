@@ -16,6 +16,7 @@
 use crate::discovery::identity::{ExaminedObject, FileIdentity, MappedFile, PinnedObjects};
 use crate::discovery::kernel_identity::{
     AnchorPass, ExaminedCustody, IdentitySession, KernelAnchorExclusions, KernelMemberProbe,
+    RunFailure,
 };
 use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{
@@ -169,10 +170,13 @@ pub(crate) const GAP_ANCHOR_BINDING_FAILED: &str =
 /// Mint the next witness generation. Each query mints fresh under the
 /// session lock and holds the lock across install and confirm, so both
 /// share exactly one generation: a stale-generation confirmation cannot
-/// validate, and the only generation failure is counter overflow, which
-/// fail-closes unavailable.
+/// validate, and the only generation failure is counter exhaustion, which
+/// fail-closes unavailable. The mint caps at the kernel session's `u32`
+/// generation bound, so exhaustion surfaces as `GenerationOverflow`
+/// instead of an anchor-binding failure at install.
 fn next_witness_generation(current: u64) -> Option<u64> {
-    current.checked_add(1)
+    let next = current.checked_add(1)?;
+    (next < u64::from(u32::MAX)).then_some(next)
 }
 
 /// Whether the held file plus the target identity needs the witness: the
@@ -279,6 +283,13 @@ pub(crate) enum WitnessStage {
     /// The monotonic clock could not be read to compare against the
     /// capture deadline.
     DeadlineClock,
+    /// The target run exceeded its deadline (overdue). Each witness
+    /// query resets the deadline streak first, so one overdue run
+    /// refuses only itself, never the rest of the inventory.
+    TargetOverdue,
+    /// Explicit `--identity-backend userspace`: the operator asked for
+    /// no BPF, so the deep-scan witness stays off.
+    ExplicitUserspace,
     /// The anchor FD census failed.
     FdCensus,
     /// The held file was refused as the witness anchor.
@@ -326,6 +337,8 @@ impl WitnessDiagnosis {
             WitnessStage::ProbeMismatch => "probe_mismatch".to_string(),
             WitnessStage::CaptureDeadline => "capture_deadline".to_string(),
             WitnessStage::DeadlineClock => "deadline_clock".to_string(),
+            WitnessStage::TargetOverdue => "target_overdue".to_string(),
+            WitnessStage::ExplicitUserspace => "explicit_userspace".to_string(),
             WitnessStage::FdCensus => "fd_census".to_string(),
             WitnessStage::AnchorOffer => "anchor_offer".to_string(),
             WitnessStage::AnchorReconcile => "anchor_reconcile".to_string(),
@@ -373,6 +386,10 @@ impl WitnessDiagnosis {
             }
             WitnessStage::CaptureDeadline => "capture deadline reached before the run".to_string(),
             WitnessStage::DeadlineClock => "capture deadline clock unreadable".to_string(),
+            WitnessStage::TargetOverdue => "kernel run exceeded its deadline".to_string(),
+            WitnessStage::ExplicitUserspace => {
+                "explicit userspace disables the kernel witness".to_string()
+            }
             WitnessStage::FdCensus => "file-descriptor census unavailable".to_string(),
             WitnessStage::AnchorOffer => "held file refused as witness anchor".to_string(),
             WitnessStage::AnchorReconcile => "witness anchor reservation failed".to_string(),
@@ -470,6 +487,21 @@ fn stage_for_unproven_confirmation(
         Confirmation::Exited => WitnessStage::TargetExited,
         Confirmation::Confirmed(_) if ranges.is_empty() => WitnessStage::NoRefusedRange,
         Confirmation::Confirmed(_) => WitnessStage::RangeUnproven,
+    }
+}
+
+/// Which stage an unavailable witness query refused at. An overdue
+/// target run carries its own stage; every other unproven shape keeps
+/// its confirm stage.
+fn stage_for_witness_unavailable(
+    overdue: bool,
+    confirmation: &Confirmation,
+    ranges: &[(u64, u64)],
+) -> WitnessStage {
+    if overdue {
+        WitnessStage::TargetOverdue
+    } else {
+        stage_for_unproven_confirmation(confirmation, ranges)
     }
 }
 
@@ -707,6 +739,10 @@ fn prove_original_file_inner(
     };
     guard.generation = generation;
     let session = guard.session.as_mut().expect("witness session is loaded");
+    // Each query starts its deadline streak fresh: three overdue in a
+    // row from a load spike must not blackout the rest of the
+    // inventory. Stream corruption stays sticky.
+    session.reset_witness_deadline_streak();
     let mut installed = match session.install_anchors(pass, generation, deadline) {
         Ok(installed) => installed,
         Err(_) => return decided(WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)),
@@ -723,11 +759,12 @@ fn prove_original_file_inner(
     }
     let confirmation = probe.confirm(pid, &BTreeSet::from([key]), budget);
     drop(probe);
+    let overdue = installed.failed_target() == Some(RunFailure::Deadline);
     drop(installed);
     let verdict = verdict_for_confirmation(&confirmation, ranges);
     let diagnosis = match verdict {
         WitnessVerdict::Failed(WitnessFailure::Unavailable) => Some(WitnessDiagnosis {
-            stage: stage_for_unproven_confirmation(&confirmation, ranges),
+            stage: stage_for_witness_unavailable(overdue, &confirmation, ranges),
         }),
         _ => None,
     };
@@ -896,6 +933,12 @@ mod tests {
         assert_eq!(next_witness_generation(0), Some(1));
         assert_eq!(next_witness_generation(7), Some(8));
         assert_eq!(next_witness_generation(u64::MAX), None);
+        assert_eq!(
+            next_witness_generation(u64::from(u32::MAX) - 2),
+            Some(u64::from(u32::MAX) - 1)
+        );
+        assert_eq!(next_witness_generation(u64::from(u32::MAX) - 1), None);
+        assert_eq!(next_witness_generation(u64::from(u32::MAX)), None);
     }
 
     fn confirmed_with(
@@ -1445,6 +1488,41 @@ mod tests {
         assert_eq!(
             stage_for_unproven_confirmation(&confirmed_with(BTreeMap::new()), &[]),
             WitnessStage::NoRefusedRange
+        );
+    }
+
+    #[test]
+    fn overdue_run_carries_its_own_stage() {
+        // An overdue target run refuses at the overdue stage whatever
+        // the confirm shape is; any other unproven shape keeps its
+        // confirm stage.
+        use crate::discovery::sweep_attribution::AttributionLoss;
+        let range = (0x7f00_0000, 0x7f00_1000);
+        let lost = Confirmation::Lost(AttributionLoss::MapFilesUnavailable, "gone".into());
+        assert_eq!(
+            stage_for_witness_unavailable(true, &lost, &[range]),
+            WitnessStage::TargetOverdue
+        );
+        assert_eq!(
+            stage_for_witness_unavailable(true, &Confirmation::Exited, &[range]),
+            WitnessStage::TargetOverdue
+        );
+        assert_eq!(
+            stage_for_witness_unavailable(false, &lost, &[range]),
+            WitnessStage::ConfirmationLost
+        );
+        assert_eq!(
+            stage_for_witness_unavailable(false, &Confirmation::Exited, &[range]),
+            WitnessStage::TargetExited
+        );
+        let diagnosis = WitnessDiagnosis {
+            stage: WitnessStage::TargetOverdue,
+        };
+        assert_eq!(diagnosis.stage_token(), "target_overdue");
+        assert_eq!(diagnosis.note(), "kernel run exceeded its deadline");
+        assert_eq!(
+            diagnosis.enriched_reason(),
+            format!("{GAP_WITNESS_UNAVAILABLE}: kernel run exceeded its deadline")
         );
     }
 

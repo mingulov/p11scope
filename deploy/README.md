@@ -7,6 +7,12 @@
 - `Dockerfile.observer` — the observer image: the static musl `p11scope` plus
   `scripts/k8s-profile-entry.sh` on Alpine. No shell tools beyond busybox, no
   API client.
+- `Dockerfile.observer-release` — the same image, but the binary comes from a
+  release tarball (`p11scope-<version>-x86_64-linux-musl.tar.gz`) instead of a
+  local build. Same base digest, same entrypoint; the tarball's `RELEASE.json`
+  rides along for provenance. `scripts/kind-e2e.sh` uses it when
+  `P11SCOPE_K8S_RELEASE_TARBALL` is set (with optional
+  `P11SCOPE_K8S_RELEASE_SHA256SUMS` verification).
 - `Dockerfile.holder`, `holder-entry.sh` — **test-only** workload image for
   the e2e: SoftHSM2 plus the ledgered client
   `tests/fixtures/public-cli/gated.c`. Never deploy it.

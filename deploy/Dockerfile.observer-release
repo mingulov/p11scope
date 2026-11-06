@@ -1,0 +1,31 @@
+# p11scope node-observer image from a release tarball: the same Alpine base,
+# entry script and checks as Dockerfile.observer, but the static binary comes
+# from the exact release bytes instead of a local build.
+# Built from a staged minimal context holding the tarball and the entry script:
+#   docker build -f p11scope/deploy/Dockerfile.observer-release \
+#     --build-arg TARBALL=p11scope-0.7.0-x86_64-linux-musl.tar.gz \
+#     -t p11scope-observer:1 ctx/
+# (ctx/p11scope-0.7.0-x86_64-linux-musl.tar.gz, ctx/scripts/k8s-profile-entry.sh).
+# scripts/kind-e2e.sh stages exactly this when P11SCOPE_K8S_RELEASE_TARBALL is
+# set, after verifying the tarball against SHA256SUMS. The tarball must hold
+# exactly one `*/p11scope` regular file (the release layout); anything else is
+# refused. Its RELEASE.json rides along for provenance when present.
+# The base tag+digest stay matched with Dockerfile.observer.
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+ARG TARBALL
+COPY ${TARBALL} /tmp/release.tar.gz
+COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
+RUN set -eu; \
+    mkdir -p /tmp/rel /usr/local/share/p11scope; \
+    if tar -tzf /tmp/release.tar.gz | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "tarball has unsafe members" >&2; exit 1; fi; \
+    tar -xzf /tmp/release.tar.gz -C /tmp/rel; \
+    if [ "$(find /tmp/rel -type f -path '*/p11scope' | head -n 2 | grep -c .)" -ne 1 ]; then echo "tarball must hold exactly one p11scope binary" >&2; exit 1; fi; \
+    cp "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)" /usr/local/bin/p11scope; \
+    chmod 0755 /usr/local/bin/p11scope; \
+    if [ "$(find /tmp/rel -type f -name RELEASE.json | head -n 2 | grep -c .)" -eq 1 ]; then cp "$(find /tmp/rel -type f -name RELEASE.json | head -n 1)" /usr/local/share/p11scope/RELEASE.json; chmod 0644 /usr/local/share/p11scope/RELEASE.json; fi; \
+    rm -rf /tmp/rel /tmp/release.tar.gz; \
+    chmod 0755 /usr/local/bin/k8s-profile-entry \
+    && /usr/local/bin/p11scope --help >/dev/null \
+    && /usr/local/bin/k8s-profile-entry --self-test
+ENTRYPOINT ["/usr/local/bin/k8s-profile-entry"]
+CMD ["--help"]

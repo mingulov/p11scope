@@ -56,6 +56,24 @@ docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11sc
 kubectl apply -f p11scope/deploy/k8s/
 ```
 
+To package the exact release bytes instead of a local build, verify the
+release tarball against its `SHA256SUMS`, stage it beside the entry script,
+and use `Dockerfile.observer-release` (same base and entrypoint; the
+tarball must hold exactly one `*/p11scope` file):
+
+```sh
+cd "$(mktemp -d)"
+tarball=/path/to/p11scope-0.7.0-x86_64-linux-musl.tar.gz
+(cd "$(dirname "$tarball")" && sha256sum -c SHA256SUMS --ignore-missing)
+mkdir -p ctx/scripts && cp "$tarball" ctx/ \
+  && cp /path/to/p11scope/scripts/k8s-profile-entry.sh ctx/scripts/
+docker build -f /path/to/p11scope/deploy/Dockerfile.observer-release \
+  --build-arg TARBALL="${tarball##*/}" -t p11scope-observer:1 ctx/
+```
+
+`scripts/kind-e2e.sh` runs this variant when `P11SCOPE_K8S_RELEASE_TARBALL`
+(plus optional `P11SCOPE_K8S_RELEASE_SHA256SUMS`) is set.
+
 A capture targets one pod by UID, from the observer pod on the same node:
 
 ```sh

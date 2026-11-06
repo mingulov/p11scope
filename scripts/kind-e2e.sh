@@ -4,7 +4,8 @@
 # uniquely named kind cluster that this script creates and always deletes.
 #
 #   1. builds the static observer from this tree (or takes
-#      P11SCOPE_K8S_OBSERVER_BIN) and both images from a staged minimal context;
+#      P11SCOPE_K8S_OBSERVER_BIN, or packages P11SCOPE_K8S_RELEASE_TARBALL)
+#      and both images from a staged minimal context;
 #   2. creates the cluster with a private kubeconfig (the caller's kubeconfig
 #      and every other cluster are never touched) and loads the images;
 #   3. applies deploy/k8s/ as documented (a directory apply of a copy where only
@@ -49,6 +50,13 @@
 #   P11SCOPE_K8S_CLUSTER       cluster name (default p11scope-e2e-<time>-<pid>);
 #                              refused if a cluster of that name already exists
 #   P11SCOPE_K8S_OBSERVER_BIN  prebuilt static x86-64 p11scope to package
+#                              (exclusive with P11SCOPE_K8S_RELEASE_TARBALL)
+#   P11SCOPE_K8S_RELEASE_TARBALL release tarball
+#                              (p11scope-<version>-x86_64-linux-musl.tar.gz) to
+#                              package via deploy/Dockerfile.observer-release
+#                              instead of building
+#   P11SCOPE_K8S_RELEASE_SHA256SUMS optional SHA256SUMS file the release tarball
+#                              must verify against
 #   P11SCOPE_K8S_TOOLCHAIN     cargo toolchain (default: .release-rust-version)
 #   P11SCOPE_K8S_WORK          evidence directory (must not exist; default a
 #                              fresh 0700 directory under $TMPDIR)
@@ -74,6 +82,32 @@ valid_cluster() {
         ''|*[!a-z0-9-]*|-*|*-) return 1 ;;
         *) [ "${#1}" -le 40 ] ;;
     esac
+}
+
+# Verify a release tarball before it becomes the observer image: it must be
+# a readable gzip tar holding exactly one `*/p11scope` regular file and no
+# absolute or parent-climbing members, and when $2 (a SHA256SUMS file) is
+# given, the tarball's entry there must match.
+verify_release_tarball() {
+    [ -f "$1" ] && [ -r "$1" ] || { echo "release tarball is not a readable file: $1" >&2; return 1; }
+    members=$(tar -tzf "$1" 2>/dev/null) || { echo "release tarball does not list: $1" >&2; return 1; }
+    verbose=$(tar -tzvf "$1" 2>/dev/null) || { echo "release tarball does not list: $1" >&2; return 1; }
+    if printf '%s\n' "$members" | grep -qE '(^/|(^|/)\.\.(/|$))'; then
+        echo "release tarball has unsafe members: $1" >&2
+        return 1
+    fi
+    # Exactly one regular file member (a symlink or directory named
+    # `p11scope` does not count); spaced names fail closed.
+    [ "$(printf '%s\n' "$verbose" | grep -cE '^-.* [^ ]*/p11scope$')" -eq 1 ] \
+        || { echo "release tarball must hold exactly one p11scope binary: $1" >&2; return 1; }
+    if [ -n "${2-}" ]; then
+        [ -f "$2" ] || { echo "SHA256SUMS file is missing: $2" >&2; return 1; }
+        base=${1##*/}
+        line=$(awk -v want="$base" '$2 == want' "$2" | head -n 1)
+        [ -n "$line" ] || { echo "SHA256SUMS has no entry for $base" >&2; return 1; }
+        (cd "${1%/*}" 2>/dev/null || cd .; printf '%s\n' "$line" | sha256sum -c --status -) \
+            || { echo "release tarball checksum mismatch: $1" >&2; return 1; }
+    fi
 }
 
 # Exactly one complete gated JSON ledger with 6xN successes (gated.c prints
@@ -183,6 +217,59 @@ self_test() {
             exit 1
         fi
     done
+    # verify_release_tarball: a layout-identical good tarball passes with and
+    # without sums; every bad shape refuses. No docker needed.
+    tar_stub=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-kind-tarball-XXXXXX")
+    # shellcheck disable=SC2064
+    trap "rm -rf '$ledger_stub' '$tar_stub'" EXIT
+    mkdir -p "$tar_stub/good/p11scope-0.7.0-x86_64-linux-musl" "$tar_stub/out"
+    printf '#!/bin/sh\necho test-observer\n' > "$tar_stub/good/p11scope-0.7.0-x86_64-linux-musl/p11scope"
+    chmod 0755 "$tar_stub/good/p11scope-0.7.0-x86_64-linux-musl/p11scope"
+    printf '{"version":"0.7.0"}\n' > "$tar_stub/good/p11scope-0.7.0-x86_64-linux-musl/RELEASE.json"
+    (cd "$tar_stub/good" && tar -czf "$tar_stub/out/good.tar.gz" p11scope-0.7.0-x86_64-linux-musl)
+    (cd "$tar_stub/out" && sha256sum good.tar.gz > SHA256SUMS)
+    verify_release_tarball "$tar_stub/out/good.tar.gz" "$tar_stub/out/SHA256SUMS" \
+        || { echo "good tarball refused" >&2; exit 1; }
+    verify_release_tarball "$tar_stub/out/good.tar.gz" "" \
+        || { echo "good tarball refused without sums" >&2; exit 1; }
+    (cd "$tar_stub/out" && sha256sum good.tar.gz | sed 's/^../zz/' > WRONG.sums)
+    if verify_release_tarball "$tar_stub/out/good.tar.gz" "$tar_stub/out/WRONG.sums" >/dev/null 2>&1; then
+        echo "checksum mismatch accepted" >&2; exit 1
+    fi
+    printf '%s  %s\n' \
+        0000000000000000000000000000000000000000000000000000000000000000 \
+        other.tar.gz > "$tar_stub/out/OTHER.sums"
+    if verify_release_tarball "$tar_stub/out/good.tar.gz" "$tar_stub/out/OTHER.sums" >/dev/null 2>&1; then
+        echo "sums without the tarball entry accepted" >&2; exit 1
+    fi
+    if verify_release_tarball "$tar_stub/out/good.tar.gz" "$tar_stub/out/missing.sums" >/dev/null 2>&1; then
+        echo "missing sums file accepted" >&2; exit 1
+    fi
+    mkdir -p "$tar_stub/none/p-0" && printf '{}\n' > "$tar_stub/none/p-0/RELEASE.json"
+    (cd "$tar_stub/none" && tar -czf "$tar_stub/out/none.tar.gz" p-0)
+    if verify_release_tarball "$tar_stub/out/none.tar.gz" "" >/dev/null 2>&1; then
+        echo "tarball without a binary accepted" >&2; exit 1
+    fi
+    mkdir -p "$tar_stub/two/p-a" "$tar_stub/two/p-b"
+    printf 'x\n' > "$tar_stub/two/p-a/p11scope"
+    printf 'x\n' > "$tar_stub/two/p-b/p11scope"
+    (cd "$tar_stub/two" && tar -czf "$tar_stub/out/two.tar.gz" p-a p-b)
+    if verify_release_tarball "$tar_stub/out/two.tar.gz" "" >/dev/null 2>&1; then
+        echo "tarball with two binaries accepted" >&2; exit 1
+    fi
+    mkdir -p "$tar_stub/link/p-0" && ln -s /bin/true "$tar_stub/link/p-0/p11scope"
+    (cd "$tar_stub/link" && tar -czf "$tar_stub/out/link.tar.gz" p-0)
+    if verify_release_tarball "$tar_stub/out/link.tar.gz" "" >/dev/null 2>&1; then
+        echo "tarball with a symlinked binary accepted" >&2; exit 1
+    fi
+    (cd "$tar_stub/good" && tar -czf "$tar_stub/out/abs.tar.gz" -P "$tar_stub/good/p11scope-0.7.0-x86_64-linux-musl/p11scope")
+    if verify_release_tarball "$tar_stub/out/abs.tar.gz" "" >/dev/null 2>&1; then
+        echo "tarball with an absolute member accepted" >&2; exit 1
+    fi
+    if verify_release_tarball "$tar_stub/out/missing.tar.gz" "" >/dev/null 2>&1; then
+        echo "missing tarball accepted" >&2; exit 1
+    fi
+    rm -rf "$tar_stub"
     rm -rf "$ledger_stub"
     trap - EXIT
     echo "kind-e2e self-test: OK"
@@ -212,6 +299,12 @@ valid_cluster "$CLUSTER" || { echo "cluster name must be a short DNS label: $CLU
 NODE=$CLUSTER-control-plane
 TOOLCHAIN=${P11SCOPE_K8S_TOOLCHAIN:-$(cat .release-rust-version)}
 OBSERVER_BIN=${P11SCOPE_K8S_OBSERVER_BIN:-}
+RELEASE_TARBALL=${P11SCOPE_K8S_RELEASE_TARBALL:-}
+RELEASE_SUMS=${P11SCOPE_K8S_RELEASE_SHA256SUMS:-}
+if [ -n "$RELEASE_TARBALL" ] && [ -n "$OBSERVER_BIN" ]; then
+    echo "P11SCOPE_K8S_RELEASE_TARBALL and P11SCOPE_K8S_OBSERVER_BIN are exclusive" >&2
+    exit 1
+fi
 LOCK=${P11SCOPE_K8S_LOCK:-}
 [ -z "$LOCK" ] || command -v flock >/dev/null || { echo "flock required for P11SCOPE_K8S_LOCK" >&2; exit 1; }
 OBS_IMAGE=p11scope-observer:e2e-$TOKEN
@@ -279,7 +372,18 @@ if kind get clusters 2>/dev/null | grep -Fqx "$CLUSTER"; then
     exit 1
 fi
 
-if [ -z "$OBSERVER_BIN" ]; then
+OBS_DOCKERFILE=deploy/Dockerfile.observer
+OBS_TARBALL_ARG=
+if [ -n "$RELEASE_TARBALL" ]; then
+    echo "=== verify the release tarball and unpack the observer ==="
+    verify_release_tarball "$RELEASE_TARBALL" "$RELEASE_SUMS"
+    mkdir -p "$WORK/rel"
+    member=$(tar -tzf "$RELEASE_TARBALL" | grep -E '/p11scope$')
+    tar -xzf "$RELEASE_TARBALL" -C "$WORK/rel" "$member"
+    OBSERVER_BIN=$WORK/rel/$member
+    OBS_DOCKERFILE=deploy/Dockerfile.observer-release
+    OBS_TARBALL_ARG=${RELEASE_TARBALL##*/}
+elif [ -z "$OBSERVER_BIN" ]; then
     echo "=== build the static observer (cargo +$TOOLCHAIN, x86_64-unknown-linux-musl) ==="
     command -v musl-gcc >/dev/null || { echo "musl-gcc required (musl-tools)" >&2; exit 1; }
     SYSROOT=$(rustc "+$TOOLCHAIN" --print sysroot) \
@@ -303,7 +407,13 @@ OCTX=$WORK/context-observer
 HCTX=$WORK/context-holder
 mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts" \
     "$HCTX/tests/fixtures/public-cli" "$HCTX/deploy"
-cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+if [ -n "$OBS_TARBALL_ARG" ]; then
+    cp "$RELEASE_TARBALL" "$OCTX/$OBS_TARBALL_ARG"
+    sha256sum "$RELEASE_TARBALL" | tee "$WORK/release-tarball.sha256"
+    tar -tzf "$RELEASE_TARBALL" > "$WORK/release-tarball.members"
+else
+    cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+fi
 cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
 cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
 cp deploy/holder-entry.sh "$HCTX/deploy/"
@@ -312,8 +422,14 @@ sha256sum "$OBSERVER_BIN" | tee "$WORK/observer.sha256"
 echo "=== build images $OBS_IMAGE $HOLD_IMAGE ==="
 lock_step
 IMAGES_BUILT=1
-timeout --signal=TERM --kill-after=10s 1200s \
-    docker build -q -f deploy/Dockerfile.observer -t "$OBS_IMAGE" "$OCTX"
+if [ -n "$OBS_TARBALL_ARG" ]; then
+    timeout --signal=TERM --kill-after=10s 1200s \
+        docker build -q -f "$OBS_DOCKERFILE" --build-arg "TARBALL=$OBS_TARBALL_ARG" \
+        -t "$OBS_IMAGE" "$OCTX"
+else
+    timeout --signal=TERM --kill-after=10s 1200s \
+        docker build -q -f "$OBS_DOCKERFILE" -t "$OBS_IMAGE" "$OCTX"
+fi
 timeout --signal=TERM --kill-after=10s 1200s \
     docker build -q -f deploy/Dockerfile.holder -t "$HOLD_IMAGE" "$HCTX"
 unlock_step

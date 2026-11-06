@@ -1171,10 +1171,14 @@ pub(crate) mod producer {
         // feeds left Joint for good, so the census is partial under
         // lost authority, the exact rows kept beside the counts. A
         // semantic loss that disposed staged history while the feed
-        // stays Joint is lost authority too: a counted `record_lost`
-        // never sits under `populated`.
+        // stays Joint is lost authority too: a current-segment
+        // `record_lost` never sits under `populated`. A clean resume
+        // clears the latches and baselines disposed history: the
+        // closed segment stays counted beside a populated section.
         let lost = stagings.iter().any(|staging| {
-            staging.degraded_loss() || staging.watchdog_tripped() || staging.history_disposed() > 0
+            staging.degraded_loss()
+                || staging.watchdog_tripped()
+                || staging.history_disposed_since_resume() > 0
         });
         let fallback = stagings.iter().any(|staging| staging.fell_back());
         let unattributed = collect_unattributed(stagings);

@@ -282,6 +282,11 @@ pub(crate) struct JointStaging {
     redeemed: u64,
     reduced: u64,
     history_disposed: u64,
+    /// Disposed-history count at the last clean resume: the
+    /// `authority_lost` latch compares the current count against
+    /// this baseline, so a clean resume clears it while the counter
+    /// above keeps counting every disposal. Never reset.
+    history_disposed_baseline: u64,
     /// Staged calls replayed S1-direct by a fallback (ordered or
     /// proof-only): they keep their S1 counts but no per-key row can
     /// be proved for them, so the projection counts them as not
@@ -319,13 +324,13 @@ pub(crate) struct JointStaging {
     /// the take-out above runs exactly once.
     watchdog_tripped: bool,
     correlation_refusals: u64,
-    /// True once real loss (not proof-only refusal) ended this
-    /// feed's object authority: the projection reports
-    /// `authority_lost`, never a silent empty success.
+    /// True while the current segment ended in real loss (not
+    /// proof-only refusal): the projection reports `authority_lost`,
+    /// never a silent empty success. Cleared on clean resume.
     degraded_loss: bool,
-    /// True once proof-only refusal replayed retained calls through
-    /// ordinary S1 and degraded to S1Only: the projection reports
-    /// `proof_refused_fallback`.
+    /// True while the current segment ended in proof-only refusal
+    /// replayed through ordinary S1: the projection reports
+    /// `proof_refused_fallback`. Cleared on clean resume.
     fell_back: bool,
     /// Whether the segment that just ended permits a clean-point
     /// resume (see [`segment_resumable_after`]); ordered fallbacks
@@ -367,6 +372,7 @@ impl JointStaging {
             redeemed: 0,
             reduced: 0,
             history_disposed: 0,
+            history_disposed_baseline: 0,
             fallback_replayed: 0,
             unsealable_direct: 0,
             pre_attach_direct: 0,
@@ -420,9 +426,11 @@ impl JointStaging {
     /// Re-enter Joint at a clean point after a fallback or loss
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,
-    /// and holds no staged remainder may resume; the loss/fallback
-    /// flags stay set so publication keeps counting the closed
-    /// segment. Returns whether the mode changed.
+    /// and holds no staged remainder may resume. A clean resume
+    /// clears the loss/fallback latches and baselines disposed
+    /// history: current tracking is healthy again, so the reason
+    /// clears, while the retained counters keep counting the closed
+    /// segment beside it. Returns whether the mode changed.
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
             && !self.watchdog_tripped
@@ -433,6 +441,9 @@ impl JointStaging {
             self.mode = FeedMode::Joint;
             self.segment_resumable = false;
             self.degraded_window = None;
+            self.degraded_loss = false;
+            self.fell_back = false;
+            self.history_disposed_baseline = self.history_disposed;
             true
         } else {
             false
@@ -449,6 +460,14 @@ impl JointStaging {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn history_disposed(&self) -> u64 {
         self.history_disposed
+    }
+
+    /// Disposed payloads since the last clean resume: the
+    /// `authority_lost` latch input. A clean resume baselines the
+    /// closed segment away; new disposal latches again.
+    pub(crate) fn history_disposed_since_resume(&self) -> u64 {
+        self.history_disposed
+            .saturating_sub(self.history_disposed_baseline)
     }
 
     /// Staged calls a fallback replayed S1-direct without proof.

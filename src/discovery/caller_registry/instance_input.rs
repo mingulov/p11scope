@@ -2396,11 +2396,12 @@ impl CallerRegistry {
                     observations.status = crate::key_operation_projection::ObsStatus::Partial;
                     // Semantic loss before any delivery disposes staged
                     // history while the feed stays Joint: the disposed
-                    // count is itself the loss.
+                    // count since the last clean resume is itself the
+                    // loss (same precedence as the producer).
                     if stagings.iter().any(|staging| {
                         staging.degraded_loss()
                             || staging.watchdog_tripped()
-                            || staging.history_disposed() > 0
+                            || staging.history_disposed_since_resume() > 0
                     }) {
                         observations.reason = "authority_lost";
                     } else if stagings.iter().any(|staging| staging.fell_back()) {

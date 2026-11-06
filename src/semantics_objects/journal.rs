@@ -3556,7 +3556,7 @@ impl SessionBirthEvidence {
     #[cfg(test)]
     pub(crate) fn scripted_with_marker_word(
         image: (u64, u64),
-        birth: BirthKind,
+        _birth: BirthKind,
         closure_generation: u64,
         marker_word: u64,
     ) -> Self {

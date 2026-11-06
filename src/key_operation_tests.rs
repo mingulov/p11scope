@@ -21156,6 +21156,246 @@ fn key_operation_watchdog_trip_conserves_across_later_loss_seal_and_stage() {
     );
 }
 
+/// v0.7.0 issue 3: a clean resume clears the `authority_lost` latch.
+/// Real loss latches first (partial, reason named, the disposed call
+/// counted); after the feed resumes Joint at a clean point the
+/// section reads populated while the closed segment's loss stays
+/// counted beside it — never a silent empty success, never a stuck
+/// latch over complete rows.
+#[test]
+fn key_operation_clean_resume_clears_loss_latch() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert!(staging.degraded_loss(), "real loss latches");
+    let lost = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (lost.status, lost.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "real loss latches before any resume"
+    );
+    assert!(
+        staging.resume_joint(),
+        "a resumable loss resumes at a clean point"
+    );
+    assert!(
+        !staging.degraded_loss(),
+        "the clean resume clears the loss latch"
+    );
+    let resumed = commit(4, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (resumed.status, resumed.reason),
+        (ObsStatus::Populated, "none"),
+        "resumed tracking reads populated, not lost"
+    );
+    assert_eq!(
+        resumed.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 1,
+        }],
+        "the closed segment's loss stays counted: {:?}",
+        resumed.unattributed
+    );
+}
+
+/// v0.7.0 issue 3 (fallback twin): a clean resume clears the
+/// `proof_refused_fallback` latch the same way — the replayed calls
+/// stay counted, the section reads populated.
+#[test]
+fn key_operation_clean_resume_clears_fallback_latch() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::ResourceUnavailable,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    assert!(staging.fell_back(), "the fallback latches");
+    let fell = commit(2, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (fell.status, fell.reason),
+        (ObsStatus::Partial, "proof_refused_fallback"),
+        "the fallback latches before any resume"
+    );
+    assert!(
+        staging.resume_joint(),
+        "a resumable fallback resumes at a clean point"
+    );
+    assert!(
+        !staging.fell_back(),
+        "the clean resume clears the fallback latch"
+    );
+    let resumed = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (resumed.status, resumed.reason),
+        (ObsStatus::Populated, "none"),
+        "resumed tracking reads populated, not refused"
+    );
+    assert_eq!(
+        resumed.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: 3,
+        }],
+        "the closed segment's replay stays counted: {:?}",
+        resumed.unattributed
+    );
+}
+
+/// v0.7.0 issue 3 (baseline lifecycle): disposed history latches
+/// while the feed stays Joint; a clean resume baselines it away;
+/// disposing again latches again. The counter itself never resets —
+/// every disposal stays counted.
+#[test]
+fn key_operation_resume_baselines_disposed_history() {
+    use crate::semantics_key_use::FeedMode;
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        1
+    );
+    assert_eq!(staging.mode(), FeedMode::Joint);
+    assert_eq!(staging.history_disposed(), 1);
+    let disposed = commit(3, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (disposed.status, disposed.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "disposed history latches while the feed stays Joint"
+    );
+    // Close the segment with real loss, then resume: the latch
+    // clears while both disposals stay counted.
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure = scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &scene.model,
+        scene.adapter.ledger_mut(),
+        &mut edge,
+        &mut keyuse,
+        instance,
+        &mut sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    assert_eq!(staging.history_disposed(), 2);
+    assert!(staging.resume_joint());
+    let resumed = commit(4, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (resumed.status, resumed.reason),
+        (ObsStatus::Populated, "none"),
+        "the clean resume clears the latch"
+    );
+    assert_eq!(
+        resumed.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 2,
+        }],
+        "both disposals stay counted: {:?}",
+        resumed.unattributed
+    );
+    // Disposing again latches again: the resume baselined, it did
+    // not blind future loss.
+    prepare_call(
+        &mut scene,
+        &mut staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        1
+    );
+    assert_eq!(staging.history_disposed(), 3);
+    let relost = commit(5, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        (relost.status, relost.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "disposing again after a resume latches again"
+    );
+}
+
 /// Conservation across every staging-derived reason (round 3):
 /// sealed, fallback-replayed, degraded-window (both endings),
 /// history-disposed, pre-attach, unmodelled and watchdog counts
@@ -21440,8 +21680,11 @@ fn key_operation_joint_resumes_at_next_clean_point() {
     );
 
     let observations = guarded.registry.joint_observations(41);
-    assert_eq!(observations.status, ObsStatus::Partial);
-    assert_eq!(observations.reason, "proof_refused_fallback");
+    // v0.7.0 issue 3: the clean resume clears the latch — the
+    // section reads populated while the fallback segment stays
+    // counted below.
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
     let completed: u64 = observations
         .unknown_key_operations
         .iter()
@@ -21555,8 +21798,11 @@ fn key_operation_degraded_window_calls_count_under_fallback_reason() {
     );
 
     let observations = guarded.registry.joint_observations(61);
-    assert_eq!(observations.status, ObsStatus::Partial);
-    assert_eq!(observations.reason, "proof_refused_fallback");
+    // v0.7.0 issue 3: the clean resume clears the latch — the
+    // section reads populated while the window calls stay counted
+    // under the closed segment's reason below.
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
     assert_eq!(
         observations.unattributed,
         vec![
@@ -21658,8 +21904,10 @@ fn key_operation_degraded_window_calls_count_under_loss_reason() {
     );
 
     let observations = guarded.registry.joint_observations(62);
-    assert_eq!(observations.status, ObsStatus::Partial);
-    assert_eq!(observations.reason, "authority_lost");
+    // v0.7.0 issue 3: the clean resume clears the latch — the
+    // section reads populated while the loss stays counted below.
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
     assert_eq!(
         observations.unattributed,
         vec![crate::key_operation_projection::UnattributedRow {

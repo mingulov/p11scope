@@ -185,6 +185,9 @@ gcc -O1 -o "$FIX/gated" "$SRC/gated.c" -ldl || exit 2
 GATED=$FIX/gated
 chmod 755 "$FIX" "$GATED"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
+# The oracle cross-checks the newcomer-queue timing line on stderr;
+# all-clear timing lines print only with capture diagnostics on.
+export P11SCOPE_CAPTURE_DIAGNOSTICS=1
 mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
 chmod 644 softhsm2.conf

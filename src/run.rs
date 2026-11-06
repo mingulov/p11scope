@@ -7433,7 +7433,7 @@ fn capture_profile(
         render::apply_legacy_gaps(&mut ev, &snapshot);
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
-        emit_timing_summaries(&summaries);
+        emit_timing_summaries(&ev.scheduling, &summaries);
 
         poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
@@ -8342,7 +8342,7 @@ fn capture_trace(
                     });
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
-                    emit_timing_summaries(&summaries);
+                    emit_timing_summaries(&evidence.scheduling, &summaries);
                     Ok(evidence)
                 },
             )
@@ -9211,18 +9211,28 @@ fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::R
 /// Emits the Phase-2 timing summary: the newcomer-queue line always
 /// (the stop-race oracle cross-checks stderr pending against the
 /// report), the rest verbose-only.
-fn emit_timing_summaries(summaries: &[String]) {
-    for summary in timing_summaries_to_emit(summaries, crate::cli::text_is_verbose()) {
+fn emit_timing_summaries(scheduling: &render::SchedulingEvidence, summaries: &[String]) {
+    let drops = scheduling.newcomer_queue.dropped + scheduling.newcomer_queue.dropped_unknown;
+    for summary in timing_summaries_to_emit(summaries, capture_diagnostics_on(), drops) {
         let _ = crate::sink::try_stderr_line(summary);
     }
 }
 
 /// The [`emit_timing_summaries`] gate as a pure predicate, so tests
-/// pin it without capturing stderr.
-fn timing_summaries_to_emit(summaries: &[String], verbose: bool) -> Vec<&String> {
+/// pin it without capturing stderr. Default stderr keeps only a
+/// newcomer-queue line that reports drops — a real warning; all-clear
+/// statistics print under `-v` or `P11SCOPE_CAPTURE_DIAGNOSTICS=1`,
+/// which is how the stop-race oracle runs.
+fn timing_summaries_to_emit(
+    summaries: &[String],
+    diagnostics: bool,
+    newcomer_drops: u64,
+) -> Vec<&String> {
     summaries
         .iter()
-        .filter(|summary| summary.contains("timing: newcomer queue:") || verbose)
+        .filter(|summary| {
+            diagnostics || (summary.contains("timing: newcomer queue:") && newcomer_drops > 0)
+        })
         .collect()
 }
 
@@ -9231,7 +9241,8 @@ fn timing_summaries_to_emit(summaries: &[String], verbose: bool) -> Vec<&String>
 /// newcomer queue ages, and capture-process resources. Missing samples
 /// render as `n/a`, never as zero. One short `p11scope: timing:` stderr
 /// line per group, so a terminal never wraps a 400-column line; the
-/// newcomer-queue ages stay on one line for the stop-race oracle.
+/// newcomer-queue ages stay on one line, which the stop-race oracle
+/// reads from runs launched with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
 pub(crate) fn timing_summary_lines(scheduling: &render::SchedulingEvidence) -> Vec<String> {
     fn ms(value: Option<u64>) -> String {
         value.map_or_else(|| "n/a".to_string(), |ms| format!("{ms}ms"))
@@ -10102,20 +10113,38 @@ mod tests {
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
 
-    /// CLI-1: default runs emit only the newcomer-queue timing line
-    /// (the oracle's cross-check); `-v` emits every timing line.
+    /// CLI text: an all-clear newcomer-queue line stays off default
+    /// stderr (statistics print under `-v` or
+    /// `P11SCOPE_CAPTURE_DIAGNOSTICS=1`, per the documented stderr
+    /// contract); the stop-race oracle runs with that variable set.
+    /// A newcomer line reporting drops is a real warning and stays.
     #[test]
-    fn timing_summaries_emit_only_the_newcomer_queue_by_default() {
+    fn timing_summaries_gate_all_clear_newcomer_by_default() {
         let summaries = vec![
             "p11scope: timing: stages: scan 6ms".to_string(),
             "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 0 (max age -)".to_string(),
         ];
         assert_eq!(
-            timing_summaries_to_emit(&summaries, false),
+            timing_summaries_to_emit(&summaries, false, 0),
+            Vec::<&String>::new(),
+        );
+    }
+
+    /// CLI text: a newcomer-queue line reporting drops is a real
+    /// warning, so it stays on default stderr; diagnostics emit every
+    /// timing line.
+    #[test]
+    fn timing_summaries_keep_newcomer_drops_and_diagnostics() {
+        let summaries = vec![
+            "p11scope: timing: stages: scan 6ms".to_string(),
+            "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 2 (max age -)".to_string(),
+        ];
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, false, 2),
             vec![&summaries[1]],
         );
         assert_eq!(
-            timing_summaries_to_emit(&summaries, true),
+            timing_summaries_to_emit(&summaries, true, 0),
             vec![&summaries[0], &summaries[1]],
         );
     }

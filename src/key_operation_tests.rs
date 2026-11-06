@@ -22320,8 +22320,10 @@ fn key_operation_schema_v4_pins_unknown_metadata_contract() {
 /// `ml_dsa_65` row. The error twin (a failed GET) establishes nothing
 /// anywhere and the use partitions `metadata_unknown`. Wire kinds and
 /// field indexes stay numeric (kind 7, field 6): no new-variant
-/// reference, so this compiles before GREEN and fails on the
-/// establishment/proved-row assertions.
+/// reference, so this compiles before GREEN and fails before GREEN
+/// at journal encode/decode of the kind-7 cells (`paired END
+/// decodes` in harness admission); the establishment/proved-row
+/// assertions bite post-admission.
 #[test]
 fn pqc_parameter_set_partial_error_preserves_neighbors() {
     use crate::key_operation_projection::ObsStatus;

@@ -2090,13 +2090,17 @@ impl SemanticCapture {
         // attach-observed at the same cut only when native truth
         // shows the task predates this closure — no marker row at
         // all, or a row the exec hook never stamped (generation 0,
-        // unpublished marker). The attach birth proves custody,
-        // image and closure only; pre-cut history stays
-        // first-observed / not attributed. A task stamped under
-        // this (or a later) closure keeps the closed exec refusal:
-        // its stronger exec/absence proof may still land on a
-        // later candidate, and an early attach birth must not
-        // preempt it. Absence births never take this fallback.
+        // unpublished marker) — or when the row is DIRTY under this
+        // closure (v0.7.0 issue 1: DIRTY sticks for the task's life,
+        // so the stronger exec/absence proof can never land on a
+        // later candidate, and absence needs an unpublished marker).
+        // The attach birth proves custody, image and closure only;
+        // pre-cut history stays first-observed / not attributed. A
+        // task stamped under this (or a later) closure with any
+        // other unready word keeps the closed exec refusal: its
+        // stronger exec/absence proof may still land on a later
+        // candidate, and an early attach birth must not preempt it.
+        // Absence births never take this fallback.
         let mut birth = birth;
         let evidence = match crate::attach::observe_retained_birth(
             rows, binding, attachment, &admission, birth,
@@ -2111,16 +2115,23 @@ impl SemanticCapture {
                             | Refusal::GenerationMismatch
                     ) =>
             {
-                let predates_closure = match rows.read_marker_row() {
-                    Err(_) => true,
+                let (predates_closure, dirty_under_closure) = match rows.read_marker_row() {
+                    Err(_) => (true, false),
                     Ok(record) => {
-                        record.exec_attach_gen == 0
-                            && p11scope_ebpf_common::journal_marker::read_word(
-                                record.journal_bootstrap,
-                            ) == p11scope_ebpf_common::journal_marker::MarkerRead::Unpublished
+                        let word = p11scope_ebpf_common::journal_marker::read_word(
+                            record.journal_bootstrap,
+                        );
+                        let predates = record.exec_attach_gen == 0
+                            && word
+                                == p11scope_ebpf_common::journal_marker::MarkerRead::Unpublished;
+                        // A future stamp still refuses: native truth
+                        // from the future cannot witness this closure.
+                        let dirty = record.exec_attach_gen <= attachment.generation()
+                            && word == p11scope_ebpf_common::journal_marker::MarkerRead::Dirty;
+                        (predates, dirty)
                     }
                 };
-                if !predates_closure {
+                if !predates_closure && !dirty_under_closure {
                     return Err(refusal);
                 }
                 birth = BirthKind::AttachObserved;

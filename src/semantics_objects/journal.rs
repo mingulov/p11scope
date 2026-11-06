@@ -3549,6 +3549,25 @@ impl SessionBirthEvidence {
             custody: 1,
         }
     }
+
+    /// Canonical evidence with one substituted marker word: the seal
+    /// re-check reads fresh words, so tests pin non-canonical words
+    /// (a DIRTY word under attach-observed) through the same gate.
+    #[cfg(test)]
+    pub(crate) fn scripted_with_marker_word(
+        image: (u64, u64),
+        birth: BirthKind,
+        closure_generation: u64,
+        marker_word: u64,
+    ) -> Self {
+        Self {
+            image,
+            marker_word,
+            admission_failed: 0,
+            attach_generation: closure_generation,
+            custody: 1,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -4228,14 +4247,19 @@ impl JournalAdapter {
                     == p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
             }
             BirthKind::AbsenceAppearance => evidence.marker_word == 0,
-            // Attach claims no exec publication: the unmarked word
-            // or this image's own READY word are the only states
-            // consistent with it. DIRTY, invalid, or another exec's
-            // READY refuse — the marker proves a different story.
+            // Attach claims no exec publication: the unmarked word,
+            // this image's own READY word, or a DIRTY word are the
+            // states consistent with it. DIRTY proves a lost prefix,
+            // which attach-observed accounts as not-attributed; it
+            // never authorizes exec or absence. Invalid or another
+            // exec's READY refuse — the marker proves a different
+            // story.
             BirthKind::AttachObserved => {
                 evidence.marker_word == 0
                     || p11scope_ebpf_common::journal_marker::read_word(evidence.marker_word)
                         == p11scope_ebpf_common::journal_marker::MarkerRead::Ready(image.1)
+                    || p11scope_ebpf_common::journal_marker::read_word(evidence.marker_word)
+                        == p11scope_ebpf_common::journal_marker::MarkerRead::Dirty
             }
         };
         if !marker_ok {
@@ -11628,6 +11652,60 @@ pub(crate) mod tests {
             ),
             Err(BirthRefusal::ImageUnknown)
         );
+    }
+
+    /// v0.7.0 issue 1 (verify level): an attach-observed birth over a
+    /// DIRTY marker word attests and seals. DIRTY proves a lost
+    /// prefix (a watched call was refused or lost before the cut),
+    /// which attach-observed accounts as not-attributed; it never
+    /// authorizes exec or absence. The seal re-checks the same fresh
+    /// word through the same rule, so the birth keeps sealing.
+    #[test]
+    fn object_journal_attach_birth_accepts_dirty_marker_word() {
+        use p11scope_ebpf_common::journal_marker::MARKER_DIRTY;
+        use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
+
+        let mut scene = Scene::new(image_default());
+        let proof = scene.attest();
+        let create = function_id("C_CreateObject");
+        let sign = function_id("C_Sign");
+        let begin = begin_bytes(1, 1, create, 0);
+        let mut affecting = ordinary_for(&begin, 0);
+        affecting.slot = 99;
+        affecting.target_function = sign;
+        scene.ingest_ordinary(affecting);
+        scene.ingest(&begin);
+        let image = (proof.key.cookie, proof.key.exec);
+        let evidence = SessionBirthEvidence::scripted_with_marker_word(
+            image,
+            BirthKind::AttachObserved,
+            scene.closure_generation(),
+            MARKER_DIRTY,
+        );
+        let birth = BootstrapReceipt::attest(
+            &scene.adapter,
+            &SessionBirthGrant::scripted_with_evidence(
+                proof,
+                BirthKind::AttachObserved,
+                1,
+                scene.closure_generation(),
+                evidence,
+            ),
+        )
+        .expect("attach-observed attests over a DIRTY marker");
+        scene.ingest(&end_bytes(&begin, OBJECT_ACTION_CREATE, 0, ENTRY_NS + 50));
+        let audit = scene.audit();
+        let frontier = scene.adapter.consumed_frontier();
+        let fresh = SessionBirthEvidence::scripted_with_marker_word(
+            image,
+            BirthKind::AttachObserved,
+            scene.closure_generation(),
+            MARKER_DIRTY,
+        );
+        let success = scene
+            .seal_explicit(&audit, &birth, frontier, fresh)
+            .expect("the seal re-check accepts the DIRTY word");
+        assert_eq!(success.prefix.settled().len(), 1);
     }
 
     #[test]

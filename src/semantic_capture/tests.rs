@@ -2407,6 +2407,158 @@ fn joint_attach_birth_for_already_present_provider() {
     );
 }
 
+/// v0.7.0 issue 1 (observe level): a task stamped under this closure
+/// whose marker word is DIRTY (a watched call was refused or lost, so
+/// the scope-gap root dirtied it) can never exec-birth — DIRTY sticks
+/// for the task's life — but it births as attach-observed, which
+/// claims nothing before the cut and counts the lost prefix as
+/// not-attributed. The DIRTY word passes through into the evidence
+/// (later seals re-check it against the same rule).
+#[test]
+fn joint_retained_attach_birth_accepts_dirty_marker() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (_report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, _proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
+    let sealed = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "1"], sealed);
+    assert_eq!(
+        row.journal_bootstrap,
+        p11scope_ebpf_common::journal_marker::MARKER_DIRTY,
+        "the publisher dumped a genuinely dirtied row"
+    );
+    let mut rows = NativeBirthRows { row, control };
+    let evidence = crate::attach::observe_retained_birth(
+        &mut rows,
+        harness.fixture.binding(),
+        harness.fixture.attachment(),
+        &binding,
+        BirthKind::AttachObserved,
+    )
+    .expect("a DIRTY row births as attach-observed");
+    assert_eq!(
+        evidence.marker_word(),
+        p11scope_ebpf_common::journal_marker::MARKER_DIRTY,
+        "the DIRTY word passes through for the seal re-check"
+    );
+}
+
+/// v0.7.0 issue 1 (finish level): the same DIRTY-stamped task at the
+/// H0 seam — its exec-marker birth refuses MarkerNotReady, but the
+/// stronger exec/absence proof can never land later (DIRTY sticks for
+/// life and absence needs an unpublished marker), so the birth falls
+/// back to attach-observed instead of staying S1Only forever.
+#[test]
+fn joint_dirty_marker_exec_birth_falls_back_to_attach_observed() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (mut report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    let sealed = harness.fixture.attachment().generation();
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "1"], sealed);
+    let mut rows = NativeBirthRows { row, control };
+    let candidate = report
+        .take_current()
+        .pop()
+        .unwrap()
+        .into_birth_candidate()
+        .unwrap_or_else(|_| panic!("actual first H0 New candidate"));
+    harness
+        .capture
+        .validate_birth_candidate(&mut harness.io, &candidate, false)
+        .unwrap();
+    let witness = harness
+        .capture
+        .finish_birth(
+            candidate,
+            None,
+            &admitted,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &proof,
+            &harness.adapter,
+            &mut rows,
+        )
+        .expect("a DIRTY-stamped task births as attach-observed");
+    assert_eq!(
+        witness.receipt().birth(),
+        crate::semantics_objects::journal::BirthKind::AttachObserved
+    );
+}
+
+/// v0.7.0 issue 1 (negative controls): the DIRTY fallback changes
+/// nothing else — a READY word naming another exec, a corrupt word,
+/// and a DIRTY row stamped past the closure still keep the closed
+/// exec refusal (a later candidate may still land the stronger proof,
+/// or native truth is from the future).
+#[test]
+fn joint_stamped_but_unready_rows_keep_closed_exec_refusal() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let publisher = NativePublisher::build();
+    // READY naming another exec, corrupt words, and DIRTY stamped
+    // past the closure: none of these falls back.
+    let cases: Vec<(Vec<String>, u64, &str)> = vec![
+        (vec!["9".into(), "0".into()], 0, "READY naming another exec"),
+        (vec!["0".into(), "0".into()], 0, "corrupt word"),
+        (
+            vec!["0".into(), "0".into(), "1".into()],
+            1,
+            "DIRTY past the closure",
+        ),
+    ];
+    for (args, gen_bump, what) in cases {
+        let mut harness = JointBirthHarness::new();
+        harness.push_ordinary(ImageIdentity::default());
+        let mut quiet = harness.collect();
+        let (mut report, admitted) = harness.route(&mut quiet);
+        quiet.classify_ordinary(&admitted).unwrap();
+        let (_, proof) = harness.ingest(quiet, &admitted);
+        let sealed = harness.fixture.attachment().generation();
+        let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (mut row, control, _) = publisher.publish_stamped(&arg_refs, sealed + gen_bump);
+        if what == "corrupt word" {
+            row.journal_bootstrap = 3;
+        }
+        let mut rows = NativeBirthRows { row, control };
+        let candidate = report
+            .take_current()
+            .pop()
+            .unwrap()
+            .into_birth_candidate()
+            .unwrap_or_else(|_| panic!("actual first H0 New candidate"));
+        harness
+            .capture
+            .validate_birth_candidate(&mut harness.io, &candidate, false)
+            .unwrap();
+        assert!(
+            matches!(
+                harness.capture.finish_birth(
+                    candidate,
+                    None,
+                    &admitted,
+                    harness.fixture.binding(),
+                    harness.fixture.attachment(),
+                    &proof,
+                    &harness.adapter,
+                    &mut rows,
+                ),
+                Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
+                    | Err(crate::attach::BirthObservationRefusal::GenerationMismatch)
+            ),
+            "{what}: the closed exec refusal stands"
+        );
+    }
+}
+
 #[test]
 fn joint_exec_marker_birth_without_publication_refuses_closed() {
     use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};

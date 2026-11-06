@@ -1447,6 +1447,14 @@ pub(crate) fn observe_retained_birth(
                 match p11scope_ebpf_common::journal_marker::read_word(record.journal_bootstrap) {
                     MarkerRead::Unpublished => 0,
                     MarkerRead::Ready(exec) if exec == image.1 => record.journal_bootstrap,
+                    // v0.7.0 issue 1: a DIRTY word passes through into
+                    // attach-observed evidence. DIRTY proves a lost
+                    // prefix (a watched call was refused or lost), which
+                    // attach-observed accounts as not-attributed; it
+                    // never authorizes exec or absence. The seal
+                    // re-checks the same fresh word through the same
+                    // rule, so the birth keeps sealing.
+                    MarkerRead::Dirty => record.journal_bootstrap,
                     _ => return Err(BirthObservationRefusal::MarkerNotReady),
                 }
             }

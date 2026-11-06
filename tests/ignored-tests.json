@@ -1958,6 +1958,12 @@
       "path": "run::tests::privileged_spawned_child_home_matches_the_target_passwd_row",
       "reason": "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1",
       "cell": "privileged"
+    },
+    {
+      "file": "src/scope.rs",
+      "path": "scope::tests::privileged_run_cgroup_place_moves_a_real_child",
+      "reason": "privileged: moves a real child into a real run cgroup; run as root with --ignored --test-threads=1",
+      "cell": "privileged"
     }
   ]
 }

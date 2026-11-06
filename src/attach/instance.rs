@@ -2236,6 +2236,10 @@ mod fault_raise_tests {
 
     #[test]
     fn competing_fault_writers_never_reopen_an_exhausted_era() {
+        // A raise lost to another raiser succeeds with the value the winner
+        // installed (see `a_raise_lost_to_other_raisers_still_succeeds`), so
+        // one to three writers report the last generation depending on the
+        // interleaving; exactly one of them moved the cell itself.
         let cell = Arc::new(AtomicU64::new(u64::from(u32::MAX) - 1));
         let barrier = Arc::new(Barrier::new(4));
         let writers: Vec<_> = (0..3)
@@ -2244,7 +2248,7 @@ mod fault_raise_tests {
                 let barrier = Arc::clone(&barrier);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    raise_fault_cell(&cell)
+                    super::raise_fault_cell_won(&cell)
                 })
             })
             .collect();
@@ -2253,15 +2257,28 @@ mod fault_raise_tests {
             .into_iter()
             .map(|writer| writer.join().unwrap())
             .collect();
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| matches!(result, Ok((_, true))))
+                .count(),
+            1,
+            "exactly one writer moves MAX-1 to MAX"
+        );
         assert!(
             results
                 .iter()
                 .filter_map(|result| result.as_ref().ok())
-                .all(|raised| *raised == u64::from(u32::MAX))
+                .all(|(raised, _)| *raised == u64::from(u32::MAX)),
+            "every reported raise is the last representable generation"
         );
-        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
+        let settled = cell.load(Ordering::SeqCst);
+        assert!(
+            settled == u64::from(u32::MAX) || settled == u64::from(u32::MAX) + 1,
+            "the cell holds MAX or the refusal sentinel, never a reopened era"
+        );
         assert!(raise_fault_cell(&cell).is_err());
+        assert_eq!(cell.load(Ordering::SeqCst), u64::from(u32::MAX) + 1);
     }
 }
 

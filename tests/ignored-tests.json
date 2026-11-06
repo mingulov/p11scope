@@ -1964,6 +1964,30 @@
       "path": "scope::tests::privileged_run_cgroup_place_moves_a_real_child",
       "reason": "privileged: moves a real child into a real run cgroup; run as root with --ignored --test-threads=1",
       "cell": "privileged"
+    },
+    {
+      "file": "tests/run_tree.rs",
+      "path": "privileged_run_tree_shell_wrapper_shows_grandchild_calls",
+      "reason": "privileged: run-tree shell-wrapper cell (root BPF capture, runtime SoftHSM workload + token)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/run_tree.rs",
+      "path": "privileged_run_tree_double_fork_shows_reparented_calls",
+      "reason": "privileged: run-tree double-fork cell (root BPF capture, runtime SoftHSM workload + token)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/run_tree.rs",
+      "path": "privileged_run_tree_outliving_child_is_disclosed",
+      "reason": "privileged: run-tree outliving-child cell (root BPF capture, runtime SoftHSM workload + token)",
+      "cell": "live-kernel"
+    },
+    {
+      "file": "tests/run_tree.rs",
+      "path": "privileged_run_tree_many_children_land_exact",
+      "reason": "privileged: run-tree many-children cell (root BPF capture, runtime SoftHSM workload + token)",
+      "cell": "live-kernel"
     }
   ]
 }

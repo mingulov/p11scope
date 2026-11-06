@@ -15612,6 +15612,55 @@ fn owned_loader_prearm_arms_beside_a_run_cgroup_naming_the_child() {
     ));
 }
 
+#[test]
+fn engine_retains_pid_reports_live_views_only() {
+    let mut engine = Engine::empty();
+    assert!(
+        !engine.retains_pid(std::process::id()),
+        "an empty engine retains nothing"
+    );
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    assert!(
+        engine.retains_pid(std::process::id()),
+        "a live view for the pid retains it"
+    );
+    assert!(!engine.retains_pid(u32::MAX), "no view, no retention");
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    let stale_pid = sleeper.id();
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), stale_pid).expect("sleeper view opens"));
+    assert!(engine.retains_pid(stale_pid), "a live view retains its pid");
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+    assert!(
+        !engine.retains_pid(stale_pid),
+        "a reaped view retains nothing"
+    );
+}
+
+#[test]
+fn engine_note_run_tree_gap_publishes_under_the_run_tree_subject() {
+    let mut engine = Engine::empty();
+    engine.note_run_tree_gap("the run cgroup could not be created");
+    assert_eq!(engine.counters.object_skips.len(), 1);
+    let skipped = &engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, "run process tree");
+    assert_eq!(skipped.reason, "the run cgroup could not be created");
+    engine.note_run_tree_gap("the run cgroup could not be created");
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "an identical gap dedups like every other skip"
+    );
+}
+
 /// A run cgroup scope missing the held child refuses the prearm by
 /// name, never arming blind.
 #[test]

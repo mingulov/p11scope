@@ -93,6 +93,15 @@ impl RunCgroup {
         );
         Ok(())
     }
+
+    /// Members still present in the run cgroup, excluding `pid` (the
+    /// direct child, settled separately): the handed-back survivor
+    /// count. Presence, not aliveness, is what's measured.
+    /// Scaffolding: the body lands with the implementation.
+    pub fn survivors_excluding(&self, pid: u32) -> std::io::Result<u64> {
+        let _ = pid;
+        Ok(999)
+    }
 }
 
 impl Drop for RunCgroup {
@@ -1209,6 +1218,34 @@ mod tests {
         let error =
             scope_names_child(&scope, 4242).expect_err("an unreadable cgroup names nothing");
         assert!(format!("{error:#}").contains("membership"), "{error:#}");
+    }
+
+    #[test]
+    fn run_cgroup_survivors_excluding_counts_other_members() {
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).unwrap();
+        std::fs::write(group.path().join("cgroup.procs"), "100\n200\n300\n").unwrap();
+        assert_eq!(group.survivors_excluding(100).unwrap(), 2);
+        assert_eq!(group.survivors_excluding(999).unwrap(), 3);
+        assert_eq!(group.survivors_excluding(200).unwrap(), 2);
+    }
+
+    #[test]
+    fn run_cgroup_survivors_excluding_ignores_malformed_lines() {
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).unwrap();
+        std::fs::write(group.path().join("cgroup.procs"), "abc\n\n100\n").unwrap();
+        assert_eq!(group.survivors_excluding(200).unwrap(), 1);
+    }
+
+    #[test]
+    fn run_cgroup_survivors_excluding_fails_on_an_unreadable_cgroup() {
+        let base = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(base.path()).unwrap();
+        let error = group
+            .survivors_excluding(100)
+            .expect_err("a missing cgroup.procs fails the count");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

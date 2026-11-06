@@ -24778,9 +24778,10 @@ fn joint_machine_idle_fresh_birth_waits_as_future_input() {
     let before = fixture.reduced_for(0);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
     fixture.published_labeled("idle-then-sign", None);
-    assert!(
-        fixture.reduced_for(0) > before,
-        "the caller's later call reduces"
+    assert_eq!(
+        fixture.reduced_for(0),
+        before + 1,
+        "the caller's later call reduces exactly once"
     );
     assert_eq!(fixture.machine.disposition_reason(), None);
 }

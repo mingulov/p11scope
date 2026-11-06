@@ -1,6 +1,7 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
 use super::*;
 use crate::attach::{OwnedLink, ProducerProgram, RetirementFixture};
+use crate::discovery::scheduler::{MAX_NEWCOMER_ADMISSIONS_PER_TICK, MAX_NEW_VIEWS_PER_TICK};
 use std::cell::RefCell;
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::time::{Duration, Instant};
@@ -983,4 +984,106 @@ fn newcomer_pid_admitted_before_deferred_backlog() {
         !kept.contains(&backlog_tail),
         "the marked tail waits another tick: {kept:?}"
     );
+}
+
+/// Task 7 call-site pin: the engine passes the bounded production share
+/// (half the 64-tick batch) to the admission window, not the whole batch.
+/// 40 marked backlog pids plus 40 fresh newcomers admit as an exact 32/32
+/// split. A call site passing `max_new_views` would admit all 40 fresh;
+/// a share of 1 would admit only 24 (the backlog cannot fill the rest).
+#[test]
+fn newcomer_share_bounded_at_the_engine_call_site() {
+    let batch = MAX_NEW_VIEWS_PER_TICK;
+    let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+    assert_eq!(share * 2, batch, "the production share is half the batch");
+    // One initial view, 48 backlog candidates (8 admit, 40 defer marked),
+    // and 40 fresh newcomers.
+    let guards = e06_spawn_sleeps(1 + 48 + 40);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let initial = pids[0];
+    let backlog_pool: Vec<u32> = pids[1..49].to_vec();
+    let fresh_pool: Vec<u32> = pids[49..].to_vec();
+    assert_eq!(fresh_pool.len(), 40);
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[initial]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    // Deterministic counts: the wall-time quanta have their own tests, so
+    // pin the tick quantum — 64 admission scans must never defer mid-window
+    // under parallel-test load.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_max_new_views_for_test(8);
+
+    // Phase 1: 48 newcomers against a batch of 8 admit 8 and mark the other
+    // 40 as backlog.
+    let mut listing = vec![initial];
+    listing.extend(backlog_pool.iter().copied());
+    e06_write_listing(scope_dir.path(), &listing);
+    refresh_inventory_once(&mut engine);
+    assert_eq!(engine.views.len(), 9, "eight backlog pids admit");
+    let views: std::collections::BTreeSet<u32> =
+        engine.views.iter().map(|view| view.pid()).collect();
+    let backlog: std::collections::BTreeSet<u32> = backlog_pool
+        .iter()
+        .copied()
+        .filter(|pid| !views.contains(pid))
+        .collect();
+    assert_eq!(backlog.len(), 40, "forty backlog pids defer");
+    for pid in &backlog {
+        assert!(
+            engine.newcomer_first_seen.contains_key(pid),
+            "deferred pid {pid} is marked backlog"
+        );
+    }
+
+    // Phase 2: the production batch sees 40 marked backlog plus 40 fresh.
+    engine.scheduler.set_max_new_views_for_test(batch);
+    listing.extend(fresh_pool.iter().copied());
+    e06_write_listing(scope_dir.path(), &listing);
+    for pid in &fresh_pool {
+        assert!(
+            !engine.newcomer_first_seen.contains_key(pid),
+            "fresh pid {pid} is an unmarked newcomer"
+        );
+    }
+    refresh_inventory_once(&mut engine);
+    let views: std::collections::BTreeSet<u32> =
+        engine.views.iter().map(|view| view.pid()).collect();
+    let fresh: std::collections::BTreeSet<u32> = fresh_pool.into_iter().collect();
+    let fresh_admitted = views.intersection(&fresh).count();
+    let backlog_admitted = views.intersection(&backlog).count();
+    assert_eq!(views.len(), 9 + batch, "one full batch admits");
+    assert_eq!(
+        fresh_admitted, share,
+        "fresh takes exactly the bounded share: {fresh_admitted} of {share}"
+    );
+    assert_eq!(
+        backlog_admitted,
+        batch - share,
+        "backlog keeps the rest of the batch"
+    );
+    assert!(
+        engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == "live discovery tick"
+                && skip.reason
+                    == "80 new processes pending; tick admitted 64 for deep scanning (tick limit 64)"
+        }),
+        "the deferral is exact: {:?}",
+        engine.counters.object_skips
+    );
+    let deferred: std::collections::BTreeSet<u32> = fresh
+        .union(&backlog)
+        .copied()
+        .filter(|pid| !views.contains(pid))
+        .collect();
+    assert_eq!(deferred.len(), 16, "sixteen pids defer to the next tick");
+    for pid in &deferred {
+        assert!(
+            engine.newcomer_first_seen.contains_key(pid),
+            "deferred pid {pid} stays marked"
+        );
+    }
 }

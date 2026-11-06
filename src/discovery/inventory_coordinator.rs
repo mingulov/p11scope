@@ -183,13 +183,14 @@ pub(crate) const MAX_PENDING_EXEC_NEWCOMERS: usize = 4096;
 pub(crate) const SHORT_LIVED_NEVER_SCANNED_SUBJECT: &str = "short-lived processes never scanned";
 
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
-/// programs missed two consecutive scan enumerations, so they started
-/// and exited between passes; `untracked` further arrivals could not be
-/// reconciled while the pending map was full. Pinned verbatim below.
+/// programs were never enumerated twice in a row or were listed only as
+/// exited before their scan, so no scan ever examined them; `untracked`
+/// further arrivals could not be reconciled while the pending map was
+/// full. Pinned verbatim below.
 pub(crate) fn short_lived_never_scanned_reason(confirmed: u64, untracked: u64) -> String {
     let mut reason = format!(
-        "{confirmed} short-lived process(es) started and exited between scan passes and were \
-         never scanned; their provider mappings are unknown, and no caller use is counted for them"
+        "{confirmed} short-lived process(es) started and exited before any scan could examine \
+         them; their provider mappings are unknown, and no caller use is counted for them"
     );
     if untracked > 0 {
         reason.push_str(&format!(
@@ -535,18 +536,18 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// call stays silent.
     stop_diff_done: bool,
     /// EXEC hooks for never-admitted pids, awaiting reconcile against
-    /// scan enumerations: each entry counts the consecutive completed
-    /// passes whose enumeration missed it. `apply_catalog` reconciles
-    /// (admitted pids are covered and drop; enumerated pids were seen
-    /// and drop; two misses count the pid as short-lived and drop it);
-    /// the terminal disclosure names what is left plus the accumulated
+    /// scan examinations: each entry counts the consecutive completed
+    /// passes that missed it. `apply_catalog` reconciles (admitted pids
+    /// are covered and drop; examined pids were disclosed elsewhere and
+    /// drop; two misses count the pid as short-lived and drop it); the
+    /// terminal disclosure names what is left plus the accumulated
     /// count. Arrival order, not hook stamps, so no clock comparison is
     /// needed. Cgroup scope never inserts (transaction coverage, not
     /// scan passes).
     pending_exec_newcomers: BTreeMap<u32, u8>,
-    /// Never-admitted exec newcomers that missed two consecutive scan
-    /// enumerations: short-lived programs that started and exited
-    /// between passes. Terminal-disclosed, then drained.
+    /// Never-admitted exec newcomers no scan ever examined: short-lived
+    /// programs that started and exited before any examination.
+    /// Terminal-disclosed, then drained.
     short_lived_never_scanned: u64,
     /// EXEC arrivals dropped while the pending map was full:
     /// unreconciled, disclosed beside the confirmed count, then drained.
@@ -4015,18 +4016,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // selection, so a rotated-out newcomer gets priority next time.
         self.note_applied_scan_tasks(&catalog);
         // The scan completed: reconcile hooks that drained before it
-        // against this pass's enumeration instead of clearing them.
-        // Admitted pids are covered (their fate is tracked); enumerated
-        // pids were seen (scan machinery owns their outcome, including
-        // admission failures and unreadable members). A pid neither
-        // admitted nor enumerated may have exec'd after this pass's
-        // listing and still be alive, so it earns a second miss before
-        // it counts: only two consecutive misses prove it started and
-        // exited between passes. (Pid reuse inside the two-pass window
-        // would misread a dead pid as covered; the window is seconds on
-        // a four-million pid space, so the count treats enumeration as
-        // authoritative.) Hooks drained between this collection's end
-        // and this apply reconcile the same way next pass.
+        // against this pass's examination instead of clearing them.
+        // Admitted pids are covered (their fate is tracked); examined
+        // pids were disclosed elsewhere (admission verdicts, skip gaps,
+        // the unexamined record). A pid neither admitted nor examined
+        // may have exec'd after this pass's listing and still be alive,
+        // so it earns a second miss before it counts: only two
+        // consecutive misses prove no scan ever examined it. (Pid reuse
+        // inside the two-pass window would misread a dead pid as
+        // covered; the window is seconds on a four-million pid space, so
+        // the count treats examination as authoritative.) Hooks drained
+        // between this collection's end and this apply reconcile the
+        // same way next pass.
         self.reconcile_exec_newcomers(&catalog);
         self.completed_scan_pass = true;
         PassReport {
@@ -8761,7 +8762,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         );
         true
     /// Track one EXEC hook for a never-admitted pid: pending until a
-    /// scan enumeration covers it or two consecutive enumerations miss
+    /// scan examination covers it or two consecutive examinations miss
     /// it. Bounded: repeat hooks for a tracked pid change nothing, and
     /// arrivals past [`MAX_PENDING_EXEC_NEWCOMERS`] distinct pids count
     /// as untracked instead of growing the map.
@@ -8777,23 +8778,29 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Reconcile pending never-admitted EXEC hooks against one completed
-    /// pass: admitted pids are covered, enumerated pids were seen, and a
-    /// pid missing from two consecutive enumerations counts as one
-    /// short-lived never-scanned program. An empty pending map costs
-    /// nothing.
+    /// pass: admitted pids are covered, and so are pids the pass examined
+    /// far enough to disclose elsewhere (deep-scanned, maps-matched,
+    /// unreadable with its skip gap, or past the cap with the unexamined
+    /// record). A pid missing from the examination — absent from the
+    /// listing, or listed only as exited before its scan — earns a miss;
+    /// two consecutive misses count one short-lived never-scanned
+    /// program. An empty pending map costs nothing.
     fn reconcile_exec_newcomers(&mut self, catalog: &crate::inspect_system::Catalog) {
         if self.pending_exec_newcomers.is_empty() {
             return;
         }
-        let enumerated: BTreeSet<u32> = catalog
+        let examined: BTreeSet<u32> = catalog
             .processes
             .iter()
+            .filter(|process| {
+                !matches!(process.status, crate::inspect_system::MemberStatus::Exited)
+            })
             .map(|process| process.pid)
             .collect();
         let adapter = &self.adapter;
         let mut counted = 0u64;
         self.pending_exec_newcomers.retain(|pid, misses| {
-            if adapter.live_id(*pid).is_some() || enumerated.contains(pid) {
+            if adapter.live_id(*pid).is_some() || examined.contains(pid) {
                 return false;
             }
             *misses = misses.saturating_add(1);
@@ -18401,9 +18408,9 @@ exit 0
     /// never-scanned processes with no untracked overflow.
     fn short_lived_gap_reason(confirmed: u64) -> String {
         format!(
-            "{confirmed} short-lived process(es) started and exited between scan passes and \
-             were never scanned; their provider mappings are unknown, and no caller use is \
-             counted for them"
+            "{confirmed} short-lived process(es) started and exited before any scan could \
+             examine them; their provider mappings are unknown, and no caller use is counted \
+             for them"
         )
     }
 
@@ -18634,8 +18641,12 @@ exit 0
                 start_time: record.start_time,
                 exe: record.exe.clone(),
             });
-        let mut first =
-            capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation.clone());
+        let mut first = capture_catalog(
+            &native.scene.pins,
+            &[&native.scene.path],
+            7,
+            generation.clone(),
+        );
         first.processes.push(crate::inspect_system::ProcessRecord {
             pid: 8,
             status: crate::inspect_system::MemberStatus::Exited,

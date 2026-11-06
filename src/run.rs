@@ -11702,6 +11702,67 @@ mod tests {
     }
 
     #[test]
+    fn run_user_refuses_uid_max_as_unknown() {
+        // Numeric form: a passwd source serving uid 2^32-1 must refuse with
+        // the plain preflight message, never reach setresuid(-1).
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| {
+                assert_eq!(uid, u32::MAX);
+                Some(fake_passwd(
+                    "maxuser",
+                    "/home/maxuser",
+                    "/bin/sh",
+                    u32::MAX,
+                    1002,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("4294967295")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user 4294967295: unknown account");
+        // Named form: a row naming uid 2^32-1 is no account either.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("a name selection must not resolve by uid");
+            },
+            passwd_by_name: &|user: &OsStr| {
+                assert_eq!(user, OsStr::new("alice"));
+                Some(fake_passwd(
+                    "alice",
+                    "/home/alice",
+                    "/bin/sh",
+                    u32::MAX,
+                    1002,
+                ))
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user alice: unknown account");
+    }
+
+    #[test]
     fn run_user_needs_root_and_refuses_set_id_observers() {
         let probes = InvokerProbes {
             passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {

@@ -14044,7 +14044,9 @@ mod tests {
             .expect("the guard marks an equal overlay range unproven");
         io.script_diagnosed(WitnessOutcome {
             verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
-            diagnosis: Some(WitnessDiagnosis::uncounted(WitnessStage::CollectionWork)),
+            diagnosis: Some(WitnessDiagnosis {
+                stage: WitnessStage::CollectionWork,
+            }),
         });
         let reason = run_k1_prove(&mut io, held, outcome).expect("unavailable refuses");
         assert_eq!(

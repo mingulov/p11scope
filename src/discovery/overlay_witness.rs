@@ -255,31 +255,15 @@ pub(crate) enum WitnessStage {
     NoRefusedRange,
 }
 
-/// Why one witness query failed, plus whether it counted as a query.
-/// The pre-query early-outs (scoped collection, a spent deadline) are
-/// not queries — no stats, no log line — but the refusal still names
-/// the stage.
+/// Why one witness query failed. The pre-query early-outs (scoped
+/// collection, a spent deadline) are not queries — no stats, no log
+/// line — but the refusal still names the stage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct WitnessDiagnosis {
     pub(crate) stage: WitnessStage,
-    pub(crate) counted: bool,
 }
 
 impl WitnessDiagnosis {
-    pub(crate) fn counted(stage: WitnessStage) -> Self {
-        Self {
-            stage,
-            counted: true,
-        }
-    }
-
-    pub(crate) fn uncounted(stage: WitnessStage) -> Self {
-        Self {
-            stage,
-            counted: false,
-        }
-    }
-
     /// The machine token for the internal log line.
     fn stage_token(self) -> String {
         match self.stage {
@@ -369,31 +353,11 @@ pub(crate) struct WitnessOutcome {
     pub(crate) diagnosis: Option<WitnessDiagnosis>,
 }
 
-impl WitnessOutcome {
-    /// Whether this outcome counted as a query (stats and the log
-    /// line). Only the pre-query early-outs skip counting; a verdict
-    /// without a diagnosis counts exactly like before.
-    fn counted(&self) -> bool {
-        self.diagnosis
-            .as_ref()
-            .is_none_or(|diagnosis| diagnosis.counted)
-    }
-}
-
-/// An unavailable verdict at a counted stage.
+/// An unavailable verdict at a stage.
 fn unavailable(stage: WitnessStage) -> WitnessOutcome {
     WitnessOutcome {
         verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
-        diagnosis: Some(WitnessDiagnosis::counted(stage)),
-    }
-}
-
-/// An unavailable verdict the query never ran for (scoped collection,
-/// a spent deadline): a refusal, not a query.
-fn skipped(stage: WitnessStage) -> WitnessOutcome {
-    WitnessOutcome {
-        verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
-        diagnosis: Some(WitnessDiagnosis::uncounted(stage)),
+        diagnosis: Some(WitnessDiagnosis { stage }),
     }
 }
 
@@ -415,7 +379,7 @@ fn diagnosis_for_deny(deny: &crate::attach::identity_iter::KernelDeny) -> Witnes
         KernelDeny::NoTaskIterPidfd => WitnessStage::BtfNoTaskIterPidfd,
         KernelDeny::NoBtf(_) => WitnessStage::BtfUnreadable,
     };
-    WitnessDiagnosis::counted(stage)
+    WitnessDiagnosis { stage }
 }
 
 /// The object-load failure as a witness stage: permission vs verifier
@@ -430,7 +394,7 @@ fn diagnosis_for_load_error(error: &crate::attach::identity_iter::LoadError) -> 
         }
         _ => WitnessStage::ObjectLoadFailed,
     };
-    WitnessDiagnosis::counted(stage)
+    WitnessDiagnosis { stage }
 }
 
 /// The detailed session-load failure as a witness stage. The probe's
@@ -441,12 +405,12 @@ fn diagnosis_for_identity_load_failure(
     use crate::discovery::kernel_identity::IdentityLoadFailure;
     match failure {
         IdentityLoadFailure::ObjectLoad(error) => diagnosis_for_load_error(error),
-        IdentityLoadFailure::ProbeFailed(error) => {
-            WitnessDiagnosis::counted(WitnessStage::FunctionalProbe { stage: error.stage })
-        }
-        IdentityLoadFailure::ProbeMismatch => {
-            WitnessDiagnosis::counted(WitnessStage::ProbeMismatch)
-        }
+        IdentityLoadFailure::ProbeFailed(error) => WitnessDiagnosis {
+            stage: WitnessStage::FunctionalProbe { stage: error.stage },
+        },
+        IdentityLoadFailure::ProbeMismatch => WitnessDiagnosis {
+            stage: WitnessStage::ProbeMismatch,
+        },
     }
 }
 
@@ -576,7 +540,7 @@ pub(crate) fn preload_session() {
 /// trigger range's kernel proof directly. Anything unexpected —
 /// including a lock, load, install, run or shape anomaly — is
 /// [`WitnessFailure::Unavailable`] or [`WitnessFailure::AnchorBindingFailed`],
-/// never a join. Only counted queries touch the stats and the log line.
+/// never a join.
 pub(crate) fn prove_original_file(
     pid: u32,
     file: &File,
@@ -585,25 +549,14 @@ pub(crate) fn prove_original_file(
     ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> WitnessVerdict {
-    let started = Instant::now();
-    let outcome = prove_original_file_diagnosed(pid, file, held, key, ranges, budget);
-    if outcome.counted() {
-        let wall = started.elapsed();
-        WITNESS_QUERIES.fetch_add(1, Ordering::SeqCst);
-        WITNESS_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::SeqCst);
-        if crate::inspect_system::stage_timings_requested() {
-            eprintln!(
-                "{}",
-                witness_log_line(outcome.verdict, outcome.diagnosis, wall.as_millis())
-            );
-        }
-    }
-    outcome.verdict
+    prove_original_file_diagnosed(pid, file, held, key, ranges, budget).verdict
 }
 
 /// The diagnosed prove step: the verdict plus the failure stage, if
 /// any. Every unavailable verdict carries its diagnosis; joins,
-/// other-file refusals and anchor failures carry none.
+/// other-file refusals and anchor failures carry none. The single
+/// choke point for stats and the log line: every path below the
+/// early-outs ran a query, so all of them count.
 pub(crate) fn prove_original_file_diagnosed(
     pid: u32,
     file: &File,
@@ -616,12 +569,23 @@ pub(crate) fn prove_original_file_diagnosed(
     // substrate; the witness stays off there too, without spending a
     // session, FDs or runs.
     if budget.has_collection_work() {
-        return skipped(WitnessStage::CollectionWork);
+        return unavailable(WitnessStage::CollectionWork);
     }
     if budget.check_deadline_now().is_some() {
-        return skipped(WitnessStage::DeadlineSpent);
+        return unavailable(WitnessStage::DeadlineSpent);
     }
-    prove_original_file_inner(pid, file, held, key, ranges, budget)
+    let started = Instant::now();
+    let outcome = prove_original_file_inner(pid, file, held, key, ranges, budget);
+    let wall = started.elapsed();
+    WITNESS_QUERIES.fetch_add(1, Ordering::SeqCst);
+    WITNESS_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::SeqCst);
+    if crate::inspect_system::stage_timings_requested() {
+        eprintln!(
+            "{}",
+            witness_log_line(outcome.verdict, outcome.diagnosis, wall.as_millis())
+        );
+    }
+    outcome
 }
 
 fn prove_original_file_inner(
@@ -717,9 +681,9 @@ fn prove_original_file_inner(
     drop(installed);
     let verdict = verdict_for_confirmation(&confirmation, ranges);
     let diagnosis = match verdict {
-        WitnessVerdict::Failed(WitnessFailure::Unavailable) => Some(WitnessDiagnosis::counted(
-            stage_for_unproven_confirmation(&confirmation, ranges),
-        )),
+        WitnessVerdict::Failed(WitnessFailure::Unavailable) => Some(WitnessDiagnosis {
+            stage: stage_for_unproven_confirmation(&confirmation, ranges),
+        }),
         _ => None,
     };
     WitnessOutcome { verdict, diagnosis }
@@ -731,11 +695,19 @@ fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis>
     }
     let parsed = match aya::Btf::from_sys_fs() {
         Ok(parsed) => parsed,
-        Err(_) => return Err(WitnessDiagnosis::counted(WitnessStage::BtfParse)),
+        Err(_) => {
+            return Err(WitnessDiagnosis {
+                stage: WitnessStage::BtfParse,
+            });
+        }
     };
     let dir = match crate::inspect_system::ProbeDir::create("p11scope-witness-probe") {
         Ok(dir) => dir,
-        Err(_) => return Err(WitnessDiagnosis::counted(WitnessStage::ProbeDir)),
+        Err(_) => {
+            return Err(WitnessDiagnosis {
+                stage: WitnessStage::ProbeDir,
+            });
+        }
     };
     IdentitySession::probe_and_load_detailed(&parsed, dir.path())
         .map_err(|failure| diagnosis_for_identity_load_failure(&failure))
@@ -1022,13 +994,14 @@ mod tests {
     }
 
     #[test]
-    fn diagnosed_collection_work_skips_uncounted_with_stage() {
-        // RED: a scoped-collection early-out is not a query, but the
-        // refusal must still name its stage in plain words.
+    fn diagnosed_collection_work_skips_the_query_with_stage() {
+        // A scoped-collection early-out is not a query (no stats), but
+        // the refusal still names its stage in plain words.
         let held = overlay_held();
         let mut budget = CaptureWorkBudget::default();
         budget.set_collection_work(crate::discovery::scan::CollectionWork::new(|_| true));
         let file = File::open("/dev/null").unwrap();
+        let (queries_before, _) = witness_stats_for_test();
         let outcome = prove_original_file_diagnosed(
             std::process::id(),
             &file,
@@ -1051,8 +1024,9 @@ mod tests {
             .diagnosis
             .expect("an unavailable verdict carries its stage");
         assert_eq!(diagnosis.stage, WitnessStage::CollectionWork);
-        assert!(
-            !diagnosis.counted,
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
             "a scoped-collection early-out is not a query"
         );
         assert_eq!(
@@ -1063,13 +1037,14 @@ mod tests {
     }
 
     #[test]
-    fn diagnosed_spent_deadline_skips_uncounted_with_stage() {
-        // RED: a query past the capture deadline never runs, and the
-        // refusal names the spent deadline.
+    fn diagnosed_spent_deadline_skips_the_query_with_stage() {
+        // A query past the capture deadline never runs (no stats), and
+        // the refusal names the spent deadline.
         let held = overlay_held();
         let mut budget = CaptureWorkBudget::default();
         budget.set_deadline(Some(0));
         let file = File::open("/dev/null").unwrap();
+        let (queries_before, _) = witness_stats_for_test();
         let outcome = prove_original_file_diagnosed(
             std::process::id(),
             &file,
@@ -1092,8 +1067,9 @@ mod tests {
             .diagnosis
             .expect("an unavailable verdict carries its stage");
         assert_eq!(diagnosis.stage, WitnessStage::DeadlineSpent);
-        assert!(
-            !diagnosis.counted,
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
             "a spent-deadline early-out is not a query"
         );
     }
@@ -1275,7 +1251,7 @@ mod tests {
             (WitnessStage::NoRefusedRange, "no refused range to prove"),
         ];
         for (stage, expected) in vocabulary {
-            let diagnosis = WitnessDiagnosis::counted(*stage);
+            let diagnosis = WitnessDiagnosis { stage: *stage };
             assert_eq!(diagnosis.note(), *expected, "stage {stage:?}");
             let enriched = diagnosis.enriched_reason();
             assert!(
@@ -1295,9 +1271,11 @@ mod tests {
     fn log_line_names_stage_and_note() {
         // RED: the internal verdict line carries the machine token plus
         // the plain-words note; joins stay bare.
-        let diagnosis = WitnessDiagnosis::counted(WitnessStage::FunctionalProbe {
-            stage: "scope-write",
-        });
+        let diagnosis = WitnessDiagnosis {
+            stage: WitnessStage::FunctionalProbe {
+                stage: "scope-write",
+            },
+        };
         assert_eq!(
             witness_log_line(
                 WitnessVerdict::Failed(WitnessFailure::Unavailable),
@@ -1368,7 +1346,9 @@ mod tests {
             generation: 0,
             unavailable: None,
         };
-        let stub = WitnessDiagnosis::uncounted(WitnessStage::ProbeDir);
+        let stub = WitnessDiagnosis {
+            stage: WitnessStage::ProbeDir,
+        };
         for _ in 0..2 {
             assert!(
                 !ensure_session_loaded_with(&mut guard, || {

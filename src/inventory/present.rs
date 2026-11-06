@@ -1836,6 +1836,35 @@ fn render_snapshot_inner(
             presentation.gaps_suppressed,
         );
     }
+    // The edge list below never carries module-level use no caller could
+    // claim: short-lived callers exit before their witness rows bind, so
+    // their folded entries would hide behind an innocent edge count. The
+    // summary names the unattributed totals in plain words, reusing the
+    // module line's gate (unidentified rows with a positive lower bound);
+    // rows bound to an identified caller are attributed, never counted
+    // here. JSON keeps the per-module record either way.
+    {
+        let mut rows: u64 = 0;
+        let mut entries: u64 = 0;
+        for module in &presentation.modules {
+            if let Some(unbound) = &module.unbound_use {
+                let unidentified = unbound.reasons.keys().any(|code| *code != NO_MAPPING_EDGE);
+                if unidentified {
+                    rows = rows.saturating_add(unbound.rows);
+                    entries = entries.saturating_add(unbound.entries);
+                }
+            }
+        }
+        if entries > 0 {
+            let _ = writeln!(
+                out,
+                "unattributed use: at least {} entries in {} witness row{} never bound to a caller",
+                entries,
+                rows,
+                if rows == 1 { "" } else { "s" }
+            );
+        }
+    }
     // Key-operation summary: revision, status, row counts and
     // per-category terminal counts from the shared projection.
     // Counts and the fixed category/unit/status vocabulary only —

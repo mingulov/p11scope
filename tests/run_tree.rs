@@ -287,6 +287,63 @@ fn verdict(profile: &serde_json::Value) -> &str {
         .unwrap_or_else(|| panic!("no completeness verdict: {profile}"))
 }
 
+/// The honest run-tree verdict for descendants that retired between
+/// admission passes: PARTIAL with exactly one descendant gap per
+/// never-admitted generation, zero event loss, the run cgroup scope,
+/// and no run-scope refusal (no `run process tree` gap entry).
+fn assert_honest_tree_gaps(profile: &serde_json::Value, descendant_gaps: u64) {
+    assert_eq!(verdict(profile), "PARTIAL", "{profile}");
+    let evidence = profile.get("evidence").expect("evidence");
+    assert_eq!(
+        evidence.get("pid_descendant_gaps"),
+        Some(&serde_json::Value::from(descendant_gaps)),
+        "{profile}"
+    );
+    assert_eq!(
+        evidence.get("event_loss"),
+        Some(&serde_json::Value::from(0)),
+        "{profile}"
+    );
+    assert_eq!(
+        evidence.get("discovery_ring_loss"),
+        Some(&serde_json::Value::from(0)),
+        "{profile}"
+    );
+    assert_eq!(
+        profile
+            .get("capture")
+            .and_then(|capture| capture.get("scope")),
+        Some(&serde_json::Value::from("cgroup")),
+        "{profile}"
+    );
+    let labels: Vec<&str> = profile
+        .get("cgroups")
+        .and_then(|cgroups| cgroups.as_array())
+        .expect("cgroups")
+        .iter()
+        .filter_map(|cgroup| cgroup.get("label").and_then(|label| label.as_str()))
+        .collect();
+    assert!(
+        labels
+            .iter()
+            .any(|label| label.starts_with("p11scope-run-")),
+        "the run cgroup scope is retained, not degraded: {labels:?}"
+    );
+    let skipped = evidence
+        .get("skipped")
+        .and_then(|skipped| skipped.as_array())
+        .expect("evidence.skipped");
+    assert!(
+        skipped.iter().all(|entry| {
+            entry
+                .get("name")
+                .and_then(|name| name.as_str())
+                .is_some_and(|name| name != "run process tree")
+        }),
+        "no run-scope refusal gap: {skipped:?}"
+    );
+}
+
 /// SoftHSM call-sequence workload. Usage:
 /// `workload MODULE LEDGER_FILE ITERATIONS [SLEEP_SECS]`.
 /// Dlopens the module and issues the scripted sequence (P2-8 call
@@ -592,7 +649,9 @@ fn run_prefix(module: &Path, out: &Path) -> Vec<String> {
 
 /// Shell wrapper: `sh -c` runs the workload twice sequentially. The
 /// shell never maps the provider, so every observed call is a
-/// grandchild's; both grandchildren land ledger-exact.
+/// grandchild's; both grandchildren land ledger-exact. Both retire
+/// between admission passes, so the verdict is honestly PARTIAL with
+/// two descendant gaps and zero loss.
 #[test]
 #[ignore = "privileged: run-tree shell-wrapper cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_shell_wrapper_shows_grandchild_calls() {
@@ -618,14 +677,16 @@ fn privileged_run_tree_shell_wrapper_shows_grandchild_calls() {
     let status = capture.wait_expect("run");
     assert!(status.success(), "run exits with the shell's status");
     let profile = read_profile(&out);
-    assert_eq!(verdict(&profile), "COMPLETE", "{profile}");
+    assert_honest_tree_gaps(&profile, 2);
     let want = sum_ledgers(&[ledger1, ledger2]);
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);
 }
 
 /// Double fork: the middle generation exits before the reparented
-/// leaf issues its calls. The leaf's ledger lands exact.
+/// leaf issues its calls. The leaf's ledger lands exact; the middle
+/// and the leaf both retire between admission passes (the direct
+/// child waits for both and exits last), so two descendant gaps stay.
 #[test]
 #[ignore = "privileged: run-tree double-fork cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_double_fork_shows_reparented_calls() {
@@ -648,7 +709,7 @@ fn privileged_run_tree_double_fork_shows_reparented_calls() {
     let status = capture.wait_expect("run");
     assert!(status.success(), "run exits with the fixture's status");
     let profile = read_profile(&out);
-    assert_eq!(verdict(&profile), "COMPLETE", "{profile}");
+    assert_honest_tree_gaps(&profile, 2);
     let want = sum_ledgers(&[ledger]);
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);
@@ -724,7 +785,8 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
 }
 
 /// Many children: 32 sequential grandchildren through one shell loop
-/// land ledger-exact in one profile.
+/// land ledger-exact in one profile, with one descendant gap each:
+/// every grandchild retires between admission passes.
 #[test]
 #[ignore = "privileged: run-tree many-children cell (root BPF capture, runtime SoftHSM workload + token)"]
 fn privileged_run_tree_many_children_land_exact() {
@@ -753,7 +815,7 @@ fn privileged_run_tree_many_children_land_exact() {
     let status = capture.wait_expect("run");
     assert!(status.success(), "run exits with the shell's status");
     let profile = read_profile(&out);
-    assert_eq!(verdict(&profile), "COMPLETE", "{profile}");
+    assert_honest_tree_gaps(&profile, 32);
     let want = sum_ledgers(&ledgers);
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);

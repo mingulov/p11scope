@@ -1779,6 +1779,34 @@ fn physical_gap_category_requires_exact_internal_subject_and_description() {
     }
 }
 
+/// Run-tree gaps project under their own subject with the run-owned
+/// reason intact: the templates carry only counts and I/O-kind words
+/// (never paths, PIDs, or error chains), and the survivor count is
+/// the disclosure.
+#[cfg(test)]
+#[test]
+fn run_tree_gaps_project_under_their_own_subject_with_their_count() {
+    for reason in [
+        "1 process-tree member was still present when the command exited; \
+         its calls after the run end are out of scope",
+        "3 process-tree members were still present when the command exited; \
+         their calls after the run end are out of scope",
+        "the run cgroup could not be created (permission denied); \
+         only the started command is observed",
+        "the run cgroup membership could not be read at run end; \
+         handed-back descendants are unknown",
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: "run process tree".into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "run process tree");
+        assert_eq!(projected.reason, reason);
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("discovery unavailable"), "{json}");
+    }
+}
+
 #[cfg(test)]
 #[test]
 fn never_stop_gaps_project_to_finite_reasons_without_paths() {

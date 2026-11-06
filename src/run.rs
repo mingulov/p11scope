@@ -1546,7 +1546,7 @@ impl OwnedChild {
             .collect();
         let environment = child_environment(std::env::vars_os())?;
         if let Some(notice) = child_env_removal_notice(std::env::vars_os()) {
-            eprintln!("{notice}");
+            emit_capture_diagnostic(&notice);
         }
         let envp: Vec<*const libc::c_char> = environment
             .iter()

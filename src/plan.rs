@@ -4181,10 +4181,13 @@ pub(crate) fn build_from_sources_scan_authorized(
             slots: 0,
             active: &BTreeMap::new(),
             owned: &BTreeMap::new(),
+            first_plan: None,
+            first_plan_had_provider: false,
         },
         false,
         AdmissionPolicy::detailed(),
         AdmissionScope::Named,
+        false,
     );
     plan.skipped.extend(orphaned);
     plan.note_object_identities(pinned);

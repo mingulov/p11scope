@@ -7288,6 +7288,282 @@ mod tests {
         }
     }
 
+    fn sole_complete_module() -> ReconciledModule {
+        let key = TEST_OBJECT;
+        let object = PinnedObjectId(key.inode as u32);
+        let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .collect();
+        assert_eq!(names.len(), 68);
+        let entries: Vec<ScannedEntry> = names
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| ScannedEntry {
+                name,
+                object: key,
+                object_path: "/opt/p11.so".into(),
+                file_offset: 0x1000 + (index as u64) * 8,
+            })
+            .collect();
+        let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+            entries
+                .iter()
+                .map(|entry| (entry.name.to_string(), entry.file_offset))
+                .collect::<Vec<_>>(),
+        );
+        ReconciledModule {
+            exports,
+            getter_present: false,
+            witness_fault: false,
+            object,
+            entry_objects: vec![vec![object; entries.len()]],
+            scanned: ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: "/opt/p11.so".into(),
+                decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                }],
+                interfaces: vec![],
+            },
+        }
+    }
+
+    fn sole_scan_semantic(module: &ReconciledModule) -> bool {
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        !plan.slots.is_empty() && plan.slots.iter().all(|slot| slot.semantic_authorized)
+    }
+
+    #[test]
+    fn sole_complete_single_full_table_mints_scan_semantics() {
+        let module = sole_complete_module();
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.slots.len(), 68);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a sole complete 2.x table mints scan semantics without linkage or live return"
+        );
+    }
+
+    #[test]
+    fn sole_complete_second_table_refuses() {
+        let mut module = sole_complete_module();
+        let mut second = module.scanned.tables[0].clone();
+        second.address = 0x8000;
+        second.file_offset = Some(0x1000);
+        module.scanned.tables.push(second);
+        module
+            .entry_objects
+            .push(vec![module.object; module.scanned.tables[0].entries.len()]);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a second table candidate refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_vendor_interface_claim_refuses() {
+        let mut module = sole_complete_module();
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "other",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        assert!(
+            !sole_scan_semantic(&module),
+            "a vendor layout claim on the table refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_known_prefix_walk_refuses() {
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].walk = "known_prefix";
+        assert!(
+            !sole_scan_semantic(&module),
+            "a non-full walk refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_short_table_refuses() {
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let dropped = table.entries.pop().expect("68 entries");
+        assert_eq!(dropped.name, "C_WaitForSlotEvent");
+        module.entry_objects[0].pop();
+        let exports: Vec<(String, u64)> = table
+            .entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect();
+        module.exports = std::sync::Arc::from(exports);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a 67-slot table refuses the 68-slot sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_cross_object_bootstrap_refuses() {
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetFunctionList")
+            .expect("bootstrap entry");
+        let other_key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 43,
+        };
+        table.entries[position].object = other_key;
+        table.entries[position].object_path = "/opt/other.so".into();
+        module.entry_objects[0][position] = PinnedObjectId(43);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a forwarded bootstrap refuses the own-code sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_required_null_refuses() {
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_SignInit")
+            .expect("required entry");
+        table.entries.remove(position);
+        table.null_entries.push("C_SignInit");
+        module.entry_objects[0].remove(position);
+        let exports: Vec<(String, u64)> = table
+            .entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect();
+        module.exports = std::sync::Arc::from(exports);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a NULL required key-operation entry refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_nonrequired_null_still_mints() {
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetInfo")
+            .expect("non-required entry");
+        table.entries.remove(position);
+        table.null_entries.push("C_GetInfo");
+        module.entry_objects[0].remove(position);
+        let exports: Vec<(String, u64)> = table
+            .entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect();
+        module.exports = std::sync::Arc::from(exports);
+        let plan = build_from_sources_scan_authorized(
+            std::slice::from_ref(&module),
+            &[],
+            &PinnedObjects::empty(),
+        );
+        assert_eq!(plan.slots.len(), 67);
+        assert!(
+            plan.slots.iter().all(|slot| slot.semantic_authorized),
+            "a NULL non-required entry keeps the sole-table grant with no probe there"
+        );
+    }
+
+    #[test]
+    fn sole_complete_missing_getfunctionlist_export_refuses() {
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetFunctionList")
+            .expect("getter entry");
+        table.entries.remove(position);
+        table.null_entries.push("C_GetFunctionList");
+        module.entry_objects[0].remove(position);
+        let exports: Vec<(String, u64)> = table
+            .entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect();
+        assert!(
+            !exports.iter().any(|(name, _)| name == "C_GetFunctionList"),
+            "the getter export is gone with its entry"
+        );
+        module.exports = std::sync::Arc::from(exports);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a missing C_GetFunctionList export refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_double_loaded_refuses() {
+        let mut module = sole_complete_module();
+        module.scanned.double_loaded = true;
+        module.scanned.same_file_loads = 2;
+        assert!(
+            !sole_scan_semantic(&module),
+            "a double-loaded file refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_required_names_match_object_descriptors() {
+        let computed: BTreeSet<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
+            .iter()
+            .map(|field| field.name)
+            .filter(|name| crate::kinds::object_descriptor(name).is_some())
+            .collect();
+        let pinned: BTreeSet<&str> = SOLE_COMPLETE_REQUIRED_2X.into_iter().collect();
+        assert_eq!(
+            pinned, computed,
+            "the sole-table required set tracks the decoder read set"
+        );
+    }
+
     #[test]
     fn native_short_prefix_without_bad_targets_remains_semantically_incomplete() {
         for words in [0, 1, 3, 67] {

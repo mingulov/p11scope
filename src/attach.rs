@@ -11615,6 +11615,37 @@ mod tests {
         }
     }
 
+    /// The doctor self-probe must not need CAP_SYS_ADMIN where the host
+    /// proves uprobe-multi: a multi session links it, and the perf single
+    /// stays only as the fallback for a host that proves link_create but
+    /// refuses a pid-filtered link.
+    #[test]
+    fn diagnostic_probe_prefers_a_multi_link_on_multi_sessions() {
+        fn body<'a>(source: &'a str, signature: &str) -> &'a str {
+            source
+                .split_once(signature)
+                .unwrap()
+                .1
+                .split_once("\n    }")
+                .unwrap()
+                .0
+        }
+        let source = include_str!("attach.rs");
+        let text = body(source, "    pub(crate) fn attach_diagnostic_probe(");
+        assert!(
+            text.contains("AttachBackend::Multi"),
+            "no multi branch in diagnostic attach"
+        );
+        assert!(
+            text.contains("attach_group"),
+            "diagnostic attach never links"
+        );
+        assert!(
+            text.contains("UProbeScope::CallingProcess"),
+            "perf fallback lost"
+        );
+    }
+
     #[test]
     fn admission_refusals_precede_the_actual_session_factory_for_every_backend() {
         use super::{BackendSelection, CapturePolicy, Scope, Session};

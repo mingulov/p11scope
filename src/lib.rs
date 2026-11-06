@@ -113,8 +113,8 @@ pub fn try_stderr_line(line: &str) -> std::io::Result<()> {
 /// crate-private module: the owned child, the pause coordinator, its clocks,
 /// maps, drains, guards and injected actions are unreachable from outside.
 pub use run::{
-    OwnedRunOutcome, capture, capture_startup_signal_dispositions, failure_already_reported,
-    failure_exit_code, run_owned,
+    OwnedRunOutcome, capture, capture_startup_signal_dispositions, check_run_user,
+    failure_already_reported, failure_exit_code, run_owned,
 };
 
 /// The BPF object, built by build.rs. Alignment matters: aya parses it

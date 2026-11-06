@@ -104,8 +104,27 @@ User-facing limits live in
   state. A quiet pre-armed interval is a stated watch interval, not
   proven-exact coverage, except on an owned `run` that meets the proven
   bound.
+- `p11scope run --user <name|uid>` (root only, like `strace -u`) starts
+  the command as that account instead of the sudo invoker, with its
+  supplementary groups and home environment (`HOME`/`USER`/`LOGNAME`/
+  `SHELL` from its passwd entry, `XDG_RUNTIME_DIR` when
+  `/run/user/<uid>` is provably its own, `MAIL` dropped). `--user root`
+  stays root on purpose. Without root, for an unknown account, or for a
+  set-id observer it refuses with a plain message (exit 2) before
+  anything starts; `-v` prints `running <cmd> as <user>`. The default
+  is unchanged: under sudo the invoker, otherwise the observer itself.
 
 ### Changed
+
+- An owned `run` child inherits the observer's environment unchanged
+  (replacing the 0.5.x small allowlist), so the workload behaves as
+  without p11scope. Only p11scope's own control inputs are withheld by
+  name — the whole `SUDO_*` namespace and `P11SCOPE_*` — with one
+  stderr line naming them; values of inherited variables are never
+  inspected or logged. Note sudo itself resets the environment first
+  (pass application variables with `sudo --preserve-env=NAME` or as
+  `env NAME=value ...` after the `--`), while anything exported in a
+  root shell now reaches the unprivileged child.
 
 - Inventory holds more endpoints: `inventory --system` defaults to
   32,768 endpoints on hosts with uprobe_multi, and `--max-endpoints`

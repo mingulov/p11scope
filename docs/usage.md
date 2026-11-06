@@ -349,12 +349,16 @@ are still in progress.
 > the launcher was `sudo`. The child has no capabilities, cannot gain
 > privilege across exec, inherits the observer's environment unchanged (so
 > the workload behaves as without p11scope), and does not inherit unrelated
-> file descriptors. Only p11scope's own control inputs are withheld from the
-> child by name, with one stderr line naming them: `SUDO_UID`/`SUDO_GID`
-> (consumed as the target-account selection), `SUDO_USER`/`SUDO_COMMAND`
-> (describing the sudo invocation a bare execution has none of), and
-> `P11SCOPE_*` (p11scope's own control namespace). Values are never read or
-> logged. The
+> file descriptors. Note sudo itself resets the environment first: pass
+> application variables with `sudo --preserve-env=NAME` or as
+> `env NAME=value ...` after the `--`. Conversely, anything exported in a
+> root shell (`sudo -i`/`-s`) now reaches the unprivileged child. Only
+> p11scope's own control inputs are withheld from the child by name, with
+> one stderr line naming them: `SUDO_*` (the whole sudo namespace: the
+> target-account selection plus anything else describing the sudo
+> invocation a bare execution has none of) and `P11SCOPE_*` (p11scope's
+> own control namespace). Values of inherited variables are never
+> inspected or logged. The
 > command is an opened ELF executable; invoke scripts explicitly as
 > `/bin/sh /path/to/script`. Owned launch requires procfs mounted
 > at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
@@ -363,18 +367,27 @@ are still in progress.
 > command's original path. The sudo path runs the child as the invoker
 > with the invoker's supplementary groups and home environment, as if the
 > user had run the command directly: `HOME`/`USER`/`LOGNAME`/`SHELL` come
-> from the invoker's passwd entry and `XDG_RUNTIME_DIR` from
-> `/run/user/<uid>` when that directory exists and is owned by the invoker.
+> from the invoker's passwd entry, `XDG_RUNTIME_DIR` from
+> `/run/user/<uid>` when that directory exists and is owned by the invoker,
+> and `MAIL` is dropped (no passwd field names a mailbox).
 > `-v`/`--verbose` prints the restored identity as one stderr line,
 > `running <cmd> as <user> (groups and home restored)`; without it `run`
 > stays quiet about the identity. An account the observer cannot resolve
-> refuses with a plain message before anything starts. When the observer
+> refuses with a plain message before anything starts.
+> `--user <name|uid>` (root only, like `strace -u`) starts the command as
+> that account instead of the invoker, with its groups and home
+> environment from its passwd entry; `--user root` stays root on purpose.
+> Without root, for an unknown account, or for a set-id observer it
+> refuses with a plain message (exit 2), and `-v` prints
+> `running <cmd> as <user>`. When the observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and
 > group-gated providers (e.g. opencryptoki's group-owned shared memory) keep
-> working under observation. Measured 2026-09-15 on Fedora 44 (6.19) and
-> Ubuntu 22.04 (5.15). Use the
+> working under observation. Such an observer starts in the loader's
+> secure mode, which unsets `LD_*`, `TMPDIR` and similar variables before
+> the child inherits the environment. Measured 2026-09-15 on Fedora 44
+> (6.19) and Ubuntu 22.04 (5.15). Use the
 > [privileges guide](#privileges-per-environment) for current capability
 > requirements.
 

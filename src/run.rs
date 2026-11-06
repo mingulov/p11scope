@@ -728,7 +728,11 @@ fn script_snap_refusal_error(
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: a script is
 /// told about its interpreter before any kernel verdict is consulted.
-fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result<()> {
+fn check_owned_target_runnable(
+    program: &OsStr,
+    args: &[OsString],
+    user: Option<&OsStr>,
+) -> io::Result<()> {
     let probes = SnapProbes {
         exists: &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
         is_runnable: &snap_path_candidate_is_runnable,
@@ -739,7 +743,7 @@ fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result
         args,
         std::env::var_os("PATH").as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-        ChildIdentity::for_invoker()
+        ChildIdentity::for_run_selection(user)
             .ok()
             .map(|identity| (identity.uid, identity.gid)),
         &probes,
@@ -819,8 +823,8 @@ struct SelectedIdentity {
     sudo_drop: bool,
 }
 
-/// One passwd row the sudo-drop path consumes: the account name, home
-/// directory, and login shell. Values come from the account database,
+/// One passwd row an account-drop path consumes: the account name, home
+/// directory, login shell, and ids. Values come from the account database,
 /// never from the environment — the child-environment rule that values
 /// are never read still holds, because nothing here reads env values.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -828,13 +832,15 @@ struct PasswdRecord {
     name: OsString,
     home: OsString,
     shell: OsString,
+    uid: libc::uid_t,
     gid: libc::gid_t,
 }
 
-/// The invoker's session as the sudo-drop path restores it: passwd
-/// identity plus the supplementary group list (mirroring initgroups, so
-/// the primary group is included) and the runtime directory, but only
-/// when that directory is provably the invoker's own.
+/// The target account's session as an account-drop path restores it:
+/// passwd identity plus the supplementary group list (mirroring initgroups,
+/// so the primary group is included) and the runtime directory, but only
+/// when that directory is provably the account's own. Both the sudo-drop
+/// path (the invoker) and `--user` (the named account) restore this shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct InvokerAccount {
     user: OsString,
@@ -844,12 +850,14 @@ struct InvokerAccount {
     xdg_runtime_dir: Option<OsString>,
 }
 
-/// Account-database probes for invoker resolution, injectable for tests:
-/// `passwd` reads one passwd row, `grouplist` reads the initgroups list
-/// for a name, `dir_owner` reports `(is_dir, owner)` for a path.
-/// Production passes the real database; behavior is identical.
+/// Account-database probes for target-account resolution, injectable for
+/// tests: `passwd` reads one passwd row by uid, `passwd_by_name` by name,
+/// `grouplist` reads the initgroups list for a name, `dir_owner` reports
+/// `(is_dir, owner)` for a path. Production passes the real database;
+/// behavior is identical.
 struct InvokerProbes<'a> {
     passwd: &'a dyn Fn(libc::uid_t) -> Option<PasswdRecord>,
+    passwd_by_name: &'a dyn Fn(&OsStr) -> Option<PasswdRecord>,
     grouplist: &'a dyn Fn(&OsStr, libc::gid_t) -> Option<Vec<libc::gid_t>>,
     dir_owner: &'a dyn Fn(&Path) -> Option<(bool, libc::uid_t)>,
 }
@@ -864,10 +872,26 @@ struct ChildIdentity {
     uid: libc::uid_t,
     gid: libc::gid_t,
     sudo_drop: Option<InvokerAccount>,
+    run_as: Option<InvokerAccount>,
 }
 
 impl ChildIdentity {
+    /// The restored account session, if either account-drop path selected
+    /// one: at most one of `sudo_drop` and `run_as` is ever set, because
+    /// an explicit `--user` replaces the sudo default.
+    fn restored(&self) -> Option<&InvokerAccount> {
+        self.sudo_drop.as_ref().or(self.run_as.as_ref())
+    }
+
+    #[cfg(test)]
     fn for_invoker() -> io::Result<Self> {
+        Self::for_run_selection(None)
+    }
+
+    /// The owned child's identity: an explicit `--user` resolves that
+    /// account, otherwise the default (under sudo the invoker with its
+    /// restored session, otherwise the observer itself).
+    fn for_run_selection(user: Option<&OsStr>) -> io::Result<Self> {
         let mut uids = [0; 3];
         let mut gids = [0; 3];
         // SAFETY: each call receives three valid output pointers.
@@ -876,19 +900,22 @@ impl ChildIdentity {
         {
             return Err(io::Error::last_os_error());
         }
-        Self::for_invoker_with(
+        Self::for_run_selection_with(
             uids,
             gids,
             std::env::var_os("SUDO_UID").as_deref(),
             std::env::var_os("SUDO_GID").as_deref(),
+            user,
             &InvokerProbes {
                 passwd: &production_passwd_lookup,
+                passwd_by_name: &production_passwd_by_name,
                 grouplist: &production_group_lookup,
                 dir_owner: &production_dir_owner,
             },
         )
     }
 
+    #[cfg(test)]
     fn for_invoker_with(
         uids: [libc::uid_t; 3],
         gids: [libc::gid_t; 3],
@@ -896,6 +923,20 @@ impl ChildIdentity {
         sudo_gid: Option<&OsStr>,
         probes: &InvokerProbes,
     ) -> io::Result<Self> {
+        Self::for_run_selection_with(uids, gids, sudo_uid, sudo_gid, None, probes)
+    }
+
+    fn for_run_selection_with(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        sudo_uid: Option<&OsStr>,
+        sudo_gid: Option<&OsStr>,
+        user: Option<&OsStr>,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        if let Some(user) = user {
+            return Self::for_explicit_user(uids, gids, user, probes);
+        }
         let selected = Self::from_ids(uids, gids, sudo_uid, sudo_gid)?;
         let sudo_drop = if selected.sudo_drop {
             Some(resolve_invoker_account_with(
@@ -910,6 +951,71 @@ impl ChildIdentity {
             uid: selected.uid,
             gid: selected.gid,
             sudo_drop,
+            run_as: None,
+        })
+    }
+
+    /// The `--user` selection (owner decision RUN-USER, like `strace -u`):
+    /// the named account with its groups and home environment, resolved
+    /// here in the parent. Needs root; `--user root` stays root on purpose.
+    /// A set-id observer is refused exactly like the default path refuses
+    /// it, before the root check.
+    fn for_explicit_user(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        user: &OsStr,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        if uids != [uids[1]; 3] || gids != [gids[1]; 3] {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing owned child with set-id observer credentials",
+            ));
+        }
+        if uids[1] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "--user needs root (sudo)",
+            ));
+        }
+        let display = crate::render::escape_controls(&user.to_string_lossy()).into_owned();
+        let unknown = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("--user {display}: unknown account"),
+            )
+        };
+        // An all-digit value names a uid; anything else names an account.
+        // Linux argv cannot carry NUL, but the lookup treats one as unknown
+        // rather than truncating the name.
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(user);
+        let record = if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) {
+            let uid: libc::uid_t = bytes
+                .iter()
+                .fold(0u64, |acc, digit| {
+                    acc.saturating_mul(10)
+                        .saturating_add(u64::from(digit - b'0'))
+                })
+                .try_into()
+                .map_err(|_| unknown())?;
+            (probes.passwd)(uid).filter(|record| record.uid == uid)
+        } else {
+            (probes.passwd_by_name)(user)
+        };
+        let record = record
+            .filter(|record| !record.name.is_empty())
+            .ok_or_else(unknown)?;
+        let session = finish_account_session(record.uid, &record, probes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("--user {display}: cannot resolve supplementary groups"),
+            )
+        })?;
+        Ok(Self {
+            uid: record.uid,
+            gid: record.gid,
+            sudo_drop: None,
+            run_as: Some(session),
         })
     }
 
@@ -987,27 +1093,53 @@ fn resolve_invoker_account_with(
             "SUDO_UID/SUDO_GID do not name one existing account",
         ));
     }
-    let mut groups = (probes.grouplist)(&record.name, gid).unwrap_or_default();
+    finish_account_session(uid, &record, probes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot resolve supplementary groups for the sudo invoker",
+        )
+    })
+}
+
+/// The initgroups list plus the provable runtime directory for a resolved
+/// passwd row, shared by the sudo-drop and `--user` paths. `None` names a
+/// group list that cannot be applied (unresolvable, empty, or past the
+/// kernel limit); each caller phrases that refusal for its own selection.
+/// An unprovable runtime dir is skipped, never a refusal.
+fn finish_account_session(
+    uid: libc::uid_t,
+    record: &PasswdRecord,
+    probes: &InvokerProbes,
+) -> Option<InvokerAccount> {
+    let mut groups = (probes.grouplist)(&record.name, record.gid).unwrap_or_default();
     groups.sort_unstable();
     groups.dedup();
     if groups.is_empty() || groups.len() > MAX_SUPPLEMENTARY_GROUPS {
-        return Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            "cannot resolve supplementary groups for the sudo invoker",
-        ));
+        return None;
     }
     let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
     let xdg_runtime_dir = match (probes.dir_owner)(&runtime_dir) {
         Some((true, owner)) if owner == uid => Some(runtime_dir.into_os_string()),
         _ => None,
     };
-    Ok(InvokerAccount {
-        user: record.name,
-        home: record.home,
-        shell: record.shell,
+    Some(InvokerAccount {
+        user: record.name.clone(),
+        home: record.home.clone(),
+        shell: record.shell.clone(),
         groups,
         xdg_runtime_dir,
     })
+}
+
+/// The `--user` preflight `main` runs before `run_owned` does anything:
+/// needs root, a non-set-id observer, and a resolvable account with a
+/// settable group list. On success the spawn resolves the same selection
+/// again; a database change in between still refuses at the spawn, with
+/// the same plain message but the spawn's exit status.
+pub fn check_run_user(user: &OsStr) -> Result<(), String> {
+    ChildIdentity::for_run_selection(Some(user))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
 }
 
 /// Copies one passwd string field out of the `getpwuid_r` buffer.
@@ -1021,21 +1153,40 @@ unsafe fn passwd_field(value: *mut libc::c_char) -> Option<OsString> {
 }
 
 fn production_passwd_lookup(uid: libc::uid_t) -> Option<PasswdRecord> {
+    passwd_lookup(|account, buffer, len, result| {
+        // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
+        unsafe { libc::getpwuid_r(uid, account, buffer, len, result) }
+    })
+}
+
+/// One passwd row by account name, for `--user`, via `getpwnam_r`. A name
+/// that cannot reach the lookup (an embedded NUL, impossible from argv)
+/// resolves to no account rather than a truncated one.
+fn production_passwd_by_name(user: &OsStr) -> Option<PasswdRecord> {
+    let name = CString::new(user.as_bytes()).ok()?;
+    passwd_lookup(|account, buffer, len, result| {
+        // SAFETY: account, buffer, and result are valid writable storage
+        // for getpwnam_r; name is NUL-terminated.
+        unsafe { libc::getpwnam_r(name.as_ptr(), account, buffer, len, result) }
+    })
+}
+
+/// One passwd row through a reentrant lookup, growing the buffer on
+/// `ERANGE` up to 1 MiB. Returns `None` on any lookup failure.
+fn passwd_lookup(
+    fill: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+) -> Option<PasswdRecord> {
     let mut capacity = 16 * 1024;
     loop {
         let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
         let mut result = std::ptr::null_mut();
         let mut buffer = vec![0; capacity];
-        // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
-        let status = unsafe {
-            libc::getpwuid_r(
-                uid,
-                &mut account,
-                buffer.as_mut_ptr().cast(),
-                buffer.len(),
-                &mut result,
-            )
-        };
+        let status = fill(
+            &mut account,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        );
         if status == libc::ERANGE {
             capacity *= 2;
             if capacity > 1024 * 1024 {
@@ -1051,6 +1202,7 @@ fn production_passwd_lookup(uid: libc::uid_t) -> Option<PasswdRecord> {
             name: unsafe { passwd_field(account.pw_name) }?,
             home: unsafe { passwd_field(account.pw_dir) }?,
             shell: unsafe { passwd_field(account.pw_shell) }?,
+            uid: account.pw_uid,
             gid: account.pw_gid,
         });
     }
@@ -1089,20 +1241,18 @@ fn production_dir_owner(path: &Path) -> Option<(bool, libc::uid_t)> {
 /// The child otherwise inherits the observer's environment unchanged, so the
 /// workload behaves exactly as without p11scope. Only p11scope's own control
 /// inputs are withheld, by name (values are never inspected here):
-/// - `SUDO_UID`/`SUDO_GID`: consumed as the target-account selection; they
-///   describe the observer's launch, not the workload.
-/// - `SUDO_USER`/`SUDO_COMMAND`: likewise describe the sudo invocation; a
-///   bare execution has none, so keeping them would mislead the child.
+/// - `SUDO_*`: the whole sudo namespace (`SUDO_UID`/`SUDO_GID` consumed as
+///   the default target-account selection, plus `SUDO_USER`,
+///   `SUDO_COMMAND`, `SUDO_HOME`, `SUDO_TTY`, and any future addition).
+///   They describe the observer's launch, not the workload; a bare
+///   execution has none, so keeping any of them would mislead the child.
 /// - `P11SCOPE_*`: p11scope's own control namespace (observer and test
 ///   controls); never workload input, and passing them on would confuse a
 ///   nested p11scope run.
 fn child_env_controlled(name: &OsStr) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     let bytes = name.as_bytes();
-    matches!(
-        bytes,
-        b"SUDO_UID" | b"SUDO_GID" | b"SUDO_USER" | b"SUDO_COMMAND"
-    ) || bytes.starts_with(b"P11SCOPE_")
+    bytes.starts_with(b"SUDO_") || bytes.starts_with(b"P11SCOPE_")
 }
 
 /// The owned child's environment: the observer's variables unchanged,
@@ -1126,15 +1276,15 @@ fn child_environment(
 }
 
 /// The one stderr line naming variables withheld from the owned child,
-/// or `None` when nothing was withheld. Names only, sorted; values are
-/// never included (environment values are never captured).
+/// or `None` when nothing was withheld. Names only, sorted and escaped;
+/// values are never included (environment values are never captured).
 fn child_env_removal_notice(
     variables: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> Option<String> {
     let mut removed: Vec<String> = variables
         .into_iter()
         .filter(|(name, _)| child_env_controlled(name))
-        .map(|(name, _)| name.to_string_lossy().into_owned())
+        .map(|(name, _)| crate::render::escape_controls(&name.to_string_lossy()).into_owned())
         .collect();
     removed.sort();
     removed.dedup();
@@ -1172,10 +1322,25 @@ fn drop_env_overrides(drop: &InvokerAccount) -> Vec<(OsString, OsString)> {
     overrides
 }
 
-/// Applies sudo-drop overrides to an already-filtered child environment:
+/// Drops `MAIL` from an already-filtered child environment. The account
+/// database names no mailbox, so on an account-drop path the inherited
+/// value (under sudo, root's mailbox) would misdescribe the new account;
+/// without a drop the inherited value already describes the child and is
+/// kept. Name-matched; the value is never read.
+fn strip_drop_mail(environment: &mut Vec<CString>) {
+    environment.retain(|entry| {
+        entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .is_none_or(|name| name != b"MAIL")
+    });
+}
+
+/// Applies account-drop overrides to an already-filtered child environment:
 /// every entry naming an overridden variable is replaced by the
 /// account-database value. An empty override list changes nothing, so
-/// the non-sudo path keeps byte-identical passthrough.
+/// the non-drop path keeps byte-identical passthrough.
 fn apply_env_overrides(
     environment: &mut Vec<CString>,
     overrides: &[(OsString, OsString)],
@@ -1207,12 +1372,23 @@ fn apply_env_overrides(
 
 /// The one `-v` line naming the sudo-drop identity. Plain text, one
 /// line, stderr only: the command spelling is the operator's own argv
-/// and the user is the passwd name, never `SUDO_USER`.
+/// and the user is the passwd name, never `SUDO_USER`. Both are escaped,
+/// so a hostile argv or account name cannot inject a terminal escape.
 fn sudo_drop_notice(program: &OsStr, user: &OsStr) -> String {
     format!(
         "running {} as {} (groups and home restored)",
-        program.to_string_lossy(),
-        user.to_string_lossy()
+        crate::render::escape_controls(&program.to_string_lossy()),
+        crate::render::escape_controls(&user.to_string_lossy())
+    )
+}
+
+/// The one `-v` line naming the `--user` identity: the requested account,
+/// likewise escaped and stderr-only.
+fn run_as_notice(program: &OsStr, user: &OsStr) -> String {
+    format!(
+        "running {} as {}",
+        crate::render::escape_controls(&program.to_string_lossy()),
+        crate::render::escape_controls(&user.to_string_lossy())
     )
 }
 
@@ -1551,7 +1727,7 @@ unsafe fn harden_owned_child(identity: &ChildIdentity) -> std::result::Result<()
     {
         return Err(unsafe { last_errno() });
     }
-    if let Some(drop) = identity.sudo_drop.as_ref() {
+    if let Some(drop) = identity.restored() {
         // Before setresgid/setresuid: only root may change the group list.
         // The list was resolved in the parent (name service calls are not
         // async-signal-safe); the child only applies it.
@@ -1643,9 +1819,9 @@ unsafe fn harden_owned_child(identity: &ChildIdentity) -> std::result::Result<()
     Ok(())
 }
 
-/// Proves the child runs with the intended group list. The non-sudo
+/// Proves the child runs with the intended group list. The non-drop
 /// child keeps whatever it inherited, so there is nothing to prove;
-/// the sudo-dropped child must show exactly the restored list. The
+/// the account-dropped child must show exactly the restored list. The
 /// count check is unbounded; the exact sorted compare runs when the
 /// list fits a small stack buffer (beyond that the count stands alone).
 /// The parent sorts the expected list; the child sorts its readback the
@@ -1653,7 +1829,7 @@ unsafe fn harden_owned_child(identity: &ChildIdentity) -> std::result::Result<()
 /// `identity` is read-only mapped memory, never a lock.
 unsafe fn child_groups_match(identity: &ChildIdentity) -> bool {
     const STACK_GROUPS: usize = 128;
-    let Some(drop) = identity.sudo_drop.as_ref() else {
+    let Some(drop) = identity.restored() else {
         return true;
     };
     let expected = drop.groups.as_slice();
@@ -1801,15 +1977,44 @@ pub(crate) struct OwnedChild {
 impl OwnedChild {
     #[cfg(test)]
     pub(crate) fn spawn(program: OsString, args: Vec<OsString>) -> io::Result<Self> {
-        Self::spawn_verbose(program, args, false)
+        Self::spawn_verbose_as(program, args, false, None)
     }
 
-    pub(crate) fn spawn_verbose(
+    /// Spawns with an explicit `--user` selection: `None` keeps the default
+    /// (under sudo the invoker, otherwise the observer itself).
+    pub(crate) fn spawn_verbose_as(
         program: OsString,
         args: Vec<OsString>,
         verbose: bool,
+        user: Option<&OsStr>,
     ) -> io::Result<Self> {
-        let identity = ChildIdentity::for_invoker()?;
+        let identity = ChildIdentity::for_run_selection(user)?;
+        // One read: the filtered environment and the removal notice name the
+        // same variables, so a concurrent `setenv` cannot split them.
+        let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        Self::spawn_prepared(program, args, verbose, identity, variables)
+    }
+
+    /// Test seam: the spawn core with an explicit identity and environment,
+    /// so spawn-level tests pin the wiring without touching the process
+    /// environment or the account database.
+    #[cfg(test)]
+    fn spawn_for_test(
+        program: OsString,
+        args: Vec<OsString>,
+        identity: ChildIdentity,
+        variables: Vec<(OsString, OsString)>,
+    ) -> io::Result<Self> {
+        Self::spawn_prepared(program, args, false, identity, variables)
+    }
+
+    fn spawn_prepared(
+        program: OsString,
+        args: Vec<OsString>,
+        verbose: bool,
+        identity: ChildIdentity,
+        variables: Vec<(OsString, OsString)>,
+    ) -> io::Result<Self> {
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
         check_launch_file(&launch_file)?;
@@ -1834,11 +2039,12 @@ impl OwnedChild {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let mut environment = child_environment(std::env::vars_os())?;
-        if let Some(drop) = identity.sudo_drop.as_ref() {
+        let mut environment = child_environment(variables.iter().cloned())?;
+        if let Some(drop) = identity.restored() {
+            strip_drop_mail(&mut environment);
             apply_env_overrides(&mut environment, &drop_env_overrides(drop))?;
         }
-        if let Some(notice) = child_env_removal_notice(std::env::vars_os()) {
+        if let Some(notice) = child_env_removal_notice(variables.iter().cloned()) {
             emit_capture_diagnostic(&notice);
         }
         let envp: Vec<*const libc::c_char> = environment
@@ -1868,13 +2074,15 @@ impl OwnedChild {
         #[cfg(test)]
         let test_parent_death = TEST_PARENT_DEATH_SIGNAL.with(std::cell::Cell::get);
         // The `-v` identity line, after every fallible setup step: it names a
-        // child that is actually about to be forked, and only on the
-        // sudo-drop path. The non-sudo path stays silent.
-        if verbose && let Some(drop) = identity.sudo_drop.as_ref() {
-            emit_capture_diagnostic(&sudo_drop_notice(
-                OsStr::from_bytes(program.to_bytes()),
-                &drop.user,
-            ));
+        // child that is actually about to be forked, and only on an
+        // account-drop path. The non-drop path stays silent.
+        if verbose {
+            let command = OsStr::from_bytes(program.to_bytes());
+            if let Some(drop) = identity.sudo_drop.as_ref() {
+                emit_capture_diagnostic(&sudo_drop_notice(command, &drop.user));
+            } else if let Some(run_as) = identity.run_as.as_ref() {
+                emit_capture_diagnostic(&run_as_notice(command, &run_as.user));
+            }
         }
 
         // SAFETY: all allocations and C strings were prepared above. The child
@@ -4238,7 +4446,7 @@ fn run_owned_inner_with_host(
     // Name errors precede hazard errors: a script (or a non-executable)
     // is refused with its interpreter fix before any kernel verdict is
     // consulted, exactly as `spawn` would refuse it at the fork.
-    check_owned_target_runnable(&program, &args.command[1..])
+    check_owned_target_runnable(&program, &args.command[1..], args.user.as_deref())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let _host = host()?;
     // Before the fork: the owned child can install a seccomp filter after
@@ -4261,8 +4469,13 @@ fn run_owned_inner_with_host(
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
-    let mut child = OwnedChild::spawn_verbose(program, command.collect(), args.verbose)
-        .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
+    let mut child = OwnedChild::spawn_verbose_as(
+        program,
+        command.collect(),
+        args.verbose,
+        args.user.as_deref(),
+    )
+    .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
         combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
@@ -10906,6 +11119,10 @@ mod tests {
                 OsString::from("SUDO_COMMAND"),
                 OsString::from("/usr/bin/p11scope"),
             ),
+            // The whole SUDO_ prefix is controlled, not just the four
+            // names above: SUDO_HOME reached a child before this strip.
+            (OsString::from("SUDO_HOME"), OsString::from("/root")),
+            (OsString::from("SUDO_TTY"), OsString::from("/dev/pts/0")),
             (
                 OsString::from("P11SCOPE_LOADER_ENV_SANITIZED"),
                 OsString::from("1"),
@@ -10915,13 +11132,18 @@ mod tests {
                 OsString::from("/tmp/x.so"),
             ),
             (OsString::from("NOT_P11SCOPE"), OsString::from("kept")),
+            // Near-misses without the underscore stay workload input.
+            (OsString::from("SUDOISH"), OsString::from("kept")),
         ])
         .unwrap();
         let environment: Vec<_> = environment
             .iter()
             .map(|entry| entry.to_str().unwrap())
             .collect();
-        assert_eq!(environment, ["HOME=/home/user", "NOT_P11SCOPE=kept"]);
+        assert_eq!(
+            environment,
+            ["HOME=/home/user", "NOT_P11SCOPE=kept", "SUDOISH=kept"]
+        );
     }
 
     #[test]
@@ -10956,11 +11178,18 @@ mod tests {
         assert!(!notice.contains("HOME"), "{notice:?}");
     }
 
-    fn fake_passwd(name: &str, home: &str, shell: &str, gid: libc::gid_t) -> PasswdRecord {
+    fn fake_passwd(
+        name: &str,
+        home: &str,
+        shell: &str,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    ) -> PasswdRecord {
         PasswdRecord {
             name: OsString::from(name),
             home: OsString::from(home),
             shell: OsString::from(shell),
+            uid,
             gid,
         }
     }
@@ -10970,7 +11199,16 @@ mod tests {
         let probes = InvokerProbes {
             passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
                 assert_eq!(uid, 1000);
-                Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001))
+                Some(fake_passwd(
+                    "testuser",
+                    "/home/testuser",
+                    "/bin/bash",
+                    1000,
+                    1001,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("the sudo path resolves by uid, never by name");
             },
             grouplist: &|user: &OsStr, gid: libc::gid_t| -> Option<Vec<libc::gid_t>> {
                 assert_eq!(user, OsStr::new("testuser"));
@@ -11010,6 +11248,9 @@ mod tests {
             passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
                 panic!("non-sudo run must not read passwd");
             },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("non-sudo run must not read passwd");
+            },
             grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
                 panic!("non-sudo run must not read groups");
             },
@@ -11035,6 +11276,9 @@ mod tests {
         let resolve = |passwd: Option<PasswdRecord>, groups: Option<Vec<libc::gid_t>>| {
             let probes = InvokerProbes {
                 passwd: &|_: libc::uid_t| passwd.clone(),
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    panic!("the sudo path resolves by uid, never by name");
+                },
                 grouplist: &|_: &OsStr, _: libc::gid_t| groups.clone(),
                 dir_owner: &|_: &Path| Some((true, 1000)),
             };
@@ -11052,7 +11296,7 @@ mod tests {
             "SUDO_UID/SUDO_GID do not name one existing account"
         );
         let empty_name = resolve(
-            Some(fake_passwd("", "/home/x", "/bin/sh", 1001)),
+            Some(fake_passwd("", "/home/x", "/bin/sh", 1000, 1001)),
             Some(vec![1001]),
         )
         .unwrap_err();
@@ -11061,7 +11305,13 @@ mod tests {
             "SUDO_UID/SUDO_GID do not name one existing account"
         );
         let gid_mismatch = resolve(
-            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 9999)),
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                9999,
+            )),
             Some(vec![9999]),
         )
         .unwrap_err();
@@ -11070,7 +11320,13 @@ mod tests {
             "SUDO_UID/SUDO_GID do not name one existing account"
         );
         let no_groups = resolve(
-            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001)),
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                1001,
+            )),
             None,
         )
         .unwrap_err();
@@ -11079,7 +11335,13 @@ mod tests {
             "cannot resolve supplementary groups for the sudo invoker"
         );
         let empty_groups = resolve(
-            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001)),
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                1001,
+            )),
             Some(Vec::new()),
         )
         .unwrap_err();
@@ -11094,7 +11356,16 @@ mod tests {
         for dir_owner in [None, Some((false, 1000)), Some((true, 0))] {
             let probes = InvokerProbes {
                 passwd: &|_: libc::uid_t| {
-                    Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001))
+                    Some(fake_passwd(
+                        "testuser",
+                        "/home/testuser",
+                        "/bin/bash",
+                        1000,
+                        1001,
+                    ))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    panic!("the sudo path resolves by uid, never by name");
                 },
                 grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
                 dir_owner: &|_: &Path| dir_owner,
@@ -11118,6 +11389,11 @@ mod tests {
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
         let record = production_passwd_lookup(uid).expect("the test user has a passwd entry");
         assert!(!record.name.is_empty());
+        // The by-name lookup agrees with the by-uid row (the `--user` path).
+        let by_name =
+            production_passwd_by_name(&record.name).expect("the test user resolves by name");
+        assert_eq!((by_name.uid, by_name.gid), (record.uid, record.gid));
+        assert_eq!((by_name.home, by_name.shell), (record.home, record.shell));
         let groups = production_group_lookup(&record.name, record.gid)
             .expect("the test user has a group list");
         assert!(
@@ -11126,6 +11402,7 @@ mod tests {
         );
         let probes = InvokerProbes {
             passwd: &production_passwd_lookup,
+            passwd_by_name: &production_passwd_by_name,
             grouplist: &production_group_lookup,
             dir_owner: &production_dir_owner,
         };
@@ -11247,6 +11524,496 @@ mod tests {
         );
         let notice = sudo_drop_notice(OsStr::new("id"), OsStr::new("testuser"));
         assert_eq!(notice.lines().count(), 1, "{notice:?}");
+    }
+
+    #[test]
+    fn run_user_resolves_a_named_account_with_groups_and_home() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("a name selection must not resolve by uid");
+            },
+            passwd_by_name: &|user: &OsStr| -> Option<PasswdRecord> {
+                assert_eq!(user, OsStr::new("alice"));
+                Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+            },
+            grouplist: &|user: &OsStr, gid: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                assert_eq!(user, OsStr::new("alice"));
+                assert_eq!(gid, 1002);
+                Some(vec![1002, 44])
+            },
+            dir_owner: &|path: &Path| -> Option<(bool, libc::uid_t)> {
+                assert_eq!(path, Path::new("/run/user/1001"));
+                Some((true, 1001))
+            },
+        };
+        // SUDO_* names another account: the explicit selection wins.
+        let identity = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1001);
+        assert_eq!(identity.gid, 1002);
+        assert_eq!(identity.sudo_drop, None);
+        let run_as = identity
+            .run_as
+            .as_ref()
+            .expect("--user selects its own drop");
+        assert_eq!(run_as.user, OsString::from("alice"));
+        assert_eq!(run_as.home, OsString::from("/home/alice"));
+        assert_eq!(run_as.groups, vec![44, 1002]);
+        assert_eq!(
+            run_as.xdg_runtime_dir.as_deref(),
+            Some(OsStr::new("/run/user/1001"))
+        );
+    }
+
+    #[test]
+    fn run_user_accepts_a_numeric_uid() {
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1001);
+                Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let identity = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1001);
+        assert_eq!(identity.gid, 1002);
+        let run_as = identity.run_as.as_ref().expect("numeric --user resolves");
+        assert_eq!(run_as.user, OsString::from("alice"));
+        assert_eq!(run_as.xdg_runtime_dir, None);
+    }
+
+    #[test]
+    fn run_user_root_stays_root_on_purpose() {
+        for value in ["root", "0"] {
+            let probes = InvokerProbes {
+                passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                    assert_eq!(uid, 0);
+                    Some(fake_passwd("root", "/root", "/bin/bash", 0, 0))
+                },
+                passwd_by_name: &|user: &OsStr| -> Option<PasswdRecord> {
+                    assert_eq!(user, OsStr::new("root"));
+                    Some(fake_passwd("root", "/root", "/bin/bash", 0, 0))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![0]),
+                dir_owner: &|_: &Path| Some((true, 0)),
+            };
+            let identity = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(value)),
+                &probes,
+            )
+            .unwrap();
+            assert_eq!((identity.uid, identity.gid), (0, 0), "{value}");
+            let run_as = identity.run_as.as_ref().expect("root resolves");
+            assert_eq!(run_as.user, OsString::from("root"), "{value}");
+        }
+    }
+
+    #[test]
+    fn run_user_refuses_unknown_accounts() {
+        let resolve = |user: &OsStr| {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| None,
+                passwd_by_name: &|_: &OsStr| None,
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+                dir_owner: &|_: &Path| None,
+            };
+            ChildIdentity::for_run_selection_with([0; 3], [0; 3], None, None, Some(user), &probes)
+        };
+        for value in ["alice", "1001", "4294967296", "+1000", " 1000", "1000 ", ""] {
+            let error = resolve(OsStr::new(value)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {value}: unknown account"),
+                "{value:?}"
+            );
+        }
+        // A NUL cannot reach the by-name lookup at all.
+        assert_eq!(
+            production_passwd_by_name(OsStr::from_bytes(b"al\x00ice")),
+            None
+        );
+        // A row with an empty name is no account either.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| None,
+            passwd_by_name: &|_: &OsStr| Some(fake_passwd("", "/home/x", "/bin/sh", 1001, 1002)),
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user alice: unknown account");
+        // A numeric selection whose row names another uid is refused, not trusted.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| {
+                Some(fake_passwd(
+                    "mallory",
+                    "/home/mallory",
+                    "/bin/sh",
+                    6666,
+                    6666,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![6666]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user 1001: unknown account");
+    }
+
+    #[test]
+    fn run_user_needs_root_and_refuses_set_id_observers() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("refused before any lookup");
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("refused before any lookup");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("refused before any lookup");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("refused before any lookup");
+            },
+        };
+        // Unprivileged, even with sudo variables set: euid decides, and
+        // `--user` has no root-group branch.
+        for gids in [[1000; 3], [0; 3]] {
+            let error = ChildIdentity::for_run_selection_with(
+                [1000; 3],
+                gids,
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "--user needs root (sudo)", "{gids:?}");
+        }
+        // Set-id observers refuse before the root check, as root or not.
+        for (uids, gids) in [
+            ([1000, 0, 0], [0; 3]),
+            ([0, 0, 1000], [0; 3]),
+            ([0; 3], [1000, 0, 0]),
+        ] {
+            let error = ChildIdentity::for_run_selection_with(
+                uids,
+                gids,
+                None,
+                None,
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "refusing owned child with set-id observer credentials",
+                "{uids:?}/{gids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_user_group_failures_name_the_selection() {
+        for groups in [None, Some(Vec::new())] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| None,
+                passwd_by_name: &|_: &OsStr| {
+                    Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| groups.clone(),
+                dir_owner: &|_: &Path| None,
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "--user alice: cannot resolve supplementary groups",
+                "{groups:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_selection_without_user_is_unchanged() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("no account database on these paths");
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("no account database on these paths");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("no account database on these paths");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("no account database on these paths");
+            },
+        };
+        // Unprivileged: self, no drop of either kind.
+        let identity =
+            ChildIdentity::for_run_selection_with([1000; 3], [1001; 3], None, None, None, &probes)
+                .unwrap();
+        assert_eq!((identity.uid, identity.gid), (1000, 1001));
+        assert_eq!(identity.sudo_drop, None);
+        assert_eq!(identity.run_as, None);
+        // Root without sudo still needs its explicit target (message unchanged).
+        let error =
+            ChildIdentity::for_run_selection_with([0; 3], [0; 3], None, None, None, &probes)
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "root observer requires a valid non-root SUDO_UID"
+        );
+    }
+
+    #[test]
+    fn run_as_notice_is_one_plain_line() {
+        assert_eq!(
+            run_as_notice(OsStr::new("/usr/bin/id"), OsStr::new("alice")),
+            "running /usr/bin/id as alice"
+        );
+        let notice = run_as_notice(OsStr::new("id"), OsStr::new("alice"));
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+    }
+
+    #[test]
+    fn identity_notices_escape_hostile_names() {
+        for notice in [
+            sudo_drop_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb")),
+            run_as_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb")),
+        ] {
+            assert_eq!(notice.lines().count(), 1, "{notice:?}");
+            assert!(notice.contains(r"/bin/x\nINJECTED"), "{notice:?}");
+            assert!(notice.contains(r"a\u{1b}lb"), "{notice:?}");
+        }
+    }
+
+    #[test]
+    fn child_env_removal_notice_escapes_control_characters() {
+        let notice = child_env_removal_notice([
+            (
+                OsString::from("SUDO_EVIL\nINJECTED"),
+                OsString::from("s3cret"),
+            ),
+            (
+                OsString::from("P11SCOPE_X\x1b[2J"),
+                OsString::from("s3cret"),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+        assert!(notice.contains(r"SUDO_EVIL\nINJECTED"), "{notice:?}");
+        assert!(notice.contains(r"P11SCOPE_X\u{1b}[2J"), "{notice:?}");
+        assert!(!notice.contains("s3cret"), "{notice:?}");
+    }
+
+    #[test]
+    fn drop_mail_strips_only_the_mailbox_name() {
+        let mut environment = child_environment([
+            (
+                OsString::from("MAIL"),
+                OsString::from("/var/spool/mail/root"),
+            ),
+            (OsString::from("MAILMAN"), OsString::from("kept")),
+            (OsString::from("XMAIL"), OsString::from("kept")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        strip_drop_mail(&mut environment);
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(environment, ["MAILMAN=kept", "XMAIL=kept", "PATH=/bin"]);
+        let mut bare =
+            child_environment([(OsString::from("PATH"), OsString::from("/bin"))]).unwrap();
+        let before = bare.clone();
+        strip_drop_mail(&mut bare);
+        assert_eq!(bare, before);
+    }
+
+    /// One process's post-exec environment as `NAME=value` strings
+    /// (`/proc/<pid>/environ`, NUL-separated).
+    fn child_environ(pid: u32) -> Vec<String> {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn spawned_child_environment_passes_sentinels_and_strips_controlled_names() {
+        // The spawn core with an explicit non-drop identity and a sentinel
+        // environment: the sentinels pass through, SUDO_*/P11SCOPE_* do
+        // not. Observed through /proc after the release proves the exec —
+        // a pre-exec read would still show the inherited table.
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let identity = ChildIdentity {
+            uid,
+            gid,
+            sudo_drop: None,
+            run_as: None,
+        };
+        let mut child = OwnedChild::spawn_for_test(
+            OsString::from("/bin/sleep"),
+            vec![OsString::from("30")],
+            identity,
+            vec![
+                (
+                    OsString::from("RUN_SPAWN_SENTINEL"),
+                    OsString::from("pass-me"),
+                ),
+                (OsString::from("SUDO_HOME"), OsString::from("/root")),
+                (OsString::from("SUDO_UID"), OsString::from("0")),
+                (
+                    OsString::from("P11SCOPE_TEST_SPAWN_SENTINEL"),
+                    OsString::from("strip-me"),
+                ),
+            ],
+        )
+        .unwrap();
+        child.release().unwrap();
+        let environ = child_environ(child.pid());
+        assert!(
+            environ
+                .iter()
+                .any(|entry| entry == "RUN_SPAWN_SENTINEL=pass-me"),
+            "{environ:?}"
+        );
+        assert!(
+            !environ.iter().any(|entry| entry.starts_with("SUDO_")),
+            "{environ:?}"
+        );
+        assert!(
+            !environ
+                .iter()
+                .any(|entry| entry.starts_with("P11SCOPE_TEST_")),
+            "{environ:?}"
+        );
+        child.terminate_and_reap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1"]
+    fn privileged_spawned_child_home_matches_the_target_passwd_row() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root: the drop needs privilege"
+        );
+        let target =
+            production_passwd_by_name(OsStr::new("nobody")).expect("the nobody account exists");
+        let probes = InvokerProbes {
+            passwd: &production_passwd_lookup,
+            passwd_by_name: &production_passwd_by_name,
+            grouplist: &production_group_lookup,
+            dir_owner: &production_dir_owner,
+        };
+        // The sudo-drop shape: a root observer, SUDO_* naming the target.
+        let uid_text = target.uid.to_string();
+        let gid_text = target.gid.to_string();
+        let identity = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new(&uid_text)),
+            Some(OsStr::new(&gid_text)),
+            &probes,
+        )
+        .unwrap();
+        let mut child = OwnedChild::spawn_for_test(
+            OsString::from("/bin/sleep"),
+            vec![OsString::from("30")],
+            identity,
+            vec![
+                (OsString::from("HOME"), OsString::from("/root")),
+                (OsString::from("USER"), OsString::from("root")),
+                (
+                    OsString::from("MAIL"),
+                    OsString::from("/var/spool/mail/root"),
+                ),
+                (
+                    OsString::from("RUN_SPAWN_SENTINEL"),
+                    OsString::from("pass-me"),
+                ),
+            ],
+        )
+        .unwrap();
+        child.release().unwrap();
+        let environ = child_environ(child.pid());
+        let home = format!("HOME={}", target.home.to_string_lossy());
+        let user = format!("USER={}", target.name.to_string_lossy());
+        assert!(environ.iter().any(|entry| entry == &home), "{environ:?}");
+        assert!(environ.iter().any(|entry| entry == &user), "{environ:?}");
+        assert!(
+            !environ.iter().any(|entry| entry.starts_with("MAIL=")),
+            "{environ:?}"
+        );
+        assert!(
+            environ
+                .iter()
+                .any(|entry| entry == "RUN_SPAWN_SENTINEL=pass-me"),
+            "{environ:?}"
+        );
+        // And the child really runs as the target account.
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.pid())).unwrap();
+        let uids = format!(
+            "Uid:\t{}\t{}\t{}\t{}",
+            target.uid, target.uid, target.uid, target.uid
+        );
+        assert!(status.lines().any(|line| line == uids), "{status}");
+        child.terminate_and_reap().unwrap();
     }
 
     #[test]
@@ -14395,14 +15162,14 @@ mod tests {
         let script = dir.path().join("hello.sh");
         std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_owned_target_runnable(script.as_os_str(), &[]).unwrap_err();
+        let error = check_owned_target_runnable(script.as_os_str(), &[], None).unwrap_err();
         let text = format!("{error}");
         assert!(text.contains("must be an ELF executable"), "{text}");
         assert!(
             text.contains("invoke scripts through an interpreter"),
             "{text}"
         );
-        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[]).is_ok());
+        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[], None).is_ok());
     }
 
     /// A `#!` launcher (Ubuntu's `/usr/bin/firefox`) is named as a script,
@@ -14414,7 +15181,7 @@ mod tests {
         let script = dir.path().join("browser");
         std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let text = check_owned_target_runnable(script.as_os_str(), &[])
+        let text = check_owned_target_runnable(script.as_os_str(), &[], None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -14430,6 +15197,30 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+    }
+
+    /// A `--user` that resolves nowhere leaves the invoker unknown, so the
+    /// script refusal hides the interpreter token (fail-closed) while still
+    /// naming the script and its fix.
+    #[test]
+    fn runnable_check_with_an_unresolvable_user_hides_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = check_owned_target_runnable(
+            script.as_os_str(),
+            &[],
+            Some(OsStr::new("p11scope-definitely-no-such-user")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(text.contains("is a script: run"), "{text}");
+        assert!(
+            text.contains("is not shown because the invoking user"),
+            "{text}"
+        );
+        assert!(!text.contains("/bin/sh"), "{text}");
     }
 
     fn snap_probes<'a>(
@@ -15684,6 +16475,7 @@ mod tests {
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
             verbose: false,
+            user: None,
             command: command.iter().map(OsString::from).collect(),
         }
     }

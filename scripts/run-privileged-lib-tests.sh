@@ -543,6 +543,10 @@ attach::prearm_witness::tests::privileged_finalize_settles_under_churn
 # sudo -o ownership: reports created in an invoker-owned directory are
 # handed to SUDO_UID:SUDO_GID (0600); elsewhere they stay root-owned.
 output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker
+# Owned-child home restoration: a sudo-shaped drop to nobody carries the
+# passwd HOME/USER into the exec'd environment (needs only root and the
+# nobody account, no BPF).
+run::tests::privileged_spawned_child_home_matches_the_target_passwd_row
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

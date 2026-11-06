@@ -58,6 +58,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
         verbose: false,
+        user: None,
         command: command.iter().map(std::ffi::OsString::from).collect(),
     }
 }

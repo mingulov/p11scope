@@ -111,6 +111,17 @@ fn run() -> Result<i32> {
                 ));
                 return Ok(2);
             }
+            // The `--user` selection refuses like a usage error (exit 2)
+            // before anything is resolved, forked, or attached.
+            if let Some(user) = a.user.as_deref()
+                && let Err(message) = p11scope::check_run_user(user)
+            {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Run.hint()
+                ));
+                return Ok(2);
+            }
             run_owned(&a).map(|outcome| outcome.exit_code())
         }
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target

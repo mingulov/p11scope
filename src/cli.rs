@@ -201,6 +201,11 @@ pub struct RunArgs {
     /// `--quiet`: summary head only, for scripts. Default off; refused
     /// beside `--verbose`.
     pub quiet: bool,
+    /// `--user <name|uid>`: start the command as that account (root
+    /// only, like `strace -u`), with its groups and home environment
+    /// from the passwd entry. `None` keeps the default: under sudo
+    /// the invoker, otherwise the observer itself.
+    pub user: Option<OsString>,
     /// Everything after `--`, verbatim — bytes, not text: Linux arguments
     /// need not be UTF-8 (M-9). Never empty.
     pub command: Vec<OsString>,
@@ -515,7 +520,7 @@ usage:
   p11scope help [command]
   p11scope profile [--pid <n> | --cgroup <path> | --system] [--mode profile|metrics] [--duration <…>] [-o <out.json>] [-v] [--quiet]
   p11scope trace [--pid <n> | --cgroup <path> | --system] [--duration <…>] [--max-events <n>] [-o <out.file>] [-v] [--quiet]
-  p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [-v] [--quiet] -- CMD [ARGS...]
+  p11scope run [--mode profile|metrics | --trace] [--pause never|auto|always] [--user <name|uid>] [-v] [--quiet] -- CMD [ARGS...]
   p11scope inspect --pid <n> [--json] [-v] [--quiet]
   p11scope inspect --system [--json] [-v] [--quiet]
   p11scope inventory --pid <n> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
@@ -629,12 +634,13 @@ exit codes: 0 ok (partial results still exit 0); 1 capture failed; 2 wrong argum
 /// `p11scope run --help`: scoped syntax, examples and evidence limits.
 const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
-                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout]
+                   [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
                    [--attach-backend auto|multi|singles]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
 
 example:
   sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
+  sudo p11scope run --user alice -- pkcs11-tool --module ... -L
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
@@ -645,7 +651,7 @@ scan-only discovery names functions from the standard table without confirming t
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
-CMD inherits the observer's environment unchanged, except SUDO_UID/SUDO_GID/SUDO_USER/SUDO_COMMAND and P11SCOPE_* (named on stderr when withheld).
+CMD inherits the observer's environment unchanged, except SUDO_* and P11SCOPE_* (named on stderr when withheld).
 Under sudo the child runs as the invoker with the invoker's groups and HOME/USER/LOGNAME/SHELL from the passwd entry (plus XDG_RUNTIME_DIR when /run/user/<uid> is the invoker's own); -v prints the restored identity.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
@@ -663,7 +669,8 @@ The selection attempt is recorded in the report; aggregate and detail counts are
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends the capture cleanly.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
--v/--verbose prints one line naming the sudo-drop identity (running CMD as USER (groups and home restored)).
+-v/--verbose prints one line naming the run-as identity (running CMD as USER; the sudo-drop path adds (groups and home restored)).
+--user <name|uid> (root only, like strace -u) starts CMD as that account with its groups and home environment; --user root stays root on purpose.
 exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
 ";
 
@@ -1146,6 +1153,11 @@ fn unknown_arg(arg: &str) -> CliError {
         "--pause" => usage_err(
             "--pause is a `p11scope run` option: only a child this observer started can be \
              paused",
+        ),
+        // Same for the run-as account: no other subcommand starts a child.
+        "--user" => usage_err(
+            "--user is a `p11scope run` option: only a child this observer started can run \
+             as another account",
         ),
         other => usage_err(format!("unknown argument: {other}")),
     }
@@ -2074,6 +2086,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
     let mut pause_seen = false;
     let mut kill_on_timeout = false;
     let mut trace = false;
+    let mut user: Option<OsString> = None;
     let mut command: Vec<OsString> = Vec::new();
 
     while let Some(a) = args.next() {
@@ -2084,6 +2097,16 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         match arg.as_ref() {
             "--help" | "-h" => return Err(CliError::Help(HelpTopic::Run)),
             "--trace" => trace = true,
+            "--user" => {
+                if user.is_some() {
+                    return Err(usage_err("--user given twice"));
+                }
+                let value = require_os_value(&mut args, "--user")?;
+                if value.is_empty() {
+                    return Err(usage_err("--user requires a non-empty value"));
+                }
+                user = Some(value);
+            }
             "--pause" => {
                 if pause_seen {
                     return Err(usage_err("--pause given twice"));
@@ -2164,6 +2187,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         track_short_lived: common.track_short_lived,
         verbose: common.verbose,
         quiet: common.quiet,
+        user,
         command,
     })
 }
@@ -4840,6 +4864,84 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_user_parses_name_and_uid_and_defaults_off() {
+        let Command::Run(a) = parse(args(&["run", "--", "/bin/true"])).unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(a.user, None);
+        for value in ["alice", "1000", "0", "root"] {
+            let Command::Run(a) =
+                parse(args(&["run", "--user", value, "--", "/bin/true"])).unwrap()
+            else {
+                panic!("expected run")
+            };
+            assert_eq!(
+                a.user.as_deref(),
+                Some(std::ffi::OsStr::new(value)),
+                "{value}"
+            );
+            assert_eq!(a.command, ["/bin/true"]);
+        }
+        // A `--user` after `--` is the child's own argument, never the flag.
+        let Command::Run(a) = parse(args(&["run", "--", "/bin/true", "--user", "alice"])).unwrap()
+        else {
+            panic!("expected run")
+        };
+        assert_eq!(a.user, None);
+        assert_eq!(a.command, ["/bin/true", "--user", "alice"]);
+        for (topic, help) in [("global", USAGE), ("run", RUN_HELP)] {
+            assert!(
+                help.contains("[--user <name|uid>]"),
+                "{topic} help must advertise the user flag"
+            );
+            assert!(
+                help.contains("--user <name|uid> (root only, like strace -u)"),
+                "{topic} help must document the user flag"
+            );
+        }
+        assert!(
+            RUN_HELP.contains("sudo p11scope run --user alice -- pkcs11-tool --module ... -L"),
+            "run help must carry the --user example"
+        );
+    }
+
+    #[test]
+    fn run_user_refusals_name_the_flag() {
+        let Err(CliError::Usage { message, .. }) = parse(args(&[
+            "run",
+            "--user",
+            "alice",
+            "--user",
+            "bob",
+            "--",
+            "/bin/true",
+        ])) else {
+            panic!("--user given twice must be refused");
+        };
+        assert_eq!(message, "--user given twice");
+        let Err(CliError::Usage { message, .. }) = parse(args(&["run", "--user"])) else {
+            panic!("--user without a value must be refused");
+        };
+        assert_eq!(message, "--user requires a value");
+        let Err(CliError::Usage { message, .. }) =
+            parse(args(&["run", "--user", "", "--", "/bin/true"]))
+        else {
+            panic!("--user with an empty value must be refused");
+        };
+        assert_eq!(message, "--user requires a non-empty value");
+        // `--user` is a `run` option everywhere else, like `--pause`.
+        let Err(CliError::Usage { message, .. }) =
+            parse(args(&["profile", "--pid", "42", "--user", "alice"]))
+        else {
+            panic!("--user outside run must be refused");
+        };
+        assert!(
+            message.contains("--user is a `p11scope run` option"),
+            "{message:?}"
+        );
+    }
+
     /// M-9: paths and the `run` command are bytes; they survive parsing
     /// exactly, and a non-UTF-8 flag or number is a usage error.
     #[test]
@@ -5144,8 +5246,11 @@ mod tests {
         // somewhere (see every_flag_is_documented_in_some_help). The
         // late-process scope bound moved with the notes into
         // inventory help (see inventory_help_bounds_late_process_scanning).
-        assert_eq!(USAGE.len(), 2720);
-        assert_eq!(hash, 0x80058f0fef22a940);
+        // 2740 / 0xba5954dfb55f7904 (run `--user`): diff vs the
+        // 2720/0x80058f0fef22a940 pin is exactly ` [--user <name|uid>]`
+        // on the run synopsis line (+20); no other drift.
+        assert_eq!(USAGE.len(), 2740);
+        assert_eq!(hash, 0xba5954dfb55f7904);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

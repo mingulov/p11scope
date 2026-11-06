@@ -52,6 +52,7 @@ fn paused_run(pause: PausePolicy, marker: &Path) -> RunArgs {
         attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
         verbose: false,
+        user: None,
         command: vec![
             "/bin/sh".into(),
             "-c".into(),

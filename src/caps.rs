@@ -206,10 +206,11 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// `CAP_SYS_ADMIN` (no `perf_event_open` remains past attach, measured
 /// lane F15); a singles session keeps it for dynamic perf re-attach.
 pub(crate) fn post_setup_keep(multi: bool, effective: u64) -> u64 {
-    // Scaffolding: the next commit sheds the transient bit; until
-    // then the mask passes through unchanged.
-    let _ = multi;
-    effective
+    if multi {
+        effective & !(1u64 << CAP_SYS_ADMIN_BIT)
+    } else {
+        effective
+    }
 }
 
 /// This process's effective capabilities, from `/proc/self/status`

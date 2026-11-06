@@ -11024,6 +11024,19 @@ impl Session {
     pub(crate) fn dynamic_multi_attached(&self) -> bool {
         self.dynamic_attach_evidence.multi_successful()
     }
+
+    /// Shed the transient startup grant once attach is complete: a
+    /// multi session drops `CAP_SYS_ADMIN` (no `perf_event_open`
+    /// remains past attach — measured lane F15: dynamic links need
+    /// `CAP_BPF`+`CAP_PERFMON`, never sysadmin); a singles session
+    /// keeps it for dynamic perf re-attach. Fail-closed like the
+    /// startup drop. Callers invoke this after their session starts,
+    /// before the capture loop.
+    pub(crate) fn drop_post_setup_capabilities(&self) -> std::io::Result<()> {
+        let multi = self.backend == AttachBackend::Multi;
+        let effective = crate::caps::read_effective().unwrap_or(0);
+        crate::caps::drop_to_keep(crate::caps::post_setup_keep(multi, effective))
+    }
 }
 
 /// One static original transfers as one owning payload. Keep the native

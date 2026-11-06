@@ -44,38 +44,98 @@ const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 
 /// A cgroup v2 subgroup owned by one `run`: the owned child is placed in
 /// it before its barrier release, so every descendant is born in scope.
-/// Scaffolding: the bodies land with the implementation.
+/// Dropping removes the directory best-effort; a nonempty directory
+/// (handed-back survivors still in it) is left in place, never forced.
 #[derive(Debug)]
-pub(crate) struct RunCgroup {
+pub struct RunCgroup {
     path: PathBuf,
 }
 
 impl RunCgroup {
-    pub(crate) fn create(base: &Path) -> Result<Self> {
-        let _ = base;
-        anyhow::bail!("run cgroup scaffolding");
+    /// Creates the run subgroup directly under `base` (production passes
+    /// `/sys/fs/cgroup`). No controllers are enabled: membership only, no
+    /// resource effects. The cgroup2 proof stays with scope construction
+    /// (`capture_cgroup`), which must build on this path before use.
+    pub fn create(base: &Path) -> Result<Self> {
+        let path = base.join(
+            run_cgroup_name()
+                .with_context(|| format!("naming a run cgroup under {}", base.display()))?,
+        );
+        std::fs::create_dir(&path)
+            .with_context(|| format!("creating run cgroup {}", path.display()))?;
+        Ok(Self { path })
     }
 
-    pub(crate) fn path(&self) -> &Path {
+    pub fn path(&self) -> &Path {
         &self.path
     }
 
-    pub(crate) fn place(&self, pid: u32) -> Result<()> {
-        let _ = pid;
-        anyhow::bail!("run cgroup scaffolding");
+    /// Moves the whole process `pid` into the run cgroup and proves the
+    /// landing via `/proc/<pid>/cgroup`: a misplaced child would flip
+    /// every later scope assertion, so a silent miss fails here instead.
+    pub fn place(&self, pid: u32) -> Result<()> {
+        std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
+            .with_context(|| format!("moving {pid} to run cgroup {}", self.path.display()))?;
+        let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+            .with_context(|| format!("reading the cgroup of {pid}"))?;
+        let relative = parse_cgroup_v2_relative(&text)
+            .with_context(|| format!("no cgroup v2 entry for process {pid}: {text:?}"))?;
+        let base = self
+            .path
+            .parent()
+            .with_context(|| format!("run cgroup {} has no parent", self.path.display()))?;
+        let placed = base.join(relative);
+        anyhow::ensure!(
+            placed == self.path,
+            "process {pid} did not land in {} (in {})",
+            self.path.display(),
+            placed.display()
+        );
+        Ok(())
     }
 }
 
-/// Scaffolding: the random name lands with the implementation.
-pub(crate) fn run_cgroup_name() -> Result<String> {
-    anyhow::bail!("run cgroup scaffolding");
+impl Drop for RunCgroup {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir(&self.path);
+    }
 }
 
-/// Scaffolding: the `/proc/<pid>/cgroup` v2-line parser lands with the
-/// implementation.
-pub(crate) fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
-    let _ = text;
-    None
+/// One run-subgroup leaf name: fixed prefix plus 64 bits from `getrandom`
+/// as lowercase hex. Random, never the observer PID: a best-effort
+/// cgroup label may publish the name, and profile output never carries
+/// PIDs.
+pub fn run_cgroup_name() -> Result<String> {
+    let mut word = [0u8; 8];
+    let mut filled = 0;
+    while filled < word.len() {
+        // SAFETY: the slice is live and entirely writable; getrandom
+        // writes at most the remaining length, with no other effects.
+        let got =
+            unsafe { libc::getrandom(word[filled..].as_mut_ptr().cast(), word.len() - filled, 0) };
+        if got < 0 {
+            let errno = std::io::Error::last_os_error();
+            if errno.raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            return Err(errno).context("reading run cgroup randomness");
+        }
+        if got == 0 {
+            return Err(std::io::Error::other("getrandom returned no randomness"))
+                .context("reading run cgroup randomness");
+        }
+        filled += got as usize;
+    }
+    Ok(format!("p11scope-run-{:016x}", u64::from_ne_bytes(word)))
+}
+
+/// The cgroup v2 path of a `/proc/<pid>/cgroup` text, relative to the v2
+/// mount: the `0::` line with its leading slash stripped (`0::/` is the
+/// mount itself, `Some("")`). `None` when no v2 line exists.
+pub fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.strip_prefix('/').unwrap_or(path))
 }
 
 /// `--cgroup` as an operator names it (M-3): [`cgroup`] plus proof, taken

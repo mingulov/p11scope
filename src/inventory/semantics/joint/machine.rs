@@ -3778,12 +3778,16 @@ impl LiveJointMachine {
                                         format!(
                                             "{}s without progress across {} consecutive commit polls in \
                                              Audited; the semantic lane stops; \
-                                             h0_below={:?}, staged_max={:?}, floor={:?}",
+                                             h0_below={:?}, staged_max={:?}, floor={:?}; {}; held={:?}",
                                             stalled.as_secs(),
                                             polls,
                                             watermarks.map(|bounds| bounds.0),
                                             watermarks.and_then(|bounds| bounds.1),
                                             watermarks.and_then(|bounds| bounds.2),
+                                            frame
+                                                .as_ref()
+                                                .map_or_else(String::new, IngestedJointQuantum::no_progress_shape),
+                                            coordinator.registry().joint_seal_held(),
                                         ),
                                     );
                                     return (

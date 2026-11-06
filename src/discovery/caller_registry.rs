@@ -2984,6 +2984,9 @@ pub(crate) struct CallerRegistry {
     /// (no ledger supplied, or the shared ledger refused): S1
     /// preserved, Joint evidence absent for those calls.
     joint_direct_fallback: u64,
+    /// Joint seal deliveries held, by cause: no record, foreign seal,
+    /// feed not Joint, no reducer, feed-internal hold.
+    joint_seal_held: [u64; 5],
     /// Calls shed unrouted after S1 proved a caller other than
     /// every bound one: counted as foreign not-attributed beside
     /// the bound callers' key-operation rows.
@@ -3087,6 +3090,7 @@ impl CallerRegistry {
             joint_accounting: false,
             key_projection: None,
             joint_direct_fallback: 0,
+            joint_seal_held: [0; 5],
             foreign_unrouted_calls: 0,
             settlement_latency: None,
         }

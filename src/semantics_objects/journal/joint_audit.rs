@@ -583,6 +583,34 @@ fn failure_storage(failure: &SealFailure) -> Option<usize> {
 }
 
 impl IngestedJointQuantum {
+    /// Bounded diagnostic shape of the frame's consumer service: counts
+    /// by state, the cursor, and whether a seal or failure is held.
+    pub(crate) fn no_progress_shape(&self) -> String {
+        let mut counts = [0usize; 5];
+        for consumer in &self.consumers {
+            counts[match consumer.state {
+                ConsumerState::Pending => 0,
+                ConsumerState::NegativeOnly => 1,
+                ConsumerState::Future => 2,
+                ConsumerState::Delivered => 3,
+                ConsumerState::LossDelivered => 4,
+            }] += 1;
+        }
+        format!(
+            "consumers={} pending/neg/future/delivered/loss={:?} cursor={} active={} failure={} ingress_disposed={}",
+            self.consumers.len(),
+            counts,
+            self.cursor,
+            match &self.active {
+                None => "none",
+                Some(active) if active.outcome.is_ok() => "seal",
+                Some(_) => "failure",
+            },
+            self.failure.is_some(),
+            matches!(self.ingress, FrameIngress::Disposed(_)),
+        )
+    }
+
     /// Bounded diagnostics from this frame's immutable audit. These scalar
     /// watermarks cannot advance H3 or authorize delivery or publication.
     pub(crate) fn no_progress_watermarks(&self) -> (u64, Option<u64>, Option<u64>) {

@@ -262,7 +262,10 @@ int main(int argc, char **argv) {
 }
 EOF
     echo "demo: building $IMAGE ..." >&2
-    docker build -q -f "$STAGE/Dockerfile" -t "$IMAGE" "$STAGE" >&2 \
+    # Host networking for the build steps only, so the image also builds
+    # against a bridgeless private daemon; the signers themselves need no
+    # network and run isolated.
+    docker build -q --network=host -f "$STAGE/Dockerfile" -t "$IMAGE" "$STAGE" >&2 \
         || { echo "demo: image build failed" >&2; exit 2; }
 fi
 

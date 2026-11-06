@@ -4856,12 +4856,16 @@ mod tests {
         };
         assert!(!a.verbose);
         assert_eq!(a.command, ["/bin/true", "-v"]);
-        // Short help spells the flag `[-v]` on every command's synopsis
-        // line; the `--verbose` spelling stays in the notes.
+        // Shortened help since CLI-1: usage lines carry `[-v]`, the prose
+        // names both spellings; topics keep the same shapes.
         for (topic, help) in [("global", USAGE), ("run", RUN_HELP)] {
             assert!(
                 help.contains("[-v]"),
                 "{topic} help must advertise the verbose flag"
+            );
+            assert!(
+                help.contains("-v, --verbose"),
+                "{topic} help must name both verbose spellings"
             );
         }
     }
@@ -4892,14 +4896,14 @@ mod tests {
         };
         assert_eq!(a.user, None);
         assert_eq!(a.command, ["/bin/true", "--user", "alice"]);
+        // Shortened help since CLI-1: global usage names the flag, the
+        // document sentence and example live in the run topic.
         for (topic, help) in [("global", USAGE), ("run", RUN_HELP)] {
             assert!(
                 help.contains("[--user <name|uid>]"),
                 "{topic} help must advertise the user flag"
             );
         }
-        // Short global help carries the synopsis only; the flag's notes
-        // live in scoped help.
         assert!(
             RUN_HELP.contains("--user <name|uid> (root only, like strace -u)"),
             "run help must document the user flag"

@@ -346,7 +346,7 @@ date -u +%Y-%m-%dT%H:%M:%SZ > "$STAGE/guest-start.txt"
 ulimit -n 65536 || exit 1
 "$P" --version > "$STAGE/version.log" 2>&1
 record_exit "$STAGE/version.log" version "$?"
-"$P" doctor > "$STAGE/doctor.log" 2>&1
+"$P" doctor -v > "$STAGE/doctor.log" 2>&1
 record_exit "$STAGE/doctor.log" doctor "$?"
 MODULE_ARGS=(); [ -z "${MODULE+x}" ] || MODULE_ARGS=(--module "$MODULE")
 MODULE=$(python3 -I "$R/scripts/release-matrix-contract.py" --select-module "${MODULE_ARGS[@]}") || exit 1

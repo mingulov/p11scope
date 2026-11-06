@@ -792,7 +792,7 @@ if [ "${P11SCOPE_PUBLIC_CLI_ONLY_IA32:-0}" = 1 ]; then
   fi
   summary profile-pid-ia32 run-ia32; exit $?
 fi
-"$P" doctor > doctor.out 2>&1; rc=$?
+"$P" doctor -v > doctor.out 2>&1; rc=$?
 result doctor "$([ "$rc" = 0 ] && grep -q 'capture available' doctor.out && grep -qE '^uprobe-multi attach \(own libc\) \.+ ok([ \t].*)?$' doctor.out && grep -qE '^uretprobe vs seccomp \.+ ok([ \t].*)?$' doctor.out && echo 1 || echo 0)" "rc=$rc"
 gated profile-pid pid "$GATED" profile --pid @PID@ --duration 12 -o "$OUT/profile-pid.json"
 # The semantic assertions reuse the independently captured receipt, with their

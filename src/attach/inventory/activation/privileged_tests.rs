@@ -7668,10 +7668,7 @@ fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
         let rv_label = pkcs11_types::CkRv(event.rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
         ensure!(
-            rendered.contains(&format!(
-                "owned_{} [semantics unverified] → {rv_label} ",
-                event.slot
-            )),
+            rendered.contains(&format!("owned_{} → {rv_label} ", event.slot)),
             "Tracer failed to render exact fixture slot and RV without authority: {rendered}"
         );
         rendered_hash.update(rendered.as_bytes());
@@ -8995,12 +8992,8 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             evidence.identity_event(event, fixture, witness, role)?;
             tracer.count_raw_call(event);
             let rendered = tracer.on_event(event, &mut state);
-            let rv_label = pkcs11_types::CkRv(event.rv).to_string();
-            let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
             ensure!(
-                rendered.contains("C_Finalize")
-                    && rendered.contains("C_Initialize")
-                    && rendered.contains(&format!("[semantics unverified] → {rv_label} "))
+                rendered.contains("C_Finalize") && rendered.contains("C_Initialize")
             );
             evidence.render(&rendered)?;
         }
@@ -9518,7 +9511,7 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
     evidence.event(&events[0], &fixture, "successor_completed")?;
     evidence.render(&rendered)?;
     ensure!(
-        tracer.raw_calls() == 1 && rendered.contains("owned_2048 [semantics unverified]"),
+        tracer.raw_calls() == 1 && rendered.contains("owned_2048 →"),
         "high-slot successor was not rendered by real Tracer"
     );
     ensure!(

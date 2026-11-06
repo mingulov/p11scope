@@ -1167,7 +1167,7 @@ jobs:
             set -euo pipefail
             binary="$PWD/target/release/p11scope"
             doctor_status=0
-            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
+            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor -v >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
             printf "%s\n" "$doctor_status" >"$TMPDIR/hosted-doctor-status.txt"
             python3 -I - "$TMPDIR/hosted-doctor.txt" "$doctor_status" << "PY"
           import re

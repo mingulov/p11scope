@@ -488,7 +488,7 @@ UID_IDLE=$(pod_uid idle)
 
 echo "=== doctor in the observer pod ==="
 lock_step
-observe k8s-profile-entry --pod-uid "$UID_A" --command doctor > "$WORK/doctor.out" 2>&1 \
+observe k8s-profile-entry --pod-uid "$UID_A" --command doctor -- -v > "$WORK/doctor.out" 2>&1 \
     || { cat "$WORK/doctor.out" >&2; exit 1; }
 unlock_step
 grep -E '^(capability tier|verdict):' "$WORK/doctor.out"

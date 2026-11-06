@@ -111,7 +111,7 @@ PTRACER_PID=
 PLAIN_PID=
 
 echo "=== doctor (host only) ==="
-"$P11SCOPE" doctor > "$WORK/doctor.txt" 2>&1 || true
+"$P11SCOPE" doctor -v > "$WORK/doctor.txt" 2>&1 || true
 cat "$WORK/doctor.txt"
 echo
 assert_inspect_doctor --host "$WORK/doctor.txt"

@@ -180,7 +180,7 @@ jobs:
           trap check_cleanup EXIT
           doctor_status=0
           # shellcheck disable=SC2024
-          sudo -n env TMPDIR="$TMPDIR" "$P11SCOPE_BIN" doctor >"$DOCKER_RUNTIME_WORK/logs/doctor.txt" 2>&1 || doctor_status=$?
+          sudo -n env TMPDIR="$TMPDIR" "$P11SCOPE_BIN" doctor -v >"$DOCKER_RUNTIME_WORK/logs/doctor.txt" 2>&1 || doctor_status=$?
           cat "$DOCKER_RUNTIME_WORK/logs/doctor.txt"
           python3 -I - "$DOCKER_RUNTIME_WORK/logs/doctor.txt" "$doctor_status" <<'PY'
           from pathlib import Path

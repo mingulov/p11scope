@@ -1620,12 +1620,47 @@ pub(crate) fn select_session_backend(
 /// it is the tail-call target the pair installs into PAIR_CALLS, and since
 /// CVE-2025-40123 a program array accepts only programs with its owner's
 /// expected attach type. The continuation is never attached
-/// (`static_probe_side` stays `None` for it); everything else (dynamic,
-/// diagnostic, lifecycle, the other tail-call target) loads plain under both
-/// backends.
-pub(crate) fn loads_with_multi_flag(backend: AttachBackend, program: &str) -> bool {
+/// (`static_probe_side` stays `None` for it). Dynamic probes load multi
+/// when `dynamic_multi` says their attach goes through links; everything
+/// else (diagnostic, lifecycle, the other tail-call target) loads plain
+/// under both backends.
+pub(crate) fn loads_with_multi_flag(
+    backend: AttachBackend,
+    program: &str,
+    _dynamic_multi: bool,
+) -> bool {
+    // Scaffolding: the next commit wires the dynamic clause; ignoring the
+    // flag keeps today's plain dynamic loads.
     backend == AttachBackend::Multi
         && (static_probe_side(program).is_some() || program == MULTI_LOADED_TAIL_TARGET)
+}
+
+/// Programs the live-discovery engine attaches dynamically (the loader
+/// hook plus the three export-hook pairs), rather than through the static
+/// slot plan. The `interface_list_worker` tail-call target is not one.
+fn is_dynamic_probe_program(program: &str) -> bool {
+    matches!(
+        program,
+        "dl_debug_state"
+            | "function_list_entry"
+            | "function_list_return"
+            | "interface_list_entry"
+            | "interface_list_return"
+            | "interface_entry"
+            | "interface_return"
+    )
+}
+
+/// Dynamic (loader/export) probes attach through uprobe-multi links only
+/// where the session backend is multi AND the kernel pid filter is proven:
+/// dynamic probes filter by target pid, and the 6.9.x thread bug would
+/// silently miss sibling threads. Everywhere else they stay on per-probe
+/// perf attach (which paranoid 3+ gates). Pure over the probe verdict so
+/// tests script it; preparation passes the live probe.
+fn dynamic_multi_links(backend: AttachBackend, pid_filter_proven: bool) -> bool {
+    // Scaffolding: always false until the next commit wires the decision.
+    let _ = (backend, pid_filter_proven);
+    false
 }
 
 /// The one tail-call target that loads for uprobe-multi: never attached, only
@@ -1823,6 +1858,11 @@ pub struct Session {
     /// per-offset links (DR-CLASSIC-PID0).
     selection: BackendSelection,
     backend_fallback: Option<String>,
+    /// Dynamic (loader/export) probes attach through uprobe-multi links.
+    /// Set at preparation from [`dynamic_multi_links`]: multi backend plus
+    /// a proven kernel pid filter. The load flags and every dynamic attach
+    /// read this one decision, so they cannot disagree.
+    dynamic_multi: bool,
     /// Approved mechanism ids the `MECH_SHAPE` publication could not fit
     /// (ruling JK-22a): the official-first subset published instead of
     /// refusing the session, and this count gapped them. Zero unless the
@@ -2481,6 +2521,15 @@ fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoin
         .collect()
 }
 
+/// How one dynamic (loader/export) hook is linked: a perf `uprobe` in
+/// aya's link table, or a raw uprobe-multi link fd outside it. The program,
+/// hook identity and registry handling are identical; only the link
+/// lifetime differs (aya detach vs drop).
+enum DynamicLinkId {
+    Perf(UProbeLinkId),
+    Multi(OwnedFd),
+}
+
 /// One link whose lifetime this session owns. Static, loader/export, and
 /// lifecycle links all remain in this one registry.
 enum RegisteredLink {
@@ -2518,7 +2567,7 @@ enum RegisteredLink {
         file_offset: u64,
         cookie: u64,
         abi: Option<HookAbi>,
-        id: UProbeLinkId,
+        id: DynamicLinkId,
     },
 }
 
@@ -7687,7 +7736,9 @@ impl Session {
                             .program_mut(prog_name)
                             .with_context(|| format!("program {prog_name} missing from object"))?
                             .try_into()?;
-                        if loads_with_multi_flag(backend, prog_name) {
+                        // Scaffolding: the next commit passes the prepared
+                        // `dynamic_multi` decision here.
+                        if loads_with_multi_flag(backend, prog_name, false) {
                             prog.load_multi()
                                 .with_context(|| format!("loading {prog_name} for multi attach"))?;
                         } else {
@@ -7798,6 +7849,9 @@ impl Session {
                 backend,
                 selection: BackendSelection::Auto,
                 backend_fallback: None,
+                // Scaffolding: the next commit computes this from the live
+                // pid-filter probe; `false` keeps today's singles behavior.
+                dynamic_multi: false,
                 unpublished_mechanisms,
                 uprobe_scope,
                 pause_key,
@@ -8379,7 +8433,7 @@ impl Session {
                     file_offset,
                     cookie,
                     abi: None,
-                    id,
+                    id: DynamicLinkId::Perf(id),
                 });
                 Ok(true)
             }
@@ -8493,7 +8547,7 @@ impl Session {
                     file_offset,
                     cookie,
                     abi: Some(abi),
-                    id,
+                    id: DynamicLinkId::Perf(id),
                 }
             }),
         );
@@ -10876,19 +10930,22 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             Ok(vec![OwnedLink::Fd(taken.into())])
         })(),
-        RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
-            let probe: &mut UProbe = ebpf
-                .program_mut(program)
-                .with_context(|| format!("program {program} missing during detach"))?
-                .try_into()?;
-            let taken = probe
-                .take_link(id)
-                .with_context(|| format!("detaching {program}"))?;
-            match taken.into_fd_links() {
-                Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
-                Err(link) => Ok(vec![OwnedLink::Probe(link)]),
-            }
-        })(),
+        RegisteredLink::DynamicUProbe { program, id, .. } => match id {
+            DynamicLinkId::Perf(id) => (|| {
+                let probe: &mut UProbe = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                let taken = probe
+                    .take_link(id)
+                    .with_context(|| format!("detaching {program}"))?;
+                match taken.into_fd_links() {
+                    Ok(links) => Ok(links.into_iter().map(OwnedLink::Fd).collect()),
+                    Err(link) => Ok(vec![OwnedLink::Probe(link)]),
+                }
+            })(),
+            DynamicLinkId::Multi(fd) => Ok(vec![OwnedLink::Multi(vec![fd])]),
+        },
     }
 }
 
@@ -10928,15 +10985,22 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
                 .detach(id)
                 .with_context(|| format!("detaching {program}"))
         })(),
-        RegisteredLink::DynamicUProbe { program, id, .. } => (|| {
-            let probe: &mut UProbe = ebpf
-                .program_mut(program)
-                .with_context(|| format!("program {program} missing during detach"))?
-                .try_into()?;
-            probe
-                .detach(id)
-                .with_context(|| format!("detaching {program}"))
-        })(),
+        RegisteredLink::DynamicUProbe { program, id, .. } => match id {
+            DynamicLinkId::Perf(id) => (|| {
+                let probe: &mut UProbe = ebpf
+                    .program_mut(program)
+                    .with_context(|| format!("program {program} missing during detach"))?
+                    .try_into()?;
+                probe
+                    .detach(id)
+                    .with_context(|| format!("detaching {program}"))
+            })(),
+            // Detach is drop: closing the fd detaches the link.
+            DynamicLinkId::Multi(fd) => {
+                drop(fd);
+                Ok(())
+            }
+        },
     }
 }
 
@@ -12319,26 +12383,68 @@ mod tests {
             "p11_entry_template_pair",
             "p11_entry_template_second",
         ] {
-            assert!(
-                loads_with_multi_flag(AttachBackend::Multi, program),
-                "{program} must load with the multi flag"
-            );
-            assert!(
-                !loads_with_multi_flag(AttachBackend::Singles, program),
-                "{program} must load plain under singles"
-            );
+            for dynamic_multi in [false, true] {
+                assert!(
+                    loads_with_multi_flag(AttachBackend::Multi, program, dynamic_multi),
+                    "{program} must load with the multi flag (dynamic_multi={dynamic_multi})"
+                );
+                assert!(
+                    !loads_with_multi_flag(AttachBackend::Singles, program, dynamic_multi),
+                    "{program} must load plain under singles"
+                );
+            }
         }
         for program in [
-            "dl_debug_state",
-            "function_list_entry",
             "sched_process_exec",
             "task_newtask",
             "interface_list_worker",
             "no_such_program",
         ] {
+            for dynamic_multi in [false, true] {
+                assert!(
+                    !loads_with_multi_flag(AttachBackend::Multi, program, dynamic_multi),
+                    "{program} must stay plain (lifecycle/worker/unknown)"
+                );
+                assert!(
+                    !loads_with_multi_flag(AttachBackend::Singles, program, dynamic_multi),
+                    "{program} must stay plain under singles"
+                );
+            }
+        }
+    }
+
+    /// Dynamic (loader/export) probes load multi exactly when their attach
+    /// goes through links: multi backend plus a proven kernel pid filter.
+    /// The load flag and the attach path read the one `dynamic_multi`
+    /// decision, so a 48-loaded program can never meet a perf attach.
+    #[test]
+    fn proven_dynamic_probes_take_the_multi_load_flag() {
+        use super::AttachBackend;
+        use super::{dynamic_multi_links, loads_with_multi_flag};
+        assert!(dynamic_multi_links(AttachBackend::Multi, true));
+        assert!(!dynamic_multi_links(AttachBackend::Multi, false));
+        assert!(!dynamic_multi_links(AttachBackend::Singles, true));
+        assert!(!dynamic_multi_links(AttachBackend::Singles, false));
+        for program in [
+            "dl_debug_state",
+            "function_list_entry",
+            "function_list_return",
+            "interface_list_entry",
+            "interface_list_return",
+            "interface_entry",
+            "interface_return",
+        ] {
             assert!(
-                !loads_with_multi_flag(AttachBackend::Multi, program),
-                "{program} must stay on singles (dynamic/diag/lifecycle)"
+                loads_with_multi_flag(AttachBackend::Multi, program, true),
+                "{program} must load multi when its attach goes through links"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Multi, program, false),
+                "{program} must load plain without a proven pid filter"
+            );
+            assert!(
+                !loads_with_multi_flag(AttachBackend::Singles, program, true),
+                "{program} must load plain under singles"
             );
         }
     }
@@ -12396,14 +12502,16 @@ mod tests {
         // one program can own the group's return/entry links, exactly like
         // the ordinary static endpoint twins they replace.
         for program in ["p11_entry_journal", "p11_return_journal"] {
-            assert!(
-                loads_with_multi_flag(AttachBackend::Multi, program),
-                "{program} must load with the multi flag"
-            );
-            assert!(
-                !loads_with_multi_flag(AttachBackend::Singles, program),
-                "{program} must load plain under singles"
-            );
+            for dynamic_multi in [false, true] {
+                assert!(
+                    loads_with_multi_flag(AttachBackend::Multi, program, dynamic_multi),
+                    "{program} must load with the multi flag"
+                );
+                assert!(
+                    !loads_with_multi_flag(AttachBackend::Singles, program, dynamic_multi),
+                    "{program} must load plain under singles"
+                );
+            }
         }
     }
 
@@ -14783,7 +14891,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: Some(HookAbi::FunctionList),
-            id: dummy_uprobe_link_id(),
+            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
         };
         assert_eq!(
             DetachQuarantine::of_link(&link),
@@ -14794,6 +14902,41 @@ mod tests {
                 cookie: 0x5555,
             }]
         );
+    }
+
+    /// Quarantine, snapshot and context matching key on the hook tuple
+    /// (program/context/object/offset/cookie), never on how the hook is
+    /// linked: a perf id and a multi link fd at the same tuple share one
+    /// identity.
+    #[test]
+    fn quarantine_of_link_ignores_the_dynamic_link_id_variant() {
+        use super::DynamicLinkId;
+        let multi_fd =
+            || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
+        let perf = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+        };
+        let multi = RegisteredLink::DynamicUProbe {
+            program: "dl_debug_state",
+            context: LoaderContextId::from_case_id(0),
+            object: PinnedObjectId(3),
+            file_offset: 0x1000,
+            cookie: 0x5555,
+            abi: None,
+            id: DynamicLinkId::Multi(multi_fd()),
+        };
+        assert_eq!(
+            DetachQuarantine::of_link(&perf),
+            DetachQuarantine::of_link(&multi)
+        );
+        assert_eq!(perf.context(), multi.context());
+        assert_eq!(perf.producer(), multi.producer());
     }
 
     #[test]
@@ -14808,7 +14951,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: dummy_uprobe_link_id(),
+            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
         };
         let export = RegisteredLink::DynamicUProbe {
             program: "function_list_return",
@@ -14817,7 +14960,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: Some(HookAbi::FunctionList),
-            id: dummy_uprobe_link_id(),
+            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
         };
         assert_eq!(
             DetachQuarantine::of_link(&loader),
@@ -14944,7 +15087,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: dummy_uprobe_link_id(),
+            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
         };
         let keys = DetachQuarantine::of_link(&link);
         let mut quarantine = std::collections::BTreeSet::new();

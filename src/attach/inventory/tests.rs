@@ -567,10 +567,11 @@ fn object_checker_multi_loaded_programs_match_the_loaders() {
     let mut loaders = BTreeSet::new();
     for unsafe_enabled in [false, true] {
         for name in crate::attach::expected_programs(unsafe_enabled) {
-            let multi = crate::attach::loads_with_multi_flag(AttachBackend::Multi, name);
+            let multi = crate::attach::loads_with_multi_flag(AttachBackend::Multi, name, false);
             assert!(!crate::attach::loads_with_multi_flag(
                 AttachBackend::Singles,
-                name
+                name,
+                false
             ));
             if multi {
                 loaders.insert(name);

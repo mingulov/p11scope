@@ -1481,9 +1481,11 @@ fn key_tally_segment(tally: &KeyOpTally) -> String {
 }
 
 /// One indented key-operations detail line: `  {name}: {segment}{suffix}`.
-/// A provider file name shrinks first so the tally stays exact; fixed
-/// labels never shrink (they are short — only a pathological tally
-/// beside one may exceed the cap, since counts are never truncated).
+/// A provider file name shrinks first so the tally stays exact; when
+/// the line still overflows, the verbose parenthesized suffix
+/// (instance labels) shrinks next, marked with `…`. Fixed labels
+/// never shrink (they are short — only a pathological tally beside
+/// one may exceed the cap, since counts are never truncated).
 fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -> String {
     let rest = format!(": {segment}{suffix}");
     let fixed = 2 + rest.chars().count();
@@ -1491,11 +1493,32 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
         return format!("  {name}{rest}");
     }
     let budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(fixed);
-    if shrink_name && budget >= 2 {
+    let shown_name = if shrink_name && budget >= 2 {
         let kept: String = name.chars().take(budget - 1).collect();
-        return format!("  {kept}…{rest}");
+        format!("{kept}…")
+    } else {
+        name.to_string()
+    };
+    let line = format!("  {shown_name}{rest}");
+    if line.chars().count() <= SUMMARY_LINE_MAX_CHARS {
+        return line;
     }
-    format!("  {name}{rest}")
+    // The tally stays exact, so only the verbose suffix can still
+    // shrink: a parenthesized list truncates its inner content with
+    // `…`, keeping the closing paren.
+    let Some(inner) = suffix
+        .strip_prefix(" (")
+        .and_then(|tail| tail.strip_suffix(')'))
+    else {
+        return line;
+    };
+    let head = format!("  {shown_name}: {segment}");
+    let suffix_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(head.chars().count());
+    if suffix_budget < 4 {
+        return line;
+    }
+    let shrunk = ellipsize_to(inner, suffix_budget - 3);
+    format!("{head} ({shrunk})")
 }
 
 /// The subject every Joint birth refusal discloses under

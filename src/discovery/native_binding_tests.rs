@@ -889,6 +889,329 @@ fn exec_between_admission_and_read_leaves_the_retained_row_unbound() {
 }
 
 #[test]
+fn a_reuse_recorded_after_the_read_does_not_void_the_retained_binding() {
+    // The holder count is evaluated once, when the row is read: a second
+    // retained holder admitted after the read (PID reuse) leaves the
+    // unambiguous binding in place. Reuse requires the old task dead, and
+    // the old task was alive at the event, so the row is still its use.
+    // The reuse twin above scripts both holders before the read.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    // The old task exits and its pid is reused after the read.
+    run.world.retain(
+        T,
+        2,
+        1_600,
+        1_600,
+        true,
+        Some(200),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn loss_at_or_after_admission_leaves_the_retained_row_unbound() {
+    // Ring loss detected after the admission voids the retained identity.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.drain(&[]);
+    run.read_with_loss(Vec::new(), 3);
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::LifecycleLoss)]);
+    // Same for a live incarnation whose pin dies during the query.
+    run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+    run.drain(&[]);
+    run.read_with_loss(Vec::new(), 4);
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::LifecycleLoss)]);
+}
+
+#[test]
+fn admission_predating_coverage_leaves_the_retained_row_unbound() {
+    // The incarnation was admitted before exec coverage began and no
+    // qualifying pass revalidated it: an unrecorded exec may hide in
+    // between.
+    let mut run = Run::covered_from(2_000);
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ExecCoverageGap)]
+    );
+    // A qualifying pass that revalidates the incarnation rescues it.
+    let mut run = Run::covered_from(2_000);
+    let d = run.domain;
+    let x = run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.revalidate(2_500, &[x]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    // A row whose live pin dies during the query waits for the pass like
+    // a live row, then takes the gap when the pass misses it.
+    let mut run = Run::covered_from(2_000);
+    let d = run.domain;
+    run.world.admit(T, 1, 1, 1_000);
+    run.world.retain(
+        T,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T, 1_500)]);
+    run.settle();
+    assert!(run.verdicts().is_empty(), "the row waits for the pass");
+    run.revalidate(2_500, &[]);
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ExecCoverageGap)]
+    );
+}
+
+#[test]
+fn a_competing_image_of_the_ticket_leaves_retained_rows_unbound() {
+    // Two images after the admission and no exec record: neither binds.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![
+        row_on(d, 7, 1, T, 1_500, 0),
+        row_on(d, 7, 2, T, 1_600, 1),
+    ]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![
+            unbound(UnboundReason::ExecAmbiguous),
+            unbound(UnboundReason::ExecAmbiguous)
+        ]
+    );
+    // Same for a live incarnation whose pin dies during the query.
+    run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![
+        row_on(d, 9, 1, T + 1, 1_500, 0),
+        row_on(d, 9, 2, T + 1, 1_600, 1),
+    ]);
+    run.settle();
+    assert_eq!(
+        run.verdicts(),
+        vec![
+            unbound(UnboundReason::ExecAmbiguous),
+            unbound(UnboundReason::ExecAmbiguous)
+        ]
+    );
+}
+
+#[test]
+fn a_retained_row_of_a_held_image_is_ambiguous_without_a_transition() {
+    // The incarnation already holds another image of the ticket: this row
+    // is not it. No cookie answer exists to prove a transition, so none
+    // is emitted.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    run.read(vec![row_on(d, 7, 2, T, 1_600, 1)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::ExecAmbiguous)]);
+    assert!(run.binder.take_transitions().is_empty());
+    // Same for a live incarnation whose pin dies during the query.
+    let y = run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(y)]);
+    run.read(vec![row_on(d, 9, 2, T + 1, 1_600, 1)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::ExecAmbiguous)]);
+    assert!(run.binder.take_transitions().is_empty());
+}
+
+#[test]
+fn retained_lifetime_and_void_boundaries_are_exact() {
+    // The strictness claims, both sides of every edge: admission `<=`
+    // event binds, a retired `event < last_seen` binds, and exec/loss
+    // `>=` admission voids.
+    for (event_ns, binds) in [
+        (999u64, false),
+        (1_000, true),
+        (1_399, true),
+        (1_400, false),
+    ] {
+        let mut run = Run::new();
+        let d = run.domain;
+        let x = run.world.retain(
+            T,
+            0,
+            1_000,
+            1_400,
+            true,
+            Some(100),
+            true,
+            CallerLifecycle::Exited,
+        );
+        run.read(vec![row(d, 7, 1, T, event_ns)]);
+        run.settle();
+        let expected = if binds {
+            bound(x)
+        } else {
+            unbound(UnboundReason::NoLiveCaller)
+        };
+        assert_eq!(run.verdicts(), vec![expected], "event {event_ns}");
+    }
+    // An exec at the admission voids; just before it binds.
+    for (exec_ns, voids) in [(1_000u64, true), (999, false)] {
+        let mut run = Run::new();
+        let d = run.domain;
+        let x = run.world.retain(
+            T,
+            0,
+            1_000,
+            2_000,
+            true,
+            Some(100),
+            true,
+            CallerLifecycle::Exited,
+        );
+        run.read(vec![row(d, 7, 1, T, 1_500)]);
+        run.drain(&[(T, exec_ns)]);
+        run.read(Vec::new());
+        let expected = if voids {
+            unbound(UnboundReason::ExecAfterAdmission)
+        } else {
+            bound(x)
+        };
+        assert_eq!(run.verdicts(), vec![expected], "exec {exec_ns}");
+    }
+    // A loss dated at the admission voids; a loss before it binds. The
+    // loss is staged first (dated at the first health read): the check is
+    // on the stamp, not on the staging order.
+    for (first_seen_ns, voids) in [(1_010u64, true), (2_000, false)] {
+        let mut run = Run::new();
+        let d = run.domain;
+        run.read_with_loss(Vec::new(), 3);
+        let x = run.world.retain(
+            T,
+            0,
+            first_seen_ns,
+            3_000,
+            true,
+            Some(100),
+            true,
+            CallerLifecycle::Exited,
+        );
+        run.read(vec![row(d, 7, 1, T, 2_500)]);
+        run.settle();
+        let expected = if voids {
+            unbound(UnboundReason::LifecycleLoss)
+        } else {
+            bound(x)
+        };
+        assert_eq!(run.verdicts(), vec![expected], "admission {first_seen_ns}");
+    }
+}
+
+#[test]
 fn a_cached_image_binds_rows_read_after_its_caller_exited() {
     let mut run = Run::new();
     let d = run.domain;

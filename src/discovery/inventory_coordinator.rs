@@ -27745,6 +27745,46 @@ int main(void) {
     }
 
     #[test]
+    fn a_post_admission_retained_exec_void_keeps_the_before_admission_label() {
+        // Residual (pending a wording ruling): a retained row voided by an
+        // exec record reads `use_before_admission` even when its admission
+        // provably predates the row. Only exit-miss rows carry the
+        // post-admission wording; no post-admission exec-void label exists.
+        let (mut native, caller) = watched_native();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        // An exec of the tgid after the admission voids the retained
+        // identity (no live caller, so the hook mints nothing).
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain(
+            native.domain,
+            at,
+            600,
+        )));
+        // The row falls inside the retired lifetime (admitted at 50, the
+        // exit observed at 500), so the void is the exec, not the exit.
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(
+            census.unbound.get(&UnboundReason::ExecAfterAdmission),
+            Some(&1)
+        );
+        assert_eq!(
+            native.scene.coverage(caller),
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission),
+            "the exec void keeps the pre-admission label"
+        );
+    }
+
+    #[test]
     fn a_row_read_before_its_callers_admission_downgrades_the_later_watch() {
         // Read before the admission: pid 9 holds no caller yet.
         let (mut native, _) = watched_native();

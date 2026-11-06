@@ -1085,6 +1085,43 @@ fn concise_module_status_names_pre_watch_window() {
     }
 }
 
+/// F4: concise module status counts pre-watch mappings across the
+/// group's edges, never a bare "no use in the covered interval" when
+/// some mapping predates the watch.
+#[test]
+fn concise_module_status_counts_pre_watch_mappings_across_edges() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.edges.truncate(2);
+    assert_eq!(presentation.edges.len(), 2);
+    let module = presentation.edges[0].module;
+    for edge in &mut presentation.edges {
+        edge.module = module;
+        edge.entry_count = 0;
+        edge.entry_saturated = false;
+        edge.coverage = UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: None,
+        };
+    }
+    presentation.edges[0].mapping_first_seen_ns = 40;
+    presentation.edges[1].mapping_first_seen_ns = 150;
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let line = snapshot
+        .lines()
+        .find(|line| line.contains("predate the watch"))
+        .unwrap_or_else(|| panic!("missing multi-edge pre-watch line:\n{snapshot}"));
+    assert!(
+        line.contains("1 of 2 mappings predate the watch"),
+        "concise counts the pre-watch mappings:\n{line}"
+    );
+    assert!(
+        line.contains("earlier calls are not counted"),
+        "concise names the miss:\n{line}"
+    );
+}
+
 #[test]
 fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     let harness = varied_harness();

@@ -499,18 +499,36 @@ pub(crate) const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
 /// mount table could not be read). Pure so every listed filesystem is
 /// unit-testable without mounting it.
 pub(crate) fn inodes_name_one_file(f_type: u64, super_options: Option<&str>) -> bool {
-    // Placeholder: always unique. Replaced with the real decision table.
-    let _ = (f_type, super_options);
-    true
+    if nonunique_inode_kind(f_type).is_some() {
+        return false;
+    }
+    if f_type != TMPFS_SUPER_MAGIC {
+        return true;
+    }
+    // Tmpfs with 64-bit inode numbers is unique; with `inode32` the
+    // 32-bit counter wraps and two live files can share a number. An
+    // unreadable mount table fails closed. The option is matched as a
+    // whole comma-separated token, never a substring.
+    super_options.is_some_and(|options| !options.split(',').any(|token| token == "inode32"))
 }
 
 /// The super-options field of mount `mnt_id` in a mountinfo table, or
 /// `None` when the mount is absent or its line is malformed. Pure so the
 /// table format is unit-testable.
 pub(crate) fn mount_super_options(mountinfo: &str, mnt_id: u64) -> Option<&str> {
-    // Placeholder: never found. Replaced with the real parser.
-    let _ = (mountinfo, mnt_id);
-    None
+    let want = mnt_id.to_string();
+    mountinfo.lines().find_map(|line| {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        if fields.first() != Some(&want.as_str()) {
+            return None;
+        }
+        let separator = fields.iter().position(|field| *field == "-")?;
+        let after = &fields[separator + 1..];
+        // After the separator the kernel emits exactly the filesystem
+        // type, the mount source and the super-options; anything else is
+        // malformed and fails closed.
+        (after.len() == 3).then_some(after[2])
+    })
 }
 
 fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, String> {
@@ -526,7 +544,40 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
     // signed on some ABIs; the magic numbers are 32-bit values.
     #[allow(clippy::unnecessary_cast)]
     let f_type = unsafe { buf.assume_init().f_type } as u64 & 0xffff_ffff;
-    Ok(nonunique_inode_kind(f_type))
+    if let Some(kind) = nonunique_inode_kind(f_type) {
+        return Ok(Some(kind));
+    }
+    if f_type != TMPFS_SUPER_MAGIC {
+        return Ok(None);
+    }
+    // Tmpfs uniqueness is a mount option, not a magic: resolve this fd's
+    // mount and read its super-options. Any failure fails closed in the
+    // callers, which refuse the join (or the cache entry) on `Err`.
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("reading mount table failed: {error}"))?;
+    let fdinfo = std::fs::read_to_string(format!("/proc/self/fdinfo/{fd}"))
+        .map_err(|error| format!("reading fd mount identity failed: {error}"))?;
+    let mount_id = fdinfo
+        .lines()
+        .find_map(|line| line.strip_prefix("mnt_id:\t"))
+        .ok_or_else(|| "fd mount identity is missing".to_string())?;
+    let mount_id = mount_id
+        .parse()
+        .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;
+    let super_options = mount_super_options(&mountinfo, mount_id);
+    if inodes_name_one_file(f_type, super_options) {
+        Ok(None)
+    } else {
+        Ok(Some("tmpfs-inode32"))
+    }
+}
+
+/// Whether identity decisions may treat this fd's `(st_dev, st_ino)` as
+/// naming one file: false on filesystems without unique inode numbers
+/// (FUSE, network filesystems, tmpfs mounted `inode32`) and when the
+/// classification itself fails. Fail-closed everywhere it is used.
+pub(crate) fn file_inodes_are_unique(file: &std::fs::File) -> bool {
+    filesystem_without_unique_inodes(file.as_raw_fd()).is_ok_and(|kind| kind.is_none())
 }
 
 /// The identity of the file the kernel installed in one mapping (the VMA's
@@ -6276,6 +6327,12 @@ fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
         && left.pin == right.pin
         && !left.sha256.is_empty()
         && left.sha256 == right.sha256
+        // Equal mapping, pin and digest prove one file only where inode
+        // numbers are unique per device; elsewhere the pair stays
+        // unmerged and the collision group refuses with its ambiguity
+        // note. Checked last so the common mismatch stays syscall-free.
+        && file_inodes_are_unique(&left.file)
+        && file_inodes_are_unique(&right.file)
     {
         return true;
     }
@@ -6300,7 +6357,16 @@ fn same_kernel_file(left: &std::fs::File, right: &std::fs::File) -> bool {
     #[cfg(test)]
     provider_metadata_read_test::metadata_read();
     match (left.metadata(), right.metadata()) {
-        (Ok(left), Ok(right)) => left.dev() == right.dev() && left.ino() == right.ino(),
+        (Ok(left_meta), Ok(right_meta)) => {
+            left_meta.dev() == right_meta.dev()
+                && left_meta.ino() == right_meta.ino()
+                // On filesystems without unique inode numbers (a FUSE
+                // daemon serving one number for two files, tmpfs
+                // `inode32` after its counter wraps) equal numbers prove
+                // nothing, so the pair never counts as one file.
+                && file_inodes_are_unique(left)
+                && file_inodes_are_unique(right)
+        }
         _ => false,
     }
 }

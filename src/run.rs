@@ -4512,8 +4512,10 @@ fn io_kind_word(kind: std::io::ErrorKind) -> &'static str {
     }
 }
 
-/// One run-tree degradation reason: the failed step plus the I/O kind
+/// One run-tree degradation diagnostic: the failed step plus the I/O kind
 /// when the failure carries one, always ending in the honest scope.
+/// Diagnostics-only — the report keeps the finite
+/// `RUN_TREE_DEGRADED` reason while this line carries the detail.
 fn run_tree_gap_reason(step: &str, error: &anyhow::Error) -> String {
     match error
         .chain()
@@ -4529,53 +4531,44 @@ fn run_tree_gap_reason(step: &str, error: &anyhow::Error) -> String {
 }
 
 /// Builds the owned capture scope from a placed run cgroup: the cgroup
-/// scope on success, else the exact child PID with the scope-build gap
-/// reason (the group drops and cleans itself up on that path).
+/// scope on success, else the exact child PID with the finite
+/// scope-build gap reason (the group drops and cleans itself up on
+/// that path). The failed step prints on stderr; the report keeps
+/// the finite vocabulary.
 fn run_tree_scope_or_exact(
     child_pid: u32,
     group: crate::scope::RunCgroup,
 ) -> (Scope, Option<crate::scope::RunCgroup>, Option<String>) {
     match crate::scope::capture_cgroup(group.path()) {
         Ok(scope) => (scope, Some(group), None),
-        Err(error) => (
-            Scope::Pid(child_pid),
-            None,
-            Some(run_tree_gap_reason(
-                "the run cgroup is not a usable scope",
-                &error,
-            )),
-        ),
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: {}",
+                run_tree_gap_reason("the run cgroup is not a usable scope", &error)
+            ));
+            (
+                Scope::Pid(child_pid),
+                None,
+                Some(crate::render::RUN_TREE_DEGRADED.to_string()),
+            )
+        }
     }
 }
 
 /// Turns a run-end membership read into the published fact and gap: the
-/// survivor count when measured, a handed-back gap above zero, and a
-/// fail-closed gap when the membership itself could not be read.
+/// survivor count when measured, a finite handed-back gap above zero,
+/// and a fail-closed gap when the membership itself could not be read.
+/// The count rides beside the reason in `run_tree_handed_back`.
 fn run_tree_survivors_gap(read: std::io::Result<u64>) -> (Option<u64>, Option<String>) {
     match read {
         Ok(0) => (Some(0), None),
-        Ok(1) => (
-            Some(1),
-            Some(
-                "1 process-tree member was still present when the command exited; \
-                 its calls after the run end are out of scope"
-                    .to_string(),
-            ),
-        ),
         Ok(survivors) => (
             Some(survivors),
-            Some(format!(
-                "{survivors} process-tree members were still present when the command exited; \
-                 their calls after the run end are out of scope"
-            )),
+            Some(crate::render::RUN_TREE_SURVIVORS.to_string()),
         ),
         Err(_) => (
             None,
-            Some(
-                "the run cgroup membership could not be read at run end; \
-                 handed-back descendants are unknown"
-                    .to_string(),
-            ),
+            Some(crate::render::RUN_TREE_MEMBERSHIP_UNKNOWN.to_string()),
         ),
     }
 }
@@ -4643,13 +4636,13 @@ fn run_owned_inner_with_host(
     let (pre_tree_group, mut run_tree_gap) =
         match crate::scope::RunCgroup::create(std::path::Path::new("/sys/fs/cgroup")) {
             Ok(group) => (Some(group), None),
-            Err(error) => (
-                None,
-                Some(run_tree_gap_reason(
-                    "the run cgroup could not be created",
-                    &error,
-                )),
-            ),
+            Err(error) => {
+                emit_capture_diagnostic(&format!(
+                    "p11scope: {}",
+                    run_tree_gap_reason("the run cgroup could not be created", &error)
+                ));
+                (None, Some(crate::render::RUN_TREE_DEGRADED.to_string()))
+            }
         };
     let mut child = OwnedChild::spawn_verbose_as(
         program,
@@ -4670,10 +4663,14 @@ fn run_owned_inner_with_host(
                 (scope, group)
             }
             Err(error) => {
-                run_tree_gap = Some(run_tree_gap_reason(
-                    "the started command could not be placed in the run cgroup",
-                    &error,
+                emit_capture_diagnostic(&format!(
+                    "p11scope: {}",
+                    run_tree_gap_reason(
+                        "the started command could not be placed in the run cgroup",
+                        &error
+                    )
                 ));
+                run_tree_gap = Some(crate::render::RUN_TREE_DEGRADED.to_string());
                 (Scope::Pid(pid), None)
             }
         },
@@ -10042,6 +10039,9 @@ pub(crate) fn evidence_for(
         pause_unavailable: pause.unavailable,
         pause_engine_incomplete_retirements,
         child_still_running,
+        // Run-only like the child flag beside it: `Some` exactly when an
+        // owned context exists, carrying the measured survivor count.
+        run_tree_handed_back: child_still_running.map(|_| engine.run_tree_handed_back()),
         discovery_ring_loss,
         discovery_state_failures,
         discovery_read_failures,

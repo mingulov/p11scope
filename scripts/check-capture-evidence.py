@@ -4490,6 +4490,7 @@ def self_test():
         owned = copy.deepcopy(clean)
         owned["evidence"]["skipped"] = []
         owned["evidence"]["child_still_running"] = False
+        owned["evidence"]["run_tree_handed_back"] = 0
         owned["evidence"]["loader_discovery"] = loader_discovery_fixture(
             strategies__debug_state_every_hit=2,
             dlopen_timing__unproven=1,
@@ -4507,6 +4508,9 @@ def self_test():
             lambda d: d["evidence"].pop("child_still_running"),
             lambda d: d["evidence"].update(child_still_running="no"),
             lambda d: d["evidence"].update(child_still_running=True),
+            lambda d: d["evidence"].pop("run_tree_handed_back"),
+            lambda d: d["evidence"].update(run_tree_handed_back="none"),
+            lambda d: d["evidence"].update(run_tree_handed_back=-1),
             lambda d: d["evidence"]["skipped"].append(
                 {"name": DISCOVERY_SUBJECT, "reason": DISCOVERY_UNAVAILABLE}
             ),
@@ -5926,6 +5930,7 @@ def self_test():
     owned_aggregate["functions"] = function_items([(["C_GetInterfaceList"], 30)])
     owned_aggregate["evidence"]["child_still_running"] = True
     owned_aggregate["evidence"]["handoff_child_pid"] = 123
+    owned_aggregate["evidence"]["run_tree_handed_back"] = 0
     owned_aggregate["evidence"]["scheduling"]["phase_mono_ns"] = {
         "attach_mono_ns": 1, "loop_start_mono_ns": 2,
         "loop_end_mono_ns": 3, "loop_end_reason": "expiry",

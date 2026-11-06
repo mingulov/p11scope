@@ -711,8 +711,7 @@ pub struct Engine {
     pid_descendant_gaps: u64,
     /// Handed-back run-tree survivors measured at run end. Run-lane only;
     /// annotation beside the paired `run process tree` skip, which carries
-    /// the verdict. The field rides through until the wiring stores it.
-    #[allow(dead_code)]
+    /// the verdict.
     run_tree_handed_back: u64,
     /// Multi-group rebuild windows this capture published: one per rebuilt
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
@@ -11002,15 +11001,17 @@ impl Engine {
     }
 
     /// Publishes a run-tree coverage gap: the command's descendants a
-    /// degraded or ended run did not follow. The survivor count rides
-    /// through until the wiring stores it.
+    /// degraded or ended run did not follow. A measured survivor count
+    /// lands beside the skip; degradations and unread memberships
+    /// measure nothing and leave the zero behind.
     pub(crate) fn note_run_tree_gap(&mut self, reason: &str, handed_back: Option<u64>) {
-        let _ = handed_back;
+        if let Some(measured) = handed_back {
+            self.run_tree_handed_back = measured;
+        }
         self.mark_partial("run process tree", reason);
     }
 
     /// Handed-back run-tree survivors measured at run end (run-lane only).
-    #[allow(dead_code)]
     pub(crate) fn run_tree_handed_back(&self) -> u64 {
         self.run_tree_handed_back
     }

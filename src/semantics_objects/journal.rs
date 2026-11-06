@@ -8358,7 +8358,7 @@ pub(crate) mod tests {
     /// manifest: every modeled function journal tests stage needs an
     /// admittable plan slot, since each staged call converts only
     /// under its own H3 admission claim.
-    const ADMITTABLE_FUNCTIONS: [&str; 26] = [
+    const ADMITTABLE_FUNCTIONS: [&str; 27] = [
         "C_CreateObject",
         "C_GetAttributeValue",
         "C_SignInit",
@@ -8392,6 +8392,9 @@ pub(crate) mod tests {
         // Seal-bound metadata invalidation (cross-session writes),
         // appended for the same reason.
         "C_SetAttributeValue",
+        // F16 residual: requested-only keygen templates reach the
+        // joint scene, appended for the same reason.
+        "C_GenerateKey",
     ];
 
     /// v3-only functions, resolved on the 3.0 interface surface
@@ -12406,6 +12409,45 @@ pub(crate) mod tests {
         assert_eq!(refused.gap, JournalGap::DomainTainted);
     }
 
+    /// F16 residual (review item 5): the userspace journal re-checks
+    /// every kind-7 wire cell with the same classifiers. Forged VALUE
+    /// cells with an out-of-range (13) or zero code recheck to
+    /// Unsupported with no retained value; the healthy code
+    /// establishes; an unknown kind stays excluded however its
+    /// status reads.
+    #[test]
+    fn object_journal_parameter_set_forged_cells_recheck_unsupported() {
+        let unsupported = AttrObservation::classified(
+            Some(SafeAttributeKind::ParameterSet),
+            QueryStatus::Unsupported,
+            None,
+        );
+        assert_eq!(
+            attribute_cell(7, 1, 13),
+            unsupported,
+            "a forged (7,1,13) cell rechecks unsupported"
+        );
+        assert_eq!(
+            attribute_cell(7, 1, 0),
+            unsupported,
+            "a forged (7,1,0) cell rechecks unsupported"
+        );
+        assert_eq!(
+            attribute_cell(7, 1, 2),
+            AttrObservation::classified(
+                Some(SafeAttributeKind::ParameterSet),
+                QueryStatus::Established,
+                Some(FieldValue::Scalar(2)),
+            ),
+            "the healthy (7,1,2) cell establishes"
+        );
+        assert_eq!(
+            attribute_cell(8, 1, 2).status(),
+            QueryStatus::Excluded,
+            "an unknown kind retains nothing"
+        );
+    }
+
     #[test]
     fn object_journal_fork_child_birth_after_parent_h3_void_respects_fence() {
         use crate::semantics_objects::{Birth, FieldState, KeyLabel, Lifetime, ViewOrigin};
@@ -12754,6 +12796,9 @@ pub(crate) mod tests {
                     SafeAttributeKind::ValueLen,
                     SafeAttributeKind::ModulusBits,
                     SafeAttributeKind::EcParams,
+                    // F16 residual (review item 9): the seventh
+                    // field joins the no-inheritance pin.
+                    SafeAttributeKind::ParameterSet,
                 ] {
                     assert_eq!(
                         view.established.field(kind),

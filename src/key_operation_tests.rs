@@ -537,8 +537,8 @@ use p11scope_ebpf_common::object_journal::{
 };
 use p11scope_ebpf_common::object_wire::{
     OBJECT_ACTION_ACCESS, OBJECT_ACTION_COPY, OBJECT_ACTION_CREATE, OBJECT_ACTION_DECAPSULATE,
-    OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND, ObjectDescriptorWire,
-    publish_object_descriptors, verify_object_descriptors,
+    OBJECT_ACTION_DESTROY, OBJECT_ACTION_ENCAPSULATE, OBJECT_ACTION_FIND, OBJECT_ACTION_GENERATE,
+    ObjectDescriptorWire, publish_object_descriptors, verify_object_descriptors,
 };
 use p11scope_ebpf_common::{Event, ImageIdentity, InstanceStamp, MAX_DESCRIPTORS};
 
@@ -728,6 +728,9 @@ struct ShapedS1 {
     find_handles: Option<(Vec<u64>, bool)>,
     /// GET attribute cells as (kind, status, value).
     getattr_cells: Vec<(u8, u8, u16)>,
+    /// Requested (creation-template) cells for pair 0 as (kind,
+    /// status, value); empty leaves the zero list.
+    request_cells: Vec<(u8, u8, u16)>,
     /// KEM result (word, status) override (`None` = the healthy
     /// minted-output default).
     kem_result: Option<(u64, u8)>,
@@ -758,6 +761,7 @@ impl ShapedS1 {
             copy_result: None,
             find_handles: None,
             getattr_cells: Vec::new(),
+            request_cells: Vec::new(),
             kem_result: None,
         }
     }
@@ -820,7 +824,7 @@ fn admit_call_input(scene: &mut JointScene, call: &ShapedS1) -> AdmittedInstance
 
 fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 224] {
     let fid = crate::kinds::function_id(call.name).unwrap();
-    begin_bytes_shaped(
+    let mut begin = begin_bytes_shaped(
         scene.thread,
         sequence,
         fid,
@@ -832,7 +836,25 @@ fn begin_for_call(scene: &JointScene, call: &ShapedS1, sequence: u64) -> [u8; 22
         call.input0,
         call.input1,
         call.flags,
-    )
+    );
+    // Requested pair 0: record[128..164], eight 4-byte cells, the
+    // inspected count at +32 and the present flag at +33 — the same
+    // list shape `end_bytes_getattr` emits for GET results.
+    if !call.request_cells.is_empty() {
+        assert!(
+            call.request_cells.len() <= 8,
+            "at most eight requested cells"
+        );
+        for (index, (kind, status, value)) in call.request_cells.iter().enumerate() {
+            let base = 128 + index * 4;
+            begin[base] = *kind;
+            begin[base + 1] = *status;
+            begin[base + 2..base + 4].copy_from_slice(&value.to_le_bytes());
+        }
+        begin[160] = call.request_cells.len() as u8;
+        begin[161] = 1;
+    }
+    begin
 }
 
 fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
@@ -843,6 +865,21 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
             }
             None => end_bytes(begin, OBJECT_ACTION_CREATE, call.rv, ENTRY_NS + 50),
         },
+        // F16 residual: keygen mints its output like creation, so
+        // requested-only keygen templates reach the model.
+        "C_GenerateKey" => {
+            let mut end = match call.result {
+                Some(result) => {
+                    end_bytes_result(begin, OBJECT_ACTION_GENERATE, call.rv, ENTRY_NS + 50, result)
+                }
+                None => end_bytes(begin, OBJECT_ACTION_GENERATE, call.rv, ENTRY_NS + 50),
+            };
+            if call.result.is_none() {
+                end[424..432].copy_from_slice(&CREATED_KEY.to_le_bytes());
+            }
+            end[506] = 1;
+            end
+        }
         "C_SignInit" | "C_VerifyInit" | "C_MessageSignInit" | "C_WrapKey" => {
             end_bytes(begin, OBJECT_ACTION_ACCESS, call.rv, ENTRY_NS + 50)
         }
@@ -22742,6 +22779,151 @@ fn key_operation_pqc_version_follows_content() {
             .is_none(),
         "no parameter_set query outcome at v1"
     );
+    fn assert_seven_key_blocks(section: &serde_json::Value) {
+        for block in ["requested", "established"] {
+            let mut keys: Vec<&str> = section["objects"][0][block]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            keys.sort_unstable();
+            let mut expected = vec![
+                "class",
+                "key_type",
+                "token",
+                "value_len",
+                "modulus_bits",
+                "ec_params",
+                "parameter_set",
+            ];
+            expected.sort_unstable();
+            assert_eq!(keys, expected, "{block} carries seven keys");
+        }
+        assert!(
+            section["objects"][0]["queries"]
+                .as_object()
+                .unwrap()
+                .get("parameter_set")
+                .is_some(),
+            "parameter_set query outcome at v5"
+        );
+    }
+    assert_seven_key_blocks(&section);
+    // F16 residual (review item 3): every v5 trigger, not only a
+    // present label. A PQC key-type scalar alone (73/74/75, no set)
+    // versions v5 without labelling.
+    for key_type in [0x49u16, 0x4a, 0x4b] {
+        let bare = commit_scene(vec![(1u8, 1u8, 2u16), (2u8, 1u8, key_type)]);
+        assert_eq!(
+            observations_version(&bare),
+            OBSERVATIONS_VERSION_V5,
+            "key type {key_type:#x} alone versions v5"
+        );
+        let section = object_observations_json(&bare);
+        assert_eq!(section["version"], 5);
+        assert_seven_key_blocks(&section);
+        assert_eq!(section["objects"][0]["established"]["key_type"]["value"], key_type);
+        assert_eq!(
+            section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+        );
+        assert!(section["objects"][0]["label"].is_null());
+        assert!(
+            section["key_operations"].as_array().unwrap().is_empty(),
+            "no proved row without a label"
+        );
+        let unknown = section["unknown_key_operations"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
+            .expect("the live scene rows its sign use unknown");
+        assert_eq!(unknown["completed"], 1);
+    }
+    // A parameter-set query outcome alone versions v5: the RSA row
+    // stays proved (the scene is live) while the refused set query
+    // carries no scalar.
+    let queried = commit_scene(vec![
+        (1u8, 1u8, 3u16),
+        (2u8, 1u8, 0u16),
+        (5u8, 1u8, 2048u16),
+        (7u8, 2u8, 0u16),
+    ]);
+    assert_eq!(
+        observations_version(&queried),
+        OBSERVATIONS_VERSION_V5,
+        "a parameter-set query alone versions v5"
+    );
+    let section = object_observations_json(&queried);
+    assert_eq!(section["version"], 5);
+    assert_seven_key_blocks(&section);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "rsa_2048",
+        "the control row proves the scene is live"
+    );
+    assert_eq!(
+        section["objects"][0]["queries"]["parameter_set"], "unsupported"
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+    );
+    // A requested-only keygen template versions v5: the PQC scalars
+    // sit in the requested block, nothing establishes, nothing labels.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            request_cells: vec![(1u8, 1u8, 4u16), (2u8, 1u8, 0x49), (7u8, 1u8, 2u16)],
+            ..ShapedS1::shaped("C_GenerateKey", CkRv::OK.0, 0x0f, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let requested_only = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&requested_only),
+        OBSERVATIONS_VERSION_V5,
+        "a requested-only keygen template versions v5"
+    );
+    let section = object_observations_json(&requested_only);
+    assert_eq!(section["version"], 5);
+    assert_seven_key_blocks(&section);
+    assert_eq!(section["objects"][0]["requested"]["key_type"]["value"], 0x49);
+    assert_eq!(section["objects"][0]["requested"]["parameter_set"]["value"], 2);
+    assert_eq!(
+        section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+    );
+    assert!(section["objects"][0]["label"].is_null());
+    let unknown = section["unknown_key_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
+        .expect("the live scene rows its sign use unknown");
+    assert_eq!(unknown["completed"], 1);
 }
 
 /// F16: the PQC constructor refuses everything outside the valid
@@ -22786,6 +22968,177 @@ fn key_operation_pqc_label_constructor_refuses_invalid_pairs() {
             KeyLabel::pqc(key_type, set),
             None,
             "({key_type:#x}, {set}) refuses"
+        );
+    }
+}
+
+/// F16 residual (review item 1): the publication rule the allowlist
+/// now states. A classified parameter-set word publishes its scalar
+/// beside whatever key type the same view established — here RSA
+/// with code 2, a valid-code/wrong-family pair — while only a
+/// same-view PQC key type with a family-valid code labels. The use
+/// partitions `metadata_unknown`; the scalar is not withheld.
+#[test]
+fn key_operation_pqc_wrong_family_pair_publishes_scalar_without_label() {
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V5, object_observations_json, observations_version,
+    };
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1 {
+            getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (7u8, 1u8, 2u16)],
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        },
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations_version(&committed),
+        OBSERVATIONS_VERSION_V5,
+        "the classified word versions v5 beside any key type"
+    );
+    let section = object_observations_json(&committed);
+    assert_eq!(section["version"], 5);
+    let established = &section["objects"][0]["established"];
+    assert_eq!(established["key_type"]["value"], 0);
+    assert_eq!(established["parameter_set"]["status"], "value");
+    assert_eq!(
+        established["parameter_set"]["value"], 2,
+        "the scalar publishes beside the RSA key type"
+    );
+    assert!(
+        section["objects"][0]["label"].is_null(),
+        "a wrong-family pair labels nothing"
+    );
+    assert!(
+        section["key_operations"].as_array().unwrap().is_empty(),
+        "no proved row without a label"
+    );
+    let unknown = section["unknown_key_operations"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["category"] == "sign" && row["reason"] == "metadata_unknown")
+        .expect("the live scene rows its sign use unknown");
+    assert_eq!(unknown["completed"], 1);
+}
+
+/// F16 residual (review item 4): the ML-KEM labelled path rows
+/// proved. GET (class 2, 0x49, set 2) then `C_EncapsulateKey`
+/// completes one (`encapsulate`, `encapsulation_key`, `ml_kem_768`)
+/// proved row at v5; the decapsulate twin (class 3) rows
+/// (`decapsulate`, `decapsulation_key`, `ml_kem_768`).
+#[test]
+fn key_operation_kem_labelled_input_rows_proved() {
+    use crate::key_operation_projection::{OBSERVATIONS_VERSION_V5, observations_version};
+    for (name, category, role, class, capture) in [
+        (
+            "C_EncapsulateKey",
+            "encapsulate",
+            "encapsulation_key",
+            2u16,
+            kem_encap_capture(),
+        ),
+        (
+            "C_DecapsulateKey",
+            "decapsulate",
+            "decapsulation_key",
+            3u16,
+            kem_decap_capture(),
+        ),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1 {
+                getattr_cells: vec![
+                    (1u8, 1u8, class),
+                    (2u8, 1u8, 0x49u16),
+                    (7u8, 1u8, 2u16),
+                ],
+                ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+            },
+        );
+        drive_kem_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped(name, CkRv::OK.0, 0x17, capture),
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            observations_version(&committed),
+            OBSERVATIONS_VERSION_V5,
+            "{name}: the labelled use versions v5"
+        );
+        assert_eq!(
+            committed.key_operations.len(),
+            1,
+            "{name}: one proved row"
+        );
+        let row = &committed.key_operations[0];
+        assert_eq!(row.category, category, "{name}: category");
+        assert_eq!(row.role, role, "{name}: role");
+        assert_eq!(
+            row.metadata_at_use, "ml_kem_768",
+            "{name}: the established label rows"
+        );
+        assert_eq!(row.completed, 1, "{name}: completed");
+        assert!(
+            committed.unknown_key_operations.is_empty(),
+            "{name}: nothing partitions unknown"
         );
     }
 }

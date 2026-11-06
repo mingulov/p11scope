@@ -5907,3 +5907,138 @@ fn pqc_parameter_set_get_roundtrip_establishes() {
         assert_no_bytes_reads(&target);
     }
 }
+
+// F16 residual (review item 7): kind-7 privacy canary on the
+// request path. A hostile parameter-set slot whose value pointer
+// aims into the CKA_SEED canary buffer classifies to nothing: the
+// emitted cell is (7, UNSUPPORTED, 0), the seed slot stays silent,
+// and no emitted cell carries a canary-derived value on either
+// layout. The healthy slot proves the template processed.
+#[test]
+fn pqc_parameter_set_seed_canary_alias_request_refuses() {
+    const CANARY: u64 = 0x5EED_5EED_5EED_5EED;
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        const BASE: u64 = 0x5000;
+        const SEED_BUF: u64 = 0x9000;
+        // The CKA_SEED canary buffer: seed bytes the capture must
+        // never retain or emit.
+        target
+            .borrow_mut()
+            .set_bytes(SEED_BUF, &[0x5E; 32]);
+        target.borrow_mut().set_word(SEED_BUF, CANARY);
+        // Slot 0: the hostile alias — a parameter-set value pointer
+        // into the canary buffer.
+        prog_attr(&target, BASE, 0, w, SEL_PARAMETER_SET, SEED_BUF, w);
+        // Slot 1: the seed selector itself stays silent.
+        prog_attr(&target, BASE, 1, w, SEL_SEED, SEED_BUF + 0x10, w);
+        // Slot 2: a healthy set word proves the template processed.
+        prog_attr(&target, BASE, 2, w, SEL_PARAMETER_SET, 0xA000, w);
+        target.borrow_mut().set_word(0xA000, 2);
+        let (mut read_word, mut read_bytes) = readers(&target);
+        let outcome =
+            inspect_request_template(BASE, 3, None, layout, &mut read_word, &mut read_bytes);
+        assert_eq!(outcome.inspected, 3, "{layout:?}");
+        assert_eq!(
+            (
+                outcome.cells[0].kind,
+                outcome.cells[0].status,
+                outcome.cells[0].value
+            ),
+            (7, ast::UNSUPPORTED, 0),
+            "the canary alias refuses {layout:?}"
+        );
+        assert_eq!(
+            outcome.cells[1],
+            AttrCell {
+                kind: 0,
+                status: 0,
+                value: 0
+            },
+            "the seed selector stays silent {layout:?}"
+        );
+        assert_eq!(
+            (
+                outcome.cells[2].kind,
+                outcome.cells[2].status,
+                outcome.cells[2].value
+            ),
+            (7, ast::VALUE, 2),
+            "the healthy word classifies {layout:?}"
+        );
+        // The ring payload is these cells: no canary-derived value
+        // may appear in any of them.
+        for (index, cell) in outcome.cells.iter().enumerate() {
+            assert!(
+                cell.value == 0 || cell.value == 2,
+                "cell {index} carries no canary byte {layout:?}: {cell:?}"
+            );
+        }
+        assert_no_read_of(&target, SEED_BUF + 0x10);
+        assert_no_bytes_reads(&target);
+    }
+}
+
+// F16 residual (review item 7): the same canary on the Get
+// entry/return path. The aliased set header retains, the return
+// refuses it to (7, UNSUPPORTED, 0), the seed neighbor stays
+// silent, and no emitted cell carries a canary-derived value.
+#[test]
+fn pqc_parameter_set_seed_canary_alias_get_refuses() {
+    const CANARY: u64 = 0x5EED_5EED_5EED_5EED;
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        const SEED_BUF: u64 = 0x8000;
+        target
+            .borrow_mut()
+            .set_bytes(SEED_BUF, &[0x5E; 32]);
+        target.borrow_mut().set_word(SEED_BUF, CANARY);
+        prog_attr(&target, 0x4000, 0, w, SEL_PARAMETER_SET, SEED_BUF, w);
+        prog_attr(&target, 0x4000, 1, w, SEL_SEED, SEED_BUF + 0x10, w);
+        prog_attr(&target, 0x4000, 2, w, SEL_PARAMETER_SET, 0xA000, w);
+        target.borrow_mut().set_word(0xA000, 2);
+        let mut state = GetEntryState::default();
+        let verdict = capture_get_entry(0x4000, 3, layout, &mut state, word_reader(&target));
+        assert_eq!(verdict.inspected, 3, "{layout:?}");
+        assert_eq!(verdict.slot_count, 2, "{layout:?}: both set headers retain");
+        let (r, b) = readers(&target);
+        let outcome = capture_get_return(&state, CKR_OK, ReturnAuthority::AUTHORIZED, layout, r, b);
+        assert_eq!(
+            (
+                outcome.cells[0].kind,
+                outcome.cells[0].status,
+                outcome.cells[0].value
+            ),
+            (7, ast::UNSUPPORTED, 0),
+            "the canary alias refuses {layout:?}"
+        );
+        assert_eq!(
+            outcome.cells[1],
+            AttrCell {
+                kind: 0,
+                status: 0,
+                value: 0
+            },
+            "the seed neighbor stays silent {layout:?}"
+        );
+        assert_eq!(
+            (
+                outcome.cells[2].kind,
+                outcome.cells[2].status,
+                outcome.cells[2].value
+            ),
+            (7, ast::VALUE, 2),
+            "the healthy word establishes {layout:?}"
+        );
+        for (index, cell) in outcome.cells.iter().enumerate() {
+            assert!(
+                cell.value == 0 || cell.value == 2,
+                "cell {index} carries no canary byte {layout:?}: {cell:?}"
+            );
+        }
+        assert_no_read_of(&target, SEED_BUF + 0x10);
+        assert_no_bytes_reads(&target);
+    }
+}

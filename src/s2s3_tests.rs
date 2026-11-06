@@ -15,7 +15,8 @@ use crate::semantics_objects::{
     CompleteInputPrefix, CompletedFact, CreationFamily, FieldState, FieldValue, FindResult,
     HandleInput, KeyLabel, Lifetime, LostOutcome, MAX_ACCESS_RELATIONS, MechanismEvidence,
     ObjectDomain, ObjectEffect, ObjectEffects, ObjectGap, ObjectHandle, ObjectId, ObjectLimits,
-    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, QueryStatus, RefCut,
+    ObjectProjection, ObjectSemantics, ObjectView, OriginFact, OutputEvidence, PqcCode, QueryStatus,
+    RefCut,
     ResultSlot, SessionEnd, SessionHandle, SessionIncarnation, SessionOrigin, SessionState,
     SlotScope, ViewOrigin,
 };
@@ -2664,6 +2665,47 @@ fn s2s3_pair_mate_private_key_inherits_public_size() {
     );
 }
 
+/// F16 residual (review item 6): pair inheritance stays RSA-only. A
+/// generate-pair ML-DSA private key without its own parameter set
+/// gets no label even though its public mate established ML-DSA-65:
+/// the mate's parameter set never crosses the pair boundary.
+#[test]
+fn s2s3_pqc_pair_mate_private_key_inherits_no_label() {
+    let mut h = Hist::qualified();
+    h.run(1, open_in(slot(SLOT1)), 2, ok().session_out(SA));
+    let x = h.run(
+        3,
+        call("C_GenerateKeyPair").on(SA),
+        4,
+        ok().result(0, H1).result(1, H2),
+    );
+    let public = attrs(&[
+        scalar(CKA_CLASS, 2),
+        scalar(CKA_KEY_TYPE, 0x4a),
+        scalar(CKA_PARAMETER_SET, 2),
+    ]);
+    h.run(5, get_attrs(SA, H1), 6, ok().attrs(public));
+    let private = attrs(&[
+        scalar(CKA_CLASS, 3),
+        scalar(CKA_KEY_TYPE, 0x4a),
+        AttrObservation::unavailable(CKA_PARAMETER_SET),
+    ]);
+    h.run(7, get_attrs(SA, H2), 8, ok().attrs(private));
+    let e = h.settle(8);
+    let public_id = created(&e, x, 0).expect("the public mate is created");
+    let private_id = created(&e, x, 1).expect("the private mate is created");
+    assert_eq!(
+        view(&h.project(), public_id).label,
+        Some(KeyLabel::Pqc(PqcCode::MlDsa65)),
+        "the mate's own read labels it"
+    );
+    assert_eq!(
+        view(&h.project(), private_id).label,
+        None,
+        "the private mate inherits no PQC label"
+    );
+}
+
 /// An unpaired private key never inherits a size: without a pair mate
 /// from the same successful return, the view stays unlabeled.
 #[test]
@@ -4754,32 +4796,38 @@ fn pqc_parameter_set_hostile_width() {
             );
         }
     }
-    // Full-width selector equality: ORed high bits are unknown selectors.
-    for high in [1u64 << 16, 1u64 << 32] {
-        assert_eq!(
-            AttrObservation::scalar(CKA_PARAMETER_SET | high, 8, 2, l).status(),
-            QueryStatus::Excluded,
-            "selector|{high:#x}"
-        );
-        assert_eq!(
-            AttrObservation::scalar(CKA_KEY_TYPE | high, 8, 0x4a, l).status(),
-            QueryStatus::Excluded,
-            "key-type selector|{high:#x}"
-        );
+    // Full-width selector equality: ORed high bits are unknown
+    // selectors, on both layouts at each layout's word width.
+    for (layout, w) in [(l, 8), (i, 4)] {
+        for high in [1u64 << 16, 1u64 << 32] {
+            assert_eq!(
+                AttrObservation::scalar(CKA_PARAMETER_SET | high, w, 2, layout).status(),
+                QueryStatus::Excluded,
+                "selector|{high:#x} {layout:?}"
+            );
+            assert_eq!(
+                AttrObservation::scalar(CKA_KEY_TYPE | high, w, 0x4a, layout).status(),
+                QueryStatus::Excluded,
+                "key-type selector|{high:#x} {layout:?}"
+            );
+        }
     }
     // Full-width value equality: ORed high bits are unsupported, never
-    // narrowed back into the accepted set.
-    for high in [1u64 << 16, 1u64 << 32] {
-        assert_eq!(
-            AttrObservation::scalar(CKA_PARAMETER_SET, 8, 2 | high, l).status(),
-            QueryStatus::Unsupported,
-            "set|{high:#x}"
-        );
-        assert_eq!(
-            AttrObservation::scalar(CKA_KEY_TYPE, 8, 0x4a | high, l).status(),
-            QueryStatus::Unsupported,
-            "key type|{high:#x}"
-        );
+    // narrowed back into the accepted set — including the ia32
+    // high-bit reader case (a 4-byte length with a wide value word).
+    for (layout, w) in [(l, 8), (i, 4)] {
+        for high in [1u64 << 16, 1u64 << 32] {
+            assert_eq!(
+                AttrObservation::scalar(CKA_PARAMETER_SET, w, 2 | high, layout).status(),
+                QueryStatus::Unsupported,
+                "set|{high:#x} {layout:?}"
+            );
+            assert_eq!(
+                AttrObservation::scalar(CKA_KEY_TYPE, w, 0x4a | high, layout).status(),
+                QueryStatus::Unsupported,
+                "key type|{high:#x} {layout:?}"
+            );
+        }
     }
     // Out-of-range codes refuse on the scalar path, however wide.
     for set in [0u64, 13, 14, 0x100, u32::MAX as u64, u64::MAX] {

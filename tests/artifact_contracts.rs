@@ -9784,6 +9784,79 @@ fn allowlist_v3_names_the_reload_disclosure_linkage_row() {
     }
 }
 
+/// F16 residual (review item 1): the allowlist-v3 PQC section states the
+/// implemented publication rule — the field publishes the classified code
+/// `1..=12` whenever the word is in range, whatever the key type, and only
+/// the combined label needs the same-view PQC key type — and names the
+/// selector-`0x061d`-driven read. The old "the field reads unknown" sentence
+/// contradicted the projection (`metadata_field` publishes the scalar
+/// beside any key type) and must not return.
+#[test]
+fn allowlist_v3_pqc_field_publishes_classified_code() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## PQC parameter-set metadata (F16, 2026-11-06)";
+    let section = text
+        .split_once(heading)
+        .expect("allowlist-v3 keeps the F16 PQC section")
+        .1;
+    assert!(
+        section.contains(
+            "publishes the classified code `1..=12` whenever the word is in range, \
+             whatever the key type"
+        ),
+        "the P1 failure cell must state the scalar publishes beside any key type"
+    );
+    assert!(
+        section.contains("selector-`0x061d`-driven"),
+        "the P1 source cell must name the selector-driven read"
+    );
+    assert!(
+        !section.contains("the field reads unknown"),
+        "the contradicted 'field reads unknown' sentence must stay out"
+    );
+}
+
+/// F16 residual (review item 2): the allowlist-v3 field counts admit the
+/// seventh F16 field, the vocabulary table carries the PQC key-type codes
+/// and the parameter-set row, and the F16 section cites the v5 schema for
+/// the eighteen labels instead of dangling capture-contract sections.
+#[test]
+fn allowlist_v3_pqc_counts_seven_fields() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    assert!(
+        text.matches("seven with F16").count() >= 7,
+        "every normative six-field count needs its seven-with-F16 note"
+    );
+    let vocab = between(
+        &text,
+        "## Finite attribute vocabulary",
+        "## Requested values and GetAttributeValue results",
+    );
+    assert!(
+        vocab.contains("0x49") && vocab.contains("PKCS #11 3.2"),
+        "the vocabulary table must carry the PQC key-type codes"
+    );
+    assert!(
+        vocab.contains("| Parameter set |"),
+        "the vocabulary table must carry the parameter-set row"
+    );
+    assert!(
+        !text.contains("Section 5 of the capture contract")
+            && !text.contains("contract Section 10"),
+        "no dangling capture-contract section references"
+    );
+    let heading = "## PQC parameter-set metadata (F16, 2026-11-06)";
+    let section = text
+        .split_once(heading)
+        .expect("allowlist-v3 keeps the F16 PQC section")
+        .1;
+    assert!(
+        section.contains("inventory-v1-object-observations-v5.schema.json")
+            && section.contains("$defs/metadata_label"),
+        "the eighteen labels resolve through the v5 schema"
+    );
+}
+
 /// The release docs describe one version: the CHANGELOG has exactly one heading
 /// for the version Cargo.toml builds (other headings are older releases or an
 /// `[Unreleased]` section), and README/usage point at its known limitations and

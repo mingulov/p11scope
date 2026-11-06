@@ -2139,3 +2139,85 @@ fn pqc_display_label_covers_all_pqc_labels() {
         .collect();
     assert_eq!(displays.len(), 18, "eighteen display names");
 }
+
+/// F16 residual (review item 8): spotlight segments sort by the
+/// `metadata_at_use` label, not the display string — `ml_kem_1024`
+/// follows `ml_kem_512` even though `ML-KEM-1024` sorts before
+/// `ML-KEM-512` lexicographically.
+#[test]
+fn key_ops_line_pqc_spotlight_sorts_by_label() {
+    let mut observations = populated(9);
+    let mut wide = key_row("sign", "key", 4, 0, 0, "operations");
+    wide.metadata_at_use = "ml_kem_1024";
+    observations.key_operations.push(wide);
+    let mut narrow = key_row("sign", "key", 6, 0, 0, "operations");
+    narrow.metadata_at_use = "ml_kem_512";
+    observations.key_operations.push(narrow);
+    let segments = pqc_key_breakdown(&observations);
+    assert_eq!(
+        segments
+            .iter()
+            .map(|segment| segment.display)
+            .collect::<Vec<_>>(),
+        vec!["ML-KEM-512", "ML-KEM-1024"],
+        "label order, not display order"
+    );
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let line = key_ops_line(&snapshot);
+    assert!(
+        line.contains("; pqc keys: ML-KEM-512 sign: 6, ML-KEM-1024 sign: 4"),
+        "the line follows label order: {line}"
+    );
+}
+
+/// F16 residual (review item 8): the spotlight names segments with
+/// proved completions only — a failed-only PQC row contributes no
+/// segment, so no `: 0` segment renders.
+#[test]
+fn key_ops_line_pqc_spotlight_skips_zero_completed_segments() {
+    let mut observations = populated(9);
+    let mut failed_only = key_row("sign", "key", 0, 2, 0, "operations");
+    failed_only.metadata_at_use = "ml_dsa_65";
+    observations.key_operations.push(failed_only);
+    assert!(
+        pqc_key_breakdown(&observations).is_empty(),
+        "no segment without a proved completion"
+    );
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let line = key_ops_line(&snapshot);
+    assert!(
+        !line.contains("pqc keys:"),
+        "no spotlight without a proved completion: {line}"
+    );
+}
+
+/// F16 residual (review item 8): the exact eighteen display strings
+/// the concise spotlight renders, pinned label by label against the
+/// capture contract's vocabulary table.
+#[test]
+fn pqc_display_label_pins_all_eighteen_display_strings() {
+    for (label, display) in [
+        ("ml_dsa_44", "ML-DSA-44"),
+        ("ml_dsa_65", "ML-DSA-65"),
+        ("ml_dsa_87", "ML-DSA-87"),
+        ("ml_kem_512", "ML-KEM-512"),
+        ("ml_kem_768", "ML-KEM-768"),
+        ("ml_kem_1024", "ML-KEM-1024"),
+        ("slh_dsa_sha2_128s", "SLH-DSA-SHA2-128S"),
+        ("slh_dsa_shake_128s", "SLH-DSA-SHAKE-128S"),
+        ("slh_dsa_sha2_128f", "SLH-DSA-SHA2-128F"),
+        ("slh_dsa_shake_128f", "SLH-DSA-SHAKE-128F"),
+        ("slh_dsa_sha2_192s", "SLH-DSA-SHA2-192S"),
+        ("slh_dsa_shake_192s", "SLH-DSA-SHAKE-192S"),
+        ("slh_dsa_sha2_192f", "SLH-DSA-SHA2-192F"),
+        ("slh_dsa_shake_192f", "SLH-DSA-SHAKE-192F"),
+        ("slh_dsa_sha2_256s", "SLH-DSA-SHA2-256S"),
+        ("slh_dsa_shake_256s", "SLH-DSA-SHAKE-256S"),
+        ("slh_dsa_sha2_256f", "SLH-DSA-SHA2-256F"),
+        ("slh_dsa_shake_256f", "SLH-DSA-SHAKE-256F"),
+    ] {
+        assert_eq!(pqc_display_label(label), Some(display), "{label}");
+    }
+}

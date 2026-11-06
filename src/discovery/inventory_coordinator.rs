@@ -18222,6 +18222,25 @@ exit 0
         assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
     }
 
+    /// One `EXEC` lifecycle record for `pid` stamped `hook_ts_ns`, drained
+    /// at `at`.
+    fn exec_hook_drain_for_pid(
+        domain: NativeDomainId,
+        pid: u32,
+        at: u64,
+        hook_ts_ns: u64,
+    ) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = hook_ts_ns;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain
+    }
+
     /// One `EXEC` lifecycle record for pid 7 stamped `hook_ts_ns`, drained
     /// at `at`.
     fn exec_hook_drain(domain: NativeDomainId, at: u64, hook_ts_ns: u64) -> DiscoveryBatch {
@@ -18234,6 +18253,206 @@ exit 0
         record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
         drain.records.push(record);
         drain
+    }
+
+    /// The expected terminal wording for `confirmed` short-lived
+    /// never-scanned processes with no untracked overflow.
+    fn short_lived_gap_reason(confirmed: u64) -> String {
+        format!(
+            "{confirmed} short-lived process(es) started and exited between scan passes and \
+             were never scanned; their provider mappings are unknown, and no caller use is \
+             counted for them"
+        )
+    }
+
+    /// `EXEC` hooks for pids no scan pass ever enumerates must be counted
+    /// at the terminal disclosure, never cleared silently: short-lived
+    /// programs that run between passes are scan-invisible by timing, and
+    /// clearing their hooks at each apply leaves them gap-silent too.
+    #[test]
+    fn mid_capture_exec_newcomers_never_enumerated_are_counted_not_silenced() {
+        let (mut native, caller) = NativeScene::new();
+        for pid in [9u32, 10] {
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+                native.domain,
+                pid,
+                at,
+                at,
+            )));
+        }
+        // Two full passes enumerate only the long-lived pid 7: both
+        // newcomers miss two consecutive enumerations.
+        for _ in 0..2 {
+            let generation = native.scene.coordinator.adapter.record(caller).map(|record| {
+                crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                }
+            });
+            let catalog =
+                capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let short = gaps
+            .iter()
+            .find(|gap| gap.subject == "short-lived processes never scanned");
+        let Some(gap) = short else {
+            panic!(
+                "two never-enumerated exec newcomers must be counted: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(gap.reason, short_lived_gap_reason(2));
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"discovery coverage ended before stop".to_string()),
+            "mid-capture deaths are not post-pass newcomers: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the next pass enumerates and admits is
+    /// covered, never counted as short-lived.
+    #[test]
+    fn exec_newcomer_admitted_by_the_next_pass_is_covered_not_counted() {
+        let (mut native, caller) = NativeScene::new();
+        native.scene.source.spawn(8, 800);
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // The next pass enumerates pid 8, which admits; a second pass
+        // follows so a missed reconcile would count it.
+        for pids in [vec![7u32, 8], vec![7u32]] {
+            let generation = native.scene.coordinator.adapter.record(caller).map(|record| {
+                crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                }
+            });
+            let mut catalog =
+                capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            for pid in pids {
+                if pid == 7 {
+                    continue;
+                }
+                catalog.processes.push(crate::inspect_system::ProcessRecord {
+                    pid,
+                    status: crate::inspect_system::MemberStatus::Scanned,
+                    objects: Vec::new(),
+                    generation: Some(crate::inspect_system::MemberGeneration {
+                        start_time: Some(800),
+                        exe: None,
+                    }),
+                    complete_scan: None,
+                    application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                        crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                    ),
+                    hints_examined: false,
+                });
+            }
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert!(
+            native.scene.coordinator.adapter.live_id(8).is_some(),
+            "pid 8 admits on its enumerated pass"
+        );
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"short-lived processes never scanned".to_string()),
+            "an admitted newcomer is covered: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the next pass enumerates but cannot admit
+    /// (its pin is gone) is seen by scan machinery, never counted as
+    /// short-lived; its fate belongs to the admission-failure gap.
+    #[test]
+    fn exec_newcomer_seen_but_unadmitted_is_covered_not_counted() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        for pids in [vec![7u32, 8], vec![7u32]] {
+            let generation = native.scene.coordinator.adapter.record(caller).map(|record| {
+                crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                }
+            });
+            let mut catalog =
+                capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            for pid in pids {
+                if pid == 7 {
+                    continue;
+                }
+                catalog.processes.push(crate::inspect_system::ProcessRecord {
+                    pid,
+                    status: crate::inspect_system::MemberStatus::Scanned,
+                    objects: Vec::new(),
+                    generation: Some(crate::inspect_system::MemberGeneration {
+                        start_time: Some(800),
+                        exe: None,
+                    }),
+                    complete_scan: None,
+                    application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                        crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                    ),
+                    hints_examined: false,
+                });
+            }
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert!(
+            native.scene.coordinator.adapter.live_id(8).is_none(),
+            "pid 8 stays unadmitted without a source pin"
+        );
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"short-lived processes never scanned".to_string()),
+            "an enumerated newcomer is seen: {:?}",
+            native.gap_subjects()
+        );
     }
 
     #[test]

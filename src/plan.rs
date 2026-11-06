@@ -364,8 +364,10 @@ pub(crate) enum RefusalKind {
     /// A whole-module capacity refusal, closure or provider, with a stated
     /// demand (`module needs N more; ...`).
     CapacityWhole,
-    /// A Part 0 closure leading-templates prefix partial (`M of N template
-    /// tables attached ... (closure_prefix)`).
+    /// A closure partial (`N of M template tables attached ...`): a Part
+    /// 0 leading-templates prefix (`(closure_prefix)`) or an
+    /// already-loaded unnamed layer's published-only spill
+    /// (`(closure_published_only)`).
     ClosurePrefix,
     /// A JK-22a provider leading-tables prefix partial (`A of N endpoints
     /// attached ... (provider_prefix)`).
@@ -612,6 +614,12 @@ enum AdmissionDecision {
         /// Part 0: a closure array admitted as a leading-templates prefix
         /// (not whole) names its covered tables for the report.
         closure_prefix: Option<(usize, usize)>,
+        /// An already-loaded unnamed closure admitted published-only
+        /// names its covered tables when it spills unpublished
+        /// templates: templates handed out before the capture started
+        /// can still be called, so the spill is a partial gap, never
+        /// silent.
+        closure_published_partial: Option<(usize, usize)>,
         /// JK-22a: an ordinary provider admitted as a leading-tables
         /// prefix (not whole) names its attached endpoints beside its
         /// needed endpoints for the report.
@@ -3324,6 +3332,7 @@ fn merge(
                 // JK-22a provider fallback reports its attached endpoints
                 // beside its needed endpoints instead.
                 let mut closure_prefix: Option<(usize, usize)> = None;
+                let mut closure_published_partial: Option<(usize, usize)> = None;
                 let mut provider_prefix: Option<(usize, usize)> = None;
                 if whole {
                     let mut scan_union = fresh.clone();
@@ -3458,6 +3467,20 @@ fn merge(
                         }
                         closure_prefix = Some((admitted.len(), ordered.len()));
                     }
+                    // An already-loaded unnamed closure admitted
+                    // published-only names its covered tables when it
+                    // spills unpublished templates: templates handed
+                    // out before the capture started can still be
+                    // called. M counts every distinct table, published
+                    // and heuristic alike, as in the prefix record
+                    // above; K counts the attached (published) ones. A
+                    // pass that attaches nothing refuses whole below
+                    // (awaiting-publication), never "0 of M".
+                    if published_only && closure_late_start && !closure_named {
+                        if admitted.len() < ordered.len() {
+                            closure_published_partial = Some((admitted.len(), ordered.len()));
+                        }
+                    }
                     // JK-22a: a provider fallback that attaches nothing falls
                     // through to the whole refusal below — the strongest
                     // table did not fit — never a "0 of N" partial. Tables
@@ -3497,7 +3520,13 @@ fn merge(
                         break 'refused full_union;
                     }
                 }
-                break 'admission Ok((fresh, admitted, closure_prefix, provider_prefix));
+                break 'admission Ok((
+                    fresh,
+                    admitted,
+                    closure_prefix,
+                    closure_published_partial,
+                    provider_prefix,
+                ));
             };
             // Over `kept` alone nothing is fresh, so only the first pass
             // refuses; were that ever broken, the module is refused whole
@@ -3581,56 +3610,58 @@ fn merge(
             }
             break 'admission Err(refused);
         };
-        let (fresh, admitted, closure_prefix, provider_prefix) = match outcome {
-            Ok(admission) => admission,
-            Err(refused) => {
-                if class != AdmissionClass::ClosureArray {
-                    provider_refused = true;
+        let (fresh, admitted, closure_prefix, closure_published_partial, provider_prefix) =
+            match outcome {
+                Ok(admission) => admission,
+                Err(refused) => {
+                    if class != AdmissionClass::ClosureArray {
+                        provider_refused = true;
+                    }
+                    holding.remove(&object);
+                    let refusal = CapacityRefusal {
+                        policy: admission_policy,
+                        needed: refused.len(),
+                        capacity,
+                        in_use: allocated_slots,
+                        retired,
+                        holders: slot_holders(&holding, &paths),
+                        reserve: reserved.then_some(reserve),
+                        closure_tables: (class == AdmissionClass::ClosureArray)
+                            .then_some(table_count),
+                        aim_hint: shared,
+                        naming_hint: is_detailed_closure
+                            && !shared
+                            && !closure_late_start
+                            && !closure_named,
+                        counter_hint,
+                        unpublished: awaiting_publication,
+                        broad_admit,
+                    };
+                    let reason = refusal.reason();
+                    let kind = if awaiting_publication {
+                        RefusalKind::AwaitingPublication
+                    } else {
+                        RefusalKind::CapacityWhole
+                    };
+                    // The kind and the wording agree at construction; later
+                    // rewordings keep the kind. One direction only: whole
+                    // refusals interpolate holder paths verbatim, so the text
+                    // oracle is not a whole-refusal invariant.
+                    debug_assert!(
+                        kind != RefusalKind::AwaitingPublication
+                            || is_closure_awaiting_publication(&reason),
+                        "awaiting kind without awaiting wording: {reason}"
+                    );
+                    decisions[position] = Some(AdmissionDecision::Refused {
+                        skipped: Skipped {
+                            subject: path.to_string(),
+                            reason,
+                        },
+                        kind,
+                    });
+                    continue;
                 }
-                holding.remove(&object);
-                let refusal = CapacityRefusal {
-                    policy: admission_policy,
-                    needed: refused.len(),
-                    capacity,
-                    in_use: allocated_slots,
-                    retired,
-                    holders: slot_holders(&holding, &paths),
-                    reserve: reserved.then_some(reserve),
-                    closure_tables: (class == AdmissionClass::ClosureArray).then_some(table_count),
-                    aim_hint: shared,
-                    naming_hint: is_detailed_closure
-                        && !shared
-                        && !closure_late_start
-                        && !closure_named,
-                    counter_hint,
-                    unpublished: awaiting_publication,
-                    broad_admit,
-                };
-                let reason = refusal.reason();
-                let kind = if awaiting_publication {
-                    RefusalKind::AwaitingPublication
-                } else {
-                    RefusalKind::CapacityWhole
-                };
-                // The kind and the wording agree at construction; later
-                // rewordings keep the kind. One direction only: whole
-                // refusals interpolate holder paths verbatim, so the text
-                // oracle is not a whole-refusal invariant.
-                debug_assert!(
-                    kind != RefusalKind::AwaitingPublication
-                        || is_closure_awaiting_publication(&reason),
-                    "awaiting kind without awaiting wording: {reason}"
-                );
-                decisions[position] = Some(AdmissionDecision::Refused {
-                    skipped: Skipped {
-                        subject: path.to_string(),
-                        reason,
-                    },
-                    kind,
-                });
-                continue;
-            }
-        };
+            };
         // PA-5 M3: a provider growth omission blocks the closure prefix
         // below — a prefix never hides a loss. Zero-demand preservation
         // (no record) does not block. A JK-22a provider prefix does not
@@ -3660,6 +3691,7 @@ fn merge(
             kept,
             allocated_slots,
             closure_prefix,
+            closure_published_partial,
             provider_prefix,
         });
     }
@@ -3680,29 +3712,38 @@ fn merge(
         let source = group[0].source;
         let (class, _) = classes[position];
         entries_seen += decoded_occurrence_count(&group);
-        let (admitted, refused_growth, kept, allocated_slots, closure_prefix, provider_prefix) =
-            match decision.expect("merge decides every module before building it") {
-                AdmissionDecision::Refused { skipped, kind } => {
-                    refused_module_objects.push((object, skipped.clone(), kind));
-                    modules_skipped.push(skipped);
-                    continue;
-                }
-                AdmissionDecision::Admitted {
-                    admitted,
-                    refused_growth,
-                    kept,
-                    allocated_slots,
-                    closure_prefix,
-                    provider_prefix,
-                } => (
-                    admitted,
-                    refused_growth,
-                    kept,
-                    allocated_slots,
-                    closure_prefix,
-                    provider_prefix,
-                ),
-            };
+        let (
+            admitted,
+            refused_growth,
+            kept,
+            allocated_slots,
+            closure_prefix,
+            closure_published_partial,
+            provider_prefix,
+        ) = match decision.expect("merge decides every module before building it") {
+            AdmissionDecision::Refused { skipped, kind } => {
+                refused_module_objects.push((object, skipped.clone(), kind));
+                modules_skipped.push(skipped);
+                continue;
+            }
+            AdmissionDecision::Admitted {
+                admitted,
+                refused_growth,
+                kept,
+                allocated_slots,
+                closure_prefix,
+                closure_published_partial,
+                provider_prefix,
+            } => (
+                admitted,
+                refused_growth,
+                kept,
+                allocated_slots,
+                closure_prefix,
+                closure_published_partial,
+                provider_prefix,
+            ),
+        };
         // Part 0: a prefix-admitted closure names its covered templates.
         // The module is admitted (its prefix counts), but calls through the
         // other templates are not observed — a partial gap, never silent.
@@ -3717,6 +3758,26 @@ fn merge(
             };
             refused_module_objects.push((object, prefix.clone(), RefusalKind::ClosurePrefix));
             modules_skipped.push(prefix);
+        }
+        // An already-loaded unnamed closure admitted published-only
+        // names its covered tables when it spilled unpublished
+        // templates. The module is admitted (its published tables
+        // count), but calls through the other templates — handed out
+        // before the capture started — are not observed: a partial
+        // gap, never silent. The `closure_published_only` name travels
+        // in the reason so JSON carries it; it is appended, so
+        // start-anchored `N of M` readers still match, and the shared
+        // `template tables attached` phrasing keeps the partial oracles
+        // exact.
+        if let Some((covered, total)) = closure_published_partial {
+            let partial = Skipped {
+                subject: path.to_string(),
+                reason: format!(
+                    "{covered} of {total} template tables attached; calls through the others are not counted (closure_published_only)"
+                ),
+            };
+            refused_module_objects.push((object, partial.clone(), RefusalKind::ClosurePrefix));
+            modules_skipped.push(partial);
         }
         // JK-22a: a prefix-admitted provider names its attached endpoints
         // beside its needed endpoints. The module is admitted (its prefix

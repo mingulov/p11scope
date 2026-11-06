@@ -2484,7 +2484,9 @@ impl<'a> CounterPreparation<'a> {
                 .program_mut(program)
                 .context("private counter root")?
                 .try_into()?;
-            if super::loads_with_multi_flag(backend, program) {
+            // Counter roots are never dynamic programs, so the dynamic
+            // flag is inert here.
+            if super::loads_with_multi_flag(backend, program, false) {
                 root.load_multi()
             } else {
                 root.load()
@@ -9683,19 +9685,23 @@ pub(crate) mod tests {
             );
             assert!(super::super::loads_with_multi_flag(
                 AttachBackend::Multi,
-                "p11_counter_bank_entry"
+                "p11_counter_bank_entry",
+                false
             ));
             assert!(super::super::loads_with_multi_flag(
                 AttachBackend::Multi,
-                "p11_counter_bank_return"
+                "p11_counter_bank_return",
+                false
             ));
             assert!(!super::super::loads_with_multi_flag(
                 AttachBackend::Singles,
-                "p11_counter_bank_entry"
+                "p11_counter_bank_entry",
+                false
             ));
             assert!(!super::super::loads_with_multi_flag(
                 AttachBackend::Singles,
-                "p11_counter_bank_return"
+                "p11_counter_bank_return",
+                false
             ));
         }
     }

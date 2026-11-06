@@ -16,7 +16,8 @@ below, the six residual additions (`drain_proven`, `verdict_detail`,
 outcome (`stop_quiescence`), the verdict
 classes (`gap_classes` and its three published inputs), row identity
 (`functions[].target`, `functions[].ordinals`, table linkage `exports`),
-and the `modules_skipped[]` named-prefix delta below.
+the `modules_skipped[]` named-prefix delta below,
+and per-provider mechanism counts (`mechanisms[].by_module`).
 
 `modules_skipped[]` extends the inherited v2 row: a module new to a
 shared-scope Detailed capture may attach in part, as a named partial
@@ -641,6 +642,32 @@ errors and in-flight, never summed into logical). Single-layer captures
 read `forwarding` zeros with both layers' rows labelled. Like
 `selected_detail`, this is a v3-additive disclosure that introduces no
 new schema revision: the `functions[]` item shape stays open.
+
+## Per-provider mechanism counts
+
+Every `mechanisms[]` row carries `by_module`: the row's `calls`/`errors`
+partitioned by provider module, one entry per sole-owner module in
+module-id order, each `{module: {dev, ino, sha256}, calls, errors}`.
+`module` is the same reference `functions[].module` uses, resolved
+through the document's discovery list.
+
+Entries cover the attributed subset of the row: observations on slots
+with no sole owner (unclaimed slots, or doubly claimed slots, which
+are count-only and record nothing at all), or whose owner the
+discovery list does not name, count in the row totals but in no entry —
+entry sums never exceed the row. The error rule matches the row (any
+nonzero `rv`), so a fully attributed row partitions exactly. Each
+entry takes one key from the capture's shared monotonic
+semantic-state budget; a refused entry records nothing and counts the
+usual `semantic_state_drops` gap.
+
+The breakdown derives from two already-captured facts — the v1
+mechanism ids and the slots' sole-owner attribution — with no new
+capture; see the allowlist-v3 derived-count row. Metrics documents
+carry no `mechanisms[]` and gain nothing here. Like the
+forwarding-layer split above, this is a v3-additive disclosure that
+introduces no new schema revision: the `mechanisms[]` item shape stays
+open.
 
 ## Kernel control evidence
 

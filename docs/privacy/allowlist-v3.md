@@ -51,7 +51,9 @@ and [derived count projections](#derived-count-projections-v060),
 which are derived counts with no new capture,
 and [PQC parameter-set metadata](#pqc-parameter-set-metadata-f16-2026-11-06),
 which reads `CKA_PARAMETER_SET` with its PQC key-type qualifier and publishes
-the finite eighteen-label vocabulary below.**
+the finite eighteen-label vocabulary below,
+and [per-provider mechanism counts](#per-provider-mechanism-counts-owner-ruling-kg-1kg-2-2026-11-03),
+which partitions each mechanism row's calls/errors by provider module.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1749,3 +1751,20 @@ unchanged.**
 derived counts over already-observed calls, admission decisions and
 loss counters — no new capture, no new read, no new retained field.
 Allowlist-v1 bytes are unchanged.**
+
+## Per-provider mechanism counts (owner ruling KG-1/KG-2, 2026-11-03)
+
+**Status: IMPLEMENTED on this branch per owner ruling KG-1/KG-2
+(2026-11-03): mechanism ids are public constants, so each
+`mechanisms[]` row additionally partitions its calls/errors by
+provider module. Publication change only; no new read exists. The
+controller shows this final text to the owner before merge.
+Allowlist-v1 bytes are unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Per-provider mechanism counts (`mechanisms[].by_module`) | The existing guarded return-time `CK_MECHANISM.mechanism` word (the same v1 capture the row aggregates) joined in userspace with the capture-lifetime sole-owner module of the observing slot (`module_of_slot`); no new kernel read, no new map and no new retention site exists — each cell lives inside its existing semantic row under the existing 16,384-key capture budget. Only sole-owner observations partition; unknown-owner observations count in the row alone, and doubly claimed slots are count-only and record nothing. | Public profile JSON only (`p11scope/observed-profile/v3`): each `mechanisms[]` row carries `by_module`, one `{module: {dev, ino, sha256}, calls, errors}` entry per sole-owner module in module-id order, the module reference resolved through the document's discovery list. Metrics, trace lines, inventory documents and text frames gain nothing (inventory `edges[].mechanisms[]` already carries per-edge counts). Never per thread, per call time, per session, or per key. | An entry whose module the discovery list does not name is skipped, never fabricated; entry sums never exceed the row. A budget-refused entry records nothing and counts the existing `semantic_state_drops` gap (`PARTIAL`). Required evidence: two-provider split/partition twins, unowned/ambiguous exclusion twins, budget-refusal and purge twins at the semantic seam, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
+Owner ruling KG-1/KG-2 also covers key creation/derivation counts as
+not secret; this section implements the mechanism-count half only.
+Creation/derivation counts remain future work and gain no row here.

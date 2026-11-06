@@ -1312,6 +1312,7 @@ mod tests {
             pause_unavailable: 0,
             pause_engine_incomplete_retirements: 0,
             child_still_running: None,
+            run_tree_handed_back: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
             discovery_read_failures: 0,

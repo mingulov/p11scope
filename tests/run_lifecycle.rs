@@ -235,8 +235,9 @@ fn a_command_that_cannot_execute_fails_by_name_and_leaves_nothing_behind() {
     assert!(text.contains("exec"), "{text}");
 }
 
-/// `child_still_running` is the one run-only evidence field: it exists in a
-/// `run` document and must not appear in a `--pid`/`--cgroup` capture.
+/// `child_still_running` and `run_tree_handed_back` are run-only evidence
+/// fields: they exist in a `run` document and must not appear in a
+/// `--pid`/`--cgroup` capture.
 #[test]
 fn the_run_only_evidence_field_reaches_the_written_document() {
     let dir = work_dir("document");
@@ -260,6 +261,7 @@ fn the_run_only_evidence_field_reaches_the_written_document() {
                 serde_json::from_str(&std::fs::read_to_string(&out).unwrap()).unwrap();
             let evidence = &document["evidence"];
             assert_eq!(evidence["child_still_running"], serde_json::json!(false));
+            assert_eq!(evidence["run_tree_handed_back"], serde_json::json!(0));
             for field in [
                 "attach_gap_ms",
                 "pause",

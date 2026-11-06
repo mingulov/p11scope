@@ -1195,6 +1195,11 @@ pub struct Evidence {
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub child_still_running: Option<bool>,
+    /// Present only for `run`: tree members handed back alive at run end
+    /// (measured zero when the tree retired cleanly). Annotation beside
+    /// the paired `run process tree` skip, which carries the verdict.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_tree_handed_back: Option<u64>,
     /// Failed `DISCOVERY` ring reservations across loader, exec, and export
     /// records — from the BPF counter, never derived from received records.
     pub discovery_ring_loss: u64,
@@ -1606,15 +1611,10 @@ impl Default for SchedulingEvidence {
 const DISCOVERY_SUBJECT: &str = "discovery subject";
 /// Run-tree scope gaps file under this subject with finite reasons
 /// (schema v3): the survivor count rides in
-/// `evidence.run_tree_handed_back`, never in the reason. Consumed by
-/// the run-tree implementation; the allow drops with it.
-#[allow(dead_code)]
+/// `evidence.run_tree_handed_back`, never in the reason.
 pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
-#[allow(dead_code)]
 pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
-#[allow(dead_code)]
 pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
-#[allow(dead_code)]
 pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
@@ -1689,10 +1689,16 @@ pub fn capture_skipped_out(s: &Skipped) -> SkippedOut {
             reason: reason.into(),
         };
     }
-    // Run-tree gaps keep their subject and their run-owned reason:
-    // the templates carry only counts and I/O-kind words — no paths,
-    // PIDs, or error chains — and the survivor count is the disclosure.
-    if s.subject == "run process tree" {
+    // Run-tree gaps keep their subject and their finite reason; the
+    // survivor count rides in `evidence.run_tree_handed_back`, never in
+    // the reason. Anything else under the subject falls through to the
+    // fail-closed generic below instead of breaking the closed vocabulary.
+    if s.subject == RUN_TREE_SUBJECT
+        && matches!(
+            s.reason.as_str(),
+            RUN_TREE_SURVIVORS | RUN_TREE_DEGRADED | RUN_TREE_MEMBERSHIP_UNKNOWN
+        )
+    {
         return SkippedOut {
             name: s.subject.clone(),
             reason: s.reason.clone(),
@@ -5179,6 +5185,7 @@ pub(crate) mod tests {
             pause_unavailable: 0,
             pause_engine_incomplete_retirements: 0,
             child_still_running: None,
+            run_tree_handed_back: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
             discovery_read_failures: 0,
@@ -13622,6 +13629,11 @@ pub(crate) mod tests {
                 document.get("child_still_running").is_none(),
                 "child_still_running is a run-only field"
             );
+            // Nothing this observer did not start can hand back a tree.
+            assert!(
+                document.get("run_tree_handed_back").is_none(),
+                "run_tree_handed_back is a run-only field"
+            );
             // A gap that was never measured is null, never an invented zero.
             assert!(document["attach_gap_ms"].is_null());
             assert_eq!(document["pause"], "none");
@@ -13629,10 +13641,12 @@ pub(crate) mod tests {
                 assert_eq!(document[counter], 0, "{counter}");
             }
         }
-        // The run-only field appears exactly when the observer owned the child.
+        // The run-only fields appear exactly when the observer owned the child.
         ev.child_still_running = Some(true);
+        ev.run_tree_handed_back = Some(2);
         let owned = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(owned["evidence"]["child_still_running"], true);
+        assert_eq!(owned["evidence"]["run_tree_handed_back"], 2);
     }
 
     #[test]

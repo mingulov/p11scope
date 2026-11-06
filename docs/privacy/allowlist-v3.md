@@ -1548,7 +1548,8 @@ cgroup/system scope (614b P1 narrow authorization). Beside
 trace, metrics, exact-PID scope or an owned `run` the flag is
 accepted but arms nothing and records no exe identity; beside
 counter modes it is refused. Inventory captures never arm and
-keep no exe identity.
+keep no exe identity. (The 7.10b draft section below proposes to
+widen this arming rule; it takes effect only upon owner approval.)
 
 ## Pre-arm module watch intervals (6.13 Detailed and inventory `prearm[]`)
 

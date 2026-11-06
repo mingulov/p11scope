@@ -790,6 +790,8 @@ proves a process did not map a watched provider.
 Arbitrary enter-then-migrate-out before refresh or exit remains outside the
 `COMPLETE` and runtime-qualified claims; no migration subsystem is provided.
 PID scope remains exact and does not attach process-creation tracking.
+Under `--track-short-lived` it additionally groups the named target's
+own execs (`target_exec_hints`); it still tracks no other process.
 
 Before either command attaches, every accepted object from the scan or an
 optional manifest is opened once and pinned by file descriptor. The whole-file
@@ -1115,15 +1117,15 @@ Limits that matter in pods:
   conformance input, and never a negative. Multi-threaded exits
   and late watches read `unknown`, and nothing here proves a
   process did not map a watched provider.
-  Beside `--trace`, `--mode metrics`, or exact `--pid` scope the flag is
-  accepted but arms nothing: no exe identity is
-  recorded there, because nothing there classifies gaps (614b P1
-  narrow authorization — the read arms only where hints publish).
-  Beside an owned `run` the flag is refused because it would record
-  nothing there; beside `--counter-mode` it is refused because
-  extensive mode arms Detailed captures only, never a counter
-  object. Privacy row: `docs/privacy/allowlist-v3.md`
-  (extensive-mode executable dependency hints).
+  On `--cgroup`/`--system` captures the flag groups unmatched exits
+  by linkage in the trace, profile and `--mode metrics` lanes alike;
+  on exact `--pid` scope and owned `run` captures it groups the
+  target's own execs instead (`target_exec_hints` beside the gap
+  counts), with the gap splits absent there. Beside `--counter-mode`
+  the flag is refused because extensive mode arms Detailed captures
+  only, never a counter object. Privacy rows:
+  `docs/privacy/allowlist-v3.md` (extensive-mode executable
+  dependency hints and the 7.10b widened read/retention contract).
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.
 - `run --kill-on-timeout` — when `--duration` expires, terminate and reap the

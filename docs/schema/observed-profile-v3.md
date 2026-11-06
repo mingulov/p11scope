@@ -343,10 +343,11 @@ counted the gap, coalescing overflow marks `PARTIAL` without another increment.
 Replays and further unremembered keys do not increment again.
 
 `gap_exe_hints` is present if and only if the capture armed extensive
-mode (`--track-short-lived`); otherwise the key is absent, never null.
-Arming is confined to profile (non-metrics) `--cgroup`/`--system`
-captures: on trace, metrics, exact-`--pid` and `run` captures the flag
-records nothing and the key stays absent.
+mode (`--track-short-lived`) over a `--cgroup`/`--system` scope;
+otherwise the key is absent, never null. The trace, profile and
+`--mode metrics` lanes all publish it there. On exact-`--pid` and
+owned-`run` captures the flag arms the PID consumer instead (see
+`target_exec_hints` below) and this key stays absent.
 It classifies the novel unmatched-exit subpopulation of
 `pid_descendant_gaps` (admissions and overflow sentinels carry no hint)
 into finite static-linkage classes: `links_provider` (the dead
@@ -364,9 +365,23 @@ never merged into call or attribution shares, and settle no birth,
 admission, absence, or call (R57). `dlopen`-only provider use is
 invisible by design and reads `no_static_link_within_scope`.
 
-`gap_exit_mappings` is present under the same arming rule (extensive
-profile `--cgroup`/`--system` captures only; absent, never null,
-otherwise). It splits the same novel unmatched-exit subpopulation of
+`target_exec_hints` is present if and only if the capture armed
+extensive mode over exact-`--pid` scope (profile `--pid` or owned
+`run`, in the trace, profile and metrics lanes); otherwise the key is
+absent, never null. On `--cgroup`/`--system` captures this key stays
+absent (no single target exists there). It classifies the
+validated-target-exec subpopulation — exactly one hint per target
+exec matched to the live retained target — into the same four
+static-linkage classes with the same `STATIC HINT` label, scope
+string, saturating-u64 counts and hint discipline as `gap_exe_hints`.
+Unvalidated execs are outside the subpopulation and add no count, not
+even `unknown`. A zero split means no validated target exec was
+observed, never "no provider use".
+
+`gap_exit_mappings` is present under the same arming rule as
+`gap_exe_hints` (extensive `--cgroup`/`--system` captures in the
+trace, profile and metrics lanes; absent, never null, otherwise). It
+splits the same novel unmatched-exit subpopulation of
 `pid_descendant_gaps` (admissions and overflow sentinels carry no
 verdict) by the kernel's exit-time answer: `mapped` (the kernel
 recorded a localized mapping of a watched provider file by the

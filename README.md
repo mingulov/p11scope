@@ -111,11 +111,12 @@ observations by recorded application path and module content; `--json` and
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
 
-Two newer capture flags: `--track-short-lived` (profile,
-default off) is extensive mode: the kernel records exec-time executable identity
-so unmatched exits gain bounded static-linkage hints, arming only on Detailed
-profile `--cgroup`/`--system` captures and refused beside `--counter-mode`
-and beside `run`
+Two newer capture flags: `--track-short-lived`
+(default off) is extensive mode: the kernel records exec-time executable identity
+so unmatched exits gain bounded static-linkage hints on Detailed
+`--cgroup`/`--system` captures (trace, profile and metrics lanes) while
+`--pid` and owned `run` captures group the target's own execs instead,
+and the flag is refused beside `--counter-mode`
 ([options](docs/usage.md#more-capture-options)). `--prearm-module
 <provider.so>` (profile, trace, run, inventory; repeatable) pins a provider file
 before any mapping and pre-arms its proved offsets; under inventory the inputs

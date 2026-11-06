@@ -1623,7 +1623,7 @@ def judge(stage, contract_path):
     system_proven = doctor_rows[0][0] == "ok" and doctor_rows[0][1].strip() in (
         "self-link attached and detached",
         "scratch program loaded; self-link attached and detached (delivery unmeasured)")
-    require(system_proven, "uprobe-multi-required: live-positive qualification requires general host load/self-link proof")
+    require(system_proven, "live-positive qualification requires general host load/self-link proof")
     for scope, proven in (("pid", pid_proven), ("sys", system_proven)):
         attach = load(relative(stage, "backend/inv-" + scope + ".json")).get("observation", {}).get("attach", {})
         fallback = attach.get("fallback")

@@ -34,6 +34,9 @@ SINKS = ('file', 'discard', 'slowpipe')
 STAGES = ('none', 'midcapture', 'midfinal')
 CELLS = tuple('-'.join(parts) for parts in itertools.product(RINGS, SINKS, STAGES))
 LIMIT = 16 * 1024 * 1024
+# Positive provider-probe readiness: one attached probe or many. The
+# waiting shape is not readiness (no provider is watched yet).
+READINESS_RE = re.compile(rb'p11scope: capturing: [1-9][0-9]* probes? attached; stop with Ctrl-C\n')
 
 
 def cancellation_marker(data, expected_signal):
@@ -282,8 +285,13 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
         argv = [str(binary.path), 'trace', '--pid', str(caller.pid),
                 '--module', str(provider.path), '--ring-bytes', ring,
                 '--duration', '6s', '-o', str(trace_path), *manifest_argv]
+        # The readiness and mid-final gates key on the verbose
+        # diagnostics markers (`capturing:`, `longrun:`); restore them
+        # for the observer without touching the caller's environment.
+        observer_env = dict(env)
+        observer_env['P11SCOPE_CAPTURE_DIAGNOSTICS'] = '1'
         observer = NATIVE.spawn_owned(owners, argv, 0, stdin=subprocess.DEVNULL,
-            stdout=stdout_fd, stderr=stderr_pipe.write_fd, env=env,
+            stdout=stdout_fd, stderr=stderr_pipe.write_fd, env=observer_env,
             start_new_session=True,
             preexec_fn=file_limit if args.control == 'file-limit' else None)
         binary.image_receipt(dict(image=0), observer)
@@ -344,7 +352,7 @@ def cell(args, label, directory, env, binary, provider, caller_pin, manifests=()
             if receipt['cancellation_ack_ns'] is None:
                 record_cancellation_marker(receipt, errors)
             if not ready:
-                if re.search(rb'p11scope: capturing: [1-9][0-9]* probe\(s\) attached; stop with Ctrl-C\n', errors):
+                if READINESS_RE.search(errors):
                     observer.verify()
                     receipt['ring_actual_bytes'] = events_ring_capacity(observer.pid)
                     expected_ring = {'4K': 4096, '4M': 4194304, '16M': 16777216}[ring]

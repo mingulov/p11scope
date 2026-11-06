@@ -347,7 +347,7 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
         let header = text.lines().next().unwrap();
         let scope = header.find(&format!("{label} scope")).unwrap();
         let duration = header.find("up 00:00:30").unwrap();
-        let counts = text.find("4 completed calls; 1 returned errors").unwrap();
+        let counts = text.find("4 completed calls; 1 returned error;").unwrap();
         let table = text.find("FUNCTION").unwrap();
         assert!(
             scope < duration && duration < counts && counts < table,

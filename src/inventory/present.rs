@@ -556,6 +556,13 @@ pub(crate) struct Presentation {
     /// empty without the flag. Pass views show live watches, the final
     /// view terminal ones — no special-casing.
     pub prearm: Vec<PrearmReportRow>,
+    /// Whether `--key-operations` was requested for this run (text
+    /// only: distinguishes "requested but unavailable" from "off";
+    /// JSON keeps the observations and gaps).
+    pub key_operations_requested: bool,
+    /// Whether the run carries manifests (text only: without one no
+    /// semantic start is attempted, so no refusal gap exists).
+    pub manifests_present: bool,
 }
 
 /// What an edge's activity label answers (Choice 3).
@@ -943,6 +950,8 @@ impl Presentation {
                 retained_suppressed: registry.gaps_suppressed(),
                 preadmission: coordinator.preadmission_counters(),
             },
+            key_operations_requested: coordinator.key_operations_requested(),
+            manifests_present: coordinator.has_manifests(),
         })
     }
 
@@ -1244,7 +1253,20 @@ pub(crate) fn observation_label_at(edge: &EdgeView, now_ns: u64) -> String {
     }
     match &edge.coverage {
         UseCoverage::Witnessed { .. } => "Use observed; count unavailable".into(),
-        UseCoverage::WatchedNoUse { .. } => {
+        UseCoverage::WatchedNoUse { since_ns, .. } => {
+            // A mapping first seen before the watch started leaves a
+            // pre-watch window whose calls are not counted: name it. A
+            // zero (unknown) or post-watch first sighting keeps the
+            // plain covered-interval line.
+            if edge.mapping_first_seen_ns > 0 && edge.mapping_first_seen_ns < *since_ns {
+                let before = crate::render::fmt_ns(Some(
+                    since_ns.saturating_sub(edge.mapping_first_seen_ns),
+                ));
+                return format!(
+                    "No entries observed during the covered interval; mapped at least {before} \
+                     before the watch started, earlier calls are not counted"
+                );
+            }
             "No entries observed during the covered interval".into()
         }
         UseCoverage::Counted { lossy: false, .. } => {
@@ -1553,6 +1575,16 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
+    if let Some(captured) = reason.strip_prefix("live capture refused (") {
+        // The PID auto-fallback gap carries the full host summary
+        // (JSON and verbose keep it); concise folds it to one short
+        // clause. Only a Denied refusal carries the sudo tail, so its
+        // presence is the privilege signal.
+        if captured.ends_with("; run with sudo for full capture") {
+            return "live capture refused (needs root); run with sudo for full capture";
+        }
+        return "live capture refused (see 'p11scope doctor')";
+    }
     match reason {
         "joint_birth_unoffered" => "no key session was offered to track",
         "joint_image_refused" | "joint_birth_claim_ImageTainted" => {
@@ -1771,11 +1803,20 @@ fn render_snapshot_inner(
                 // A refused journal start leaves a "key operations
                 // unavailable" scope gap: --key-operations was requested
                 // but per-key tracking never started. Name the request and
-                // the cause; without that gap tracking is simply off.
+                // the cause; a request without --manifest never attempts
+                // a start (no gap exists), so it names the missing flag
+                // instead of reading "off"; without that gap tracking is
+                // simply off.
                 if let Some(cause) = key_operations_refusal_cause(presentation) {
                     let _ = writeln!(
                         out,
                         "key operations: requested, but per-key tracking did not start ({cause})"
+                    );
+                } else if presentation.key_operations_requested && !presentation.manifests_present {
+                    let _ = writeln!(
+                        out,
+                        "key operations: requested, but per-key tracking needs --manifest on this \
+                         build"
                     );
                 } else if verbose {
                     let _ = writeln!(

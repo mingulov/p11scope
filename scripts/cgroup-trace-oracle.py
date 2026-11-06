@@ -24,7 +24,7 @@ ROW = re.compile(
 IMAGE_FIELDS = ('image', 'pid', 'start_time', 'path', 'dev', 'ino', 'mtime_ns',
                 'pid_namespace', 'time_namespace')
 TRACE_TOTALS = re.compile(
-    r'\d+ completed calls; \d+ returned errors; \d+ entries without an observed return\.')
+    r'\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.')
 
 
 def parse_trace(text):

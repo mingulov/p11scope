@@ -1430,6 +1430,7 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
+    coordinator.set_key_operations_requested(key_operations);
     // Packet 6.13 round-2 (F5): the startup pinning above is retained
     // for the run, its proved offsets lower into the run's attach set
     // before passes, and one interval row per input renders in `prearm[]`.
@@ -6669,10 +6670,19 @@ fn open_native_lane_with(
             // process maps, and the gap names the missing live capture.
             if mode == CaptureMode::Auto && pid_scope {
                 let summary = crate::attach::summarize_native_preparation_error(&error);
-                return unavailable(
-                    coordinator,
-                    format!("live capture refused ({summary}); run with sudo for full capture"),
-                );
+                // The sudo advice is gated on the typed cause: only a
+                // `Denied` refusal (permission/policy) can sudo fix. An
+                // old kernel or a verifier-shaped refusal points at
+                // doctor through the summary itself.
+                let denied = error
+                    .downcast_ref::<crate::attach::MultiHostRefusal>()
+                    .is_some_and(crate::attach::MultiHostRefusal::needs_privilege_hint);
+                let reason = if denied {
+                    format!("live capture refused ({summary}); run with sudo for full capture")
+                } else {
+                    format!("live capture refused ({summary})")
+                };
+                return unavailable(coordinator, reason);
             }
             return Err(error);
         }
@@ -9922,7 +9932,13 @@ mod tests {
             .iter()
             .find(|(subject, _)| subject == "native usage feed unavailable")
             .expect("fallback records a named gap");
-        assert!(reason.contains("sudo"), "{reason}");
+        // ProgramLoad EACCES is `Unproven` (verifier-shaped): sudo cannot
+        // help, so the gap carries no sudo advice.
+        assert!(!reason.contains("sudo"), "{reason}");
+        assert!(
+            reason.starts_with("live capture refused (live capture did not start: "),
+            "{reason}"
+        );
     }
 
     /// Item 6: the auto PID fallback advises sudo only when the typed
@@ -10212,7 +10228,7 @@ mod tests {
                 .unwrap_err();
                 assert!(
                     error.to_string().contains("--max-endpoints")
-                        && error.to_string().contains("1..=131072")
+                        && error.to_string().contains("1–131072")
                 );
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             }

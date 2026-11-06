@@ -263,8 +263,9 @@ pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 131_072;
 pub fn inventory_endpoint_budget(requested: Option<u64>) -> Result<InventoryBudget, String> {
     let endpoints = requested.unwrap_or(DEFAULT_INVENTORY_ENDPOINT_LIMIT);
     if !(1..=MAX_INVENTORY_ENDPOINT_LIMIT).contains(&endpoints) {
+        // The en-dash range matches the help this error points at.
         return Err(format!(
-            "--max-endpoints must be in 1..={MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
+            "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
         ));
     }
     let payload = endpoints
@@ -2628,7 +2629,7 @@ mod tests {
         }
         for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
             let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
-            assert!(refusal.contains("--max-endpoints") && refusal.contains("1..=131072"));
+            assert!(refusal.contains("--max-endpoints") && refusal.contains("1–131072"));
         }
         // The public policy does not narrow the general, checked ID API.
         let general = u64::from(u32::MAX);
@@ -2641,15 +2642,18 @@ mod tests {
     }
 
     /// The `--max-endpoints` refusal spells the range the way the help
-    /// does (`1–8192`), since the error points at that help.
+    /// does (en-dash plus the live ceiling), since the error points at
+    /// that help.
     #[test]
     fn max_endpoints_refusal_uses_help_range_notation() {
-        let refusal = inventory_endpoint_budget(Some(99_999)).unwrap_err();
+        let refusal = inventory_endpoint_budget(Some(999_999)).unwrap_err();
         assert_eq!(
             refusal,
-            "--max-endpoints must be in 1–8192 (requested 99999)"
+            format!(
+                "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested 999999)"
+            )
         );
-        assert!(!refusal.contains("1..=8192"), "{refusal}");
+        assert!(!refusal.contains("1..="), "{refusal}");
     }
 
     #[test]

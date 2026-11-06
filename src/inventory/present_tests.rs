@@ -941,18 +941,9 @@ fn watched_no_use_with_pre_watch_mapping_discloses_window() {
             "No entries observed during the covered interval; mapped at least 60ns before the \
              watch started, earlier calls are not counted",
         ),
-        (
-            0,
-            "No entries observed during the covered interval",
-        ),
-        (
-            100,
-            "No entries observed during the covered interval",
-        ),
-        (
-            150,
-            "No entries observed during the covered interval",
-        ),
+        (0, "No entries observed during the covered interval"),
+        (100, "No entries observed during the covered interval"),
+        (150, "No entries observed during the covered interval"),
     ] {
         let harness = varied_harness();
         let mut presentation = capture_for(&harness, &harness.render());

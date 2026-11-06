@@ -379,6 +379,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     )>,
     /// Explicit count inputs enter the catalog's one plan before admission.
     count_manifests: Vec<PathBuf>,
+    /// Whether `--key-operations` was requested for this run (text
+    /// only: the snapshot distinguishes "requested but unavailable"
+    /// from "off"). Set once at run setup; harnesses leave it false.
+    key_operations_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
     /// Inventory capture. Proved offsets lower into the run's attach set
@@ -867,6 +871,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             scan_mint_requested: false,
             scan_mint_sources: None,
             count_manifests: Vec::new(),
+            key_operations_requested: false,
             prearm: None,
             prearm_prior: (0, 0),
             prearm_state: crate::prearm_module::PrearmState::empty(),
@@ -948,6 +953,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // setter order is.
         let (objects, bytes) = self.prearm_prior;
         self.semantic_inputs.set_prearm_prior(objects, bytes);
+    }
+
+    /// Whether the run carries manifests (the same inputs the
+    /// semantic-lane gate reads at run setup).
+    pub(crate) fn has_manifests(&self) -> bool {
+        !self.count_manifests.is_empty()
+    }
+
+    /// Record the run's `--key-operations` request for snapshot text.
+    pub(crate) fn set_key_operations_requested(&mut self, requested: bool) {
+        self.key_operations_requested = requested;
+    }
+
+    /// Whether `--key-operations` was requested for this run.
+    pub(crate) fn key_operations_requested(&self) -> bool {
+        self.key_operations_requested
     }
 
     /// Retains an already-validated `--prearm-module` pinning for the run's

@@ -4181,7 +4181,7 @@ def build_manifest(discover_pin, module_path, out_path, env, uid, gid):
 
 
 LIVE_PREFIX = "\x1b[2J\x1b[H"
-LIVE_TOTALS = re.compile(r"(\d+) completed calls; (\d+) returned errors; (\d+) entries without an observed return\.")
+LIVE_TOTALS = re.compile(r"(\d+) completed calls?; (\d+) returned errors?; (\d+) entr(?:y|ies) without an observed return\.")
 LIVE_ROW = re.compile(r"(\S+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(\d+)")
 
 

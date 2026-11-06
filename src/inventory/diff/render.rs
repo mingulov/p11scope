@@ -70,18 +70,20 @@ pub(super) fn render_concise(report: &DiffReport, out: &mut dyn Write) -> io::Re
     } else {
         const SHOWN: usize = 5;
         human.blank()?;
-        human.line(0, "Top changed applications:")?;
-        for row in report.application_changes.iter().take(SHOWN) {
-            let path = &report.comparison.application_paths[row.key.exe_path_ref.0];
-            human.line(2, path)?;
-            human.line(
-                4,
-                &format!("{}; {}", presence(row.presence), row.changes.join(", ")),
-            )?;
-        }
-        let more = report.application_changes.len().saturating_sub(SHOWN);
-        if more > 0 {
-            human.line(2, &format!("and {more} more (--json has every item)"))?;
+        if !report.application_changes.is_empty() {
+            human.line(0, "Top changed applications:")?;
+            for row in report.application_changes.iter().take(SHOWN) {
+                let path = &report.comparison.application_paths[row.key.exe_path_ref.0];
+                human.line(2, path)?;
+                human.line(
+                    4,
+                    &format!("{}; {}", presence(row.presence), row.changes.join(", ")),
+                )?;
+            }
+            let more = report.application_changes.len().saturating_sub(SHOWN);
+            if more > 0 {
+                human.line(2, &format!("and {more} more (--json has every item)"))?;
+            }
         }
         if !report.module_path_changes.is_empty() {
             human.line(
@@ -92,6 +94,22 @@ pub(super) fn render_concise(report: &DiffReport, out: &mut dyn Write) -> io::Re
                     plural(report.module_path_changes.len())
                 ),
             )?;
+        }
+        if report.application_changes.is_empty() {
+            let changed = report
+                .module_contents
+                .iter()
+                .filter(|row| !row.changes.is_empty())
+                .count();
+            if changed > 0 {
+                human.line(
+                    2,
+                    &format!(
+                        "{changed} module content change{} (--json lists each)",
+                        plural(changed)
+                    ),
+                )?;
+            }
         }
     }
     render_caveats(&mut human)?;

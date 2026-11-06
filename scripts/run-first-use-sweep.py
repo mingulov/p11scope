@@ -81,7 +81,21 @@ TRACE_HEADERS = (
     "Trace — completed call events in arrival order",
     "Executable labels use verified observed paths; "
     "event PID/TID remain diagnostic identifiers.",
+    "Calls on unverified functions are not decoded (names only).",
 )
+TRACE_TOTALS_RE = re.compile(
+    r"^\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.$")
+TRACE_TAIL_HINT = "run with -v for details"
+
+
+def _is_trace_tail_line(line):
+    """Whether a line is the validated human summary tail (totals, one
+    coverage line, the detail hint)."""
+    return (
+        line == TRACE_TAIL_HINT
+        or line.startswith("coverage: ")
+        or TRACE_TOTALS_RE.match(line) is not None
+    )
 
 
 class SweepError(Exception):
@@ -126,6 +140,8 @@ def parse_trace(text):
                 errors.append(f"invalid {prefix}: {error}")
         elif (not line or line in TRACE_HEADERS
                 or line.startswith("CAPTURE privacy=")):
+            continue
+        elif _is_trace_tail_line(line):
             continue
         elif line.startswith(("LOST ", "TRUNCATED ")):
             errors.append(f"trace ended with loss evidence: {line[:160]}")

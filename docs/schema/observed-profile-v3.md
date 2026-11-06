@@ -609,8 +609,8 @@ guessed per-name shares. Rows that do not name exactly `C_Initialize`,
 and Initialize rows without positively counted returns, omit the key
 (absent, never null or false): absence means Initialize was not
 observed on that row (unknown, per OD35). The live function table marks
-qualifying rows with the same words (`[init: <outcome>]`, plus
-`, potential provider` when the likelihood holds).
+qualifying rows `[init: <outcome>]`; the PROVIDER column beside it names the
+row's file.
 
 Like `selected_detail` and `instance_reload_not_excluded`, this is a
 v3-additive disclosure that introduces no new schema revision: the

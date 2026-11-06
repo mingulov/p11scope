@@ -26,6 +26,12 @@ fn text(report: &model::DiffReport) -> String {
     String::from_utf8(output).unwrap()
 }
 
+fn concise(report: &model::DiffReport) -> String {
+    let mut output = Vec::new();
+    super::render::render_concise(report, &mut output).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
 fn counted(value: &mut Value, count: u64, lossy: bool) {
     value["edges"][0]["entries"]["count"] = json!(count);
     value["edges"][0]["entries"]["observation"] = json!("observed");
@@ -67,19 +73,19 @@ fn application_and_module_paths_are_resolved_and_basename_collisions_stay_separa
 
 /// Item 20: no bare `Top changed applications:` header when the
 /// application section is empty (a module-path-only diff still names
-/// its path line).
+/// its path line; a content-only diff names its content count).
 #[test]
 fn empty_application_section_omits_the_applications_header() {
     let before = document();
     let mut after = before.clone();
     after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
-    let mut report = report(&before, &after);
+    let mut path_report = report(&before, &after);
     assert!(
-        !report.module_path_changes.is_empty(),
+        !path_report.module_path_changes.is_empty(),
         "the fixture flip must move a module path"
     );
-    report.application_changes.clear();
-    let output = text(&report);
+    path_report.application_changes.clear();
+    let output = concise(&path_report);
     assert!(
         !output.contains("Top changed applications:"),
         "no bare header without rows: {output}"
@@ -88,6 +94,32 @@ fn empty_application_section_omits_the_applications_header() {
         output.contains("module path changed (--json lists each)")
             || output.contains("module paths changed (--json lists each)"),
         "the path line survives: {output}"
+    );
+
+    // A real content-only diff (edgeless modules, one admission flip)
+    // carries no application section at all.
+    let mut before = document();
+    before["edges"] = json!([]);
+    before["gaps"] = json!([]);
+    let mut after = before.clone();
+    after["modules"][0]["admission"]["endpoints"] = json!(5);
+    let report = report(&before, &after);
+    assert!(report.application_changes.is_empty());
+    assert!(
+        report
+            .module_contents
+            .iter()
+            .any(|row| !row.changes.is_empty()),
+        "the fixture flip must change module content"
+    );
+    let output = concise(&report);
+    assert!(
+        !output.contains("Top changed applications:"),
+        "no bare header without rows: {output}"
+    );
+    assert!(
+        output.contains("1 module content change (--json lists each)"),
+        "the content count replaces the header: {output}"
     );
 }
 

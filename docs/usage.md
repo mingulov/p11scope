@@ -448,7 +448,7 @@ profile, trace, run, and inspect.
 
 `doctor` has no module-specific probe lane. `doctor --module` is rejected as
 unsupported instead of accepting and ignoring operator input; use
-`inspect --pid <pid> --module <provider.so>` to list mapped providers.
+`p11scope inspect --pid <pid> --module <provider.so>` to list mapped providers.
 
 ### Pre-arming providers with `--prearm-module`
 
@@ -1283,8 +1283,9 @@ Limits that matter in pods:
   `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
-  start and otherwise falls back to `scan` with the gap `native usage
-  feed unavailable`. Under the interactive `--dashboard` the native lane
+  start and, for `--pid`, otherwise falls back to `scan` with the gap
+  `native usage feed unavailable` (`--system` and `--cgroup` fail the
+  run with the refusal instead). Under the interactive `--dashboard` the native lane
   runs exactly as on the classic path; the dashboard gives the terminal
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
@@ -1294,7 +1295,7 @@ Limits that matter in pods:
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
   `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
-  selects the capture-lifetime physical endpoint budget (1..=131072;
+  selects the capture-lifetime physical endpoint budget (1–131072;
   `inventory --system` on hosts with uprobe_multi defaults to 32,768),
   before output files or native maps are opened. The same
   limit applies to scan, native and auto fallback, including the dashboard.

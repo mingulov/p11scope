@@ -3244,8 +3244,12 @@ fn missed_provider_load(ev: &Evidence) -> bool {
 
 /// The totals line shared by the profile summary and the trace tail.
 pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
+    let call_noun = if calls == 1 { "call" } else { "calls" };
+    let error_noun = if errors == 1 { "error" } else { "errors" };
+    let entry_noun = if open == 1 { "entry" } else { "entries" };
     format!(
-        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return."
+        "{calls} completed {call_noun}; {errors} returned {error_noun}; {open} {entry_noun} \
+         without an observed return."
     )
 }
 
@@ -7619,7 +7623,7 @@ pub(crate) mod tests {
             &ev,
             crate::cli::TextVerbosity::Quiet,
         );
-        assert!(out.contains("1 completed calls;"), "{out}");
+        assert!(out.contains("1 completed call;"), "{out}");
         assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("Attribution:"), "{out}");
         assert!(!out.contains("Module gaps"), "{out}");

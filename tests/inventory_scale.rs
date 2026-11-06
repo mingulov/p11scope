@@ -252,7 +252,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("--max-endpoints") && stderr.contains("1..=131072"),
+        stderr.contains("--max-endpoints") && stderr.contains("1–131072"),
         "a policy error names the selected endpoint range: {stderr}"
     );
     assert!(output.stdout.is_empty());

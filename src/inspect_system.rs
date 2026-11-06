@@ -3227,23 +3227,39 @@ fn render_object(
         AdmissionRecord::Admitted { class, endpoints } => {
             // Inspect watches nothing: say what a capture aimed at this
             // file would watch. Concise has no per-table listing below,
-            // so the scan-only note stays verbose-only.
-            let noun = if *endpoints == 1 {
-                "function"
+            // so the scan-only note stays verbose-only. A zero-endpoint
+            // record qualifies rather than predicts: an unscanned
+            // module deep-scans on capture (admitting its real
+            // functions), while a genuinely empty table admits nothing,
+            // and this renderer cannot tell them apart.
+            if *endpoints == 0 {
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  0 functions admitted from this scan (class {class}; \
+                         {TEXT_SCAN_ONLY_NOTE})"
+                    );
+                } else {
+                    let _ = writeln!(out, "  admission  0 functions admitted from this scan");
+                }
             } else {
-                "functions"
-            };
-            if verbose {
-                let _ = writeln!(
-                    out,
-                    "  admission  profile/run would watch {endpoints} {noun} (class {class}; \
-                     {TEXT_SCAN_ONLY_NOTE})"
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "  admission  profile/run would watch {endpoints} {noun}"
-                );
+                let noun = if *endpoints == 1 {
+                    "function"
+                } else {
+                    "functions"
+                };
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  profile/run would watch {endpoints} {noun} (class {class}; \
+                         {TEXT_SCAN_ONLY_NOTE})"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  admission  profile/run would watch {endpoints} {noun}"
+                    );
+                }
             }
         }
         AdmissionRecord::Partial { class, reason, .. } => {
@@ -3523,7 +3539,8 @@ fn render_process_summary(
     render_admission_summary(out, catalog, verbose);
 }
 
-/// The admission totals in words: admitted/partial/refused/unresolved, the
+/// The admission totals in the JSON-aligned verdict terms
+/// (admitted/partial/refused/unresolved), the
 /// unconfirmed-function count with its ordinary-scan gloss, and the
 /// scan-only disclaimer. Verbose pairs the machine counters.
 fn render_admission_summary(out: &mut String, catalog: &Catalog, verbose: bool) {

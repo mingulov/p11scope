@@ -582,10 +582,10 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String 
     // holds counts, so neither the sysctl nor a lockdown is the story.
     if facts.init_user_ns == Some(false) {
         return format!(
-            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process \
-             runs in a child user namespace (a rootless or userns-remapped container), and \
+            "the kernel refused to load p11scope's BPF programs ({why}). This process runs in \
+             a child user namespace (a rootless or userns-remapped container), and \
              capabilities held there, even as uid 0, do not count for BPF or perf_event_open: \
-             capturing requires CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON in the host's initial \
+             capturing needs CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON in the host's initial \
              user namespace (for example a container without user-namespace remapping). \
              `p11scope doctor` shows what this host allows"
         );
@@ -605,26 +605,26 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String 
     }
     match (facts.euid_root, facts.sys_admin) {
         (true, Some(true)) => format!(
-            "cannot load p11scope's BPF programs even as root ({why}): a kernel lockdown, an \
-             LSM policy, or a container's seccomp profile is refusing BPF here. Run \
-             `p11scope doctor` to see which"
+            "the kernel refused to load p11scope's BPF programs even as root ({why}): a kernel \
+             lockdown, an LSM policy, or a container's seccomp profile is refusing BPF here. \
+             Run `p11scope doctor` to see which"
         ),
         (true, Some(false)) => format!(
-            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process runs \
-             as root without CAP_SYS_ADMIN (a container that dropped it): capturing requires \
+            "the kernel refused to load p11scope's BPF programs ({why}). This process runs as \
+             root without CAP_SYS_ADMIN (a container that dropped it): capturing needs \
              CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope doctor` shows what this host \
              allows"
         ),
         // An unreadable CapEff is not evidence of a dropped capability.
         (true, None) => format!(
-            "cannot load p11scope's BPF programs: the kernel refused ({why}). This process runs \
-             as root, but its effective capabilities could not be read (/proc/self/status \
-             CapEff): capturing requires CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope \
+            "the kernel refused to load p11scope's BPF programs ({why}). This process runs as \
+             root, but its effective capabilities could not be read (/proc/self/status \
+             CapEff): capturing needs CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON. `p11scope \
              doctor` shows what this host allows"
         ),
         (false, _) => format!(
-            "cannot load p11scope's BPF programs: the kernel refused ({why}). Capturing requires \
-             root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON: run it with sudo. `p11scope \
+            "the kernel refused to load p11scope's BPF programs ({why}). Live capture needs \
+             root, or CAP_SYS_ADMIN, CAP_BPF and CAP_PERFMON: run with sudo. `p11scope \
              doctor` shows what this host allows"
         ),
     }
@@ -1666,7 +1666,7 @@ mod tests {
             );
             assert!(!message.contains("seccomp filter"), "{message}");
         }
-        assert!(user.contains("requires root"), "{user}");
+        assert!(user.contains("needs root"), "{user}");
         assert!(user.contains("sudo"), "{user}");
         assert!(root.contains("even as root"), "{root}");
         // Root without CAP_SYS_ADMIN (a container that dropped it) is a

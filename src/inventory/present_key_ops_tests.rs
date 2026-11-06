@@ -347,12 +347,10 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
     let stored = "live capture refused (live capture needs root: the kernel refused to load \
         p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope \
         inspect --pid N' for a scan without capture.); run with sudo for full capture";
-    presentation.gaps.push(named_gap(
-        "native usage feed unavailable",
-        stored,
-    ));
-    let concise =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    presentation
+        .gaps
+        .push(named_gap("native usage feed unavailable", stored));
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let gaps = concise
         .lines()
         .find(|line| line.starts_with("gaps: "))
@@ -363,8 +361,7 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
          with sudo for full capture (--json has every item)"
     );
     assert!(!concise.contains("Operation not permitted"), "{concise}");
-    let verbose =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains(stored), "{verbose}");
 }
 
@@ -378,12 +375,10 @@ fn concise_gap_summary_folds_unproven_capture_refusal() {
     let stored = "live capture refused (live capture did not start: loading p11scope's BPF \
         programs failed (Permission denied); run 'p11scope doctor' for host readiness, or use \
         'p11scope inspect --pid N' for a scan without capture.)";
-    presentation.gaps.push(named_gap(
-        "native usage feed unavailable",
-        stored,
-    ));
-    let concise =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    presentation
+        .gaps
+        .push(named_gap("native usage feed unavailable", stored));
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let gaps = concise
         .lines()
         .find(|line| line.starts_with("gaps: "))
@@ -394,8 +389,7 @@ fn concise_gap_summary_folds_unproven_capture_refusal() {
          doctor') (--json has every item)"
     );
     assert!(!concise.contains("sudo"), "{concise}");
-    let verbose =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains(stored), "{verbose}");
 }
 

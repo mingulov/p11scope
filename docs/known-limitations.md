@@ -10,7 +10,8 @@ entries under Prior releases retain their historical context.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses with `live capture unavailable` or `live capture did not
+start` before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -98,8 +99,8 @@ integration may still move them; the candidate pass confirms the numbers.
 - Strict speed claims apply only on kernels with working uprobe_multi,
   normally 6.6 and newer: the rate and latency numbers above were
   measured there. Older kernels stay correct with a finite stop but are
-  not speed-qualified; live capture refuses there with
-  `uprobe-multi-required`. (verify at candidate)
+  not speed-qualified; live capture refuses there with a `live capture ...`
+  refusal (`unavailable` or `did not start`). (verify at candidate)
 - Per-key rows cover operations that start after the attach.
   Attaching to an already-running process (for example a running
   Firefox or Chromium) works: operations that start after the attach
@@ -2048,7 +2049,8 @@ a silent drop.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses with `live capture unavailable` or `live capture did not
+start` before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved

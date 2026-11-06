@@ -58,6 +58,13 @@ impl MultiHostRefusal {
         Self::at(stage, errno)
     }
 
+    /// Whether sudo can help this refusal: only a `Denied` cause
+    /// (permission/policy) is privilege-shaped. An old kernel or a
+    /// verifier-shaped refusal must never carry sudo advice.
+    pub(crate) fn needs_privilege_hint(&self) -> bool {
+        self.cause == MultiHostCause::Denied
+    }
+
     /// Whether the probe shape proves the kernel itself lacks Multi: the
     /// scratch self-link refusal observed on 6.1, an explicit unsupported
     /// answer at load or link time, or a load refusal for the unknown

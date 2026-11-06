@@ -276,7 +276,7 @@ TRACE_CONTEXT_LINES = frozenset((
     "Calls on unverified functions are not decoded (names only).",
 ))
 TRACE_TOTALS = re.compile(
-    r"\d+ completed calls; \d+ returned errors; \d+ entries without an observed return\.")
+    r"\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.")
 TRACE_TAIL_LINES = frozenset((
     "run with -v for details",
 ))

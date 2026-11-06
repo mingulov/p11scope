@@ -560,7 +560,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Aggregate across the selected scope; counts are not per application.
 --mode metrics is the lighter maps-only profile mode; metrics is not a subcommand.
@@ -601,7 +601,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
@@ -641,7 +641,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
-scan-only discovery is counted but not named; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
+scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
@@ -1955,8 +1955,8 @@ fn parse_doctor(mut args: impl Iterator<Item = OsString>) -> Result<DoctorArgs, 
             "--quiet" => doctor.quiet = true,
             "--module" => {
                 return Err(usage_err(
-                    "doctor --module is not supported; use inspect --pid <n> --module \
-                     <provider.so> to list mapped providers",
+                    "doctor --module is not supported; use 'p11scope inspect --pid <n> --module \
+                     <provider.so>' to list mapped providers",
                 ));
             }
             "--system" => {
@@ -2749,7 +2749,7 @@ mod tests {
                 matches!(
                     parse(args(&["inventory", "--system", "--max-endpoints", value])),
                     Err(CliError::Usage { message, .. })
-                        if message.contains("--max-endpoints") && message.contains("1..=131072")
+                        if message.contains("--max-endpoints") && message.contains("1–131072")
                 ),
                 "out-of-policy endpoint budget {value} names the accepted range"
             );
@@ -5168,7 +5168,13 @@ mod tests {
                 help.contains("checked against the scan when possible"),
                 "{help:.200}"
             );
-            assert!(help.contains("counted but not named"), "{help:.200}");
+            assert!(
+                help.contains(
+                    "scan-only discovery names functions from the standard table without \
+                     confirming them"
+                ),
+                "{help:.200}"
+            );
             assert!(
                 help.contains("watches the file from before it loads"),
                 "{help:.200}"
@@ -5204,7 +5210,7 @@ mod tests {
         for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
             for statement in [
                 "--manifest is explicit operator attestation of exact accepted function-name/offset claims",
-                "scan-only discovery is counted but not named",
+                "scan-only discovery names functions from the standard table without confirming them",
                 "aggregate counts/RVs/latency remain available",
             ] {
                 assert!(

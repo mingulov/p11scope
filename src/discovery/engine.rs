@@ -23598,7 +23598,11 @@ impl Engine {
     /// Admits one tick's newcomer window: opens, scans, and stages each
     /// admitted pid as an inventory new view. The tick quantum stops
     /// admissions before another scan — the current pid and the rest defer
-    /// with their requests retained, never dropped. At view capacity a
+    /// with their requests retained, never dropped. Deferral strikes the
+    /// admitted tail in order (fresh first, backlog behind), so under
+    /// sustained quantum or capacity pressure the backlog portion absorbs
+    /// it first: the window's no-starvation bound covers selection, not
+    /// attempts. At view capacity a
     /// pressure-selected pid evicts one guarded exploratory view and
     /// retries (Lane-A P1); as the last resort, a still-unhoused pending
     /// newcomer with no evictable view anywhere completes without a view
@@ -24093,9 +24097,11 @@ impl Engine {
         // Newcomers first: new pids with no arrival mark yet were first
         // observed this pass, so they sort ahead of marked backlog up to a
         // bounded share; the backlog keeps its existing order (Lane-A P2a
-        // pending-first while view slots are scarce — a reconcile pass
-        // that just evicted still owes its freed slots to event-driven
-        // work first — plain rotation with free slots).
+        // pending-first inside each class while view slots are scarce — a
+        // reconcile pass that just evicted still counts as scarce — plain
+        // rotation with free slots). The bound governs window selection:
+        // quantum or capacity pressure below still defers the admitted
+        // tail, backlog first, before any scan.
         let max_new_views = self.scheduler.max_new_views_per_tick();
         let scarce = self.views.len() >= self.max_scan_pids || reconcile_evicted;
         let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();

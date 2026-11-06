@@ -66,11 +66,14 @@ pub(crate) const RECONCILE_EVICTION_COOLDOWN_SWEEPS: u64 = 2;
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 
-/// Bounded newcomer share of one admission tick: at most this many of the
-/// tick's admitted batch are first-seen-this-pass newcomers; the rest of
-/// the batch serves backlog in its existing order, so a steady newcomer
-/// stream delays the backlog but never starves it. Half the tick batch:
-/// backlog keeps at least half the batch whenever it is non-empty.
+/// Bounded newcomer share of one admission tick's window: at most this many
+/// of the tick's admitted batch are first-seen-this-pass newcomers; the
+/// rest of the batch serves backlog in its existing order, so in window
+/// selection a steady newcomer stream delays the backlog but never starves
+/// it. Half the tick batch: the window keeps at least half the batch for
+/// a non-empty backlog. Selection is not attempts: the tick quantum or view
+/// capacity can still defer the admitted tail (backlog first) before any
+/// scan; see `admit_inventory_new_views`.
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEWCOMER_ADMISSIONS_PER_TICK: usize = MAX_NEW_VIEWS_PER_TICK / 2;
 
@@ -298,9 +301,12 @@ impl DiscoveryScheduler {
     /// `pending`-first when `scarce` (Lane-A P2a) and rotation otherwise, so
     /// with no backlog the window is exactly today's order. Either class
     /// fills batch slots the other cannot use, so the window stays full.
-    /// Returns `(admitted, deferred)` in admission order. Every input list
-    /// must be sorted ascending; `newcomers` and `pending` must be subsets
-    /// of `pids`.
+    /// The no-starvation bound governs this window selection, not the
+    /// attempts below: quantum or capacity pressure defers the admitted
+    /// tail (backlog first) before any scan. Returns `(admitted, deferred)`
+    /// in admission order. Every input list must be sorted ascending;
+    /// `newcomers` must be a subset of `pids`; `pending` entries outside
+    /// `pids` are ignored.
     pub(crate) fn new_view_window_newcomers_first(
         &self,
         pids: &[u32],
@@ -330,8 +336,8 @@ impl DiscoveryScheduler {
         // Newcomers take at most their share, plus any batch slots the
         // backlog cannot fill; the backlog fills the rest. Callers keep
         // the share below the batch, so a non-empty backlog keeps at
-        // least the difference every tick. Either class empty leaves
-        // today's single-class window untouched.
+        // least the difference in the selected window every tick. Either
+        // class empty leaves today's single-class window untouched.
         let newcomer_share = newcomer_share.min(max_new_views);
         let fresh_take = fresh_order
             .len()
@@ -762,6 +768,9 @@ mod tests {
     /// `ceil(2000 / batch) + 50` ticks. Each tick's newcomer set holds only
     /// that tick's arrival — a deferred newcomer is marked and rejoins as
     /// backlog next tick, exactly as the engine's arrival marks behave.
+    /// A coarse guard: one newcomer per tick drains even with the share at
+    /// the full batch; the per-tick share bound itself is pinned by
+    /// `newcomer_share_bounded_per_tick_under_flood`.
     #[test]
     fn backlog_not_starved_by_newcomers() {
         let batch = MAX_NEW_VIEWS_PER_TICK;

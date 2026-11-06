@@ -713,6 +713,7 @@ const UNKNOWN_REASONS: &[&str] = &[
     "loss",
     "retired_before_coverage",
     "use_before_admission",
+    "caller_exited_before_match",
     "pending_first_use",
     "uncounted",
     "scope_membership_unproven",

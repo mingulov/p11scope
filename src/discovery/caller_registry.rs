@@ -3750,6 +3750,22 @@ impl CallerRegistry {
         });
     }
 
+    /// The same sticky downgrade for a row that stayed unbound after
+    /// the caller's admission because the caller exited before the row
+    /// could be matched: the edge reads unknown
+    /// `caller_exited_before_match`, never "before admission".
+    pub(crate) fn note_caller_exited_before_match(
+        &mut self,
+        caller: CallerId,
+        module: Option<ModuleKey>,
+    ) {
+        self.staged.push(Mutation::NoteUseBeforeAdmission {
+            caller,
+            module,
+            reason: UnknownReason::CallerExitedBeforeMatch,
+        });
+    }
+
     /// The same sticky downgrade for a row lifecycle loss left unbound
     /// (R-C51-3): the edge reads unknown `loss` with `reason`.
     pub(crate) fn note_unbound_row_loss(

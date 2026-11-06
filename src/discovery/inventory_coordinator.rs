@@ -8028,7 +8028,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             Err(reason) => {
                 self.drop_pair_count(&row, DiagnosticReason::NotAdmitted);
                 if let Binding::Unbound(unbound) = binding {
-                    self.note_preadmission(row.host_tgid, &[None], unbound);
+                    self.note_preadmission(row.host_tgid, &[None], unbound, row.recorded_at_ns);
                 }
                 return Err(reason);
             }
@@ -8045,7 +8045,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // entries are a positive module-level fact.
                 let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
-                self.note_preadmission(row.host_tgid, &keys, reason);
+                self.note_preadmission(row.host_tgid, &keys, reason, row.recorded_at_ns);
                 self.registry
                     .note_unbound_witness(modules, row.recorded_at_ns, reason, folded)
             }
@@ -8066,11 +8066,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// stash bound every caller of the scope reads it, with a gap. A row
     /// left unbound by lifecycle loss downgrades the same way but reads
     /// `loss` (R-C51-3): the loss, not an early use, is what it shows.
+    /// A `NoLiveCaller`/`CallerExited` row provably after a holder's
+    /// admission (its `first_seen_ns` is at or before `row_ns`) reads
+    /// `caller_exited_before_match`: the caller exited before the row
+    /// could be matched, not before admission.
     fn note_preadmission(
         &mut self,
         pid: u32,
         modules: &[Option<ModuleKey>],
         unbound: UnboundReason,
+        row_ns: u64,
     ) {
         let loss = unbound == UnboundReason::LifecycleLoss;
         let Some(capture) = self.capture.as_mut() else {
@@ -8138,9 +8143,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .filter(|record| record.pid == pid)
             .map(|record| record.id)
             .collect();
+        let exit_unbound = matches!(
+            unbound,
+            UnboundReason::NoLiveCaller | UnboundReason::CallerExited
+        );
         for caller in callers {
+            // A live-miss row after this holder's admission is a
+            // post-admission exit, never a use before admission.
+            let post_admission_exit = exit_unbound
+                && self
+                    .adapter
+                    .record(caller)
+                    .is_some_and(|record| record.first_seen_ns <= row_ns);
             for module in &fresh {
-                self.downgrade(caller, module.clone(), loss);
+                if post_admission_exit {
+                    self.registry
+                        .note_caller_exited_before_match(caller, module.clone());
+                } else {
+                    self.downgrade(caller, module.clone(), loss);
+                }
             }
         }
     }

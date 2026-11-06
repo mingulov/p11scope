@@ -415,6 +415,8 @@ non-null values needs a new allowlist row.
     `identity_unavailable`, `capacity_limited` (`detail` names the
     resource), `loss` (`detail` says what was lost),
     `retired_before_coverage`, `use_before_admission`,
+    `caller_exited_before_match` (since v0.7.0: a post-admission exit
+    left the row unbound),
     `pending_first_use`, or `uncounted` (since v0.3.0, C7: a
     CALLER_USE pair insert failed, so some pair has use but no row
     and absence proves nothing — `detail` names the
@@ -446,6 +448,13 @@ non-null values needs a new allowlist row.
     A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
     the same way but reads `loss` (`detail`: the lost lifecycle
     evidence), since the loss, not an early use, is what it shows.
+    A `no_live_caller`/`caller_exited` row provably after the holder's
+    admission (its admission is at or before the row) downgrades the
+    same way but reads `caller_exited_before_match`: the caller exited
+    before the row could be matched, not before admission. A short-lived
+    caller whose retained identity is unambiguous (exactly one retained
+    incarnation holds the tgid, the row falls inside its lifetime, no
+    exec or PID reuse recorded) binds instead and counts on the edge.
   - `pending_first_use` (native lane, transient): a `CALLER_USE` row of
     this caller's pid on this module is read but undecided — its
     lifecycle and health horizons have not arrived yet, so the edge may

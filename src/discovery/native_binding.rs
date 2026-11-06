@@ -43,6 +43,17 @@
 //!    no other image. (Earlier sequences under `C` are earlier images of the
 //!    same task; they cannot be `X`'s image once rules 3 and 4 hold.)
 //!
+//! A row with no live answer (no live incarnation held `T` when it was
+//! read, or the pin died during the query) may still bind through the
+//! retained scan-time identity, and only then: exactly one retained
+//! incarnation holds `T` with a proven start time and exe identity, `t0`
+//! falls inside its monotonic lifetime (admitted at or before `t0`, and
+//! strictly before the observed exit when retired), and no exec, lost
+//! lifecycle evidence, PID reuse (a second retained holder of `T`) or
+//! competing image is recorded. The checks run under the same horizons;
+//! anything else keeps its [`UnboundReason::NoLiveCaller`] or
+//! [`UnboundReason::CallerExited`] gap, never a merge by pid.
+//!
 //! Every domain is settled on its own: lifecycle quanta carry the domain
 //! the facade drained them from, and `finish` names one domain.
 //!
@@ -265,6 +276,22 @@ impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> 
             first_seen_ns: record.first_seen_ns,
             pin,
         })
+    }
+
+    fn retained_callers(&self, pid: u32) -> Vec<RetainedCaller> {
+        self.records()
+            .filter(|record| record.pid == pid)
+            .map(|record| RetainedCaller {
+                id: record.id,
+                first_seen_ns: record.first_seen_ns,
+                last_seen_ns: record.last_seen_ns,
+                retired: record.retired,
+                start_time: record.start_time,
+                exe_present: record.exe.is_some(),
+                exec_observed: record.exec_observed,
+                lifecycle: record.lifecycle,
+            })
+            .collect()
     }
 }
 
@@ -516,6 +543,32 @@ struct Pending {
     /// When the row's read finished (`None`: unstamped, never covered).
     read_ns: Option<u64>,
     sighting: Option<Sighting>,
+    /// The unambiguous retained fallback for a row with no live answer
+    /// (no live incarnation, or the pin died during the query): `Some`
+    /// only when exactly one retained incarnation holds the row's tgid
+    /// with proven scan-time identity (start time plus exe) and the
+    /// row's instant falls inside its lifetime. The exec, loss,
+    /// coverage and competing-image checks still run at decision time,
+    /// once both horizons cover the read.
+    retained: Option<RetainedCaller>,
+}
+
+/// Whether `candidate` may carry the row at `event_ns`: proven
+/// scan-time identity (a start time, a readable exe, an observed exec
+/// detector) for a mapped or exited image, with the event inside its
+/// monotonic lifetime (admission at or before the event, and strictly
+/// before the observed exit when retired). Anything else is ambiguous
+/// and the row keeps its live-miss gap.
+fn retained_candidate(candidate: &RetainedCaller, event_ns: u64) -> bool {
+    candidate.start_time.is_some()
+        && candidate.exe_present
+        && candidate.exec_observed
+        && matches!(
+            candidate.lifecycle,
+            CallerLifecycle::Mapped | CallerLifecycle::Exited
+        )
+        && candidate.first_seen_ns <= event_ns
+        && (!candidate.retired || event_ns < candidate.last_seen_ns)
 }
 
 /// A facade stamp, or `None` when the clock read failed (`u64::MAX`): an
@@ -867,10 +920,25 @@ impl NativeBinder {
                 first_seen_ns: caller.first_seen_ns,
                 query: identity.query_cookie(row.domain, caller.pin),
             });
+            // A row with no live answer may still bind through the one
+            // unambiguous retained incarnation; anything else keeps its
+            // live-miss gap at decision time.
+            let needs_retained = sighting
+                .as_ref()
+                .is_none_or(|sighting| matches!(sighting.query, CookieQuery::Exited));
+            let retained = needs_retained
+                .then(|| lookup.retained_callers(row.host_tgid))
+                .and_then(|held| {
+                    let [only] = held.as_slice() else {
+                        return None;
+                    };
+                    retained_candidate(only, row.recorded_at_ns).then_some(*only)
+                });
             state.pending.push_back(Pending {
                 row: row.clone(),
                 read_ns,
                 sighting,
+                retained,
             });
             self.census.pending += 1;
         }
@@ -1120,14 +1188,28 @@ fn decide(
     {
         return Binding::Bound(caller);
     }
-    // Rule 1: a live incarnation answered through its held pidfd.
+    // Rule 1: a live incarnation answered through its held pidfd. A row
+    // with no live answer falls back to the one unambiguous retained
+    // incarnation; anything else keeps its live-miss gap.
     let Some(sighting) = &pending.sighting else {
-        return Binding::Unbound(UnboundReason::NoLiveCaller);
+        return pending
+            .retained
+            .as_ref()
+            .map_or(Binding::Unbound(UnboundReason::NoLiveCaller), |retained| {
+                decide_retained(state, pending, retained)
+            });
     };
     let answered = match &sighting.query {
         CookieQuery::Cookie(answered) => *answered,
         CookieQuery::NoCookie => return Binding::Unbound(UnboundReason::CookieMismatch),
-        CookieQuery::Exited => return Binding::Unbound(UnboundReason::CallerExited),
+        CookieQuery::Exited => {
+            return pending
+                .retained
+                .as_ref()
+                .map_or(Binding::Unbound(UnboundReason::CallerExited), |retained| {
+                    decide_retained(state, pending, retained)
+                });
+        }
         CookieQuery::Unavailable(_) => return Binding::Unbound(UnboundReason::CookieUnavailable),
     };
     // Rule 2: the same ticket of the same domain (equality includes the
@@ -1194,6 +1276,72 @@ fn decide(
             other != exec
                 && (other > exec
                     || seen.bound.is_none() && seen.last_t0_ns >= sighting.first_seen_ns)
+        })
+    });
+    if competing {
+        return Binding::Unbound(UnboundReason::ExecAmbiguous);
+    }
+    state
+        .cookies
+        .entry(cookie)
+        .or_default()
+        .entry(exec)
+        .or_default()
+        .bound = Some(caller);
+    state.callers.insert(caller, (cookie, exec));
+    Binding::Bound(caller)
+}
+
+/// The retained-identity fallback for one row with no live answer whose
+/// horizons arrived: `retained` is already the exactly-one incarnation
+/// holding the row's tgid with proven scan-time identity and the row
+/// inside its lifetime (checked at read time). The remaining checks
+/// mirror rules 4 and 5 against the retained admission: exec coverage,
+/// no exec or lost lifecycle evidence at or after it, and no competing
+/// image of the ticket. A held conflicting image is ambiguous (no
+/// cookie answer exists to prove a transition, so none is emitted).
+/// Anything else binds and caches exactly like a live binding.
+fn decide_retained(
+    state: &mut DomainState,
+    pending: &Pending,
+    retained: &RetainedCaller,
+) -> Binding {
+    let row = &pending.row;
+    let cookie = row.cookie();
+    let exec = row.exec_id();
+    let caller = retained.id;
+    if let Some(&(held, held_exec)) = state.callers.get(&caller) {
+        if held == cookie && held_exec == exec {
+            return Binding::Bound(caller);
+        }
+        return Binding::Unbound(UnboundReason::ExecAmbiguous);
+    }
+    if state.predates_coverage(retained.first_seen_ns)
+        && !state
+            .revalidated
+            .as_ref()
+            .is_some_and(|revalidated| revalidated.contains(&caller))
+    {
+        return Binding::Unbound(UnboundReason::ExecCoverageGap);
+    }
+    if state
+        .exec_ns
+        .get(&row.host_tgid)
+        .is_some_and(|&exec_ns| exec_ns >= retained.first_seen_ns)
+    {
+        return Binding::Unbound(UnboundReason::ExecAfterAdmission);
+    }
+    if state
+        .loss_ns
+        .is_some_and(|loss_ns| loss_ns >= retained.first_seen_ns)
+    {
+        return Binding::Unbound(UnboundReason::LifecycleLoss);
+    }
+    let competing = state.cookies.get(&cookie).is_some_and(|execs| {
+        execs.iter().any(|(&other, seen)| {
+            other != exec
+                && (other > exec
+                    || seen.bound.is_none() && seen.last_t0_ns >= retained.first_seen_ns)
         })
     });
     if competing {

@@ -1224,6 +1224,26 @@ pub(crate) fn coverage_label_at(coverage: &UseCoverage, now_ns: u64) -> String {
     }
 }
 
+/// One edge's coverage with its pre-watch window: when a watched
+/// edge's mapping predates its watch, the covered-interval "no use"
+/// keeps its scope but names the missed window beside it, so the
+/// coverage never reads as a bare "no use" while calls before the
+/// watch were missed. Other coverages delegate to
+/// [`coverage_label_at`].
+pub(crate) fn coverage_label_for_edge_at(edge: &EdgeView, now_ns: u64) -> String {
+    let base = coverage_label_at(&edge.coverage, now_ns);
+    let UseCoverage::WatchedNoUse { since_ns, .. } = &edge.coverage else {
+        return base;
+    };
+    if edge.mapping_first_seen_ns == 0 || edge.mapping_first_seen_ns >= *since_ns {
+        return base;
+    }
+    let before = crate::render::fmt_ns(Some(since_ns.saturating_sub(edge.mapping_first_seen_ns)));
+    format!(
+        "{base}; mapped at least {before} before the watch started, earlier calls are not counted"
+    )
+}
+
 /// The dashboard's compact entry count: the number only where it is a
 /// fact (a counted or ongoing watched edge, or a positive count — `+`
 /// marks a lossy lower bound), `?` where the count is unavailable
@@ -2351,7 +2371,38 @@ fn concise_module_status(
         .all(|edge| matches!(edge.coverage, UseCoverage::WatchedNoUse { .. }))
         && !edges.is_empty()
     {
-        return "no use in the covered interval".to_string();
+        // A pre-watch mapping names its missed window beside the
+        // covered-interval "no use", so concise never reads as a bare
+        // "no use" while calls before the watch were missed. A single
+        // edge names its exact window; several name their count with
+        // the exact windows in -v and JSON.
+        let windows: Vec<u64> = edges
+            .iter()
+            .filter_map(|edge| match &edge.coverage {
+                UseCoverage::WatchedNoUse { since_ns, .. }
+                    if edge.mapping_first_seen_ns > 0 && edge.mapping_first_seen_ns < *since_ns =>
+                {
+                    Some(since_ns.saturating_sub(edge.mapping_first_seen_ns))
+                }
+                _ => None,
+            })
+            .collect();
+        if windows.is_empty() {
+            return "no use in the covered interval".to_string();
+        }
+        if windows.len() == 1 && edges.len() == 1 {
+            let before = crate::render::fmt_ns(Some(windows[0]));
+            return format!(
+                "no use in the covered interval; mapped at least {before} before the watch \
+                 started, earlier calls are not counted"
+            );
+        }
+        return format!(
+            "no use in the covered interval; {} of {} mappings predate the watch, earlier calls \
+             are not counted",
+            windows.len(),
+            edges.len()
+        );
     }
     if edges
         .iter()
@@ -2403,7 +2454,7 @@ fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &Edg
         let _ = write!(
             out,
             "; coverage {}",
-            escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns))
+            escape_controls(&coverage_label_for_edge_at(edge, presentation.ended_ns))
         );
     }
     out.push('\n');
@@ -3067,7 +3118,7 @@ fn render_snapshot_inner(
             edge.capture.label(),
             edge.activity.label(),
             snapshot_semantics_at(edge, presentation.ended_ns),
-            escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns)),
+            escape_controls(&coverage_label_for_edge_at(edge, presentation.ended_ns)),
         );
         for child in presentation.semantic_children(edge.caller, edge.module) {
             let instance = child.instance;

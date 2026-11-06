@@ -1622,8 +1622,8 @@ pub(crate) fn coverage_item(
 ) -> String {
     format!(
         "coverage {}",
-        escape_controls(&crate::inventory_present::coverage_label_at(
-            &edge.coverage,
+        escape_controls(&crate::inventory_present::coverage_label_for_edge_at(
+            edge,
             presentation.ended_ns
         ))
     )

@@ -22409,6 +22409,130 @@ fn seed_for_unknown_or_refused_object_keeps_the_owner_check() {
     );
 }
 
+/// A seed-loop candidate around a hand-built plan: seed placement
+/// reads only the plan and the delta, so the remaining candidate
+/// state stays empty.
+fn seed_loop_candidate(plan: plan::AttachPlan, pinned: PinnedObjects) -> LiveCandidate {
+    LiveCandidate {
+        pinned,
+        modules: Vec::new(),
+        plan,
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: Vec::new(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    }
+}
+
+#[test]
+fn seed_loop_skips_an_unadmitted_closure_seed_benignly() {
+    // Loop-level twin of `seed_for_unadmitted_closure_skips_the_owner_check`:
+    // the unadmitted-closure seed goes through the real seed loop, not just
+    // the predicate, so removing the skip from the loop fails this test.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let seed = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: closure.path.clone(),
+        file_offset: 60384,
+    };
+    let mut candidate = seed_loop_candidate(plan, engine.pinned);
+    let mut loop_engine = Engine::empty();
+    let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(complete, "the closure seed leaves the batch complete");
+    assert!(candidate.delta.new.is_empty(), "the closure seed takes no slot");
+    assert!(
+        loop_engine.counters.object_skips.is_empty(),
+        "the closure seed marks no partial: {:?}",
+        loop_engine.counters.object_skips
+    );
+}
+
+#[test]
+fn seed_loop_still_fails_a_non_closure_seed_without_an_owner() {
+    // Twin: a seed no closure skip covers still fails the batch loudly
+    // through the same loop, with the owner partial recorded. The seed
+    // names a genuinely unknown object: the terminal rule decides by
+    // object identity, so the closure's own object would place terminal
+    // whatever path it carries.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let seed = CountOnlySeedWork {
+        object: PinnedObjectId(u32::MAX),
+        object_path: "/opt/unknown-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    let mut candidate = seed_loop_candidate(plan, engine.pinned);
+    let mut loop_engine = Engine::empty();
+    let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(!complete, "a non-closure seed without an owner fails the batch");
+    assert!(candidate.delta.new.is_empty(), "the failed seed takes no slot");
+    assert_eq!(loop_engine.counters.object_skips.len(), 1);
+    let skipped = &loop_engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, "live export hook");
+    assert!(
+        skipped
+            .reason
+            .contains("had no unique candidate module owner"),
+        "unexpected partial: {skipped:?}"
+    );
+}
+
 #[test]
 fn expired_deadline_names_live_export_snapshot_refusal() {
     let (_fixture, _view, module, pins) = loaded_seed_provider();

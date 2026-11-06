@@ -9259,6 +9259,14 @@ pub(crate) fn timing_summary_lines(scheduling: &render::SchedulingEvidence) -> V
     let gap = &scheduling.inter_drain_gap;
     let queue = &scheduling.newcomer_queue;
     let resource = &scheduling.resource;
+    // The default-stderr gate keeps this line for unknown drops
+    // alone, so the printed figure names them beside the known
+    // drops — never a lone "dropped 0" that reads all-clear.
+    let dropped_text = if queue.dropped_unknown > 0 {
+        format!("{} (+{} unknown)", queue.dropped, queue.dropped_unknown)
+    } else {
+        queue.dropped.to_string()
+    };
     vec![
         format!(
             "p11scope: timing: stages scan={}ms pin={}ms bind={}ms plan={}ms merge={}ms projection={}ms",
@@ -9286,7 +9294,7 @@ pub(crate) fn timing_summary_lines(scheduling: &render::SchedulingEvidence) -> V
             ms(queue.mean_admitted_age_ms),
             queue.pending,
             ms(queue.oldest_pending_age_ms),
-            queue.dropped,
+            dropped_text,
             ms(queue.max_dropped_age_ms),
         ),
         format!(

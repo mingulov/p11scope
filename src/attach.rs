@@ -1621,24 +1621,28 @@ pub(crate) fn select_session_backend(
 /// CVE-2025-40123 a program array accepts only programs with its owner's
 /// expected attach type. The continuation is never attached
 /// (`static_probe_side` stays `None` for it). Dynamic probes load multi
-/// when `dynamic_multi` says their attach goes through links; everything
-/// else (diagnostic, lifecycle, the other tail-call target) loads plain
-/// under both backends.
+/// when `dynamic_multi` says their attach goes through links, and the
+/// interface worker follows them (shared TAIL_CALLS); everything else
+/// (diagnostic, lifecycle) loads plain under both backends.
 pub(crate) fn loads_with_multi_flag(
     backend: AttachBackend,
     program: &str,
-    _dynamic_multi: bool,
+    dynamic_multi: bool,
 ) -> bool {
-    // Scaffolding: the next commit wires the dynamic clause; ignoring the
-    // flag keeps today's plain dynamic loads.
     backend == AttachBackend::Multi
-        && (static_probe_side(program).is_some() || program == MULTI_LOADED_TAIL_TARGET)
+        && (static_probe_side(program).is_some()
+            || program == MULTI_LOADED_TAIL_TARGET
+            || (dynamic_multi && uses_dynamic_load_flag(program)))
 }
 
-/// Programs the live-discovery engine attaches dynamically (the loader
-/// hook plus the three export-hook pairs), rather than through the static
-/// slot plan. The `interface_list_worker` tail-call target is not one.
-fn is_dynamic_probe_program(program: &str) -> bool {
+/// Programs that load with the dynamic flag: the seven live-discovery
+/// hooks plus the interface worker they tail-call. The worker is never
+/// attached, but it shares TAIL_CALLS with the hooks, and since
+/// CVE-2025-40123 every program referencing one array must load with one
+/// expected attach type — so the worker follows the hooks' flag. No other
+/// program references TAIL_CALLS (the static endpoints use STACK_GUARD,
+/// lifecycle programs use no array).
+fn uses_dynamic_load_flag(program: &str) -> bool {
     matches!(
         program,
         "dl_debug_state"
@@ -1648,6 +1652,7 @@ fn is_dynamic_probe_program(program: &str) -> bool {
             | "interface_list_return"
             | "interface_entry"
             | "interface_return"
+            | "interface_list_worker"
     )
 }
 
@@ -1658,9 +1663,7 @@ fn is_dynamic_probe_program(program: &str) -> bool {
 /// perf attach (which paranoid 3+ gates). Pure over the probe verdict so
 /// tests script it; preparation passes the live probe.
 fn dynamic_multi_links(backend: AttachBackend, pid_filter_proven: bool) -> bool {
-    // Scaffolding: always false until the next commit wires the decision.
-    let _ = (backend, pid_filter_proven);
-    false
+    backend == AttachBackend::Multi && pid_filter_proven
 }
 
 /// The one tail-call target that loads for uprobe-multi: never attached, only
@@ -2792,37 +2795,55 @@ fn detach_selected_with<T>(
 }
 
 #[derive(Default)]
-struct DynamicAttachEvidence(bool);
+struct DynamicAttachEvidence {
+    perf: bool,
+    multi: bool,
+}
 
 impl DynamicAttachEvidence {
-    fn record<T, E>(&mut self, result: std::result::Result<T, E>) -> std::result::Result<T, E> {
+    fn record<T, E>(
+        &mut self,
+        multi: bool,
+        result: std::result::Result<T, E>,
+    ) -> std::result::Result<T, E> {
         if result.is_ok() {
-            self.0 = true;
+            if multi {
+                self.multi = true;
+            } else {
+                self.perf = true;
+            }
         }
         result
     }
 
-    fn successful(&self) -> bool {
-        self.0
+    fn perf_successful(&self) -> bool {
+        self.perf
+    }
+
+    fn multi_successful(&self) -> bool {
+        self.multi
     }
 }
 
 fn record_dynamic_attach_with<S, T, E>(
     state: &mut S,
     evidence: &mut DynamicAttachEvidence,
+    multi: bool,
     attach: impl FnOnce(&mut S) -> std::result::Result<T, E>,
 ) -> std::result::Result<T, E> {
-    evidence.record(attach(state))
+    evidence.record(multi, attach(state))
 }
 
 fn attach_dynamic_export_with<S, T, E>(
     state: &mut S,
     evidence: &mut DynamicAttachEvidence,
+    multi: bool,
     mut attach: impl FnMut(&mut S, bool) -> std::result::Result<T, E>,
     mut detach_return: impl FnMut(&mut S, T),
 ) -> std::result::Result<(T, T), E> {
-    let return_id = record_dynamic_attach_with(state, evidence, |state| attach(state, true))?;
-    match record_dynamic_attach_with(state, evidence, |state| attach(state, false)) {
+    let return_id =
+        record_dynamic_attach_with(state, evidence, multi, |state| attach(state, true))?;
+    match record_dynamic_attach_with(state, evidence, multi, |state| attach(state, false)) {
         Ok(entry_id) => Ok((entry_id, return_id)),
         Err(error) => {
             detach_return(state, return_id);
@@ -4778,6 +4799,33 @@ fn multi_prog_fd(ebpf: &mut Ebpf, program: &'static str) -> Result<RawFd> {
         .fd()
         .with_context(|| format!("program {program} has no loaded fd"))?;
     Ok(fd.as_fd().as_raw_fd())
+}
+
+/// One dynamic (loader/export) hook through an uprobe-multi link: the
+/// target pid filters the link (exact only where [`dynamic_multi_links`]
+/// said the filter is proven), one offset, the hook cookie. The program
+/// must have loaded with the multi flag; preparation and every dynamic
+/// attach read the same `dynamic_multi` decision, so they cannot disagree.
+/// The pid must be non-zero (both callers refuse zero first, as the perf
+/// path always has); `attach_group` asserts it.
+fn dynamic_multi_attach(
+    ebpf: &mut Ebpf,
+    program: &'static str,
+    pid: u32,
+    path: &Path,
+    file_offset: u64,
+    cookie: u64,
+    is_return: bool,
+) -> Result<OwnedFd> {
+    let prog_fd = multi_prog_fd(ebpf, program)?;
+    Ok(attach_group(
+        prog_fd,
+        pid,
+        path,
+        std::slice::from_ref(&file_offset),
+        std::slice::from_ref(&cookie),
+        is_return,
+    )?)
 }
 
 /// PID filter for a uprobe-multi `link_create` (DR-CLASSIC-PID0): the
@@ -7488,6 +7536,14 @@ impl Session {
         if policy.uses_unsafe_decoders() && !flavor.unsafe_present {
             bail!("unsafe-unvalidated-metadata policy is absent from this eBPF object");
         }
+        // One dynamic-attach decision for the load flags below and every
+        // later dynamic attach, so they cannot disagree. Singles sessions
+        // never run the pid-filter probe (forced singles probes nothing);
+        // multi sessions ask the cached functional probe.
+        let dynamic_multi = match backend {
+            AttachBackend::Multi => dynamic_multi_links(backend, kernel_multi_pid_filter().is_ok()),
+            AttachBackend::Singles => false,
+        };
         let counter_collection_generation = counter_generation::allocate()?;
         // `--ring-bytes` resizes the EVENTS ringbuf at load (aya rounds to a
         // page-sized power of two like libbpf); omission resolves to the
@@ -7736,9 +7792,7 @@ impl Session {
                             .program_mut(prog_name)
                             .with_context(|| format!("program {prog_name} missing from object"))?
                             .try_into()?;
-                        // Scaffolding: the next commit passes the prepared
-                        // `dynamic_multi` decision here.
-                        if loads_with_multi_flag(backend, prog_name, false) {
+                        if loads_with_multi_flag(backend, prog_name, dynamic_multi) {
                             prog.load_multi()
                                 .with_context(|| format!("loading {prog_name} for multi attach"))?;
                         } else {
@@ -7849,9 +7903,7 @@ impl Session {
                 backend,
                 selection: BackendSelection::Auto,
                 backend_fallback: None,
-                // Scaffolding: the next commit computes this from the live
-                // pid-filter probe; `false` keeps today's singles behavior.
-                dynamic_multi: false,
+                dynamic_multi,
                 unpublished_mechanisms,
                 uprobe_scope,
                 pause_key,
@@ -8408,46 +8460,78 @@ impl Session {
         let path = objects
             .attach_path_for(object)
             .map_err(|error| DynamicLoaderAttachFailure::Registry(anyhow!(error)))?;
-        let point = UProbeAttachPoint {
-            location: UProbeAttachLocation::AbsoluteOffset(file_offset),
-            cookie: Some(cookie),
-        };
         let program = "dl_debug_state";
-        let probe: &mut UProbe = self
-            .ebpf
-            .program_mut(program)
-            .ok_or(DynamicLoaderAttachFailure::ProgramMissing)?
-            .try_into()
-            .map_err(|error| DynamicLoaderAttachFailure::ProgramType(anyhow::Error::from(error)))?;
-        let scope = UProbeScope::OneProcess(
-            std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
-        );
-        match record_dynamic_attach_with(probe, &mut self.dynamic_attach_evidence, |probe| {
-            probe.attach([point], &path, scope)
-        }) {
-            Ok(id) => {
-                self.links.push(RegisteredLink::DynamicUProbe {
-                    program,
-                    context,
-                    object,
-                    file_offset,
-                    cookie,
-                    abi: None,
-                    id: DynamicLinkId::Perf(id),
-                });
-                Ok(true)
-            }
-            Err(error) => {
-                let message = format!(
-                    "{program} at object {:?}+{file_offset:#x}: {}",
-                    object,
-                    error_chain(&error)
-                );
-                Err(DynamicLoaderAttachFailure::KernelUnavailable(anyhow!(
-                    message
-                )))
-            }
+        // Presence and type are checked once for both mechanisms, with the
+        // same errors as before: only a kernel refusal degrades the
+        // strategy, never a corrupt object.
+        {
+            let _: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .ok_or(DynamicLoaderAttachFailure::ProgramMissing)?
+                .try_into()
+                .map_err(|error| {
+                    DynamicLoaderAttachFailure::ProgramType(anyhow::Error::from(error))
+                })?;
         }
+        // Both mechanisms refuse a zero pid (the perf path always has via
+        // its scope); the multi link asserts it.
+        if pid == 0 {
+            return Err(DynamicLoaderAttachFailure::InvalidPid);
+        }
+        let id = if self.dynamic_multi {
+            let fd = record_dynamic_attach_with(
+                &mut self.ebpf,
+                &mut self.dynamic_attach_evidence,
+                true,
+                |ebpf| dynamic_multi_attach(ebpf, program, pid, &path, file_offset, cookie, false),
+            )
+            .map_err(|error| {
+                DynamicLoaderAttachFailure::KernelUnavailable(anyhow!(
+                    "{program} at object {object:?}+{file_offset:#x}: {error:#}"
+                ))
+            })?;
+            DynamicLinkId::Multi(fd)
+        } else {
+            let point = UProbeAttachPoint {
+                location: UProbeAttachLocation::AbsoluteOffset(file_offset),
+                cookie: Some(cookie),
+            };
+            let probe: &mut UProbe = self
+                .ebpf
+                .program_mut(program)
+                .ok_or(DynamicLoaderAttachFailure::ProgramMissing)?
+                .try_into()
+                .map_err(|error| {
+                    DynamicLoaderAttachFailure::ProgramType(anyhow::Error::from(error))
+                })?;
+            let scope = UProbeScope::OneProcess(
+                std::num::NonZeroU32::new(pid).ok_or(DynamicLoaderAttachFailure::InvalidPid)?,
+            );
+            let id = record_dynamic_attach_with(
+                probe,
+                &mut self.dynamic_attach_evidence,
+                false,
+                |probe| probe.attach([point], &path, scope),
+            )
+            .map_err(|error| {
+                DynamicLoaderAttachFailure::KernelUnavailable(anyhow!(
+                    "{program} at object {object:?}+{file_offset:#x}: {}",
+                    error_chain(&error)
+                ))
+            })?;
+            DynamicLinkId::Perf(id)
+        };
+        self.links.push(RegisteredLink::DynamicUProbe {
+            program,
+            context,
+            object,
+            file_offset,
+            cookie,
+            abi: None,
+            id,
+        });
+        Ok(true)
     }
 
     pub(crate) fn attach_dynamic_export(
@@ -8476,6 +8560,9 @@ impl Session {
         let path = objects
             .attach_path_for(object)
             .map_err(anyhow::Error::msg)?;
+        if pid == 0 {
+            bail!("dynamic export PID must be non-zero");
+        }
         let point = || UProbeAttachPoint {
             location: UProbeAttachLocation::AbsoluteOffset(file_offset),
             cookie: Some(cookie),
@@ -8483,41 +8570,67 @@ impl Session {
         let scope = UProbeScope::OneProcess(
             std::num::NonZeroU32::new(pid).context("dynamic export PID must be non-zero")?,
         );
+        let dynamic_multi = self.dynamic_multi;
         let mut partial_detach_failures = Vec::new();
         let outcome = attach_dynamic_export_with(
             &mut self.ebpf,
             &mut self.dynamic_attach_evidence,
+            dynamic_multi,
             |ebpf, is_return| {
                 let program = if is_return {
                     return_program
                 } else {
                     entry_program
                 };
+                if dynamic_multi {
+                    return dynamic_multi_attach(
+                        ebpf,
+                        program,
+                        pid,
+                        &path,
+                        file_offset,
+                        cookie,
+                        is_return,
+                    )
+                    .map(DynamicLinkId::Multi)
+                    .map_err(|error| {
+                        anyhow!("{program} at object {object:?}+{file_offset:#x}: {error:#}")
+                    });
+                }
                 let probe: &mut UProbe = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing from object"))?
                     .try_into()?;
-                probe.attach([point()], &path, scope).map_err(|error| {
-                    anyhow!(
-                        "{program} at object {:?}+{file_offset:#x}: {}",
-                        object,
-                        error_chain(&error)
-                    )
-                })
+                probe
+                    .attach([point()], &path, scope)
+                    .map(DynamicLinkId::Perf)
+                    .map_err(|error| {
+                        anyhow!(
+                            "{program} at object {:?}+{file_offset:#x}: {}",
+                            object,
+                            error_chain(&error)
+                        )
+                    })
             },
             |ebpf, return_id| {
-                let result = ebpf
-                    .program_mut(return_program)
-                    .with_context(|| {
-                        format!("program {return_program} missing during partial detach")
-                    })
-                    .and_then(|program| {
-                        let probe: &mut UProbe = program.try_into()?;
-                        probe.detach(return_id).map_err(Into::into)
-                    });
-                if let Err(error) = result {
-                    partial_detach_failures
-                        .push(format!("detaching partial {return_program}: {error:#}"));
+                match return_id {
+                    DynamicLinkId::Perf(return_id) => {
+                        let result = ebpf
+                            .program_mut(return_program)
+                            .with_context(|| {
+                                format!("program {return_program} missing during partial detach")
+                            })
+                            .and_then(|program| {
+                                let probe: &mut UProbe = program.try_into()?;
+                                probe.detach(return_id).map_err(Into::into)
+                            });
+                        if let Err(error) = result {
+                            partial_detach_failures
+                                .push(format!("detaching partial {return_program}: {error:#}"));
+                        }
+                    }
+                    // A multi link detaches by drop.
+                    DynamicLinkId::Multi(fd) => drop(fd),
                 }
             },
         );
@@ -8547,7 +8660,7 @@ impl Session {
                     file_offset,
                     cookie,
                     abi: Some(abi),
-                    id: DynamicLinkId::Perf(id),
+                    id,
                 }
             }),
         );
@@ -10862,7 +10975,11 @@ impl Session {
     }
 
     pub(crate) fn dynamic_per_offset_attached(&self) -> bool {
-        self.dynamic_attach_evidence.successful()
+        self.dynamic_attach_evidence.perf_successful()
+    }
+
+    pub(crate) fn dynamic_multi_attached(&self) -> bool {
+        self.dynamic_attach_evidence.multi_successful()
     }
 }
 
@@ -12394,12 +12511,7 @@ mod tests {
                 );
             }
         }
-        for program in [
-            "sched_process_exec",
-            "task_newtask",
-            "interface_list_worker",
-            "no_such_program",
-        ] {
+        for program in ["sched_process_exec", "task_newtask", "no_such_program"] {
             for dynamic_multi in [false, true] {
                 assert!(
                     !loads_with_multi_flag(AttachBackend::Multi, program, dynamic_multi),
@@ -12416,7 +12528,9 @@ mod tests {
     /// Dynamic (loader/export) probes load multi exactly when their attach
     /// goes through links: multi backend plus a proven kernel pid filter.
     /// The load flag and the attach path read the one `dynamic_multi`
-    /// decision, so a 48-loaded program can never meet a perf attach.
+    /// decision, so a 48-loaded program can never meet a perf attach. The
+    /// interface worker rides along: it shares TAIL_CALLS with the hooks,
+    /// and one array keeps one attach type (CVE-2025-40123).
     #[test]
     fn proven_dynamic_probes_take_the_multi_load_flag() {
         use super::AttachBackend;
@@ -12433,10 +12547,11 @@ mod tests {
             "interface_list_return",
             "interface_entry",
             "interface_return",
+            "interface_list_worker",
         ] {
             assert!(
                 loads_with_multi_flag(AttachBackend::Multi, program, true),
-                "{program} must load multi when its attach goes through links"
+                "{program} must load multi with a proven pid filter"
             );
             assert!(
                 !loads_with_multi_flag(AttachBackend::Multi, program, false),
@@ -16515,6 +16630,7 @@ mod tests {
             attach_dynamic_export_with(
                 &mut state,
                 &mut failed,
+                false,
                 |state, is_return| {
                     state.push(if is_return { "return" } else { "entry" });
                     Err::<u8, _>("return failed")
@@ -16523,7 +16639,8 @@ mod tests {
             ),
             Err("return failed")
         );
-        assert!(!failed.successful());
+        assert!(!failed.perf_successful());
+        assert!(!failed.multi_successful());
         assert_eq!(state, ["return"]);
 
         let mut evidence = DynamicAttachEvidence::default();
@@ -16532,6 +16649,7 @@ mod tests {
             attach_dynamic_export_with(
                 &mut state,
                 &mut evidence,
+                true,
                 |state, is_return| {
                     state.push(if is_return { "return" } else { "entry" });
                     if is_return {
@@ -16545,7 +16663,8 @@ mod tests {
             Err("entry failed")
         );
         assert_eq!(state, ["return", "entry", "cleanup"]);
-        assert!(evidence.successful());
+        assert!(!evidence.perf_successful());
+        assert!(evidence.multi_successful());
     }
 
     #[test]
@@ -16553,10 +16672,34 @@ mod tests {
         let mut evidence = DynamicAttachEvidence::default();
         let mut state = ();
         assert_eq!(
-            record_dynamic_attach_with(&mut state, &mut evidence, |_| Ok::<_, &str>(2)),
+            record_dynamic_attach_with(&mut state, &mut evidence, false, |_| Ok::<_, &str>(2)),
             Ok(2)
         );
-        assert!(evidence.successful());
+        assert!(evidence.perf_successful());
+        assert!(!evidence.multi_successful());
+    }
+
+    /// The mechanisms label must name the attach type that actually armed
+    /// each dynamic probe: perf singles stay `per-offset`, uprobe-multi
+    /// links join `uprobe-multi`. One sticky bit cannot say which.
+    #[test]
+    fn dynamic_attach_evidence_splits_perf_from_multi() {
+        let mut evidence = DynamicAttachEvidence::default();
+        let mut state = ();
+        assert!(!evidence.perf_successful());
+        assert!(!evidence.multi_successful());
+        assert_eq!(
+            record_dynamic_attach_with(&mut state, &mut evidence, false, |_| Ok::<_, &str>(2)),
+            Ok(2)
+        );
+        assert!(evidence.perf_successful());
+        assert!(!evidence.multi_successful());
+        assert_eq!(
+            record_dynamic_attach_with(&mut state, &mut evidence, true, |_| Ok::<_, &str>(3)),
+            Ok(3)
+        );
+        assert!(evidence.perf_successful());
+        assert!(evidence.multi_successful());
     }
     use p11scope_ebpf_common::{ARG_NONE, SlotSemantics};
     use std::io;

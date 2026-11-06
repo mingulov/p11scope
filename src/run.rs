@@ -6620,7 +6620,7 @@ fn capture_profile(
                 engine.capture_facts(),
                 session.attached_probes(),
                 session.dynamic_per_offset_attached(),
-                session.static_multi_attached(),
+                session.static_multi_attached() || session.dynamic_multi_attached(),
                 session.attach_backend_evidence(),
                 session.object_capture_evidence(),
                 session.attach_failures(),
@@ -7340,7 +7340,7 @@ fn capture_profile(
             context.0.capture_facts(),
             context.1.attached_probes(),
             context.1.dynamic_per_offset_attached(),
-            context.1.static_multi_attached(),
+            context.1.static_multi_attached() || context.1.dynamic_multi_attached(),
             context.1.attach_backend_evidence(),
             context.1.object_capture_evidence(),
             context.1.attach_failures(),
@@ -8249,7 +8249,8 @@ fn capture_trace(
                             context.0.capture_facts(),
                             context.1.attached_probes(),
                             context.1.dynamic_per_offset_attached(),
-                            context.1.static_multi_attached(),
+                            context.1.static_multi_attached()
+                                || context.1.dynamic_multi_attached(),
                             context.1.attach_backend_evidence(),
                             context.1.object_capture_evidence(),
                             context.1.attach_failures(),
@@ -9791,7 +9792,7 @@ pub(crate) fn evidence_for(
     facts: render::CaptureFacts,
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
-    static_multi_attached: bool,
+    multi_attached: bool,
     attach_backend: render::AttachBackendEvidence,
     object_capture: render::ObjectCaptureEvidence,
     attach_failures: &[(u32, String)],
@@ -9931,11 +9932,7 @@ pub(crate) fn evidence_for(
         loader_discovery: facts.loader_discovery(),
         interface_selection,
         attach_mechanisms: if include_selection {
-            attach_mechanisms(
-                attached_probes,
-                dynamic_per_offset_attached,
-                static_multi_attached,
-            )
+            attach_mechanisms(attached_probes, dynamic_per_offset_attached, multi_attached)
         } else {
             Vec::new()
         },
@@ -10051,16 +10048,17 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
 fn attach_mechanisms(
     attached_probes: usize,
     dynamic_per_offset_attached: bool,
-    static_multi_attached: bool,
+    multi_attached: bool,
 ) -> Vec<&'static str> {
     // Sorted to match the capture oracle (`mechanisms == sorted(set)`):
-    // static singles and dynamic loader/export probes report
-    // "per-offset", static multi group links report "uprobe-multi".
+    // static singles and perf-attached dynamic loader/export probes
+    // report "per-offset"; static multi group links and multi-attached
+    // dynamic probes report "uprobe-multi".
     let mut mechanisms = Vec::new();
-    if (attached_probes > 0 && !static_multi_attached) || dynamic_per_offset_attached {
+    if (attached_probes > 0 && !multi_attached) || dynamic_per_offset_attached {
         mechanisms.push("per-offset");
     }
-    if static_multi_attached {
+    if multi_attached {
         mechanisms.push("uprobe-multi");
     }
     mechanisms

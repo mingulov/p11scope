@@ -767,6 +767,22 @@ pub(crate) enum JournalContradiction {
     UnclosedEndpoint,
 }
 
+/// Why a seal attempt answered `BoundNotReady` (internal diagnostics
+/// and the frame's future-input decision; never authority).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SealWait {
+    None,
+    UnboundStaging,
+    AttributionPending,
+    /// A fresh birth whose key has no staged call of its own above the
+    /// birth cut inside this frontier: only the caller's future calls
+    /// can ground it, so an immutable frame can never seal it.
+    FreshBirthNoHistory,
+    FloorsPastFrontier,
+    AbandonReturnPending,
+    RefusedReturnPending,
+}
+
 /// Finite seal/audit refusal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JournalGap {
@@ -1037,6 +1053,9 @@ pub(crate) struct TestPhaseSample {
 /// the audit passes, so an audit failure voids staged proof before any
 /// model input exists to corrupt.
 pub(crate) struct JournalAdapter {
+    /// The current seal attempt's wait cause (internal; never authority
+    /// and never user-visible text). Reset at every seal attempt.
+    seal_wait: std::cell::Cell<SealWait>,
     limits: JournalLimits,
     consumed_through: u64,
     stream_boundary: Option<crate::events::EventsConsumptionCut>,
@@ -1155,6 +1174,7 @@ impl JournalAdapter {
 
     pub(crate) fn with_ledger(limits: JournalLimits, ledger: StagingLedger) -> Self {
         Self {
+            seal_wait: std::cell::Cell::new(SealWait::None),
             limits,
             consumed_through: 0,
             stream_boundary: None,
@@ -5389,6 +5409,7 @@ impl JournalAdapter {
         replay: ReplayPreparation,
     ) -> Result<SealSuccess, SealFailure> {
         let (audit, bootstrap, frontier) = input.into_parts();
+        self.seal_wait.set(SealWait::None);
         let requested = self.retained_failure_domain(bootstrap);
         let outcome = (|| {
             self.check_collection_owner(audit)?;
@@ -5538,7 +5559,7 @@ impl JournalAdapter {
         // refused S1-only subjects), each with its gap and ledger
         // accounting.
         if self.has_unbound_staging(frontier) {
-            return Err(self.failure(JournalGap::BoundNotReady));
+            return Err(self.wait(SealWait::UnboundStaging));
         }
         // With sibling keys, every staged entry for this image needs
         // its attribution: this key's entries convert, a sibling's
@@ -5548,7 +5569,7 @@ impl JournalAdapter {
         match self.attribution_readiness(key, &live, frontier, audit) {
             AttributionReadiness::Ready => {}
             AttributionReadiness::Pending => {
-                return Err(self.failure(JournalGap::BoundNotReady));
+                return Err(self.wait(SealWait::AttributionPending));
             }
             AttributionReadiness::Unmatched => {
                 // No claim can ever name this staged call: the image's
@@ -5567,7 +5588,7 @@ impl JournalAdapter {
         if !state.bootstraps.contains_key(&bootstrap.proof().era)
             && !self.has_staged_history(key, &live, bootstrap.birth_cut(), frontier)
         {
-            return Err(self.failure(JournalGap::BoundNotReady));
+            return Err(self.wait(SealWait::FreshBirthNoHistory));
         }
         // The model's bootstrap authority is derived, not supplied:
         // strictly above the birth, the last sealed frontier, the void
@@ -5633,7 +5654,7 @@ impl JournalAdapter {
             .map(|entry| entry.begin_ordinal)
             .min();
         if floors > frontier {
-            return Err(self.failure(JournalGap::BoundNotReady));
+            return Err(self.wait(SealWait::FloorsPastFrontier));
         }
         let fence = match held {
             Some(pinned) if pinned < floors => None,
@@ -6113,6 +6134,17 @@ impl JournalAdapter {
         }
     }
 
+    /// A seal wait, recording its cause for this attempt.
+    fn wait(&self, why: SealWait) -> SealFailure {
+        self.seal_wait.set(why);
+        self.failure(JournalGap::BoundNotReady)
+    }
+
+    /// The last seal attempt's wait cause (`None` when it did not wait).
+    pub(crate) fn last_seal_wait(&self) -> SealWait {
+        self.seal_wait.get()
+    }
+
     fn failure(&self, gap: JournalGap) -> SealFailure {
         SealFailure {
             gap,
@@ -6204,7 +6236,7 @@ impl JournalAdapter {
                 })
         });
         if unready {
-            return Err(self.failure(JournalGap::BoundNotReady));
+            return Err(self.wait(SealWait::AbandonReturnPending));
         }
         // Every refused begin of this key at or below the frontier needs
         // its bound within the frontier; otherwise the seal waits.
@@ -6214,7 +6246,7 @@ impl JournalAdapter {
                 && refused.corroborated_return.is_none_or(|at| at > frontier)
         });
         if refused_unready {
-            return Err(self.failure(JournalGap::BoundNotReady));
+            return Err(self.wait(SealWait::RefusedReturnPending));
         }
         self.validate_invocation_claims(key, &live, frontier, audit)?;
         self.convert_and_settle(model, key, bootstrap, frontier, model_fence, replay)

@@ -65019,3 +65019,297 @@ fn live_clean_prefix_applies_without_transport_gap() {
         engine.counters.object_skips
     );
 }
+
+/// Opus review Probe A helper (scratch export, ported): one inventory tick
+/// whose deep-scan clock permits exactly `permits` admission attempts.
+fn opus_probe_refresh_with_permits(engine: &mut Engine, permits: usize) {
+    let mut session = ScriptedSession::with_records([], 0);
+    let mut collect: Box<DiscoveryCollector<'_>> = Box::new(Engine::collect_discovery_records);
+    let polls = std::cell::Cell::new(0usize);
+    let mut tick_now = || {
+        let n = polls.get();
+        polls.set(n + 1);
+        if n <= permits {
+            Some(1_000_000u64)
+        } else {
+            Some(u64::MAX / 2)
+        }
+    };
+    engine
+        .refresh_inventory(
+            &mut session,
+            &mut true,
+            &mut Vec::new(),
+            &mut PendingViewRetirements::new(),
+            &mut *collect,
+            &mut PauseClosure::new(true),
+            &mut tick_now,
+        )
+        .expect("an inventory refresh over a cgroup scope");
+}
+
+/// Opus Probe A (quantum, 2 attempts/tick): free slots, one marked backlog
+/// pid, each tick brings as many first-seen pids as the tick quantum lets
+/// attempt. The marked backlog must admit within the flood, not after it.
+#[test]
+fn newcomer_flood_does_not_starve_marked_backlog_two_attempts() {
+    const TICKS: usize = 6;
+    const PER_TICK: usize = 2;
+    let guards = e06_spawn_sleeps(2 + TICKS * PER_TICK);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let (initial, backlog) = (pids[0], pids[1]);
+    let fresh: Vec<u32> = pids[2..].to_vec();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[initial]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+
+    let mut listing = vec![initial, backlog];
+    e06_write_listing(scope_dir.path(), &listing);
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert!(!engine.views.iter().any(|view| view.pid() == backlog));
+    assert!(
+        engine.newcomer_first_seen.contains_key(&backlog),
+        "the deferred pid is marked"
+    );
+
+    let mut first_admitted = None;
+    for tick in 0..TICKS {
+        listing.extend_from_slice(&fresh[tick * PER_TICK..(tick + 1) * PER_TICK]);
+        e06_write_listing(scope_dir.path(), &listing);
+        opus_probe_refresh_with_permits(&mut engine, PER_TICK);
+        if first_admitted.is_none() && engine.views.iter().any(|view| view.pid() == backlog) {
+            first_admitted = Some(tick + 1);
+        }
+    }
+    let views_before_quiet = engine.views.len();
+    opus_probe_refresh_with_permits(&mut engine, PER_TICK);
+    let admitted_when_quiet = engine.views.iter().any(|view| view.pid() == backlog);
+    eprintln!(
+        "OPUS-PROBE-A ticks={TICKS} per_tick={PER_TICK} backlog_first_admitted_tick={first_admitted:?} views_after_flood={views_before_quiet} admitted_once_flood_stops={admitted_when_quiet}"
+    );
+    assert!(
+        first_admitted.is_some(),
+        "the marked backlog pid was never attempted in {TICKS} flooded ticks"
+    );
+}
+
+/// Opus Probe A at 1 attempt/tick: one newcomer per tick must not starve
+/// the marked backlog; the backlog-owed flag alternates the lead so the
+/// backlog admits within the flood.
+#[test]
+fn newcomer_flood_does_not_starve_marked_backlog_one_attempt() {
+    const TICKS: usize = 6;
+    const PER_TICK: usize = 1;
+    let guards = e06_spawn_sleeps(2 + TICKS * PER_TICK);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let (initial, backlog) = (pids[0], pids[1]);
+    let fresh: Vec<u32> = pids[2..].to_vec();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[initial]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+
+    let mut listing = vec![initial, backlog];
+    e06_write_listing(scope_dir.path(), &listing);
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert!(!engine.views.iter().any(|view| view.pid() == backlog));
+    assert!(
+        engine.newcomer_first_seen.contains_key(&backlog),
+        "the deferred pid is marked"
+    );
+
+    let mut first_admitted = None;
+    for tick in 0..TICKS {
+        listing.extend_from_slice(&fresh[tick * PER_TICK..(tick + 1) * PER_TICK]);
+        e06_write_listing(scope_dir.path(), &listing);
+        opus_probe_refresh_with_permits(&mut engine, PER_TICK);
+        if first_admitted.is_none() && engine.views.iter().any(|view| view.pid() == backlog) {
+            first_admitted = Some(tick + 1);
+        }
+    }
+    eprintln!("OPUS-PROBE-A-1 ticks={TICKS} backlog_first_admitted_tick={first_admitted:?}");
+    assert!(
+        first_admitted.is_some(),
+        "the marked backlog pid was never attempted in {TICKS} flooded ticks at 1 attempt/tick"
+    );
+}
+
+/// Finding 3: newcomer classification ignores timing marks. A truly new pid
+/// (absent from the previous enumeration) admits first even when it carries
+/// a stale arrival mark (e.g. a pressure pass marked it); marks are timing
+/// evidence only.
+#[test]
+fn truly_new_pid_with_stale_mark_still_admits_first() {
+    let guards = e06_spawn_sleeps(3);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let (initial, backlog, newcomer) = (pids[0], pids[1], pids[2]);
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[initial]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+
+    e06_write_listing(scope_dir.path(), &[initial, backlog]);
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert!(!engine.views.iter().any(|view| view.pid() == backlog));
+    assert!(
+        engine.newcomer_first_seen.contains_key(&backlog),
+        "the deferred pid is marked backlog"
+    );
+
+    e06_write_listing(scope_dir.path(), &[initial, backlog, newcomer]);
+    // Simulate a stale mark (e.g. a pressure service pass marked the truly
+    // new pid): classification must still see it as a newcomer.
+    engine.newcomer_first_seen.insert(newcomer, None);
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert!(
+        kept.contains(&newcomer),
+        "the truly new pid admits first despite its stale mark: {kept:?}"
+    );
+    assert!(
+        !kept.contains(&backlog),
+        "the marked backlog waits another tick: {kept:?}"
+    );
+}
+
+fn opus_probe_view_pids(engine: &Engine) -> std::collections::BTreeSet<u32> {
+    engine.views.iter().map(|view| view.pid()).collect()
+}
+
+fn opus_spawn_static_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
+    let guards: Vec<SystemScopeChildGuard> = (0..count)
+        .map(|_| {
+            SystemScopeChildGuard::new(
+                std::process::Command::new("/usr/bin/busybox")
+                    .args(["sleep", "60"])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap(),
+            )
+        })
+        .collect();
+    let self_exe = std::env::current_exe().unwrap();
+    for guard in &guards {
+        let exe = format!("/proc/{}/exe", guard.pid());
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "busybox child never execed");
+    }
+    guards
+}
+
+/// Opus Probe B4: 200 static (ungrouped) sleeps over a 40-view cap, so a
+/// 64-pid reconcile slice holds more unscanned pids than the eviction
+/// budget. A marked provider-carrying waiter outside the slice must settle
+/// within one sweep; eviction-freed slots reach pending waiters first, not
+/// never-touched long-runners.
+#[test]
+fn reconcile_marked_waiter_vs_ungrouped_slice_settles_within_one_sweep() {
+    let sleeps = opus_spawn_static_sleeps(200);
+    let mut sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    sleep_pids.sort_unstable();
+    let cap = 40usize;
+    let tag = "B4";
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "opus-waiter4");
+    let driver = system_scope_build_driver(dir.path());
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider.clone()], Some(cap));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    for _ in 0..40 {
+        if engine.views.len() >= cap {
+            break;
+        }
+        refresh_inventory_once(&mut engine);
+    }
+    assert_eq!(engine.views.len(), cap, "rotation fills the cap");
+    if engine.scheduler.over_cap_passes() % 2 == 1 {
+        refresh_inventory_once(&mut engine);
+        assert_eq!(engine.views.len(), cap);
+    }
+    let child = system_scope_spawn_loaded(&driver, &provider);
+    let waiter = child.pid();
+    let mut listing = sleep_pids.clone();
+    listing.push(waiter);
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(waiter, None), "the waiter queues");
+    let park = *opus_probe_view_pids(&engine).iter().max().unwrap();
+    engine.scheduler.advance_cursor(park);
+    let sweeps0 = engine.scheduler.reconcile_sweeps_for_test();
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.scheduler.reconcile_sweeps_for_test(),
+        sweeps0,
+        "an ordinary pass"
+    );
+    assert!(!opus_probe_view_pids(&engine).contains(&waiter));
+    let marked = engine.newcomer_first_seen.contains_key(&waiter);
+    let mut settled_after = None;
+    for pass in 0..24 {
+        let marks: std::collections::BTreeSet<u32> =
+            engine.newcomer_first_seen.keys().copied().collect();
+        let before = opus_probe_view_pids(&engine);
+        let evictions = engine.exploratory_evictions;
+        let order = crate::discovery::scheduler::DiscoveryScheduler::rotated_after(
+            &listing,
+            engine.scheduler.cursor(),
+        );
+        let slice: Vec<u32> = order.into_iter().take(64).collect();
+        let pool = slice
+            .iter()
+            .filter(|pid| !before.contains(pid) && !engine.scheduler.cooling_down(**pid))
+            .count();
+        let evictable = engine.exploratory_evictable_views().len();
+        refresh_inventory_once(&mut engine);
+        let after = opus_probe_view_pids(&engine);
+        let added: Vec<u32> = after.difference(&before).copied().collect();
+        let added_marked = added.iter().filter(|pid| marks.contains(pid)).count();
+        eprintln!(
+            "OPUS-PROBE-{tag} pass={pass} sweeps={} pre_evictable={evictable} pre_pool={pool} slice_has_waiter={} evicted={} added={} added_previously_marked={added_marked} waiter_view={}",
+            engine.scheduler.reconcile_sweeps_for_test() - sweeps0,
+            slice.contains(&waiter),
+            engine.exploratory_evictions - evictions,
+            added.len(),
+            after.contains(&waiter)
+        );
+        if after.contains(&waiter) {
+            settled_after = Some(engine.scheduler.reconcile_sweeps_for_test() - sweeps0);
+            break;
+        }
+    }
+    eprintln!(
+        "OPUS-PROBE-{tag} waiter_marked_after_ordinary={marked} settled_after_sweeps={settled_after:?}"
+    );
+    assert_eq!(
+        settled_after,
+        Some(1),
+        "the marked waiter settles within one sweep"
+    );
+}

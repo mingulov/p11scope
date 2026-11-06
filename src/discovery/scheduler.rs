@@ -1148,4 +1148,69 @@ mod tests {
             "six sweeps at the two-frame cadence"
         );
     }
+
+    /// M6 killer: with no backlog, 40 unmarked newcomers against the
+    /// production batch admit all 40, not just the newcomer share. The
+    /// `.max(batch - backlog.len())` term lets fresh fill slots the
+    /// backlog cannot use; removing it admits only 32.
+    #[test]
+    fn batch_64_no_backlog_40_newcomers_all_admit() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        assert_eq!(batch, 64);
+        assert_eq!(share, 32);
+        let pids: Vec<u32> = (1..=40).collect();
+        let newcomers: BTreeSet<u32> = pids.iter().copied().collect();
+        let scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) = scheduler.new_view_window_newcomers_first(
+            &pids,
+            &newcomers,
+            &BTreeSet::new(),
+            false,
+            batch,
+            share,
+        );
+        assert_eq!(
+            admitted.len(),
+            40,
+            "all 40 newcomers admit with no backlog: {admitted:?}"
+        );
+        assert!(deferred.is_empty());
+    }
+
+    /// The newcomer share is literally half the batch under flood: 100 fresh
+    /// plus 100 backlog against the production batch admit exactly 32 fresh.
+    /// Pinned literally (not via the share constant) so a constant change
+    /// fails behaviorally, not just via the constant assertion.
+    #[test]
+    fn newcomer_share_bounded_per_tick_literal_32() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        assert_eq!(batch, 64);
+        assert_eq!(share, 32);
+        let backlog: Vec<u32> = (1..=100).collect();
+        let fresh: Vec<u32> = (1_000_000..1_000_100).collect();
+        let mut pids = backlog.clone();
+        pids.extend(fresh.iter().copied());
+        pids.sort_unstable();
+        let newcomers: BTreeSet<u32> = fresh.into_iter().collect();
+        let scheduler = DiscoveryScheduler::new();
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &pids,
+            &newcomers,
+            &BTreeSet::new(),
+            false,
+            batch,
+            share,
+        );
+        let fresh_admitted = admitted
+            .iter()
+            .filter(|pid| newcomers.contains(pid))
+            .count();
+        assert_eq!(
+            fresh_admitted, 32,
+            "fresh takes literally half the batch: {admitted:?}"
+        );
+        assert_eq!(admitted.len(), 64);
+    }
 }

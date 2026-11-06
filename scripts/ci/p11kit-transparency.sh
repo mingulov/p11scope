@@ -748,8 +748,8 @@ PY
 # admitted, but their calls fold to module-level use. The oracle checks
 # the two exact module-use equations (entries/spy/bindings, spy pids)
 # plus drop-detection against the summed ledger and admission whole.
-# Short lives are far below the inventory pass cadence, so the exact
-# equations are timing-deterministic.
+# Short lives are far below the inventory pass cadence; the exact
+# equations hold or fail loud, never vacuous.
 T9_SHORTS=${T9_SHORTS:-6}
 t9() {
   local cell=p11kit-moduleuse-system-isolated

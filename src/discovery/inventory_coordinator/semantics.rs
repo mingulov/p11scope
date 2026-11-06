@@ -510,6 +510,10 @@ fn accept_retained_inputs(
             };
             let mut by_object: std::collections::BTreeMap<_, ReconciledModule> =
                 std::collections::BTreeMap::new();
+            // Sticky per-object disagreement: once two views of an
+            // object disagree (count or content), no later agreeing
+            // view may OR the finished flag back.
+            let mut disagreed: BTreeSet<PinnedObjectId> = BTreeSet::new();
             for module in modules {
                 match by_object.entry(module.object) {
                     std::collections::btree_map::Entry::Vacant(slot) => {
@@ -523,6 +527,7 @@ fn accept_retained_inputs(
                             // (fail closed for the sole-table gate, which
                             // needs exactly one), and clear the finished
                             // flag so the sole leg refuses even for 0-vs-1.
+                            disagreed.insert(module.object);
                             if incoming_tables > kept_tables {
                                 let mut kept = module;
                                 kept.scanned.tables_scan_finished = false;
@@ -537,6 +542,7 @@ fn accept_retained_inputs(
                             // Same count, different tables: keep the
                             // complete entry as before, but clear finished
                             // so the sole leg refuses the disagreement.
+                            disagreed.insert(module.object);
                             if !entry_complete(slot.get()) && entry_complete(&module) {
                                 let mut kept = module;
                                 kept.scanned.tables_scan_finished = false;
@@ -548,7 +554,9 @@ fn accept_retained_inputs(
                             // Agreeing views: keep the complete entry as
                             // before; finished when either view finished (a
                             // finished view proves exactly-one, and agreeing
-                            // unfinished views do not refute it).
+                            // unfinished views do not refute it). The
+                            // post-loop clear below keeps disagreement
+                            // sticky against this OR.
                             let finished = slot.get().scanned.tables_scan_finished
                                 || module.scanned.tables_scan_finished;
                             if !entry_complete(slot.get()) && entry_complete(&module) {
@@ -560,6 +568,11 @@ fn accept_retained_inputs(
                             }
                         }
                     }
+                }
+            }
+            for (object, module) in by_object.iter_mut() {
+                if disagreed.contains(object) {
+                    module.scanned.tables_scan_finished = false;
                 }
             }
             let modules: Vec<_> = by_object.into_values().collect();

@@ -797,6 +797,8 @@ OVERLAY_TESTS=(
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_fresh_upper_joins
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_deep_scan_stale_lower_refuses
 discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace_edge_absent
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_proves_stale_mapping
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_refuses_fresh_mapping
 )
 
 # Expected-failure campaign cells: run only with

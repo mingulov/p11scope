@@ -4677,3 +4677,440 @@ fn k2_sweep_fresh_row(
     );
     Ok(())
 }
+
+/// Copy-up old-file feasibility: after an overlayfs copy-up the observer
+/// holds the fresh upper file while a pre-copy-up mapper still runs the
+/// lower file. The deep-scan witness proves the stale range is another
+/// file (the K1 stale twin pins the refusal); the cells below prove the
+/// same kernel primitive can also positively identify the lower file, so
+/// each mapper can later be attributed to its real file without guessing.
+/// The lower path is read back from the live mount table (never from the
+/// construction call) and then proved — the open alone never joins.
+///
+/// One setup serves both twins: a stale child maps before the copy-up,
+/// a fresh child maps after, and the held file opens after (the B16
+/// direction).
+struct CopyUpOldFile {
+    fixture: OverlayFixture,
+    stale: SwapChild,
+    fresh: SwapChild,
+    merged: std::path::PathBuf,
+}
+
+/// Mount one overlay merge with a provider-shaped lower file, map it
+/// from the stale child, copy it up, then map it from the fresh child.
+/// The stale and fresh keys pin the lane's rendering premise: on lane B
+/// (except xino-off, whose file numbers are non-persistent) both keys
+/// are equal — the userspace indistinguishability — while on lane A the
+/// copy-up moves the key.
+fn copyup_old_file_setup(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+) -> Result<CopyUpOldFile, String> {
+    let fixture = OverlayFixture::mount(work, mode)?;
+    std::fs::write(fixture.lower_path("lib.so"), vec![0xE4u8; 8192])
+        .map_err(|error| format!("copyup old-file lower write: {error}"))?;
+    fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    let stale = SwapChild::spawn(&merged);
+    trigger_copy_up(
+        &merged,
+        &fixture.upper_path("lib.so"),
+        &fixture.lower_path("lib.so"),
+    )?;
+    let fresh = SwapChild::spawn(&merged);
+    let stale_key = ObjectKey::of(&find_line(&stale.maps(), target_range(&stale), *b"r-xp")?);
+    let fresh_key = ObjectKey::of(&find_line(&fresh.maps(), target_range(&fresh), *b"r-xp")?);
+    match lane {
+        OverlayLane::B if mode != XinoMode::Off && stale_key != fresh_key => {
+            return Err(
+                "copyup old-file lane-B premise broken: stale key moved across copy-up".into(),
+            );
+        }
+        OverlayLane::A if stale_key == fresh_key => {
+            return Err(
+                "copyup old-file lane-A premise broken: stale key equals the fresh key".into(),
+            );
+        }
+        _ => {}
+    }
+    Ok(CopyUpOldFile {
+        fixture,
+        stale,
+        fresh,
+        merged,
+    })
+}
+
+/// Lower-layer candidates for a merged path, read back from a mount
+/// table: the overlay mount with the longest mountpoint prefix of the
+/// path contributes its `lowerdir` stack in order, each joined with the
+/// path's remainder. Empty when no overlay row covers the path, the row
+/// names no lowerdir, or the remainder escapes (fail closed): the caller
+/// keeps the named gap. Mountinfo escapes are decoded on both sides;
+/// the stack splits on `:` exactly like the kernel mount parser.
+fn lower_candidates_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    fn unescape(field: &str) -> String {
+        field
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    }
+    let merged_str = merged.to_string_lossy();
+    let mut best: Option<(usize, Vec<String>, String)> = None;
+    for line in mountinfo.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let pre_fields: Vec<&str> = pre.split_whitespace().collect();
+        let post_fields: Vec<&str> = post.split_whitespace().collect();
+        let (Some(mountpoint), Some(fstype)) = (pre_fields.get(4), post_fields.first()) else {
+            continue;
+        };
+        if *fstype != "overlay" {
+            continue;
+        }
+        let mountpoint = unescape(mountpoint);
+        let rest = match merged_str.strip_prefix(mountpoint.as_str()) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let rel = match rest.strip_prefix('/') {
+            Some(rel) => rel,
+            None if rest.is_empty() => "",
+            None => continue,
+        };
+        if std::path::Path::new(rel)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            continue;
+        }
+        let super_opts = post_fields.get(2).unwrap_or(&"");
+        let mut lowers = Vec::new();
+        for opt in super_opts.split(',') {
+            if let Some(stack) = opt.strip_prefix("lowerdir=") {
+                lowers.extend(
+                    stack
+                        .split(':')
+                        .filter(|layer| !layer.is_empty())
+                        .map(unescape),
+                );
+            }
+        }
+        if lowers.is_empty() {
+            continue;
+        }
+        let len = mountpoint.len();
+        if best
+            .as_ref()
+            .is_some_and(|(best_len, _, _)| *best_len >= len)
+        {
+            continue;
+        }
+        best = Some((len, lowers, rel.to_string()));
+    }
+    let Some((_, lowers, rel)) = best else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for lower in lowers {
+        let candidate = std::path::Path::new(&lower).join(&rel);
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
+/// One diagnosed original-file query against an explicitly opened file
+/// (held upper or a lower candidate), with the global query spend delta.
+/// The caller picks the anchor; the verdict names which file the range
+/// maps.
+#[allow(clippy::type_complexity)]
+fn copyup_old_file_prove(
+    pid: u32,
+    file: &std::fs::File,
+    held: &crate::discovery::identity::MappedFile,
+    key: ObjectKey,
+    ranges: &[(u64, u64)],
+) -> Result<
+    (
+        crate::discovery::overlay_witness::WitnessVerdict,
+        Option<crate::discovery::overlay_witness::WitnessDiagnosis>,
+        u64,
+    ),
+    String,
+> {
+    use crate::discovery::overlay_witness::{
+        prove_original_file_diagnosed, witness_stats_for_test,
+    };
+    let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+    let (before, _) = witness_stats_for_test();
+    let outcome = prove_original_file_diagnosed(pid, file, held, key, ranges, &mut budget);
+    let (after, _) = witness_stats_for_test();
+    Ok((
+        outcome.verdict,
+        outcome.diagnosis,
+        after.saturating_sub(before),
+    ))
+}
+
+/// Retry a direct prove across transient witness-infrastructure loss:
+/// only the unavailable verdict retries (at most three attempts, each
+/// spending exactly one query), mirroring the K1 guard retry. A
+/// systematic refusal returns on the third strike.
+#[allow(clippy::type_complexity)]
+fn copyup_old_file_prove_retry(
+    label: &str,
+    pid: u32,
+    file: &std::fs::File,
+    held: &crate::discovery::identity::MappedFile,
+    key: ObjectKey,
+    ranges: &[(u64, u64)],
+) -> Result<
+    (
+        crate::discovery::overlay_witness::WitnessVerdict,
+        Option<crate::discovery::overlay_witness::WitnessDiagnosis>,
+        u64,
+        u32,
+    ),
+    String,
+> {
+    use crate::discovery::overlay_witness::{WitnessFailure, WitnessVerdict};
+    let mut total = 0u64;
+    for attempt in 1..=3u32 {
+        let (verdict, diagnosis, queries) = copyup_old_file_prove(pid, file, held, key, ranges)?;
+        total += queries;
+        if queries != 1 {
+            return Err(format!(
+                "{label}: attempt {attempt} spent {queries} queries, not one"
+            ));
+        }
+        let retry =
+            matches!(verdict, WitnessVerdict::Failed(WitnessFailure::Unavailable)) && attempt < 3;
+        if retry {
+            eprintln!("COPYUP_OLD_FILE {label} attempt {attempt}: transient unavailable, retrying");
+            continue;
+        }
+        return Ok((verdict, diagnosis, total, attempt));
+    }
+    unreachable!("copyup old-file {label}: retry loop returns on attempt 3");
+}
+
+/// Old-file positive twin (privileged): the stale range proves same-file
+/// against the lower file opened through the mount-table read-back. The
+/// kernel primitive positively identifies the old file — the witness an
+/// old-vs-fresh attribution needs exists.
+#[test]
+#[ignore = "root: loop overlay mounts drive the production original-file witness against the lower file"]
+fn privileged_copyup_lower_anchor_proves_stale_mapping() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        copyup_lower_row(work.path(), mode, lane, true)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "COPYUP_OLD_FILE direction=stale-lower lane={lane:?} modes=on,off,same-fs verdict=same-file"
+    );
+}
+
+/// Old-file negative twin (privileged): the fresh range proves
+/// another-file against the lower file — the lower anchor refuses
+/// exactly the mapper it must refuse.
+#[test]
+#[ignore = "root: loop overlay mounts drive the production original-file witness against the lower file"]
+fn privileged_copyup_lower_anchor_refuses_fresh_mapping() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        copyup_lower_row(work.path(), mode, lane, false)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "COPYUP_OLD_FILE direction=fresh-upper lane={lane:?} modes=on,off,same-fs verdict=other-file"
+    );
+}
+
+/// One old-file row over a fresh fixture: discover the lower file from
+/// the live mount table, prove the chosen side's range against it, and
+/// require the verdict the side needs. Where the kernel proof cannot run
+/// at all the row asserts the exact unavailable shape instead — still a
+/// refusal, never silence.
+fn copyup_lower_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    stale_side: bool,
+) -> Result<(), String> {
+    use crate::discovery::overlay_witness::{WitnessFailure, WitnessVerdict};
+    let side = if stale_side {
+        "stale-lower"
+    } else {
+        "fresh-upper"
+    };
+    eprintln!("COPYUP_OLD_FILE start mode={mode:?} row={side} lane={lane:?}");
+    let setup = copyup_old_file_setup(work, mode, lane)?;
+    let mountinfo = std::fs::read_to_string("/proc/self/mountinfo")
+        .map_err(|error| format!("copyup old-file mountinfo: {error}"))?;
+    let candidates = lower_candidates_from_mountinfo(&mountinfo, &setup.merged);
+    let candidate = candidates.first().ok_or_else(|| {
+        "copyup old-file: mount table names no lowerdir for the merge".to_string()
+    })?;
+    let lower_file = std::fs::File::open(candidate).map_err(|error| {
+        format!(
+            "copyup old-file lower open {}: {error}",
+            candidate.display()
+        )
+    })?;
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        let got = lower_file
+            .metadata()
+            .map_err(|error| format!("copyup old-file candidate fstat: {error}"))?;
+        let want = std::fs::metadata(setup.fixture.lower_path("lib.so"))
+            .map_err(|error| format!("copyup old-file lower fstat: {error}"))?;
+        if (got.dev(), got.ino()) != (want.dev(), want.ino()) {
+            return Err(format!(
+                "copyup old-file premise broken: {} is not the lower file (candidate {:?} vs lower {:?})",
+                candidate.display(),
+                (got.dev(), got.ino()),
+                (want.dev(), want.ino())
+            ));
+        }
+    }
+    let lower_held = crate::discovery::identity::self_mapped_file(&lower_file)
+        .map_err(|error| format!("copyup old-file lower identity: {error}"))?;
+    let child = if stale_side {
+        &setup.stale
+    } else {
+        &setup.fresh
+    };
+    let pid = child.pid as u32;
+    let range = target_range(child);
+    let key = ObjectKey::of(&find_line(&child.maps(), range, *b"r-xp")?);
+    if !k1_witness_capable() {
+        let (verdict, diagnosis, queries) =
+            copyup_old_file_prove(pid, &lower_file, &lower_held, key, &[range])?;
+        match verdict {
+            WitnessVerdict::Failed(WitnessFailure::Unavailable) => {
+                eprintln!(
+                    "COPYUP_OLD_FILE mode={mode:?} row={side} lane={lane:?} verdict=unavailable queries={queries} diagnosis={diagnosis:?}"
+                );
+                return Ok(());
+            }
+            other => {
+                return Err(format!(
+                    "copyup old-file {side}: expected unavailable without kernel proof, got {other:?}"
+                ));
+            }
+        }
+    }
+    let (verdict, diagnosis, queries, attempts) =
+        copyup_old_file_prove_retry(side, pid, &lower_file, &lower_held, key, &[range])?;
+    let want = if stale_side {
+        WitnessVerdict::SameFile
+    } else {
+        WitnessVerdict::OtherFile
+    };
+    if verdict != want {
+        return Err(format!(
+            "copyup old-file {side}: expected {want:?}, got {verdict:?} diagnosis={diagnosis:?} queries={queries} attempts={attempts}"
+        ));
+    }
+    eprintln!(
+        "COPYUP_OLD_FILE mode={mode:?} row={side} lane={lane:?} verdict={verdict:?} queries={queries} attempts={attempts}"
+    );
+    Ok(())
+}
+
+#[test]
+fn lower_candidates_single_layer_joins_the_remainder() {
+    let table = "31 23 0:27 / /var/tmp/x/merged1 rw,relatime - overlay overlay rw,lowerdir=/var/tmp/x/lower,upperdir=/var/tmp/x/upper1,workdir=/var/tmp/x/work1\n";
+    let got =
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/var/tmp/x/merged1/lib.so"));
+    assert_eq!(
+        got,
+        vec![std::path::PathBuf::from("/var/tmp/x/lower/lib.so")]
+    );
+}
+
+#[test]
+fn lower_candidates_stack_keeps_kernel_order() {
+    let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1:/l2:/l3,upperdir=/u,workdir=/w\n";
+    let got = lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a/b.so"));
+    assert_eq!(
+        got,
+        vec![
+            std::path::PathBuf::from("/l1/a/b.so"),
+            std::path::PathBuf::from("/l2/a/b.so"),
+            std::path::PathBuf::from("/l3/a/b.so"),
+        ]
+    );
+}
+
+#[test]
+fn lower_candidates_longest_overlay_prefix_wins() {
+    let table = concat!(
+        "20 1 0:17 / / rw,relatime - overlay overlay rw,lowerdir=/base/rootfs,upperdir=/base/upper,workdir=/base/work\n",
+        "31 23 0:27 / /var/tmp/x/merged1 rw,relatime - overlay overlay rw,lowerdir=/var/tmp/x/lower,upperdir=/var/tmp/x/upper1,workdir=/var/tmp/x/work1\n",
+    );
+    let got =
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/var/tmp/x/merged1/lib.so"));
+    assert_eq!(
+        got,
+        vec![std::path::PathBuf::from("/var/tmp/x/lower/lib.so")]
+    );
+}
+
+#[test]
+fn lower_candidates_skips_non_overlay_and_prefix_siblings() {
+    let table = concat!(
+        "10 1 8:1 / /var/tmp/x rw,relatime - ext4 /dev/sda3 rw\n",
+        "31 23 0:27 / /var/tmp/x/merged1 rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n",
+    );
+    assert!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/var/tmp/x/plain.so"))
+            .is_empty()
+    );
+    assert!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/var/tmp/x/merged10/lib.so"))
+            .is_empty()
+    );
+}
+
+#[test]
+fn lower_candidates_decodes_mountinfo_escapes() {
+    let table = "31 23 0:27 / /var/tmp/my\\040x/merged1 rw,relatime - overlay overlay rw,lowerdir=/var/tmp/my\\040x/lower,upperdir=/u,workdir=/w\n";
+    let got = lower_candidates_from_mountinfo(
+        table,
+        std::path::Path::new("/var/tmp/my x/merged1/lib.so"),
+    );
+    assert_eq!(
+        got,
+        vec![std::path::PathBuf::from("/var/tmp/my x/lower/lib.so")]
+    );
+}
+
+#[test]
+fn lower_candidates_refuses_escapes_and_missing_lowerdir() {
+    let table =
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n";
+    assert!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/../evil.so"))
+            .is_empty()
+    );
+    let no_lower = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,upperdir=/u,workdir=/w\n";
+    assert!(
+        lower_candidates_from_mountinfo(no_lower, std::path::Path::new("/mnt/r/a.so")).is_empty()
+    );
+    assert!(lower_candidates_from_mountinfo("", std::path::Path::new("/mnt/r/a.so")).is_empty());
+}

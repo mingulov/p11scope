@@ -756,6 +756,18 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_proves_stale_mapping",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity; old-file positive twin (the lower anchor proves the stale mapping), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_refuses_fresh_mapping",
+      "reason": "root: loop overlay mounts plus eligible BTF/task_vma identity; old-file negative twin (the lower anchor refuses the fresh mapping), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_population_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",

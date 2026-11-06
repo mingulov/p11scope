@@ -6194,7 +6194,10 @@ fn broad_fixed_pool_module(
             ),
         );
         // Table 0 may already have been added above; drop it — a pool whose
-        // stride is unverified contributes nothing.
+        // stride is unverified contributes nothing. The probe decoded
+        // something the sweep did not verify, so the sweep's finished
+        // verdict must not survive either.
+        module.tables_scan_finished = false;
         module.tables.retain(|table| table.address != pool);
         return;
     }

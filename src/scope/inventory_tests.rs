@@ -259,7 +259,16 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
                 config: [0, 0x1234],
                 ..ScopeMaps::default()
             };
-            publish_detailed_with(&Scope::Pid(101), policy, token, false, None, &mut maps).unwrap();
+            publish_detailed_with(
+                &Scope::Pid(101),
+                policy,
+                token,
+                false,
+                None,
+                None,
+                &mut maps,
+            )
+            .unwrap();
             assert_eq!(maps.pids, BTreeMap::from([(101, token.unwrap_or(1))]));
             assert_eq!(
                 maps.config,
@@ -281,6 +290,7 @@ fn detailed_scope_factoring_preserves_policies_pause_tokens_and_reserved_config_
                 token,
                 false,
                 None,
+                None,
                 &mut maps
             )
             .is_err()
@@ -298,6 +308,7 @@ fn detailed_scope_track_short_lived_sets_only_the_extensive_bit() {
             CapturePolicy::Allowlisted,
             None,
             track,
+            None,
             None,
             &mut maps,
         )
@@ -328,6 +339,7 @@ fn counter_policies_refuse_track_short_lived_config() {
             None,
             true,
             None,
+            None,
             &mut armed,
         )
         .unwrap_err();
@@ -345,6 +357,7 @@ fn counter_policies_refuse_track_short_lived_config() {
             None,
             false,
             None,
+            None,
             &mut disarmed,
         )
         .unwrap();
@@ -361,6 +374,7 @@ fn counter_policies_refuse_track_short_lived_config() {
         CapturePolicy::AggregateOnly,
         None,
         true,
+        None,
         None,
         &mut aggregate,
     )

@@ -3990,6 +3990,24 @@ mod safe_capture {
         }
     }
 
+    /// Run-tree sessions pause only the owned child while the cgroup
+    /// admits its descendants: PAUSE rides beside CGROUP_FILTER with
+    /// the child's PID_FILTER row as the token. System scope still
+    /// refuses pause: no one process owns a machine-wide receipt.
+    #[test]
+    fn pause_accepts_cgroup_beside_pid_while_system_stays_refused() {
+        assert!(valid_config(
+            FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(valid_config(
+            FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(FLAG_PAUSE_ENABLED | FLAG_POLICY_ALLOWLISTED));
+    }
+
     #[test]
     fn pause_stays_pid_only_when_system_scope_is_selected() {
         assert!(valid_config(

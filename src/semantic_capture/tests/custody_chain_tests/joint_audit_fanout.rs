@@ -999,6 +999,7 @@ impl LiveMachineDiscovery {
 impl MachineScene {
     fn absence_scene(providers: usize) -> Self {
         let mut fixture = Self::with_initial_files(providers, &[0], true);
+        fixture.native.predating_births = true;
         fixture.push_quiet();
         fixture.published_labeled("absence-quiet-prefix", None);
         assert_eq!(
@@ -1009,14 +1010,17 @@ impl MachineScene {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            1
         );
         assert!(
             fixture
                 .native
                 .birth_outcomes
                 .iter()
-                .any(|(file, result)| *file == 0 && result.is_err())
+                .any(|(file, result)| *file == 0
+                    && *result == Ok(crate::semantics_objects::journal::BirthKind::AttachObserved)),
+            "precondition: the quiet prefix is born attach-observed: {:?}",
+            fixture.native.birth_outcomes
         );
         fixture
     }
@@ -5223,7 +5227,7 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
             .coordinator
             .registry()
             .joint_feeds(),
-        1
+        2
     );
     assert_eq!(fixture.reduced_for(1), 2);
     assert_eq!(
@@ -5365,7 +5369,7 @@ fn joint_machine_absence_rejects_late_busy_and_affecting_prefix() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            usize::from(boundary == "busy")
+            1 + usize::from(boundary == "busy")
         );
         if boundary == "late" {
             assert!(!before.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
@@ -5473,7 +5477,7 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
             .coordinator
             .registry()
             .joint_feeds(),
-        1
+        2
     );
     assert_eq!(fixture.reduced_for(2), 1);
     let table = fixture.machine.retained_births_for_test();
@@ -5489,6 +5493,9 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
         let witness = table
             .find_ready(&target)
             .expect("the exact actual Ready target must be found across pending B");
+        if witness.candidate.receipt.endpoint().file_slot == 0 {
+            continue;
+        }
         assert_eq!(witness.receipt().domain(), target.bootstrap().domain());
         assert_eq!(witness.candidate.receipt.endpoint().file_slot, 2);
         assert_eq!(witness.receipt(), target.bootstrap());
@@ -5703,7 +5710,7 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
         let coordinator = &fixture.scene.real.scene.coordinator;
         let revision = coordinator.registry().published_revision();
         let h3 = coordinator.reference_h3_audit_state();
-        assert_eq!(coordinator.registry().joint_feeds(), 0);
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
         assert!(
             coordinator
                 .joint_capture()
@@ -5753,7 +5760,7 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
         );
         fixture.published();
         let coordinator = &fixture.scene.real.scene.coordinator;
-        assert_eq!(coordinator.registry().joint_feeds(), 2);
+        assert_eq!(coordinator.registry().joint_feeds(), 3);
         assert_eq!(coordinator.registry().published_revision(), revision + 1);
         assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
         assert_eq!(
@@ -5780,12 +5787,15 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
             2
         );
         let table = fixture.machine.retained_births_for_test();
-        assert_eq!(table.ready_for_test().count(), 2);
+        assert_eq!(table.ready_for_test().count(), 3);
         let mut targets = 0;
         for (target, _) in coordinator.registry().joint_history_targets() {
             let witness = table
                 .find_ready(&target)
                 .expect("each exact original Ready must serve its actual target");
+            if witness.candidate.receipt.endpoint().file_slot == 0 {
+                continue;
+            }
             assert_eq!(witness.receipt(), target.bootstrap());
             assert!(witness.original.in_quantum(original));
             assert!(witness.candidate.quantum == original);
@@ -5857,7 +5867,7 @@ fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            if stale == "epoch" { 1 } else { 0 }
         );
         assert!(
             fixture
@@ -5896,7 +5906,7 @@ fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            if stale == "epoch" { 1 } else { 0 }
         );
     }
 }

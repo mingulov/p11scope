@@ -1333,13 +1333,13 @@ mod tests {
             crate::attach::CapturePolicy::Allowlisted,
         );
         let shared_label = format!(
-            "unknown#{}|unknown#{}",
+            "function #{} (unnamed)|function #{} (unnamed)",
             ordinal("C_Sign"),
             ordinal("C_SignUpdate")
         );
         assert!(live.contains(&shared_label), "{live}");
         assert!(
-            live.contains(&format!("unknown#{} ", ordinal("C_Verify"))),
+            live.contains(&format!("function #{} (unnamed)", ordinal("C_Verify"))),
             "{live}"
         );
 

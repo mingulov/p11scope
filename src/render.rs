@@ -8610,6 +8610,144 @@ pub(crate) mod tests {
         );
     }
 
+    /// Remote-client shape: a closure-array forwarding layer is the only
+    /// observation point — no watched provider below it. The split needs
+    /// an active provider, so the layer's calls stay in the headline
+    /// totals everywhere (text, live, metrics and profile JSON) and no
+    /// forwarding line prints.
+    #[test]
+    fn lone_forwarding_layer_keeps_its_calls_in_the_totals() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut row = report("C_Sign", 22, 0, false);
+        row.module = Some(ModuleId(7));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[row.clone()], &ev);
+        assert!(
+            text.contains("22 completed calls;"),
+            "a lone layer stays in the headline totals: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[row.clone()],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            !out.contains("(forwarding layer)"),
+            "a lone layer carries no live marker: {out}"
+        );
+        let document = json(&[row.clone()], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 22);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0]["forwarding_layer"], false);
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["layer_totals"]["logical"]["calls"], 22);
+        assert_eq!(profile["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = profile["functions"].as_array().unwrap();
+        assert_eq!(functions[0]["forwarding_layer"], false);
+    }
+
+    /// A provider attached but quiet (no calls, errors or in-flight
+    /// rows) beside an active layer: exclusion needs an *active*
+    /// provider, so the layer's calls stay logical.
+    #[test]
+    fn quiet_provider_beside_active_layer_keeps_layer_calls_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 695, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut quiet = report("C_Sign", 0, 0, false);
+        quiet.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), quiet.clone()], &ev);
+        assert!(
+            text.contains("695 completed calls;"),
+            "a quiet provider keeps the layer logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let document = json(&[outer, quiet], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 695);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// A provider row with errors but no completed calls still proves an
+    /// active provider below the layer: the split stays on and the
+    /// provider errors stay in the logical totals.
+    #[test]
+    fn provider_errors_alone_keep_the_forwarding_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut errored = report("C_Sign", 0, 0, false);
+        errored.module = Some(ModuleId(8));
+        errored.errors = 3;
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), errored.clone()], &ev);
+        assert!(
+            text.contains("0 completed calls; 3 returned errors;"),
+            "provider errors stay logical while the layer splits out: {text}"
+        );
+        assert!(
+            text.contains("Forwarding layers counted separately"),
+            "an erroring provider keeps the split: {text}"
+        );
+        let document = json(&[outer, errored], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 0);
+        assert_eq!(document["layer_totals"]["logical"]["errors"], 3);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
     /// JK-22a: a prefix-admitted ordinary provider names its attached
     /// endpoints as partially covered, counted under "modules partially
     /// covered" rather than "modules refused".

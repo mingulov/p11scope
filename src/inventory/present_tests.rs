@@ -2167,6 +2167,111 @@ fn forwarding_entries_line_states_the_counting_rule() {
     );
 }
 
+/// Two callers share a closure-array layer; only one also uses the
+/// provider. The closure edge of the provider-active caller splits to
+/// forwarding; the closure-only caller's edge stays logical.
+#[test]
+fn closure_only_caller_edges_stay_logical_beside_an_active_caller() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    assert!(
+        presentation.modules.len() >= 2,
+        "the twin needs two modules: {}",
+        presentation.modules.len()
+    );
+    presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
+    presentation.modules[0].admission_class = Some("closure_array".into());
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    let mut callers: Vec<CallerId> = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == fwd_id)
+        .map(|edge| edge.caller)
+        .collect();
+    callers.sort();
+    callers.dedup();
+    assert!(
+        callers.len() >= 2,
+        "the twin needs two callers at the layer: {}",
+        callers.len()
+    );
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id && edge.caller == callers[0])
+        .expect("an active-caller forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id && edge.caller == callers[0])
+        .expect("an active-caller provider edge")
+        .entry_count = 744;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id && edge.caller == callers[1])
+        .expect("a closure-only forwarding edge")
+        .entry_count = 22;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("Forwarding-layer entries counted separately"),
+        "forwarding split stated in plain words: {summary}"
+    );
+    assert!(
+        summary.contains("/opt/libforward.so") && summary.contains("500"),
+        "forwarding layer shown per layer: {summary}"
+    );
+    assert!(
+        !summary.contains("522"),
+        "the closure-only caller's entries are not in the forwarding line: {summary}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(document["layer_totals"]["logical_entries"], 766);
+    assert_eq!(document["layer_totals"]["forwarding_entries"], 500);
+}
+
+/// Lone-layer inventory twin: every edge sits at closure-array modules,
+/// so no caller has a provider edge and all entries stay logical.
+#[test]
+fn lone_forwarding_layer_edges_stay_logical() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    assert!(
+        presentation.modules.len() >= 2,
+        "the twin needs two modules: {}",
+        presentation.modules.len()
+    );
+    presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
+    presentation.modules[0].admission_class = Some("closure_array".into());
+    presentation.modules[1].paths = vec!["/opt/libother.so".into()];
+    presentation.modules[1].admission_class = Some("closure_array".into());
+    let fwd_id = presentation.modules[0].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id)
+        .expect("a forwarding edge")
+        .entry_count = 22;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        !summary.contains("Forwarding-layer entries counted separately"),
+        "no forwarding line without a provider edge: {summary}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(document["layer_totals"]["logical_entries"], 22);
+    assert_eq!(document["layer_totals"]["forwarding_entries"], 0);
+}
+
 #[test]
 fn f7_snapshot_high_cardinality_allocation_baseline() {
     // Exercise the real renderer with all 4096 edges/children, rather than

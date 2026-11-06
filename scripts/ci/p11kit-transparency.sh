@@ -538,6 +538,31 @@ PY
     --layer "client:$OUT/client.pin:workload:offset" --target-identity "$OUT/client.pin" \
     --forbid "$OUT/owned.pin" --exact-only client "$LOOP_FUNCS" --forbid-unknown
   local crc=$JUDGE_RC; local c_detail="$JUDGE_DETAIL"
+  # The client is the only observation point, so its calls stay
+  # logical: the logical split must equal the client total with
+  # nothing split out. A hard gate on a trusted report only — when
+  # the client report itself failed the oracle the composite below
+  # already fails the cell.
+  if [ "$crc" = 0 ]; then
+    if ! python3 - "$cell.client.json" <<'PY'; then
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = doc.get("functions", [])
+total = sum(row.get("calls", 0) for row in rows)
+layers = doc.get("layer_totals", {})
+logical = layers.get("logical", {}).get("calls", 0)
+forwarding = layers.get("forwarding", {}).get("calls", 0)
+marked = [row for row in rows if row.get("forwarding_layer")]
+assert forwarding == 0, "forwarding split %r, want 0" % (forwarding,)
+assert not marked, "%d rows marked forwarding_layer" % len(marked)
+assert logical == total, "logical %r != client total %r" % (logical, total)
+print("client layer split: logical %d == client total, forwarding 0" % logical)
+PY
+      terminate "$server" 2>/dev/null; rm -f -- "$sock"
+      result "$cell" 0 'client layer split broken: logical != client total or forwarding != 0' failed
+      return 1
+    fi
+  fi
 
   # Phase 2: server side. The server predates the capture, so every
   # server-side call the ledger names is post-attach and must be exact.

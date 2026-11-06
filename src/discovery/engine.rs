@@ -11920,10 +11920,16 @@ impl Engine {
     /// the gap counter it never moves calls or attribution; unlike
     /// it, the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
-        self.extensive.enabled().then_some(render::GapExitMappings {
-            mapped: self.exit_map.mapped,
-            unknown: self.exit_map.unknown,
-        })
+        // 7.10b: the exit-mapping split publishes with the gap
+        // consumer only. Gating on the master enable leaked a zero
+        // split under exact-PID scope, which has no gap
+        // subpopulation; the PID consumer publishes its own key.
+        self.extensive
+            .gap_active()
+            .then_some(render::GapExitMappings {
+                mapped: self.exit_map.mapped,
+                unknown: self.exit_map.unknown,
+            })
     }
 
     #[cfg(test)]

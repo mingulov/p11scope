@@ -53,11 +53,11 @@ pub(crate) const OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS: u32 = 8;
 /// Every refused overlay candidate proves through the private session
 /// — the only prover on such passes — so the budget covers the whole
 /// refused set of an inventory-sized sweep (cells need ~300) instead
-/// of the rare-exclusion bound above. Queries run sub-millisecond
-/// after the one-time session load, so a full budget costs about a
-/// second per pass worst case; the capture deadline still fail-closes
-/// each query, and the rotation accumulates past the bound across
-/// passes exactly like the kernel-pass window.
+/// of the rare-exclusion bound above. Each query runs under the same
+/// 500 ms ceiling as every target run and the capture deadline still
+/// fail-closes it, so the pass cost stays bounded; the rotation
+/// accumulates past the bound across passes exactly like the
+/// kernel-pass window.
 pub(crate) const OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE: u32 = 1024;
 
 /// The sweep's kernel witness for overlay keys with no sweep route.

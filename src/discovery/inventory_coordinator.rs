@@ -18735,6 +18735,154 @@ exit 0
         assert_eq!(gap.reason, short_lived_never_scanned_reason(1, 0));
     }
 
+    /// Twin: one miss is grace, not death. An exec newcomer missing a
+    /// single enumeration stays pending — a live process whose hook
+    /// drains between a pass's listing and its apply must not be
+    /// counted as "started and exited" — and lands in the post-pass
+    /// remainder at the terminal disclosure, never in the short-lived
+    /// count.
+    #[test]
+    fn single_miss_does_not_count_as_short_lived() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // One pass enumerates only the long-lived pid 7: the newcomer
+        // earns its first miss and stays pending.
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&SHORT_LIVED_NEVER_SCANNED_SUBJECT.to_string()),
+            "one miss is grace: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"discovery coverage ended before stop".to_string()),
+            "the still-pending pid lands in the post-pass remainder: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the passes list as examined-but-unadmitted
+    /// is covered by those listings' own disclosure — dropped from
+    /// pending, never counted as short-lived — for every non-Exited
+    /// listing status, not just `Scanned`. Two passes, so a status
+    /// wrongly earning misses would count.
+    #[test]
+    fn exec_newcomer_listed_but_unadmitted_is_covered_not_counted() {
+        let statuses: Vec<(&str, crate::inspect_system::MemberStatus)> = vec![
+            (
+                "unreadable",
+                crate::inspect_system::MemberStatus::Unreadable {
+                    reason: "test listing".to_string(),
+                },
+            ),
+            (
+                "not_selected",
+                crate::inspect_system::MemberStatus::NotSelected { loss: None },
+            ),
+            (
+                "memory_unavailable",
+                crate::inspect_system::MemberStatus::MemoryUnavailable {
+                    reason: "test listing",
+                },
+            ),
+            (
+                "maps_matched",
+                crate::inspect_system::MemberStatus::MapsMatched,
+            ),
+        ];
+        for (label, status) in statuses {
+            let (mut native, caller) = NativeScene::new();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+                native.domain,
+                8,
+                at,
+                at,
+            )));
+            // Two passes list pid 8 with the status: covered means
+            // dropped from pending on the first, so the second has
+            // nothing to miss and the terminal stays silent.
+            for _ in 0..2 {
+                let generation = native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .map(|record| crate::inspect_system::MemberGeneration {
+                        start_time: record.start_time,
+                        exe: record.exe.clone(),
+                    });
+                let mut catalog =
+                    capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+                catalog
+                    .processes
+                    .push(crate::inspect_system::ProcessRecord {
+                        pid: 8,
+                        status: status.clone(),
+                        objects: Vec::new(),
+                        generation: None,
+                        complete_scan: None,
+                        application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                        ),
+                        hints_examined: false,
+                    });
+                native.scene.coordinator.apply_catalog(
+                    catalog,
+                    &mut UnavailableImageGuard,
+                    &mut native.cookies,
+                    u64::MAX,
+                    native.stamps.tick(),
+                );
+                native.scene.coordinator.commit_batch(false).unwrap();
+            }
+            native.scene.coordinator.note_post_pass_exec_newcomers();
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                !native
+                    .gap_subjects()
+                    .contains(&SHORT_LIVED_NEVER_SCANNED_SUBJECT.to_string()),
+                "a {label}-listed newcomer is covered: {:?}",
+                native.gap_subjects()
+            );
+            assert!(
+                !native
+                    .gap_subjects()
+                    .contains(&"discovery coverage ended before stop".to_string()),
+                "a {label}-listed newcomer leaves no post-pass remainder: {:?}",
+                native.gap_subjects()
+            );
+        }
+    }
+
     /// The pending map is bounded: arrivals past the bound count as
     /// untracked and disclose beside the confirmed total, never growing
     /// the map and never silently dropped.

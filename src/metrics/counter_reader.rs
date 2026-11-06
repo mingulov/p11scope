@@ -6625,6 +6625,7 @@ mod tests {
             "counter_bank_growth_e0007",
             engine.plan(),
             &crate::attach::Scope::System,
+            None,
             &mut ledger,
         );
         assert!(

@@ -6279,6 +6279,7 @@ fn capture_profile(
             name,
             engine.plan(),
             scope,
+            None,
             &mut selection_ledger,
         )
     {

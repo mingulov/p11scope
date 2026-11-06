@@ -775,6 +775,11 @@ impl PidLifecycleTap {
     }
 
     #[cfg(test)]
+    pub(crate) fn test_pid(&self) -> u32 {
+        self.0.pid.get()
+    }
+
+    #[cfg(test)]
     pub(crate) fn test_facts(&self) -> Result<LifecycleFacts, PidContinuityRefusal> {
         self.facts()
     }

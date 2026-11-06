@@ -1674,10 +1674,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
         // and a zero lower bound carries no information, so neither prints
         // the line; JSON keeps the full record either way.
         if let Some(unbound) = &module.unbound_use {
-            let unidentified = unbound
-                .reasons
-                .keys()
-                .any(|code| *code != NO_MAPPING_EDGE);
+            let unidentified = unbound.reasons.keys().any(|code| *code != NO_MAPPING_EDGE);
             if unidentified && unbound.entries > 0 {
                 let _ = writeln!(
                     out,

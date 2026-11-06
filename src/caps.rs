@@ -10,12 +10,27 @@
 
 use std::io;
 
+/// `CAP_CHOWN` (`linux/capability.h`): hand `-o` outputs to the invoking
+/// user (root runs). Never in the file set.
+pub(crate) const CAP_CHOWN_BIT: u32 = 0;
+/// `CAP_DAC_OVERRIDE` (`linux/capability.h`): write `-o` outputs where
+/// only privilege allows (root runs). Never in the file set.
+pub(crate) const CAP_DAC_OVERRIDE_BIT: u32 = 1;
 /// `CAP_DAC_READ_SEARCH` (`linux/capability.h`): open provider files and
 /// traverse target paths the observer could not otherwise read.
 pub(crate) const CAP_DAC_READ_SEARCH_BIT: u32 = 2;
+/// `CAP_SETGID` / `CAP_SETUID` (`linux/capability.h`): assume `--user` in
+/// `run` (root runs). Never in the file set.
+pub(crate) const CAP_SETGID_BIT: u32 = 6;
+pub(crate) const CAP_SETUID_BIT: u32 = 7;
 /// `CAP_SYS_PTRACE` (`linux/capability.h`): read a target's memory under
 /// ptrace/Yama and cross-UID checks.
 pub(crate) const CAP_SYS_PTRACE_BIT: u32 = 19;
+/// `CAP_SYS_ADMIN` (`linux/capability.h`): only the per-probe singles
+/// fallback still needs it (paranoid 3+). Never in the file set; kept at
+/// startup so root singles captures keep working, dropped after setup
+/// when the session runs uprobe-multi.
+pub(crate) const CAP_SYS_ADMIN_BIT: u32 = 21;
 /// `CAP_PERFMON` (`linux/capability.h`): the BPF/perf half of program load.
 pub(crate) const CAP_PERFMON_BIT: u32 = 38;
 /// `CAP_BPF` (`linux/capability.h`): load BPF programs and attach links.
@@ -216,23 +231,46 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 }
 
 /// The capabilities one command keeps after startup: everything it can
-/// need later, nothing else. Live capture keeps the full minimal set
-/// (dynamic attach and rescans run until the end); `doctor` keeps it too
-/// (it reports the invoking set, so it must not drop first); `inspect`
-/// never loads BPF; offline commands keep nothing.
+/// need later, nothing else. That is the minimal live set plus the
+/// root-functional extras, each conditioned on the flags that need it:
+/// `-o` anywhere needs DAC_OVERRIDE and CHOWN, the singles fallback needs
+/// SYS_ADMIN, `run --user` needs SETUID/SETGID. A setcap user never holds
+/// the extras, so the same masks shed the whole grant surplus there;
+/// root keeps a functional subset instead of the full set. Live capture
+/// keeps the minimal set whole (dynamic attach and rescans run until the
+/// end); `doctor` keeps it too (it reports the invoking set, so it must
+/// not drop first); `inspect` never loads BPF; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let live = minimal_live_mask();
+    let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+    let out = |out: &Option<std::path::PathBuf>| {
+        if out.is_some() {
+            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT)
+        } else {
+            0
+        }
+    };
     match command {
-        Command::Profile(_)
-        | Command::Trace(_)
-        | Command::Run(_)
-        | Command::Inventory(_)
-        | Command::Doctor(_) => live,
+        Command::Profile(a) | Command::Trace(a) => live | sys_admin | out(&a.out),
+        Command::Inventory(a) => live | sys_admin | out(&a.out),
+        Command::Run(a) => {
+            let ids = if a.user.is_some() {
+                (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT)
+            } else {
+                0
+            };
+            live | sys_admin | out(&a.out) | ids
+        }
+        // Transient: SYS_ADMIN for the diagnostic perf attach until the
+        // diagnostic probe moves to uprobe-multi.
+        Command::Doctor(_) => live | sys_admin,
         // `inspect` reads memory and files only ("No BPF" is its module
-        // contract); the witness still needs checkpoint/restore.
+        // contract, and it has no `-o`); the witness still needs
+        // checkpoint/restore.
         Command::Inspect(_) => live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT)),
-        Command::InventoryDiff(_) | Command::Version => 0,
+        Command::InventoryDiff(a) => (1u64 << CAP_DAC_READ_SEARCH_BIT) | out(&a.out),
+        Command::Version => 0,
     }
 }
 
@@ -326,9 +364,13 @@ mod tests {
         crate::cli::parse(argv.iter().map(std::ffi::OsString::from)).expect("test argv parses")
     }
 
-    /// Per-command keep sets: live capture keeps the full minimal set,
-    /// `inspect` drops the BPF pair it never uses, offline commands and
-    /// `--version` keep nothing.
+    /// Per-command keep sets: live capture keeps the minimal set plus
+    /// the root-functional extras (`-o` anywhere needs DAC_OVERRIDE and
+    /// CHOWN for the handoff, the singles fallback needs SYS_ADMIN,
+    /// `run --user` needs SETUID/SETGID);
+    /// `inspect` drops the BPF pair it never uses; `diff` keeps file IO
+    /// only; `--version` keeps nothing. A setcap user never holds the
+    /// extras, so the same masks shed them there automatically.
     #[test]
     fn keep_masks_match_command_needs() {
         let live = minimal_live_mask();
@@ -336,22 +378,63 @@ mod tests {
         for cap in &MINIMAL_LIVE {
             assert_ne!(live & (1u64 << cap.bit), 0, "{} is kept", cap.name);
         }
+        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT);
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        let set_ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT);
+        // Live capture without `-o`: minimal set plus the singles fallback.
         for argv in [
             vec!["profile", "--pid", "1"],
             vec!["trace", "--pid", "1"],
             vec!["run", "--", "/bin/true"],
             vec!["inventory", "--system"],
         ] {
-            assert_eq!(keep_mask_for_command(&parse(&argv)), live, "{argv:?}");
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                live | sys_admin,
+                "{argv:?}"
+            );
         }
+        // `-o` anywhere needs DAC_OVERRIDE on top (root runs).
+        for argv in [
+            vec!["profile", "--pid", "1", "-o", "out.json"],
+            vec!["trace", "--pid", "1", "-o", "out.json"],
+            vec!["run", "-o", "out.json", "--", "/bin/true"],
+            vec!["inventory", "--system", "-o", "out.json"],
+        ] {
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                live | sys_admin | file_out,
+                "{argv:?}"
+            );
+        }
+        // `run --user` assumes the identity: SETUID/SETGID on top.
+        assert_eq!(
+            keep_mask_for_command(&parse(&["run", "--user", "nobody", "--", "/bin/true"])),
+            live | sys_admin | set_ids
+        );
         let inspect = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
         for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
             assert_eq!(keep_mask_for_command(&parse(&argv)), inspect, "{argv:?}");
         }
-        assert_eq!(keep_mask_for_command(&parse(&["doctor"])), live);
+        // Transient: doctor keeps SYS_ADMIN for the diagnostic perf attach
+        // until the diagnostic probe moves to uprobe-multi.
+        assert_eq!(keep_mask_for_command(&parse(&["doctor"])), live | sys_admin);
+        // `diff` reads two inputs and optionally writes one output.
+        let dac_read_search = 1u64 << CAP_DAC_READ_SEARCH_BIT;
         assert_eq!(
             keep_mask_for_command(&parse(&["inventory", "diff", "a.json", "b.json"])),
-            0
+            dac_read_search
+        );
+        assert_eq!(
+            keep_mask_for_command(&parse(&[
+                "inventory",
+                "diff",
+                "a.json",
+                "b.json",
+                "-o",
+                "out.json"
+            ])),
+            dac_read_search | file_out
         );
         assert_eq!(keep_mask_for_command(&parse(&["--version"])), 0);
     }

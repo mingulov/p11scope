@@ -871,26 +871,33 @@ contracts are
 [inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
 (section version 2) and
 [inventory-v1-object-observations-v3.schema.json](inventory-v1-object-observations-v3.schema.json)
-(section version 3) and
+(section version 3),
 [inventory-v1-object-observations-v4.schema.json](inventory-v1-object-observations-v4.schema.json)
-(section version 4); consumers must reject unknown section versions,
+(section version 4) and
+[inventory-v1-object-observations-v5.schema.json](inventory-v1-object-observations-v5.schema.json)
+(section version 5); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` follows the content: 4 iff a key row carries the
+- `version` follows the content: 5 iff PQC content is present — a
+  PQC `metadata_at_use` or object label, a PQC key-type scalar
+  (73, 74 or 75, requested or established), a non-blank
+  `parameter_set` field, or a `parameter_set` query other than
+  `not_queried` — else 4 iff a key row carries the
   `unknown` metadata label (a first-observed key — first seen before
   attach — whose type/size were never established in the observed
   window; its identity and counts are proved, no label is guessed),
   else 3 iff an `unattributed` counter is present, else 2 iff a KEM
   creation (`encapsulate`, `decapsulate`) or role
   (`encapsulation_key`, `decapsulation_key`) label is present,
-  otherwise byte-stable 1. Versions 1, 2 and 3 are frozen; version 1
-  never carries KEM labels and neither 1 nor 2 carries
-  `unattributed`; version 4 always carries `unattributed` (possibly
-  empty). A feed that fell back or lost
+  otherwise byte-stable 1. Versions 1, 2, 3 and 4 are frozen;
+  version 1 never carries KEM labels and neither 1 nor 2 carries
+  `unattributed`; versions 4 and 5 always carry `unattributed`
+  (possibly empty), and version 5 always carries the seven-key
+  metadata blocks. A feed that fell back or lost
   authority publishes its retained rows as `partial` with the reason
   named and its unproved calls counted in `unattributed[]`
   (`{reason, count}`, finite reasons, frozen order); the section is
@@ -912,26 +919,37 @@ never imply S1 loss.
   interval or null, never physical age. Counters count successful
   references, never distinct keys, completed operations or physical
   token inventory.
-- `requested`/`established` each hold the six fixed metadata slots
-  (`class`, `key_type`, `token`, `value_len`, `modulus_bits`,
-  `ec_params`), every slot `{status, value}` with `status` one of
-  `unknown`, `value`, `conflict` or `invalidated`. A `value` carries
-  the accepted numeric code or null: class 0-4, key type 0, 1, 2, 3,
-  4, 16, 31, 64 or 65 (OASIS numbers), token 0 or 1, value length 16,
-  24 or 32 bytes, modulus bits 1024, 2048, 3072, 4096 or 8192, and
-  the EC curve name (`secp256r1`, `secp384r1`, `secp521r1`) or null.
-  Labels are presentation names; JSON carries numeric codes. Requested
-  metadata never establishes result properties; conflicting duplicates
-  stay conflicts, never last-writer-wins.
+- `requested`/`established` each hold the fixed metadata slots —
+  six at section versions 1–4 (`class`, `key_type`, `token`,
+  `value_len`, `modulus_bits`, `ec_params`), seven at version 5
+  (plus `parameter_set`) — every slot `{status, value}` with
+  `status` one of `unknown`, `value`, `conflict` or `invalidated`.
+  A `value` carries the accepted numeric code or null: class 0-4,
+  key type 0, 1, 2, 3, 4, 16, 31, 64, 65 (73, 74, 75 for ML-KEM,
+  ML-DSA, SLH-DSA at version 5; OASIS numbers), token 0 or 1,
+  value length 16, 24 or 32 bytes, modulus bits 1024, 2048, 3072,
+  4096 or 8192, the EC curve name (`secp256r1`, `secp384r1`,
+  `secp521r1`) or null, and the parameter-set code 1..=12 at
+  version 5. Labels are presentation names; JSON carries numeric
+  codes. Requested metadata never establishes result properties;
+  conflicting duplicates stay conflicts, never last-writer-wins.
 - `queries` holds the per-field latest query outcome (`not_queried`,
   `established`, `unavailable`, `size_only`, `unsupported`,
-  `malformed`, `excluded`), distinct from current validity.
+  `malformed`, `excluded`), distinct from current validity, over
+  the six metadata fields (seven at section version 5).
 - `label` is the combined key label from established facts of the same
   view only (`rsa_1024`, `rsa_2048`, `rsa_3072`, `rsa_4096`,
   `rsa_other`, `aes_128`, `aes_192`, `aes_256`, `aes_other`,
-  `ec_p256`, `ec_p384`, `ec_p521`) or null. It is withheld when class
+  `ec_p256`, `ec_p384`, `ec_p521`, and at section version 5 the
+  eighteen PQC labels `ml_dsa_44`, `ml_dsa_65`, `ml_dsa_87`,
+  `ml_kem_512`, `ml_kem_768`, `ml_kem_1024` and the twelve
+  `slh_dsa_*` sets) or null. It is withheld when class
   conflicts or an established class is incompatible with the key type
-  (AES needs `secret_key`; RSA/EC need `public_key`/`private_key`).
+  (AES needs `secret_key`; RSA/EC/PQC need
+  `public_key`/`private_key`). A PQC label joins an established
+  parameter-set code with the established key type from the same
+  view; a code alone, a type alone, or a recognized mechanism never
+  labels. `unknown` is a key-row label only, never a view label.
   One provenance exception: an RSA private key created by
   `C_GenerateKeyPair` carries its pair-mate public key's established
   size when both handles came from the same successful return

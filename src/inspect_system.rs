@@ -26,7 +26,6 @@
 use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
-use crate::discovery::confirm_shards::attribute_unselected_with_policy;
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
     select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
@@ -1311,12 +1310,20 @@ fn collect_identity(
         (policy, ReservationOwner::new(policy))
     };
     let attribute = |pools: ProofPools<'_>| {
+        // Single-shot sweeps run no kernel run at all: refused overlay
+        // keys prove through the private witness session under the
+        // no-route budget (the first-pass window covers them all).
+        // Without overlay keys the hook answers plain userspace and no
+        // query runs, exactly like the policy path before.
+        let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::with_budget(
+            crate::discovery::overlay_witness::OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE,
+        );
         attribute_sweep_with(
             &mut collection,
             &bound,
             &bound.aggregate,
             |sweep, unavailable, selected, index, budget| {
-                attribute_unselected_with_policy(
+                crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
                     sweep,
                     unavailable,
                     selected,
@@ -1326,7 +1333,12 @@ fn collect_identity(
                     &reservations,
                     shards,
                     &|| OsConfirmIo::with_pools(pools),
+                    &bound.aggregate,
+                    &mut witness,
+                    0,
+                    0,
                 )
+                .0
             },
         )
     };

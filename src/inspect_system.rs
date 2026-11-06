@@ -5161,12 +5161,42 @@ where
 mod tests {
     use super::{
         IdentityNumbering, IdentityRunShared, IdentityShared, IdentityUnavailable,
-        LiveIdentityChecks, ProbeDir, ScriptedIdentityChecks, apply_kernel_fallback,
-        decide_pass_attempt, forced_kernel_refusal, preflight_forced_kernel,
-        runtime_fallback_label, take_session_for_pass,
+        LiveIdentityChecks, PassAttempt, ProbeDir, ScriptedIdentityChecks, apply_kernel_fallback,
+        decide_pass_attempt, forced_kernel_refusal, no_route_userspace_witness,
+        preflight_forced_kernel, runtime_fallback_label, take_session_for_pass,
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn no_route_userspace_pass_takes_the_witness() {
+        // RED: a userspace-mechanics pass proves its refused overlay
+        // keys through the private witness exactly when the selection
+        // allows BPF and the sweep planned proof but runs no kernel
+        // run (auto fell back). Explicit userspace never loads BPF;
+        // kernel passes already prove through their own run; without
+        // proof demand nothing loads.
+        assert!(no_route_userspace_witness(
+            false,
+            true,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            true,
+            true,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            false,
+            false,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            false,
+            true,
+            &PassAttempt::Kernel { threshold: None }
+        ));
+    }
 
     #[test]
     fn aimed_system_capture_lowers_without_shared_reserve() {

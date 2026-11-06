@@ -994,6 +994,53 @@ mod tests {
     }
 
     #[test]
+    fn no_route_budget_is_pinned() {
+        // RED: passes with no kernel route at all prove their refused
+        // overlay candidates through the private witness under their
+        // own per-pass budget.
+        assert_eq!(OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE, 1024);
+    }
+
+    #[test]
+    fn sweep_witness_with_budget_caps_at_its_cap() {
+        // RED: a budgeted sweep witness reports its cap for the window
+        // and exhausts at it, never at the kernel-pass bound.
+        let witness = KernelSweepWitness::new();
+        assert_eq!(
+            witness.queries_per_pass(),
+            OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS
+        );
+        let held = overlay_held();
+        let mut budget = CaptureWorkBudget::default();
+        let file = File::open("/dev/null").unwrap();
+        let key = ObjectKey {
+            device: p11scope_manifest::maps::Device { major: 8, minor: 1 },
+            inode: 7_101,
+        };
+        let mut witness = KernelSweepWitness::with_budget(2);
+        assert_eq!(witness.queries_per_pass(), 2);
+        witness.used = 2;
+        let (queries_before, _) = witness_stats_for_test();
+        let verdict = witness.prove(
+            std::process::id(),
+            &file,
+            &held,
+            key,
+            &[(0x1000_0000, 0x1000_1000)],
+            &mut budget,
+        );
+        assert_eq!(
+            verdict,
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted)
+        );
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
+            "an exhausted budgeted witness runs no query"
+        );
+    }
+
+    #[test]
     fn diagnosed_collection_work_skips_the_query_with_stage() {
         // A scoped-collection early-out is not a query (no stats), but
         // the refusal still names its stage in plain words.

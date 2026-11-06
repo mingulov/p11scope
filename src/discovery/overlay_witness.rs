@@ -276,6 +276,9 @@ pub(crate) enum WitnessStage {
     ProbeMismatch,
     /// The capture deadline expired before the run could start.
     CaptureDeadline,
+    /// The monotonic clock could not be read to compare against the
+    /// capture deadline.
+    DeadlineClock,
     /// The anchor FD census failed.
     FdCensus,
     /// The held file was refused as the witness anchor.
@@ -322,6 +325,7 @@ impl WitnessDiagnosis {
             WitnessStage::FunctionalProbe { stage } => format!("functional_probe:{stage}"),
             WitnessStage::ProbeMismatch => "probe_mismatch".to_string(),
             WitnessStage::CaptureDeadline => "capture_deadline".to_string(),
+            WitnessStage::DeadlineClock => "deadline_clock".to_string(),
             WitnessStage::FdCensus => "fd_census".to_string(),
             WitnessStage::AnchorOffer => "anchor_offer".to_string(),
             WitnessStage::AnchorReconcile => "anchor_reconcile".to_string(),
@@ -368,6 +372,7 @@ impl WitnessDiagnosis {
                 "kernel identity self-test failed its checks".to_string()
             }
             WitnessStage::CaptureDeadline => "capture deadline reached before the run".to_string(),
+            WitnessStage::DeadlineClock => "capture deadline clock unreadable".to_string(),
             WitnessStage::FdCensus => "file-descriptor census unavailable".to_string(),
             WitnessStage::AnchorOffer => "held file refused as witness anchor".to_string(),
             WitnessStage::AnchorReconcile => "witness anchor reservation failed".to_string(),
@@ -659,9 +664,10 @@ fn prove_original_file_inner(
     if budget.check_deadline_now().is_some() {
         return unavailable(WitnessStage::CaptureDeadline);
     }
-    let deadline = witness_deadline(budget);
-    let Some(deadline) = deadline else {
-        return unavailable(WitnessStage::CaptureDeadline);
+    let deadline = match witness_deadline(budget) {
+        Ok(Some(deadline)) => deadline,
+        Ok(None) => return unavailable(WitnessStage::CaptureDeadline),
+        Err(stage) => return unavailable(stage),
     };
     let owner = match SegmentPolicy::try_snapshot(0, 0) {
         Ok(policy) => ReservationOwner::for_examined(policy, 1),
@@ -753,19 +759,40 @@ fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis>
 }
 
 /// One query's ceiling: 500 ms like every target run, clamped by the
-/// capture deadline. `None` when the capture is already over deadline.
-fn witness_deadline(budget: &CaptureWorkBudget) -> Option<Instant> {
-    let now = Instant::now();
+/// capture deadline. `Ok(None)` when the capture is already over deadline;
+/// `Err` names the stage when the ceiling itself cannot be computed.
+fn witness_deadline(budget: &CaptureWorkBudget) -> Result<Option<Instant>, WitnessStage> {
+    witness_deadline_with_clock(
+        budget.effective_deadline_ns(),
+        crate::attach::monotonic_ns(),
+        Instant::now(),
+    )
+}
+
+/// The deadline arithmetic with an injected clock reading, so the
+/// clock-failure arm is testable without failing `clock_gettime`.
+fn witness_deadline_with_clock(
+    limit: Option<u64>,
+    clock: Option<u64>,
+    now: Instant,
+) -> Result<Option<Instant>, WitnessStage> {
     let mut deadline = now + Duration::from_millis(500);
-    if let Some(limit) = budget.effective_deadline_ns() {
-        let clock = crate::attach::monotonic_ns()?;
-        let left = limit.checked_sub(clock)?;
-        deadline = deadline.min(now.checked_add(Duration::from_nanos(left))?);
+    if let Some(limit) = limit {
+        let Some(clock) = clock else {
+            return Ok(None);
+        };
+        let Some(left) = limit.checked_sub(clock) else {
+            return Ok(None);
+        };
+        let Some(clamped) = now.checked_add(Duration::from_nanos(left)) else {
+            return Ok(None);
+        };
+        deadline = deadline.min(clamped);
     }
     if Instant::now() >= deadline {
-        return None;
+        return Ok(None);
     }
-    Some(deadline)
+    Ok(Some(deadline))
 }
 
 /// Read every refused range's kernel proof from the one confirmation.
@@ -1481,6 +1508,55 @@ mod tests {
         assert_eq!(
             queries_before, queries_after,
             "an exhausted sweep budget runs no query"
+        );
+    }
+
+    #[test]
+    fn deadline_clock_failure_names_its_own_stage() {
+        // RED: an unreadable monotonic clock is not a spent deadline —
+        // the refusal names the clock, never "capture deadline reached".
+        let now = Instant::now();
+        assert_eq!(
+            witness_deadline_with_clock(Some(1_000_000_000), None, now),
+            Err(WitnessStage::DeadlineClock)
+        );
+    }
+
+    #[test]
+    fn deadline_past_limit_stays_capture_deadline() {
+        // A limit already behind the clock is still the spent deadline,
+        // not the clock stage.
+        let now = Instant::now();
+        assert_eq!(
+            witness_deadline_with_clock(Some(100), Some(200), now),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn deadline_without_limit_keeps_the_500ms_ceiling() {
+        // No capture deadline: the query keeps its own 500 ms ceiling,
+        // and no clock reading is needed.
+        let now = Instant::now();
+        let deadline = witness_deadline_with_clock(None, None, now)
+            .expect("no limit always computes a ceiling")
+            .expect("the ceiling is in the future");
+        assert_eq!(deadline, now + Duration::from_millis(500));
+    }
+
+    #[test]
+    fn deadline_clock_note_and_token_are_pinned() {
+        // The new stage's machine token and plain-words note, pinned
+        // exactly like the rest of the vocabulary.
+        let diagnosis = WitnessDiagnosis {
+            stage: WitnessStage::DeadlineClock,
+        };
+        assert_eq!(diagnosis.stage_token(), "deadline_clock");
+        assert_eq!(diagnosis.note(), "capture deadline clock unreadable");
+        assert_eq!(
+            diagnosis.enriched_reason(),
+            "original_file_unproven: kernel witness unavailable: \
+             capture deadline clock unreadable"
         );
     }
 }

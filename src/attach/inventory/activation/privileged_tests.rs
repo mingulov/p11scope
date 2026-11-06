@@ -8992,9 +8992,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             evidence.identity_event(event, fixture, witness, role)?;
             tracer.count_raw_call(event);
             let rendered = tracer.on_event(event, &mut state);
-            ensure!(
-                rendered.contains("C_Finalize") && rendered.contains("C_Initialize")
-            );
+            ensure!(rendered.contains("C_Finalize") && rendered.contains("C_Initialize"));
             evidence.render(&rendered)?;
         }
     }

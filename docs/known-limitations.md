@@ -91,7 +91,7 @@ integration may still move them; the candidate pass confirms the numbers.
   `original_file_unproven` gap and its later calls are missed; restart
   such processes.
 - The overlay-identity witness proves up to 8 refused callers per
-  deep-scan scan and per kernel-route sweep pass, and up to 1024
+  deep scan and per kernel-route sweep pass, and up to 1024
   refused callers per no-route sweep pass (single-shot
   inspect/inventory sweeps prove through the same witness under the
   1024 budget): past each route's budget, callers take turns across

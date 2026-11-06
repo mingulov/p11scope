@@ -8776,6 +8776,111 @@ pub(crate) mod tests {
         assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
     }
 
+    /// Ownership-gap lines explain headline attribution gaps, so they
+    /// count logical rows only: unattributed forwarding rows are already
+    /// stated in the forwarding line, never summed here.
+    #[test]
+    fn ownership_gap_lines_count_logical_rows_only() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.dev = (8, 1);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut stray = report("unknown#4", 5, 0, false);
+        stray.module = None;
+        stray.module_unresolved = true;
+        stray.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 82,
+            sha256: None,
+        });
+        let mut contested = report("unknown#5", 7, 0, false);
+        contested.module = None;
+        contested.module_ambiguous = true;
+        contested.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, stray, contested, inner], &ev);
+        assert!(
+            text.contains("749 completed calls;"),
+            "headline counts logical rows once: {text}"
+        );
+        assert!(
+            text.contains("\n5 completed calls have unresolved module ownership.\n"),
+            "unresolved line counts the logical stray only: {text}"
+        );
+        assert!(
+            !text.contains("505 completed calls"),
+            "forwarding rows are not summed into the unresolved line: {text}"
+        );
+        assert!(
+            !text.contains("ambiguous module ownership"),
+            "a forwarding-only ambiguity prints no ownership line: {text}"
+        );
+    }
+
+    /// An unattributed forwarding row matched to its layer by attach-target
+    /// file identity is named in the per-layer line, not hidden behind
+    /// "an unattributed forwarding target".
+    #[test]
+    fn unattributed_forwarding_line_names_the_identity_matched_layer() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains("/opt/libforward.so recorded 500 completed forwarding-layer calls"),
+            "the identity-matched layer is named: {text}"
+        );
+        assert!(
+            !text.contains("an unattributed forwarding target"),
+            "no unattributed label for a matched layer: {text}"
+        );
+    }
+
     /// JK-22a: a prefix-admitted ordinary provider names its attached
     /// endpoints as partially covered, counted under "modules partially
     /// covered" rather than "modules refused".
@@ -9392,6 +9497,62 @@ pub(crate) mod tests {
         assert!(out.contains("C_Sign (forwarding layer)"), "{out}");
         assert_eq!(out.matches("C_Sign").count(), 2, "{out}");
         assert_eq!(out.matches("(forwarding layer)").count(), 1, "{out}");
+    }
+
+    /// A marked long-name row stays inside the name field: its CALLS
+    /// value aligns with the header's CALLS column instead of pushing
+    /// the row's columns right.
+    #[test]
+    fn live_table_forwarding_marker_keeps_column_alignment() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_GetAttributeValue", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[outer, inner],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header = out
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col = header.find("CALLS").expect("CALLS column");
+        let marked = out
+            .lines()
+            .find(|line| line.contains("C_GetAttributeValue (forwarding layer)"))
+            .expect("marked long-name row");
+        assert_eq!(
+            &marked[calls_col..calls_col + 5],
+            "  500",
+            "marked row CALLS aligns with the header: {out}"
+        );
+        let plain = out
+            .lines()
+            .find(|line| line.starts_with("C_Sign "))
+            .expect("unmarked row");
+        assert_eq!(
+            &plain[calls_col..calls_col + 5],
+            "  744",
+            "unmarked row CALLS aligns with the header: {out}"
+        );
     }
 
     /// Demo journey 2, empty side: with observed calls but no attributed

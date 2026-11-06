@@ -462,13 +462,34 @@ fn apply_seccomp() -> Result<(), String> {
     Ok(())
 }
 
+/// Apply the isolated fence with injectable stages (test seam): the
+/// architecture gate runs before any raw syscall, so a non-x86-64 build
+/// refuses with `x86-64 only` instead of probing Landlock with the wrong
+/// syscall numbers (contract R6).
+fn apply_isolated_with(
+    is_x86_64: bool,
+    writable_dir: Option<&Path>,
+    landlock: impl FnOnce(Option<&Path>) -> Result<(), String>,
+    seccomp: impl FnOnce() -> Result<(), String>,
+) -> Result<(), String> {
+    landlock(writable_dir)?;
+    if !is_x86_64 {
+        return Err("isolated profile: x86-64 only".into());
+    }
+    seccomp()
+}
+
 /// Apply the isolated fence: Landlock first, then seccomp. `writable_dir`
 /// is the `-o` parent directory, or `None` for stdout output. On success
 /// the caller may load the provider; on failure it must exit before
 /// `dlopen` — provider code never runs.
 pub fn apply_isolated(writable_dir: Option<&Path>) -> Result<(), String> {
-    apply_landlock(writable_dir)?;
-    apply_seccomp()
+    apply_isolated_with(
+        cfg!(target_arch = "x86_64"),
+        writable_dir,
+        apply_landlock,
+        apply_seccomp,
+    )
 }
 
 #[cfg(test)]
@@ -598,5 +619,65 @@ mod tests {
             "the tree rule is not the output dir: {error}"
         );
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn arch_gate_runs_before_any_fence_syscall() {
+        use std::cell::Cell;
+        let landlock_called = Cell::new(false);
+        let seccomp_called = Cell::new(false);
+        let error = apply_isolated_with(
+            false,
+            Some(Path::new("/no-such-output-dir")),
+            |_| {
+                landlock_called.set(true);
+                Ok(())
+            },
+            || {
+                seccomp_called.set(true);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "isolated profile: x86-64 only");
+        assert!(
+            !landlock_called.get(),
+            "the arch gate must run before Landlock"
+        );
+        assert!(
+            !seccomp_called.get(),
+            "the arch gate must run before seccomp"
+        );
+    }
+
+    #[test]
+    fn supported_arch_runs_both_stages_in_order() {
+        use std::cell::RefCell;
+        let order = RefCell::new(Vec::new());
+        let result = apply_isolated_with(
+            true,
+            None,
+            |dir| {
+                order.borrow_mut().push("landlock");
+                assert_eq!(dir, None);
+                Ok(())
+            },
+            || {
+                order.borrow_mut().push("seccomp");
+                Ok(())
+            },
+        );
+        assert!(result.is_ok());
+        assert_eq!(*order.borrow(), ["landlock", "seccomp"]);
+        let error = apply_isolated_with(
+            true,
+            None,
+            |_| Err("landlock stage failed".to_string()),
+            || {
+                panic!("seccomp must not run after a Landlock failure");
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error, "landlock stage failed");
     }
 }

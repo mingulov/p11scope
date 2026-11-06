@@ -34,6 +34,7 @@ pub mod attach;
 #[allow(dead_code)]
 pub(crate) mod caller_metadata;
 pub mod capacity;
+pub mod caps;
 pub(crate) mod cgroup_stop_acceptance;
 pub mod cli;
 pub mod discovery;

@@ -8596,9 +8596,10 @@ pub(crate) mod tests {
         assert_eq!(outer_json["forwarding_layer"], true);
     }
 
-    /// The forwarding line states the counting rule, not a structural
-    /// nesting claim: each forwarding-layer call is counted at the
-    /// provider it forwards into.
+    /// The forwarding line states the counting rule honestly: provider
+    /// totals, self-answered layer calls kept in the forwarding line,
+    /// and per-provider counting of multi-provider layer calls — not an
+    /// exactness claim the code does not have.
     #[test]
     fn forwarding_line_states_the_counting_rule() {
         let mut layer = discovered_fixture();
@@ -8618,8 +8619,17 @@ pub(crate) mod tests {
         ev.verdict();
         let text = scope_summary("pid", &[outer, inner], &ev);
         assert!(
-            text.contains("Each forwarding-layer call is counted at the provider it forwards into"),
-            "counting rule stated: {text}"
+            text.contains(
+                "The totals above count calls at the attached providers; \
+                 calls a layer answered itself, including its errors, appear only here, \
+                 and a layer call that reaches several providers counts at each."
+            ),
+            "honest counting rule stated: {text}"
+        );
+        assert!(
+            !text
+                .contains("Each forwarding-layer call is counted at the provider it forwards into"),
+            "no exactness claim beyond the code: {text}"
         );
         assert!(
             !text.contains("contains one provider call on the same thread"),

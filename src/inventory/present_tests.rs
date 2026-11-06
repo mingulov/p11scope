@@ -2128,8 +2128,10 @@ fn forwarding_layer_entries_count_separately_with_per_layer_split() {
     assert_eq!(plain_json["layer_totals"]["forwarding_entries"], 0);
 }
 
-/// The inventory forwarding line states the counting rule, not a
-/// structural nesting claim.
+/// The inventory forwarding line states the counting rule honestly:
+/// provider edges are the logical totals, self-answered layer entries
+/// stay in the forwarding line, and multi-provider layer entries count
+/// at each — not an exactness claim the code does not have.
 #[test]
 fn forwarding_entries_line_states_the_counting_rule() {
     let harness = varied_harness();
@@ -2158,8 +2160,17 @@ fn forwarding_entries_line_states_the_counting_rule() {
         .entry_count = 744;
     let summary = render_snapshot_summary(&presentation);
     assert!(
-        summary.contains("Each forwarding-layer entry is counted at the provider it forwards into"),
-        "counting rule stated: {summary}"
+        summary.contains(
+            "Provider edges are the logical totals; \
+             entries a layer answered itself appear only here, \
+             and a layer entry that reaches several providers counts at each."
+        ),
+        "honest counting rule stated: {summary}"
+    );
+    assert!(
+        !summary
+            .contains("Each forwarding-layer entry is counted at the provider it forwards into"),
+        "no exactness claim beyond the code: {summary}"
     );
     assert!(
         !summary.contains("Each contains one provider entry on the same thread"),

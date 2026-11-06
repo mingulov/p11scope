@@ -1330,8 +1330,9 @@ Limits that matter in pods:
   sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
   intervening migration. Concise text prints one scope line per labeled caller,
   e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker)`;
-  verbose text and JSON show the full 64-hex ID. Required installed multi-container/pod
-  qualification remains open.
+  verbose text and JSON show the full 64-hex ID. Installed two-container and
+  synthetic-pod qualification passed on Fedora 7.2 in v0.7.0; kind-orchestrated
+  pod qualification remains open (nested-PID-namespace binding limitation, R-45).
 
   `--capture auto|scan|native` selects the usage lane. `scan` reads
   `/proc` without loading usage BPF: every edge's usage coverage

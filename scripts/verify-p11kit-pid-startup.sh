@@ -7,7 +7,9 @@
 # yet must START (exit 0, PARTIAL) with the closure named as an unpublished
 # gap, then attach the three providers the holder loads after attach and
 # count exactly the holder's calls: 5 C_GetInfo plus 1 C_Finalize per
-# backend, 18 calls over 242 slots. The pre-fix observer refuses to start
+# backend, 18 calls over 242 slots (opensc additionally admits its proven
+# load-time suffixes when live attach wins the race against p11-kit's
+# load-time calls, for 19-21 calls total). The pre-fix observer refuses to start
 # here ("every module discovery found was refused at the 512 attach-slot
 # ceiling"), so this cell is the live guard for that startup rule.
 #
@@ -16,9 +18,10 @@
 # line, loads three managed modules (p11-kit-trust, softhsm2, opensc) from a
 # private XDG_CONFIG_HOME, then drives 5 C_GetInfo calls through each.
 # Oracle: exit 0, PARTIAL, 242 slots, per-backend tables [68] / [68] /
-# [68, 92, 104], 18 calls (6 per backend; softhsm and opensc name C_GetInfo
-# x5 plus C_Finalize x1), and the closure gap text with no capacity
-# sentence. Per-module function-row counts are recorded, not pinned.
+# [68, 92, 104], 18 calls (6 per backend; softhsm names C_GetInfo x5
+# plus C_Finalize x1; opensc that or one proven load-time suffix),
+# and the closure gap text with no capacity sentence. Per-module
+# function-row counts are recorded, not pinned.
 #
 # Needs root for the observer (sudo -n), plus gcc, the p11-kit trust and
 # proxy modules, opensc and softhsm2. Provider paths are probed (Debian and
@@ -95,6 +98,22 @@ OPENSC_CANDIDATES = (
 )
 HOLDER_SRC = Path("scripts/fixtures/p11kit-pid-holder.c")
 CALLS = 5
+# B3: the proven opensc load-time ledger (ground-truth bpftrace on the
+# holder sequence): p11-kit calls C_GetInterface x1 then C_Initialize
+# x1 at load; opensc's C_Initialize nests one C_Finalize (rv
+# CKR_CRYPTOKI_NOT_INITIALIZED) as init cleanup; the holder then
+# drives C_GetInfo x5 and release calls C_Finalize x1 at shutdown.
+# Live discovery attaches asynchronously and a return without an
+# observed entry is dropped (BPF return path), so the observer
+# legally sees the post-load shape or one entry-observed suffix of
+# the load-time prefix. Every other shape is still rejected.
+OPENSC_ACCEPTED = (
+    {"C_GetInfo": CALLS, "C_Finalize": 1},
+    {"C_GetInterface": 1, "C_Initialize": 1, "C_Finalize": 2,
+     "C_GetInfo": CALLS},
+    {"C_Initialize": 1, "C_Finalize": 2, "C_GetInfo": CALLS},
+    {"C_Finalize": 2, "C_GetInfo": CALLS},
+)
 EXPECTED_SLOTS = 242
 EXPECTED_TABLES = {
     "p11-kit-trust.so": [68],
@@ -194,17 +213,23 @@ def check_calls(doc):
     # The grand total covers every counted module, not just the three
     # backends: a call counted anywhere else breaks the exact shape.
     total = sum(calls for entries in per.values() for _, calls in entries)
-    for base in ("libsofthsm2.so", "opensc-pkcs11.so"):
-        agg = {}
-        for names, calls in per.get(base, []):
-            agg[names] = agg.get(names, 0) + calls
-        want = {"C_GetInfo": CALLS, "C_Finalize": 1}
-        require(agg == want, "%s calls %r, want %r" % (base, agg, want))
+    agg = {}
+    for names, calls in per.get("libsofthsm2.so", []):
+        agg[names] = agg.get(names, 0) + calls
+    want = {"C_GetInfo": CALLS, "C_Finalize": 1}
+    require(agg == want, "libsofthsm2.so calls %r, want %r" % (agg, want))
+    agg = {}
+    for names, calls in per.get("opensc-pkcs11.so", []):
+        agg[names] = agg.get(names, 0) + calls
+    require(agg in OPENSC_ACCEPTED,
+            "opensc-pkcs11.so calls %r, want one of %r"
+            % (agg, list(OPENSC_ACCEPTED)))
+    opensc_total = sum(agg.values())
     trust_total = sum(calls for _, calls in per.get("p11-kit-trust.so", []))
     require(trust_total == CALLS + 1,
             "trust calls %d, want %d" % (trust_total, CALLS + 1))
-    require(total == 3 * (CALLS + 1),
-            "total %d calls, want %d" % (total, 3 * (CALLS + 1)))
+    require(total == 2 * (CALLS + 1) + opensc_total,
+            "total %d calls, want %d" % (total, 2 * (CALLS + 1) + opensc_total))
     return per
 
 
@@ -263,6 +288,19 @@ def self_test():
     print("self-test: positive fixture passes "
           "(PARTIAL, 242 slots, exact tables and calls)")
 
+    for shape in OPENSC_ACCEPTED[1:]:
+        led = copy.deepcopy(doc)
+        led["functions"] = [row for row in led["functions"]
+                            if row["module"]["ino"] != 2]
+        for names, calls in sorted(shape.items()):
+            led["functions"].append(
+                {"module": {"ino": 2}, "names": [names], "calls": calls})
+        check_capture(led)
+        check_tables(led)
+        check_calls(led)
+    print("self-test: %d proven opensc load-time suffixes pass"
+          % (len(OPENSC_ACCEPTED) - 1))
+
     def tweak_slots(doc):
         doc["evidence"]["slots"] = 241
 
@@ -311,6 +349,26 @@ def self_test():
     def tweak_opensc_names(doc):
         doc["functions"][3]["names"] = []
 
+    def tweak_opensc_suffix_short(doc):
+        doc["functions"] = [row for row in doc["functions"]
+                            if row["module"]["ino"] != 2]
+        for names, calls in (("C_GetInterface", 1), ("C_Initialize", 1),
+                             ("C_Finalize", 2), ("C_GetInfo", CALLS - 1)):
+            doc["functions"].append(
+                {"module": {"ino": 2}, "names": [names], "calls": calls})
+
+    def tweak_opensc_suffix_extra(doc):
+        doc["functions"].append(
+            {"module": {"ino": 2}, "names": ["C_Encrypt"], "calls": 1})
+
+    def tweak_opensc_suffix_fini3(doc):
+        doc["functions"] = [row for row in doc["functions"]
+                            if row["module"]["ino"] != 2]
+        for names, calls in (("C_GetInterface", 1), ("C_Initialize", 1),
+                             ("C_Finalize", 3), ("C_GetInfo", CALLS)):
+            doc["functions"].append(
+                {"module": {"ino": 2}, "names": [names], "calls": calls})
+
     def tweak_trust_short(doc):
         doc["functions"][4]["calls"] = 4
 
@@ -333,6 +391,9 @@ def self_test():
         ("softhsm-missing", tweak_softhsm_missing, check_tables),
         ("softhsm-calls", tweak_softhsm_calls, check_calls),
         ("opensc-names", tweak_opensc_names, check_calls),
+        ("opensc-suffix-short", tweak_opensc_suffix_short, check_calls),
+        ("opensc-suffix-extra", tweak_opensc_suffix_extra, check_calls),
+        ("opensc-suffix-fini3", tweak_opensc_suffix_fini3, check_calls),
         ("trust-short", tweak_trust_short, check_calls),
         ("extra-module", tweak_extra_module, check_calls),
     ]

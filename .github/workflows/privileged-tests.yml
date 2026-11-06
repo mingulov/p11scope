@@ -805,8 +805,9 @@ jobs:
       # A named capture starting beside an unpublished p11-kit closure array:
       # the observer must start PARTIAL with the closure gap named, then
       # attach the three providers the holder loads after attach and count
-      # exactly 18 calls over 242 slots. The pre-fix observer refuses to
-      # start here, so this cell guards that startup rule.
+      # exactly the holder's calls over 242 slots (18, or 19-21 when live
+      # attach precedes opensc's load-time calls). The pre-fix observer
+      # refuses to start here, so this cell guards that startup rule.
       - name: Run p11-kit pid-startup cell
         shell: bash
         run: |

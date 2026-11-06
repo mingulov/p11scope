@@ -1815,6 +1815,29 @@ The old bounds are measurements, not a product startup SLA.
 - Workaround: restart the capture on the new pid.
 - Planned: v0.3.0 (C5/C5b re-attach policy or a documented boundary).
 
+### `inventory --pid` leaves a one-shot caller's use unattributed
+
+- What the user sees: a one-shot `pkcs11-tool --sign` (or any caller that
+  uses and exits between two ~1 Hz inventory passes) shows its edge with
+  no entries (`entries.count=0`, coverage `use_before_admission`,
+  `mechanisms=null`) while the module carries the folded calls as
+  `unbound_use` with reason `no_live_caller`. The same flow under
+  `profile --pid` binds (the identical 7-call sign shows `C_Sign` there).
+- Kernels/conditions: all kernels; `--pid` with a caller that exits before
+  the next witness drain. Reproduced with and without an exec during
+  capture and with and without a manifest (SoftHSM stable shape:
+  1 caller retired `exited`, 1 edge, `unbound_use.entries=7`).
+- Disclosure: `modules[].unbound_use` (`rows`, `reasons`, `entries`),
+  `observation.native_witnesses` (`rows`/`bound`/`unbound`), the edge's
+  `use_before_admission` coverage, and the `used by an unidentified
+  caller image` gap. No false join is made: the use stays module-level.
+- Workaround: `profile --pid` for one-shot flows; long-lived callers
+  (alive across at least two passes) for inventory edge counts.
+- Planned: bind PID-scope rows to the retained scope incarnation when the
+  kernel pid filter proves the generation, or cache the ticket while the
+  caller lives. Either needs a design that keeps pid-reuse safety
+  (a pid number alone never selects the exited generation).
+
 ### Per-call overhead on attested endpoints unmeasured (DR-12)
 
 - What the user sees: double probe cost on attested endpoints plus the

@@ -9786,6 +9786,150 @@ pub(crate) mod tests {
         );
     }
 
+    /// Concise shows one short top-mechanisms line instead of the full
+    /// table: the top three by calls, then an "and K more" suffix. The
+    /// full table stays one `-v` away (see the verbose twin below).
+    #[test]
+    fn concise_frame_shows_top_mechanisms_on_one_line() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
+            (0x1087, mech_stat(120, 2)),
+            (0x250, mech_stat(45, 0)),
+            (0x1081, mech_stat(30, 0)),
+            (0x1041, mech_stat(12, 0)),
+            (0x1, mech_stat(3, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 210, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains("MECHANISM"), "{out}");
+        let line = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("concise mechanisms line: {out}");
+        assert!(
+            line.contains("CKM_AES_GCM")
+                && line.contains("CKM_SHA256")
+                && line.contains("CKM_AES_ECB"),
+            "top three by calls: {line}"
+        );
+        assert!(!line.contains("CKM_ECDSA"), "beyond the top three: {line}");
+        assert!(
+            !line.contains("CKM_RSA_PKCS"),
+            "beyond the top three: {line}"
+        );
+        assert!(line.contains("and 2 more"), "{line}");
+    }
+
+    /// The concise mechanisms line names nonzero errors beside the call
+    /// count and renders unregistered ids as hex, exactly like the
+    /// table does. Three or fewer ids carry no "more" suffix.
+    #[test]
+    fn concise_mechanism_line_names_errors_and_hex_ids() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
+            (0x1087, mech_stat(120, 2)),
+            (0x9999, mech_stat(1, 1)),
+            (0x250, mech_stat(30, 0)),
+        ]
+        .into_iter()
+        .collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 151, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        let line = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("concise mechanisms line: {out}");
+        assert!(line.contains("CKM_AES_GCM 120 calls (2 errors)"), "{line}");
+        assert!(line.contains("0x9999 1 call (1 error)"), "{line}");
+        assert!(line.contains("CKM_SHA256 30 calls"), "{line}");
+        assert!(!line.contains("more"), "{line}");
+    }
+
+    /// Verbose keeps the full mechanism table: every id on its own row,
+    /// with no "and K more" truncation.
+    #[test]
+    fn verbose_frame_lists_every_mechanism_row() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
+            (0x1087, mech_stat(120, 2)),
+            (0x250, mech_stat(45, 0)),
+            (0x1081, mech_stat(30, 0)),
+            (0x1041, mech_stat(12, 0)),
+            (0x9999, mech_stat(3, 1)),
+        ]
+        .into_iter()
+        .collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 210, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("MECHANISM"), "{out}");
+        for name in [
+            "CKM_AES_GCM",
+            "CKM_SHA256",
+            "CKM_AES_ECB",
+            "CKM_ECDSA",
+            "0x9999",
+        ] {
+            assert!(out.contains(name), "{out}");
+        }
+        assert!(!out.contains("more"), "{out}");
+    }
+
+    /// Verbose with no attributed mechanisms keeps the same one-line gap
+    /// note concise shows.
+    #[test]
+    fn verbose_frame_without_mechanisms_says_none_recorded() {
+        let mut ev = evidence();
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped_with_verbosity(
+            &[report("C_GetInfo", 1, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            out.contains("Mechanisms: none recorded for the observed calls."),
+            "{out}"
+        );
+    }
+
     #[test]
     fn live_view_without_mechanisms_shows_no_table() {
         let mut ev = evidence();
@@ -11404,6 +11548,141 @@ pub(crate) mod tests {
         let mut op = init_event(1, p11scope_ebpf_common::MECH_NONE, shape::NONE, 0, 0, 0);
         op.capture = p11scope_ebpf_common::capture::MECHANISM_NONE;
         op
+    }
+
+    /// Two providers sharing one process: slots 0/2 (`C_SignInit`/`C_Sign`)
+    /// on module 0, slots 1/3 on module 1, each pair on its own pinned
+    /// object — the seam per-provider mechanism attribution renders.
+    fn two_module_sign_plan() -> crate::plan::AttachPlan {
+        let slot = |index: u32, name: &str, module: u32, object: u32, file_offset: u64| {
+            crate::plan::Slot {
+                index,
+                descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
+                object: crate::discovery::identity::PinnedObjectId(object),
+                object_path: format!("/opt/p{module}.so"),
+                file_offset,
+                names: vec![name.into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor(name).unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: false,
+                module_ids: vec![crate::plan::ModuleId(module)],
+            }
+        };
+        crate::plan::AttachPlan::from_slots(vec![
+            slot(0, "C_SignInit", 0, 42, 0x10),
+            slot(1, "C_SignInit", 1, 43, 0x10),
+            slot(2, "C_Sign", 0, 42, 0x20),
+            slot(3, "C_Sign", 1, 43, 0x20),
+        ])
+    }
+
+    /// An operational `C_Sign` call on an explicit slot of
+    /// [`two_module_sign_plan`] with an explicit return code.
+    fn sign_op_event_at(slot: u32, rv: u64) -> p11scope_ebpf_common::Event {
+        let mut op = init_event(
+            slot,
+            p11scope_ebpf_common::MECH_NONE,
+            p11scope_ebpf_common::shape::NONE,
+            0,
+            0,
+            0,
+        );
+        op.capture = p11scope_ebpf_common::capture::MECHANISM_NONE;
+        op.rv = rv;
+        op
+    }
+
+    /// Every mechanism row splits its calls/errors by provider module:
+    /// one `by_module` entry per sole-owner module, each with the same
+    /// `{dev, ino, sha256}` reference `functions[].module` uses. The
+    /// entries partition the row: their sums equal the row totals.
+    #[test]
+    fn profile_json_mechanism_rows_split_calls_and_errors_by_module() {
+        let mut state = crate::semantics::State::with_policy(
+            &two_module_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let shape_none = p11scope_ebpf_common::shape::NONE;
+        // Same session handle on both providers: sessions are
+        // module-scoped, so each Init binds its own provider. Every
+        // single-part `C_Sign` consumes its binding, so each op gets a
+        // fresh Init first.
+        state.observe(&init_event(0, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event_at(2, 0));
+        state.observe(&init_event(0, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event_at(2, 0x5));
+        state.observe(&init_event(1, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event_at(3, 0));
+        state.observe(&init_event(1, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event_at(3, 0));
+        state.observe(&init_event(1, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&sign_op_event_at(3, 0));
+
+        let mut mod1 = discovered_fixture();
+        mod1.id = crate::plan::ModuleId(1);
+        mod1.dev = (8, 2);
+        mod1.ino = 22;
+        mod1.sha256 = Some("22".repeat(32));
+        mod1.path = "/opt/p1.so".into();
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture(), mod1];
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        assert_eq!(v["mechanisms"].as_array().unwrap().len(), 1);
+        let row = &v["mechanisms"][0];
+        assert_eq!(row["mechanism"], 0x1087);
+        assert_eq!(row["calls"], 10);
+        assert_eq!(row["errors"], 1);
+        assert_eq!(
+            row["by_module"],
+            serde_json::json!([
+                {
+                    "module": {"dev": [8, 1], "ino": 11, "sha256": "11".repeat(32)},
+                    "calls": 4,
+                    "errors": 1,
+                },
+                {
+                    "module": {"dev": [8, 2], "ino": 22, "sha256": "22".repeat(32)},
+                    "calls": 6,
+                    "errors": 0,
+                },
+            ]),
+            "per-provider partition of the row: {row}"
+        );
+    }
+
+    /// A `by_module` entry whose module the document's discovery list
+    /// does not name is skipped, never fabricated: the row totals stay
+    /// authoritative and the breakdown degrades to the attributed subset.
+    #[test]
+    fn profile_json_by_module_skips_modules_missing_from_discovery() {
+        let mut state = crate::semantics::State::with_policy(
+            &two_module_sign_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let shape_none = p11scope_ebpf_common::shape::NONE;
+        state.observe(&init_event(0, 0x1087, shape_none, 0, 0, 0));
+        state.observe(&init_event(1, 0x1087, shape_none, 0, 0, 0));
+
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.verdict();
+        let capture = capture_fixture();
+        let v = profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture);
+
+        let row = &v["mechanisms"][0];
+        assert_eq!(row["calls"], 2);
+        assert_eq!(
+            row["by_module"].as_array().map(|rows| rows.len()),
+            Some(1),
+            "only the discovered module renders: {row}"
+        );
+        assert_eq!(row["by_module"][0]["module"]["ino"], 11);
+        assert_eq!(row["by_module"][0]["calls"], 1);
     }
 
     #[test]

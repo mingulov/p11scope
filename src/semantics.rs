@@ -135,6 +135,169 @@ mod corrective_tests {
         assert!(state.semantic_evidence().semantic_state_drops > 0);
     }
 
+    /// Two providers sharing one process: slots 0/2 (`C_SignInit`/`C_Sign`)
+    /// on module 0, slots 1/3 on module 1, each pair on its own pinned
+    /// object — the seam per-provider mechanism attribution is recorded.
+    fn two_module_plan() -> AttachPlan {
+        let slot = |index: u32, name: &str, module: u32, object: u32, file_offset: u64| Slot {
+            index,
+            descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
+            object: crate::discovery::identity::PinnedObjectId(object),
+            object_path: format!("/opt/p{module}.so"),
+            file_offset,
+            names: vec![name.into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor(name).unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids: vec![crate::plan::ModuleId(module)],
+        };
+        AttachPlan::from_slots(vec![
+            slot(0, "C_SignInit", 0, 42, 0x10),
+            slot(1, "C_SignInit", 1, 43, 0x10),
+            slot(2, "C_Sign", 0, 42, 0x20),
+            slot(3, "C_Sign", 1, 43, 0x20),
+        ])
+    }
+
+    /// Two `C_SignInit` slots with no sole owner: slot 0 unclaimed,
+    /// slot 1 claimed by two modules.
+    fn unowned_plan() -> AttachPlan {
+        let slot = |index: u32, module_ids: Vec<crate::plan::ModuleId>| Slot {
+            index,
+            descriptor_index: crate::kinds::function_id("C_SignInit").unwrap() + 1,
+            object: crate::plan::TEST_PINNED_OBJECT,
+            object_path: "/opt/p11.so".into(),
+            file_offset: index as u64 * 0x10,
+            names: vec!["C_SignInit".into()],
+            aliased: false,
+            semantics: crate::kinds::descriptor("C_SignInit").unwrap(),
+            semantic_authorized: true,
+            semantic_ambiguous: false,
+            fork_safe: false,
+            module_ids,
+        };
+        AttachPlan::from_slots(vec![
+            slot(0, vec![]),
+            slot(1, vec![crate::plan::ModuleId(0), crate::plan::ModuleId(1)]),
+        ])
+    }
+
+    /// A mechanism-carrying event aimed at an explicit slot: two slots
+    /// may share one name across providers, so name lookup alone cannot
+    /// address them.
+    fn mechanism_at(
+        plan: &AttachPlan,
+        name: &str,
+        slot: u32,
+        session: u64,
+        mechanism_id: u64,
+        rv: u64,
+    ) -> Event {
+        let mut ev = mechanism(plan, name, session, mechanism_id, rv);
+        ev.slot = slot;
+        ev
+    }
+
+    /// An operational event aimed at an explicit slot: no mechanism of
+    /// its own, attributed through the session binding like
+    /// [`event`] shapes it.
+    fn op_at(plan: &AttachPlan, name: &str, slot: u32, session: u64, rv: u64) -> Event {
+        let mut ev = event(plan, name, session, rv);
+        ev.slot = slot;
+        ev
+    }
+
+    #[test]
+    fn mechanism_calls_and_errors_split_by_provider_module() {
+        let p = two_module_plan();
+        let mut state = State::new(&p);
+        // Same session handle on both providers: sessions are
+        // module-scoped, so each Init binds its own provider. Every
+        // single-part `C_Sign` consumes its binding, so each op gets a
+        // fresh Init first. Each observation lands on its own event's
+        // slot module — Inits and ops alike.
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 2, 7, 0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 2, 7, CkRv::GENERAL_ERROR.0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 1, 7, 0x1087, 0));
+        state.observe(&op_at(&p, "C_Sign", 3, 7, 0));
+
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!(row.calls, 6);
+        assert_eq!(row.errors, 1);
+        assert_eq!(row.by_module[&crate::plan::ModuleId(0)].calls, 4);
+        assert_eq!(row.by_module[&crate::plan::ModuleId(0)].errors, 1);
+        assert_eq!(row.by_module[&crate::plan::ModuleId(1)].calls, 2);
+        assert_eq!(row.by_module[&crate::plan::ModuleId(1)].errors, 0);
+    }
+
+    #[test]
+    fn mechanism_without_sole_owner_module_counts_row_only() {
+        // Neither an unclaimed slot nor a doubly claimed slot names a
+        // provider: the capture-wide row still counts the calls, but no
+        // provider cell is recorded for either shape.
+        let p = unowned_plan();
+        let mut state = State::new(&p);
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 1, 7, 0x1087, 0));
+
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!(row.calls, 2);
+        assert!(
+            row.by_module.is_empty(),
+            "no sole owner, no provider cell: {row:?}"
+        );
+    }
+
+    #[test]
+    fn module_cells_share_the_state_key_budget() {
+        // The provider breakdown takes its keys from the same monotonic
+        // budget as every other semantic map: a refused cell records
+        // nothing, counts a disclosed drop, and retained keys stay
+        // within the limit. Limit 3 admits the history, cgroup and row
+        // keys of the first event and refuses the module cell.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::with_limit(&p, 3);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+
+        let row = state
+            .mechanisms()
+            .get(&0x1087)
+            .expect("row admitted before its breakdown");
+        assert_eq!(row.calls, 1);
+        assert!(
+            row.by_module.is_empty(),
+            "refused cell records nothing: {row:?}"
+        );
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+        assert!(
+            state.retained_dynamic_keys() <= 3,
+            "retained {} keys",
+            state.retained_dynamic_keys()
+        );
+    }
+
+    #[test]
+    fn purge_modules_drops_the_provider_breakdown_with_its_rows() {
+        let p = two_module_plan();
+        let mut state = State::new(&p);
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        state.observe(&mechanism_at(&p, "C_SignInit", 1, 7, 0x1087, 0));
+        assert_eq!(state.mechanisms()[&0x1087].by_module.len(), 2);
+
+        state.purge_modules(&BTreeSet::from([crate::plan::ModuleId(0)]));
+        assert!(state.mechanisms().is_empty());
+
+        state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!(row.calls, 1);
+        assert_eq!(row.by_module.len(), 1);
+        assert_eq!(row.by_module[&crate::plan::ModuleId(0)].calls, 1);
+    }
+
     #[test]
     fn history_loss_saturates_and_capacity_open_remains_observed() {
         let p = plan(&["C_OpenSession"]);

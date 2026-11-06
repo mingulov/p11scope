@@ -9102,7 +9102,12 @@ pub(crate) mod tests {
         ev.verdict();
         let text = scope_summary(
             "pid",
-            &[outer.clone(), stray.clone(), contested.clone(), inner.clone()],
+            &[
+                outer.clone(),
+                stray.clone(),
+                contested.clone(),
+                inner.clone(),
+            ],
             &ev,
         );
         assert!(

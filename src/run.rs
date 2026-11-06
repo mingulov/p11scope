@@ -7585,17 +7585,10 @@ fn capture_trace(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    // The header says once that unverified calls are not decoded, when
-    // the plan watches any: no per-line marker repeats it.
-    let mut header = format!(
-        "{}\n{}",
-        trace::capture_line(policy),
-        trace::identity_note()
-    );
-    if trace::watches_unverified(engine.plan()) {
-        header.push('\n');
-        header.push_str(trace::unverified_note());
-    }
+    // One header assembly point (capture, identity, zone, and the
+    // unverified note when the plan watches any): no per-line marker
+    // repeats it.
+    let header = trace::header(policy, engine.plan());
     if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
         return Err(finish_capture_error(
             error,

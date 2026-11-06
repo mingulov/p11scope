@@ -346,6 +346,7 @@ TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+    "Trace times are UTC.",
     "Calls on unverified functions are not decoded (names only).",
 ))
 TRACE_TOTALS_RE = re.compile(

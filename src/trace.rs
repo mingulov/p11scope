@@ -272,6 +272,30 @@ pub fn identity_note() -> &'static str {
     "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
 }
 
+/// The event clock, stated once: trace stamps are UTC wall time
+/// anchored to the kernel monotonic clock at the first event.
+pub fn zone_note() -> &'static str {
+    "Trace times are UTC."
+}
+
+/// The whole trace header: the CAPTURE line, the identity note, the
+/// zone note, and the unverified note when the plan watches any.
+/// Oracles tolerate each context line, so this is the one assembly
+/// point — never a second inline copy.
+pub(crate) fn header(policy: CapturePolicy, plan: &AttachPlan) -> String {
+    let mut header = format!(
+        "{}\n{}\n{}",
+        capture_line(policy),
+        identity_note(),
+        zone_note()
+    );
+    if watches_unverified(plan) {
+        header.push('\n');
+        header.push_str(unverified_note());
+    }
+    header
+}
+
 /// The header note printed once, instead of a per-line marker, when the
 /// capture watches functions whose semantics are not authorized: those
 /// calls show names without decoded parameters.
@@ -1591,5 +1615,27 @@ mod tests {
         let quiet = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet);
         assert_eq!(quiet.len(), 2);
         assert!(!quiet[1].contains("event_loss"), "{quiet:?}");
+    }
+
+    /// CLI text: the trace header labels the event clock. Trace
+    /// stamps are UTC wall time anchored to the kernel monotonic
+    /// clock, so the header says so once, after the identity note and
+    /// before the unverified note.
+    #[test]
+    fn trace_header_labels_utc_after_identity() {
+        let plan = test_plan();
+        assert_eq!(
+            header(CapturePolicy::Allowlisted, &plan),
+            "CAPTURE privacy=allowlisted\nTrace — completed call events in arrival order\nExecutable \
+             labels use verified observed paths; event PID/TID remain diagnostic \
+             identifiers.\nTrace times are UTC."
+        );
+        let unwatched = AttachPlan::from_slots(vec![]);
+        assert!(
+            header(CapturePolicy::Allowlisted, &unwatched).ends_with(
+                "\nTrace times are UTC.\nCalls on unverified functions are not decoded (names only)."
+            ),
+            "the zone note precedes the unverified note"
+        );
     }
 }

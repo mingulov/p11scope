@@ -83,6 +83,7 @@ TRACE_ROW = re.compile(
 TRACE_HEADERS = {
     "Trace — completed call events in arrival order",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+    "Trace times are UTC.",
     "Calls on unverified functions are not decoded (names only).",
     "CAPTURE privacy=allowlisted",
 }

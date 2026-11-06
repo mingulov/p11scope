@@ -2993,7 +2993,9 @@ impl ClassicDriver<'_> {
     /// silent runs commit nothing extra.
     fn disclose_scan_terminal_newcomers(&mut self) -> bool {
         let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
-        let staged = self.coordinator.note_post_pass_newcomers(&live_at_stop, stop_lost.len());
+        let staged = self
+            .coordinator
+            .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
         // The counted short-lived gap stages beside the named disclosure.
         let counted = self.coordinator.note_short_lived_never_scanned();
         staged || counted

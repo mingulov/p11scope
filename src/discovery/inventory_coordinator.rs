@@ -18875,7 +18875,11 @@ exit 0
         )));
         assert_eq!(native.scene.coordinator.short_lived_never_scanned, 1);
         assert!(
-            native.scene.coordinator.pending_exec_newcomers.contains_key(&10),
+            native
+                .scene
+                .coordinator
+                .pending_exec_newcomers
+                .contains_key(&10),
             "the late hook is still pending at the terminal call"
         );
         assert!(native.scene.coordinator.note_short_lived_never_scanned());
@@ -18894,7 +18898,11 @@ exit 0
             native.gap_subjects()
         );
         assert!(
-            native.scene.coordinator.pending_exec_newcomers.contains_key(&10),
+            native
+                .scene
+                .coordinator
+                .pending_exec_newcomers
+                .contains_key(&10),
             "the pending map stays for the stop-diff disclosure"
         );
         assert_eq!(native.scene.coordinator.short_lived_never_scanned, 0);

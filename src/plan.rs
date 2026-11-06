@@ -2972,13 +2972,13 @@ fn merge(
             shared && class.leaves_reserve()
         };
         // Route A (publication-driven admission): an unnamed Detailed
-        // closure admits published tables only, never whole and never a
-        // heuristic prefix, in every scope and arrival order. Publication
-        // evidence is a live return, interface linkage, a manifest, or
-        // export agreement (`table_observation_authorized`); unpublished
-        // templates take no slots, so a forwarding layer can never crowd
-        // out a provider.
-        // Sole exception, proven by the remote-client cell: an
+        // closure admits published tables only, never a heuristic prefix,
+        // in every scope and arrival order — except the bounded whole
+        // below. Publication evidence is a live return, interface linkage,
+        // a manifest, or export agreement
+        // (`table_observation_authorized`); unpublished templates take no
+        // slots, so a forwarding layer can never crowd out a provider.
+        // Sole prefix exception, proven by the remote-client cell: an
         // operator-named closure (`--module <path>`) keeps its
         // reserve-capped prefix (whole first when late-start), because a
         // remote client's tables are only ever handed out before any
@@ -2986,7 +2986,19 @@ fn merge(
         // classed as a closure array).
         let closure_named_exception =
             is_detailed_closure && closure_named && closure_prefix_allowed;
-        let closure_published_only_first = is_detailed_closure && !closure_named_exception;
+        // Bounded whole: an unnamed Detailed closure already loaded beside
+        // a provider when the capture started (PA-9/C1) tries whole first
+        // when no provider was refused or omitted ahead of it (via
+        // `closure_prefix_allowed`); the whole pass below admits it only
+        // when its complete fresh target union fits one standard function
+        // list. Generic object size only — no provider names. Decided
+        // after every provider and outside the reserve, so a forwarding
+        // layer can never crowd one out; anything bigger falls through to
+        // published-only.
+        let closure_bounded_whole =
+            is_detailed_closure && closure_late_start && !closure_named && closure_prefix_allowed;
+        let closure_published_only_first =
+            is_detailed_closure && !closure_named_exception && !closure_bounded_whole;
         let budget = GroupBudget {
             policy: admission_policy,
             ceiling: if reserved {
@@ -3031,9 +3043,11 @@ fn merge(
         // the retry — a double spill alongside the omission.
         let spill_baseline = uncorroborated_candidates;
         // Route A: a Detailed closure starts published-only and never
-        // retries as whole or a heuristic prefix — except an
-        // operator-named mid-capture closure, which starts at its
-        // reserve-capped prefix attempt (the remote-client exception).
+        // retries as a heuristic prefix — except an operator-named
+        // mid-capture closure, which starts at its reserve-capped prefix
+        // attempt (the remote-client exception), and an unnamed
+        // bounded-whole closure, which starts at whole and falls through
+        // to published-only when whole is refused.
         let mut use_prefix_fallback =
             is_detailed_closure && !closure_late_start && closure_prefix_allowed;
         let mut use_published_fallback = false;
@@ -3286,6 +3300,14 @@ fn merge(
                             scan_union.extend(keys.iter().filter(|key| is_fresh(key)).copied());
                         }
                     }
+                    // Bounded whole: an unnamed already-loaded layer admits
+                    // whole only when its complete fresh target union fits
+                    // one standard function list; anything bigger is
+                    // refused here and retried published-only below, so a
+                    // forwarding layer can never crowd out a provider.
+                    if closure_bounded_whole && scan_union.len() > LARGEST_STANDARD_TABLE_ENTRIES {
+                        break 'refused scan_union;
+                    }
                     if budget
                         .checked_required(allocated_slots, scan_union.len())
                         .is_err()
@@ -3428,10 +3450,14 @@ fn merge(
                     if published_only && admitted.is_empty() {
                         // Route A: published-only from the start (never a
                         // fallback after a failed whole or prefix) and
-                        // unnamed: nothing published is the only reason.
-                        // A named closure lands here only when a loss
-                        // ahead blocked its prefix, keeping its refusal.
-                        awaiting_publication = closure_published_only_first && !closure_named;
+                        // unnamed: nothing published is the only reason —
+                        // as is a bounded whole refused for size, which
+                        // retried here. A named closure lands here only
+                        // when a loss ahead blocked its prefix, keeping
+                        // its refusal.
+                        awaiting_publication = (closure_published_only_first
+                            || closure_bounded_whole)
+                            && !closure_named;
                         let full_union: BTreeSet<AttachKey> = keys_of
                             .values()
                             .flat_map(|keys| keys.iter().filter(|key| is_fresh(key)).copied())
@@ -3476,8 +3502,10 @@ fn merge(
                 uncorroborated_candidates = spill_baseline;
                 continue 'admission;
             }
-            // Route A: an unnamed Detailed closure already ran
-            // published-only, so its refusal is terminal. An
+            // Route A: an unnamed Detailed closure that started
+            // published-only already ran it, so its refusal is terminal;
+            // a bounded-whole one tried whole instead and falls through
+            // to published-only below, never a prefix. An
             // operator-named closure walks the remote-client exception
             // chain instead: a late-start one tries whole, then its
             // prefix, then published-only, while a mid-capture one
@@ -3488,7 +3516,11 @@ fn merge(
                 && kept.is_empty()
                 && (closure_late_start || use_prefix_fallback)
             {
-                if closure_prefix_allowed && !use_prefix_fallback && !use_published_fallback {
+                if closure_named
+                    && closure_prefix_allowed
+                    && !use_prefix_fallback
+                    && !use_published_fallback
+                {
                     use_prefix_fallback = true;
                     uncorroborated_candidates = spill_baseline;
                     refused_top = None;
@@ -12754,7 +12786,11 @@ mod tests {
         let beside = scoped_plan(&[family, sidecar], AdmissionScope::Named);
 
         assert_eq!(slots_of(&beside, 42), 68, "provider admitted first");
-        assert_eq!(slots_of(&beside, 41), 0, "105 targets exceed the bounded whole");
+        assert_eq!(
+            slots_of(&beside, 41),
+            0,
+            "105 targets exceed the bounded whole"
+        );
         assert_eq!(beside.uncorroborated_candidates, 5);
         let refusal = refusal_of(&beside, "/opt/small-closure.so").expect("gap reported");
         assert!(

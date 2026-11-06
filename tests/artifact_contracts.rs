@@ -12312,6 +12312,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
     };
     let module = DiscoveredModule {
         id: ModuleId(0),
+        admission_class: None,
         dev: object.dev,
         ino: object.ino,
         sha256: object.sha256.clone(),

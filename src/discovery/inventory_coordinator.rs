@@ -18609,6 +18609,76 @@ exit 0
         );
     }
 
+    /// An exec newcomer the pass lists but that exits before its scan is
+    /// NOT covered: `Exited` members carry no disclosure anywhere else
+    /// in inventory output, so the newcomer stays pending and counts
+    /// once the next enumeration misses it too.
+    #[test]
+    fn exec_newcomer_exited_before_its_scan_is_counted_not_covered() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // Pass one lists pid 8 but marks it exited before its scan; pass
+        // two never lists it.
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let mut first =
+            capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation.clone());
+        first.processes.push(crate::inspect_system::ProcessRecord {
+            pid: 8,
+            status: crate::inspect_system::MemberStatus::Exited,
+            objects: Vec::new(),
+            generation: None,
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: false,
+        });
+        native.scene.coordinator.apply_catalog(
+            first,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let second = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            second,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let short = gaps
+            .iter()
+            .find(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT);
+        let Some(gap) = short else {
+            panic!(
+                "an exited-before-scan newcomer must be counted: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(gap.reason, short_lived_never_scanned_reason(1, 0));
+    }
+
     /// The pending map is bounded: arrivals past the bound count as
     /// untracked and disclose beside the confirmed total, never growing
     /// the map and never silently dropped.

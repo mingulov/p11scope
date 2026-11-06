@@ -2073,6 +2073,12 @@ pub(crate) enum UnknownReason {
     /// a use before its admission): the pair's only row exists, so later
     /// use leaves no row and a watch could not see it (R-C51-1). Sticky.
     UseBeforeAdmission,
+    /// A CALLER_USE row from this caller's pid, provably after its
+    /// admission, stayed unbound because the caller exited before the
+    /// row could be matched to a live incarnation and the retained
+    /// identity was ambiguous: same sticky R-C51-1 downgrade as
+    /// [`Self::UseBeforeAdmission`], with honest post-admission wording.
+    CallerExitedBeforeMatch,
     /// A CALLER_USE row of this caller's pid on this module is read but
     /// undecided (its lifecycle and health horizons have not arrived):
     /// the edge may have been used. Transient, never staged: the
@@ -2100,6 +2106,7 @@ impl UnknownReason {
             Self::Loss(_) => "loss",
             Self::RetiredBeforeCoverage => "retired_before_coverage",
             Self::UseBeforeAdmission => "use_before_admission",
+            Self::CallerExitedBeforeMatch => "caller_exited_before_match",
             Self::PendingFirstUse => "pending_first_use",
             Self::Uncounted(_) => "uncounted",
         }
@@ -2129,6 +2136,7 @@ impl UnknownReason {
             Self::Loss(reason) => format!("loss: {reason}"),
             Self::RetiredBeforeCoverage => "retired before coverage".into(),
             Self::UseBeforeAdmission => "use before admission".into(),
+            Self::CallerExitedBeforeMatch => "the caller exited before it could be matched".into(),
             Self::PendingFirstUse => "first use undecided".into(),
             Self::Uncounted(evidence) => format!("uncounted: {evidence}"),
         }

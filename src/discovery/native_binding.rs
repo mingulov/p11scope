@@ -68,7 +68,7 @@ use crate::attach::capture::{
     ExecCoverage, InventoryCapture, NativeDomainId, RetiredCapture, RetiringCapture, WitnessBatch,
     WitnessRow,
 };
-use crate::discovery::caller_registry::{CallerAdapter, CallerId, ProcessSource};
+use crate::discovery::caller_registry::{CallerAdapter, CallerId, CallerLifecycle, ProcessSource};
 use crate::process::PidPin;
 use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -229,9 +229,32 @@ pub(crate) struct LiveCaller<'a, Pin> {
     pub pin: &'a Pin,
 }
 
+/// One retained incarnation for a pid, as the binder's unambiguous
+/// post-exit fallback sees it: the scan-time identity (PID plus start
+/// time and exe identity) with its monotonic lifetime. The binder binds
+/// through it only when exactly one retained incarnation matches the
+/// row's tgid and the row's instant falls inside its lifetime.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct RetainedCaller {
+    pub id: CallerId,
+    pub first_seen_ns: u64,
+    pub last_seen_ns: u64,
+    pub retired: bool,
+    pub start_time: Option<u64>,
+    pub exe_present: bool,
+    pub exec_observed: bool,
+    pub lifecycle: CallerLifecycle,
+}
+
 /// The live-incarnation lookup the binder reads (the caller adapter).
 pub(crate) trait CallerLookup<Pin> {
     fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Pin>>;
+    /// Every retained incarnation (live plus retired-with-evidence) for
+    /// `pid`. The default is none: lookups without retained history keep
+    /// the live-only behavior and stay unbound on exit.
+    fn retained_callers(&self, _pid: u32) -> Vec<RetainedCaller> {
+        Vec::new()
+    }
 }
 
 impl<Source: ProcessSource> CallerLookup<Source::Pin> for CallerAdapter<Source> {

@@ -27687,6 +27687,43 @@ int main(void) {
     }
 
     #[test]
+    fn a_post_admission_exit_unbound_row_says_the_caller_exited_before_it_could_be_matched() {
+        // The caller was admitted (at 50), then exited (observed at 500);
+        // its row arrives after the exit with no unambiguous retained
+        // identity (here: past the observed exit, so the lifetime misses).
+        // The sticky downgrade keeps fail-safe unknown, but says the
+        // caller exited before it could be matched, not "before admission".
+        let (mut native, caller) = watched_native();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 1_500, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+        let coverage = native.scene.coverage(caller);
+        assert_eq!(
+            coverage,
+            UseCoverage::Unknown(UnknownReason::CallerExitedBeforeMatch),
+            "{coverage:?}"
+        );
+        assert_eq!(
+            UnknownReason::CallerExitedBeforeMatch.text(),
+            "the caller exited before it could be matched"
+        );
+        assert_eq!(
+            UnknownReason::CallerExitedBeforeMatch.code(),
+            "caller_exited_before_match"
+        );
+    }
+
+    #[test]
     fn a_row_read_before_its_callers_admission_downgrades_the_later_watch() {
         // Read before the admission: pid 9 holds no caller yet.
         let (mut native, _) = watched_native();

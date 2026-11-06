@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::attach::capture::{CaptureHealth, CapturePhase, ScopeCustody};
+use crate::discovery::caller_registry::CallerLifecycle;
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
 use p11scope_ebpf_common::{DiscoveryRecord, ImageIdentity};
 use std::collections::HashMap;
@@ -15,6 +16,9 @@ type Pin = (u32, u64);
 #[derive(Default)]
 struct World {
     live: HashMap<u32, (CallerId, u64, Pin)>,
+    /// Retained incarnations per pid (live plus retired-with-evidence),
+    /// in admission order. Scripted scan-time identity, never a host read.
+    retained: HashMap<u32, Vec<RetainedCaller>>,
     /// What a cookie query through a pin answers, per domain.
     answers: HashMap<(Pin, NativeDomainId), CookieQuery>,
     queries: usize,
@@ -30,6 +34,35 @@ impl World {
 
     fn retire(&mut self, pid: u32) {
         self.live.remove(&pid);
+    }
+
+    /// Script one retained incarnation for `pid`: the scan-time identity
+    /// (start time plus exe presence) with its monotonic lifetime
+    /// (`first_seen_ns`, and `last_seen_ns` when `retired`).
+    #[allow(clippy::too_many_arguments)]
+    fn retain(
+        &mut self,
+        pid: u32,
+        caller: u32,
+        first_seen_ns: u64,
+        last_seen_ns: u64,
+        retired: bool,
+        start_time: Option<u64>,
+        exe_present: bool,
+        lifecycle: super::super::caller_registry::CallerLifecycle,
+    ) -> CallerId {
+        let id = CallerId(caller);
+        self.retained.entry(pid).or_default().push(RetainedCaller {
+            id,
+            first_seen_ns,
+            last_seen_ns,
+            retired,
+            start_time,
+            exe_present,
+            exec_observed: exe_present,
+            lifecycle,
+        });
+        id
     }
 
     fn answer(&mut self, pid: u32, generation: u64, domain: NativeDomainId, query: CookieQuery) {
@@ -193,10 +226,11 @@ impl Run {
         let batch = read_at(domain, rows, at, loss);
         let World {
             live,
+            retained,
             answers,
             queries,
         } = &mut self.world;
-        let lookup = Lookup(live);
+        let lookup = Lookup(live, retained);
         let mut identity = AnswerTable { answers, queries };
         self.binder.absorb_witnesses(&batch, &lookup, &mut identity);
     }
@@ -223,7 +257,10 @@ impl Run {
     }
 }
 
-struct Lookup<'a>(&'a HashMap<u32, (CallerId, u64, Pin)>);
+struct Lookup<'a>(
+    &'a HashMap<u32, (CallerId, u64, Pin)>,
+    &'a HashMap<u32, Vec<RetainedCaller>>,
+);
 
 impl CallerLookup<Pin> for Lookup<'_> {
     fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Pin>> {
@@ -232,6 +269,10 @@ impl CallerLookup<Pin> for Lookup<'_> {
             first_seen_ns: *first_seen_ns,
             pin,
         })
+    }
+
+    fn retained_callers(&self, pid: u32) -> Vec<RetainedCaller> {
+        self.1.get(&pid).cloned().unwrap_or_default()
     }
 }
 
@@ -362,7 +403,7 @@ fn metadata_binding_refuses_unreadable_health_and_ignores_older_healthy_read() {
     let older = read_at(domain, Vec::new(), run.clock - 1, Some(0));
     run.binder.absorb_witnesses(
         &older,
-        &Lookup(&run.world.live),
+        &Lookup(&run.world.live, &run.world.retained),
         &mut AnswerTable {
             answers: &run.world.answers,
             queries: &mut run.world.queries,
@@ -669,17 +710,182 @@ fn pid_reuse_produces_a_different_cookie_and_an_unbound_row() {
 
 #[test]
 fn exit_before_the_poll_leaves_the_row_unbound() {
+    // Ambiguous only: the retained incarnation's lifetime does not hold
+    // the row, so no unambiguous binding exists. The unambiguous twin
+    // below binds.
     let mut run = Run::new();
     let d = run.domain;
+    // Retired at 1_400; the row at 1_500 is after the observed exit.
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        1_400,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
     run.settle();
     assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
-    // Exit during the query.
+    // Exit during the query, with the row before the admission.
     run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 900)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::CallerExited)]);
+}
+
+#[test]
+fn exit_before_the_poll_binds_the_unambiguous_retained_row() {
+    // Bound twin: exactly one retained incarnation holds the tgid, the
+    // row falls inside its lifetime, and no exec or reuse is recorded.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+    // Exit during the query: the live incarnation still binds through
+    // its retained identity.
+    let y = run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
     run.world.answer(T + 1, 1, d, CookieQuery::Exited);
     run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
     run.settle();
+    assert_eq!(run.verdicts(), vec![bound(y)]);
+}
+
+#[test]
+fn pid_reuse_leaves_the_retained_row_unbound() {
+    // Two retained incarnations hold the tgid (a PID reuse): even though
+    // the row falls inside the first lifetime, the match is ambiguous.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        1_400,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.world.retain(
+        T,
+        2,
+        1_600,
+        1_600,
+        true,
+        Some(200),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_200)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    // A live successor plus a retired predecessor is likewise ambiguous
+    // when the live pin dies during the query.
+    run.world.admit(T + 1, 2, 3, 1_600);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_400,
+        true,
+        Some(101),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.world.retain(
+        T + 1,
+        3,
+        1_600,
+        1_600,
+        false,
+        Some(201),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 2, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 1_200)]);
+    run.settle();
     assert_eq!(run.verdicts(), vec![unbound(UnboundReason::CallerExited)]);
+}
+
+#[test]
+fn exec_between_admission_and_read_leaves_the_retained_row_unbound() {
+    // One retained incarnation holds the tgid and the lifetime, but an
+    // exec record at/after the admission voids the retained identity.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.drain(&[(T, 1_600)]);
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ExecAfterAdmission)]
+    );
+    // Same for a live incarnation whose pin dies during the query.
+    run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+    run.drain(&[(T + 1, 1_600)]);
+    run.read(Vec::new());
+    assert_eq!(
+        run.verdicts(),
+        vec![unbound(UnboundReason::ExecAfterAdmission)]
+    );
 }
 
 #[test]
@@ -935,11 +1141,15 @@ fn the_census_counts_every_row_once() {
         });
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
-    run.binder
-        .absorb_witnesses(&batch, &Lookup(live), &mut AnswerTable { answers, queries });
+    run.binder.absorb_witnesses(
+        &batch,
+        &Lookup(live, retained),
+        &mut AnswerTable { answers, queries },
+    );
     assert_eq!(run.binder.census().pending, 2);
     run.settle();
     assert_eq!(
@@ -1158,11 +1368,15 @@ fn horizons_follow_the_facade_stamps_and_domain_tags() {
     let stale = read_at(d, Vec::new(), before, Some(0));
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
-    run.binder
-        .absorb_witnesses(&stale, &Lookup(live), &mut AnswerTable { answers, queries });
+    run.binder.absorb_witnesses(
+        &stale,
+        &Lookup(live, retained),
+        &mut AnswerTable { answers, queries },
+    );
     assert!(
         run.verdicts().is_empty(),
         "the stale health read covers nothing"
@@ -1205,10 +1419,11 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
     };
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
-    let lookup = Lookup(live);
+    let lookup = Lookup(live, retained);
     let mut identity = AnswerTable { answers, queries };
     let sighting = run
         .binder
@@ -1231,12 +1446,13 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
     );
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
     run.binder.absorb_witnesses(
         &read_at(run.domain, Vec::new(), 2_002, Some(0)),
-        &Lookup(live),
+        &Lookup(live, retained),
         &mut AnswerTable { answers, queries },
     );
     assert!(matches!(
@@ -1255,6 +1471,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
     ));
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
@@ -1262,7 +1479,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
         run.binder
             .sight_current_binding_at(
                 request,
-                &Lookup(live),
+                &Lookup(live, retained),
                 &mut AnswerTable { answers, queries },
                 || Some(3_000)
             )
@@ -1270,6 +1487,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
     );
     let World {
         live,
+        retained,
         answers,
         queries,
     } = &mut run.world;
@@ -1280,7 +1498,7 @@ fn demotion_retirement_current_binding_waits_for_fresh_horizons() {
             3_001,
             Some(0),
         ),
-        &Lookup(live),
+        &Lookup(live, retained),
         &mut AnswerTable { answers, queries },
     );
     assert_eq!(
@@ -1321,12 +1539,13 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
         }
         let World {
             live,
+            retained,
             answers,
             queries,
         } = &mut run.world;
         let result = run.binder.sight_current_binding_at(
             request,
-            &Lookup(live),
+            &Lookup(live, retained),
             &mut AnswerTable { answers, queries },
             || if control == 4 { None } else { Some(2_000) },
         );
@@ -1344,6 +1563,7 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
             ));
             let World {
                 live,
+                retained,
                 answers,
                 queries,
             } = &mut run.world;
@@ -1354,7 +1574,7 @@ fn demotion_retirement_current_binding_rejects_exec_loss_and_identity_uncertaint
                     2_002,
                     Some(if control == 6 { 1 } else { 0 }),
                 ),
-                &Lookup(live),
+                &Lookup(live, retained),
                 &mut AnswerTable { answers, queries },
             );
             assert!(

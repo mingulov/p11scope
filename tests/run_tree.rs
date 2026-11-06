@@ -693,8 +693,13 @@ fn privileged_run_tree_shell_wrapper_shows_grandchild_calls() {
     open_cell_dir(dir.path());
     let (ledger1, ledger2) = (dir.path().join("l1"), dir.path().join("l2"));
     let (_outdir, out) = out_dir();
+    // Drain settle: the shell holds the loop open two seconds after the
+    // last grandchild so its exit record lands before the terminal drain
+    // fixes its read position; without the settle the last exit strands
+    // past it on some hosts (Fedora) and the gap undercounts by one.
+    // `exec` keeps the direct-child PID: no new process, no new exit.
     let script = format!(
-        "{} {} {} 3; {} {} {} 3",
+        "{} {} {} 3; {} {} {} 3; exec sleep 2",
         workload.display(),
         module.display(),
         ledger1.display(),
@@ -851,6 +856,9 @@ fn privileged_run_tree_many_children_land_exact() {
         ));
         ledgers.push(ledger);
     }
+    // Drain settle (see the shell-wrapper cell): two seconds between the
+    // last grandchild and loop end, same PID via `exec`.
+    script.push_str("exec sleep 2");
     let mut args = run_prefix(&module, &out);
     args.extend(["sh".to_string(), "-c".to_string(), script]);
     let mut capture = spawn_run(&args, &conf);

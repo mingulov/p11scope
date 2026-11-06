@@ -5681,6 +5681,21 @@ fn capture_profile(
             &mut selection_ledger,
         );
     }
+    // A selection that never opened a window says so once, here:
+    // the JSON ledger alone left `--select-endpoint` a silent
+    // no-op. The close path stays quiet for these (no window opened).
+    if let Some(name) = select_endpoint
+        && k0_window.is_none()
+        && let Some((_, Some(refusal))) = selection_ledger.selection_outcome()
+    {
+        emit_capture_diagnostic(
+            &metrics::selected_detail_driver::format_selection_refused_line(
+                name,
+                refusal,
+                owned.is_some(),
+            ),
+        );
+    }
     let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_capture(owned.is_some());
     let mut stdout_sink = crate::sink::stdout_sink()?;
@@ -6637,6 +6652,17 @@ fn capture_profile(
                 after_losses,
                 ledger,
             );
+            // A resolved selection whose detail voided at close says
+            // so once, here: the JSON ledger alone left the void
+            // silent. Selections refused before any window opened
+            // already spoke at selection time, never here.
+            if let Some((endpoint, Some(refusal))) = ledger.selection_outcome() {
+                emit_capture_diagnostic(
+                    &metrics::selected_detail_driver::format_selection_withheld_line(
+                        endpoint, refusal,
+                    ),
+                );
+            }
         }
         poll_terminal_cancellation();
         consumers

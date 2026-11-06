@@ -532,8 +532,10 @@ fn path_dirs_and_candidate_modes_close_the_chmod_window() {
 /// fresh generation after CONFLICT → clean OK; (e) straddling VMA →
 /// BAD_SHAPE; (f) misaligned/oversized/past-slots/zero-inode shapes →
 /// BAD_SHAPE (+ anonymous VMAs silently skipped); (g) contained VMA →
-/// OK. Unprivileged and permanent; the strict verifier gate still proves
-/// the BPF object loads (re-run as root, see the report).
+/// OK; (h) a non-100 observed tgid installs under the zero wildcard,
+/// is skipped under a mismatched observer, and the observer itself
+/// still installs. Unprivileged and permanent; the strict verifier gate
+/// still proves the BPF object loads (re-run as root, see the report).
 #[test]
 fn anchor_host_harness_replay_and_arena_behavior() {
     let native = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/ebpf/native");
@@ -646,6 +648,16 @@ fn anchor_host_harness_replay_and_arena_behavior() {
             &[
                 "ASSERT ok_on_contained_install",
                 "ASSERT contained_vma_installed",
+            ][..],
+        ),
+        (
+            "observer-tgid-gate-and-wildcard",
+            &[
+                "ASSERT wildcard_installs_non100_tgid",
+                "ASSERT wildcard_installs_entry",
+                "ASSERT mismatch_emits_nothing",
+                "ASSERT mismatch_installs_nothing",
+                "ASSERT match_installs_observer",
             ][..],
         ),
     ] {

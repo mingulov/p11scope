@@ -535,7 +535,7 @@ jobs:
             ${{ runner.temp }}/privileged-out/run/logs/
           if-no-files-found: warn
           retention-days: 7
-  # The btrfs campaign: the 14 cells that need TMPDIR on btrfs. The
+  # The btrfs campaign: the 15 cells that need TMPDIR on btrfs. The
   # curated runner loop-mounts its own image for them (no ambient
   # btrfs needed) and tears it down afterwards; the cleanup step
   # re-runs the idempotent teardown so a mount never leaks past the job.

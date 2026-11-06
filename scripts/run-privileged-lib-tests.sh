@@ -90,7 +90,7 @@
 # set it for a guest or qualification run. A set opt-in is recorded as an
 # `# opt-in:` line in results.txt and echoed to stderr.
 #
-# Btrfs group (--include-btrfs): the 14 cells that assert TMPDIR is on
+# Btrfs group (--include-btrfs): the 15 cells that assert TMPDIR is on
 # btrfs. The runner loop-mounts one btrfs image for the group
 # (scripts/ci/prepare-btrfs-tmpdir.sh), runs those cells with TMPDIR
 # pointed at the mount, and unmounts it afterwards. Without mkfs.btrfs
@@ -735,6 +735,7 @@ discovery::sweep_attribution::tests::privileged_d4_btrfs_zombie_leader_single_su
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_leader_collision_and_dataonly_twins
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
 discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
+discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections
 )
 
 # Btrfs TMPDIR provisioning also covers these expected-failure cells,

@@ -1965,6 +1965,12 @@
       "reason": "needs btrfs scratch; run by exact selector (privileged-btrfs runs the equivalent scripts/ci/discover-btrfs-subvol.sh cell; the ignored test itself runs by hand on btrfs scratch)",
       "cell": "feature",
       "owner": "discover-btrfs-subvol cell"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections",
+      "reason": "root on a btrfs TMPDIR: creates subvolume pairs until an equal-pin twin is found",
+      "cell": "privileged"
     }
   ]
 }

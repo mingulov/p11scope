@@ -2079,6 +2079,140 @@ fn privileged_a_file_swapped_behind_an_identical_line_is_proved_as_the_new_file(
     std::fs::remove_dir(parent.join("s.old")).unwrap();
 }
 
+/// Root on a btrfs TMPDIR, through the production cache-key constructor:
+/// two equal-pin twins in two fresh subvolumes (one maps key and pin,
+/// different bytes) never share an inspection, while each twin reuses
+/// its own entry. The retry bound (200) covers the host-measured
+/// 39-of-40 equal-ctime rate.
+#[test]
+#[ignore = "root on a btrfs TMPDIR: creates subvolume pairs until an equal-pin twin is found"]
+fn privileged_btrfs_equal_pin_twins_use_their_own_inspections() {
+    use crate::discovery::identity::pin_of;
+    use crate::discovery::scan::{
+        CaptureWorkBudget, InspectedFileKey, InventoryDiscoveryLimits, InventoryRetainedLimits,
+        InventoryWindowLimits, WindowId,
+    };
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs.
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
+
+    // Two equal-size, different-byte valid ELFs: trailing bytes change the
+    // digest without affecting the parse.
+    let base = std::fs::read("/bin/true").unwrap();
+    let bytes_a = [base.as_slice(), &[0xAAu8; 64]].concat();
+    let bytes_b = [base.as_slice(), &[0xBBu8; 64]].concat();
+
+    let mut pair = None;
+    for i in 0..200u32 {
+        let sub_a = format!("twin_a{i}");
+        let sub_b = format!("twin_b{i}");
+        create_subvolume(parent, &sub_a);
+        create_subvolume(parent, &sub_b);
+        let path_a = parent.join(format!("{sub_a}/lib.so"));
+        let path_b = parent.join(format!("{sub_b}/lib.so"));
+        // Back-to-back writes, like the host reproducer: the pair shares
+        // its change time in 39 of 40 tries.
+        std::fs::write(&path_a, &bytes_a).unwrap();
+        std::fs::write(&path_b, &bytes_b).unwrap();
+        let (a, b) = (
+            std::fs::metadata(&path_a).unwrap(),
+            std::fs::metadata(&path_b).unwrap(),
+        );
+        let pin_eq = (a.ino(), a.len(), (a.ctime(), a.ctime_nsec()))
+            == (b.ino(), b.len(), (b.ctime(), b.ctime_nsec()));
+        if pin_eq && a.dev() != b.dev() {
+            pair = Some((path_a, path_b));
+            break;
+        }
+        std::fs::remove_file(&path_a).unwrap();
+        std::fs::remove_file(&path_b).unwrap();
+        std::fs::remove_dir(parent.join(&sub_a)).unwrap();
+        std::fs::remove_dir(parent.join(&sub_b)).unwrap();
+    }
+    let (path_a, path_b) = pair.expect("an equal-pin twin pair within 200 tries");
+
+    let file_a = std::fs::File::open(&path_a).unwrap();
+    let file_b = std::fs::File::open(&path_b).unwrap();
+    // Positive controls: the fixture really collides on maps key and pin.
+    let map_a = mapping_file_key(&file_a).unwrap();
+    let map_b = mapping_file_key(&file_b).unwrap();
+    assert_eq!(
+        (map_a.device_major, map_a.device_minor, map_a.inode),
+        (map_b.device_major, map_b.device_minor, map_b.inode),
+        "twins share the maps key"
+    );
+    let pin_a = pin_of(&file_a).unwrap();
+    assert_eq!(pin_a, pin_of(&file_b).unwrap(), "twins share the whole pin");
+    let inspected_a = inspect_file(&file_a).unwrap();
+    let inspected_b = inspect_file(&file_b).unwrap();
+    assert_ne!(
+        inspected_a.identity.sha256, inspected_b.identity.sha256,
+        "twins have different bytes"
+    );
+    // The production keys differ by the held fd's device, so the budget
+    // never hands one twin's inspection to the other.
+    let key_a = InspectedFileKey::for_open_file(
+        &file_a,
+        Device {
+            major: map_a.device_major,
+            minor: map_a.device_minor,
+        },
+        map_a.inode,
+        pin_a,
+    )
+    .unwrap();
+    let key_b = InspectedFileKey::for_open_file(
+        &file_b,
+        Device {
+            major: map_b.device_major,
+            minor: map_b.device_minor,
+        },
+        map_b.inode,
+        pin_a,
+    )
+    .unwrap();
+    assert_ne!(key_a, key_b, "the subvolume device separates the twins");
+
+    let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+    let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+    let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+    let mut budget = CaptureWorkBudget::for_inventory(limits);
+    let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+    let scan = budget.checkpoint(token.clone()).unwrap();
+    assert!(budget.note_inspected_file(key_a, inspected_a.clone()));
+    assert_eq!(
+        budget.inspected_file(&key_b),
+        None,
+        "twin B must not reuse twin A's inspection"
+    );
+    assert_eq!(
+        budget.inspected_file(&key_a).unwrap().identity.sha256,
+        inspected_a.identity.sha256,
+        "twin A reuses its own inspection"
+    );
+    budget.finish_scan(scan).unwrap();
+    budget.finish_window(token).unwrap();
+
+    std::fs::remove_file(&path_a).unwrap();
+    std::fs::remove_file(&path_b).unwrap();
+    std::fs::remove_dir(path_a.parent().unwrap()).unwrap();
+    std::fs::remove_dir(path_b.parent().unwrap()).unwrap();
+}
+
 /// A private ext4 filesystem on a loop device under a temporary directory,
 /// unmounted (lazily if busy) and deleted on drop.
 struct Ext4Loop {

@@ -618,20 +618,24 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
     if lines.next().is_some() {
         return Err("text object must have exactly one admission".into());
     }
-    if let Some(admitted) = line.strip_prefix("admission  watched (") {
-        let (class, rest) = admitted
-            .split_once(", ")
-            .ok_or("text admitted class is missing")?;
-        let (endpoints, _) = rest
-            .split_once(" functions;")
+    if let Some(admitted) = line.strip_prefix("admission  profile/run would watch ") {
+        // `68 functions (class standard; ...)` or `1 function (class ...; ...)`.
+        let (endpoints, rest) = admitted
+            .split_once(' ')
             .ok_or("text admitted endpoint count is missing")?;
+        let (_, rest) = rest
+            .split_once("(class ")
+            .ok_or("text admitted class is missing")?;
+        let (class, _) = rest
+            .split_once(|c| c == ';' || c == ',' || c == ')')
+            .ok_or("text admitted class is unterminated")?;
         Ok(WholeAdmission {
             state: "admitted",
             class,
             endpoints: Some(endpoints.parse().map_err(|_| "invalid text endpoints")?),
             reason: None,
         })
-    } else if let Some(refused) = line.strip_prefix("admission  not watched (") {
+    } else if let Some(refused) = line.strip_prefix("admission  refused (") {
         let (class, reason) = refused
             .split_once("): ")
             .ok_or("text refusal reason is missing")?;
@@ -711,7 +715,7 @@ fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
     ] {
         let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
         let text = format!(
-            "  admission  not watched ({class}): {reason} [scan only: names below come from the files themselves]"
+            "  admission  refused ({class}): {reason} [scan-only admission: manifest corroboration was not consulted]"
         );
         validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, false)
             .unwrap();
@@ -725,7 +729,7 @@ fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
                 "state": "refused", "class": class, "reason": invalid_reason,
             });
             let text = format!(
-                "  admission  not watched ({class}): {invalid_reason} [scan only: names below come from the files themselves]"
+                "  admission  refused ({class}): {invalid_reason} [scan-only admission: manifest corroboration was not consulted]"
             );
             assert!(
                 validate_whole_admission(
@@ -757,7 +761,7 @@ fn catalog_admission_oracle_rejects_strict_wide_refusals() {
     ] {
         let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
         let text = format!(
-            "  admission  not watched ({class}): {reason} [scan only: names below come from the files themselves]"
+            "  admission  refused ({class}): {reason} [scan-only admission: manifest corroboration was not consulted]"
         );
         assert!(
             validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, true)
@@ -776,7 +780,7 @@ fn catalog_admission_oracle_rejects_admitted_prefixes() {
         let json =
             serde_json::json!({ "state": "admitted", "class": class, "endpoints": endpoints });
         let text = format!(
-            "  admission  watched ({class}, {endpoints} functions; scan only: names below come from the files themselves)"
+            "  admission  profile/run would watch {endpoints} functions (class {class}; scan only: names below come from the files themselves)"
         );
         for strict in [false, true] {
             assert!(
@@ -807,7 +811,7 @@ fn catalog_closure_admission_accepts_prefix_gap_only_when_relaxed() {
     let json =
         serde_json::json!({ "state": "refused", "class": "closure_array", "reason": reason });
     let text = format!(
-        "  admission  not watched (closure_array): {reason} [scan only: names below come from the files themselves]"
+        "  admission  refused (closure_array): {reason} [scan-only admission: manifest corroboration was not consulted]"
     );
     for wide in [false, true] {
         validate_closure_admission(json_whole_admission(&json).unwrap(), CLOSURE, wide, false)
@@ -1233,7 +1237,7 @@ fn catalog_reader_finds_every_fixture_object() {
         "tless.so",
         "h1.so",
         "h2.so",
-        "watched",
+        "  admission  ",
         "alias object",
         "(deleted)",
         "names below come from the files themselves",

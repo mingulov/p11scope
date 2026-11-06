@@ -5483,6 +5483,48 @@ mod tests {
         }
     }
 
+    /// Inner driver of `probe_dir_fallback_prints_no_notice_by_default`:
+    /// creates one probe dir and proves it usable. Re-exec-only
+    /// meaningful under a TMPDIR that forces the fallback; harmless
+    /// (drop removes the dir) as an ordinary passing cell.
+    #[test]
+    fn probe_dir_create_smoke() {
+        let dir = ProbeDir::create("p11scope-identity-probe").expect("probe dir");
+        assert!(dir.path().is_dir(), "probe dir exists");
+    }
+
+    /// CLI-1 suppresses informational stderr notes by default: a temp
+    /// fallback must not print. Re-execs this binary to run exactly
+    /// the smoke cell with TMPDIR pointed at a missing dir (creation
+    /// there fails, so `/var/tmp` is tried), and asserts the inner
+    /// positive ran (exit 0 plus `1 passed`, never a zero-match pass)
+    /// with no fallback notice on either stream.
+    #[test]
+    fn probe_dir_fallback_prints_no_notice_by_default() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let missing = scratch.path().join("missing-temp-root");
+        let exe = std::env::current_exe().expect("own test binary");
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("inspect_system::tests::probe_dir_create_smoke")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("TMPDIR", &missing)
+            .output()
+            .expect("re-exec the smoke cell");
+        assert!(output.status.success(), "inner exit: {}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed"),
+            "inner positive missing: {stdout}"
+        );
+        assert!(
+            !stdout.contains("fell back") && !stderr.contains("fell back"),
+            "fallback notice printed: {stdout}{stderr}"
+        );
+    }
+
     /// Fresh probe dirs are unique per call.
     #[test]
     fn probe_dir_names_are_unique() {

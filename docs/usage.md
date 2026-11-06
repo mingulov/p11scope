@@ -1536,9 +1536,12 @@ p11scope inventory diff before.json after.json -o comparison.json
 p11scope inventory diff --json -- -before.json -after.json
 ```
 
-Default stdout is readable text, with application names, full recorded paths,
-module content digests, and separate before/after evidence. `--json` emits one
-`p11scope/inventory-diff/v1` document plus newline. `-o` atomically saves that
+Default stdout is the concise comparison summary: counts, the top changed
+applications, and caveats. `-v`/`--verbose` shows the full readable report,
+with application names, full recorded paths, module content digests, and
+separate before/after evidence; `--quiet` omits the detail hint. `--json`
+emits one `p11scope/inventory-diff/v1` document plus newline. `-o` atomically
+saves that
 JSON regardless of stdout mode, before writing stdout. Output aliases of
 either input, including hardlinks and symlinks, are refused; the existing
 trusted-directory/final-name protections apply. The final check and rename
@@ -1549,8 +1552,9 @@ prefix a dash-leading output name with `./`.
 For an illustrative application upgrade, suppose `/opt/service/bin/worker`
 has an edge to `/opt/vendor/lib/pkcs11.so` with digest A before and digest B
 after. A and B here stand for different valid 64-digit SHA-256 values, not
-literal input values. The report names one changed application group, two
-content-presence rows, and different module content observed at that path.
+literal input values. With `-v`, the report names one changed application
+group, two content-presence rows, and different module content observed at
+that path.
 If counts are 128 before and 24 after, they remain separate window
 observations; no -104 delta or throughput change is inferred. Equal digests
 mean equal module bytes, while different inodes remain separate physical

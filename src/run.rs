@@ -1335,6 +1335,18 @@ fn child_env_removal_notice(
     ))
 }
 
+/// The `-v` removal notice for a spawn: `Some` only when verbose and a
+/// controlled variable was actually withheld. Without `-v` the spawn
+/// stays quiet even when variables were removed.
+fn verbose_removal_notice(
+    verbose: bool,
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<String> {
+    verbose
+        .then(|| child_env_removal_notice(variables))
+        .flatten()
+}
+
 /// The sudo-drop environment overrides: `USER`/`LOGNAME` always, `HOME`
 /// and `SHELL` from the invoker's passwd row when the row names them,
 /// `XDG_RUNTIME_DIR` when the runtime directory is provably the
@@ -2102,7 +2114,7 @@ impl OwnedChild {
         }
         // M10 (CLI-1): the removal notice is a -v detail, like the identity
         // notices below; without -v the spawn stays quiet.
-        if verbose && let Some(notice) = child_env_removal_notice(variables.iter().cloned()) {
+        if let Some(notice) = verbose_removal_notice(verbose, variables.iter().cloned()) {
             emit_capture_diagnostic(&notice);
         }
         let envp: Vec<*const libc::c_char> = environment
@@ -11234,6 +11246,23 @@ mod tests {
         assert!(!notice.contains("1000"), "{notice:?}");
         assert!(!notice.contains("s3cret"), "{notice:?}");
         assert!(!notice.contains("HOME"), "{notice:?}");
+    }
+
+    #[test]
+    fn removal_notice_is_absent_without_verbose() {
+        // The spawn gate: the same withheld variables that name a notice
+        // under -v stay quiet without it, and -v with nothing withheld
+        // stays quiet too.
+        let variables = || {
+            [
+                (OsString::from("SUDO_UID"), OsString::from("1000")),
+                (OsString::from("HOME"), OsString::from("/home/user")),
+            ]
+        };
+        assert!(verbose_removal_notice(false, variables()).is_none());
+        let notice = verbose_removal_notice(true, variables()).unwrap();
+        assert!(notice.contains("SUDO_UID"), "{notice:?}");
+        assert!(verbose_removal_notice(true, []).is_none());
     }
 
     fn fake_passwd(

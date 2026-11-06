@@ -678,20 +678,22 @@ object, offset, and canonical function name. `p11scope run` never
 implicitly releases a root child: a non-root observer keeps its UID/GID while
 losing capabilities, and a sudo-root observer requires valid non-root
 `SUDO_UID`/`SUDO_GID` values naming one existing non-root account and drops to
-them before the release barrier. Root without that explicit target and set-id
-invocations are refused; those environment values select the target account
-but do not authenticate that the launcher was `sudo`. The child also receives
-`no_new_privs`, no capabilities, the observer's environment unchanged
+them before the release barrier. Root without that explicit target (or
+`--user`) and set-id invocations are refused; those environment values
+select the target account but do not authenticate that the launcher was
+`sudo`. The child also receives `no_new_privs`, no capabilities, the
+observer's environment unchanged
 except `SUDO_*`/`P11SCOPE_*` control variables (named on stderr under -v when
 withheld), and no unrelated inherited file descriptors. Its executable is opened
-by root before fork and executed by descriptor, so the target account needs no
-directory search permission on its path; scripts must be invoked through an
-explicit ELF interpreter such as `/bin/sh script`.
+by the observer (root under sudo) before fork and executed by descriptor, so
+the target account needs no directory search permission on its path; scripts
+must be invoked through an explicit ELF interpreter such as `/bin/sh script`.
 The sudo path restores the invoker's supplementary groups from the account
 database (glibc may return only the primary group) and home environment
 (`HOME`/`USER`/`LOGNAME`/`SHELL` from the passwd entry, `XDG_RUNTIME_DIR`
-when `/run/user/<uid>` is the invoker's own), so HSM/device-group workloads run
-as if launched directly; `-v` prints the restored identity.
+when `/run/user/<uid>` is the invoker's own, otherwise unset), so
+HSM/device-group workloads run as if launched directly; `-v` prints the
+restored identity.
 
 The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 identify final tagged-artifact qualification and hosted CI. The

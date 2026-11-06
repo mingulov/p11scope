@@ -109,12 +109,14 @@ User-facing limits live in
   supplementary groups from the account database (glibc may return only
   the primary group) and home environment (`HOME`/`USER`/`LOGNAME`/
   `SHELL` from its passwd entry, `XDG_RUNTIME_DIR` when
-  `/run/user/<uid>` is provably its own, `MAIL` dropped). `--user root`
-  stays root on purpose. Without root, for an unknown account, when its
-  group list cannot be resolved, or for a set-id observer it refuses
-  with a plain message (exit 2) before anything starts; `-v` prints
-  `running <cmd> as <user> (uid <uid>)`. The default is unchanged: under
-  sudo the invoker, otherwise the observer itself.
+  `/run/user/<uid>` is provably its own (otherwise unset), `MAIL`
+  dropped). Only `root` or `0` select uid 0; any other name or spelling
+  resolving to uid 0 is refused as an unknown account. Without root,
+  for an unknown account, when its group list cannot be resolved, or for
+  a set-id observer it refuses with a plain message (exit 2) before
+  anything starts; `-v` prints `running <cmd> as <user> (uid <uid>)`.
+  The default is unchanged: under sudo the invoker, otherwise the
+  observer itself.
 
 ### Changed
 
@@ -239,12 +241,13 @@ User-facing limits live in
   (glibc may return only the primary group; HSM and device-group
   providers keep working), `HOME`/`USER`/`LOGNAME`/`SHELL` from the
   invoker's passwd entry, and `XDG_RUNTIME_DIR` from `/run/user/<uid>`
-  when that directory exists and is owned by the invoker. The child keeps
-  `no_new_privs` with clear capabilities. New `-v`/`--verbose` flag for
-  `run` prints the restored identity as `running <cmd> as <user>
-  (uid <uid>) (groups and home restored)`; without it `run` stays quiet
-  about the identity. An account the observer cannot resolve refuses with
-  a plain message before anything starts (DR-56).
+  when that directory exists and is owned by the invoker (otherwise
+  unset). The child keeps `no_new_privs` with clear capabilities. New
+  `-v`/`--verbose` flag for `run` prints the restored identity as
+  `running <cmd> as <user> (uid <uid>) (groups and home restored)`;
+  without it `run` stays quiet about the identity. An account the
+  observer cannot resolve refuses with a plain message before anything
+  starts (DR-56).
 
 ### Known limitations
 

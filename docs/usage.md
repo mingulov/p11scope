@@ -359,8 +359,9 @@ are still in progress.
 > invocation a bare execution has none of) and `P11SCOPE_*` (p11scope's
 > own control namespace). Apart from PATH, used to find CMD, values of
 > inherited variables are never inspected or logged. The
-> command is an opened ELF executable, opened by root before any drop and run
-> by descriptor; invoke scripts explicitly as `/bin/sh /path/to/script`.
+> command is an opened ELF executable, opened by the observer (root under
+> sudo) before any drop and run by descriptor; invoke scripts explicitly as
+> `/bin/sh /path/to/script`.
 > Owned launch requires procfs mounted at `/proc`: the opened executable is
 > invoked through `/proc/self/fd`, so the target account needs no directory
 > search permission on its path and a later path replacement cannot change the
@@ -371,7 +372,8 @@ are still in progress.
 > environment, as if the user had run the command directly:
 > `HOME`/`USER`/`LOGNAME`/`SHELL` come from the invoker's passwd entry,
 > `XDG_RUNTIME_DIR` from `/run/user/<uid>` when that directory exists and is
-> owned by the invoker, and `MAIL` is dropped (no passwd field names a mailbox).
+> owned by the invoker (otherwise unset), and `MAIL` is dropped (no passwd
+> field names a mailbox).
 > `-v`/`--verbose` prints the restored identity as one stderr line,
 > `running <cmd> as <user> (uid <uid>) (groups and home restored)`; without it
 > `run` stays quiet about the identity. An account the observer cannot resolve
@@ -379,14 +381,15 @@ are still in progress.
 > `--user <name|uid>` (root only, like `strace -u`) starts the command as
 > that account instead of the invoker, with its groups from the account database
 > (glibc may return only the primary group) and home environment from its passwd
-> entry; `--user root` stays root on purpose. Without root, for an unknown
-> account, when its group list cannot be resolved, or for a set-id observer it
-> refuses with a plain message (exit 2), and `-v` prints
+> entry; only `root` or `0` select uid 0; any other name or spelling
+> resolving to uid 0 is refused as an unknown account. Without root, for an
+> unknown account, when its group list cannot be resolved, or for a set-id
+> observer it refuses with a plain message (exit 2), and `-v` prints
 > `running <cmd> as <user> (uid <uid>)`. A sudoers grant of `p11scope run` is a
 > root grant: `--user` lets that user start commands as any account, including
-> `--user root`, where capless uid 0 still owns root files (owner DAC reads
-> `/etc/shadow`) and user namespaces restore privilege; do not delegate it.
-> Restrict it with sudoers argument matching or do not grant `run`. When the
+> `--user root`, where capless uid 0 still owns root files (as owner it can
+> chmod and rewrite root-owned files such as `/etc/shadow` or `/etc/sudoers`)
+> and user namespaces restore privilege; do not delegate it. When the
 > observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),

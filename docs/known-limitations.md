@@ -2119,9 +2119,9 @@ Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 - Disclosure: usage `run` safety boundary.
 - Status: shipped fixed in v0.6.0. The child keeps `no_new_privs` with
   clear capabilities; `-v`/`--verbose` prints the restored identity as
-  `running <cmd> as <user> (groups and home restored)`. The old
-  workaround (`profile`/`trace` against an already-running target, or a
-  capability-carrying observer) is no longer needed for this.
+  `running <cmd> as <user> (uid <uid>) (groups and home restored)`.
+  The old workaround (`profile`/`trace` against an already-running target,
+  or a capability-carrying observer) is no longer needed for this.
 
 ### One observer per target assumed (DR-52)
 

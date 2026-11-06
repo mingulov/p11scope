@@ -37,9 +37,11 @@
 # A load kernel passes only when the probe rows carry both journal roots
 # loaded with verifier stats, the per-program report passes, and the
 # observer text proves the linked lane sealed and live: the `semantic
-# lane ready` line, no `key operations unavailable` refusal gap (the
-# refused-linked arm records exactly that before its ordinary retry),
-# and joined semantic calls from an admitted binding. Zero journal
+# lane ready` line, no `p11scope: key operations unavailable` refusal
+# diagnostic (the refused-linked arm prints exactly that before its
+# ordinary retry; verbose per-process gap detail also names the
+# condition, so the bare phrase is not matched), and joined semantic
+# calls from an admitted binding. Zero journal
 # rows, a refused journal start, an idle lane, a timeout, a crash or a
 # missing count is FAIL. The finite refusal reasons
 # (`journal-pair-unavailable-in-build` on a build that omits the
@@ -530,19 +532,22 @@ PY
     elif grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
         add_reason "observer crashed"
     fi
-    # Linked proof: the seal line plus no journal-start refusal gap
-    # means the linked start succeeded (start_semantic_lane records
-    # "key operations unavailable" on exactly the refused-linked arm
-    # before its ordinary retry, and prints the seal line only for a
-    # sealed lane), and joined calls prove the lane is live. The
+    # Linked proof: the seal line plus no journal-start refusal
+    # diagnostic means the linked start succeeded (start_semantic_lane
+    # prints "p11scope: key operations unavailable: ..." on exactly the
+    # refused-linked arm before its ordinary retry, and prints the seal
+    # line only for a sealed lane), and joined calls prove the lane is
+    # live. The diagnostic prefix matters: verbose per-process gap
+    # detail also names the condition ("Joint key operations
+    # unavailable"), so the bare phrase would refuse a live lane. The
     # key-operations display latch (bootstrap_unavailable) does not
     # complete in production runs at this base, so the display state
     # is recorded in the row, never gated.
-    # Both refusal shapes: the gap subject from a runtime journal
+    # Both refusal shapes: the stderr diagnostic from a runtime journal
     # refusal (with an ordinary retry behind it), and the bare finite
     # reason from a build that rejects --key-operations up front.
-    if [ -f "$J_TXT" ] && grep -Eq 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
-        REFUSAL=$(grep -E 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
+    if [ -f "$J_TXT" ] && grep -Eq 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
+        REFUSAL=$(grep -E 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
     elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
         add_reason "semantic lane never sealed"

@@ -1180,9 +1180,13 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         let numbering = crate::pidns::numbering();
         let nested = !numbering.agrees();
         let own_proc = numbering.proc_view == crate::pidns::ProcView::Own;
-        // A nested pidfd-bound promotion proves its single emitter is
-        // the request's task by construction; match it without numbers.
-        // Mirrors the promotion below (single Confirm with a pidfd).
+        // A nested pidfd-bound promotion matches its single emitter
+        // without numbers. The pidfd pins the task against reuse, but
+        // exactness is not by construction alone: the target may exec
+        // between preparation and the run, so the confirm finish path
+        // re-proves liveness after the run (`still_the_same`, plus the
+        // exe-identity re-read). Mirrors the promotion below (single
+        // Confirm with a pidfd).
         let nested_per_pid = nested
             && matches!(batch.requests(), [only]
             if matches!(only.kind(), AcceptedKind::Confirm) && only.pidfd().is_some());
@@ -1501,7 +1505,8 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 continue;
             }
             // Nested pidfd-bound runs match the sole emitter (the
-            // pidfd already bound the request's task); anywhere else the
+            // pidfd already bound the request's task, and the finish
+            // path re-proves liveness after the run); anywhere else the
             // numbered pid keys the run. A nested run without promotion
             // (no pidfd) or without our own /proc never reaches this
             // match: it fails closed to userspace above, since the

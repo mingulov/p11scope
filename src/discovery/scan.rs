@@ -12994,6 +12994,100 @@ mod tests {
         budget.finish_window(next).unwrap();
     }
 
+    /// Two different files in two Btrfs subvolumes render the same maps
+    /// (device, inode) and the same whole Pin{ino,size,ctime} (39 of 40
+    /// host tries), differing only in the held fd's st_dev. Neither
+    /// inspection cache may hand one file's digest and exports to the
+    /// other. RED: the key cannot name the distinguishing st_dev, so the
+    /// second twin's lookup hits the first twin's entry.
+    #[test]
+    fn btrfs_equal_pin_twins_never_share_an_inspection() {
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        let file = File::open("/bin/sh").unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let pin = pin_of(&file).unwrap();
+        // Both twins render one maps key and one pin; only the held fd's
+        // st_dev tells them apart, and the key does not carry it (the bug).
+        let twin_a = InspectedFileKey {
+            device: Device {
+                major: 0,
+                minor: 140,
+            },
+            inode: 257,
+            pin,
+        };
+        let twin_b = InspectedFileKey {
+            device: Device {
+                major: 0,
+                minor: 140,
+            },
+            inode: 257,
+            pin,
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        assert!(budget.note_inspected_file(twin_a, inspected));
+        assert!(budget.note_elf_export_facts(twin_a, facts));
+        assert_eq!(
+            budget.inspected_file(&twin_b),
+            None,
+            "a different file with an equal maps key and pin must not reuse the cached inspection"
+        );
+        assert_eq!(
+            budget.elf_export_facts_for(&twin_b),
+            None,
+            "a different file with an equal maps key and pin must not reuse the cached export facts"
+        );
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
+    /// Healthy twin: the same file inspected twice reuses its cached
+    /// inspection and export facts (the cache still serves the common case).
+    #[test]
+    fn same_file_inspection_is_reused_from_cache() {
+        let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
+        let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
+        let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+
+        let file = File::open("/bin/sh").unwrap();
+        let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
+        let key = InspectedFileKey {
+            device: Device { major: 8, minor: 1 },
+            inode: 7,
+            pin: pin_of(&file).unwrap(),
+        };
+        let facts = ElfExportFacts {
+            abi: ElfAbi::Lp64,
+            exports: vec![("C_GetFunctionList".into(), 7)],
+            getter_present: false,
+            witness_fault: false,
+            excluded_anchor_ranges: Vec::new(),
+        };
+        assert!(budget.note_inspected_file(key, inspected.clone()));
+        assert!(budget.note_elf_export_facts(key, facts.clone()));
+        assert_eq!(budget.inspected_file(&key), Some(inspected));
+        assert_eq!(budget.elf_export_facts_for(&key), Some(facts));
+
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
+    }
+
     #[test]
     fn inventory_cache_byte_limit_accepts_exact_size_and_refuses_one_over() {
         let key = InspectedFileKey {

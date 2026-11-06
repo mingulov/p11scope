@@ -472,17 +472,17 @@ fn apply_isolated_with(
     landlock: impl FnOnce(Option<&Path>) -> Result<(), String>,
     seccomp: impl FnOnce() -> Result<(), String>,
 ) -> Result<(), String> {
-    landlock(writable_dir)?;
     if !is_x86_64 {
         return Err("isolated profile: x86-64 only".into());
     }
+    landlock(writable_dir)?;
     seccomp()
 }
 
-/// Apply the isolated fence: Landlock first, then seccomp. `writable_dir`
-/// is the `-o` parent directory, or `None` for stdout output. On success
-/// the caller may load the provider; on failure it must exit before
-/// `dlopen` — provider code never runs.
+/// Apply the isolated fence: the architecture gate, then Landlock, then
+/// seccomp. `writable_dir` is the `-o` parent directory, or `None` for
+/// stdout output. On success the caller may load the provider; on failure
+/// it must exit before `dlopen` — provider code never runs.
 pub fn apply_isolated(writable_dir: Option<&Path>) -> Result<(), String> {
     apply_isolated_with(
         cfg!(target_arch = "x86_64"),

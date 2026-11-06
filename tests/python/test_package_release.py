@@ -526,6 +526,18 @@ class PackageReleaseTests(unittest.TestCase):
             self.package()
         self.assertEqual(sentinel.read_text(), "keep")
 
+    def test_system_package_docs_state_tested_distros_and_glibc_floor(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("### System packages (DEB/RPM)", readme)
+        section = readme.split("### System packages (DEB/RPM)", 1)[1].split("\n### ", 1)[0]
+        usage = (ROOT / "docs/usage.md").read_text()
+        self.assertIn("## Installing system packages", usage)
+        installing = usage.split("## Installing system packages", 1)[1].split("\n## ", 1)[0]
+        for name, text in (("README.md", section), ("docs/usage.md", installing)):
+            with self.subTest(doc=name):
+                for marker in ("Ubuntu 26.04", "Fedora 44", "glibc 2.34"):
+                    self.assertIn(marker, text)
+
 
 if __name__ == "__main__":
     unittest.main()

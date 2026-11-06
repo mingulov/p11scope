@@ -8966,6 +8966,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: reason.into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
@@ -9175,6 +9176,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
@@ -9201,6 +9203,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
@@ -9231,6 +9234,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
@@ -9251,6 +9255,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
         let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Quiet);

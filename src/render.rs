@@ -8990,9 +8990,16 @@ pub(crate) mod tests {
             !text.contains("Forwarding layers counted separately"),
             "no split without an attributed provider row: {text}"
         );
+        // Owner-gap lines are verbose-only; concise keeps the headline above.
+        let verbose_text = scope_summary_with_verbosity(
+            "pid",
+            &[outer.clone(), stray.clone()],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(
-            text.contains("\n500 completed calls have unresolved module ownership.\n"),
-            "the ownership gap names the unattributed share: {text}"
+            verbose_text.contains("\n500 completed calls have unresolved module ownership.\n"),
+            "the ownership gap names the unattributed share: {verbose_text}"
         );
         let document = json(&[outer, stray], &ev, &capture_fixture());
         assert_eq!(document["layer_totals"]["logical"]["calls"], 1000);
@@ -9093,22 +9100,33 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.discovery.modules = vec![layer, backend];
         ev.verdict();
-        let text = scope_summary("pid", &[outer, stray, contested, inner], &ev);
+        let text = scope_summary(
+            "pid",
+            &[outer.clone(), stray.clone(), contested.clone(), inner.clone()],
+            &ev,
+        );
         assert!(
             text.contains("749 completed calls;"),
             "headline counts logical rows once: {text}"
         );
-        assert!(
-            text.contains("\n5 completed calls have unresolved module ownership.\n"),
-            "unresolved line counts the logical stray only: {text}"
+        // Owner-gap lines are verbose-only; concise keeps the headline above.
+        let verbose_text = scope_summary_with_verbosity(
+            "pid",
+            &[outer, stray, contested, inner],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(
-            !text.contains("505 completed calls"),
-            "forwarding rows are not summed into the unresolved line: {text}"
+            verbose_text.contains("\n5 completed calls have unresolved module ownership.\n"),
+            "unresolved line counts the logical stray only: {verbose_text}"
         );
         assert!(
-            !text.contains("ambiguous module ownership"),
-            "a forwarding-only ambiguity prints no ownership line: {text}"
+            !verbose_text.contains("505 completed calls"),
+            "forwarding rows are not summed into the unresolved line: {verbose_text}"
+        );
+        assert!(
+            !verbose_text.contains("ambiguous module ownership"),
+            "a forwarding-only ambiguity prints no ownership line: {verbose_text}"
         );
     }
 

@@ -5371,13 +5371,15 @@ fn own_piece(piece: Discovered<'_>) -> OwnedPiece {
     }
 }
 
-/// One old plan module, cached for the slot remap and refusal attribution.
+/// One old plan module, cached for the slot remap, refusal attribution
+/// and its deciding admission class (which survives with the module).
 // consumed by T4: read only inside the cursor derivation.
 #[allow(dead_code)]
 struct OldModuleInfo {
     id: ModuleId,
     object: PinnedObjectId,
     path: String,
+    admission_class: Option<&'static str>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -6172,6 +6174,7 @@ impl ConservativePlanCursor {
             id: module.id,
             object: module.object,
             path: module.path.clone(),
+            admission_class: module.admission_class,
         });
         self.old_id_objects.insert(module.id, module.object);
         self.old_objects.insert(module.object);
@@ -6222,6 +6225,13 @@ impl ConservativePlanCursor {
                     .and_then(|pieces| pieces.first().copied())
                     .ok_or(GraphRefusal::Identity)?;
                 let piece = self.pieces.get(first).ok_or(GraphRefusal::Identity)?;
+                // The admission class survives with the module: the old plan
+                // already classified it, and replication must not drop it.
+                let admission_class = self
+                    .old_modules
+                    .iter()
+                    .find(|info| info.object == object)
+                    .and_then(|info| info.admission_class);
                 self.in_summary = Some(ModuleSummary {
                     id: stable,
                     object,
@@ -6232,7 +6242,7 @@ impl ConservativePlanCursor {
                     source: piece.source,
                     corroborated: false,
                     skipped: Vec::new(),
-                    admission_class: None,
+                    admission_class,
                 });
                 self.surviving_paths.insert(piece.path.clone());
                 self.replicate_count_only = false;

@@ -17,13 +17,12 @@
 //! in `doctor`. The verdict comes from actually running the mechanism against
 //! a child of our own.
 
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
-use aya::programs::UProbe;
-use aya::programs::uprobe::{UProbeAttachLocation, UProbeAttachPoint, UProbeScope};
+use aya::programs::{ProbeKind, UProbe};
 
 /// x86-64 `__NR_uretprobe`. The syscall exists only on kernels that use the
 /// trampoline; on older ones this number is unallocated, the filter below
@@ -433,8 +432,9 @@ pub(crate) fn probe_kernel() -> KernelVerdict {
     }
 }
 
-/// Context the self-probe puts on its uprobe attach; an EACCES there is the
-/// perf-event permission check (`kernel.perf_event_paranoid`, CAP_PERFMON).
+/// Context the self-probe puts on its uprobe-multi link; an EACCES or
+/// EPERM there is the BPF link-creation check (missing CAP_BPF), never the
+/// paranoid sysctl, which does not gate links.
 const SELF_PROBE_ATTACH_CONTEXT: &str = "attaching the uretprobe self-probe";
 
 /// A self-probe failure is `NotPermitted` when the kernel refused this
@@ -590,16 +590,20 @@ pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String 
              `p11scope doctor` shows what this host allows"
         );
     }
-    if why.starts_with(SELF_PROBE_ATTACH_CONTEXT)
+    // Only genuine perf_event_open failures reach this arm: the self-probe
+    // attaches through an uprobe-multi link now, so its failures name the
+    // link creation instead. (The arm goes away with the refusal rewrite,
+    // which moves paranoid guidance to the singles paths that use perf.)
+    if why.contains("perf_event_open")
         && perf_open_restricted(facts)
         && let Some(level) = facts.perf_event_paranoid
     {
         return format!(
-            "cannot attach p11scope's uretprobe self-probe ({why}): kernel.perf_event_paranoid \
+            "cannot attach a per-probe uprobe ({why}): kernel.perf_event_paranoid \
              is {level}, and at {PERF_OPEN_RESTRICT_PARANOID} or above this kernel refuses \
              perf_event_open to any process without CAP_SYS_ADMIN — CAP_BPF and CAP_PERFMON do \
-             not lift it. The self-probe and live-discovery probes attach through \
-             perf_event_open, so this capture needs CAP_SYS_ADMIN (root normally has it), or \
+             not lift it. Per-probe (singles) uprobes attach through \
+             perf_event_open, so this attach needs CAP_SYS_ADMIN (root normally has it), or \
              kernel.perf_event_paranoid at 2 or below. `p11scope doctor` shows this host's row"
         );
     }
@@ -658,9 +662,11 @@ fn probe_kernel_inner() -> Result<KernelVerdict> {
             .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
             .try_into()
             .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
+        // Multi-capable load: the probe attaches through an uprobe-multi
+        // link, which the paranoid sysctl does not gate.
         program
-            .load()
-            .with_context(|| format!("loading {SELF_PROBE_PROGRAM}"))?;
+            .load_multi()
+            .with_context(|| format!("loading {SELF_PROBE_PROGRAM} for multi attach"))?;
     }
     let ebpf = &mut ebpf;
     let offset = own_text_file_offset(probe_point as *const () as usize as u64)
@@ -742,22 +748,34 @@ fn probe_parent(
         .with_context(|| format!("program {SELF_PROBE_PROGRAM} missing from the BPF object"))?
         .try_into()
         .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?;
-    let point = UProbeAttachPoint {
-        location: UProbeAttachLocation::AbsoluteOffset(offset),
-        cookie: None,
-    };
-    let scope = UProbeScope::OneProcess(
-        std::num::NonZeroU32::new(child).context("the self-probe child pid must be non-zero")?,
-    );
-    let link = program
-        .attach([point], "/proc/self/exe", scope)
-        .context(SELF_PROBE_ATTACH_CONTEXT)?;
+    // A BPF link, not a perf_event_open uprobe: the paranoid sysctl gates
+    // per-probe uprobes (CAP_SYS_ADMIN at 3+) but not uprobe-multi links,
+    // so the probe needs only CAP_BPF. The child is single-threaded, so
+    // the pid filter is exact even on kernels with the 6.9.x thread bug.
+    let is_return = matches!(program.kind(), ProbeKind::Return);
+    let prog_fd = program
+        .fd()
+        .map_err(|error: aya::programs::ProgramError| anyhow!("{error}"))?
+        .as_fd()
+        .as_raw_fd();
+    if child == 0 {
+        return Err(anyhow!("the self-probe child pid must be non-zero"));
+    }
+    let link = p11scope_bpf_multi::attach_group(
+        prog_fd,
+        child,
+        std::path::Path::new("/proc/self/exe"),
+        std::slice::from_ref(&offset),
+        &[0],
+        is_return,
+    )
+    .context(SELF_PROBE_ATTACH_CONTEXT)?;
 
     drop(release_write); // the child's blocking read returns 0 -> it proceeds
     let status = reap(child, Duration::from_secs(10));
     // Detached before the verdict is returned: this link must never outlive the
-    // probe and reach the real capture's accounting.
-    let _ = program.detach(link);
+    // probe and reach the real capture's accounting. Link detach is drop.
+    drop(link);
     let status = status.context("waiting for the self-probe child")?;
     Ok(classify_probe_child(status))
 }
@@ -1379,7 +1397,7 @@ mod tests {
                     return Err(format!("self-probe attach lacks {marker}"));
                 }
             }
-            for forbidden in [".attach(", "UProbeScope", "UProbeAttachPoint", "perf_event"] {
+            for forbidden in [".attach(", "UProbeScope", "UProbeAttachPoint"] {
                 if attach.contains(forbidden) {
                     return Err(format!("self-probe attach still uses {forbidden}"));
                 }
@@ -1391,8 +1409,8 @@ mod tests {
         contract(source).unwrap();
         for (original, replacement, role) in [
             (
-                "program.load_multi()",
-                "program.load()",
+                ".load_multi()",
+                ".load()",
                 "self-probe load lacks load_multi()",
             ),
             (
@@ -1789,10 +1807,12 @@ mod tests {
         }
     }
 
-    /// DR-K8S-3: the self-probe attaches through `perf_event_open`, which
-    /// `perf_event_paranoid >= 3` refuses to anything without CAP_SYS_ADMIN
-    /// (CAP_PERFMON does not lift it). That refusal must name the sysctl
-    /// and the capability — for root too — never a lockdown, LSM or seccomp.
+    /// DR-K8S-3: per-probe (singles) uprobes attach through
+    /// `perf_event_open`, which `perf_event_paranoid >= 3` refuses to anything
+    /// without CAP_SYS_ADMIN (CAP_PERFMON does not lift it). That refusal must
+    /// name the sysctl and the capability — for root too — never a lockdown,
+    /// LSM or seccomp. (The self-probe itself attaches through a BPF link now;
+    /// this arm only fires when the error chain proves perf was used.)
     #[test]
     fn a_paranoid_refused_self_probe_names_the_sysctl_and_cap_sys_admin() {
         let why = "attaching the uretprobe self-probe: `perf_event_open` failed: Permission \

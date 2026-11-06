@@ -3767,43 +3767,6 @@ impl LiveJointMachine {
                                 let since = *self.finish_no_progress_since.get_or_insert(now);
                                 let stalled = now.duration_since(since);
                                 if stalled >= JOINT_FINISH_NO_PROGRESS_TIMEOUT {
-                                    // A stall behind staging no bound key can
-                                    // account for (another process's call
-                                    // still in flight) degrades only that
-                                    // process: refuse its image, name it, and
-                                    // restart the clock. Every bound caller
-                                    // keeps its Joint feed; the lane stops
-                                    // only for a stall with no such cause.
-                                    let (images, entries) = coordinator
-                                        .joint_capture_mut()
-                                        .adapter_mut()
-                                        .refuse_unbound_staging_images();
-                                    if images > 0 {
-                                        coordinator.note_scope_gap(
-                                            "joint audit stall released".to_string(),
-                                            format!(
-                                                "{}s without progress in Audited behind {} in-flight \
-                                                 call{} of {} process image{} no bound caller \
-                                                 accounts for; those processes stay S1-only and \
-                                                 never enter Joint, every bound caller continues",
-                                                stalled.as_secs(),
-                                                entries,
-                                                if entries == 1 { "" } else { "s" },
-                                                images,
-                                                if images == 1 { "" } else { "s" },
-                                            ),
-                                        );
-                                        self.audit_no_progress_polls = 0;
-                                        self.finish_no_progress_since = None;
-                                        return (
-                                            Phase::Audited {
-                                                frame,
-                                                identity,
-                                                base,
-                                            },
-                                            Ok(Step::Yield),
-                                        );
-                                    }
                                     let polls = self.audit_no_progress_polls;
                                     let watermarks = frame
                                         .as_ref()

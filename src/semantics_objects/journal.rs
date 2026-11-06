@@ -1918,36 +1918,6 @@ impl JournalAdapter {
         true
     }
 
-    /// Release a stalled audit: refuse every image whose unconverted
-    /// staging (open or refused begins) no bound key accounts for. Those
-    /// entries are exactly what `has_unbound_staging` barriers every seal
-    /// on; a call still in flight in a process that never binds (a
-    /// blocking wait) would hold every bound caller's seal forever. Each
-    /// such image is tainted as `refuse_other_caller_image` does: its
-    /// staging drops, later records refuse, and it never enters Joint,
-    /// so only that process degrades (S1 stays, named). Returns the
-    /// refused image count and the dropped staged entry count.
-    pub(crate) fn refuse_unbound_staging_images(&mut self) -> (usize, usize) {
-        let mut images: BTreeSet<(u64, u64)> = BTreeSet::new();
-        let mut entries = 0usize;
-        for entry in self.open.values() {
-            if entry.converted_ticket.is_none() && !self.image_keys.contains_key(&entry.image) {
-                images.insert(entry.image);
-                entries += 1;
-            }
-        }
-        for refused in &self.refused {
-            if !self.image_keys.contains_key(&refused.image) {
-                images.insert(refused.image);
-                entries += 1;
-            }
-        }
-        for image in &images {
-            self.taint_image(*image);
-        }
-        (images.len(), entries)
-    }
-
     /// Whether the journal refuses future proof for this image (tainted,
     /// or untracked past taint saturation).
     pub(crate) fn image_refused(&self, image: (u64, u64)) -> bool {

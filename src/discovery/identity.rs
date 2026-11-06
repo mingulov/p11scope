@@ -490,6 +490,29 @@ pub(crate) fn nonunique_inode_kind(f_type: u64) -> Option<&'static str> {
         .find_map(|(magic, name)| (*magic == f_type).then_some(*name))
 }
 
+/// Tmpfs `f_type`: whether inode numbers name one file depends on the
+/// mount's `inode32`/`inode64` option, read from the mount table.
+pub(crate) const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
+
+/// Whether inode numbers on a filesystem with this `fstatfs` magic name
+/// one file per device, given the mount's super-options (`None` when the
+/// mount table could not be read). Pure so every listed filesystem is
+/// unit-testable without mounting it.
+pub(crate) fn inodes_name_one_file(f_type: u64, super_options: Option<&str>) -> bool {
+    // Placeholder: always unique. Replaced with the real decision table.
+    let _ = (f_type, super_options);
+    true
+}
+
+/// The super-options field of mount `mnt_id` in a mountinfo table, or
+/// `None` when the mount is absent or its line is malformed. Pure so the
+/// table format is unit-testable.
+pub(crate) fn mount_super_options(mountinfo: &str, mnt_id: u64) -> Option<&str> {
+    // Placeholder: never found. Replaced with the real parser.
+    let _ = (mountinfo, mnt_id);
+    None
+}
+
 fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, String> {
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
@@ -11804,6 +11827,80 @@ mod tests {
             "the per-object check does not latch the whole set"
         );
         assert!(pinned.object_unchanged(PinnedObjectId(999)).is_err());
+    }
+
+    #[test]
+    fn unique_inode_decision_refuses_fuse_and_network_filesystems() {
+        assert!(
+            !inodes_name_one_file(0x6573_5546, None),
+            "FUSE inode numbers are daemon-chosen"
+        );
+        assert!(
+            !inodes_name_one_file(0x6969, None),
+            "NFS inode numbers are server-assigned"
+        );
+        assert!(!inodes_name_one_file(0x517b, None));
+        assert!(!inodes_name_one_file(0xff53_4d42, None));
+        assert!(!inodes_name_one_file(0xfe53_4d42, None));
+        assert!(!inodes_name_one_file(0x0102_1997, None));
+        assert!(!inodes_name_one_file(0x00c3_6400, None));
+        assert!(!inodes_name_one_file(0x5346_414f, None));
+        assert!(!inodes_name_one_file(0x7375_7245, None));
+    }
+
+    #[test]
+    fn unique_inode_decision_accepts_ordinary_filesystems() {
+        assert!(inodes_name_one_file(0xef53, None), "ext4");
+        assert!(inodes_name_one_file(0x5846_5342, None), "xfs");
+        assert!(inodes_name_one_file(0x9123_683e, None), "btrfs");
+        assert!(
+            inodes_name_one_file(0x0102_1994, Some("rw,inode64")),
+            "tmpfs inode64"
+        );
+    }
+
+    #[test]
+    fn unique_inode_decision_refuses_tmpfs_inode32() {
+        assert!(
+            !inodes_name_one_file(0x0102_1994, Some("rw,size=1024k,inode32")),
+            "tmpfs inode32 wraps its 32-bit counter"
+        );
+        assert!(
+            !inodes_name_one_file(0x0102_1994, None),
+            "an unreadable mount table fails closed"
+        );
+    }
+
+    #[test]
+    fn unique_inode_decision_matches_super_option_tokens_exactly() {
+        assert!(
+            inodes_name_one_file(0x0102_1994, Some("rw,noinode32x")),
+            "inode32 must be a whole comma-separated token, not a substring"
+        );
+        assert!(
+            !inodes_name_one_file(0x0102_1994, Some("inode32")),
+            "a bare inode32 option still refuses"
+        );
+    }
+
+    #[test]
+    fn mount_super_options_reads_the_mount_table() {
+        let table = "34 45 0:29 / /run rw,nosuid,nodev shared:13 - tmpfs tmpfs rw,size=1024k,inode32\n\
+             41 45 0:7 / /dev rw,nosuid shared:2 - devtmpfs devtmpfs rw,size=1024k,mode=755\n";
+        assert_eq!(
+            mount_super_options(table, 34),
+            Some("rw,size=1024k,inode32")
+        );
+        assert_eq!(
+            mount_super_options(table, 41),
+            Some("rw,size=1024k,mode=755")
+        );
+        assert_eq!(mount_super_options(table, 999), None, "absent mount");
+        assert_eq!(
+            mount_super_options("34 45 0:29 / /run rw,nosuid,nodev\n", 34),
+            None,
+            "a line without the separator is malformed"
+        );
     }
 
     #[test]

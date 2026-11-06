@@ -2497,8 +2497,9 @@ fn forwarding_layer_lines(
     }
     format!(
         "Forwarding layers counted separately (not in the totals above): {}.\n\
-         Each forwarding-layer call is counted at the provider it forwards into; \
-         the totals above count that logical call once.\n",
+         The totals above count calls at the attached providers; \
+         calls a layer answered itself, including its errors, appear only here, \
+         and a layer call that reaches several providers counts at each.\n",
         layers.join("; ")
     )
 }

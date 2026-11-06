@@ -1090,10 +1090,15 @@ conservatively instead of riding to the run end.
 Top-level `layer_totals` (always present) splits entry counts:
 `logical_entries` (provider edges, counted once) and
 `forwarding_entries` (closure-array forwarding-layer edges, never
-summed into logical). One logical entry observed at both layers counts
-once, on its provider edge. `modules[].admission.class` names the
-forwarding layers (`closure_array`); consumers that sum entry counts
-must skip those modules' edges to count logical entries once.
+summed into logical). An edge splits out only for callers that also
+entered a watched provider; closure-only callers' edges stay logical.
+One logical entry observed at both layers counts once, on its provider
+edge. `modules[].admission.class` names the forwarding layers
+(`closure_array`); consumers that sum entry counts must skip those
+modules' edges to count logical entries once, except for closure-only
+callers whose edges never split out. Layer-self-answered entries
+appear only in the forwarding split, and one layer entry reaching
+several providers counts at each.
 
 ## Example (abridged)
 

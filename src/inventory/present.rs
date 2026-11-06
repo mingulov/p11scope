@@ -2130,7 +2130,9 @@ fn render_snapshot_inner(
             let _ = writeln!(
                 out,
                 "Forwarding-layer entries counted separately (not independent calls): {}. \
-                 Each forwarding-layer entry is counted at the provider it forwards into; provider edges are the logical totals.",
+                 Provider edges are the logical totals; \
+                 entries a layer answered itself appear only here, \
+                 and a layer entry that reaches several providers counts at each.",
                 parts.join("; ")
             );
         }

@@ -623,10 +623,15 @@ v3-additive disclosure that introduces no new schema revision: the
 Every `functions[]` row carries `forwarding_layer` (boolean, always
 present): true when the row counts calls at a forwarding layer (a
 closure array admitted beside watched providers), false for provider
-rows. One logical call observed at both layers counts once, in the
-provider row; the forwarding row stays explicit beside it. Consumers
-that sum `calls` across rows must skip `forwarding_layer` rows to count
-logical calls once.
+rows. The split needs an active provider in the same capture (a
+non-layer row with a call, an error, or an in-flight entry);
+otherwise the layer's rows read `forwarding_layer: false` and stay in
+the totals. One logical call observed at both layers counts once, in
+the provider row; the forwarding row stays explicit beside it.
+Consumers that sum `calls` across rows must skip `forwarding_layer`
+rows to count logical calls once. Layer-self-answered calls,
+including their errors, appear only in the forwarding split, and one
+layer call reaching several providers counts at each.
 
 Top-level `layer_totals` (always present in both v3 documents, metrics
 and profile) splits the same totals: `logical` (provider calls, errors

@@ -206,19 +206,29 @@ reserve-capped leading-templates prefix instead of published-only
 admission, because a remote client's tables are handed out before any
 export probe can observe the return.
 
-When both a forwarding layer and the providers below it attach, every
-headline total counts one logical call once, at its provider; the
-forwarding layer's own calls print on a separate `Forwarding layers
-counted separately` line (per layer) and never sum into the totals, and
-`inventory` prints the same split as `Forwarding-layer entries counted
-separately`. In JSON, every `functions[]` row carries `forwarding_layer`
-(true at the layer, false at providers) with top-level `layer_totals`
+When a forwarding layer attaches beside an active provider below it —
+one that counted a call, an error, or an in-flight entry in the same
+capture (per caller in `inventory`) — every call-count headline total
+counts one logical call once, at its provider; the forwarding layer's
+own calls print on a separate `Forwarding layers counted separately`
+line (per layer) and never sum into the totals, and `inventory` prints
+the same split as `Forwarding-layer entries counted separately`. In
+JSON, every `functions[]` row carries `forwarding_layer` (true at the
+layer, false at providers) with top-level `layer_totals`
 (`logical`/`forwarding`); `inventory` carries `layer_totals`
 (`logical_entries`/`forwarding_entries`). Consumers that sum `calls`
-must skip `forwarding_layer` rows. Known limitation: a whole-admitted
-layer's own named rows plus its unknown stub rows can total ~2x the
-logical calls in the separate forwarding count; that intra-layer
-fan-out is shown, not deduplicated.
+must skip `forwarding_layer` rows. With no active provider — a lone
+remote client, or providers attached but quiet — the layer's calls stay
+in the totals and no forwarding line prints. Calls the layer answers
+itself, including its errors, appear only in the forwarding line, and
+one layer call that reaches several providers counts at each;
+per-mechanism, per-session and per-login sections still observe both
+layers. Known limitation: a whole-admitted layer's own named rows plus
+its unknown stub rows can total ~2x the logical calls in the separate
+forwarding count; that intra-layer fan-out is shown, not deduplicated.
+Residual: in `--system` captures rows carry no caller, so the render
+gate applies capture-wide, and a misclassified provider beside another
+active provider would still split out.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,

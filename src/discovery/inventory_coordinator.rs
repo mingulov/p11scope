@@ -18811,6 +18811,88 @@ exit 0
         );
     }
 
+    /// The short-lived extractor stages only the counted gap: the
+    /// pending population stays undisclosed (the stop-diff disclosure
+    /// names those pids instead), and a repeat call stays silent.
+    #[test]
+    fn short_lived_extractor_stages_only_the_counted_gap() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            9,
+            at,
+            at,
+        )));
+        for _ in 0..2 {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        let late = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            10,
+            late,
+            late,
+        )));
+        assert_eq!(native.scene.coordinator.short_lived_never_scanned, 1);
+        assert!(
+            native.scene.coordinator.pending_exec_newcomers.contains_key(&10),
+            "the late hook is still pending at the terminal call"
+        );
+        assert!(native.scene.coordinator.note_short_lived_never_scanned());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT),
+            "the extractor discloses the counted gap: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            gaps.iter()
+                .all(|gap| gap.subject != "discovery coverage ended before stop"),
+            "the extractor never names the pending population: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            native.scene.coordinator.pending_exec_newcomers.contains_key(&10),
+            "the pending map stays for the stop-diff disclosure"
+        );
+        assert_eq!(native.scene.coordinator.short_lived_never_scanned, 0);
+        assert!(!native.scene.coordinator.note_short_lived_never_scanned());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let (index, _) = registry
+            .gaps()
+            .iter()
+            .enumerate()
+            .find(|(_, gap)| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT)
+            .expect("the disclosed gap stays");
+        assert_eq!(
+            registry.gap_repeats()[index],
+            1,
+            "a repeated extractor call stages nothing: {:?}",
+            native.gap_subjects()
+        );
+    }
+
     #[test]
     fn an_exec_hook_mints_while_the_leader_holds_no_ticket_yet() {
         // Fedora's lost race: the EXEC record drains before the new image

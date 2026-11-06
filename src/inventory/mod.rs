@@ -3100,8 +3100,8 @@ impl ClassicDriver<'_> {
                         self.coordinator.note_scope_gap(
                             "semantic subset scan-derived".into(),
                             "key operations use scan-discovered tables without a manifest; \
-                             table provenance is scan publication evidence (linked or \
-                             live-returned tables only), not operator attestation"
+                             table provenance is scan publication evidence (linked, \
+                             live-returned or sole complete tables), not operator attestation"
                                 .into(),
                         );
                         self.initialize_joint_lane();

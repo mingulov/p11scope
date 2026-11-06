@@ -11,8 +11,12 @@ use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
 use crate::discovery::overlay_witness::{
-    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessVerdict,
+    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessOutcome, WitnessVerdict,
     original_file_witness_required, prove_original_file,
+};
+#[cfg(test)]
+use crate::discovery::overlay_witness::{
+    GAP_WITNESS_UNAVAILABLE, WitnessDiagnosis, WitnessStage,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
@@ -13674,6 +13678,7 @@ mod tests {
         prove_calls: usize,
         witness_used: u32,
         witness_max: u32,
+        diagnosed: Option<WitnessOutcome>,
     }
 
     impl K1RedIo {
@@ -13687,6 +13692,7 @@ mod tests {
                 prove_calls: 0,
                 witness_used: 0,
                 witness_max: 8,
+                diagnosed: None,
             }
         }
 
@@ -13700,6 +13706,7 @@ mod tests {
                 prove_calls: 0,
                 witness_used: 0,
                 witness_max: 8,
+                diagnosed: None,
             }
         }
 
@@ -13717,6 +13724,10 @@ mod tests {
 
         fn script_binding_failed(&mut self) {
             self.witness.push_back(K1RedVerdict::BindingFailed);
+        }
+
+        fn script_diagnosed(&mut self, outcome: WitnessOutcome) {
+            self.diagnosed = Some(outcome);
         }
 
         fn exhaust(&mut self) {
@@ -13791,6 +13802,28 @@ mod tests {
                 K1RedVerdict::BindingFailed => {
                     WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)
                 }
+            }
+        }
+
+        fn prove_original_file_diagnosed(
+            &mut self,
+            view: &ProcessView,
+            file: &std::fs::File,
+            held: &MappedFile,
+            key: ObjectKey,
+            range: (u64, u64),
+            budget: &mut CaptureWorkBudget,
+        ) -> WitnessOutcome {
+            if let Some(outcome) = self.diagnosed.take() {
+                self.prove_calls += 1;
+                self.witness_used += 1;
+                return outcome;
+            }
+            let verdict =
+                self.prove_original_file(view, file, held, key, range, budget);
+            WitnessOutcome {
+                verdict,
+                diagnosis: None,
             }
         }
     }
@@ -13956,6 +13989,49 @@ mod tests {
             "exhaustion carries the finite gap, got {reason:?}"
         );
         assert_eq!(io.prove_calls, 0, "no query runs past the budget");
+    }
+
+    #[test]
+    fn k1_prove_appends_plain_stage_for_unavailable() {
+        // RED: an unavailable verdict with a diagnosis refuses with the
+        // canonical prefix plus the plain-words stage.
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_diagnosed(WitnessOutcome {
+            verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+            diagnosis: Some(WitnessDiagnosis::uncounted(WitnessStage::CollectionWork)),
+        });
+        let reason = run_k1_prove(&mut io, held, outcome).expect("unavailable refuses");
+        assert_eq!(
+            reason,
+            "original_file_unproven: kernel witness unavailable: \
+             scoped collection deactivates the kernel proof"
+        );
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
+    }
+
+    #[test]
+    fn k1_prove_keeps_canonical_reason_without_diagnosis() {
+        // RED: an unavailable verdict without a diagnosis (scripted IOs,
+        // old behavior) refuses with the exact canonical reason.
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_unavailable();
+        let reason = run_k1_prove(&mut io, held, outcome).expect("unavailable refuses");
+        assert_eq!(reason, GAP_WITNESS_UNAVAILABLE);
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
     }
 
     #[test]

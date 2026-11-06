@@ -63,6 +63,7 @@ def extract_inventory_oracle():
 
 MODPATH = "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"
 UNPROVEN = "original_file_unproven: kernel witness unavailable"
+UNPROVEN_DIAGNOSED = UNPROVEN + ": kernel identity self-test failed at stage 'scope-write'"
 NATIVE = ("no settled expected native image for this caller in the "
           "acquisition domain; scan-pinned fallback retained")
 
@@ -77,7 +78,7 @@ def overlay_report():
         "edges": [],
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
-             "reason": UNPROVEN, "subject": MODPATH, "repeats": 12},
+             "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
             {"caller": None, "module": None, "pid": None,
              "reason": "cgroup member scan was incomplete",
              "subject": "cgroup scope transaction incomplete",

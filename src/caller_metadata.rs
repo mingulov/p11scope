@@ -618,6 +618,50 @@ mod tests {
     }
 
     #[test]
+    fn binds_kind_pod_nested_under_its_node_container_on_the_host() {
+        // Host view of a kind pod process: the node's docker scope prefixes
+        // the in-node kubelet.slice path. The parser must bind the inner
+        // pod/container pair, never the outer node container. Shape pinned
+        // from a live Fedora kind cell (host inventory, two pods).
+        let node = "a".repeat(64);
+        let id = "b".repeat(64);
+        let uid = "12345678-1234-abcd-9876-1234567890ab";
+        let systemd_uid = uid.replace('-', "_");
+        for qos in [None, Some("burstable"), Some("besteffort")] {
+            let qos_unit = qos
+                .map(|qos| format!("kubelet-kubepods-{qos}.slice/"))
+                .unwrap_or_default();
+            let qos_pod = qos.map(|qos| format!("-{qos}")).unwrap_or_default();
+            let path = format!(
+                "system.slice/docker-{node}.scope/kubelet.slice/kubelet-kubepods.slice/{qos_unit}kubelet-kubepods{qos_pod}-pod{systemd_uid}.slice/cri-containerd-{id}.scope"
+            );
+            let parsed = parse_cgroup_membership(&membership(&path));
+            assert_eq!(parsed.status, ParseStatus::Recognized, "{path}");
+            assert_eq!(
+                parsed.pod.map(|pod| pod.uid.as_str().to_owned()),
+                Some(uid.to_owned()),
+                "{path}"
+            );
+            let container = parsed.container.expect("inner container hint");
+            assert_eq!(container.id.as_str(), id, "{path}");
+            assert_eq!(container.runtime, RuntimeHint::Containerd, "{path}");
+        }
+        // Failure twin: the same nesting with a dash-form pod UID (not the
+        // fixed underscore form) yields no pod hint; the inner container
+        // unit still stands alone.
+        let bad_path = format!(
+            "system.slice/docker-{node}.scope/kubelet.slice/kubelet-kubepods.slice/kubelet-kubepods-besteffort.slice/kubelet-kubepods-besteffort-pod{uid}.slice/cri-containerd-{id}.scope"
+        );
+        let parsed = parse_cgroup_membership(&membership(&bad_path));
+        assert_eq!(parsed.pod, None, "{bad_path}");
+        assert_eq!(
+            parsed.container.unwrap().id.as_str(),
+            id,
+            "independent exact runtime hint remains finite"
+        );
+    }
+
+    #[test]
     fn mismatched_kubelet_roots_qos_or_stems_never_create_pod_hints() {
         let uid = "12345678_1234_abcd_9876_1234567890ab";
         let id = "d".repeat(64);

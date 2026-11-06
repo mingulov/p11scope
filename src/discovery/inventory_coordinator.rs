@@ -8823,11 +8823,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// scan completed (the zero-pass diagnostic owns that run). Cgroup
     /// scope stays unjudged (transaction coverage, not scan passes).
     /// Drains every count, so a repeated terminal call stays silent.
+    ///
+    /// Test-only: production terminal paths disclose the counted gap
+    /// through `note_short_lived_never_scanned` beside the stop-diff
+    /// disclosure (which already names the pending pids), so staging
+    /// this count-only pending gap there would double-report.
+    #[cfg(test)]
     pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
         let pending = std::mem::take(&mut self.pending_exec_newcomers);
-        let confirmed = std::mem::take(&mut self.short_lived_never_scanned);
-        let untracked = std::mem::take(&mut self.short_lived_untracked);
         if !self.completed_scan_pass {
+            // Drain the counts silently; the zero-pass diagnostic owns this run.
+            self.note_short_lived_never_scanned();
             return;
         }
         if !pending.is_empty() {
@@ -8839,12 +8845,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 ),
             );
         }
-        if confirmed > 0 || untracked > 0 {
-            self.note_scope_gap(
-                SHORT_LIVED_NEVER_SCANNED_SUBJECT.into(),
-                short_lived_never_scanned_reason(confirmed, untracked),
-            );
+        self.note_short_lived_never_scanned();
+    }
+
+    /// Terminal short-lived disclosure: stage the accumulated
+    /// never-scanned count (plus untracked arrivals) as its named gap.
+    /// The pending population itself is NOT named here: the stop-diff
+    /// disclosure (`note_post_pass_newcomers`) already names those
+    /// pids, so naming them again would double-report. Silent when
+    /// nothing was counted or no scan completed (drains either way, so
+    /// a repeated terminal call stays silent). True when anything
+    /// staged, so the tail can publish it.
+    pub(crate) fn note_short_lived_never_scanned(&mut self) -> bool {
+        let confirmed = std::mem::take(&mut self.short_lived_never_scanned);
+        let untracked = std::mem::take(&mut self.short_lived_untracked);
+        if !self.completed_scan_pass || (confirmed == 0 && untracked == 0) {
+            return false;
         }
+        self.note_scope_gap(
+            SHORT_LIVED_NEVER_SCANNED_SUBJECT.into(),
+            short_lived_never_scanned_reason(confirmed, untracked),
+        );
+        true
     }
 
     /// The physical tail and registry share the actual publication boundary.

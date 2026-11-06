@@ -2993,8 +2993,10 @@ impl ClassicDriver<'_> {
     /// silent runs commit nothing extra.
     fn disclose_scan_terminal_newcomers(&mut self) -> bool {
         let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
-        self.coordinator
-            .note_post_pass_newcomers(&live_at_stop, stop_lost.len())
+        let staged = self.coordinator.note_post_pass_newcomers(&live_at_stop, stop_lost.len());
+        // The counted short-lived gap stages beside the named disclosure.
+        let counted = self.coordinator.note_short_lived_never_scanned();
+        staged || counted
     }
 
     /// One warning through a split display borrow (the stop
@@ -6285,6 +6287,8 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
         self.coordinator
             .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
+        // The counted short-lived gap stages beside the named disclosure.
+        self.coordinator.note_short_lived_never_scanned();
         // Terminal pre-arm close, staged before the loop's final commit so
         // the staged changed-identity gap publishes with it (no extra plain
         // commit). Uses the frozen probe result and stop boundary from

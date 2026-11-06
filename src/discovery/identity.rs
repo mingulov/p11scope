@@ -57,8 +57,9 @@ pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
 #[cfg(test)]
 pub(crate) mod provider_metadata_read_test {
     //! Observer for actual provider metadata reads (held-fd `fstat`
-    //! through `pin_of`/`same_kernel_file`, the primitives behind
-    //! `check_unchanged`, target retention and identity comparison).
+    //! through `pin_of`/`same_kernel_file`/`InspectedFileKey::for_open_file`,
+    //! the primitives behind `check_unchanged`, target retention, identity
+    //! comparison and inspection cache keys).
     //! The scoped inventory transaction marks its final membership
     //! sample; the observer tags each read pre/post-sample so twins
     //! prove the permit-backed commit performs no provider I/O.
@@ -88,7 +89,7 @@ pub(crate) mod provider_metadata_read_test {
         action()
     }
 
-    pub(super) fn metadata_read() {
+    pub(crate) fn metadata_read() {
         let post_sample = POST_SAMPLE.with(|flag| flag.get());
         OBSERVER.with(|observer| {
             if let Some(observer) = observer.borrow_mut().as_mut() {
@@ -6980,12 +6981,11 @@ fn inspect_count_manifest_file(
 ) -> Result<InspectedObject, String> {
     budget.spend(1).map_err(str::to_owned)?;
     let key = object_key(mapping);
-    let cache_key = InspectedFileKey {
-        device: key.device,
-        inode: key.inode,
-        pin: before,
-    };
-    if let Some(inspected) = budget.inspected_file(&cache_key) {
+    let cache_key = InspectedFileKey::for_open_file(file, key.device, key.inode, before)?;
+    // On filesystems without unique inode numbers the key cannot name one
+    // file, so the inspection is never cached there: always read, never store.
+    let cacheable = file_inodes_are_unique(file);
+    if cacheable && let Some(inspected) = budget.inspected_file(&cache_key) {
         if pin_of(file)? == before {
             return Ok(inspected);
         }
@@ -7015,7 +7015,9 @@ fn inspect_count_manifest_file(
     if pin_of(file)? != before {
         return Err("file changed while it was being identified".into());
     }
-    budget.note_inspected_file(cache_key, inspected.clone());
+    if cacheable {
+        budget.note_inspected_file(cache_key, inspected.clone());
+    }
     Ok(inspected)
 }
 
@@ -8098,12 +8100,12 @@ fn pin_scanned_object(
     // A repeat pin of the unchanged file reuses the cached inspection with zero
     // reads. The key's (device, inode) is the mountinfo-validated identity above.
     let validated = object_key(found);
-    let cache_key = InspectedFileKey {
-        device: validated.device,
-        inode: validated.inode,
-        pin: before,
-    };
-    if let Some(inspected) = budget.inspected_file(&cache_key) {
+    let cache_key =
+        InspectedFileKey::for_open_file(&file, validated.device, validated.inode, before)?;
+    // On filesystems without unique inode numbers the key cannot name one
+    // file, so the inspection is never cached there: always read, never store.
+    let cacheable = file_inodes_are_unique(&file);
+    if cacheable && let Some(inspected) = budget.inspected_file(&cache_key) {
         // Nothing was read for this hit, but the file may have changed since
         // `before`; only the still-unchanged file may reuse the cached value.
         // The clock read precedes the verification it timestamps.
@@ -8147,7 +8149,9 @@ fn pin_scanned_object(
         return Err("file changed while it was being identified — retry".into());
     }
     // Only the stable read lands here: a file that changed mid-read is never cached.
-    budget.note_inspected_file(cache_key, inspected.clone());
+    if cacheable {
+        budget.note_inspected_file(cache_key, inspected.clone());
+    }
     Entry::new(
         file,
         before,
@@ -9926,14 +9930,10 @@ mod tests {
     ) {
         let file = std::fs::File::open(path).unwrap();
         let key = object_key(mapping_file_key(&file).unwrap());
-        assert!(budget.note_inspected_file(
-            InspectedFileKey {
-                device: key.device,
-                inode: key.inode,
-                pin: pin_of(&file).unwrap()
-            },
-            inspected
-        ));
+        let cache_key =
+            InspectedFileKey::for_open_file(&file, key.device, key.inode, pin_of(&file).unwrap())
+                .unwrap();
+        assert!(budget.note_inspected_file(cache_key, inspected));
     }
 
     #[test]

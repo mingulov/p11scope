@@ -9,7 +9,7 @@
 use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
-use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
+use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, file_inodes_are_unique, pin_of};
 #[cfg(test)]
 use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
 use crate::discovery::overlay_witness::{
@@ -897,14 +897,45 @@ fn observed_interface_identity(
 pub(crate) type InspectedFile = InspectedObject;
 
 /// Identity of one inspected file: the maps-comparable (device, inode) plus the
-/// `(ino, size, ctime)` pin the inspection was read under. A repeat pin of the
-/// unchanged file reuses the cached inspection with zero reads; a changed file
+/// `(ino, size, ctime)` pin the inspection was read under, plus the held
+/// fd's own `st_dev`. The maps half alone cannot tell apart two Btrfs
+/// subvolume files (one maps device for every subvolume) that share an
+/// inode number, size and change time; the fd device (the subvolume's
+/// anonymous device) can. Both store and lookup read it from the opened
+/// fd, so the comparison is like-for-like. A repeat pin of the unchanged
+/// file reuses the cached inspection with zero reads; a changed file
 /// misses and is read (and charged) again.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct InspectedFileKey {
     pub(crate) device: Device,
     pub(crate) inode: u64,
     pub(crate) pin: Pin,
+    pub(crate) fd_dev: u64,
+}
+
+impl InspectedFileKey {
+    /// The cache key for one opened file: the maps-comparable (device,
+    /// inode) the caller validated, the pin the inspection was read
+    /// under, and the held fd's own `st_dev`.
+    pub(crate) fn for_open_file(
+        file: &File,
+        device: Device,
+        inode: u64,
+        pin: Pin,
+    ) -> Result<Self, String> {
+        #[cfg(test)]
+        crate::discovery::identity::provider_metadata_read_test::metadata_read();
+        let fd_dev = file
+            .metadata()
+            .map_err(|error| format!("fstat failed: {error}"))?
+            .dev();
+        Ok(Self {
+            device,
+            inode,
+            pin,
+            fd_dev,
+        })
+    }
 }
 
 /// The digest-sized facts one ELF contributes to every scan: its ABI plus the
@@ -5848,16 +5879,27 @@ fn scan_view_examined_mode(
         };
         // DetailedLegacy has no whole-size gate on this demand-paged export
         // check. Inventory reserves the full logical mapped range below.
-        let cache_key = InspectedFileKey {
-            device: key.device,
-            inode: key.inode,
-            pin: before,
+        let cache_key = match InspectedFileKey::for_open_file(&file, key.device, key.inode, before)
+        {
+            Ok(cache_key) => cache_key,
+            Err(reason) => {
+                skipped.push(Skipped { subject, reason });
+                continue;
+            }
         };
+        // On filesystems without unique inode numbers the key cannot name
+        // one file, so the facts are never cached there: always read, never
+        // store.
+        let cacheable = file_inodes_are_unique(&file);
         // Nothing is read for this hit, but the file may have changed since
         // `before`; only the still-unchanged file may reuse the cached facts.
-        let cached = budget
-            .elf_export_facts_for(&cache_key)
-            .filter(|_| pin_of(&file).is_ok_and(|after| after == before));
+        let cached = if cacheable {
+            budget
+                .elf_export_facts_for(&cache_key)
+                .filter(|_| pin_of(&file).is_ok_and(|after| after == before))
+        } else {
+            None
+        };
         let facts = match cached {
             Some(facts) => facts,
             None => {
@@ -5871,7 +5913,9 @@ fn scan_view_examined_mode(
                 // File-derived anchor exclusions share the export pin bracket.
                 match check_pin_after_read(pin_of(&file), &before) {
                     Ok(()) => {
-                        budget.note_elf_export_facts(cache_key, facts.clone());
+                        if cacheable {
+                            budget.note_elf_export_facts(cache_key, facts.clone());
+                        }
                         facts
                     }
                     Err(reason) => {
@@ -12964,10 +13008,12 @@ mod tests {
         let file = File::open("/bin/sh").unwrap();
         let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
         let pin = pin_of(&file).unwrap();
+        let fd_dev = file.metadata().unwrap().dev();
         let key = |inode| InspectedFileKey {
             device: Device { major: 8, minor: 1 },
             inode,
             pin,
+            fd_dev,
         };
         assert!(budget.note_inspected_file(key(1), inspected.clone()));
         assert!(!budget.note_inspected_file(key(2), inspected));
@@ -12998,8 +13044,7 @@ mod tests {
     /// (device, inode) and the same whole Pin{ino,size,ctime} (39 of 40
     /// host tries), differing only in the held fd's st_dev. Neither
     /// inspection cache may hand one file's digest and exports to the
-    /// other. RED: the key cannot name the distinguishing st_dev, so the
-    /// second twin's lookup hits the first twin's entry.
+    /// other.
     #[test]
     fn btrfs_equal_pin_twins_never_share_an_inspection() {
         let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
@@ -13013,7 +13058,7 @@ mod tests {
         let inspected = p11scope_manifest::identity::inspect_file(&file).unwrap();
         let pin = pin_of(&file).unwrap();
         // Both twins render one maps key and one pin; only the held fd's
-        // st_dev tells them apart, and the key does not carry it (the bug).
+        // st_dev (the subvolume's anonymous device) tells them apart.
         let twin_a = InspectedFileKey {
             device: Device {
                 major: 0,
@@ -13021,6 +13066,7 @@ mod tests {
             },
             inode: 257,
             pin,
+            fd_dev: 82,
         };
         let twin_b = InspectedFileKey {
             device: Device {
@@ -13029,6 +13075,7 @@ mod tests {
             },
             inode: 257,
             pin,
+            fd_dev: 97,
         };
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
@@ -13071,6 +13118,7 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode: 7,
             pin: pin_of(&file).unwrap(),
+            fd_dev: file.metadata().unwrap().dev(),
         };
         let facts = ElfExportFacts {
             abi: ElfAbi::Lp64,
@@ -13090,10 +13138,12 @@ mod tests {
 
     #[test]
     fn inventory_cache_byte_limit_accepts_exact_size_and_refuses_one_over() {
+        let file = File::open("/bin/sh").unwrap();
         let key = InspectedFileKey {
             device: Device { major: 8, minor: 1 },
             inode: 7,
-            pin: pin_of(&File::open("/bin/sh").unwrap()).unwrap(),
+            pin: pin_of(&file).unwrap(),
+            fd_dev: file.metadata().unwrap().dev(),
         };
         let exact = ElfExportFacts {
             abi: ElfAbi::Lp64,
@@ -13135,7 +13185,9 @@ mod tests {
     /// value. Bytes share the one ceiling; a sealed budget refuses.
     #[test]
     fn inventory_loader_cache_bounds_are_separate_and_exact() {
-        let pin = pin_of(&File::open("/bin/sh").unwrap()).unwrap();
+        let file = File::open("/bin/sh").unwrap();
+        let pin = pin_of(&file).unwrap();
+        let fd_dev = file.metadata().unwrap().dev();
         let window = InventoryWindowLimits::new(1024, 32, 4, 512, 4).unwrap();
         let retained = InventoryRetainedLimits::new(2, 1, 1, 1, 1, u64::MAX).unwrap();
         let limits = InventoryDiscoveryLimits::new(1024, window, retained).unwrap();
@@ -13147,6 +13199,7 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode,
             pin,
+            fd_dev,
         };
         let exports = ElfExportFacts {
             abi: ElfAbi::Lp64,

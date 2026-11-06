@@ -8659,6 +8659,31 @@ mod tests {
         );
     }
 
+    /// The nested probe must not hold the observer pidfd and the child
+    /// pidfd at once (6 transient fds vs the pinned 5): the observer
+    /// pidfd closes before the child pidfd opens. A source-order pin —
+    /// the peak has no other unprivileged observable; the privileged
+    /// nested probe cell runs the reordered lines live.
+    #[test]
+    fn nested_probe_closes_the_observer_pidfd_before_the_child_pidfd() {
+        let source = include_str!("identity_iter.rs");
+        let body = source
+            .split_once("pub fn run_functional_probe(")
+            .expect("probe fn exists")
+            .1
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module follows")
+            .0;
+        let close = body.find("drop(pidfd)").expect("observer pidfd closes");
+        let open = body
+            .find("open_pidfd(child.pid())")
+            .expect("child pidfd opens");
+        assert!(
+            close < open,
+            "the observer pidfd must close before the child pidfd opens"
+        );
+    }
+
     /// §6.5 on the host: a hard link to an anchored file reads back its
     /// slot, a byte-identical copy reads NONE, and a stale generation
     /// reads NONE everywhere (the `gen`-check probe). Run as root with

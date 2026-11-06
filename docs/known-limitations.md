@@ -235,7 +235,10 @@ for them is still planned.
 Short-lived processes missed at system scale are counted only as gaps
 (`pid_descendant_gaps`); their calls through attached providers still
 count. A process whose main thread had already exited when the capture
-first met it is not admitted, and its calls are not counted.
+first met it is not admitted, and its calls are not counted. The
+`short-lived processes never scanned` inventory gap counts only captures
+with the native EXEC lane; scan-only captures cannot count inter-pass
+deaths, and processes already gone at first contact are never admitted.
 Every process admitted after the initial membership sweep — a fork child,
 an ambient fork, any newcomer — and every leader exit that matches no
 admitted generation counts `pid_descendant_gaps` and keeps the observation

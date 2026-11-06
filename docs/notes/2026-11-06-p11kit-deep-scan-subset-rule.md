@@ -86,10 +86,11 @@ maps-match attribution and unexamined record).
 
 ## Cost (measured 2026-11-06, Fedora, root, ~220 processes)
 
-Per-pass `deep_scan` stage: 700–800 ms for the whole pass
-(`P11SCOPE_STAGE_TIMINGS=1`), about 3.2 ms per deep scan including
-ELF decode and pinning; `assemble` ~100 ms, `confirm`/`absorb`/
-`reconcile`/`project` single-digit ms. Part 1 adds at most the unused
+Per-pass `deep_scan` stage: ~700–1100 ms for the whole pass
+(`P11SCOPE_STAGE_TIMINGS=1`), about 3–5 ms per deep scan at ~215
+enumerated including ELF decode and pinning; `assemble` ~100–155 ms,
+`confirm`/`absorb`/`project` single-digit ms, `reconcile` mostly
+single-digit ms (13.6 ms on pass 0). Part 1 adds at most the unused
 slots per over-cap pass — worst case a full cap of 256 scans, the
 same order as today's under-cap passes (~820 ms), charged to the
 existing pass budget. Part 2 adds O(enumerated) retained integers and

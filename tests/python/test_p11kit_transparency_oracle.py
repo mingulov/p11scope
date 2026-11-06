@@ -908,11 +908,28 @@ class InventoryTests(unittest.TestCase):
                                     module_use=use, want=1)
         self.assertIn("module use", result["detail"])
 
+    def test_module_use_over_entries_fails(self):
+        # Observer overcount (folded entries above spy + bindings) must
+        # fail: the equation is exact, not a lower bound.
+        modules, use = self.use_case(entries=45)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use, want=1)
+        self.assertIn("module use", result["detail"])
+
     def test_module_use_spy_shortfall_fails(self):
         modules, use = self.use_case(entries=44, drop=3)
         result = self.run_inventory(modules, admitted=(("owned", 68),),
                                     module_use=use, want=1)
         self.assertIn("module use", result["detail"])
+
+    def test_module_use_correlated_loss_fails(self):
+        # Drop-detection isolation: entries still match the spy stream
+        # (43 == 41 + 2), so only the drop check can reject the spy's
+        # shortfall against the ledger (41 < 44 - 2).
+        modules, use = self.use_case(entries=43, drop=3)
+        result = self.run_inventory(modules, admitted=(("owned", 68),),
+                                    module_use=use, want=1)
+        self.assertIn("calls were dropped", result["detail"])
 
     def test_module_use_proxy_surplus_passes(self):
         modules, use = self.use_case(entries=45, drop=1)

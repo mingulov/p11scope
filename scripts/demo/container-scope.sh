@@ -64,15 +64,20 @@ STARTED_A=0
 STARTED_B=0
 STAGE=
 OUT=
+# Plain ifs: an && chain that ends false would trip set -e inside the trap
+# and flip a PASS to exit 1.
 cleanup() {
     if [ "$KEEP" -eq 0 ]; then
-        [ "$STARTED_A" -eq 1 ] && docker rm -f "$CTR_A" >/dev/null 2>&1 || true
-        [ "$STARTED_B" -eq 1 ] && docker rm -f "$CTR_B" >/dev/null 2>&1 || true
+        if [ "$STARTED_A" -eq 1 ]; then docker rm -f "$CTR_A" >/dev/null 2>&1 || true; fi
+        if [ "$STARTED_B" -eq 1 ]; then docker rm -f "$CTR_B" >/dev/null 2>&1 || true; fi
+        if [ -n "$OUT" ]; then rm -rf "$OUT" || true; fi
     fi
-    [ -n "$STAGE" ] && rm -rf "$STAGE"
-    [ -n "$OUT" ] && [ "$KEEP" -eq 0 ] && rm -rf "$OUT"
+    if [ -n "$STAGE" ]; then rm -rf "$STAGE" || true; fi
+    return 0
 }
-trap cleanup EXIT INT TERM
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
 
 # Never touch a container we did not start.
 names=$(docker ps -a --format '{{.Names}}' 2>/dev/null) \

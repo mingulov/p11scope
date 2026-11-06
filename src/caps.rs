@@ -144,6 +144,49 @@ pub(crate) fn setcap_command(binary: &str) -> String {
     format!("sudo setcap '{}' {}", setcap_spec(), quote_binary(binary))
 }
 
+/// The `CapEff` bits gating BPF program load and link attach: a load
+/// refusal names the missing ones of these, never the wider live set.
+pub(crate) const LOAD_BITS: [u32; 2] = [CAP_BPF_BIT, CAP_PERFMON_BIT];
+
+/// The `CapEff` bits gating reads of another process's memory, mount
+/// namespace and mappings: either can be the cause of an access refusal.
+pub(crate) const TARGET_READ_BITS: [u32; 2] = [CAP_DAC_READ_SEARCH_BIT, CAP_SYS_PTRACE_BIT];
+
+/// The `CapEff` bit gating `/proc/<pid>/map_files` for another uid.
+pub(crate) const MAP_FILES_BITS: [u32; 1] = [CAP_CHECKPOINT_RESTORE_BIT];
+
+/// Among `bits`, the known minimal-live entries absent from `effective`,
+/// in canonical order. Empty when the gated operation's set is complete.
+#[allow(dead_code)]
+pub(crate) fn missing_in(effective: u64, bits: &[u32]) -> Vec<&'static KnownCap> {
+    MINIMAL_LIVE
+        .iter()
+        .filter(|cap| bits.contains(&cap.bit) && effective & (1u64 << cap.bit) == 0)
+        .collect()
+}
+
+/// This binary's path for the recipe line: the running executable, or a
+/// bare `p11scope` when it cannot be determined.
+#[allow(dead_code)]
+pub(crate) fn current_binary() -> String {
+    std::env::current_exe()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| "p11scope".to_string())
+}
+
+/// The plain clause for a refusal gated by `missing`: each capability
+/// with what it enables, then the one-line setcap recipe. Never empty:
+/// callers use it only for a non-empty missing set.
+#[allow(dead_code)]
+pub(crate) fn lacking_line(missing: &[&KnownCap], binary: &str) -> String {
+    let needs: Vec<String> = missing.iter().map(|cap| needs_line(cap)).collect();
+    format!(
+        "{}. Grant the minimal set: {}",
+        needs.join("; "),
+        setcap_command(binary)
+    )
+}
+
 /// This process's effective capabilities, from `/proc/self/status`
 /// `CapEff`; `None` when unreadable or unparsable.
 #[allow(dead_code)]
@@ -359,6 +402,51 @@ mod tests {
             line.ends_with("'/tmp/evil dir/p11scope;id'") || !line.contains(";id"),
             "the path must not break out of the command line: {line}"
         );
+    }
+
+    /// A refusal names only the capabilities gating its own operation:
+    /// a load refusal never blames checkpoint/restore, a map_files
+    /// refusal never blames the BPF pair.
+    #[test]
+    fn missing_in_scopes_blame_to_the_gated_operation() {
+        let full = minimal_live_mask();
+        assert!(missing_in(full, &LOAD_BITS).is_empty());
+        assert!(missing_in(u64::MAX, &LOAD_BITS).is_empty());
+        let names =
+            |missing: Vec<&KnownCap>| missing.iter().map(|cap| cap.name).collect::<Vec<_>>();
+        // One load cap missing: exactly it, even with the rest held.
+        assert_eq!(
+            names(missing_in(full & !(1u64 << CAP_BPF_BIT), &LOAD_BITS)),
+            ["CAP_BPF"]
+        );
+        assert_eq!(
+            names(missing_in(full & !(1u64 << CAP_PERFMON_BIT), &LOAD_BITS)),
+            ["CAP_PERFMON"]
+        );
+        // Capabilities outside the gated set are never blamed.
+        assert!(missing_in(full & !(1u64 << CAP_CHECKPOINT_RESTORE_BIT), &LOAD_BITS).is_empty());
+        assert!(missing_in(full & !(1u64 << CAP_BPF_BIT), &MAP_FILES_BITS).is_empty());
+        // The target-read pair blames either member, in canonical order.
+        assert_eq!(
+            names(missing_in(0, &TARGET_READ_BITS)),
+            ["CAP_DAC_READ_SEARCH", "CAP_SYS_PTRACE"]
+        );
+    }
+
+    /// The refusal clause: every missing capability with what it
+    /// enables, then the one-line recipe. Byte-exact: refusals embed it.
+    #[test]
+    fn lacking_line_names_each_cap_then_the_recipe() {
+        let binary = "/usr/bin/p11scope";
+        let line = lacking_line(&missing_in(0, &LOAD_BITS), binary);
+        assert_eq!(
+            line,
+            "needs CAP_BPF (load BPF programs and attach probes); needs CAP_PERFMON \
+             (load BPF programs alongside CAP_BPF). Grant the minimal set: sudo setcap \
+             'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
+             /usr/bin/p11scope"
+        );
+        assert_eq!(line.lines().count(), 1);
     }
 
     fn parse(argv: &[&str]) -> crate::cli::Command {

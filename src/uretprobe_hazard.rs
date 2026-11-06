@@ -20,6 +20,7 @@
 use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
 use std::time::{Duration, Instant};
 
+use crate::caps::CAP_SYS_ADMIN_BIT;
 use anyhow::{Context, Result, anyhow};
 use aya::Ebpf;
 use aya::programs::{ProbeKind, UProbe};
@@ -257,7 +258,11 @@ pub(crate) fn refusal_error(action: Action) -> anyhow::Error {
              profile, trace and run"
         ),
         Action::NotPermitted(why) => {
-            anyhow!(not_permitted_message(&why, PrivilegeFacts::current()))
+            anyhow!(not_permitted_message(
+                &why,
+                PrivilegeFacts::current(),
+                &crate::caps::current_binary()
+            ))
         }
         Action::FlavorMismatch(why) => anyhow!("{why}"),
         _ => anyhow!("return-probe admission did not provide a refusal"),
@@ -467,8 +472,8 @@ fn classify_probe_error(error: &anyhow::Error) -> KernelVerdict {
     }
 }
 
-/// `CAP_SYS_ADMIN`'s bit in a `CapEff` mask.
-const CAP_SYS_ADMIN_BIT: u32 = 21;
+/// `CAP_SYS_ADMIN`'s bit in a `CapEff` mask comes from the one `caps`
+/// definition, so the lane's bit numbers cannot drift apart.
 
 /// `PROC_USER_INIT_INO`: the nsfs inode of the initial user namespace
 /// (`include/linux/proc_ns.h`), as `PROC_PID_INIT_INO` is for PIDs.
@@ -483,6 +488,9 @@ const INIT_USER_NS_INODE: u64 = 0xEFFF_FFFD;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PrivilegeFacts {
     pub(crate) euid_root: bool,
+    /// Effective capabilities; `None` when `CapEff` was unreadable.
+    /// Load refusals name the missing ones of these.
+    pub(crate) cap_eff: Option<u64>,
     /// `CAP_SYS_ADMIN` in `CapEff`; `None` when `CapEff` was unreadable.
     pub(crate) sys_admin: Option<bool>,
     /// Whether this task runs in the initial user namespace; `None` when
@@ -516,6 +524,7 @@ impl PrivilegeFacts {
     ) -> Self {
         Self {
             euid_root: euid == 0,
+            cap_eff,
             sys_admin: cap_eff.map(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
             init_user_ns: user_ns
                 .ok()
@@ -577,7 +586,7 @@ pub(crate) fn perf_open_restricted(facts: PrivilegeFacts) -> bool {
 /// capability, and a self-probe attach refused under a restrictive
 /// `perf_event_paranoid` is that sysctl — neither is a lockdown, an LSM or
 /// seccomp (DR-K8S-3).
-pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts) -> String {
+pub(crate) fn not_permitted_message(why: &str, facts: PrivilegeFacts, _binary: &str) -> String {
     // Checked first: in a child user namespace no capability this process
     // holds counts, so neither the sysctl nor a lockdown is the story.
     if facts.init_user_ns == Some(false) {
@@ -1676,10 +1685,11 @@ mod tests {
         );
     }
 
-    fn facts(euid_root: bool, sys_admin: bool, paranoid: Option<i64>) -> PrivilegeFacts {
+    fn facts(euid_root: bool, cap_eff: Option<u64>, paranoid: Option<i64>) -> PrivilegeFacts {
         PrivilegeFacts {
             euid_root,
-            sys_admin: Some(sys_admin),
+            cap_eff,
+            sys_admin: cap_eff.map(|mask| mask & (1u64 << CAP_SYS_ADMIN_BIT) != 0),
             init_user_ns: Some(true),
             perf_event_paranoid: paranoid,
         }
@@ -1694,13 +1704,13 @@ mod tests {
         let why = "loading the BPF object: Operation not permitted (os error 1)";
         let remapped = PrivilegeFacts {
             init_user_ns: Some(false),
-            ..facts(true, true, Some(4))
+            ..facts(true, Some(u64::MAX), Some(4))
         };
         for why in [
             why,
             "attaching the uretprobe self-probe: `perf_event_open` failed: Permission denied",
         ] {
-            let message = not_permitted_message(why, remapped);
+            let message = not_permitted_message(why, remapped, "/usr/bin/p11scope");
             assert!(message.contains("child user namespace"), "{message}");
             assert!(message.contains("initial"), "{message}");
             for blamed in [
@@ -1716,16 +1726,19 @@ mod tests {
         // An unreadable user-namespace link does not invent a remap.
         let unknown_ns = PrivilegeFacts {
             init_user_ns: None,
-            ..facts(true, true, Some(4))
+            ..facts(true, Some(u64::MAX), Some(4))
         };
-        assert!(not_permitted_message(why, unknown_ns).contains("even as root"));
+        assert!(
+            not_permitted_message(why, unknown_ns, "/usr/bin/p11scope").contains("even as root")
+        );
         assert!(!perf_open_restricted(unknown_ns));
         // An unreadable CapEff.
         let unread = PrivilegeFacts {
+            cap_eff: None,
             sys_admin: None,
-            ..facts(true, false, Some(2))
+            ..facts(true, Some(0), Some(2))
         };
-        let message = not_permitted_message(why, unread);
+        let message = not_permitted_message(why, unread, "/usr/bin/p11scope");
         assert!(message.contains("could not be read"), "{message}");
         assert!(!message.contains("without CAP_SYS_ADMIN"), "{message}");
         assert!(!message.contains("lockdown"), "{message}");
@@ -1741,9 +1754,14 @@ mod tests {
     #[test]
     fn the_not_permitted_message_names_the_privilege_and_never_the_override() {
         let why = "loading the BPF object: Operation not permitted (os error 1)";
-        let user = not_permitted_message(why, facts(false, false, Some(2)));
-        let root = not_permitted_message(why, facts(true, true, Some(2)));
-        let capless_root = not_permitted_message(why, facts(true, false, Some(2)));
+        let user = not_permitted_message(why, facts(false, Some(0), Some(2)), "/usr/bin/p11scope");
+        let root = not_permitted_message(
+            why,
+            facts(true, Some(u64::MAX), Some(2)),
+            "/usr/bin/p11scope",
+        );
+        let capless_root =
+            not_permitted_message(why, facts(true, Some(0), Some(2)), "/usr/bin/p11scope");
         for message in [&user, &root, &capless_root] {
             assert!(message.contains(why), "{message}");
             assert!(message.contains("p11scope doctor"), "{message}");
@@ -1753,20 +1771,24 @@ mod tests {
             );
             assert!(!message.contains("seccomp filter"), "{message}");
         }
-        assert!(user.contains("needs root"), "{user}");
-        assert!(user.contains("sudo"), "{user}");
-        assert!(root.contains("even as root"), "{root}");
-        // Root without CAP_SYS_ADMIN (a container that dropped it) is a
-        // missing capability, not a lockdown or an LSM.
         assert!(
-            capless_root.contains("without CAP_SYS_ADMIN"),
+            user.contains("needs CAP_BPF (load BPF programs and attach probes)"),
+            "{user}"
+        );
+        assert!(user.contains("sudo setcap 'cap_bpf,"), "{user}");
+        assert!(root.contains("even as root"), "{root}");
+        // Root without capabilities (a container that dropped them) is
+        // missing capabilities, not a lockdown or an LSM.
+        assert!(
+            capless_root.contains("needs CAP_BPF (load BPF programs and attach probes)"),
             "{capless_root}"
         );
         assert!(!capless_root.contains("lockdown"), "{capless_root}");
     }
 
-    /// The privilege refusal shares the host-gate wording (`needs`,
-    /// `refused to load`, `run with sudo`), not a parallel vocabulary.
+    /// The privilege refusal shares the host-gate wording (`needs CAP_`,
+    /// `refused to load`, the one-line `setcap`), not a parallel
+    /// vocabulary.
     #[test]
     fn not_permitted_wording_matches_host_gate() {
         assert_not_permitted_wording_matches_host_gate();
@@ -1774,37 +1796,100 @@ mod tests {
 
     fn assert_not_permitted_wording_matches_host_gate() {
         let why = "loading the BPF object: Operation not permitted (os error 1)";
-        let user = not_permitted_message(why, facts(false, false, Some(2)));
+        let user = not_permitted_message(why, facts(false, Some(0), Some(2)), "/usr/bin/p11scope");
         assert!(
             user.contains("the kernel refused to load p11scope's BPF programs"),
             "{user}"
         );
-        assert!(user.contains("needs root"), "{user}");
-        assert!(user.contains("run with sudo"), "{user}");
+        assert!(user.contains("needs CAP_BPF"), "{user}");
+        assert!(user.contains("sudo setcap 'cap_bpf,"), "{user}");
         assert!(!user.contains("requires root"), "{user}");
         assert!(!user.contains("run it with sudo"), "{user}");
+        assert!(!user.contains("run with sudo"), "{user}");
+        assert!(!user.contains("needs root"), "{user}");
         assert!(!user.contains("cannot load"), "{user}");
         for message in [
-            not_permitted_message(why, facts(true, true, Some(2))),
-            not_permitted_message(why, facts(true, false, Some(2))),
+            not_permitted_message(
+                why,
+                facts(true, Some(u64::MAX), Some(2)),
+                "/usr/bin/p11scope",
+            ),
+            not_permitted_message(why, facts(true, Some(0), Some(2)), "/usr/bin/p11scope"),
             not_permitted_message(
                 why,
                 PrivilegeFacts {
+                    cap_eff: None,
                     sys_admin: None,
-                    ..facts(true, false, Some(2))
+                    ..facts(true, Some(0), Some(2))
                 },
+                "/usr/bin/p11scope",
             ),
             not_permitted_message(
                 why,
                 PrivilegeFacts {
                     init_user_ns: Some(false),
-                    ..facts(true, true, Some(4))
+                    ..facts(true, Some(u64::MAX), Some(4))
                 },
+                "/usr/bin/p11scope",
             ),
         ] {
             assert!(!message.contains("requires "), "{message}");
             assert!(!message.contains("cannot load"), "{message}");
         }
+    }
+
+    /// Per-capability twins for the load refusal: each missing load
+    /// capability gives its exact `needs` clause plus the one-line
+    /// recipe, for a user and for root alike (DR-K8S-3: a dropped
+    /// capability is missing privilege, never the uid). A complete load
+    /// set — or CAP_SYS_ADMIN, which suffices for load — reads as other
+    /// enforcement, never more privilege.
+    #[test]
+    fn load_refusal_names_the_missing_load_caps_and_the_recipe() {
+        use crate::caps;
+        let why = "loading the BPF object: Operation not permitted (os error 1)";
+        let binary = "/usr/bin/p11scope";
+        let recipe = caps::setcap_command(binary);
+        let full = caps::minimal_live_mask();
+        for (bit, needs) in [
+            (
+                caps::CAP_BPF_BIT,
+                "needs CAP_BPF (load BPF programs and attach probes)",
+            ),
+            (
+                caps::CAP_PERFMON_BIT,
+                "needs CAP_PERFMON (load BPF programs alongside CAP_BPF)",
+            ),
+        ] {
+            for euid_root in [false, true] {
+                let message = not_permitted_message(
+                    why,
+                    facts(euid_root, Some(full & !(1u64 << bit)), Some(2)),
+                    binary,
+                );
+                assert!(message.contains(why), "{message}");
+                assert!(message.contains(needs), "{message}");
+                assert!(message.contains(&recipe), "{message}");
+                assert!(message.contains("p11scope doctor"), "{message}");
+                assert!(!message.contains("needs root"), "{message}");
+                assert!(!message.contains("run with sudo"), "{message}");
+                assert!(!message.contains("Run with sudo"), "{message}");
+                assert!(!message.contains("lockdown"), "{message}");
+            }
+        }
+        // The load set complete: other enforcement, even for a user.
+        let held = not_permitted_message(why, facts(false, Some(u64::MAX), Some(2)), binary);
+        assert!(held.contains("lockdown"), "{held}");
+        assert!(!held.contains("needs CAP_"), "{held}");
+        // CAP_SYS_ADMIN suffices for load: its holder is not told to
+        // grant the set.
+        let sys_admin_only = not_permitted_message(
+            why,
+            facts(false, Some(1u64 << CAP_SYS_ADMIN_BIT), Some(2)),
+            binary,
+        );
+        assert!(sys_admin_only.contains("lockdown"), "{sys_admin_only}");
+        assert!(!sys_admin_only.contains(&recipe), "{sys_admin_only}");
     }
 
     /// DR-K8S-3: per-probe (singles) uprobes attach through
@@ -1819,7 +1904,11 @@ mod tests {
                    denied (os error 13)";
         for euid_root in [false, true] {
             for paranoid in [3, 4] {
-                let message = not_permitted_message(why, facts(euid_root, false, Some(paranoid)));
+                let message = not_permitted_message(
+                    why,
+                    facts(euid_root, Some(0), Some(paranoid)),
+                    "/usr/bin/p11scope",
+                );
                 assert!(message.contains(why), "{message}");
                 assert!(
                     message.contains(&format!("kernel.perf_event_paranoid is {paranoid}")),
@@ -1835,15 +1924,15 @@ mod tests {
         // Not the sysctl: CAP_SYS_ADMIN held, paranoid permissive or
         // unreadable, or a refusal that was not the self-probe's attach.
         for (facts, why) in [
-            (facts(true, true, Some(4)), why),
-            (facts(false, false, Some(2)), why),
-            (facts(false, false, None), why),
+            (facts(true, Some(u64::MAX), Some(4)), why),
+            (facts(false, Some(0), Some(2)), why),
+            (facts(false, Some(0), None), why),
             (
-                facts(false, false, Some(4)),
+                facts(false, Some(0), Some(4)),
                 "loading the BPF object: Operation not permitted (os error 1)",
             ),
         ] {
-            let message = not_permitted_message(why, facts);
+            let message = not_permitted_message(why, facts, "/usr/bin/p11scope");
             assert!(
                 !message.contains("perf_event_paranoid is"),
                 "{facts:?}: {message}"
@@ -1853,11 +1942,11 @@ mod tests {
 
     #[test]
     fn only_paranoid_three_or_more_without_cap_sys_admin_restricts_perf_open() {
-        assert!(!perf_open_restricted(facts(false, false, Some(2))));
-        assert!(perf_open_restricted(facts(false, false, Some(3))));
-        assert!(perf_open_restricted(facts(true, false, Some(4))));
-        assert!(!perf_open_restricted(facts(true, true, Some(4))));
-        assert!(!perf_open_restricted(facts(false, false, None)));
+        assert!(!perf_open_restricted(facts(false, Some(0), Some(2))));
+        assert!(perf_open_restricted(facts(false, Some(0), Some(3))));
+        assert!(perf_open_restricted(facts(true, Some(0), Some(4))));
+        assert!(!perf_open_restricted(facts(true, Some(u64::MAX), Some(4))));
+        assert!(!perf_open_restricted(facts(false, Some(0), None)));
     }
 
     #[test]
@@ -1876,6 +1965,7 @@ mod tests {
             facts,
             PrivilegeFacts {
                 euid_root: true,
+                cap_eff: Some(1 << 21),
                 sys_admin: Some(true),
                 init_user_ns: Some(true),
                 perf_event_paranoid: Some(4),
@@ -1891,6 +1981,7 @@ mod tests {
             facts,
             PrivilegeFacts {
                 euid_root: false,
+                cap_eff: Some(!(1u64 << 21)),
                 sys_admin: Some(false),
                 init_user_ns: Some(false),
                 perf_event_paranoid: None,
@@ -1905,6 +1996,7 @@ mod tests {
             ),
             PrivilegeFacts {
                 euid_root: true,
+                cap_eff: None,
                 sys_admin: None,
                 init_user_ns: None,
                 perf_event_paranoid: None,

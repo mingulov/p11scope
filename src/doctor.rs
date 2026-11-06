@@ -871,6 +871,18 @@ fn capabilities_check() -> Check {
     }
 }
 
+/// The one-line `setcap` recipe row; `next_line` reads its severity
+/// back to point a deprived operator at the grant instead of root.
+#[allow(dead_code)]
+const MINIMAL_SETCAP_ROW: &str = "minimal setcap";
+
+/// Scaffolding: the next commit renders the recipe, warning while any
+/// minimal-live capability is missing.
+#[allow(dead_code)]
+fn setcap_status(_read: Result<u64, String>, _binary: &str) -> Status {
+    Status::Ok(String::new())
+}
+
 /// The capabilities row for one mask read: a read/parse failure is
 /// reported, never coerced into "none" — an unmeasured mask must not read
 /// the same as a genuinely empty one. A genuinely empty mask warns: live
@@ -995,6 +1007,7 @@ fn uretprobe_seccomp_check() -> Check {
             crate::uretprobe_hazard::not_permitted_message(
                 &why,
                 crate::uretprobe_hazard::PrivilegeFacts::current(),
+                &crate::caps::current_binary(),
             )
         )),
         // A broken observer build was never assessed: fail with the plain
@@ -4110,12 +4123,13 @@ mod tests {
         assert!(matches!(ptrace("3", true), Status::Warn(_)));
     }
 
-    /// F3 + DR-K8S-3: on a multi-capable kernel (≥ 6.9) paranoid does not
-    /// gate static uprobe-multi links, but at 3 or above it refuses every
-    /// `perf_event_open` without CAP_SYS_ADMIN — and the uretprobe
-    /// self-probe and live-discovery probes attach through it. So the row
-    /// warns there unless CAP_SYS_ADMIN is held, and never claims that
-    /// CAP_BPF+CAP_PERFMON suffice.
+    /// F3 + DR-K8S-3: on a multi-capable kernel paranoid does not
+    /// gate uprobe-multi links — every probe attaches through them now —
+    /// but at 3 or above it still refuses `perf_event_open` without
+    /// CAP_SYS_ADMIN, which only the singles fallback uses. So the row
+    /// warns there unless CAP_SYS_ADMIN is held, scopes the need to
+    /// `--attach-backend singles`, and never claims the lane's probes
+    /// need it.
     #[test]
     fn paranoid_row_on_multi_kernels_names_what_still_needs_cap_sys_admin() {
         let row = |value: &str, held| {
@@ -4138,8 +4152,9 @@ mod tests {
                 "{detail}"
             );
             assert!(detail.contains("uprobe-multi"), "{detail}");
-            assert!(detail.contains("uretprobe self-probe"), "{detail}");
-            assert!(detail.contains("need CAP_SYS_ADMIN"), "{detail}");
+            assert!(detail.contains("--attach-backend singles"), "{detail}");
+            assert!(!detail.contains("uretprobe self-probe"), "{detail}");
+            assert!(!detail.contains("live-discovery"), "{detail}");
             assert!(!detail.contains("suffice"), "{detail}");
             let Status::Ok(detail) = row(value, true) else {
                 panic!(
@@ -4147,10 +4162,8 @@ mod tests {
                     row(value, true)
                 );
             };
-            assert!(
-                detail.contains("this process has CAP_SYS_ADMIN"),
-                "{detail}"
-            );
+            assert!(detail.contains("CAP_SYS_ADMIN"), "{detail}");
+            assert!(detail.contains("singles fallback"), "{detail}");
         }
         for value in ["-1\n", "0\n", "1\n", "2\n"] {
             let Status::Ok(detail) = row(value, false) else {
@@ -4708,18 +4721,100 @@ mod tests {
 
     #[test]
     fn empty_capabilities_warn_while_a_read_failure_stays_distinct() {
-        assert_eq!(
-            capabilities_status(Ok(0)),
-            Status::Warn("none — live capture needs root".into())
-        );
+        // Empty: every minimal capability named with what it enables,
+        // never "needs root".
+        let Status::Warn(detail) = capabilities_status(Ok(0)) else {
+            panic!("empty capabilities must warn");
+        };
+        for cap in &crate::caps::MINIMAL_LIVE {
+            assert!(detail.contains(&crate::caps::needs_line(cap)), "{detail}");
+        }
+        assert!(!detail.contains("needs root"), "{detail}");
         assert_eq!(
             capabilities_status(Err("cannot read".into())),
             Status::Warn("cannot read".into())
         );
+        // Partial: the missing capabilities warn, even with some held.
         assert!(matches!(
             capabilities_status(Ok((1u64 << 2) | (1u64 << 19) | (1u64 << 39))),
-            Status::Ok(_)
+            Status::Warn(_)
         ));
+    }
+
+    /// Per-capability twins: each missing capability warns with its
+    /// exact `needs` clause; only the complete set reads Ok.
+    #[test]
+    fn partial_capabilities_warn_with_each_missing_capability() {
+        use crate::caps;
+        let full = caps::minimal_live_mask();
+        assert!(matches!(capabilities_status(Ok(full)), Status::Ok(_)));
+        assert!(matches!(capabilities_status(Ok(u64::MAX)), Status::Ok(_)));
+        for cap in &caps::MINIMAL_LIVE {
+            let Status::Warn(detail) = capabilities_status(Ok(full & !(1u64 << cap.bit))) else {
+                panic!("{} missing must warn", cap.name);
+            };
+            assert!(detail.contains(&caps::needs_line(cap)), "{detail}");
+            for other in &caps::MINIMAL_LIVE {
+                if other.bit != cap.bit {
+                    assert!(!detail.contains(&caps::needs_line(other)), "{detail}");
+                }
+            }
+        }
+    }
+
+    /// The recipe row: the exact one-line setcap command, warning
+    /// while any minimal-live capability is missing.
+    #[test]
+    fn setcap_row_renders_the_one_line_recipe() {
+        use crate::caps;
+        let binary = "/usr/bin/p11scope";
+        let recipe = caps::setcap_command(binary);
+        assert_eq!(
+            setcap_status(Ok(caps::minimal_live_mask()), binary),
+            Status::Ok(recipe.clone())
+        );
+        assert_eq!(
+            setcap_status(Ok(u64::MAX), binary),
+            Status::Ok(recipe.clone())
+        );
+        let Status::Warn(detail) = setcap_status(Ok(0), binary) else {
+            panic!("empty capabilities must warn the recipe");
+        };
+        for cap in &caps::MINIMAL_LIVE {
+            assert!(detail.contains(cap.name), "{detail}");
+        }
+        assert!(detail.contains(&recipe), "{detail}");
+        assert_eq!(
+            setcap_status(Err("cannot read".into()), binary),
+            Status::Warn("cannot read".into())
+        );
+    }
+
+    /// While any minimal-live capability is missing, Next points at
+    /// the setcap recipe row instead of root; without that row,
+    /// today's guidance stands (whatever the runner's uid selects).
+    #[test]
+    fn next_step_points_at_the_setcap_row_when_caps_are_lacking() {
+        let denied = Check {
+            name: "BPF map create".into(),
+            status: Status::Fail(
+                "map error: failed to create map `DISCOVERY_STATE`: Operation not permitted (os error 1)"
+                    .into(),
+            ),
+        };
+        let lacking = vec![
+            denied.clone(),
+            Check {
+                name: MINIMAL_SETCAP_ROW.into(),
+                status: Status::Warn(
+                    "missing CAP_BPF: sudo setcap 'cap_bpf=ep' /usr/bin/p11scope".into(),
+                ),
+            },
+        ];
+        let next = next_line(&lacking, false, None);
+        assert!(next.contains("minimal setcap"), "{next}");
+        let bare = next_line(&lacking[..1], false, None);
+        assert!(!bare.contains("minimal setcap"), "{bare}");
     }
 
     #[test]

@@ -2740,7 +2740,17 @@ pub(crate) fn live_snapshot_scoped(
         mechanisms,
     );
     if let Some(summary) = snapshot.counter_summary() {
-        frame.push_str(&summary);
+        // Concise frames end with the `-v` hint: the counter block reads
+        // before it so the hint stays the frame's last line (and a
+        // `--select-endpoint` report line inserted before the hint lands
+        // after this block). Verbose and quiet frames carry no trailing
+        // hint, so they keep the plain append.
+        let hint = format!("{}\n", crate::cli::VERBOSE_HINT);
+        if let Some(body) = frame.strip_suffix(hint.as_str()) {
+            frame = format!("{body}{summary}{hint}");
+        } else {
+            frame.push_str(&summary);
+        }
     }
     frame
 }
@@ -7969,6 +7979,38 @@ pub(crate) mod tests {
         assert!(out.contains("coverage: partial"), "{out}");
         assert!(!out.contains("Evidence:"), "{out}");
         assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI text: the concise metrics frame keeps the `-v` hint last —
+    /// the counter-collection block reads before it, so a
+    /// `--select-endpoint` report line inserted before the hint lands
+    /// after that block instead of orphaned past the hint.
+    #[test]
+    fn concise_counter_frame_reads_counter_block_before_hint() {
+        let mut fixture = crate::metrics::ConsumerFixture::new();
+        let snapshot = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let mut ev = evidence();
+        ev.verdict();
+        let frame = live_snapshot_scoped(
+            &snapshot,
+            &ev,
+            Duration::ZERO,
+            "owned",
+            "metrics",
+            CapturePolicy::AggregateOnly,
+            "pid",
+            &BTreeMap::new(),
+        );
+        let hint = crate::cli::VERBOSE_HINT;
+        assert!(frame.contains("Counter collection:"), "{frame}");
+        assert!(
+            frame.ends_with(&format!("{hint}\n")),
+            "hint stays last: {frame}"
+        );
+        assert!(
+            frame.find("Counter collection:").unwrap() < frame.find(hint).unwrap(),
+            "counter block reads before the hint: {frame}"
+        );
     }
 
     /// CLI-1: the verbose live frame keeps Evidence and no hint.

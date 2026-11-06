@@ -327,10 +327,10 @@ collect_receipt() {
 # line on stderr once probes are attached and the capture loop starts
 # (capture_ready_line in src/run.rs — "the one readiness line ... scripts
 # and supervisors wait for this line"), so that line is the in-observer
-# attach-end signal: "p11scope: capturing: N probe(s) attached; stop with
-# Ctrl-C" (the concise pass pluralizes: "1 probe", "N probes"; a
-# zero-probe session prints "capturing: waiting for ...; stop with
-# Ctrl-C" instead, which also fires this gate). The discovery summary is
+# attach-end signal: "p11scope: capturing: N probes attached; stop with
+# Ctrl-C" ("1 probe attached" for a single probe; a zero-probe session
+# prints "capturing: waiting for ...; stop with Ctrl-C" instead, which
+# also fires this gate). The discovery summary is
 # a verbose diagnostic, so the observer below runs with
 # P11SCOPE_CAPTURE_DIAGNOSTICS=1 (after the argv receipt, so the recorded
 # command stays the real one).

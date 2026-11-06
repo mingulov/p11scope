@@ -136,8 +136,11 @@ impl SelectedDriverRefusal {
 ///   two or more ⇒ [`PromotionRefusal::EndpointAmbiguous`], never
 ///   first-match; an aliased slot resolves as its whole group);
 /// - the scope must resolve to one live original (`--pid` pins and
-///   re-checks liveness; `--cgroup`/`--system` cannot name one
-///   original ⇒ [`PromotionRefusal::ScopeUnsupported`]).
+///   re-checks liveness; `--system`, and a `--cgroup` without an owned
+///   child, cannot name one original ⇒
+///   [`PromotionRefusal::ScopeUnsupported`]; a cgroup scope with an
+///   owned child resolves to that child, whose pin carries the
+///   window's continuity rules).
 ///
 /// An empty name never resolves (fail-closed for programmatic
 /// callers; the CLI already refuses it).
@@ -148,8 +151,6 @@ pub(crate) fn resolve_selection(
     owned: Option<u32>,
 ) -> Result<ResolvedSelection, SelectedDriverRefusal> {
     use SelectedDriverRefusal::{Detail, EndpointUnknown, Promotion};
-    // Scaffolding: the owned-cgroup branch lands with the implementation.
-    let _ = owned;
     if !matches!(broad_plan.admission_policy(), AdmissionPolicy::Counters(_)) {
         return Err(Detail(SelectedDetailRefusal::BroadPlanTopology));
     }
@@ -168,7 +169,11 @@ pub(crate) fn resolve_selection(
     let slot = matched.ok_or(EndpointUnknown)?;
     let pid = match scope {
         Scope::Pid(pid) => *pid,
-        Scope::Cgroup { .. } | Scope::System => {
+        Scope::Cgroup { .. } => match owned.filter(|pid| *pid != 0) {
+            Some(pid) => pid,
+            None => return Err(Promotion(PromotionRefusal::ScopeUnsupported)),
+        },
+        Scope::System => {
             return Err(Promotion(PromotionRefusal::ScopeUnsupported));
         }
     };

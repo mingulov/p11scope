@@ -632,24 +632,27 @@ fn root_seed_authority<'fd>(
     child_pid: u32,
     original_pidfd: std::io::Result<BorrowedFd<'fd>>,
 ) -> Result<BorrowedFd<'fd>> {
-    if !matches!(scope, Scope::Pid(pid) if *pid == child_pid) {
-        bail!("owned root seed requires the exact retained child PID scope");
-    }
+    crate::scope::scope_names_child(scope, child_pid).map_err(|error| {
+        anyhow!("owned root seed requires a scope naming the owned child: {error:#}")
+    })?;
     original_pidfd.context("borrowing original owned-child pidfd for root seed")
 }
 
 /// Which PID lifecycle tap a session carries: the single process under
 /// `OneProcess`, the owned child beside a process-wide owned run, and
-/// none anywhere else. Scaffolding: the body lands with the
-/// implementation.
-#[cfg(test)]
+/// none anywhere else. The tap is a userspace pid-matcher over the
+/// session's discovery stream: under a run cgroup it witnesses exactly
+/// the direct child's EXEC/EXIT records, never a descendant's.
 fn pid_lifecycle_tap_for(
     uprobe_scope: UProbeScope,
     owned_pid: Option<NonZeroU32>,
     domain: &events::DiscoveryDomain,
 ) -> Option<PidLifecycleTap> {
-    let _ = (uprobe_scope, owned_pid, domain);
-    None
+    match uprobe_scope {
+        UProbeScope::OneProcess(pid) => Some(PidLifecycleTap::new(pid, domain.clone())),
+        UProbeScope::AllProcesses => owned_pid.map(|pid| PidLifecycleTap::new(pid, domain.clone())),
+        UProbeScope::CallingProcess => None,
+    }
 }
 
 fn owner_limit_for_start(actual: ExactMapMetadata) -> Result<u64> {
@@ -7773,12 +7776,11 @@ impl Session {
             prepared_discovery_domain.expect("preparation established the discovery domain");
         let image_coverage = image_query::CoverageControl::new(&ebpf)?;
 
-        let pid_lifecycle = match uprobe_scope {
-            UProbeScope::OneProcess(pid) => {
-                Some(PidLifecycleTap::new(pid, discovery_domain.clone()))
-            }
-            UProbeScope::AllProcesses | UProbeScope::CallingProcess => None,
-        };
+        let pid_lifecycle = pid_lifecycle_tap_for(
+            uprobe_scope,
+            owned_child.and_then(|child| NonZeroU32::new(child.pid())),
+            &discovery_domain,
+        );
 
         Ok((
             Self {

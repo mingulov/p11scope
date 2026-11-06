@@ -141,10 +141,33 @@ pub fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
 /// Proves the owned path's scope names the owned child: PID scope by
 /// exact equality, cgroup scope by live membership through the retained
 /// descriptor (never the path). System scope never names one child.
-/// Scaffolding: the body lands with the implementation.
 pub fn scope_names_child(scope: &Scope, pid: u32) -> Result<()> {
-    let _ = (scope, pid);
-    anyhow::bail!("scope-names-child scaffolding");
+    match scope {
+        Scope::Pid(scope_pid) => {
+            if *scope_pid == pid {
+                Ok(())
+            } else {
+                bail!("owned scope names PID {scope_pid}, not the owned child {pid}")
+            }
+        }
+        Scope::Cgroup { dir, .. } => {
+            let members =
+                std::fs::read_to_string(format!("/proc/self/fd/{}/cgroup.procs", dir.as_raw_fd()))
+                    .with_context(|| {
+                        format!("reading cgroup scope membership for the owned child {pid}")
+                    })?;
+            let member = members
+                .lines()
+                .filter_map(|line| line.trim().parse::<u32>().ok())
+                .any(|member| member == pid);
+            if member {
+                Ok(())
+            } else {
+                bail!("the owned child {pid} is not a member of its cgroup scope")
+            }
+        }
+        Scope::System => bail!("system scope never names one owned child"),
+    }
 }
 
 /// `--cgroup` as an operator names it (M-3): [`cgroup`] plus proof, taken

@@ -19262,9 +19262,9 @@ impl Engine {
             );
             return Ok(OwnedLoaderPrearmOutcome::Unavailable);
         };
-        if !matches!(self.scope, Scope::Pid(pid) if pid == child.pid()) {
-            bail!("the retained Engine scope did not name the owned child exactly");
-        }
+        crate::scope::scope_names_child(&self.scope, child.pid()).map_err(|error| {
+            anyhow!("the retained Engine scope did not name the owned child exactly: {error:#}")
+        })?;
         let Some(position) = self.views.iter().position(|view| {
             view.pid() == child.pid() && view.still_the_same() && child.pin().still_the_same()
         }) else {

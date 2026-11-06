@@ -8136,6 +8136,106 @@ pub(crate) mod tests {
         );
     }
 
+    /// Nested forwarding twin: one logical call observed twice — once at
+    /// the forwarding layer's published stub (outer, same thread, containing
+    /// the inner call) and once at the watched provider it forwards into.
+    /// Every headline total counts the logical call once (provider layer);
+    /// the forwarding layer is shown separately per layer, never summed in.
+    #[test]
+    fn headline_totals_count_nested_forwarding_once_with_per_layer_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        // Same function, nested pair: outer at the layer, inner at the
+        // provider. The 500 outer calls each contain one inner call; the
+        // provider also answered 244 calls directly (not through the layer).
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "headline counts logical calls once (provider layer): {text}"
+        );
+        assert!(
+            !text.contains("1244 completed calls;"),
+            "headline must not sum both layers: {text}"
+        );
+        assert!(
+            text.contains("/opt/libforward.so")
+                && text.contains("500")
+                && text.contains("forwarding"),
+            "forwarding layer shown separately per layer in plain words: {text}"
+        );
+    }
+
+    /// JSON twin of the nested-forwarding headline: both layers stay
+    /// present and explicitly labelled; logical totals count once.
+    #[test]
+    fn json_labels_both_nested_layers_and_counts_logical_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 2, "both layers stay present");
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        let inner_json = functions
+            .iter()
+            .find(|row| row["calls"] == 744)
+            .expect("provider row present");
+        assert_eq!(
+            outer_json["forwarding_layer"], true,
+            "outer row labelled as the forwarding layer"
+        );
+        assert_eq!(
+            inner_json["forwarding_layer"], false,
+            "inner row labelled as the provider layer"
+        );
+        assert_eq!(
+            document["layer_totals"]["logical"]["calls"], 744,
+            "JSON logical totals count once"
+        );
+        assert_eq!(
+            document["layer_totals"]["forwarding"]["calls"], 500,
+            "JSON forwarding totals stay explicit"
+        );
+    }
+
     /// JK-22a: a prefix-admitted ordinary provider names its attached
     /// endpoints as partially covered, counted under "modules partially
     /// covered" rather than "modules refused".

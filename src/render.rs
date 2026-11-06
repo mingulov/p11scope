@@ -9875,9 +9875,10 @@ pub(crate) mod tests {
             .find(|line| line.starts_with("FUNCTION"))
             .expect("function table header");
         let calls_col = header.find("CALLS").expect("CALLS column");
+        // Name width + gap + PROVIDER column + gap + CALLS right-offset.
         assert_eq!(
             calls_col,
-            28 + 1 + 3,
+            28 + 1 + 16 + 1 + 3,
             "a short frame uses the min width 28: {out}"
         );
         let mut layer = discovered_fixture();
@@ -9910,9 +9911,10 @@ pub(crate) mod tests {
             .find(|line| line.starts_with("FUNCTION"))
             .expect("function table header");
         let calls_col2 = header2.find("CALLS").expect("CALLS column");
+        // Name width + gap + PROVIDER column + gap + CALLS right-offset.
         assert_eq!(
             calls_col2,
-            38 + 1 + 3,
+            38 + 1 + 16 + 1 + 3,
             "a long marked row expands the field to its rendered name: {out2}"
         );
     }

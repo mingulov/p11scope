@@ -2254,8 +2254,15 @@ fn closure_only_caller_edges_stay_logical_beside_an_active_caller() {
         summary.contains("/opt/libforward.so") && summary.contains("500"),
         "forwarding layer shown per layer: {summary}"
     );
+    // Concise groups edges per provider, so the layer's module line honestly
+    // sums all 522 observed entries; the split itself lives in the
+    // forwarding line, which must exclude the closure-only caller's 22.
+    let forwarding_line = summary
+        .lines()
+        .find(|line| line.contains("Forwarding-layer entries counted separately"))
+        .expect("forwarding line present");
     assert!(
-        !summary.contains("522"),
+        !forwarding_line.contains("522"),
         "the closure-only caller's entries are not in the forwarding line: {summary}"
     );
     let document = crate::inventory::render_json_from_presentation(&presentation);

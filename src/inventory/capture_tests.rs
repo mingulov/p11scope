@@ -1049,6 +1049,7 @@ impl Scene {
             attribution_losses: std::collections::BTreeMap::new(),
             cap: 1,
             scan_ms: 0,
+            wall_ms: None,
             processes: members
                 .iter()
                 .map(|(pid, start)| {

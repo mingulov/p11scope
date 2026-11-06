@@ -3040,6 +3040,7 @@ mod c1b {
             attribution_losses: BTreeMap::new(),
             cap: 256,
             scan_ms: 0,
+            wall_ms: None,
             processes,
             objects: vec![object],
             relationships: Vec::new(),

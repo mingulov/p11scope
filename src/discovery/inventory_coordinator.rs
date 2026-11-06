@@ -13491,6 +13491,7 @@ pub(crate) mod tests {
             attribution_losses: std::collections::BTreeMap::new(),
             cap: 1,
             scan_ms: 0,
+            wall_ms: None,
             processes: vec![crate::inspect_system::ProcessRecord {
                 application: crate::inspect_identity::InspectApplicationResult::Unknown(
                     crate::inspect_identity::InspectIdentityUnknown::NotExamined,

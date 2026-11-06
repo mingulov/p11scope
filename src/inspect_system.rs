@@ -110,7 +110,8 @@ fn run_with_writer(
     max_scan_pids: Option<usize>,
     out: &mut dyn std::io::Write,
 ) -> Result<i32> {
-    let catalog = collect(
+    let wall_start = std::time::Instant::now();
+    let mut catalog = collect(
         hints,
         excludes,
         hooks,
@@ -119,6 +120,9 @@ fn run_with_writer(
         // Single pass: no earlier scans, pure rarity selection.
         &BTreeSet::new(),
     )?;
+    // The header's wall total: measured around the collection, so
+    // `deep scans` never reads as the command's own time.
+    catalog.wall_ms = Some(u64::try_from(wall_start.elapsed().as_millis()).unwrap_or(u64::MAX));
     if stage_timings_requested() {
         eprintln!(
             "p11scope: stage timings: {}",
@@ -1099,6 +1103,11 @@ pub(crate) struct Catalog {
     pub attribution_losses: BTreeMap<AttributionLoss, usize>,
     pub cap: usize,
     pub scan_ms: u64,
+    /// The collection's measured wall time in ms, stamped by the run
+    /// entry around `collect`. Text-only (the header's `total`):
+    /// command wall time is a presentation measurement, not an
+    /// observation, so JSON carries no wall clock. `None` unmeasured.
+    pub wall_ms: Option<u64>,
     pub processes: Vec<ProcessRecord>,
     pub objects: Vec<CatalogObject>,
     pub relationships: Vec<Relationship>,
@@ -2527,6 +2536,7 @@ fn assemble(
         attribution_losses: losses,
         cap: collection.cap,
         scan_ms,
+        wall_ms: None,
         processes,
         objects,
         relationships,
@@ -3048,13 +3058,23 @@ fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerb
              unreadable, of {found} found"
         )
     };
+    // The measured wall total sits beside the deep-scan sum when the
+    // run entry stamped one; unmeasured catalogs keep today's header.
+    let wall = catalog.wall_ms.map(|ms| {
+        if ms < 1000 {
+            format!("; total {ms} ms")
+        } else {
+            format!("; total {:.1} s", ms as f64 / 1000.0)
+        }
+    });
     let _ = writeln!(
         out,
-        "system — {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms; {})",
+        "system — {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms{}; {})",
         catalog.objects.len(),
         catalog.processes.len(),
         catalog.cap,
         catalog.scan_ms,
+        wall.as_deref().unwrap_or_default(),
         catalog.scan_status,
     );
     out.push_str(
@@ -7044,6 +7064,7 @@ mod tests {
             attribution_losses: BTreeMap::new(),
             cap: MAX_SCAN_PIDS,
             scan_ms: 7,
+            wall_ms: None,
             processes: vec![
                 ProcessRecord {
                     application: InspectApplicationResult::Unknown(
@@ -8934,6 +8955,36 @@ mod tests {
         let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
         assert!(concise.contains("deep scans 7 ms"), "{concise}");
         assert!(!concise.contains("scan took"), "{concise}");
+    }
+
+    /// Item 11: the header pairs deep-scan time with the command's
+    /// measured wall time (`deep scans 7 ms; total 2.7 s`); without a
+    /// measured wall time the header stays as it was.
+    #[test]
+    fn header_pairs_deep_scans_with_wall_total() {
+        let mut catalog = catalog_with(Vec::new());
+        catalog.wall_ms = Some(2700);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let header = concise.lines().next().expect("header");
+        assert!(
+            header.contains("deep scans 7 ms; total 2.7 s"),
+            "wall total beside deep scans: {header}"
+        );
+        catalog.wall_ms = Some(42);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let header = concise.lines().next().expect("header");
+        assert!(
+            header.contains("deep scans 7 ms; total 42 ms"),
+            "sub-second totals read in ms: {header}"
+        );
+        catalog.wall_ms = None;
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        let header = concise.lines().next().expect("header");
+        assert!(header.contains("deep scans 7 ms"), "{header}");
+        assert!(
+            !header.contains("total"),
+            "unmeasured wall stays out: {header}"
+        );
     }
 
     /// Item 31: concise object headers name the provider file without an

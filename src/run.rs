@@ -10149,6 +10149,54 @@ mod tests {
         );
     }
 
+    /// CLI text: the newcomer-queue line names unknown drops beside
+    /// known ones, so a line the gate keeps for unknown drops alone
+    /// never reads "dropped 0". With no unknown drops the shape is
+    /// unchanged; the oracle's `pending N (oldest …)` substring stays
+    /// on the line either way.
+    #[test]
+    fn timing_summary_lines_show_unknown_drops() {
+        let line_for = |dropped: u64, dropped_unknown: u64| {
+            let scheduling = render::SchedulingEvidence {
+                newcomer_queue: render::NewcomerQueueEvidence {
+                    admitted: 1,
+                    max_admitted_age_ms: Some(2),
+                    mean_admitted_age_ms: Some(1),
+                    pending: 0,
+                    oldest_pending_age_ms: None,
+                    dropped,
+                    dropped_unknown,
+                    max_dropped_age_ms: None,
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            timing_summary_lines(&scheduling)
+                .into_iter()
+                .find(|line| line.contains("timing: newcomer queue:"))
+                .expect("newcomer line")
+        };
+        let unknown_only = line_for(0, 3);
+        assert!(
+            unknown_only.contains("(+3 unknown)"),
+            "unknown drops print beside known ones: {unknown_only}"
+        );
+        assert!(
+            unknown_only.contains("pending 0 (oldest n/a)"),
+            "the oracle substring stays: {unknown_only}"
+        );
+        let both = line_for(2, 1);
+        assert!(
+            both.contains("dropped 2 (+1 unknown)"),
+            "known and unknown drops print together: {both}"
+        );
+        let known_only = line_for(2, 0);
+        assert!(
+            !known_only.contains("unknown"),
+            "no unknown suffix without unknown drops: {known_only}"
+        );
+    }
+
     /// F7: `run --quiet` frames are header, totals and coverage only —
     /// no function table, no Evidence, no `-v` hint. Mirrors
     /// `render::tests::quiet_live_frame_keeps_header_totals_coverage_only`

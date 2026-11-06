@@ -627,7 +627,7 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
             .split_once("(class ")
             .ok_or("text admitted class is missing")?;
         let (class, _) = rest
-            .split_once(|c| c == ';' || c == ',' || c == ')')
+            .split_once([';', ',', ')'])
             .ok_or("text admitted class is unterminated")?;
         Ok(WholeAdmission {
             state: "admitted",

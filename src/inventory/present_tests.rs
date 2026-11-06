@@ -2128,6 +2128,45 @@ fn forwarding_layer_entries_count_separately_with_per_layer_split() {
     assert_eq!(plain_json["layer_totals"]["forwarding_entries"], 0);
 }
 
+/// The inventory forwarding line states the counting rule, not a
+/// structural nesting claim.
+#[test]
+fn forwarding_entries_line_states_the_counting_rule() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    assert!(presentation.modules.len() >= 2);
+    presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
+    presentation.modules[0].admission_class = Some("closure_array".into());
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id)
+        .expect("a forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id)
+        .expect("a provider edge")
+        .entry_count = 744;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("Each forwarding-layer entry is counted at the provider it forwards into"),
+        "counting rule stated: {summary}"
+    );
+    assert!(
+        !summary.contains("Each contains one provider entry on the same thread"),
+        "no structural nesting claim: {summary}"
+    );
+}
+
 #[test]
 fn f7_snapshot_high_cardinality_allocation_baseline() {
     // Exercise the real renderer with all 4096 edges/children, rather than

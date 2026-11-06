@@ -2480,7 +2480,7 @@ fn forwarding_layer_lines(
     }
     format!(
         "Forwarding layers counted separately (not in the totals above): {}.\n\
-         Each forwarding-layer call contains one provider call on the same thread; \
+         Each forwarding-layer call is counted at the provider it forwards into; \
          the totals above count that logical call once.\n",
         layers.join("; ")
     )
@@ -8577,6 +8577,37 @@ pub(crate) mod tests {
             .find(|row| row["calls"] == 500)
             .expect("forwarding row present");
         assert_eq!(outer_json["forwarding_layer"], true);
+    }
+
+    /// The forwarding line states the counting rule, not a structural
+    /// nesting claim: each forwarding-layer call is counted at the
+    /// provider it forwards into.
+    #[test]
+    fn forwarding_line_states_the_counting_rule() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains("Each forwarding-layer call is counted at the provider it forwards into"),
+            "counting rule stated: {text}"
+        );
+        assert!(
+            !text.contains("contains one provider call on the same thread"),
+            "no structural nesting claim: {text}"
+        );
     }
 
     /// JK-22a: a prefix-admitted ordinary provider names its attached

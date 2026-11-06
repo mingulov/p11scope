@@ -97,7 +97,9 @@ Semantic authority comes from exactly one of three sources:
   version-consistent 2.x 68-slot layout (a 3.x label with a proven complete
   68-slot legacy prefix counts as full; any other walk, version or slot
   count refuses), with a complete export witness and no 3.x interface
-  getter; (c) every slot is either NULL (an unimplemented function, which
+  getter, and the table is file-backed with every retained entry agreeing
+  with the object's exports; (c) every slot is either NULL (an
+  unimplemented function, which
   gets no probe and no argument reads) or resolves to code inside the
   provider's own executable mapping, with every 2.x key-operation entry
   the decoder reads non-NULL and in own code (`C_CreateObject`,
@@ -107,8 +109,8 @@ Semantic authority comes from exactly one of three sources:
   `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
   `C_GenerateKey`, `C_GenerateKeyPair`, `C_WrapKey`, `C_UnwrapKey`,
   `C_DeriveKey`, `C_SetOperationState`); (d) the object exports
-  `C_GetFunctionList`; (e) the provider is not a forwarding layer under
-  the Route A classification (a single load, not a closure array).
+  `C_GetFunctionList`; (e) the provider file has a single load in the
+  process, not a proxy's multi-table closure array.
   Anything else stays refused as today.
 
 Every other scan result, including every ordinary (non-`--key-operations`)

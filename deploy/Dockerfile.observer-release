@@ -4,18 +4,25 @@
 # Built from a staged minimal context holding the tarball and the entry script:
 #   docker build -f p11scope/deploy/Dockerfile.observer-release \
 #     --build-arg TARBALL=p11scope-0.7.0-x86_64-linux-musl.tar.gz \
+#     --build-arg TARBALL_SHA256=<sha256 from SHA256SUMS> \
 #     -t p11scope-observer:1 ctx/
 # (ctx/p11scope-0.7.0-x86_64-linux-musl.tar.gz, ctx/scripts/k8s-profile-entry.sh).
 # scripts/kind-e2e.sh stages exactly this when P11SCOPE_K8S_RELEASE_TARBALL is
-# set, after verifying the tarball against SHA256SUMS. The tarball must hold
-# exactly one `*/p11scope` regular file (the release layout); anything else is
-# refused. Its RELEASE.json rides along for provenance when present.
+# set, after verifying the tarball against SHA256SUMS, and passes the checked
+# hash as TARBALL_SHA256. The build re-verifies the copied bytes against that
+# hash before unpacking, so a tarball swapped after staging is refused. The
+# tarball must hold exactly one `*/p11scope` regular file (the release
+# layout); anything else is refused. Its RELEASE.json rides along for
+# provenance when present.
 # The base tag+digest stay matched with Dockerfile.observer.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 ARG TARBALL
+ARG TARBALL_SHA256
 COPY ${TARBALL} /tmp/release.tar.gz
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
 RUN set -eu; \
+    [ -n "${TARBALL_SHA256:-}" ] || { echo "TARBALL_SHA256 build arg is required" >&2; exit 1; }; \
+    echo "${TARBALL_SHA256}  /tmp/release.tar.gz" | sha256sum -c -; \
     mkdir -p /tmp/rel /usr/local/share/p11scope; \
     if tar -tzf /tmp/release.tar.gz | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "tarball has unsafe members" >&2; exit 1; fi; \
     tar -xzf /tmp/release.tar.gz -C /tmp/rel; \

@@ -68,11 +68,13 @@ tarball=/path/to/p11scope-0.7.0-x86_64-linux-musl.tar.gz
 mkdir -p ctx/scripts && cp "$tarball" ctx/ \
   && cp /path/to/p11scope/scripts/k8s-profile-entry.sh ctx/scripts/
 docker build -f /path/to/p11scope/deploy/Dockerfile.observer-release \
-  --build-arg TARBALL="${tarball##*/}" -t p11scope-observer:1 ctx/
+  --build-arg TARBALL="${tarball##*/}" \
+  --build-arg TARBALL_SHA256="$(sha256sum "$tarball" | awk '{print $1}')" \
+  -t p11scope-observer:1 ctx/
 ```
 
 `scripts/kind-e2e.sh` runs this variant when `P11SCOPE_K8S_RELEASE_TARBALL`
-(plus optional `P11SCOPE_K8S_RELEASE_SHA256SUMS`) is set.
+(plus required `P11SCOPE_K8S_RELEASE_SHA256SUMS`) is set.
 
 A capture targets one pod by UID, from the observer pod on the same node:
 

@@ -55,8 +55,9 @@
 #                              (p11scope-<version>-x86_64-linux-musl.tar.gz) to
 #                              package via deploy/Dockerfile.observer-release
 #                              instead of building
-#   P11SCOPE_K8S_RELEASE_SHA256SUMS optional SHA256SUMS file the release tarball
-#                              must verify against
+#   P11SCOPE_K8S_RELEASE_SHA256SUMS SHA256SUMS file the release tarball
+#                              must verify against (required with
+#                              P11SCOPE_K8S_RELEASE_TARBALL)
 #   P11SCOPE_K8S_TOOLCHAIN     cargo toolchain (default: .release-rust-version)
 #   P11SCOPE_K8S_WORK          evidence directory (must not exist; default a
 #                              fresh 0700 directory under $TMPDIR)
@@ -108,6 +109,19 @@ verify_release_tarball() {
         (cd "${1%/*}" 2>/dev/null || cd .; printf '%s\n' "$line" | sha256sum -c --status -) \
             || { echo "release tarball checksum mismatch: $1" >&2; return 1; }
     fi
+}
+
+# Print the verified sha256 of a release tarball from its SHA256SUMS
+# entry (the TARBALL_SHA256 docker build arg). The checksum is verified
+# here, not just looked up, so the printed hash is the checked one.
+release_tarball_sha256() {
+    [ -f "$2" ] || { echo "SHA256SUMS file is missing: $2" >&2; return 1; }
+    base=${1##*/}
+    line=$(awk -v want="$base" '$2 == want' "$2" | head -n 1)
+    [ -n "$line" ] || { echo "SHA256SUMS has no entry for $base" >&2; return 1; }
+    (cd "${1%/*}" 2>/dev/null || cd .; printf '%s\n' "$line" | sha256sum -c --status -) \
+        || { echo "release tarball checksum mismatch: $1" >&2; return 1; }
+    printf '%s\n' "$line" | awk '{print $1}'
 }
 
 # Exactly one complete gated JSON ledger with 6xN successes (gated.c prints
@@ -245,6 +259,21 @@ self_test() {
     if verify_release_tarball "$tar_stub/out/good.tar.gz" "$tar_stub/out/missing.sums" >/dev/null 2>&1; then
         echo "missing sums file accepted" >&2; exit 1
     fi
+    # release_tarball_sha256 prints the checked hash for the docker build
+    # arg; mismatches and missing entries refuse. No docker needed.
+    want_hash=$(cd "$tar_stub/out" && sha256sum good.tar.gz | awk '{print $1}')
+    got_hash=$(release_tarball_sha256 "$tar_stub/out/good.tar.gz" "$tar_stub/out/SHA256SUMS") \
+        || { echo "good tarball hash refused" >&2; exit 1; }
+    [ "$got_hash" = "$want_hash" ] || { echo "wrong tarball hash: $got_hash" >&2; exit 1; }
+    if release_tarball_sha256 "$tar_stub/out/good.tar.gz" "$tar_stub/out/WRONG.sums" >/dev/null 2>&1; then
+        echo "mismatched hash accepted" >&2; exit 1
+    fi
+    if release_tarball_sha256 "$tar_stub/out/good.tar.gz" "$tar_stub/out/OTHER.sums" >/dev/null 2>&1; then
+        echo "sums without the tarball entry accepted" >&2; exit 1
+    fi
+    if release_tarball_sha256 "$tar_stub/out/good.tar.gz" "$tar_stub/out/missing.sums" >/dev/null 2>&1; then
+        echo "missing sums file accepted for the hash" >&2; exit 1
+    fi
     mkdir -p "$tar_stub/none/p-0" && printf '{}\n' > "$tar_stub/none/p-0/RELEASE.json"
     (cd "$tar_stub/none" && tar -czf "$tar_stub/out/none.tar.gz" p-0)
     if verify_release_tarball "$tar_stub/out/none.tar.gz" "" >/dev/null 2>&1; then
@@ -303,6 +332,10 @@ RELEASE_TARBALL=${P11SCOPE_K8S_RELEASE_TARBALL:-}
 RELEASE_SUMS=${P11SCOPE_K8S_RELEASE_SHA256SUMS:-}
 if [ -n "$RELEASE_TARBALL" ] && [ -n "$OBSERVER_BIN" ]; then
     echo "P11SCOPE_K8S_RELEASE_TARBALL and P11SCOPE_K8S_OBSERVER_BIN are exclusive" >&2
+    exit 1
+fi
+if [ -n "$RELEASE_TARBALL" ] && [ -z "$RELEASE_SUMS" ]; then
+    echo "P11SCOPE_K8S_RELEASE_TARBALL requires P11SCOPE_K8S_RELEASE_SHA256SUMS" >&2
     exit 1
 fi
 LOCK=${P11SCOPE_K8S_LOCK:-}
@@ -374,9 +407,11 @@ fi
 
 OBS_DOCKERFILE=deploy/Dockerfile.observer
 OBS_TARBALL_ARG=
+OBS_TARBALL_SHA256=
 if [ -n "$RELEASE_TARBALL" ]; then
     echo "=== verify the release tarball and unpack the observer ==="
     verify_release_tarball "$RELEASE_TARBALL" "$RELEASE_SUMS"
+    OBS_TARBALL_SHA256=$(release_tarball_sha256 "$RELEASE_TARBALL" "$RELEASE_SUMS") || exit 1
     mkdir -p "$WORK/rel"
     member=$(tar -tzf "$RELEASE_TARBALL" | grep -E '/p11scope$')
     tar -xzf "$RELEASE_TARBALL" -C "$WORK/rel" "$member"
@@ -425,6 +460,7 @@ IMAGES_BUILT=1
 if [ -n "$OBS_TARBALL_ARG" ]; then
     timeout --signal=TERM --kill-after=10s 1200s \
         docker build -q -f "$OBS_DOCKERFILE" --build-arg "TARBALL=$OBS_TARBALL_ARG" \
+        --build-arg "TARBALL_SHA256=$OBS_TARBALL_SHA256" \
         -t "$OBS_IMAGE" "$OCTX"
 else
     timeout --signal=TERM --kill-after=10s 1200s \

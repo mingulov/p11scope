@@ -50,6 +50,7 @@ and detail counts are never summed.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
+- [Installing system packages](#installing-system-packages)
 - [Quickstart](#quickstart)
 - [Inventory diagnostics](#inventory-diagnostics)
 - [Offline inventory comparison](#offline-inventory-comparison)
@@ -141,6 +142,33 @@ capture authority or public object projection.
 A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see
 [Honest claims](#honest-claims).
+
+## Installing system packages
+
+The v0.6.0 release provides `p11scope_0.6.0_amd64.deb` (Debian/Ubuntu) and
+`p11scope-0.6.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. Each
+installs the same static observer plus the glibc discovery helper to
+`/usr/bin`, with licenses and provenance under `/usr/share/doc/p11scope`,
+and carries no file capabilities, set-id bits, services or maintainer
+scripts. Every release file carries a GitHub build-provenance attestation;
+[Install](../README.md#install) has the full bundle table. Download the
+package and `SHA256SUMS`, verify both, then install the file:
+
+```sh
+download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
+cd "$download_dir"
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope_0.6.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify p11scope_0.6.0_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.6.0_amd64.deb
+p11scope --version
+sudo p11scope doctor
+```
+
+On Fedora/RHEL, download `p11scope-0.6.0-1.x86_64.rpm` instead, verify it
+with `gh attestation verify p11scope-0.6.0-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.6.0-1.x86_64.rpm`.
 
 ## PKCS #11 versions and interface names
 

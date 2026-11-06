@@ -188,10 +188,11 @@ with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
 The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
 provides a static x86-64 Linux observer bundle, optional glibc and musl discovery
-helper bundles, and a source export. The examples below install **v0.6.0**.
-Download `SHA256SUMS` with the bundle you
+helper bundles, DEB and RPM system packages, and a source export. The examples
+below install **v0.6.0**. Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
+Every release file carries a GitHub build-provenance attestation.
 Older bundles remain under their release tags. To build current source
 instead, see [Build locally from source](#build-locally-from-source).
 GitHub's automatic source archive still needs the dependency inputs
@@ -202,6 +203,8 @@ described above.
 | `p11scope-0.6.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
 | `p11scope-discover-0.6.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
 | `p11scope-discover-0.6.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope_0.6.0_amd64.deb` | System package for Debian/Ubuntu: observer plus glibc helper. |
+| `p11scope-0.6.0-1.x86_64.rpm` | System package for Fedora/RHEL: observer plus glibc helper. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -220,6 +223,35 @@ sudo p11scope doctor
 
 Keep the extracted bundle with its licenses, notices and `RELEASE.json` as
 the record of the binary you installed.
+
+### System packages (DEB/RPM)
+
+The system packages install the same static observer binary plus the glibc
+discovery helper (same bytes as the tarballs, no rebuild) to `/usr/bin`,
+with licenses and provenance under `/usr/share/doc/p11scope`. They carry
+no file capabilities, set-id bits, services or maintainer scripts. The musl
+helper stays tarball-only for musl systems. Download the package and
+`SHA256SUMS`, verify the checksum and the build attestation, then install
+the file (Debian/Ubuntu shown; Fedora/RHEL uses `dnf install` with the
+`.rpm` file):
+
+```sh
+download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
+cd "$download_dir"
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope_0.6.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify p11scope_0.6.0_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.6.0_amd64.deb
+p11scope --version
+sudo p11scope doctor
+p11scope-discover --version
+```
+
+On Fedora/RHEL, replace the download with
+`p11scope-0.6.0-1.x86_64.rpm`, verify it with
+`gh attestation verify p11scope-0.6.0-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.6.0-1.x86_64.rpm`.
 
 To use attested semantic capture, download and verify the helper bundle for
 the provider's C library, then extract and install its `p11scope-discover`

@@ -149,7 +149,9 @@ sys.stdout.buffer.write((base / name).read_bytes())
         assets = {"RELEASE.json": release, f"{prefix}.tar.gz": archive.getvalue(),
                   f"p11scope-discover-{VERSION}-x86_64-linux-gnu.tar.gz": b"glibc helper archive",
                   f"p11scope-discover-{VERSION}-x86_64-linux-musl.tar.gz": b"musl helper archive",
-                  f"p11scope-{VERSION}-source.tar.gz": b"source export"}
+                  f"p11scope-{VERSION}-source.tar.gz": b"source export",
+                  f"p11scope_{VERSION}_amd64.deb": b"deb system package",
+                  f"p11scope-{VERSION}-1.x86_64.rpm": b"rpm system package"}
         assets["SHA256SUMS"] = "".join(f"{digest(data)}  {name}\n"
                                         for name, data in sorted(assets.items())).encode()
         if self.bad_checksum:
@@ -243,6 +245,21 @@ sys.stdout.buffer.write((base / name).read_bytes())
                 calls = (self.base / "calls").read_text()
                 self.assertIn("workflows/ci.yml", calls)
                 self.assertNotIn("workflows/package-preview.yml", calls)
+                shutil.rmtree(self.output)
+
+    def test_nested_package_full_accepts_present_attest_and_install_test_jobs(self):
+        for extra in (("package-delivery / attest",), ("package-delivery / install-test",),
+                      ("package-delivery / attest", "package-delivery / install-test")):
+            with self.subTest(extra=extra):
+                self.package_delivery()
+                identifier = 30
+                for name in extra:
+                    self.jobs["jobs"].append({"id": identifier, "run_id": 12, "run_attempt": 1,
+                                             "head_sha": HEAD, "name": name,
+                                             "status": "completed", "conclusion": "success"})
+                    identifier += 1
+                    self.jobs["total_count"] += 1
+                self.accepted()
                 shutil.rmtree(self.output)
 
     def test_nested_producer_cannot_borrow_legacy_or_standalone_route(self):

@@ -90,12 +90,13 @@ Semantic authority comes from exactly one of three sources:
   no argument reads there; or
 - a scan-derived sole-complete-table claim, only in the same no-manifest
   `inventory --key-operations` opt-in, and only when every condition holds
-  together: (a) a finished tables scan proves the provider object holds
-  exactly one function-table candidate — no truncating skip, I/O ceiling,
-  budget or table-cap stop on that module, no rival, aliased or degraded
-  second candidate (including no exports-only second table), all views of
-  the object agreeing, and no vendor or opaque interface claiming this
-  table's layout; (b) that table's published walk is full with a
+  together: (a) at least one view's tables scan finished with no
+  truncating skip, I/O ceiling, budget or table-cap stop on that module,
+  proving the provider object holds exactly one function-table candidate
+  — no rival, aliased or degraded second candidate (including no
+  exports-only second table), every other view of the object agreeing,
+  and no vendor or opaque interface claiming this table's layout; (b)
+  that table's published walk is full with a
   version-consistent 2.x 68-slot layout (a 3.x label with a proven complete
   68-slot legacy prefix counts as full; any other walk, version or slot
   count refuses), with a complete export witness and no 3.x interface

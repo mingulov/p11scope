@@ -7374,6 +7374,7 @@ mod tests {
                 },
                 key,
                 path: path.into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
@@ -7435,6 +7436,7 @@ mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {

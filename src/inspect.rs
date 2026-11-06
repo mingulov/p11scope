@@ -1149,6 +1149,7 @@ mod tests {
                 },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into(), "C_GetInterfaceList".into()],
                 tables: vec![ScannedTable {
@@ -1349,6 +1350,7 @@ mod tests {
                 },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![],

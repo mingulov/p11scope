@@ -232,6 +232,7 @@ fn scan_identity_truncation_is_bounded_and_invalidates_the_journal() {
             inode: 1,
         },
         path: String::new(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],

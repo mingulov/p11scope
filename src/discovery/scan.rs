@@ -2178,6 +2178,14 @@ pub struct ScannedModule {
     /// and only a complete-scan replacement lowers it.
     pub same_file_loads: u32,
     pub path: String,
+    /// Scan evidence: this module's tables scan ran to completion in a real
+    /// process scan with no truncating skip (`scan_skip_truncates`), I/O
+    /// ceiling, budget/table-cap stop, short read or refusal on this module.
+    /// The sole-complete-table grant requires it: "exactly one table" is only
+    /// proven when the scan that found one finished. Default `false` for every
+    /// synthesized module (heap-lowered records, loader prearm, projections,
+    /// manifests); merges AND it and clear it when the union grows.
+    pub tables_scan_finished: bool,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
     /// not manufacture this provenance.
@@ -5936,6 +5944,7 @@ fn scan_view_examined_mode(
             double_loaded: same_file_loads >= 2,
             same_file_loads,
             path,
+            tables_scan_finished: false,
             decoder_abi: Some(abi),
             exports: hook_exports,
             tables: Vec::new(),
@@ -9158,6 +9167,7 @@ mod tests {
                     double_loaded: false,
                     same_file_loads: 1,
                     path,
+                    tables_scan_finished: false,
                     decoder_abi: Some(ElfAbi::Lp64),
                     exports: Vec::new(),
                     tables,

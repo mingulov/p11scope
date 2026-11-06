@@ -5081,6 +5081,7 @@ mod tests {
                 double_loaded: false,
                 same_file_loads: 1,
                 path,
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".to_string()],
                 tables: vec![ScannedTable {

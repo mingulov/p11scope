@@ -2121,6 +2121,7 @@ fn double_load_transition_keeps_its_hit_unresolved() {
         double_loaded,
         same_file_loads: u32::from(double_loaded) + 1,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2167,6 +2168,7 @@ fn same_file_load_count_change_keeps_its_hit_unresolved() {
         double_loaded,
         same_file_loads,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2213,6 +2215,7 @@ fn stable_same_file_load_count_resolves_benignly() {
         double_loaded: true,
         same_file_loads: 2,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2256,6 +2259,7 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
         double_loaded: false,
         same_file_loads: 1,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -29590,6 +29594,7 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi,
         exports: vec![],
         tables: vec![ScannedTable {
@@ -29660,6 +29665,7 @@ fn incomplete_rescan_preserves_double_load_detection() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -29705,6 +29711,7 @@ fn incomplete_rescan_unions_the_extension_proof() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![ScannedTable {
@@ -29760,6 +29767,7 @@ fn incomplete_rescan_preserves_highest_load_count() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -32872,6 +32880,7 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
         mount_namespace: current_mount_namespace(),
         key: facts[0].0,
         path: paths[0].display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -33938,6 +33947,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         mount_namespace: current_mount_namespace(),
         key,
         path: path.clone(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -34174,6 +34184,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -34271,6 +34282,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -34344,6 +34356,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
             mount_namespace: current_mount_namespace(),
             key,
             path: "/stable-view.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -34429,6 +34442,7 @@ fn pinned_owned_fixture() -> (Vec<ScannedModule>, PinnedObjects) {
         mount_namespace: view.mount_namespace(),
         key,
         path: object.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(if usize::BITS == 64 {
             ElfAbi::Lp64
         } else {
@@ -35436,6 +35450,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
                 inode: key.inode,
             },
             path: path.display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: vec![],
             tables: vec![],
@@ -35518,6 +35533,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         mount_namespace: current_mount_namespace(),
         key: key(module_mapping),
         path: module_path.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -35700,6 +35716,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
             inode: 7,
         },
         path: "/opt/decoy.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -39058,6 +39075,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
                 inode: 7,
             },
             path: "/lib/provider.so".to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: Vec::new(),
             tables: Vec::new(),
@@ -39146,6 +39164,7 @@ fn view_pin_revalidation_detects_replaced_files() {
         mount_namespace: view.mount_namespace(),
         key,
         path: path.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: Vec::new(),
         tables: Vec::new(),
@@ -54840,6 +54859,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
             mount_namespace: current_mount_namespace(),
             key,
             path: "/provider.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {

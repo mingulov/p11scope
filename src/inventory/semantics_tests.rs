@@ -129,6 +129,7 @@ impl ProviderFixture {
                 double_loaded: false,
                 same_file_loads: 1,
                 path: self.manifest.module_path.clone(),
+                tables_scan_finished: false,
                 decoder_abi: None,
                 exports: Vec::new(),
                 interfaces: Vec::new(),

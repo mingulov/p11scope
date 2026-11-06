@@ -1808,9 +1808,16 @@ fn loss_gap_count(gaps: &[GapView]) -> usize {
         .count()
 }
 
+/// Concise gap groups listed before the block folds: per-PID
+/// subjects (one group per unreadable `/proc/{pid}/mem`) could
+/// otherwise print hundreds of lines on a `--system` scan. The
+/// header count stays exact; `--json` carries every item.
+const GAP_GROUPS_SHOWN: usize = 20;
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
-/// line per plain subject/reason group, every group listed, most
-/// frequent first. Plain words only (reusing `gap_plain_*`); per-gap
+/// line per plain subject/reason group, most frequent first, up to
+/// [`GAP_GROUPS_SHOWN`] groups; beyond that one fold line names the
+/// remainder. Plain words only (reusing `gap_plain_*`); per-gap
 /// `gap [` lines stay verbose-only. Counts distinct loss rows like the
 /// coverage line, not `repeats` (JSON carries `repeats`); deleted
 /// mappings read on the notes line instead. Empty when no loss gaps
@@ -1830,8 +1837,16 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut ranked: Vec<((String, String), usize)> = groups.into_iter().collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
-    for ((subject, reason), count) in &ranked {
+    for ((subject, reason), count) in ranked.iter().take(GAP_GROUPS_SHOWN) {
         lines.push(gap_group_line(*count, subject, reason));
+    }
+    let rest = ranked.len().saturating_sub(GAP_GROUPS_SHOWN);
+    if rest == 1 {
+        lines.push("  and 1 more group (--json has every item)".to_string());
+    } else if rest > 1 {
+        lines.push(format!(
+            "  and {rest} more groups (--json has every item)"
+        ));
     }
     lines
 }

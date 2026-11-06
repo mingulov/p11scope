@@ -10263,7 +10263,6 @@ mod tests {
             pause,
             attach_backend: crate::attach::BackendSelection::default(),
             kill_on_timeout: false,
-            verbose: false,
             user: None,
             command,
         };

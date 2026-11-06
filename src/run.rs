@@ -16892,7 +16892,6 @@ mod tests {
             pause,
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
-            verbose: false,
             user: None,
             command: command.iter().map(OsString::from).collect(),
         }

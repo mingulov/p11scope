@@ -3940,9 +3940,9 @@ impl Owned {
         // the gap reason; `None` (degraded exact-PID path) discloses
         // nothing on top of the degradation gap.
         if let Some(group) = self.run_cgroup.as_ref() {
-            let (_, gap) = run_tree_survivors_gap(group.survivors_excluding(self.pid));
+            let (count, gap) = run_tree_survivors_gap(group.survivors_excluding(self.pid));
             if let Some(reason) = gap {
-                engine.note_run_tree_gap(&reason);
+                engine.note_run_tree_gap(&reason, count);
             }
         }
         let Some(child) = self.child.as_ref() else {
@@ -4713,7 +4713,7 @@ fn run_owned_inner_with_host(
         ));
     }
     if let Some(reason) = run_tree_gap {
-        engine.note_run_tree_gap(&reason);
+        engine.note_run_tree_gap(&reason, None);
     }
     engine.set_scope_start_ns(scope_start_ns);
     engine.retain_return_probe_admission(return_admission);
@@ -14304,9 +14304,10 @@ mod tests {
         );
         assert!(kept.is_none(), "no group is kept on the exact path");
         let reason = gap.expect("the scope-build gap is named");
-        assert!(
-            reason.contains("not a usable scope") && reason.contains("only the started command"),
-            "{reason}"
+        assert_eq!(
+            reason,
+            crate::render::RUN_TREE_DEGRADED,
+            "the scope-build gap is finite vocabulary; the step prints on stderr"
         );
         assert!(!path.exists(), "the unused group dir is removed");
     }
@@ -14318,28 +14319,17 @@ mod tests {
             (Some(0), None),
             "an empty tree at run end is a measured zero, not a gap"
         );
-        assert_eq!(
-            super::run_tree_survivors_gap(Ok(1)),
-            (
-                Some(1),
-                Some(
-                    "1 process-tree member was still present when the command exited; \
-                     its calls after the run end are out of scope"
-                        .to_string()
+        // The gap reasons are finite vocabulary (schema v3): the count
+        // rides beside the reason in `run_tree_handed_back`, never in it.
+        for survivors in [1, 3] {
+            assert_eq!(
+                super::run_tree_survivors_gap(Ok(survivors)),
+                (
+                    Some(survivors),
+                    Some(crate::render::RUN_TREE_SURVIVORS.to_string())
                 )
-            )
-        );
-        assert_eq!(
-            super::run_tree_survivors_gap(Ok(3)),
-            (
-                Some(3),
-                Some(
-                    "3 process-tree members were still present when the command exited; \
-                     their calls after the run end are out of scope"
-                        .to_string()
-                )
-            )
-        );
+            );
+        }
         let (count, gap) = super::run_tree_survivors_gap(Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
             "cgroup.procs",
@@ -14347,10 +14337,7 @@ mod tests {
         assert_eq!(count, None, "an unread membership is unknown, never zero");
         assert_eq!(
             gap.as_deref(),
-            Some(
-                "the run cgroup membership could not be read at run end; \
-                 handed-back descendants are unknown"
-            )
+            Some(crate::render::RUN_TREE_MEMBERSHIP_UNKNOWN)
         );
     }
 

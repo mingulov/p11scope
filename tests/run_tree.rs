@@ -290,13 +290,19 @@ fn verdict(profile: &serde_json::Value) -> &str {
 /// The honest run-tree verdict for descendants that retired between
 /// admission passes: PARTIAL with exactly one descendant gap per
 /// never-admitted generation, zero event loss, the run cgroup scope,
-/// and no run-scope refusal (no `run process tree` gap entry).
+/// a measured zero handed back, and no run-scope refusal (no
+/// `run process tree` gap entry).
 fn assert_honest_tree_gaps(profile: &serde_json::Value, descendant_gaps: u64) {
     assert_eq!(verdict(profile), "PARTIAL", "{profile}");
     let evidence = profile.get("evidence").expect("evidence");
     assert_eq!(
         evidence.get("pid_descendant_gaps"),
         Some(&serde_json::Value::from(descendant_gaps)),
+        "{profile}"
+    );
+    assert_eq!(
+        evidence.get("run_tree_handed_back"),
+        Some(&serde_json::Value::from(0)),
         "{profile}"
     );
     assert_eq!(
@@ -755,16 +761,27 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
-    let skipped = profile
-        .get("evidence")
-        .and_then(|evidence| evidence.get("skipped"))
+    let evidence = profile.get("evidence").expect("evidence");
+    assert_eq!(
+        evidence.get("run_tree_handed_back"),
+        Some(&serde_json::Value::from(1)),
+        "{profile}"
+    );
+    let skipped = evidence
+        .get("skipped")
         .and_then(|skipped| skipped.as_array())
         .expect("evidence.skipped");
     assert!(
         skipped.iter().any(|entry| entry
-            .get("reason")
-            .and_then(|reason| reason.as_str())
-            .is_some_and(|reason| reason.contains("still present when the command exited"))),
+            .get("name")
+            .and_then(|name| name.as_str())
+            .is_some_and(|name| name == "run process tree")
+            && entry
+                .get("reason")
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| reason
+                    == "process-tree members were still present when the command exited; \
+                        their calls after the run end are out of scope")),
         "the handed-back leaf is disclosed: {skipped:?}"
     );
     // Cleanup: nothing this cell started may outlive it.

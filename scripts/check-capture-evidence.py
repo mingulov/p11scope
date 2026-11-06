@@ -600,6 +600,23 @@ LOADER_ARM_LEDGER_FULL = "the bounded loader-arm catch-up ledger was full"
 MANIFEST_OBJECT_UNAVAILABLE = "manifest object unavailable"
 PREARM_OBJECT_UNAVAILABLE = "prearm object unavailable"
 DISCOVERY_TRANSPORT_UNAVAILABLE = "discovery transport unavailable"
+# Run-tree (v0.7.0): a run that follows the command's child processes
+# files its scope gaps under its own subject with finite reasons
+# (render.rs `capture_skipped_out` run-tree arm). The survivor count
+# rides in `evidence.run_tree_handed_back`, never in the reason, so
+# the vocabulary stays finite.
+RUN_TREE_SUBJECT = "run process tree"
+RUN_TREE_SURVIVORS = (
+    "process-tree members were still present when the command exited; "
+    "their calls after the run end are out of scope"
+)
+RUN_TREE_DEGRADED = "only the started command is observed"
+RUN_TREE_MEMBERSHIP_UNKNOWN = "handed-back descendants are unknown"
+RUN_TREE_REASONS = {
+    RUN_TREE_SURVIVORS,
+    RUN_TREE_DEGRADED,
+    RUN_TREE_MEMBERSHIP_UNKNOWN,
+}
 DISCOVERY_REASONS = {
     DISCOVERY_UNAVAILABLE,
     TABLE_UNAVAILABLE,
@@ -1091,6 +1108,11 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
+        # Run-tree (v0.7.0): the handed-back survivor count, present on
+        # every run document (measured zero when the tree retired
+        # cleanly). Annotation only: the paired `run process tree` skip
+        # carries the verdict.
+        wanted.add("run_tree_handed_back")
     require(actual == wanted, f"unexpected evidence keys: missing={sorted(wanted - actual)}, extra={sorted(actual - wanted)}")
     if not historical:
         # Historical v2-metrics documents predate active_slots (see above);
@@ -1099,6 +1121,8 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if child:
         require(isinstance(evidence["child_still_running"], bool),
                 f"invalid child_still_running: {evidence['child_still_running']!r}")
+        require(u64(evidence["run_tree_handed_back"]),
+                f"invalid run_tree_handed_back: {evidence['run_tree_handed_back']!r}")
 
 
 def exact_excluded_modules(value):
@@ -2647,11 +2671,17 @@ def bounded_skip(item):
     )
     entry = item["name"].startswith("C_")
     gated_null = item == UNKNOWN_NULL_SKIP
+    run_tree = item["name"] == RUN_TREE_SUBJECT
     require(
-        entry or gated_null or item["name"] == DISCOVERY_SUBJECT,
+        entry or gated_null or run_tree or item["name"] == DISCOVERY_SUBJECT,
         f"unbounded capture skip subject: {item}",
     )
-    allowed = ENTRY_REASONS if (entry or gated_null) else DISCOVERY_REASONS
+    if entry or gated_null:
+        allowed = ENTRY_REASONS
+    elif run_tree:
+        allowed = RUN_TREE_REASONS
+    else:
+        allowed = DISCOVERY_REASONS
     require(item["reason"] in allowed, f"unbounded capture skip reason: {item}")
     return entry or gated_null
 
@@ -2886,10 +2916,18 @@ def exact_live_discovery_evidence(evidence, *, run=False):
             isinstance(evidence.get("child_still_running"), bool),
             f"run evidence must state child_still_running: {evidence.get('child_still_running')!r}",
         )
+        require(
+            u64(evidence.get("run_tree_handed_back")),
+            f"run evidence must state run_tree_handed_back: {evidence.get('run_tree_handed_back')!r}",
+        )
     else:
         require(
             "child_still_running" not in evidence,
             "child_still_running is a run-only field",
+        )
+        require(
+            "run_tree_handed_back" not in evidence,
+            "run_tree_handed_back is a run-only field",
         )
     exact_loader_discovery(evidence)
 
@@ -5544,6 +5582,7 @@ def self_test():
     print("capture.scope is exactly pid, cgroup, or system on current profile and metrics: OK")
     run_profile = copy.deepcopy(selection_doc)
     run_profile["evidence"]["child_still_running"] = False
+    run_profile["evidence"]["run_tree_handed_back"] = 0
     exact_profile_v3_selection(run_profile, run=True)
     run_trace = copy.deepcopy(run_profile["evidence"])
     run_trace.update(
@@ -6597,11 +6636,16 @@ def self_test():
 
     run_document = copy.deepcopy(live)
     run_document["evidence"]["child_still_running"] = True
+    run_document["evidence"]["run_tree_handed_back"] = 2
     exact_live_discovery_evidence(run_document["evidence"], run=True)
     for mutate in (
         lambda d: d["evidence"].pop("child_still_running"),
         lambda d: d["evidence"].update(child_still_running="yes"),
         lambda d: d["evidence"].update(child_still_running=4242),
+        lambda d: d["evidence"].pop("run_tree_handed_back"),
+        lambda d: d["evidence"].update(run_tree_handed_back="yes"),
+        lambda d: d["evidence"].update(run_tree_handed_back=True),
+        lambda d: d["evidence"].update(run_tree_handed_back=-1),
     ):
         bad = copy.deepcopy(run_document)
         mutate(bad)
@@ -6610,6 +6654,7 @@ def self_test():
             lambda bad=bad: exact_live_discovery_evidence(bad["evidence"], run=True)
         )
     print("child_still_running is a run-only boolean: OK")
+    print("run_tree_handed_back is a run-only count: OK")
 
     # ---- module ownership relation --------------------------------------
     ownership = copy.deepcopy(live)

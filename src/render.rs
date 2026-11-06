@@ -1604,6 +1604,18 @@ impl Default for SchedulingEvidence {
 }
 
 const DISCOVERY_SUBJECT: &str = "discovery subject";
+/// Run-tree scope gaps file under this subject with finite reasons
+/// (schema v3): the survivor count rides in
+/// `evidence.run_tree_handed_back`, never in the reason. Consumed by
+/// the run-tree implementation; the allow drops with it.
+#[allow(dead_code)]
+pub(crate) const RUN_TREE_SUBJECT: &str = "run process tree";
+#[allow(dead_code)]
+pub(crate) const RUN_TREE_SURVIVORS: &str = "process-tree members were still present when the command exited; their calls after the run end are out of scope";
+#[allow(dead_code)]
+pub(crate) const RUN_TREE_DEGRADED: &str = "only the started command is observed";
+#[allow(dead_code)]
+pub(crate) const RUN_TREE_MEMBERSHIP_UNKNOWN: &str = "handed-back descendants are unknown";
 const DISCOVERY_UNAVAILABLE: &str = "discovery unavailable";
 const ENTRY_UNAVAILABLE: &str = "function entry unavailable";
 const TABLE_UNAVAILABLE: &str = "function table unavailable in file-backed data";
@@ -1788,22 +1800,16 @@ fn physical_gap_category_requires_exact_internal_subject_and_description() {
     }
 }
 
-/// Run-tree gaps project under their own subject with the run-owned
-/// reason intact: the templates carry only counts and I/O-kind words
-/// (never paths, PIDs, or error chains), and the survivor count is
-/// the disclosure.
+/// Run-tree gaps project under their own subject with their finite
+/// reason intact; anything else under the subject fails closed to the
+/// generic discovery skip instead of breaking the closed vocabulary.
 #[cfg(test)]
 #[test]
-fn run_tree_gaps_project_under_their_own_subject_with_their_count() {
+fn run_tree_gaps_project_under_their_own_subject_with_finite_reasons() {
     for reason in [
-        "1 process-tree member was still present when the command exited; \
-         its calls after the run end are out of scope",
-        "3 process-tree members were still present when the command exited; \
-         their calls after the run end are out of scope",
-        "the run cgroup could not be created (permission denied); \
-         only the started command is observed",
-        "the run cgroup membership could not be read at run end; \
-         handed-back descendants are unknown",
+        RUN_TREE_SURVIVORS,
+        RUN_TREE_DEGRADED,
+        RUN_TREE_MEMBERSHIP_UNKNOWN,
     ] {
         let projected = capture_skipped_out(&Skipped {
             subject: "run process tree".into(),
@@ -1813,6 +1819,20 @@ fn run_tree_gaps_project_under_their_own_subject_with_their_count() {
         assert_eq!(projected.reason, reason);
         let json = serde_json::to_string(&projected).unwrap();
         assert!(!json.contains("discovery unavailable"), "{json}");
+    }
+    for reason in [
+        "1 process-tree member was still present",
+        "the run cgroup could not be created (permission denied)",
+        "anything else under this subject",
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: "run process tree".into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject", "{reason}");
+        assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("permission denied"), "{json}");
     }
 }
 

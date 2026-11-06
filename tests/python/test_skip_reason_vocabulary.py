@@ -46,6 +46,11 @@ PRODUCER_CONSTANTS = (
     "MANIFEST_OBJECT_UNAVAILABLE",
     "PREARM_OBJECT_UNAVAILABLE",
     "DISCOVERY_TRANSPORT_UNAVAILABLE",
+    # Run-tree scope gaps: survivors, degradation, unreadable
+    # membership — filed under their own subject with finite reasons.
+    "RUN_TREE_SURVIVORS",
+    "RUN_TREE_DEGRADED",
+    "RUN_TREE_MEMBERSHIP_UNKNOWN",
 )
 
 
@@ -61,11 +66,13 @@ def producer_constant(name):
 
 
 def producer_reasons():
-    """(entry_reasons, discovery_reasons) as the producer defines them.
+    """(entry_reasons, discovery_reasons, run_tree_reasons) as the producer
+    defines them.
 
     Entry granularity (function subjects and the one gated null) renders
-    "null pointer" or ENTRY_UNAVAILABLE; everything else renders one of the
-    fourteen discovery reasons. The split mirrors `capture_skipped_out`'s
+    "null pointer" or ENTRY_UNAVAILABLE; discovery scope renders one of the
+    fourteen discovery reasons; the run-tree scope renders one of its three
+    reasons under its own subject. The split mirrors `capture_skipped_out`'s
     branches; the strings themselves come from the source, never from a
     copy pasted into this test.
     """
@@ -89,25 +96,34 @@ def producer_reasons():
         const["PREARM_OBJECT_UNAVAILABLE"],
         const["DISCOVERY_TRANSPORT_UNAVAILABLE"],
     }
-    assert len(entry) == 2 and len(discovery) == 14, const
-    return entry, discovery
+    run_tree = {
+        const["RUN_TREE_SURVIVORS"],
+        const["RUN_TREE_DEGRADED"],
+        const["RUN_TREE_MEMBERSHIP_UNKNOWN"],
+    }
+    assert len(entry) == 2 and len(discovery) == 14 and len(run_tree) == 3, const
+    return entry, discovery, run_tree
 
 
 class SkipReasonVocabularyTests(unittest.TestCase):
     def test_validator_accepts_exactly_the_producer_vocabulary(self):
-        entry, discovery = producer_reasons()
+        entry, discovery, run_tree = producer_reasons()
         # Two-way: a producer reason the validator rejects fails here, and
         # so does a validator reason the producer never emits.
         self.assertEqual(set(CHECKER["ENTRY_REASONS"]), entry)
         self.assertEqual(set(CHECKER["DISCOVERY_REASONS"]), discovery)
+        self.assertEqual(set(CHECKER["RUN_TREE_REASONS"]), run_tree)
 
     def test_every_producer_reason_passes_bounded_skip(self):
-        entry, discovery = producer_reasons()
+        entry, discovery, run_tree = producer_reasons()
         for reason in sorted(entry):
             item = {"name": "C_Initialize", "reason": reason}
             self.assertTrue(CHECKER["bounded_skip"](item), item)
         for reason in sorted(discovery):
             item = {"name": CHECKER["DISCOVERY_SUBJECT"], "reason": reason}
+            self.assertFalse(CHECKER["bounded_skip"](item), item)
+        for reason in sorted(run_tree):
+            item = {"name": CHECKER["RUN_TREE_SUBJECT"], "reason": reason}
             self.assertFalse(CHECKER["bounded_skip"](item), item)
 
     def test_gated_null_skip_matches_plan_subject(self):
@@ -122,9 +138,9 @@ class SkipReasonVocabularyTests(unittest.TestCase):
         self.assertTrue(CHECKER["bounded_skip"](dict(expected)))
 
     def test_schema_doc_names_every_public_reason(self):
-        entry, discovery = producer_reasons()
+        entry, discovery, run_tree = producer_reasons()
         doc = SCHEMA_DOC.read_text(encoding="utf-8")
-        for reason in sorted(entry | discovery):
+        for reason in sorted(entry | discovery | run_tree):
             self.assertIn(reason, doc, f"schema doc omits {reason!r}")
 
 

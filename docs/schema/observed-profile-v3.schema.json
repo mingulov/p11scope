@@ -376,6 +376,7 @@
           "required": ["observer", "kernel_pids", "proc_pids"]
         },
         "provider_changed": {"type": "boolean"},
+        "run_tree_handed_back": {"type": "integer", "minimum": 0},
         "rv_update_failures": {"type": "integer", "minimum": 0},
         "scan_ms": {"type": "integer", "minimum": 0},
         "scan_unavailable": {"type": ["string", "null"]},
@@ -548,7 +549,10 @@
                   "the bounded loader-arm catch-up ledger was full",
                   "manifest object unavailable",
                   "prearm object unavailable",
-                  "discovery transport unavailable"
+                  "discovery transport unavailable",
+                  "process-tree members were still present when the command exited; their calls after the run end are out of scope",
+                  "only the started command is observed",
+                  "handed-back descendants are unknown"
                 ]
               }
             }

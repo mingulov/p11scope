@@ -710,6 +710,11 @@ pub struct Engine {
     /// churn or a completed rearm clears it, and view removal prunes it.
     exec_rearm_views: BTreeMap<ProcessViewId, Option<u64>>,
     pid_descendant_gaps: u64,
+    /// Handed-back run-tree survivors measured at run end. Run-lane only;
+    /// annotation beside the paired `run process tree` skip, which carries
+    /// the verdict. The field rides through until the wiring stores it.
+    #[allow(dead_code)]
+    run_tree_handed_back: u64,
     /// Multi-group rebuild windows this capture published: one per rebuilt
     /// group per rebuild transaction. Ungated by scope — a rebuild blinds
     /// its members wherever the capture runs.
@@ -10872,6 +10877,7 @@ impl Engine {
             counted_leader_exit_views: BTreeSet::new(),
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
+            run_tree_handed_back: 0,
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
@@ -11051,9 +11057,17 @@ impl Engine {
     }
 
     /// Publishes a run-tree coverage gap: the command's descendants a
-    /// degraded or ended run did not follow.
-    pub(crate) fn note_run_tree_gap(&mut self, reason: &str) {
+    /// degraded or ended run did not follow. The survivor count rides
+    /// through until the wiring stores it.
+    pub(crate) fn note_run_tree_gap(&mut self, reason: &str, handed_back: Option<u64>) {
+        let _ = handed_back;
         self.mark_partial("run process tree", reason);
+    }
+
+    /// Handed-back run-tree survivors measured at run end (run-lane only).
+    #[allow(dead_code)]
+    pub(crate) fn run_tree_handed_back(&self) -> u64 {
+        self.run_tree_handed_back
     }
 
     fn cancellation_requested(&self) -> bool {

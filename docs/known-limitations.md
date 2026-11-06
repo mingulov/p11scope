@@ -76,18 +76,23 @@ names the source SHA behind each check the release rounds re-measured.
   observed semantic registration") and the late provider's unwatched
   window. Affected runs read PARTIAL. Hold the child with `run --pause
   auto` or keep it alive past attach.
-- `run` (and `profile --pid`) observe exactly the started (named)
-  process, never its descendants: a fork/exec child, `subprocess`
-  worker, or `multiprocessing` spawn child that loads a provider gets
-  no probes and its calls are entirely absent, however long it lives.
-  When only descendants touch PKCS#11 the run reports 0 probes with
-  `newcomer queue: admitted 0` and honest PARTIAL coverage. This is the
-  exact-PID scope (`run` is a PID scope over its own child; discovery
-  sweeps only the named PID and probes bind to that process alone), not
-  a timing race. Multi-process workloads such as `pkcs11-check test`
-  with default crash isolation are affected: every test runs in a
-  subprocess, so `run` sees none of it. Capture such workloads with
-  `inventory --system` (or `--cgroup`), which admits short-lived
+- `run` captures the command with its child processes: the child is
+  placed in a dedicated cgroup before release, so fork/exec children,
+  `sh -c` and `env` wrappers, `sudo -u` hops and double forks are born
+  in scope and their calls are counted. Descendants that retire between
+  admission passes count `pid_descendant_gaps` like cgroup scope (same
+  lossy-by-design rule: exact counts with `PARTIAL` observation), and
+  descendants still alive at run end are handed back alive, disclosed
+  by count (`run_tree_handed_back` with a `run process tree` gap). The
+  run still ends with the direct child's exit. Without permission to
+  create the cgroup, `run` degrades to its exact child with a named
+  gap. `profile --pid` still observes exactly the named process, never
+  its descendants: a fork/exec child, `subprocess` worker, or
+  `multiprocessing` spawn child that loads a provider gets no probes
+  and its calls are entirely absent, however long it lives. This is the
+  exact-PID scope (discovery sweeps only the named PID and probes bind
+  to that process alone), not a timing race. Capture such workloads
+  with `inventory --system` (or `--cgroup`), which admits short-lived
   processes, or run the leaf command that loads the provider directly
   under `run`.
 - Container providers carry named unproven cases: the container checks

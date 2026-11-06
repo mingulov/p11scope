@@ -3476,10 +3476,12 @@ fn merge(
                     // above; K counts the attached (published) ones. A
                     // pass that attaches nothing refuses whole below
                     // (awaiting-publication), never "0 of M".
-                    if published_only && closure_late_start && !closure_named {
-                        if admitted.len() < ordered.len() {
-                            closure_published_partial = Some((admitted.len(), ordered.len()));
-                        }
+                    if published_only
+                        && closure_late_start
+                        && !closure_named
+                        && admitted.len() < ordered.len()
+                    {
+                        closure_published_partial = Some((admitted.len(), ordered.len()));
                     }
                     // JK-22a: a provider fallback that attaches nothing falls
                     // through to the whole refusal below — the strongest

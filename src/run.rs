@@ -5886,6 +5886,21 @@ fn loader_readiness_line(active_hooks: usize) -> String {
     format!("p11scope: loader readiness: {active_hooks} active hook(s)")
 }
 
+/// Inserts a report line before the trailing `-v` hint of a concise
+/// frame, or appends it to a frame without one (quiet, verbose).
+/// Matched on the shared hint constant, never a copy of its text.
+fn insert_before_hint(frame: &str, line: &str) -> String {
+    let hint = format!("{}\n", crate::cli::VERBOSE_HINT);
+    if let Some(body) = frame.strip_suffix(hint.as_str()) {
+        return format!("{body}{line}\n{hint}");
+    }
+    if frame.ends_with('\n') || frame.is_empty() {
+        format!("{frame}{line}\n")
+    } else {
+        format!("{frame}\n{line}\n")
+    }
+}
+
 /// The disclosure line, printed on stderr before the readiness line, when
 /// an `auto` session runs per-offset links instead of uprobe-multi
 /// (DR-CLASSIC-PID0): the reason is also `evidence.attach_backend.fallback`.
@@ -7376,7 +7391,7 @@ fn capture_profile(
         render::apply_counter_snapshot(&mut ev, &snapshot);
         render::apply_legacy_gaps(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
-        let frame = render::live_snapshot_scoped(
+        let mut frame = render::live_snapshot_scoped(
             &snapshot,
             &ev,
             clock.elapsed(),
@@ -7386,6 +7401,19 @@ fn capture_profile(
             scope.kind(),
             consumers.state.mechanisms(),
         );
+        // A cleanly closed --select-endpoint window names itself in the
+        // report, before the hint: refused and voided selections already
+        // spoke on stderr, but a success never mentioned its endpoint.
+        if let Some(ledger) = selection_ledger.as_deref()
+            && let Some((endpoint, calls, errors)) = ledger.closed_detail_totals()
+        {
+            frame = insert_before_hint(
+                &frame,
+                &metrics::selected_detail_driver::format_selection_closed_line(
+                    endpoint, calls, errors,
+                ),
+            );
+        }
         if let Some(bytes) = live_display.frame_bytes(&frame, true) {
             write_stdout(context.3, context.4, bytes.as_bytes())?;
             flush_stdout(context.3, context.4)?;
@@ -19629,6 +19657,35 @@ mod tests {
         assert_eq!(
             capture_ready_line(0, false),
             "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C"
+        );
+    }
+
+    /// CLI text: the Selected line lands before the `-v` hint in a
+    /// concise frame, and at the end of a frame without one.
+    #[test]
+    fn selected_line_inserts_before_hint_or_at_end() {
+        let hint = crate::cli::VERBOSE_HINT;
+        let concise = format!("totals\ncoverage: complete\n{hint}\n");
+        assert_eq!(
+            insert_before_hint(
+                &concise,
+                "Selected C_Sign: 2 calls, 0 errors (detail window closed cleanly)"
+            ),
+            format!(
+                "totals\ncoverage: complete\nSelected C_Sign: 2 calls, 0 errors (detail window \
+                 closed cleanly)\n{hint}\n"
+            ),
+            "concise frames keep the hint last"
+        );
+        let quiet = "totals\ncoverage: complete\n";
+        assert_eq!(
+            insert_before_hint(
+                quiet,
+                "Selected C_Sign: 2 calls, 0 errors (detail window closed cleanly)"
+            ),
+            "totals\ncoverage: complete\nSelected C_Sign: 2 calls, 0 errors (detail window closed \
+             cleanly)\n",
+            "frames without a hint append the line"
         );
     }
 

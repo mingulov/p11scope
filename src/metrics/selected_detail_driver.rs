@@ -945,6 +945,27 @@ impl SelectionLedger {
             .as_ref()
             .map(|record| (record.endpoint.as_str(), record.refusal))
     }
+
+    /// The report's Selected line inputs: the endpoint plus the detail
+    /// window's returned/error totals. `Some` only for a cleanly closed
+    /// window — a recorded selection, no refusal, and a detail product
+    /// whose rows parse as counters. Anything else (no attempt, a
+    /// void, an unexpected shape) yields no line rather than a wrong
+    /// one; refused and voided selections already spoke on stderr.
+    pub(crate) fn closed_detail_totals(&self) -> Option<(&str, u64, u64)> {
+        let selection = self.selection.as_ref()?;
+        if selection.refusal.is_some() {
+            return None;
+        }
+        let rows = self.detail.as_ref()?.get("rows")?.as_array()?;
+        let mut returned = 0u64;
+        let mut errors = 0u64;
+        for row in rows {
+            returned = returned.saturating_add(row.get("returned")?.as_u64()?);
+            errors = errors.saturating_add(row.get("errors")?.as_u64()?);
+        }
+        Some((selection.endpoint.as_str(), returned, errors))
+    }
 }
 
 /// One plain-text line for a `--select-endpoint` attempt that never
@@ -993,6 +1014,18 @@ pub(crate) fn format_selection_withheld_line(endpoint: &str, refusal: &str) -> S
     format!(
         "p11scope: --select-endpoint {endpoint} detail withheld ({refusal}); \
          aggregate counters continue."
+    )
+}
+
+/// One report line for a `--select-endpoint` whose K0 detail closed
+/// cleanly: endpoint, window totals, and the clean close. The endpoint
+/// is operator input, so controls escape like any report field.
+pub(crate) fn format_selection_closed_line(endpoint: &str, calls: u64, errors: u64) -> String {
+    let call_noun = if calls == 1 { "call" } else { "calls" };
+    let error_noun = if errors == 1 { "error" } else { "errors" };
+    format!(
+        "Selected {}: {calls} {call_noun}, {errors} {error_noun} (detail window closed cleanly)",
+        crate::render::escape_controls(endpoint)
     )
 }
 
@@ -2452,6 +2485,103 @@ mod tests {
             refused.selection_outcome(),
             Some(("C_Missing", Some("endpoint_unknown"))),
             "the named refusal is readable for text"
+        );
+    }
+
+    /// A ledger holding a used selection record plus a detail product.
+    fn closed_ledger(endpoint: &str, detail: serde_json::Value) -> SelectionLedger {
+        let mut ledger = SelectionLedger::new();
+        ledger.selection = Some(SelectionRecord {
+            endpoint: endpoint.to_string(),
+            slot: Some(2),
+            file_offset: Some(0x40),
+            names: vec![endpoint.to_string()],
+            refusal: None,
+        });
+        ledger.detail = Some(detail);
+        ledger
+    }
+
+    /// CLI text: a cleanly closed detail window reports its endpoint
+    /// with the returned/error totals for the report's Selected line.
+    #[test]
+    fn selection_closed_detail_totals_report_endpoint_and_counts() {
+        let ledger = closed_ledger(
+            "C_Sign",
+            serde_json::json!({"rows": [{"returned": 2u64, "errors": 0u64}]}),
+        );
+        assert_eq!(
+            ledger.closed_detail_totals(),
+            Some(("C_Sign", 2, 0)),
+            "endpoint plus window totals"
+        );
+        let multi = closed_ledger(
+            "C_Decrypt",
+            serde_json::json!({"rows": [
+                {"returned": 3u64, "errors": 1u64},
+                {"returned": 4u64, "errors": 2u64},
+            ]}),
+        );
+        assert_eq!(
+            multi.closed_detail_totals(),
+            Some(("C_Decrypt", 7, 3)),
+            "rows sum across the window"
+        );
+    }
+
+    /// CLI text: anything but a cleanly closed detail yields no
+    /// Selected line — a refusal, a missing detail, or rows that do
+    /// not parse as counters.
+    #[test]
+    fn selection_closed_detail_totals_absent_without_clean_detail() {
+        assert_eq!(
+            SelectionLedger::new().closed_detail_totals(),
+            None,
+            "no attempt"
+        );
+        let mut refused = closed_ledger(
+            "C_Sign",
+            serde_json::json!({"rows": [{"returned": 2u64, "errors": 0u64}]}),
+        );
+        refused.mark_selection_refused("caller_changed");
+        assert_eq!(
+            refused.closed_detail_totals(),
+            None,
+            "a voided window stays silent in the report"
+        );
+        let mut no_detail = closed_ledger("C_Sign", serde_json::json!({}));
+        no_detail.detail = None;
+        assert_eq!(no_detail.closed_detail_totals(), None, "no detail product");
+        for detail in [
+            serde_json::json!({"rows": [{"returned": "two", "errors": 0u64}]}),
+            serde_json::json!({"rows": [{"errors": 0u64}]}),
+            serde_json::json!({"rows": "C_Sign"}),
+            serde_json::json!({}),
+        ] {
+            assert_eq!(
+                closed_ledger("C_Sign", detail).closed_detail_totals(),
+                None,
+                "unparsable rows fail closed"
+            );
+        }
+    }
+
+    /// CLI text: the report's Selected line names the endpoint with
+    /// singular/plural counts and the clean close; the endpoint is
+    /// operator input, so controls escape.
+    #[test]
+    fn selection_closed_line_names_endpoint_counts_and_clean_close() {
+        assert_eq!(
+            format_selection_closed_line("C_Sign", 2, 0),
+            "Selected C_Sign: 2 calls, 0 errors (detail window closed cleanly)"
+        );
+        assert_eq!(
+            format_selection_closed_line("C_Verify", 1, 1),
+            "Selected C_Verify: 1 call, 1 error (detail window closed cleanly)"
+        );
+        assert_eq!(
+            format_selection_closed_line("C_X\nY", 1, 0),
+            "Selected C_X\\nY: 1 call, 0 errors (detail window closed cleanly)"
         );
     }
 

@@ -2898,9 +2898,7 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
                 format!(
                     "6s without progress across {audited_polls} consecutive commit polls in \
                      Audited; the semantic lane stops; \
-                     h0_below=Some(3), staged_max=Some(2), floor=None; \
-                     consumers=0 pending/neg/future/delivered/loss=[0, 0, 0, 0, 0] cursor=0 \
-                     active=none failure=false ingress_disposed=false; held=[0, 0, 0, 0, 0]"
+                     h0_below=Some(3), staged_max=Some(2), floor=None"
                 ),
                 "the gap names the stall in time"
             );
@@ -3015,16 +3013,11 @@ fn unbound_staging(fixture: &MachineScene) -> std::collections::BTreeSet<(u64, u
         .unbound_staging_images_for_test()
 }
 
-/// The live Firefox late-attach shape (fedora, 2026-11-06): another
-/// process's call still in flight (BEGIN only, e.g. a blocking wait)
-/// is journal staging no bound key can account for, and it holds every
-/// bound caller's seal. At the running no-progress bound only that
-/// stalled image degrades: it is refused in the journal (named, with
-/// its dropped in-flight count), the stall clock restarts, and the bound
-/// caller's call still publishes through its Joint feed. The lane never
-/// stops and nothing latches.
+/// A seal that can only be retried, with nothing delivered, is no
+/// progress: the running Audited bound ends it with a named gap instead
+/// of spinning its retry budget until the run deadline.
 #[test]
-fn joint_machine_in_flight_unbound_call_degrades_only_its_image() {
+fn joint_machine_retry_without_delivery_trips_the_running_bound() {
     use crate::inventory_semantics::JointServiceProgress;
     let bound = std::time::Duration::from_secs(6);
     let margin = std::time::Duration::from_millis(100);
@@ -3053,48 +3046,19 @@ fn joint_machine_in_flight_unbound_call_degrades_only_its_image() {
         .machine
         .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
     match fixture.service(1024) {
-        Ok(_) => {}
-        other => panic!("the bound degrades the stalled image, never the lane: {other:?}"),
+        Err(SemanticRefusal::Unavailable) => {}
+        other => panic!("a retry-only seal past the bound must refuse: {other:?}"),
     }
+    let gaps = audit_no_progress_gaps(&fixture);
+    assert_eq!(gaps.len(), 1, "the stall is named once: {gaps:?}");
     assert!(
-        audit_no_progress_gaps(&fixture).is_empty(),
-        "the lane does not stop"
+        fixture.machine.audit_no_progress_trip_for_test().is_some(),
+        "the trip is recorded for the hold"
     );
-    let released: Vec<(String, String)> = fixture
-        .scene
-        .real
-        .scene
-        .coordinator
-        .registry()
-        .staged_scope_gaps_for_test()
-        .into_iter()
-        .filter(|(subject, _)| subject == "joint audit stall released")
-        .collect();
-    assert_eq!(released.len(), 1, "the release is named once: {released:?}");
-    assert!(
-        released[0].1.contains("1 in-flight call of 1 process image"),
-        "the dropped count is named: {}",
-        released[0].1
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
     );
-    assert!(
-        fixture
-            .scene
-            .real
-            .scene
-            .coordinator
-            .joint_capture()
-            .adapter()
-            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
-        "the stalled image is refused in the journal"
-    );
-    assert!(unbound_staging(&fixture).is_empty(), "its staging dropped");
-    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
-    assert_eq!(fixture.machine.disposition_reason(), None, "nothing latches");
-    // The bound caller's call publishes through its Joint feed.
-    fixture.published_labeled("released-stall", None);
-    let registry = fixture.scene.real.scene.coordinator.registry();
-    assert_eq!(registry.joint_feeds(), 1, "the bound Joint feed continues");
-    assert_eq!(fixture.machine.disposition_reason(), None);
 }
 
 /// The live step-3 shape: a foreign process's finished call that S1 sheds

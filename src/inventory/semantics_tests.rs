@@ -1078,6 +1078,155 @@ fn native_semantic_scan_subset_sole_complete_one_vs_two_views_refuse_both_orders
     }
 }
 
+/// A same-count different-content sole view: the same 68-entry 2.x full
+/// table decoded at another file offset. Alone it mints (pinned below),
+/// so multi-view refusals blame disagreement, never a defective view.
+fn sole_variant_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let mut variant = sole_complete_source(fixture);
+    variant.scanned.tables[0].address = 0x7100;
+    variant.scanned.tables[0].file_offset = Some(0x1000);
+    variant
+}
+
+/// An empty finished view of the same object: this vantage saw no table.
+fn sole_empty_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let mut empty = sole_complete_source(fixture);
+    empty.scanned.tables.clear();
+    empty.entry_objects.clear();
+    empty
+}
+
+/// Control: the variant table mints alone through the real mint.
+#[test]
+fn native_semantic_scan_subset_sole_complete_variant_mints_alone() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let variant = sole_variant_source(&fixture);
+    let engine = engine_for_test(Vec::new(), vec![variant], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("a sole-valid variant table mints alone");
+    assert_eq!(subset.plan().slots.len(), 68);
+}
+
+/// Same-count different-content views refuse in both orders: two
+/// finished views describing the one table differently prove nothing
+/// about exactly-one.
+#[test]
+fn native_semantic_scan_subset_sole_complete_content_disagree_refuses_both_orders() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let variant = sole_variant_source(&fixture);
+    for (label, modules) in [
+        ("table-first", vec![table.clone(), variant.clone()]),
+        ("variant-first", vec![variant.clone(), table.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: same-count different-content views refuse the sole grant"
+        );
+    }
+}
+
+/// Sticky disagreement: a disagreeing view refuses in every rotation, not
+/// just when it arrives last — a later agreeing view must not OR the
+/// finished flag back.
+#[test]
+fn native_semantic_scan_subset_sole_complete_disagreement_is_sticky_all_rotations() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let variant = sole_variant_source(&fixture);
+    for (label, modules) in [
+        (
+            "variant-middle",
+            vec![table.clone(), variant.clone(), table.clone()],
+        ),
+        (
+            "variant-first",
+            vec![variant.clone(), table.clone(), table.clone()],
+        ),
+        (
+            "variant-last",
+            vec![table.clone(), table.clone(), variant.clone()],
+        ),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: a disagreeing view refuses in every rotation"
+        );
+    }
+}
+
+/// An empty finished view disagrees by count with a single-table view:
+/// it refuses in every rotation and never corroborates one alone.
+#[test]
+fn native_semantic_scan_subset_sole_complete_empty_view_disagreement_is_sticky() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let empty = sole_empty_source(&fixture);
+    for (label, modules) in [
+        (
+            "empty-first",
+            vec![empty.clone(), table.clone(), table.clone()],
+        ),
+        (
+            "empty-middle",
+            vec![table.clone(), empty.clone(), table.clone()],
+        ),
+        (
+            "empty-last",
+            vec![table.clone(), table.clone(), empty.clone()],
+        ),
+        ("empty-then-table", vec![empty.clone(), table.clone()]),
+        ("table-then-empty", vec![table.clone(), empty.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: an empty view refuses beside a single-table view"
+        );
+    }
+}
+
+/// Healthy twin: agreeing finished/unfinished views still mint in both
+/// orders — the finished view proves exactly-one and the unfinished one
+/// does not refute it.
+#[test]
+fn native_semantic_scan_subset_sole_complete_finished_and_unfinished_views_mint() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let finished = sole_complete_source(&fixture);
+    let mut unfinished = sole_complete_source(&fixture);
+    unfinished.scanned.tables_scan_finished = false;
+    for (label, modules) in [
+        ("finished-first", vec![finished.clone(), unfinished.clone()]),
+        (
+            "unfinished-first",
+            vec![unfinished.clone(), finished.clone()],
+        ),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        let subset = prepared.subset.unwrap_or_else(|| {
+            panic!("{label}: agreeing finished/unfinished views mint the sole grant")
+        });
+        assert_eq!(subset.plan().slots.len(), 68);
+    }
+}
+
 /// Real-seam twin of the exports-only plan test above: export-name
 /// agreement alone (no linkage, live return or sole legs) mints nothing
 /// through the mint, while the live-return twin mints.

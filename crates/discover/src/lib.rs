@@ -4,6 +4,7 @@
 //! separate unprivileged short-lived process.
 
 pub mod discover;
+pub mod isolation;
 pub mod maps;
 
 pub use p11scope_manifest::{identity, manifest};

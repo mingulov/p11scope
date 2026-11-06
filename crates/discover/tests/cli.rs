@@ -467,20 +467,34 @@ fn isolation_healthy_sparse_lazy_provider_matches_trusted() {
     let default = run(&[]);
     let trusted = run(&["--isolation", "trusted"]);
     let isolated = run(&["--isolation", "isolated"]);
-    for (name, out) in [("default", &default), ("trusted", &trusted), ("isolated", &isolated)] {
+    for (name, out) in [
+        ("default", &default),
+        ("trusted", &trusted),
+        ("isolated", &isolated),
+    ] {
         assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
     }
-    assert_eq!(default.stdout, trusted.stdout, "explicit trusted differs from default");
+    assert_eq!(
+        default.stdout, trusted.stdout,
+        "explicit trusted differs from default"
+    );
     assert_eq!(
         default.stdout, isolated.stdout,
         "the fence changed a healthy provider's manifest"
     );
     for (name, out) in [("default", &default), ("trusted", &trusted)] {
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("ISOLATION_SOCKET=allowed"), "{name}: {stderr}");
-        assert!(stderr.contains("ISOLATION_WRITE=allowed"), "{name}: {stderr}");
+        assert!(
+            stderr.contains("ISOLATION_SOCKET=allowed"),
+            "{name}: {stderr}"
+        );
+        assert!(
+            stderr.contains("ISOLATION_WRITE=allowed"),
+            "{name}: {stderr}"
+        );
     }
-    let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&isolated.stdout).unwrap();
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&isolated.stdout).unwrap();
     assert_eq!(m.surfaces.len(), 2);
     assert!(matches!(m.interface_list, Acquisition::Ok));
     let null_surface = &m.surfaces[1];
@@ -535,6 +549,51 @@ fn isolation_socket_needy_getter_is_recorded_not_hidden() {
         stderr.contains("isolated profile: C_GetFunctionList failed"),
         "{stderr}"
     );
+}
+
+/// The `-o` parent directory stays writable under the fence (private
+/// atomic publish), and an unusable one refuses before provider load: no
+/// constructor marker may appear.
+#[test]
+fn isolation_o_writes_through_the_fenced_output_directory() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let provider_dir = scratch("isolation-o-provider");
+    let out_dir = scratch("isolation-o-out");
+    let provider = build_isolation_probe(&provider_dir);
+    let outfile = out_dir.join("manifest.json");
+    let out = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&outfile)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    assert!(String::from_utf8_lossy(&out.stdout).is_empty());
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&std::fs::read(&outfile).unwrap()).unwrap();
+    assert_eq!(m.schema, "p11scope-manifest/5");
+    assert_eq!(
+        std::fs::metadata(&outfile).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    let missing = out_dir.join("no-such-dir").join("manifest.json");
+    let refused = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&missing)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("isolated profile: "), "{stderr}");
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the output refusal: {stderr}"
+    );
+    assert!(!missing.exists());
 }
 
 /// F-56: `--help` is an exit-0 answer, so it goes to stdout like

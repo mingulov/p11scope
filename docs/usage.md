@@ -537,6 +537,16 @@ so it resolves symbolic links on the way to the directory and accepts a
 group-writable one: the directory is the operator's choice. `p11scope-discover --help` prints its usage on stdout and
 exits 0.
 
+For providers you do not trust, `--isolation isolated` fences the helper
+before it loads the provider: the filesystem stays read-only except the
+`-o` directory, and network, exec/mount/ptrace/BPF and related syscalls
+fail with `EACCES`. The fence needs Landlock ABI 5 or newer and an x86-64
+helper; when either is unavailable the helper refuses before loading
+rather than running weaker. A provider that needs a denied access at
+discovery time fails plainly (a loader or getter error, or an acquisition
+error recorded on its surface). The default `trusted` profile keeps
+today's ambient behavior after the standard privilege drop.
+
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,
 `NSC_GetFunctionList`, `FC_GetFunctionList`). `--hook-symbol NAME[:ABI]`

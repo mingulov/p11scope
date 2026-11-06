@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
-const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json]\n       p11scope-discover --version\n\nPrepare a discovery manifest using an absolute provider path. This executes provider code in its own helper process, using the host ABI; use a helper matching the provider's ABI.\n\nExample: p11scope-discover --module /absolute/provider.so -o manifest.json\nWithout -o, manifest JSON goes to stdout. With -o, it is saved privately to a regular file.\n\nUse the result only after an explicit observer --manifest choice. A manifest does not prove application use or semantic attestation.";
+const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json] [--isolation trusted|isolated]\n       p11scope-discover --version\n\nPrepare a discovery manifest using an absolute provider path. This executes provider code in its own helper process, using the host ABI; use a helper matching the provider's ABI.\n\nExample: p11scope-discover --module /absolute/provider.so -o manifest.json\nWithout -o, manifest JSON goes to stdout. With -o, it is saved privately to a regular file.\n\nProfiles: trusted (default) runs provider code with the helper's ambient authority after the standard privilege drop. isolated additionally fences it before loading: read-only filesystem except the -o directory, no network, and no exec/mount/ptrace/BPF syscalls; when the fence is unavailable the helper refuses before loading. Use isolated for providers you do not trust.\n\nUse the result only after an explicit observer --manifest choice. A manifest does not prove application use or semantic attestation.";
 
 const MANIFEST_GUIDANCE: &str = "Use it only after an explicit observer --manifest choice; it does not prove application use or semantic attestation.";
 
@@ -556,6 +556,7 @@ fn write_private_atomically_with(
 fn main() {
     let mut module: Option<PathBuf> = None;
     let mut out: Option<PathBuf> = None;
+    let mut isolation: Option<String> = None;
     let mut args = std::env::args().skip(1).peekable();
     // Like `p11scope --version`: the whole command line, answered before any
     // privilege handling or provider access.
@@ -581,6 +582,17 @@ fn main() {
                 Some(v) => out = Some(PathBuf::from(v)),
                 None => {
                     eprintln!("-o requires a value\n{USAGE}");
+                    std::process::exit(2);
+                }
+            },
+            "--isolation" => match args.next() {
+                Some(v) if v == "trusted" || v == "isolated" => isolation = Some(v),
+                Some(_) => {
+                    eprintln!("--isolation must be trusted or isolated\n{USAGE}");
+                    std::process::exit(2);
+                }
+                None => {
+                    eprintln!("--isolation requires a value\n{USAGE}");
                     std::process::exit(2);
                 }
             },
@@ -616,12 +628,49 @@ fn main() {
             std::process::exit(1);
         }
     };
+    let isolated = isolation.as_deref() == Some("isolated");
+    if isolated {
+        // The fence goes up after the privilege drop and before any
+        // provider code runs. The only writable directory is the `-o`
+        // parent (stdout output leaves the whole tree read-only).
+        let writable = out.as_ref().map(|path| match path.parent() {
+            Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+            _ => PathBuf::from("."),
+        });
+        if let Err(error) = p11scope_discover::isolation::apply_isolated(writable.as_deref()) {
+            eprintln!("p11scope-discover: {error}");
+            std::process::exit(1);
+        }
+    }
     match p11scope_discover::discover::discover_with_self_memory(&module, self_memory) {
         Err(e) => {
-            eprintln!("p11scope-discover: {e}");
+            if isolated {
+                eprintln!("p11scope-discover: {e} (under the isolated profile)");
+            } else {
+                eprintln!("p11scope-discover: {e}");
+            }
             std::process::exit(1);
         }
         Ok(m) => {
+            if isolated {
+                // R8: a getter that failed under the fence is already
+                // recorded in the manifest; name the profile beside it.
+                if let Some(legacy) = m.surfaces.first()
+                    && let p11scope_discover::manifest::Acquisition::Error { detail } =
+                        &legacy.acquisition
+                {
+                    eprintln!(
+                        "p11scope-discover: isolated profile: C_GetFunctionList failed: {detail}"
+                    );
+                }
+                if let p11scope_discover::manifest::Acquisition::Error { detail } =
+                    &m.interface_list
+                {
+                    eprintln!(
+                        "p11scope-discover: isolated profile: C_GetInterfaceList failed: {detail}"
+                    );
+                }
+            }
             let json = serde_json::to_string_pretty(&m).expect("manifest serializes");
             match out {
                 None => {

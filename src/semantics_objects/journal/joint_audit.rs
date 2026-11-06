@@ -9,7 +9,7 @@ use super::joint_driver::{
 use super::seal_replay::{ReplayBounds, ReplayPreparation, SealBatchDelivery, SealReplayCursor};
 use super::{
     BirthEvidenceSource, BootstrapReceipt, H3DispositionEvidence, H3FinalizerPort,
-    H3VoidAcknowledgement, JournalGap, SealSuccess, SealedCall, SessionBirthEvidence,
+    H3VoidAcknowledgement, JournalGap, SealSuccess, SealWait, SealedCall, SessionBirthEvidence,
     StagingLedger,
 };
 use super::{
@@ -1594,8 +1594,15 @@ impl IngestedJointQuantum {
                 self.failure_storage = Some(storage);
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
+            // A fresh birth with no staged call of its own inside this
+            // frontier (late attach, an idle caller) can only be grounded
+            // by the caller's future calls: this immutable frame never
+            // seals it, so it waits as future input exactly like an
+            // awaited terminal, instead of retrying until the lane-wide
+            // no-progress bound stops every caller.
             if failure.gap == JournalGap::BoundNotReady
-                && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)
+                && (adapter.last_seal_wait() == SealWait::FreshBirthNoHistory
+                    || adapter.awaits_future_terminal(target.bootstrap(), self.frontier))
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's

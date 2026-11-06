@@ -1757,6 +1757,15 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
+    // The overlay-witness unavailable family (canonical plus every
+    // enriched `: <stage>` suffix) folds to one plain clause; verbose
+    // keeps the machine token beside it, JSON keeps it verbatim.
+    if reason
+        .strip_prefix("original_file_unproven: kernel witness unavailable")
+        .is_some()
+    {
+        return "kernel proof unavailable";
+    }
     if let Some(captured) = reason.strip_prefix("live capture refused (") {
         // The PID auto-fallback gap carries the full host summary
         // (JSON and verbose keep it); concise folds it to one short
@@ -1779,6 +1788,11 @@ fn gap_plain_reason(reason: &str) -> &str {
             "some processes were identified from /proc only"
         }
         "deleted mapping" => "mapped file was deleted (not loss)",
+        "original_file_unproven: the kernel witness proved another file" => {
+            "mapping is another file, not the held file"
+        }
+        "original_file_unproven: witness query budget exhausted" => "kernel proof budget exhausted",
+        "original_file_unproven: witness anchor binding failed" => "kernel proof anchor failed",
         other => other,
     }
 }
@@ -2029,8 +2043,7 @@ fn render_snapshot_inner(
                 } else if presentation.key_operations_requested && !presentation.manifests_present {
                     let _ = writeln!(
                         out,
-                        "key operations: requested, but per-key tracking needs --manifest on this \
-                         build"
+                        "key operations: requested, but per-key tracking needs --manifest"
                     );
                 } else if verbose {
                     let _ = writeln!(

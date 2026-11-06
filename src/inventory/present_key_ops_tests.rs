@@ -397,7 +397,7 @@ fn key_ops_line_requested_without_manifest_names_manifest() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: requested, but per-key tracking needs --manifest on this build",
+        "key operations: requested, but per-key tracking needs --manifest",
         "requested without a manifest never reads 'off':\n{snapshot}"
     );
 }
@@ -531,7 +531,7 @@ fn key_ops_line_requested_but_refused_names_request_not_tracking_off() {
     // The flag was given but the seal refused (subset or journal
     // start): the `key operations unavailable` gap proves tracking was
     // wanted, so the header names the request and the cause, never
-    // tracking-off.
+    // tracking-off — one wording per state (I1).
     for reason in [
         "subset refused; broad inventory continues with S1 mechanisms and API results",
         "journal-pair-missing: p11scope-journal-btf; broad inventory continues with S1 mechanisms and API results",
@@ -1138,4 +1138,83 @@ fn key_ops_line_requested_but_not_started_names_cause() {
         key_ops_line(&render_snapshot(&plain)),
         "key operations: not reported (per-key tracking is off)",
     );
+}
+
+/// I7: overlay-witness gap reasons render in plain words in text
+/// (concise folds, verbose pairs the machine token beside them);
+/// JSON keeps the stored reasons unchanged.
+#[test]
+fn overlay_witness_gap_reasons_render_plain_words_with_machine_tokens() {
+    let cases = [
+        (
+            "original_file_unproven: the kernel witness proved another file",
+            "mapping is another file, not the held file",
+        ),
+        (
+            "original_file_unproven: witness query budget exhausted",
+            "kernel proof budget exhausted",
+        ),
+        (
+            "original_file_unproven: kernel witness unavailable",
+            "kernel proof unavailable",
+        ),
+        (
+            "original_file_unproven: kernel witness unavailable: \
+             scoped collection deactivates the kernel proof",
+            "kernel proof unavailable",
+        ),
+        (
+            "original_file_unproven: witness anchor binding failed",
+            "kernel proof anchor failed",
+        ),
+    ];
+    // Concise: one gap at a time (no folding), plain only.
+    for (reason, plain) in cases {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+        presentation.gaps.clear();
+        presentation
+            .gaps
+            .push(named_gap("/provider/lib.so", reason));
+        let concise =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        let gaps = concise
+            .lines()
+            .find(|line| line.starts_with("gaps: "))
+            .expect("the concise gaps line");
+        assert!(gaps.contains(plain), "{reason}: {gaps}");
+        assert!(
+            !concise.contains("original_file_unproven"),
+            "{reason}: {concise}"
+        );
+        assert!(!concise.contains("kernel witness"), "{reason}: {concise}");
+    }
+    // Verbose: every gap line pairs plain words with the machine token.
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+    presentation.gaps.clear();
+    for (reason, _) in cases {
+        presentation
+            .gaps
+            .push(named_gap("/provider/lib.so", reason));
+    }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for (reason, plain) in cases {
+        assert!(verbose.contains(plain), "{reason}: {verbose}");
+        assert!(
+            verbose.contains(&format!("({reason})")),
+            "{reason}: {verbose}"
+        );
+    }
+    // JSON keeps the stored machine reasons.
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let stored: Vec<&str> = document["gaps"]
+        .as_array()
+        .expect("gaps array")
+        .iter()
+        .map(|gap| gap["reason"].as_str().expect("reason"))
+        .collect();
+    for (reason, _) in cases {
+        assert!(stored.contains(&reason), "{reason} missing: {stored:?}");
+    }
 }

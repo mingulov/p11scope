@@ -301,11 +301,12 @@ v0.6.0 reports key operations when opted in with `inventory
 counts completions per operation category, and the JSON report carries
 the rows under `object_observations`. Without the opt-in, or on a build
 without the journal object, the line reads `not reported (per-key
-tracking is off)`. With `--key-operations` but a refused subset or
-journal start, the line reads `unavailable (<refusal>)`; the gap below
-names the remedy. A
-linked capture whose tracking never starts reads `unavailable
-(bootstrap_unavailable)`. Mechanisms and API results are reported as
+tracking is off)`. With `--key-operations` but a refused subset, the
+line names the rerun or check remedy; when the journal start itself is
+refused, it names the request and the cause (`requested, but per-key
+tracking did not start (<cause>)`). A linked capture whose tracking
+never starts reads `not available — per-key tracking never started, so
+no key can be named yet`. Mechanisms and API results are reported as
 before. An ordinary native-retirement refusal during a `--manifest`
 capture ends the first stop with an incomplete report and a nonzero
 exit. Uncertain native ownership stays retained and replacement

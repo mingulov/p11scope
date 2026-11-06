@@ -80,6 +80,20 @@ integration may still move them; the candidate pass confirms the numbers.
   window. Affected runs read PARTIAL. Hold the child with `run --pause
   auto` or keep it alive past attach. (verify at candidate: confirm the
   exact incomplete marking)
+- `run` (and `profile --pid`) observe exactly the started (named)
+  process, never its descendants: a fork/exec child, `subprocess`
+  worker, or `multiprocessing` spawn child that loads a provider gets
+  no probes and its calls are entirely absent, however long it lives.
+  When only descendants touch PKCS#11 the run reports 0 probes with
+  `newcomer queue: admitted 0` and honest PARTIAL coverage. This is the
+  exact-PID scope (`run` is a PID scope over its own child; discovery
+  sweeps only the named PID and probes bind to that process alone), not
+  a timing race. Multi-process workloads such as `pkcs11-check test`
+  with default crash isolation are affected: every test runs in a
+  subprocess, so `run` sees none of it. Capture such workloads with
+  `inventory --system` (or `--cgroup`), which admits short-lived
+  processes, or run the leaf command that loads the provider directly
+  under `run`.
 - Container providers carry named unproven cases: the container checks
   use one kind node, and multi-node clusters, CRI-O and the cgroupfs
   driver are not exercised. Docker shared image layers and copy-up, the
@@ -650,6 +664,9 @@ detail during a counter capture (`--select-endpoint`).
   further cut the short-run void rate.
 - Tracking short-lived processes that exit before their first binding
   (exit-time mapping verdicts shipped; full call attribution still planned).
+- Following the started command's process tree under `run`
+  (descendant admission and per-descendant probes, scoped to that tree
+  only).
 - Parallel BPF program loading for faster startup.
 - File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
   `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).

@@ -325,15 +325,35 @@ fn os_error(context: &str) -> String {
 /// when `want_dir` so a file can never stand in for the output directory.
 fn open_rule_path(path: &Path, want_dir: bool) -> Result<File, String> {
     use std::ffi::CString;
-    let raw = CString::new(path.as_os_str().as_bytes())
-        .map_err(|_| format!("isolated profile: path has a NUL byte: {}", path.display()))?;
+    // Contract §3 step 1: any unusable `-o` parent refuses as
+    // `isolated profile: output directory <dir> is unusable: <reason>`.
+    // The `/` rule path keeps its own wording: it is not the output dir.
+    let unusable = |reason: String| {
+        if want_dir {
+            format!(
+                "isolated profile: output directory {} is unusable: {reason}",
+                path.display()
+            )
+        } else {
+            format!("isolated profile: {reason}")
+        }
+    };
+    let raw = match CString::new(path.as_os_str().as_bytes()) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return Err(unusable(format!(
+                "cannot open {}: path has a NUL byte",
+                path.display()
+            )));
+        }
+    };
     let fd = unsafe { libc::open(raw.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
     if fd < 0 {
-        return Err(format!(
-            "isolated profile: cannot open {}: {}",
+        return Err(unusable(format!(
+            "cannot open {}: {}",
             path.display(),
             std::io::Error::last_os_error()
-        ));
+        )));
     }
     let file = unsafe { File::from_raw_fd(fd) };
     if want_dir && !file.metadata().is_ok_and(|meta| meta.file_type().is_dir()) {
@@ -538,6 +558,45 @@ mod tests {
         assert!(error.contains("not a directory"), "{error}");
         assert!(open_rule_path(&file, false).is_ok());
         assert!(open_rule_path(&dir.join("missing"), true).is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn unusable_output_directories_use_the_contract_wording() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = std::env::temp_dir().join(format!("isolation-wording-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // Missing, file-as-parent and NUL parents all refuse with the
+        // contract §3 step-1 shape; the `/` rule path keeps its own.
+        let missing = dir.join("no-such-dir");
+        let error = open_rule_path(&missing, true).unwrap_err();
+        assert!(
+            error.starts_with("isolated profile: output directory ")
+                && error.contains(" is unusable: "),
+            "{error}"
+        );
+        let file = dir.join("file");
+        std::fs::write(&file, b"x").unwrap();
+        let error = open_rule_path(&file, true).unwrap_err();
+        assert!(
+            error.starts_with("isolated profile: output directory ")
+                && error.contains(" is unusable: "),
+            "{error}"
+        );
+        let nul = std::ffi::OsStr::from_bytes(b"bad\0dir");
+        let error = open_rule_path(Path::new(nul), true).unwrap_err();
+        assert!(
+            error.starts_with("isolated profile: output directory ")
+                && error.contains(" is unusable: "),
+            "{error}"
+        );
+        let error = open_rule_path(&missing, false).unwrap_err();
+        assert!(error.contains("cannot open"), "{error}");
+        assert!(
+            !error.contains("output directory"),
+            "the tree rule is not the output dir: {error}"
+        );
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

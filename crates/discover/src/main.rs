@@ -10,7 +10,7 @@ use std::os::unix::ffi::OsStrExt as _;
 use std::path::PathBuf;
 use std::process::Command;
 
-const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json] [--isolation trusted|isolated]\n       p11scope-discover --version\n\nPrepare a discovery manifest using an absolute provider path. This executes provider code in its own helper process, using the host ABI; use a helper matching the provider's ABI.\n\nExample: p11scope-discover --module /absolute/provider.so -o manifest.json\nWithout -o, manifest JSON goes to stdout. With -o, it is saved privately to a regular file.\n\nProfiles: trusted (default) runs provider code with the helper's ambient authority after the standard privilege drop. isolated additionally fences it before loading: read-only filesystem except the -o directory, no network, and no exec/mount/ptrace/BPF syscalls; when the fence is unavailable the helper refuses before loading. Use isolated for providers you do not trust.\n\nUse the result only after an explicit observer --manifest choice. A manifest does not prove application use or semantic attestation.";
+const USAGE: &str = "usage: p11scope-discover --module <provider.so> [-o manifest.json] [--isolation trusted|isolated]\n       p11scope-discover --version\n\nPrepare a discovery manifest using an absolute provider path. This executes provider code in its own helper process, using the host ABI; use a helper matching the provider's ABI.\n\nExample: p11scope-discover --module /absolute/provider.so -o manifest.json\nWithout -o, manifest JSON goes to stdout. With -o, it is saved privately to a regular file.\n\nTrusted (default): runs provider code with the helper's ambient authority after the standard privilege drop.\n\nIsolated: additionally fences provider code before loading: read-only filesystem except the -o directory, no network, and no exec/mount/ptrace/BPF syscalls; when the fence is unavailable the helper refuses before loading. Use isolated for providers you do not trust.\n\nUse the result only after an explicit observer --manifest choice. A manifest does not prove application use or semantic attestation.";
 
 const MANIFEST_GUIDANCE: &str = "Use it only after an explicit observer --manifest choice; it does not prove application use or semantic attestation.";
 
@@ -637,6 +637,20 @@ fn main() {
             Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
             _ => PathBuf::from("."),
         });
+        // A `-o` parent of `/` would grant the whole tree write access and
+        // void the read-only promise (contract §2/D6): refuse before any
+        // provider code runs. Canonicalization resolves symlinks, `.` and
+        // `..`; an unresolvable parent falls through to the fence, which
+        // refuses it with the unusable-directory wording.
+        if let Some(dir) = writable.as_deref()
+            && let Ok(canonical) = std::fs::canonicalize(dir)
+            && canonical == std::path::Path::new("/")
+        {
+            eprintln!(
+                "p11scope-discover: isolated profile: output directory / is unusable: refusing the filesystem root"
+            );
+            std::process::exit(1);
+        }
         if let Err(error) = p11scope_discover::isolation::apply_isolated(writable.as_deref()) {
             eprintln!("p11scope-discover: {error}");
             std::process::exit(1);

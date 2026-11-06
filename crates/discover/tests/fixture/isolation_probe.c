@@ -1,6 +1,7 @@
-/* Isolation probe fixture: the constructor probes two accesses the isolated
- * profile fences (AF_INET socket creation, file write beside the provider)
- * and reports each as a stderr marker. The provider itself is healthy: a
+/* Isolation probe fixture: the constructor probes three accesses the isolated
+ * profile fences (AF_INET socket creation, file creation beside the provider,
+ * overwrite of a test-owned sibling) and reports each as a stderr marker.
+ * The provider itself is healthy: a
  * sparse 2.40 legacy table, one all-NULL "PKCS 11" interface, and a lazily
  * dlopen'd backend (never DT_NEEDED; link with -Wl,-rpath,$ORIGIN).
  *
@@ -57,6 +58,32 @@ __attribute__((constructor)) static void ctor(void) {
         }
     } else {
         fprintf(stderr, "ISOLATION_WRITE=unknown(dladdr failed)\n");
+    }
+    /* Overwrite probe: opening an existing sibling for write needs
+     * WRITE_FILE, while creation above only needs MAKE_REG. The test
+     * owns "isolation-overwrite.tmp"; without it there is nothing to
+     * open, so a missing file is unknown rather than denied. */
+    if (dladdr((void *)ctor, &info) && info.dli_fname) {
+        char opath[4096];
+        const char *obase = strrchr(info.dli_fname, '/');
+        size_t odirlen = obase ? (size_t)(obase - info.dli_fname) : 0;
+        if (odirlen > 0 && odirlen + sizeof("/isolation-overwrite.tmp") <= sizeof(opath)) {
+            memcpy(opath, info.dli_fname, odirlen);
+            strcpy(opath + odirlen, "/isolation-overwrite.tmp");
+            int ofd = open(opath, O_WRONLY);
+            if (ofd >= 0) {
+                fprintf(stderr, "ISOLATION_OVERWRITE=allowed\n");
+                close(ofd);
+            } else if (errno == ENOENT) {
+                fprintf(stderr, "ISOLATION_OVERWRITE=unknown(no scratch file)\n");
+            } else {
+                fprintf(stderr, "ISOLATION_OVERWRITE=denied(errno=%d)\n", errno);
+            }
+        } else {
+            fprintf(stderr, "ISOLATION_OVERWRITE=unknown(path too long)\n");
+        }
+    } else {
+        fprintf(stderr, "ISOLATION_OVERWRITE=unknown(dladdr failed)\n");
     }
     fflush(stderr);
 }

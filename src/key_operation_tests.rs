@@ -17225,10 +17225,7 @@ fn key_operation_history_loss_preserves_observed_pair_as_unknown() {
         2,
         "loss disposal never reduces through live S1"
     );
-    assert!(
-        pos_init < pos_sign,
-        "non-vacuous: the pair staged in order"
-    );
+    assert!(pos_init < pos_sign, "non-vacuous: the pair staged in order");
     // The observed completion rows unknown-key beside the counted
     // proof loss; the proved history stands.
     let observations = guarded.registry.joint_observations(18);

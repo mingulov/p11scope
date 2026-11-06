@@ -557,6 +557,7 @@ fn changing_only_times_and_local_incarnations_is_not_an_application_change() {
         first_ns: 111,
         rows: 1,
         reasons: [("no_live_caller".into(), 1)].into_iter().collect(),
+        entries: 0,
     });
     let mut after = before.clone();
     after.observation.started_ns = 10000;

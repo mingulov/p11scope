@@ -463,8 +463,8 @@ impl Human<'_> {
             self.line(
                 2,
                 &format!(
-                    "Unbound use: {} rows; first {}",
-                    unbound.rows, unbound.first_ns
+                    "Unbound use: {} rows, {} entries; first {}",
+                    unbound.rows, unbound.entries, unbound.first_ns
                 ),
             )?;
             for (reason, rows) in &unbound.reasons {

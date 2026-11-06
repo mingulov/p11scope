@@ -139,7 +139,7 @@ are excluded from the output; indexes are report-local value references.
 | Module `identity` | `device` with `{major, minor}`, `inode`, nullable `sha256`, nullable `build_id`, nullable `source` |
 | Module `admission` | `state`, nullable `class`, nullable `endpoints`, `reasons`, `note`, nullable `history` |
 | Admission history element | `from`, `to`, `at_ns` |
-| Module `unbound_use` | `first_ns`, `rows`, `reasons` (reason-to-count object) |
+| Module `unbound_use` | `first_ns`, `rows`, `reasons` (reason-to-count object), `entries` (folded entry-count lower bound; 0 when the capture predates it) |
 | Edge | Caller ref `caller`, module ref `module`, `mapping`, `entries`, nullable `coverage`, `semantics` |
 | Edge `mapping` | `state`, nullable `evidence`, nullable `reason`, `first_seen_ns`, `last_seen_ns`, `interruptions` |
 | Edge `entries` | `count`, `saturated`, `cap`, nullable `first_seen_ns`, nullable `last_seen_ns`, `in_flight`, `observation` |

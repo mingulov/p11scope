@@ -152,6 +152,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `before_admission`). It never names a pid. At most 256 entries are
   listed; the rows of the rest are summed in `unbound_rows_truncated`
   (0 when nothing was cut). A scan-lane run always reads `[]` and 0.
+  `modules[].unbound_use.entries` is snapshot-only: the stream carries
+  row deltas per (module, reason), and per-reason entry deltas would
+  need a new map.
   Every `pass_committed` also carries `edge_events` (the `edge_observed`
   records the commit wrote just before it) and `edge_events_deferred`
   (changed edges still waiting past the per-pass cap; see

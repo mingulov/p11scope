@@ -5242,13 +5242,14 @@ fn start_semantic_lane(
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
         // *start* retries ordinary, never a refused subset. The
-        // subset refusal additionally names the manifest remedy,
-        // since the flag asked for rows no subset can serve.
+        // subset refusal additionally names its path's remedy (rerun
+        // on the scan path, check-the-manifest when manifests were
+        // supplied), since the flag asked for rows no subset can serve.
         let (attach_subset, convert_subset) =
             match seal_mint_start_subsets(coordinator, scan_subset) {
                 Ok(pair) => pair,
                 Err(refusals) => {
-                    note_key_operations_subset_refused(coordinator, &refusals);
+                    note_key_operations_subset_refused(coordinator, &refusals, scan_subset);
                     return None;
                 }
             };
@@ -5337,14 +5338,17 @@ fn seal_mint_start_subsets(
 }
 
 /// `--key-operations` was requested but no semantic subset minted:
-/// disclose the failing mint's codes with the manifest remedy, since
-/// the flag asked for rows no subset can serve. Quiet when the mint
-/// refused silently (nothing discovered yet — the scan mint retries
-/// per pass by design). The gap repeats per attempt like its subset
-/// sibling; the stderr line speaks only on its first appearance.
+/// disclose the failing mint's codes with its path's remedy, since
+/// the flag asked for rows no subset can serve. The scan path (no
+/// manifests) reruns with `--manifest`; the manifest path (manifests
+/// supplied) checks them, since a rerun clause would lie. Quiet when
+/// the mint refused silently (nothing discovered yet — the scan mint
+/// retries per pass by design). The gap repeats per attempt like its
+/// subset sibling; the stderr line speaks only on its first appearance.
 fn note_key_operations_subset_refused(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     refusals: &[crate::inventory_semantics::SemanticRefusal],
+    scan_subset: bool,
 ) {
     if refusals.is_empty() {
         return;
@@ -5354,11 +5358,19 @@ fn note_key_operations_subset_refused(
         .map(|refusal| refusal.to_string())
         .collect::<Vec<_>>()
         .join(", ");
-    let reason = format!(
-        "subset refused ({codes}); provider function tables cannot be verified \
-         without operator attestation: rerun with --manifest <manifest.json> \
-         for per-key rows; broad inventory continues with S1 mechanisms and API results"
-    );
+    let reason = if scan_subset {
+        format!(
+            "subset refused ({codes}); provider function tables cannot be verified \
+             without operator attestation: rerun with --manifest <manifest.json> \
+             for per-key rows; broad inventory continues with S1 mechanisms and API results"
+        )
+    } else {
+        format!(
+            "subset refused ({codes}); provider function tables cannot be verified \
+             from the supplied --manifest inputs: check the manifest inputs \
+             for per-key rows; broad inventory continues with S1 mechanisms and API results"
+        )
+    };
     let fresh = !coordinator
         .registry()
         .gaps()
@@ -25824,6 +25836,52 @@ mod seal_readiness_tests {
         assert!(
             gaps[0].1.contains("rerun with --manifest"),
             "the gap names the remedy: {}",
+            gaps[0].1
+        );
+    }
+
+    #[test]
+    fn key_operations_manifest_path_refusal_names_check_remedy() {
+        // Flag on, manifest-path subset refused with codes (manifests
+        // were supplied but the mint still refused): no lane seats,
+        // and the key-operations gap names the refusal with the
+        // check-the-manifest remedy, never the rerun clause.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::IncompleteProvider],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the remedy gap is noted once");
+        assert!(
+            gaps[0]
+                .1
+                .starts_with("subset refused (incomplete_provider)"),
+            "the gap names the refusal: {}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0].1.contains("check the manifest"),
+            "the gap names the check remedy: {}",
+            gaps[0].1
+        );
+        assert!(
+            !gaps[0].1.contains("rerun with --manifest"),
+            "the manifest path never reruns: {}",
             gaps[0].1
         );
     }

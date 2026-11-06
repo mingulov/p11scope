@@ -1437,21 +1437,23 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
 }
 
 /// The key-operations summary when `--key-operations` was requested
-/// but the semantic subset refused: the scan-derived tables the
-/// observer found cannot be verified (export-name agreement alone
-/// never grants argument-read authority), so per-key rows need a
-/// rerun with `--manifest`. Visible only beside the `key operations
-/// unavailable` subset gap the seal path notes; without that gap the
-/// tracking-off line stands. One module names its provider by file
-/// name; zero or several modules stay generic, since no single
-/// provider is nameable.
+/// but the semantic subset refused. The scan path (unverifiable
+/// scan-derived tables; export-name agreement alone never grants
+/// argument-read authority) reruns with `--manifest`; the manifest
+/// path (supplied inputs still refused) checks them. Visible only
+/// beside the `key operations unavailable` subset gap the seal path
+/// notes; without that gap the tracking-off line stands. One module
+/// names its provider by file name; zero or several modules stay
+/// generic, since no single provider is nameable.
 fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
-    let refused = presentation.gaps.iter().any(|gap| {
-        gap.subject == "key operations unavailable" && gap.reason.starts_with("subset refused (")
-    });
-    if !refused {
-        return None;
-    }
+    let refused_reason = presentation.gaps.iter().find_map(|gap| {
+        (gap.subject == "key operations unavailable" && gap.reason.starts_with("subset refused ("))
+            .then_some(gap.reason.as_str())
+    })?;
+    // The seal path's remedy decides the summary: a check-the-manifest
+    // gap (manifests supplied) checks, every other subset refusal
+    // reruns. Both arms stay generic over providers.
+    let manifest_path = refused_reason.contains("check the manifest");
     if let [single] = presentation.modules.as_slice()
         && let Some(base) = single
             .paths
@@ -1459,10 +1461,23 @@ fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
             .and_then(|path| path.rsplit('/').next())
             .filter(|base| !base.is_empty())
     {
+        if manifest_path {
+            return Some(format!(
+                "key operations: {base}'s function table cannot be verified \
+                 from the supplied --manifest inputs; check the manifest"
+            ));
+        }
         return Some(format!(
             "key operations: {base}'s function table cannot be verified \
              without --manifest; rerun with --manifest"
         ));
+    }
+    if manifest_path {
+        return Some(
+            "key operations: provider function tables cannot be verified \
+             from the supplied --manifest inputs; check the manifest"
+                .to_string(),
+        );
     }
     Some(
         "key operations: provider function tables cannot be verified \

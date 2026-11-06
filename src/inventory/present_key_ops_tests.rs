@@ -403,6 +403,27 @@ fn key_ops_line_requested_without_manifest_names_manifest() {
 }
 
 #[test]
+fn key_ops_line_manifest_path_refusal_names_check_remedy() {
+    // Manifest-path refusal: the summary names the file but remedies
+    // with check-the-manifest, never the rerun.
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.modules[0].paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
+    presentation.gaps.push(subset_refused_gap(
+        "subset refused (incomplete_provider); provider function tables cannot be verified \
+         from the supplied --manifest inputs: check the manifest inputs for per-key rows; \
+         broad inventory continues with S1 mechanisms and API results",
+    ));
+    let snapshot = render_snapshot(&presentation);
+    assert_eq!(
+        key_ops_line(&snapshot),
+        "key operations: libfoo-pkcs11.so's function table cannot be verified \
+         from the supplied --manifest inputs; check the manifest",
+        "manifest-path line checks, never reruns:\n{snapshot}"
+    );
+}
+
+#[test]
 fn key_ops_line_requested_with_manifest_and_no_gap_stays_off() {
     // Requested with a manifest but no start was recorded and no gap
     // exists (no start was refused): the conservative fallthrough is
@@ -473,6 +494,36 @@ fn concise_gap_summary_folds_unproven_capture_refusal() {
     assert!(!concise.contains("sudo"), "{concise}");
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains(stored), "{verbose}");
+}
+
+#[test]
+fn key_ops_line_manifest_path_refusal_without_single_module_stays_generic() {
+    // Manifest-path refusal, zero or several modules: no single
+    // provider is nameable, so the line stays generic but still
+    // names the check remedy.
+    for extra in [false, true] {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+        if extra {
+            let mut second = presentation.modules[0].clone();
+            second.paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
+            presentation.modules.push(second);
+        } else {
+            presentation.modules.clear();
+        }
+        presentation.gaps.push(subset_refused_gap(
+            "subset refused (incomplete_provider); provider function tables cannot be verified \
+             from the supplied --manifest inputs: check the manifest inputs for per-key rows; \
+             broad inventory continues with S1 mechanisms and API results",
+        ));
+        let snapshot = render_snapshot(&presentation);
+        assert_eq!(
+            key_ops_line(&snapshot),
+            "key operations: provider function tables cannot be verified \
+             from the supplied --manifest inputs; check the manifest",
+            "extra={extra}: generic but checked:\n{snapshot}"
+        );
+    }
 }
 
 #[test]

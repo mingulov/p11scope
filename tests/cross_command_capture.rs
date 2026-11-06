@@ -185,10 +185,7 @@ fn aggregate_scope_has_no_application_allocation() {
         aliased.contains("two providers") && aliased.contains('7'),
         "{text}"
     );
-    let unowned = text
-        .lines()
-        .find(|line| line.contains("unknown"))
-        .unwrap();
+    let unowned = text.lines().find(|line| line.contains("unknown")).unwrap();
     assert!(
         unowned.contains("C_Sign") && unowned.contains('5'),
         "{text}"

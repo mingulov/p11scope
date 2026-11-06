@@ -7628,6 +7628,14 @@ mod tests {
 
     #[test]
     fn sole_complete_missing_getfunctionlist_export_refuses() {
+        // The coupled removal is deliberate: dropping only the export
+        // symbol would also break full export agreement, refusing via
+        // name authorization instead of isolating (d). Removing the
+        // entry too keeps agreement complete over the retained entries
+        // (`C_GetFunctionList` is not in the required 20, the slot count
+        // stays 68 through the NULL hole, and the `C_GetInfo` twin proves
+        // a NULL non-required entry mints), so this twin refuses via the
+        // (d) export check alone.
         let mut module = sole_complete_module();
         let table = &mut module.scanned.tables[0];
         let position = table
@@ -7810,6 +7818,42 @@ mod tests {
         assert!(
             !sole_scan_semantic(&module),
             "an unreadable interface claim refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_partial_export_agreement_refuses() {
+        // Every retained entry must agree with the object's exports: one
+        // dropped export symbol refuses via name authorization even with
+        // all 68 entries present and the (d) export retained.
+        let mut module = sole_complete_module();
+        let exports: Vec<(String, u64)> = module
+            .exports
+            .iter()
+            .filter(|(name, _)| *name != "C_Sign")
+            .cloned()
+            .collect();
+        assert!(
+            exports.iter().any(|(name, _)| name == "C_GetFunctionList"),
+            "the (d) export stays, so only agreement refuses"
+        );
+        module.exports = std::sync::Arc::from(exports);
+        assert!(
+            !sole_scan_semantic(&module),
+            "a missing export agreement refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_heap_resident_table_refuses() {
+        // Name authorization needs a file-backed table: a heap-resident
+        // table (no version-word file offset) refuses even with all 68
+        // entries agreeing.
+        let mut module = sole_complete_module();
+        module.scanned.tables[0].file_offset = None;
+        assert!(
+            !sole_scan_semantic(&module),
+            "a heap-resident table refuses the sole-table grant"
         );
     }
 

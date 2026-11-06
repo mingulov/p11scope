@@ -377,9 +377,12 @@ are still in progress.
 > `--user <name|uid>` (root only, like `strace -u`) starts the command as
 > that account instead of the invoker, with its groups and home
 > environment from its passwd entry; `--user root` stays root on purpose.
-> Without root, for an unknown account, or for a set-id observer it
-> refuses with a plain message (exit 2), and `-v` prints
-> `running <cmd> as <user>`. When the observer
+> Without root, for an unknown account, when its group list cannot be
+> resolved, or for a set-id observer it refuses with a plain message
+> (exit 2), and `-v` prints `running <cmd> as <user>`. A sudoers rule
+> allowing `p11scope run` lets that user start commands as any account
+> via `--user`; restrict it with sudoers argument matching or do not
+> grant `run`. When the observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and

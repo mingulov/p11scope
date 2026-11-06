@@ -109,10 +109,11 @@ User-facing limits live in
   supplementary groups and home environment (`HOME`/`USER`/`LOGNAME`/
   `SHELL` from its passwd entry, `XDG_RUNTIME_DIR` when
   `/run/user/<uid>` is provably its own, `MAIL` dropped). `--user root`
-  stays root on purpose. Without root, for an unknown account, or for a
-  set-id observer it refuses with a plain message (exit 2) before
-  anything starts; `-v` prints `running <cmd> as <user>`. The default
-  is unchanged: under sudo the invoker, otherwise the observer itself.
+  stays root on purpose. Without root, for an unknown account, when its
+  group list cannot be resolved, or for a set-id observer it refuses
+  with a plain message (exit 2) before anything starts; `-v` prints
+  `running <cmd> as <user>`. The default is unchanged: under sudo the
+  invoker, otherwise the observer itself.
 
 ### Changed
 

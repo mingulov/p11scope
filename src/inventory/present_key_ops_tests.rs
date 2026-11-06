@@ -527,6 +527,41 @@ fn key_ops_line_manifest_path_refusal_without_single_module_stays_generic() {
 }
 
 #[test]
+fn key_ops_line_requested_but_refused_names_unavailable_not_tracking_off() {
+    // The flag was given but the seal refused (subset or journal
+    // start): the `key operations unavailable` gap proves tracking was
+    // wanted, so the header reads unavailable with the refusal, never
+    // tracking-off — the same shape as every other unavailable reason.
+    for reason in [
+        "subset refused; broad inventory continues with S1 mechanisms and API results",
+        "journal-pair-missing: p11scope-journal-btf; broad inventory continues with S1 mechanisms and API results",
+    ] {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "key operations unavailable".into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+        let snapshot = render_snapshot(&presentation);
+        let line = key_ops_line(&snapshot);
+        let want = format!(
+            "key operations: unavailable ({})",
+            reason.split(';').next().unwrap()
+        );
+        assert_eq!(line, want, "reason={reason:?}:\n{snapshot}");
+        assert!(
+            !line.contains("tracking is off"),
+            "a refused request never reads tracking-off: {line}"
+        );
+    }
+}
+
+#[test]
 fn key_ops_line_populated_counts_primary_once() {
     let mut observations = populated(3);
     observations.sessions.push(SessionRow {

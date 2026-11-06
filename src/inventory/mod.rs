@@ -26005,6 +26005,45 @@ mod seal_readiness_tests {
     }
 
     #[test]
+    fn key_operations_gap_present_only_for_flag_on_subset_refusal() {
+        // A refused subset mint with `--key-operations` discloses the
+        // refused request beside the subset gap, so the summary never
+        // reads tracking-off for a wanted-but-refused capture. Without
+        // the flag the subset gap stands alone.
+        for key_operations in [false, true] {
+            let mut coordinator = coordinator();
+            let scope = Scope::Pid(std::process::id());
+            let lane = seal_startup_test::with(
+                vec![SubsetPreparation {
+                    subset: None,
+                    refusals: vec![SemanticRefusal::Unattested],
+                }],
+                None,
+                || {
+                    start_semantic_lane(
+                        &mut coordinator,
+                        &scope,
+                        crate::attach::BackendSelection::Auto,
+                        key_operations,
+                        false,
+                    )
+                },
+            );
+            assert!(lane.is_none(), "a refused mint seats no lane");
+            assert_eq!(
+                gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+                1,
+                "key_operations={key_operations}: the subset gap stays"
+            );
+            assert_eq!(
+                gaps_for_subject(&mut coordinator, "key operations unavailable").len(),
+                usize::from(key_operations),
+                "key_operations={key_operations}: the request gap follows the flag"
+            );
+        }
+    }
+
+    #[test]
     fn seal_line_absent_when_conversion_subset_refused() {
         // Isolate from lines other tests on this thread noted: the
         // recorder is thread-local and every read drains.

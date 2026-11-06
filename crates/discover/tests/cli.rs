@@ -713,10 +713,7 @@ fn help_documents_each_profile_in_its_own_paragraph() {
 fn isolation_output_directory_filesystem_root_is_refused() {
     let dir = scratch("isolation-root");
     let provider = build_isolation_probe(&dir);
-    let name = format!(
-        "p11scope-helper-iso-root-test-{}.json",
-        std::process::id()
-    );
+    let name = format!("p11scope-helper-iso-root-test-{}.json", std::process::id());
     let link = dir.join("rootlink");
     std::os::unix::fs::symlink("/", &link).unwrap();
     let outputs = [

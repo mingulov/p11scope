@@ -74,7 +74,7 @@ def journal_rows():
 LINKED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
 p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)
 p11scope: semantic calls: collected 233, joined 203, shed 30, lost 0, bindings 1, refused 0, hook misses 0, eras 0, instances 1
-key operations: unavailable (bootstrap_unavailable)
+key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)
 """
 
 LINKED_UNLATCHED_TEXT = """p11scope: native usage lane active (Inventory capture activated, uprobe-multi links, --attach-backend auto)
@@ -207,7 +207,8 @@ class JournalGateTests(unittest.TestCase):
             "linked-zero": {"rc": 0, "text": ZERO_JOINED_TEXT},
             "missing-root": {"rc": 0, "text": LINKED_TEXT},
             "unlinked": {"rc": 0, "text": LINKED_TEXT.replace(
-                "key operations: unavailable (bootstrap_unavailable)",
+                "key operations: not available — per-key tracking never started, so no "
+                "key can be named yet (reason: bootstrap_unavailable)",
                 "key operations: not reported (per-key tracking is off)")},
             "refused-build": {"rc": 0, "text":
                 "p11scope: semantic lane ready; mechanisms and API results "
@@ -227,6 +228,9 @@ class JournalGateTests(unittest.TestCase):
                 "journal-pair-unavailable-in-build: this build omits the "
                 "production journal object\n"},
             "refused-loaded": {"rc": 0, "text":
+                "p11scope: key operations unavailable: "
+                "semantic_attachment_refused; broad inventory continues "
+                "with S1 mechanisms and API results\n"
                 "gap [key operations unavailable] "
                 "semantic_attachment_refused; broad inventory continues "
                 "with S1 mechanisms and API results\n"},
@@ -301,7 +305,7 @@ class JournalGateTests(unittest.TestCase):
         self.assertIn("journal rows", row["detail"])
         # The linked command shape is pinned, not just the verdict.
         argv = self.observer_argv()
-        self.assertEqual(argv[:2], ["inventory", "--system"])
+        self.assertEqual(argv[:3], ["inventory", "-v", "--system"])
         for flag in ("--capture", "native", "--key-operations",
                      "--manifest", "--duration", "60s"):
             self.assertIn(flag, argv)

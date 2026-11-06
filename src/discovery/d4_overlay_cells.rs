@@ -2918,7 +2918,7 @@ fn k1_production_guard_retry(
     key: ObjectKey,
     maps: &dyn Fn() -> Vec<MapEntry>,
 ) -> Result<(Result<(), String>, u64, u32), String> {
-    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
     let mut total = 0u64;
     for attempt in 1..=3u32 {
         let live = maps();
@@ -2933,7 +2933,7 @@ fn k1_production_guard_retry(
             ));
         }
         let retry =
-            matches!(&result, Err(reason) if reason == GAP_WITNESS_UNAVAILABLE) && attempt < 3;
+            matches!(&result, Err(reason) if witness_unavailable_refusal(reason)) && attempt < 3;
         if retry {
             eprintln!("K1_DEEP_SCAN {label} attempt {attempt}: transient unavailable, retrying");
             continue;
@@ -3120,7 +3120,7 @@ fn privileged_k1_deep_scan_fresh_upper_joins() {
 /// One fresh-upper row over a fresh fixture.
 fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Result<(), String> {
     use crate::discovery::overlay_witness::{
-        GAP_WITNESS_UNAVAILABLE, original_file_witness_required,
+        original_file_witness_required, witness_unavailable_refusal,
     };
     eprintln!("K1_DEEP_SCAN start mode={mode:?} row=fresh-upper lane={lane:?}");
     let fixture = OverlayFixture::mount(work, mode)?;
@@ -3202,7 +3202,7 @@ fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
                 "k1 fresh: guard refused the fresh upper: {reason:?}"
             ));
         }
-        (false, Err(reason)) if reason == GAP_WITNESS_UNAVAILABLE => {}
+        (false, Err(reason)) if witness_unavailable_refusal(&reason) => {}
         (false, other) => {
             return Err(format!(
                 "k1 fresh without the kernel proof must refuse unavailable: {other:?}"
@@ -3340,7 +3340,7 @@ fn privileged_k1_same_key_twice_proves() {
 /// steps over the same key, each with the fresh scan state a later
 /// pass would carry.
 fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), String> {
-    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
     eprintln!("K1_DEEP_SCAN start mode={mode:?} row=same-key-twice");
     let fixture = OverlayFixture::mount(work, mode)?;
     std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
@@ -3386,7 +3386,7 @@ fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), S
                     "k1 twice pass {pass}: guard refused the fresh upper: {reason:?}"
                 ));
             }
-            (false, Err(reason)) if reason == GAP_WITNESS_UNAVAILABLE => {}
+            (false, Err(reason)) if witness_unavailable_refusal(&reason) => {}
             (false, other) => {
                 return Err(format!(
                     "k1 twice pass {pass} without the kernel proof must refuse unavailable: {other:?}"

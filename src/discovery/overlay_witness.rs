@@ -119,6 +119,8 @@ pub(crate) const GAP_WITNESS_REFUSED: &str =
 pub(crate) const GAP_BUDGET_EXHAUSTED: &str =
     "original_file_unproven: witness query budget exhausted";
 /// The kernel proof could not run (no anchor, deadline, failed run).
+/// The family prefix: diagnosed refusals append the plain-words stage
+/// ([`WitnessDiagnosis::enriched_reason`]).
 pub(crate) const GAP_WITNESS_UNAVAILABLE: &str =
     "original_file_unproven: kernel witness unavailable";
 /// The held file could not be installed as the witness anchor.
@@ -198,6 +200,297 @@ impl WitnessVerdict {
     }
 }
 
+/// Which witness stage failed: the finite vocabulary behind an
+/// unavailable verdict. The public gap keeps the canonical prefix and
+/// appends the stage's plain-words note. Notes name no pids, paths,
+/// addresses or run detail; the functional-probe stage tag is the only
+/// interpolation, and it is itself a fixed probe tag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WitnessStage {
+    /// Scoped collection deactivates the kernel proof substrate.
+    CollectionWork,
+    /// The capture deadline was already spent before the query.
+    DeadlineSpent,
+    /// The held fd could not be duplicated for the anchor.
+    FdClone,
+    /// The process-wide session lock was unavailable.
+    SessionLock,
+    /// The BTF selection deny, by label.
+    BtfFixMissing,
+    BtfNoTaskIterPidfd,
+    BtfUnreadable,
+    /// vmlinux BTF would not parse.
+    BtfParse,
+    /// No exec-capable probe directory.
+    ProbeDir,
+    /// The identity object failed to load: permission, verifier or
+    /// object, a missing program, or an unretainable program fd.
+    ObjectLoadPermission,
+    ObjectLoadFailed,
+    ObjectLoadMissingProgram,
+    ObjectLoadFdRetain,
+    /// The functional probe failed at its stage tag.
+    FunctionalProbe {
+        stage: &'static str,
+    },
+    /// The functional probe ran but its report failed the checks.
+    ProbeMismatch,
+    /// The capture deadline expired before the run could start.
+    CaptureDeadline,
+    /// The anchor FD census failed.
+    FdCensus,
+    /// The held file was refused as the witness anchor.
+    AnchorOffer,
+    /// The anchor reservation failed to reconcile.
+    AnchorReconcile,
+    /// The witness generation counter overflowed.
+    GenerationOverflow,
+    /// The kernel run was lost before confirmation.
+    ConfirmationLost,
+    /// The target exited before confirmation.
+    TargetExited,
+    /// The kernel run proved no refused range.
+    RangeUnproven,
+    /// No refused range was passed to prove.
+    NoRefusedRange,
+}
+
+/// Why one witness query failed, plus whether it counted as a query.
+/// The pre-query early-outs (scoped collection, a spent deadline) are
+/// not queries — no stats, no log line — but the refusal still names
+/// the stage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WitnessDiagnosis {
+    pub(crate) stage: WitnessStage,
+    pub(crate) counted: bool,
+}
+
+impl WitnessDiagnosis {
+    pub(crate) fn counted(stage: WitnessStage) -> Self {
+        Self {
+            stage,
+            counted: true,
+        }
+    }
+
+    pub(crate) fn uncounted(stage: WitnessStage) -> Self {
+        Self {
+            stage,
+            counted: false,
+        }
+    }
+
+    /// The machine token for the internal log line.
+    fn stage_token(self) -> String {
+        match self.stage {
+            WitnessStage::CollectionWork => "collection_work".to_string(),
+            WitnessStage::DeadlineSpent => "deadline_spent".to_string(),
+            WitnessStage::FdClone => "fd_clone".to_string(),
+            WitnessStage::SessionLock => "session_lock".to_string(),
+            WitnessStage::BtfFixMissing => "btf_fix_missing".to_string(),
+            WitnessStage::BtfNoTaskIterPidfd => "btf_no_task_iter_pidfd".to_string(),
+            WitnessStage::BtfUnreadable => "btf_unreadable".to_string(),
+            WitnessStage::BtfParse => "btf_parse".to_string(),
+            WitnessStage::ProbeDir => "probe_dir".to_string(),
+            WitnessStage::ObjectLoadPermission => "object_load_permission".to_string(),
+            WitnessStage::ObjectLoadFailed => "object_load_failed".to_string(),
+            WitnessStage::ObjectLoadMissingProgram => "object_load_missing_program".to_string(),
+            WitnessStage::ObjectLoadFdRetain => "object_load_fd_retain".to_string(),
+            WitnessStage::FunctionalProbe { stage } => format!("functional_probe:{stage}"),
+            WitnessStage::ProbeMismatch => "probe_mismatch".to_string(),
+            WitnessStage::CaptureDeadline => "capture_deadline".to_string(),
+            WitnessStage::FdCensus => "fd_census".to_string(),
+            WitnessStage::AnchorOffer => "anchor_offer".to_string(),
+            WitnessStage::AnchorReconcile => "anchor_reconcile".to_string(),
+            WitnessStage::GenerationOverflow => "generation_overflow".to_string(),
+            WitnessStage::ConfirmationLost => "confirmation_lost".to_string(),
+            WitnessStage::TargetExited => "target_exited".to_string(),
+            WitnessStage::RangeUnproven => "range_unproven".to_string(),
+            WitnessStage::NoRefusedRange => "no_refused_range".to_string(),
+        }
+    }
+
+    /// The plain-words note appended to the canonical gap reason.
+    pub(crate) fn note(self) -> String {
+        match self.stage {
+            WitnessStage::CollectionWork => {
+                "scoped collection deactivates the kernel proof".to_string()
+            }
+            WitnessStage::DeadlineSpent => "capture deadline already reached".to_string(),
+            WitnessStage::FdClone => "held file descriptor could not be duplicated".to_string(),
+            WitnessStage::SessionLock => "witness session lock unavailable".to_string(),
+            WitnessStage::BtfFixMissing => "kernel BTF lacks the task_vma mm member".to_string(),
+            WitnessStage::BtfNoTaskIterPidfd => {
+                "kernel BTF has no task-iterator pidfd support".to_string()
+            }
+            WitnessStage::BtfUnreadable => "kernel BTF is unreadable".to_string(),
+            WitnessStage::BtfParse => "kernel BTF could not be parsed".to_string(),
+            WitnessStage::ProbeDir => "no exec-capable probe directory".to_string(),
+            WitnessStage::ObjectLoadPermission => {
+                "identity BPF load refused (permission)".to_string()
+            }
+            WitnessStage::ObjectLoadFailed => {
+                "identity BPF load failed (verifier or object)".to_string()
+            }
+            WitnessStage::ObjectLoadMissingProgram => {
+                "identity object lacks a required program".to_string()
+            }
+            WitnessStage::ObjectLoadFdRetain => {
+                "verified program fd could not be retained".to_string()
+            }
+            WitnessStage::FunctionalProbe { stage } => {
+                format!("kernel identity self-test failed at stage '{stage}'")
+            }
+            WitnessStage::ProbeMismatch => {
+                "kernel identity self-test failed its checks".to_string()
+            }
+            WitnessStage::CaptureDeadline => "capture deadline reached before the run".to_string(),
+            WitnessStage::FdCensus => "file-descriptor census unavailable".to_string(),
+            WitnessStage::AnchorOffer => "held file refused as witness anchor".to_string(),
+            WitnessStage::AnchorReconcile => "witness anchor reservation failed".to_string(),
+            WitnessStage::GenerationOverflow => "witness generation counter exhausted".to_string(),
+            WitnessStage::ConfirmationLost => "kernel run lost before confirmation".to_string(),
+            WitnessStage::TargetExited => "target process exited before confirmation".to_string(),
+            WitnessStage::RangeUnproven => "kernel run left a refused range unproven".to_string(),
+            WitnessStage::NoRefusedRange => "no refused range to prove".to_string(),
+        }
+    }
+
+    /// The gap reason: the canonical prefix plus the plain-words stage.
+    pub(crate) fn enriched_reason(self) -> String {
+        format!("{}: {}", GAP_WITNESS_UNAVAILABLE, self.note())
+    }
+}
+
+/// One witness query's verdict plus its failure diagnosis, if any.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct WitnessOutcome {
+    pub(crate) verdict: WitnessVerdict,
+    pub(crate) diagnosis: Option<WitnessDiagnosis>,
+}
+
+impl WitnessOutcome {
+    /// Whether this outcome counted as a query (stats and the log
+    /// line). Only the pre-query early-outs skip counting; a verdict
+    /// without a diagnosis counts exactly like before.
+    fn counted(&self) -> bool {
+        self.diagnosis
+            .as_ref()
+            .is_none_or(|diagnosis| diagnosis.counted)
+    }
+}
+
+/// An unavailable verdict at a counted stage.
+fn unavailable(stage: WitnessStage) -> WitnessOutcome {
+    WitnessOutcome {
+        verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+        diagnosis: Some(WitnessDiagnosis::counted(stage)),
+    }
+}
+
+/// An unavailable verdict the query never ran for (scoped collection,
+/// a spent deadline): a refusal, not a query.
+fn skipped(stage: WitnessStage) -> WitnessOutcome {
+    WitnessOutcome {
+        verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+        diagnosis: Some(WitnessDiagnosis::uncounted(stage)),
+    }
+}
+
+/// A verdict without a failure stage (joins, other-file refusals,
+/// budget and anchor failures).
+fn decided(verdict: WitnessVerdict) -> WitnessOutcome {
+    WitnessOutcome {
+        verdict,
+        diagnosis: None,
+    }
+}
+
+/// The BTF selection deny as a witness stage. The label is kept; the
+/// raw detail (paths, io errors) never reaches the note.
+fn diagnosis_for_deny(deny: &crate::attach::identity_iter::KernelDeny) -> WitnessDiagnosis {
+    use crate::attach::identity_iter::KernelDeny;
+    let stage = match deny {
+        KernelDeny::FixMissing => WitnessStage::BtfFixMissing,
+        KernelDeny::NoTaskIterPidfd => WitnessStage::BtfNoTaskIterPidfd,
+        KernelDeny::NoBtf(_) => WitnessStage::BtfUnreadable,
+    };
+    WitnessDiagnosis::counted(stage)
+}
+
+/// The object-load failure as a witness stage: permission vs verifier
+/// or object vs a missing program vs an unretainable fd.
+fn diagnosis_for_load_error(error: &crate::attach::identity_iter::LoadError) -> WitnessDiagnosis {
+    use crate::attach::identity_iter::LoadError;
+    let stage = match error {
+        LoadError::MissingProgram(_) => WitnessStage::ObjectLoadMissingProgram,
+        LoadError::FdClone(_) => WitnessStage::ObjectLoadFdRetain,
+        error if crate::inspect_system::load_error_is_permission(error) => {
+            WitnessStage::ObjectLoadPermission
+        }
+        _ => WitnessStage::ObjectLoadFailed,
+    };
+    WitnessDiagnosis::counted(stage)
+}
+
+/// The detailed session-load failure as a witness stage. The probe's
+/// stage tag is kept; its raw detail never reaches the note.
+fn diagnosis_for_identity_load_failure(
+    failure: &crate::discovery::kernel_identity::IdentityLoadFailure,
+) -> WitnessDiagnosis {
+    use crate::discovery::kernel_identity::IdentityLoadFailure;
+    match failure {
+        IdentityLoadFailure::ObjectLoad(error) => diagnosis_for_load_error(error),
+        IdentityLoadFailure::ProbeFailed(error) => {
+            WitnessDiagnosis::counted(WitnessStage::FunctionalProbe { stage: error.stage })
+        }
+        IdentityLoadFailure::ProbeMismatch => {
+            WitnessDiagnosis::counted(WitnessStage::ProbeMismatch)
+        }
+    }
+}
+
+/// Which confirm shape an unavailable confirmation refused at. Call
+/// only for a confirmation [`verdict_for_confirmation`] refused
+/// unavailable: a fully proven confirmation has no unproven stage.
+fn stage_for_unproven_confirmation(
+    confirmation: &Confirmation,
+    ranges: &[(u64, u64)],
+) -> WitnessStage {
+    match confirmation {
+        Confirmation::Lost(..) => WitnessStage::ConfirmationLost,
+        Confirmation::Exited => WitnessStage::TargetExited,
+        Confirmation::Confirmed(_) if ranges.is_empty() => WitnessStage::NoRefusedRange,
+        Confirmation::Confirmed(_) => WitnessStage::RangeUnproven,
+    }
+}
+
+/// Whether a gap reason is the unavailable refusal: the canonical
+/// reason or any enriched one. Retries and degraded-mode arms match
+/// the family, never one spelling.
+#[cfg(test)]
+pub(crate) fn witness_unavailable_refusal(reason: &str) -> bool {
+    reason.starts_with(GAP_WITNESS_UNAVAILABLE)
+}
+
+/// The internal verdict line: the verdict token, the machine stage
+/// token (`-` without a diagnosis) and the plain-words note, if any.
+fn witness_log_line(
+    verdict: WitnessVerdict,
+    diagnosis: Option<WitnessDiagnosis>,
+    wall_ms: u128,
+) -> String {
+    let stage = diagnosis.map_or_else(|| "-".to_string(), |diagnosis| diagnosis.stage_token());
+    let mut line = format!(
+        "p11scope: overlay-witness verdict={} stage={stage} wall_ms={wall_ms}",
+        verdict.log_word(),
+    );
+    if let Some(diagnosis) = diagnosis {
+        line.push_str(&format!(" note=\"{}\"", diagnosis.note()));
+    }
+    line
+}
+
 /// The process-wide witness session. One session serves every deep scan
 /// (loading per query would dwarf the millisecond run cost); the sweep
 /// cannot lend its session because the userspace backend has none and
@@ -207,7 +500,7 @@ impl WitnessVerdict {
 struct WitnessSession {
     session: Option<IdentitySession>,
     generation: u64,
-    unavailable: Option<&'static str>,
+    unavailable: Option<WitnessDiagnosis>,
 }
 
 static WITNESS_SESSION: OnceLock<Mutex<WitnessSession>> = OnceLock::new();
@@ -237,22 +530,26 @@ fn witness_session() -> &'static Mutex<WitnessSession> {
 
 /// Load the process-wide witness session unless already loaded or
 /// already failed. Shared by the preload and the lazy query path so
-/// the two cannot diverge: a failed load remembers unavailable and
-/// later calls fail fast without retrying.
-fn ensure_session_loaded(guard: &mut WitnessSession) -> bool {
+/// the two cannot diverge: a failed load remembers its diagnosis and
+/// later calls fail fast with the same stage, without retrying. The
+/// loader is injected so tests can stub it without a kernel.
+fn ensure_session_loaded_with(
+    guard: &mut WitnessSession,
+    load: impl FnOnce() -> Result<IdentitySession, WitnessDiagnosis>,
+) -> bool {
     if guard.session.is_some() {
         return true;
     }
     if guard.unavailable.is_some() {
         return false;
     }
-    match load_witness_session() {
+    match load() {
         Ok(session) => {
             guard.session = Some(session);
             true
         }
-        Err(reason) => {
-            guard.unavailable = Some(reason);
+        Err(diagnosis) => {
+            guard.unavailable = Some(diagnosis);
             false
         }
     }
@@ -270,7 +567,7 @@ pub(crate) fn preload_session() {
         Ok(guard) => guard,
         Err(_) => return,
     };
-    ensure_session_loaded(&mut guard);
+    ensure_session_loaded_with(&mut guard, load_witness_session_diagnosed);
 }
 
 /// Prove the trigger range of `pid` is the scan's held file: install a
@@ -279,7 +576,7 @@ pub(crate) fn preload_session() {
 /// trigger range's kernel proof directly. Anything unexpected —
 /// including a lock, load, install, run or shape anomaly — is
 /// [`WitnessFailure::Unavailable`] or [`WitnessFailure::AnchorBindingFailed`],
-/// never a join.
+/// never a join. Only counted queries touch the stats and the log line.
 pub(crate) fn prove_original_file(
     pid: u32,
     file: &File,
@@ -288,28 +585,43 @@ pub(crate) fn prove_original_file(
     ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
 ) -> WitnessVerdict {
+    let started = Instant::now();
+    let outcome = prove_original_file_diagnosed(pid, file, held, key, ranges, budget);
+    if outcome.counted() {
+        let wall = started.elapsed();
+        WITNESS_QUERIES.fetch_add(1, Ordering::SeqCst);
+        WITNESS_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::SeqCst);
+        if crate::inspect_system::stage_timings_requested() {
+            eprintln!(
+                "{}",
+                witness_log_line(outcome.verdict, outcome.diagnosis, wall.as_millis())
+            );
+        }
+    }
+    outcome.verdict
+}
+
+/// The diagnosed prove step: the verdict plus the failure stage, if
+/// any. Every unavailable verdict carries its diagnosis; joins,
+/// other-file refusals and anchor failures carry none.
+pub(crate) fn prove_original_file_diagnosed(
+    pid: u32,
+    file: &File,
+    held: &MappedFile,
+    key: ObjectKey,
+    ranges: &[(u64, u64)],
+    budget: &mut CaptureWorkBudget,
+) -> WitnessOutcome {
     // Scoped collection deliberately deactivates the kernel proof
     // substrate; the witness stays off there too, without spending a
     // session, FDs or runs.
     if budget.has_collection_work() {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return skipped(WitnessStage::CollectionWork);
     }
     if budget.check_deadline_now().is_some() {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return skipped(WitnessStage::DeadlineSpent);
     }
-    let started = Instant::now();
-    let verdict = prove_original_file_inner(pid, file, held, key, ranges, budget);
-    let wall = started.elapsed();
-    WITNESS_QUERIES.fetch_add(1, Ordering::SeqCst);
-    WITNESS_NANOS.fetch_add(wall.as_nanos() as u64, Ordering::SeqCst);
-    if crate::inspect_system::stage_timings_requested() {
-        eprintln!(
-            "p11scope: overlay-witness verdict={} wall_ms={}",
-            verdict.log_word(),
-            wall.as_millis()
-        );
-    }
-    verdict
+    prove_original_file_inner(pid, file, held, key, ranges, budget)
 }
 
 fn prove_original_file_inner(
@@ -319,32 +631,38 @@ fn prove_original_file_inner(
     key: ObjectKey,
     ranges: &[(u64, u64)],
     budget: &mut CaptureWorkBudget,
-) -> WitnessVerdict {
+) -> WitnessOutcome {
     let anchor = match file.try_clone() {
         Ok(anchor) => anchor,
-        Err(_) => return WitnessVerdict::Failed(WitnessFailure::Unavailable),
+        Err(_) => return unavailable(WitnessStage::FdClone),
     };
     let mut guard = match witness_session().lock() {
         Ok(guard) => guard,
-        Err(_) => return WitnessVerdict::Failed(WitnessFailure::Unavailable),
+        Err(_) => return unavailable(WitnessStage::SessionLock),
     };
-    if !ensure_session_loaded(&mut guard) {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+    if !ensure_session_loaded_with(&mut guard, load_witness_session_diagnosed) {
+        let diagnosis = guard
+            .unavailable
+            .expect("a failed load remembers its stage");
+        return WitnessOutcome {
+            verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+            diagnosis: Some(diagnosis),
+        };
     }
     // The install/run ceiling starts after the one-time session load:
     // the load is process setup (like the capture's), not query work,
     // and must not eat the query's deadline. A capture that expired
     // during the load still fail-closes here.
     if budget.check_deadline_now().is_some() {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return unavailable(WitnessStage::CaptureDeadline);
     }
     let deadline = witness_deadline(budget);
     let Some(deadline) = deadline else {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return unavailable(WitnessStage::CaptureDeadline);
     };
     let owner = match SegmentPolicy::try_snapshot(0, 0) {
         Ok(policy) => ReservationOwner::for_examined(policy, 1),
-        Err(_) => return WitnessVerdict::Failed(WitnessFailure::Unavailable),
+        Err(_) => return unavailable(WitnessStage::FdCensus),
     };
     let mut custody = ExaminedCustody::new(owner, BTreeMap::new());
     let scan = custody.begin_scan();
@@ -354,14 +672,14 @@ fn prove_original_file_inner(
         key_is_identity: held.key_is_identity(key),
     };
     if !custody.offer(scan, examined, anchor) {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return unavailable(WitnessStage::AnchorOffer);
     }
     let reconciled = (|| {
         let policy = SegmentPolicy::try_snapshot(1, 1).ok()?;
         custody.reconcile(policy).ok()
     })();
     if reconciled.is_none() {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return unavailable(WitnessStage::AnchorReconcile);
     }
     let pins = PinnedObjects::empty();
     // The witness session is private (own BPF maps, own fresh arena per
@@ -373,16 +691,16 @@ fn prove_original_file_inner(
     let no_exclusions = KernelAnchorExclusions::default();
     let pass = AnchorPass::prepare_excluding(&pins, std::iter::empty(), custody, &no_exclusions);
     if pass.fallback.contains_key(&key) {
-        return WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed);
+        return decided(WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed));
     }
     let Some(generation) = next_witness_generation(guard.generation) else {
-        return WitnessVerdict::Failed(WitnessFailure::Unavailable);
+        return unavailable(WitnessStage::GenerationOverflow);
     };
     guard.generation = generation;
     let session = guard.session.as_mut().expect("witness session is loaded");
     let mut installed = match session.install_anchors(pass, generation, deadline) {
         Ok(installed) => installed,
-        Err(_) => return WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed),
+        Err(_) => return decided(WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)),
     };
     let (mut index, _) =
         KnownKeyIndex::build(std::iter::empty(), &BTreeMap::new(), [examined], &pins);
@@ -392,20 +710,35 @@ fn prove_original_file_inner(
         deadline,
     );
     if probe.install_expectations(&mut index).is_err() {
-        return WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed);
+        return decided(WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed));
     }
     let confirmation = probe.confirm(pid, &BTreeSet::from([key]), budget);
     drop(probe);
     drop(installed);
-    verdict_for_confirmation(&confirmation, ranges)
+    let verdict = verdict_for_confirmation(&confirmation, ranges);
+    let diagnosis = match verdict {
+        WitnessVerdict::Failed(WitnessFailure::Unavailable) => Some(WitnessDiagnosis::counted(
+            stage_for_unproven_confirmation(&confirmation, ranges),
+        )),
+        _ => None,
+    };
+    WitnessOutcome { verdict, diagnosis }
 }
 
-fn load_witness_session() -> Result<IdentitySession, &'static str> {
-    crate::attach::identity_iter::ensure_kernel_identity_btf().map_err(|_| "no BTF")?;
-    let parsed = aya::Btf::from_sys_fs().map_err(|_| "no BTF")?;
-    let dir = crate::inspect_system::ProbeDir::create("p11scope-witness-probe")
-        .map_err(|_| "no probe dir")?;
-    IdentitySession::probe_and_load(&parsed, dir.path()).map_err(|_| "load failed")
+fn load_witness_session_diagnosed() -> Result<IdentitySession, WitnessDiagnosis> {
+    if let Err(deny) = crate::attach::identity_iter::ensure_kernel_identity_btf() {
+        return Err(diagnosis_for_deny(&deny));
+    }
+    let parsed = match aya::Btf::from_sys_fs() {
+        Ok(parsed) => parsed,
+        Err(_) => return Err(WitnessDiagnosis::counted(WitnessStage::BtfParse)),
+    };
+    let dir = match crate::inspect_system::ProbeDir::create("p11scope-witness-probe") {
+        Ok(dir) => dir,
+        Err(_) => return Err(WitnessDiagnosis::counted(WitnessStage::ProbeDir)),
+    };
+    IdentitySession::probe_and_load_detailed(&parsed, dir.path())
+        .map_err(|failure| diagnosis_for_identity_load_failure(&failure))
 }
 
 /// One query's ceiling: 500 ms like every target run, clamped by the
@@ -701,7 +1034,10 @@ mod tests {
             &file,
             &held,
             ObjectKey {
-                device: p11scope_manifest::maps::Device { major: 0, minor: 42 },
+                device: p11scope_manifest::maps::Device {
+                    major: 0,
+                    minor: 42,
+                },
                 inode: 7,
             },
             &[(0x7f00_0000, 0x7f00_1000)],
@@ -739,7 +1075,10 @@ mod tests {
             &file,
             &held,
             ObjectKey {
-                device: p11scope_manifest::maps::Device { major: 0, minor: 42 },
+                device: p11scope_manifest::maps::Device {
+                    major: 0,
+                    minor: 42,
+                },
                 inode: 7,
             },
             &[(0x7f00_0000, 0x7f00_1000)],
@@ -753,7 +1092,10 @@ mod tests {
             .diagnosis
             .expect("an unavailable verdict carries its stage");
         assert_eq!(diagnosis.stage, WitnessStage::DeadlineSpent);
-        assert!(!diagnosis.counted, "a spent-deadline early-out is not a query");
+        assert!(
+            !diagnosis.counted,
+            "a spent-deadline early-out is not a query"
+        );
     }
 
     #[test]
@@ -818,7 +1160,9 @@ mod tests {
         let diagnosis = diagnosis_for_identity_load_failure(&failed);
         assert_eq!(
             diagnosis.stage,
-            WitnessStage::FunctionalProbe { stage: "scope-write" }
+            WitnessStage::FunctionalProbe {
+                stage: "scope-write"
+            }
         );
         assert!(diagnosis.note().contains("scope-write"));
         assert!(
@@ -850,12 +1194,18 @@ mod tests {
                 WitnessStage::CollectionWork,
                 "scoped collection deactivates the kernel proof",
             ),
-            (WitnessStage::DeadlineSpent, "capture deadline already reached"),
+            (
+                WitnessStage::DeadlineSpent,
+                "capture deadline already reached",
+            ),
             (
                 WitnessStage::FdClone,
                 "held file descriptor could not be duplicated",
             ),
-            (WitnessStage::SessionLock, "witness session lock unavailable"),
+            (
+                WitnessStage::SessionLock,
+                "witness session lock unavailable",
+            ),
             (
                 WitnessStage::BtfFixMissing,
                 "kernel BTF lacks the task_vma mm member",
@@ -884,7 +1234,9 @@ mod tests {
                 "verified program fd could not be retained",
             ),
             (
-                WitnessStage::FunctionalProbe { stage: "scope-write" },
+                WitnessStage::FunctionalProbe {
+                    stage: "scope-write",
+                },
                 "kernel identity self-test failed at stage 'scope-write'",
             ),
             (
@@ -895,10 +1247,7 @@ mod tests {
                 WitnessStage::CaptureDeadline,
                 "capture deadline reached before the run",
             ),
-            (
-                WitnessStage::FdCensus,
-                "file-descriptor census unavailable",
-            ),
+            (WitnessStage::FdCensus, "file-descriptor census unavailable"),
             (
                 WitnessStage::AnchorOffer,
                 "held file refused as witness anchor",

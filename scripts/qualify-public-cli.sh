@@ -545,13 +545,13 @@ if owned is None:
     assert not outside_ids, 'outside workload leaked into cgroup inventory'
     assert report.get('edges',[])==[], 'overlay unproven edges present'
     want=sorted(set(inside_ids+child_ids))
-    unproven=[g for g in report.get('gaps',[]) if g.get('reason')=='original_file_unproven: kernel witness unavailable']
+    unproven=[g for g in report.get('gaps',[]) if (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
     assert sorted(g.get('caller') for g in unproven)==want, 'overlay unproven caller cover'
     pidof={cid:callers[cid].get('pid') for cid in want}
     for g in unproven:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
-    rest=[g for g in report.get('gaps',[]) if g.get('reason')!='original_file_unproven: kernel witness unavailable']
+    rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
     known={'cgroup member scan was incomplete','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'}
     assert all(g.get('reason') in known for g in rest), 'overlay unproven extra gap: %r' % rest
     assert False, 'inventory overlay unproven signature: 0 modules, %d unproven gaps' % len(unproven)

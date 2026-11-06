@@ -1722,7 +1722,9 @@ The old bounds are measurements, not a product startup SLA.
   A stale copy-up mapping surfaces as an `original_file_unproven` gap
   under the provider path, with one of four fixed causes (the witness
   proved another file, the witness query budget was exhausted, the
-  witness was unavailable, the anchor binding failed). A swept overlay
+  witness was unavailable, the anchor binding failed). The unavailable
+  cause appends the failed stage in plain words after the fixed
+  `original_file_unproven: kernel witness unavailable` prefix. A swept overlay
   caller with no covering kernel proof surfaces as an
   `overlay_kernel_unavailable` maps-attribution loss (`inventory
   --system` with the kernel identity backend first tries the private

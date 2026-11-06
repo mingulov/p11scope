@@ -10,13 +10,11 @@ use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
+#[cfg(test)]
+use crate::discovery::overlay_witness::{GAP_WITNESS_UNAVAILABLE, WitnessDiagnosis, WitnessStage};
 use crate::discovery::overlay_witness::{
     OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessOutcome, WitnessVerdict,
-    original_file_witness_required, prove_original_file,
-};
-#[cfg(test)]
-use crate::discovery::overlay_witness::{
-    GAP_WITNESS_UNAVAILABLE, WitnessDiagnosis, WitnessStage,
+    original_file_witness_required, prove_original_file_diagnosed,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
@@ -4226,7 +4224,10 @@ pub(crate) enum GuardOutcome {
 /// ranges with the fresh ones on a same-file verdict; per-range proving
 /// would exhaust the per-scan budget on honest multi-range joins, so
 /// the mixed-mapping corner stays disclosed, not proved (see the
-/// overlay copy-up section in `docs/known-limitations.md`).
+/// overlay copy-up section in `docs/known-limitations.md`). An
+/// unavailable verdict with a diagnosis refuses with the canonical
+/// prefix plus the plain-words stage; without one the reason stays the
+/// exact canonical string.
 pub(crate) fn witness_join(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4236,9 +4237,14 @@ pub(crate) fn witness_join(
     range: (u64, u64),
     budget: &mut CaptureWorkBudget,
 ) -> Option<String> {
-    io.prove_original_file(view, file, held, key, range, budget)
-        .gap_reason()
-        .map(str::to_string)
+    let outcome = io.prove_original_file_diagnosed(view, file, held, key, range, budget);
+    let canonical = outcome.verdict.gap_reason()?;
+    match (&outcome.verdict, outcome.diagnosis) {
+        (WitnessVerdict::Failed(WitnessFailure::Unavailable), Some(diagnosis)) => {
+            Some(diagnosis.enriched_reason())
+        }
+        _ => Some(canonical.to_string()),
+    }
 }
 
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
@@ -4890,6 +4896,24 @@ pub(crate) trait ScanIo {
         let _ = (view, file, held, key, range, budget);
         WitnessVerdict::Failed(WitnessFailure::Unavailable)
     }
+    /// The diagnosed prove step: the verdict plus the failure stage,
+    /// if any. The default pairs this IO's verdict with no diagnosis
+    /// (scripted IOs refuse with the canonical reason); the production
+    /// IO spends the per-scan budget and runs the diagnosed witness.
+    fn prove_original_file_diagnosed(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessOutcome {
+        WitnessOutcome {
+            verdict: self.prove_original_file(view, file, held, key, range, budget),
+            diagnosis: None,
+        }
+    }
 }
 
 pub(crate) struct ProcScanIo {
@@ -5004,15 +5028,31 @@ impl ScanIo for ProcScanIo {
         range: (u64, u64),
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict {
+        self.prove_original_file_diagnosed(view, file, held, key, range, budget)
+            .verdict
+    }
+
+    fn prove_original_file_diagnosed(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessOutcome {
         // The per-scan budget spends before the run: a failed attempt
         // still spends, and exhaustion refuses without running. The
         // deep scan keeps its single trigger range; only the sweep
         // passes every refused range of the key.
         if self.witness_used >= OVERLAY_WITNESS_QUERIES_PER_SCAN {
-            return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            return WitnessOutcome {
+                verdict: WitnessVerdict::Failed(WitnessFailure::BudgetExhausted),
+                diagnosis: None,
+            };
         }
         self.witness_used += 1;
-        prove_original_file(view.pid(), file, held, key, &[range], budget)
+        prove_original_file_diagnosed(view.pid(), file, held, key, &[range], budget)
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
@@ -13819,8 +13859,7 @@ mod tests {
                 self.witness_used += 1;
                 return outcome;
             }
-            let verdict =
-                self.prove_original_file(view, file, held, key, range, budget);
+            let verdict = self.prove_original_file(view, file, held, key, range, budget);
             WitnessOutcome {
                 verdict,
                 diagnosis: None,

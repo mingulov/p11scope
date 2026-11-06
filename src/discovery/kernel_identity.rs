@@ -2091,6 +2091,19 @@ fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport)
         && report.stale_unmatched
 }
 
+/// Why the witness session failed to load, with the underlying
+/// error. [`IdentitySession::probe_and_load`] collapses these to its
+/// two static strings; the overlay witness maps them to stages instead.
+#[derive(Debug)]
+pub(crate) enum IdentityLoadFailure {
+    /// The strict object load failed.
+    ObjectLoad(crate::attach::identity_iter::LoadError),
+    /// The functional probe failed at its stage.
+    ProbeFailed(crate::attach::identity_iter::ProbeError),
+    /// The functional probe ran but its report failed the checks.
+    ProbeMismatch,
+}
+
 impl IdentitySession {
     #[cfg(test)]
     fn install_unowned_for_test<'p>(
@@ -2106,18 +2119,30 @@ impl IdentitySession {
         btf: &aya::Btf,
         dir: &std::path::Path,
     ) -> Result<Self, &'static str> {
+        Self::probe_and_load_detailed(btf, dir).map_err(|failure| match failure {
+            IdentityLoadFailure::ObjectLoad(_) => "identity object load failed",
+            IdentityLoadFailure::ProbeFailed(_) | IdentityLoadFailure::ProbeMismatch => {
+                "identity functional probe failed"
+            }
+        })
+    }
+
+    pub(crate) fn probe_and_load_detailed(
+        btf: &aya::Btf,
+        dir: &std::path::Path,
+    ) -> Result<Self, IdentityLoadFailure> {
         let loaded = probe_then_fresh(
             || {
                 crate::attach::identity_iter::load_identity_object_strict(btf)
-                    .map_err(|_| "identity object load failed")
+                    .map_err(IdentityLoadFailure::ObjectLoad)
             },
             |loaded| {
                 let report = crate::attach::identity_iter::run_functional_probe(dir, loaded, 1)
-                    .map_err(|_| "identity functional probe failed")?;
+                    .map_err(IdentityLoadFailure::ProbeFailed)?;
                 if probe_succeeded(&report) {
                     Ok(())
                 } else {
-                    Err("identity functional probe failed")
+                    Err(IdentityLoadFailure::ProbeMismatch)
                 }
             },
         )?;

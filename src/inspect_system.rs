@@ -3912,7 +3912,7 @@ impl IdentityChecks for LiveIdentityChecks {
 /// refusal (EPERM/EACCES on the BPF syscalls) rather than a verifier or
 /// object failure. Any non-empty verifier log means verifier rejection
 /// (`load_failed`), even when its errno is EACCES.
-fn load_error_is_permission(error: &crate::attach::identity_iter::LoadError) -> bool {
+pub(crate) fn load_error_is_permission(error: &crate::attach::identity_iter::LoadError) -> bool {
     use std::error::Error as _;
     if crate::attach::identity_iter::verifier_log_of(error).is_some_and(|log| !log.is_empty()) {
         return false;

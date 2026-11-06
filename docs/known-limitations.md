@@ -1736,11 +1736,13 @@ The old bounds are measurements, not a product startup SLA.
   witness was unavailable, the anchor binding failed). The unavailable
   cause appends the failed stage in plain words after the fixed
   `original_file_unproven: kernel witness unavailable` prefix. A swept overlay
-  caller with no covering kernel proof surfaces as an
+  caller with no covering kernel proof surfaces as the bare
   `overlay_kernel_unavailable` maps-attribution loss (`inventory
   --system` with the kernel identity backend first tries the private
   witness session, 8 queries per kernel-route pass and 1024 per
-  no-route pass; exhaustion keeps the same loss).
+  no-route pass; exhaustion keeps the same loss); only the deep-scan
+  gap carries the failed stage, and a failed sweep query's stage is
+  visible only in the `P11SCOPE_STAGE_TIMINGS=1` stderr line.
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.

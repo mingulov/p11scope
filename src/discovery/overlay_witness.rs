@@ -126,6 +126,10 @@ impl SweepWitness for KernelSweepWitness {
             return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
         }
         self.used += 1;
+        // The sweep loss stays the bare `overlay_kernel_unavailable`
+        // label: only the deep-scan gap carries the failed stage, and a
+        // failed sweep query's stage is visible only in the gated
+        // timings line the diagnosed prove step still emits below.
         prove_original_file(pid, file, held, key, ranges, budget)
     }
 

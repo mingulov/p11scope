@@ -114,6 +114,12 @@
       "until": "0.7.0"
     },
     {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace",
+      "reason": "privileged: functional probe passes in a nested pid namespace",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32",
       "reason": "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof",
@@ -1063,6 +1069,18 @@
       "file": "src/inspect_system.rs",
       "path": "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed",
       "reason": "privileged: real kernel BTF identity-denial disclosure; lane-classified",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inspect_system.rs",
+      "path": "inspect_system::tests::probe_dir_created_dir_exec_maps",
+      "reason": "privileged: created probe dir exec-maps",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inspect_system.rs",
+      "path": "inspect_system::tests::probe_dir_falls_back_when_temp_is_noexec",
+      "reason": "privileged: probe dir falls back when temp is noexec",
       "cell": "privileged"
     },
     {

@@ -64470,6 +64470,10 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
         pid_engine.gap_exe_hints().is_none(),
         "exact-PID scope classifies no descendant gaps"
     );
+    assert!(
+        pid_engine.gap_exit_mappings().is_none(),
+        "exact-PID scope publishes no exit-mapping split"
+    );
     assert_eq!(pid_engine.target_exec_hints().unwrap().total(), 0);
     let pid = std::process::id();
     let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
@@ -64482,10 +64486,16 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
         cgroup_engine.target_exec_hints().is_none(),
         "cgroup scope has no single target"
     );
+    assert!(
+        cgroup_engine.gap_exit_mappings().is_some(),
+        "cgroup scope arms the exit-mapping split"
+    );
     cgroup_engine.arm_extensive(false, CapturePolicy::Allowlisted);
     assert!(cgroup_engine.gap_exe_hints().is_none());
+    assert!(cgroup_engine.gap_exit_mappings().is_none());
     pid_engine.arm_extensive(false, CapturePolicy::Allowlisted);
     assert!(pid_engine.target_exec_hints().is_none());
+    assert!(pid_engine.gap_exit_mappings().is_none());
 }
 
 // 7.10b: a validated target EXEC under exact-PID scope classifies

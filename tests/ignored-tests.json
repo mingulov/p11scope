@@ -1952,6 +1952,12 @@
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness",
       "reason": "root: loop overlay mounts drive the no-route collect cell",
       "cell": "privileged"
+    },
+    {
+      "file": "src/run.rs",
+      "path": "run::tests::privileged_spawned_child_home_matches_the_target_passwd_row",
+      "reason": "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1",
+      "cell": "privileged"
     }
   ]
 }

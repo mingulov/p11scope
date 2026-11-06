@@ -117,6 +117,23 @@ def doc_template(doc, name_part):
     return None
 
 
+def doc_layers(doc):
+    layers = doc.get("layer_totals", {})
+    logical = layers.get("logical", {}).get("calls", 0)
+    forwarding = layers.get("forwarding", {}).get("calls", 0)
+    return logical, forwarding
+
+
+def check_remote_layers(doc, total):
+    # The remote client is the only observation point, so its calls
+    # stay logical: the logical split must equal the client total
+    # with nothing split out.
+    logical, forwarding = doc_layers(doc)
+    require(logical == total and forwarding == 0,
+            "remote layer split %r/%r != client total %d"
+            % (logical, forwarding, total))
+
+
 def self_test():
     doc = {
         "functions": [

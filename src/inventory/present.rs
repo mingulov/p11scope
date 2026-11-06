@@ -25,7 +25,7 @@ use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, Regis
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
     ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId, ModuleLifecycle,
-    ModuleRecord, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
+    ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -1669,15 +1669,24 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
         }
         // A module with unidentified use names its folded lower bound in
         // plain words, on its own detail line: every decided-unbound row
-        // counts once with the entries it held at drop.
+        // counts once with the entries it held at drop. Rows bound to an
+        // identified caller (`no_mapping_edge`) are not unidentified use,
+        // and a zero lower bound carries no information, so neither prints
+        // the line; JSON keeps the full record either way.
         if let Some(unbound) = &module.unbound_use {
-            let _ = writeln!(
-                out,
-                "  unidentified use: at least {} entries observed ({} caller image{})",
-                unbound.entries,
-                unbound.rows,
-                if unbound.rows == 1 { "" } else { "s" }
-            );
+            let unidentified = unbound
+                .reasons
+                .keys()
+                .any(|code| *code != NO_MAPPING_EDGE);
+            if unidentified && unbound.entries > 0 {
+                let _ = writeln!(
+                    out,
+                    "  unidentified use: at least {} entries observed ({} caller image{})",
+                    unbound.entries,
+                    unbound.rows,
+                    if unbound.rows == 1 { "" } else { "s" }
+                );
+            }
         }
     }
     for edge in &presentation.edges {

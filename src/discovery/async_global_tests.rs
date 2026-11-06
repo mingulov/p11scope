@@ -931,3 +931,56 @@ fn async_global_fix_round_deferred_pending_refused_and_terminal_publish_fresh_co
     );
     assert!(case.engine.pending_global_retirement.is_some());
 }
+
+/// Task 7 wiring: a pid first enumerated this pass (no arrival mark yet)
+/// is admitted ahead of a deferred, marked backlog pid. With a batch of
+/// one, the first tick admits the backlog head and marks the tail; the
+/// next tick the fresh pid jumps ahead of the marked one.
+#[test]
+fn newcomer_pid_admitted_before_deferred_backlog() {
+    let guards = e06_spawn_sleeps(4);
+    let mut pids: Vec<u32> = guards.iter().map(|guard| guard.pid()).collect();
+    pids.sort_unstable();
+    let (initial, backlog_head, backlog_tail, newcomer) = (pids[0], pids[1], pids[2], pids[3]);
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[initial]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_max_new_views_for_test(1);
+
+    e06_write_listing(scope_dir.path(), &[initial, backlog_head, backlog_tail]);
+    refresh_inventory_once(&mut engine);
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(kept.len(), 2, "one backlog pid admits: {kept:?}");
+    assert!(
+        kept.contains(&backlog_head),
+        "the backlog head admits first: {kept:?}"
+    );
+    assert!(!kept.contains(&backlog_tail), "the tail defers: {kept:?}");
+    assert!(
+        engine.newcomer_first_seen.contains_key(&backlog_tail),
+        "the deferred tail is marked backlog"
+    );
+
+    e06_write_listing(
+        scope_dir.path(),
+        &[initial, backlog_head, backlog_tail, newcomer],
+    );
+    assert!(
+        !engine.newcomer_first_seen.contains_key(&newcomer),
+        "the fresh pid is an unmarked newcomer"
+    );
+    refresh_inventory_once(&mut engine);
+    let kept: Vec<u32> = engine.views.iter().map(|view| view.pid()).collect();
+    assert_eq!(kept.len(), 3, "one more pid admits: {kept:?}");
+    assert!(
+        kept.contains(&newcomer),
+        "the newcomer jumps ahead of the marked backlog: {kept:?}"
+    );
+    assert!(
+        !kept.contains(&backlog_tail),
+        "the marked tail waits another tick: {kept:?}"
+    );
+}

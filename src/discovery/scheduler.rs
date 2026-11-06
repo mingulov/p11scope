@@ -66,6 +66,14 @@ pub(crate) const RECONCILE_EVICTION_COOLDOWN_SWEEPS: u64 = 2;
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 
+/// Bounded newcomer share of one admission tick: at most this many of the
+/// tick's admitted batch are first-seen-this-pass newcomers; the rest of
+/// the batch serves backlog in its existing order, so a steady newcomer
+/// stream delays the backlog but never starves it. Half the tick batch:
+/// backlog keeps at least half the batch whenever it is non-empty.
+/// Provisional — ratify by measurement.
+pub(crate) const MAX_NEWCOMER_ADMISSIONS_PER_TICK: usize = MAX_NEW_VIEWS_PER_TICK / 2;
+
 /// Polling rescans per polling round: at most this many retained
 /// exploratory views are queued for a same-tick refresh rescan, so a
 /// retained process that gains a provider is re-examined within a finite
@@ -281,6 +289,35 @@ impl DiscoveryScheduler {
         let mut ordered = Self::rotated_after(&queued, self.new_view_cursor);
         ordered.extend(Self::rotated_after(&exploratory, self.new_view_cursor));
         ordered
+    }
+
+    /// One admission tick's window with newcomers first: `newcomers` (the
+    /// subset of `pids` first seen this pass) ahead of backlog, up to
+    /// `newcomer_share` of the `max_new_views` batch; the rest of the batch
+    /// serves backlog in its existing order (`pending`-first when `scarce`,
+    /// rotation otherwise). Either class fills batch slots the other cannot
+    /// use, so the window stays full. Returns `(admitted, deferred)` in
+    /// admission order. Every input list must be sorted ascending; `newcomers`
+    /// and `pending` must be subsets of `pids`.
+    pub(crate) fn new_view_window_newcomers_first(
+        &self,
+        pids: &[u32],
+        newcomers: &BTreeSet<u32>,
+        pending: &BTreeSet<u32>,
+        scarce: bool,
+        max_new_views: usize,
+        newcomer_share: usize,
+    ) -> (Vec<u32>, Vec<u32>) {
+        // Test scaffold: single-class order; the two-class split lands next.
+        let _ = (newcomers, newcomer_share);
+        let ordered = if scarce {
+            self.new_view_order_pending_first(pids, pending)
+        } else {
+            self.new_view_order(pids)
+        };
+        let admitted = ordered.iter().copied().take(max_new_views).collect();
+        let deferred = ordered.iter().copied().skip(max_new_views).collect();
+        (admitted, deferred)
     }
 
     /// Called only after the tick's time and capacity checks permit an attempt.
@@ -611,6 +648,186 @@ mod tests {
         assert_eq!(
             rotated.new_view_order_pending_first(&[1, 3, 5, 7, 9], &pending),
             vec![7, 3, 9, 1, 5]
+        );
+    }
+
+    /// A mapping first seen this pass admits ahead of backlog: with 2,000
+    /// backlog processes and one newcomer, one admission tick puts the
+    /// newcomer in the first batch while the backlog keeps its existing
+    /// order — rotation order with free slots, pending-first when scarce.
+    #[test]
+    fn newcomer_mapping_admitted_before_backlog() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        let backlog: Vec<u32> = (1..=2000).collect();
+        let newcomer = 1_000_000u32;
+        let mut pids = backlog.clone();
+        pids.push(newcomer);
+        let newcomers: BTreeSet<u32> = BTreeSet::from([newcomer]);
+
+        let scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) = scheduler.new_view_window_newcomers_first(
+            &pids,
+            &newcomers,
+            &BTreeSet::new(),
+            false,
+            batch,
+            share,
+        );
+        assert_eq!(admitted.len(), batch);
+        assert_eq!(
+            admitted[0], newcomer,
+            "the newcomer joins the first admitted batch"
+        );
+        let baseline = scheduler.new_view_order(&backlog);
+        assert_eq!(
+            &admitted[1..],
+            &baseline[..batch - 1],
+            "backlog order is otherwise unchanged"
+        );
+        assert_eq!(
+            deferred,
+            baseline[batch - 1..],
+            "deferred backlog keeps rotation order"
+        );
+
+        // Scarce slots: the newcomer still leads, and the backlog behind it
+        // keeps the Lane-A P2a pending-first order verbatim.
+        let pending: BTreeSet<u32> = [500, 1500].into_iter().collect();
+        let (admitted, deferred) = scheduler
+            .new_view_window_newcomers_first(&pids, &newcomers, &pending, true, batch, share);
+        assert_eq!(admitted[0], newcomer);
+        let window: Vec<u32> = admitted.into_iter().chain(deferred).collect();
+        let rest: Vec<u32> = window.into_iter().filter(|pid| *pid != newcomer).collect();
+        assert_eq!(
+            rest,
+            scheduler.new_view_order_pending_first(&backlog, &pending),
+            "scarce backlog order is otherwise unchanged"
+        );
+    }
+
+    /// Newcomers cannot starve the backlog: 50 ticks each adding one
+    /// newcomer still admit every backlog entry within
+    /// `ceil(2000 / batch) + 50` ticks. Each tick's newcomer set holds only
+    /// that tick's arrival — a deferred newcomer is marked and rejoins as
+    /// backlog next tick, exactly as the engine's arrival marks behave.
+    #[test]
+    fn backlog_not_starved_by_newcomers() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        let mut scheduler = DiscoveryScheduler::new();
+        let mut remaining: BTreeSet<u32> = (1..=2000).collect();
+        let bound = 2000usize.div_ceil(batch) + 50;
+        let mut tick = 0usize;
+        loop {
+            tick += 1;
+            assert!(
+                tick <= bound,
+                "backlog still unadmitted after {bound} ticks: {} left",
+                remaining.len()
+            );
+            if tick <= 50 {
+                remaining.insert(1_000_000 + tick as u32);
+            }
+            let pids: Vec<u32> = remaining.iter().copied().collect();
+            let newcomers: BTreeSet<u32> = if tick <= 50 {
+                BTreeSet::from([1_000_000 + tick as u32])
+            } else {
+                BTreeSet::new()
+            };
+            let (admitted, _) = scheduler.new_view_window_newcomers_first(
+                &pids,
+                &newcomers,
+                &BTreeSet::new(),
+                false,
+                batch,
+                share,
+            );
+            assert!(
+                !admitted.is_empty(),
+                "tick {tick}: a non-empty queue admits nothing"
+            );
+            for pid in &admitted {
+                scheduler.note_new_view_attempt(*pid);
+                remaining.remove(pid);
+            }
+            if remaining.iter().all(|pid| *pid > 1_000_000) {
+                break;
+            }
+        }
+        assert!(
+            tick <= bound,
+            "every backlog entry admits within {bound} ticks, took {tick}"
+        );
+    }
+
+    /// The newcomer share is bounded per tick under flood: with 100 fresh
+    /// newcomers per tick, the first tick splits the batch evenly and the
+    /// backlog still drains at the guaranteed half-batch rate.
+    #[test]
+    fn newcomer_share_bounded_per_tick_under_flood() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        assert_eq!(share * 2, batch, "the share is half the batch");
+        let mut scheduler = DiscoveryScheduler::new();
+        let mut remaining: BTreeSet<u32> = (1..=2000).collect();
+        for fresh in 0..100 {
+            remaining.insert(1_000_000 + fresh);
+        }
+        let pids: Vec<u32> = remaining.iter().copied().collect();
+        let newcomers: BTreeSet<u32> = (1_000_000..1_000_100).collect();
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &pids,
+            &newcomers,
+            &BTreeSet::new(),
+            false,
+            batch,
+            share,
+        );
+        let fresh_admitted = admitted
+            .iter()
+            .filter(|pid| newcomers.contains(pid))
+            .count();
+        assert_eq!(
+            fresh_admitted, share,
+            "the first tick splits the batch: {admitted:?}"
+        );
+        for pid in &admitted {
+            scheduler.note_new_view_attempt(*pid);
+            remaining.remove(pid);
+        }
+        // The flood continues; deferred newcomers rejoin as marked backlog.
+        let mut tick = 1usize;
+        let mut arrival = 1_000_100u32;
+        while remaining.iter().any(|pid| *pid <= 2000) {
+            tick += 1;
+            assert!(
+                tick <= 2000,
+                "backlog still unadmitted after {tick} ticks under flood"
+            );
+            let mut fresh_set = BTreeSet::new();
+            for _ in 0..100 {
+                remaining.insert(arrival);
+                fresh_set.insert(arrival);
+                arrival += 1;
+            }
+            let pids: Vec<u32> = remaining.iter().copied().collect();
+            let (admitted, _) = scheduler.new_view_window_newcomers_first(
+                &pids,
+                &fresh_set,
+                &BTreeSet::new(),
+                false,
+                batch,
+                share,
+            );
+            for pid in &admitted {
+                scheduler.note_new_view_attempt(*pid);
+                remaining.remove(pid);
+            }
+        }
+        assert!(
+            tick <= 2000usize.div_ceil(share),
+            "backlog drains at the guaranteed half-batch rate: {tick} ticks"
         );
     }
 

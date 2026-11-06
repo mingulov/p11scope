@@ -36011,6 +36011,26 @@ fn distinct_objects_are_never_coalesced_by_the_source_union() {
     assert_eq!(retained.sources, vec!["scan", "manifest"]);
 }
 
+/// The retained record takes the fresher incoming deciding class: early
+/// evidence may show a closure array as heuristic before all its lookalike
+/// tables decode. Incoming `None` keeps the retained class.
+#[test]
+fn retained_module_takes_the_fresher_incoming_admission_class() {
+    let mut retained = merged_module(vec!["scan"]);
+    retained.admission_class = Some("heuristic");
+    let mut incoming = merged_module(vec!["scan"]);
+    incoming.admission_class = Some("closure_array");
+    merge_discovered_module(&mut retained, incoming);
+    assert_eq!(retained.admission_class, Some("closure_array"));
+
+    let mut retained = merged_module(vec!["scan"]);
+    retained.admission_class = Some("heuristic");
+    let mut incoming = merged_module(vec!["scan"]);
+    incoming.admission_class = None;
+    merge_discovered_module(&mut retained, incoming);
+    assert_eq!(retained.admission_class, Some("heuristic"));
+}
+
 #[test]
 fn manifest_selection_queries_merge_once_and_preserve_manifest_loss() {
     let (_fixture, mut engine, _session) = initial_export_route();

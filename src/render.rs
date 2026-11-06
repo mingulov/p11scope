@@ -8487,6 +8487,98 @@ pub(crate) mod tests {
         assert_eq!(control["layer_totals"]["forwarding"]["calls"], 0);
     }
 
+    /// Live pause/counter shape: a class-marked whole-admitted forwarding
+    /// layer with attributed rows and no gap. The halves compose through
+    /// `row_is_forwarding`, but the exact live shape deserves one pin.
+    #[test]
+    fn class_marked_attributed_rows_without_gap_count_logical_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "class-marked attributed rows count logical once: {text}"
+        );
+        assert!(
+            !text.contains("1244 completed calls;"),
+            "headline must not sum both layers: {text}"
+        );
+        assert!(
+            text.contains("/opt/libforward.so")
+                && text.contains("500")
+                && text.contains("forwarding"),
+            "forwarding layer shown separately: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        let inner_json = functions
+            .iter()
+            .find(|row| row["calls"] == 744)
+            .expect("provider row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+        assert_eq!(inner_json["forwarding_layer"], false);
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// A refused closure array marks forwarding by its refusal reason alone
+    /// (no class, no prefix gap): the `is_closure_array_refusal` arm of
+    /// `forwarding_module_ids`. Refused modules hold no rows in production,
+    /// so this is rebuild-history defense; the pin keeps the arm honest.
+    #[test]
+    fn refused_closure_array_marks_forwarding_by_reason_alone() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = None;
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix of its 67 lookalike function tables (a proxy closure array is admitted whole under this capture policy)".into(),
+        });
+        ev.verdict();
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+    }
+
     /// JK-22a: a prefix-admitted ordinary provider names its attached
     /// endpoints as partially covered, counted under "modules partially
     /// covered" rather than "modules refused".
@@ -9067,6 +9159,42 @@ pub(crate) mod tests {
             &mechanisms,
         );
         assert!(!out.contains("MECHANISM"), "{out}");
+    }
+
+    /// Live rows at a forwarding layer carry the `(forwarding layer)`
+    /// marker; provider rows do not. The table holds two `C_Sign` rows,
+    /// exactly one marked.
+    #[test]
+    fn live_table_marks_forwarding_layer_rows() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[outer, inner],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(out.contains("C_Sign (forwarding layer)"), "{out}");
+        assert_eq!(out.matches("C_Sign").count(), 2, "{out}");
+        assert_eq!(out.matches("(forwarding layer)").count(), 1, "{out}");
     }
 
     /// Demo journey 2, empty side: with observed calls but no attributed

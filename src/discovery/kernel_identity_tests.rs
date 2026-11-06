@@ -3630,7 +3630,10 @@ fn foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
         out.concrete_runs, 0,
         "a refused foreign-/proc confirm ran the iterator"
     );
-    assert_eq!(out.outcomes, 0, "a refused foreign-/proc confirm recorded a run");
+    assert_eq!(
+        out.outcomes, 0,
+        "a refused foreign-/proc confirm recorded a run"
+    );
     assert_eq!(
         out.attempts, 0,
         "a refused foreign-/proc confirm counted an attempt"
@@ -3672,7 +3675,10 @@ fn nested_foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
         out.concrete_runs, 0,
         "a refused nested foreign-/proc confirm ran the iterator"
     );
-    assert_eq!(out.attempts, 0, "a refused nested foreign-/proc confirm counted an attempt");
+    assert_eq!(
+        out.attempts, 0,
+        "a refused nested foreign-/proc confirm counted an attempt"
+    );
     assert!(out.failed_target.is_none(), "a refusal demoted the pass");
     assert_eq!(
         out.per_pid.get(&6100),

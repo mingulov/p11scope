@@ -600,6 +600,34 @@ class CompareTwins(unittest.TestCase):
             with self.assertRaisesRegex(oracle.LedgerError,
                                         "metadata_at_use invalid"):
                 oracle.validate_snapshot(snapshot)
+        with self.subTest("v5 PQC key and object labels validate"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 5
+            snapshot["unattributed"] = []
+            snapshot["key_operations"][0]["metadata_at_use"] = "ml_dsa_65"
+            snapshot["objects"][0]["label"] = "ml_dsa_65"
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("PQC key label before v5 refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 4
+            snapshot["unattributed"] = []
+            snapshot["key_operations"][0]["metadata_at_use"] = "ml_dsa_65"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("PQC object label before v5 refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 4
+            snapshot["unattributed"] = []
+            snapshot["objects"][0]["label"] = "ml_dsa_65"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v5 without unattributed refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 5
+            with self.assertRaises(oracle.LedgerError):
+                oracle.validate_snapshot(snapshot)
 
     def test_healthy_same_scope_handle_joins_one_row(self):
         oracle = require_oracle(self)
@@ -810,6 +838,58 @@ class StreamTwins(unittest.TestCase):
             snapshot = healthy_snapshot([first, second])
             stream = healthy_stream([first, second], snapshot)
             oracle.compare_stream(stream, [first, second], snapshot)
+
+    def test_h9_v5_stream_dispatch(self):
+        oracle = require_oracle(self)
+        _, _, first, second = validated_pair(oracle, "interleave")
+
+        def pqc_stream(key_version, object_version):
+            """Healthy stream with one PQC row pair, at given row versions."""
+            snapshot = healthy_snapshot([first, second])
+            stream = healthy_stream([first, second], snapshot)
+            target = snapshot["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["metadata_at_use"] = "ml_dsa_65"
+            obj_row = next(row for row in snapshot["objects"]
+                           if row["object"] == target["object"])
+            obj_row["label"] = "ml_dsa_65"
+            snapshot["version"] = 5
+            snapshot["unattributed"] = []
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == target["object"]:
+                        line["event"]["row"]["label"] = "ml_dsa_65"
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if (row["instance"], row["object"], row["category"],
+                            row["role"], row["metadata_at_use"]) == old_key:
+                        row["metadata_at_use"] = "ml_dsa_65"
+                    line["event"]["version"] = key_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 5
+            return snapshot, stream
+
+        with self.subTest("v5 PQC stream validates"):
+            snapshot, stream = pqc_stream(5, 5)
+            oracle.validate_snapshot(snapshot)
+            oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("PQC key label on a v4 row refused"
+                          " from stream authority"):
+            snapshot, stream = pqc_stream(4, 5)
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
+        with self.subTest("PQC object label on a v4 row refused"
+                          " from stream authority"):
+            snapshot, stream = pqc_stream(5, 4)
+            oracle.validate_snapshot(snapshot)
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.compare_stream(stream, [first, second], snapshot)
 
     def test_h9_stream_version_refusals(self):
         oracle = require_oracle(self)

@@ -691,6 +691,112 @@ class ObservedRsaTests(unittest.TestCase):
                 ORACLE.check_section(mutated)
             self.assertNotIn("C_Fabricated", str(caught.exception))
 
+    def test_oracle_v5_tables_match_v5_schema(self):
+        with open(ROOT / "docs" / "schema"
+                  / "inventory-v1-object-observations-v5.schema.json",
+                  encoding="utf-8") as stream:
+            schema = json.load(stream)
+        defs = schema["$defs"]
+        with self.subTest("version const"):
+            self.assertEqual(schema["properties"]["version"]["const"], 5)
+            self.assertEqual(ORACLE.OBSERVATIONS_VERSION_V5, 5)
+        with self.subTest("METADATA_LABELS_V5"):
+            self.assertEqual(set(ORACLE.METADATA_LABELS_V5),
+                             set(defs["metadata_label"]["enum"]))
+            self.assertEqual(tuple(ORACLE.METADATA_LABELS_V5),
+                             tuple(ORACLE.METADATA_LABELS_V4)
+                             + tuple(ORACLE.PQC_METADATA_LABELS))
+            self.assertEqual(len(ORACLE.PQC_METADATA_LABELS), 18)
+        with self.subTest("OBJECT_LABELS_V5"):
+            label = defs["object_row"]["properties"]["label"]["enum"]
+            self.assertEqual(set(ORACLE.OBJECT_LABELS_V5),
+                             set(label) - {None})
+            self.assertEqual(tuple(ORACLE.OBJECT_LABELS_V5),
+                             tuple(ORACLE.METADATA_LABELS)
+                             + tuple(ORACLE.PQC_METADATA_LABELS))
+        with self.subTest("METADATA_KEYS_V5"):
+            self.assertEqual(set(ORACLE.METADATA_KEYS_V5),
+                             set(defs["metadata_block"]["required"]))
+            self.assertEqual(set(defs["query_block"]["required"]),
+                             set(ORACLE.METADATA_KEYS_V5))
+            self.assertEqual(tuple(ORACLE.METADATA_KEYS_V5),
+                             tuple(ORACLE.METADATA_KEYS)
+                             + ("parameter_set",))
+        with self.subTest("v5 scalar values"):
+            block = defs["metadata_block"]["properties"]
+            self.assertEqual(set(ORACLE.METADATA_FIELD_VALUES_V5)
+                             | {"ec_params"},
+                             set(block))
+            key_type = defs["metadata_field_key_type"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V5["key_type"]),
+                set(key_type) - {None})
+            param_set = defs["metadata_field_parameter_set"]["properties"]["value"]["enum"]
+            self.assertEqual(
+                set(ORACLE.METADATA_FIELD_VALUES_V5["parameter_set"]),
+                set(param_set) - {None})
+            for field, accepted in ORACLE.METADATA_FIELD_VALUES.items():
+                self.assertEqual(
+                    tuple(ORACLE.METADATA_FIELD_VALUES_V5[field]),
+                    tuple(accepted), field)
+
+    def test_h9_v5_section_checks_structurally(self):
+        section = observed("clean.json")
+        section["version"] = 5
+        section["unattributed"] = []
+        for row in section["objects"]:
+            for block in (row["requested"], row["established"]):
+                block["parameter_set"] = {"status": "unknown",
+                                          "value": None}
+            row["queries"]["parameter_set"] = "not_queried"
+        pqc_object = section["objects"][0]
+        pqc_object["established"]["key_type"] = {"status": "value",
+                                                 "value": 74}
+        pqc_object["established"]["parameter_set"] = {"status": "value",
+                                                      "value": 2}
+        pqc_object["queries"]["parameter_set"] = "established"
+        pqc_object["label"] = "ml_dsa_65"
+        section["key_operations"][0]["metadata_at_use"] = "ml_dsa_65"
+        with self.subTest("v5 shape checks"):
+            facts = ORACLE.check_section(copy.deepcopy(section))
+            self.assertEqual(len(facts["rows"]), 2)
+            self.assertEqual(len(facts["unknown"]), 0)
+        with self.subTest("v4 unknown label still validates at v5"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][1]["metadata_at_use"] = "unknown"
+            facts = ORACLE.check_section(mutated)
+            self.assertEqual(len(facts["rows"]), 2)
+        with self.subTest("v5 content at v4 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 4
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("v5 with six-key blocks refused"):
+            mutated = copy.deepcopy(section)
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    del block["parameter_set"]
+                del row["queries"]["parameter_set"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("PQC key type below v5 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 4
+            mutated["objects"][0]["label"] = "rsa_2048"
+            mutated["key_operations"][0]["metadata_at_use"] = "rsa_2048"
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    del block["parameter_set"]
+                del row["queries"]["parameter_set"]
+            with self.assertRaises(ORACLE.OracleRefusal):
+                ORACLE.check_section(mutated)
+        with self.subTest("unknown versions refused"):
+            for version in (0, 6, 99):
+                mutated = copy.deepcopy(section)
+                mutated["version"] = version
+                with self.assertRaises(ORACLE.OracleRefusal):
+                    ORACLE.check_section(mutated)
+
 
 # S1 twins: the installed RSA capture as v0.5.0 reports it (no key-operation
 # feed). Every number below is derived from the ledger workload

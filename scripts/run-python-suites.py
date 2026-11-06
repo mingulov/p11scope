@@ -133,6 +133,7 @@ RUN = [
     ("test_narrow_scope_oracle.py", []),
     ("test_object_journal_qualification.py", []),
     ("test_object_observations.py", []),
+    ("test_object_observations_v5.py", []),
     ("test_observed_key_operations.py", []),
     ("test_operator_output_qualification.py", []),
     ("test_package_release.py", []),

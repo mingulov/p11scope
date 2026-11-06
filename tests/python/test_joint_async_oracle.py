@@ -1732,6 +1732,111 @@ class AsyncVersionDispatchTwins(unittest.TestCase):
         self.assertEqual(completed.returncode, 1)
         self.assertRegex(completed.stderr, r"object creation invalid")
 
+    def test_cli_v5_superset_content_accepted(self):
+        require_oracle(self)
+        oracle = ORACLE
+        collision, joint, single = paired(oracle, "poll_msg")
+        joint["version"] = 5
+        joint["unattributed"] = []
+        single["version"] = 5
+        single["unattributed"] = []
+        joint_stream = healthy_stream(collision, joint)
+        for line in joint_stream:
+            # v5 rows carrying v1 content validate (superset tables);
+            # the marker version rides along.
+            if line["kind"] in ("object_observed",
+                                "key_operations_observed"):
+                line["event"]["version"] = 5
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 5
+        single_stream = healthy_s1only_stream(collision, single)
+        for line in single_stream:
+            if line["kind"] == "key_operations_observed":
+                line["event"]["version"] = 5
+            elif line["kind"] == "pass_committed":
+                line["event"]["object_version"] = 5
+        completed = self.run_cli(joint, single, joint_stream, single_stream)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+
+
+class AsyncV5PqcTwins(unittest.TestCase):
+    """H9 section version 5 through the async oracle, direct calls."""
+
+    def test_v5_pqc_snapshot_validates_and_v4_refuses(self):
+        oracle = require_oracle(self)
+        _collision, joint, _single = paired(oracle, "poll_msg")
+        key_label = joint["key_operations"][0]["metadata_at_use"]
+        obj_label = joint["objects"][0]["label"]
+        with self.subTest("v5 PQC key and object labels validate"):
+            joint["version"] = 5
+            joint["unattributed"] = []
+            joint["key_operations"][0]["metadata_at_use"] = "ml_kem_768"
+            joint["objects"][0]["label"] = "ml_kem_768"
+            oracle.validate_snapshot(joint, "joint")
+        with self.subTest("PQC key label before v5 refused"):
+            joint["version"] = 4
+            joint["objects"][0]["label"] = obj_label
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(joint, "joint")
+        with self.subTest("PQC object label before v5 refused"):
+            joint["key_operations"][0]["metadata_at_use"] = key_label
+            joint["objects"][0]["label"] = "ml_kem_768"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.validate_snapshot(joint, "joint")
+
+    def test_v5_pqc_stream_dispatch(self):
+        oracle = require_oracle(self)
+
+        def pqc_pair(key_version, object_version):
+            """Fresh pair with one PQC row pair, at given row versions."""
+            collision, joint, _single = paired(oracle, "poll_msg")
+            stream = healthy_stream(collision, joint)
+            target = joint["key_operations"][0]
+            old_key = (target["instance"], target["object"],
+                       target["category"], target["role"],
+                       target["metadata_at_use"])
+            target["metadata_at_use"] = "ml_kem_768"
+            obj_row = next(row for row in joint["objects"]
+                           if row["object"] == target["object"])
+            obj_row["label"] = "ml_kem_768"
+            joint["version"] = 5
+            joint["unattributed"] = []
+            for line in stream:
+                if line["kind"] == "object_observed":
+                    if line["event"]["row"]["object"] == target["object"]:
+                        line["event"]["row"]["label"] = "ml_kem_768"
+                    line["event"]["version"] = object_version
+                elif line["kind"] == "key_operations_observed":
+                    row = line["event"]["row"]
+                    if (row["instance"], row["object"], row["category"],
+                            row["role"], row["metadata_at_use"]) == old_key:
+                        row["metadata_at_use"] = "ml_kem_768"
+                    line["event"]["version"] = key_version
+                elif line["kind"] == "pass_committed":
+                    line["event"]["object_version"] = 5
+            return collision, joint, stream
+
+        with self.subTest("v5 PQC stream validates"):
+            collision, joint, stream = pqc_pair(5, 5)
+            oracle.validate_snapshot(joint, "joint")
+            oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("PQC key label on a v4 row refused"
+                          " from stream authority"):
+            collision, joint, stream = pqc_pair(4, 5)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+        with self.subTest("PQC object label on a v4 row refused"
+                          " from stream authority"):
+            collision, joint, stream = pqc_pair(5, 4)
+            oracle.validate_snapshot(joint, "joint")
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "object label invalid"):
+                oracle.compare_stream(stream, collision, joint, "joint")
+
 
 class CollisionEmissionTests(unittest.TestCase):
     def build_provider(self, tmp, m32=False):

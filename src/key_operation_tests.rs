@@ -17043,7 +17043,10 @@ fn key_operation_c5_retirement_preserves_observed_pair_as_unknown() {
         .fixture
         .admit_function("C_SignInit")
         .h0_ordinal();
-    assert!(retire_at > pos_sign, "non-vacuous: retirement above the queue");
+    assert!(
+        retire_at > pos_sign,
+        "non-vacuous: retirement above the queue"
+    );
     guarded.registry.retire_instance(retirement(
         Retirement::Exact(joint_key.clone()),
         position(guarded.domain, retire_at),
@@ -17130,7 +17133,10 @@ fn key_operation_c5_retirement_truncated_init_rows_no_completion() {
         .fixture
         .admit_function("C_SignInit")
         .h0_ordinal();
-    assert!(retire_at > pos_init, "non-vacuous: retirement above the queue");
+    assert!(
+        retire_at > pos_init,
+        "non-vacuous: retirement above the queue"
+    );
     guarded.registry.retire_instance(retirement(
         Retirement::Exact(joint_key.clone()),
         position(guarded.domain, retire_at),

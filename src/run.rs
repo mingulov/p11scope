@@ -16551,11 +16551,11 @@ mod tests {
             .find("overlay_witness::preload_session()")
             .expect("owned startup preloads the witness session");
         let spawned = body
-            .find("OwnedChild::spawn(")
+            .find("OwnedChild::spawn_verbose_as(")
             .expect("owned startup spawns the child");
         assert!(
             preloaded < spawned,
-            "witness preload sits before OwnedChild::spawn"
+            "witness preload sits before OwnedChild::spawn_verbose_as"
         );
         assert_eq!(
             body.matches("overlay_witness::preload_session()").count(),

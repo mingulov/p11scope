@@ -7490,6 +7490,9 @@ fn capture_trace(
                         .scheduling
                         .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
                     consumers.scheduling.sync_tail_stats(context.0);
+                    // The frozen consumer map pins the single-line coordinator
+                    // projections below; keep them byte-stable for the marker.
+                    #[rustfmt::skip]
                     let mut evidence =
                         evidence_for(
                             context.0,
@@ -7507,12 +7510,8 @@ fn capture_trace(
                             consumers.state,
                             context.0.pinned().provider_changed(),
                             true,
-                            context.2.as_deref().map_or_else(Default::default, |owned| {
-                                owned.coordinator.counters()
-                            }),
-                            context.2.as_deref().map_or(0, |owned| {
-                                owned.coordinator.engine_incomplete_retirements()
-                            }),
+                            context.2.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                            context.2.as_deref().map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
                             context.2.as_deref().map(|owned| owned.still_running),
                             capture_tracking_degraded,
                             consumers

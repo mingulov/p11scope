@@ -1442,9 +1442,9 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
 /// never grants argument-read authority), so per-key rows need a
 /// rerun with `--manifest`. Visible only beside the `key operations
 /// unavailable` subset gap the seal path notes; without that gap the
-/// tracking-off line stands. One module names its file (SoftHSM by
-/// its product name, anything else by basename); zero or several
-/// modules stay generic, since no single provider is nameable.
+/// tracking-off line stands. One module names its provider by file
+/// name; zero or several modules stay generic, since no single
+/// provider is nameable.
 fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
     let refused = presentation.gaps.iter().any(|gap| {
         gap.subject == "key operations unavailable" && gap.reason.starts_with("subset refused (")
@@ -1459,13 +1459,8 @@ fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
             .and_then(|path| path.rsplit('/').next())
             .filter(|base| !base.is_empty())
     {
-        let display = if base.to_lowercase().contains("softhsm") {
-            "SoftHSM".to_string()
-        } else {
-            base.to_string()
-        };
         return Some(format!(
-            "key operations: {display}'s function table cannot be verified \
+            "key operations: {base}'s function table cannot be verified \
              without --manifest; rerun with --manifest"
         ));
     }

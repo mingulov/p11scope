@@ -1034,8 +1034,9 @@ Limits that matter in pods:
   return; tables with export-name agreement alone never qualify (for example
   SoftHSM, which publishes no standard interface, when the observer attached
   after the application fetched the list). Then the subset refuses with
-  `incomplete_provider`, the summary reads `key operations: <provider>'s
-  function table cannot be verified without --manifest; rerun with --manifest`,
+  `incomplete_provider`, the summary reads `key operations: <file>'s
+  function table cannot be verified without --manifest; rerun with --manifest`
+  (naming the provider by its file name),
   and per-key rows need a rerun with `--manifest <manifest.json>`. A sealed
   scan lane carries a `semantic subset scan-derived` gap naming that provenance;
   a manifest still adds operator attestation when supplied. A build without the
@@ -1075,7 +1076,7 @@ Limits that matter in pods:
   Without the opt-in, or on a build without the journal object, the line
   reads `key operations: not reported (per-key tracking is off)`. With the
   opt-in but a refused semantic subset (unverifiable scan tables, see
-  above), it names the rerun instead: `key operations: <provider>'s
+  above), it names the rerun instead: `key operations: <file>'s
   function table cannot be verified without --manifest; rerun with
   --manifest`.
   The line shows counts per operation category from the

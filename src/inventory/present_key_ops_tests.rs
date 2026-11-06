@@ -323,7 +323,8 @@ fn subset_refused_gap(reason: &str) -> GapView {
 #[test]
 fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
     // Requested tracking, refused subset, one SoftHSM module: the
-    // line names the provider and the rerun, never tracking-off.
+    // line names the provider by file name like any other provider,
+    // plus the rerun, never tracking-off.
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.modules[0].paths = vec!["/usr/lib64/pkcs11/libsofthsm2.so".into()];
@@ -335,9 +336,9 @@ fn key_ops_line_subset_refused_names_manifest_for_softhsm() {
     let snapshot = render_snapshot(&presentation);
     assert_eq!(
         key_ops_line(&snapshot),
-        "key operations: SoftHSM's function table cannot be verified \
+        "key operations: libsofthsm2.so's function table cannot be verified \
          without --manifest; rerun with --manifest",
-        "the SoftHSM line names provider and rerun:\n{snapshot}"
+        "the SoftHSM line names the file and the rerun:\n{snapshot}"
     );
 }
 

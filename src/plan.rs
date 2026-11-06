@@ -1486,6 +1486,22 @@ impl AttachPlan {
         Ok(next)
     }
 
+    /// Shed every slot's argument-read authority ahead of counter
+    /// re-admission: descriptor, semantics and authorization back to
+    /// count-only, identities and names untouched. Counter captures
+    /// never read arguments, so a manifest-authorized discovery plan
+    /// converts losslessly. [`with_counters_policy`](Self::with_counters_policy)
+    /// keeps its preserving contract: a semantic plan handed to it
+    /// directly still fails Counters validation downstream.
+    pub(crate) fn demote_slots_to_count_only(&mut self) {
+        self.mutations.bump();
+        for slot in &mut self.slots {
+            slot.descriptor_index = 0;
+            slot.semantics = SlotSemantics::COUNT_ONLY;
+            slot.semantic_authorized = false;
+        }
+    }
+
     /// Restore the staged counter prefix on a freshly rebuilt plan, which
     /// always starts unconsumed. The caller passes the committed staged
     /// length (the directory high-water); lengths past the slots refuse.
@@ -7564,6 +7580,49 @@ mod tests {
             detailed.admission_policy(),
             AdmissionPolicy::Detailed
         ));
+    }
+
+    #[test]
+    fn counter_readmission_demotes_manifest_slots_before_policy_flip() {
+        // A Detailed discovery plan over manifest inputs carries
+        // semantic slots; counter re-admission must shed the
+        // argument-read authority (counters never read arguments)
+        // while keeping every slot's identity and names.
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Encrypt", 0x20)]);
+        let detailed =
+            build_from_test_sources_with_policy(&[], &[manifest], AdmissionPolicy::detailed());
+        assert!(
+            detailed.slots.iter().any(|slot| slot.descriptor_index != 0),
+            "precondition: the manifest discovery plan carries semantic slots"
+        );
+        let mut counters = detailed.clone();
+        counters.demote_slots_to_count_only();
+        for slot in &counters.slots {
+            assert_eq!(slot.descriptor_index, 0, "slot {} demoted", slot.index);
+            assert_eq!(slot.semantics, SlotSemantics::COUNT_ONLY);
+            assert!(
+                !slot.semantic_authorized,
+                "slot {} unauthorized",
+                slot.index
+            );
+        }
+        assert_eq!(
+            counters.slots.len(),
+            detailed.slots.len(),
+            "demotion keeps every slot"
+        );
+        for (before, after) in detailed.slots.iter().zip(counters.slots.iter()) {
+            assert_eq!(before.index, after.index);
+            assert_eq!(before.object, after.object);
+            assert_eq!(before.file_offset, after.file_offset);
+            assert_eq!(before.names, after.names, "names survive for selection");
+            assert_eq!(before.module_ids, after.module_ids);
+        }
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        let converted = counters.with_counters_policy(budget).unwrap();
+        converted
+            .validate_slot_index()
+            .expect("a demoted plan validates under Counters");
     }
 
     #[test]

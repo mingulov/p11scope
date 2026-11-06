@@ -30560,6 +30560,16 @@ impl Engine {
         ) {
             return Ok(());
         }
+        // Rebuilds lower Detailed plans, so a manifest-authorized
+        // slot would refuse the Counters policy below. Counters
+        // never read arguments: shed the authority first, keeping
+        // every slot's identity and names. The budget refuses
+        // before any mutation, so a refusal leaves the plan
+        // untouched.
+        budget
+            .validate_count(self.plan.slots.len())
+            .map_err(|refusal| anyhow!("{refusal}"))?;
+        self.plan.demote_slots_to_count_only();
         self.plan = self
             .plan
             .with_counters_policy(budget)
@@ -30745,6 +30755,16 @@ impl Engine {
                 .counter_mode()
                 .expect("counter spec implies counter policy");
             let budget = Self::counter_start_budget(mode, self.counter_preflight_cpus())?;
+            // Discovery lowers a Detailed plan, so manifest inputs
+            // arrive with argument-read authority the Counters
+            // policy refuses. Counters never read arguments: shed
+            // that authority first, keeping identities and names.
+            // The budget refuses before any mutation, so a refusal
+            // leaves the plan untouched.
+            budget
+                .validate_count(self.plan.slots.len())
+                .map_err(|refusal| anyhow!("{refusal}"))?;
+            self.plan.demote_slots_to_count_only();
             self.plan = self
                 .plan
                 .with_counters_policy(budget)

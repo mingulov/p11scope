@@ -1088,17 +1088,20 @@ conservatively instead of riding to the run end.
 ## Forwarding-layer entry totals (additive within v1)
 
 Top-level `layer_totals` (always present) splits entry counts:
-`logical_entries` (provider edges, counted once) and
-`forwarding_entries` (closure-array forwarding-layer edges, never
-summed into logical). An edge splits out only for callers that also
-entered a watched provider; closure-only callers' edges stay logical.
-One logical entry observed at both layers counts once, on its provider
-edge. `modules[].admission.class` names the forwarding layers
-(`closure_array`); consumers that sum entry counts must skip those
-modules' edges to count logical entries once, except for closure-only
-callers whose edges never split out. Layer-self-answered entries
-appear only in the forwarding split, and one layer entry reaching
-several providers counts at each.
+`logical_entries` (provider edges, plus the layer edges of callers with
+no entries at any non-closure module or with a refused backend, counted
+once) and `forwarding_entries` (closure-array forwarding-layer edges of
+provider-active callers without a refused backend, never summed into
+logical). An edge splits out only for callers that also entered a watched
+provider and have no refused backend; callers with no entries at any
+non-closure module, or with a refused backend, stay logical. One logical
+entry observed at both layers counts once, on its provider edge.
+`modules[].admission.class` names the forwarding layers (`closure_array`);
+consumers that sum entry counts must skip those modules' edges to count
+logical entries once, except for callers with no entries at any non-closure
+module, whose edges never split out. Layer-self-answered entries appear
+only in the forwarding split, and one layer entry reaching several providers
+counts at each.
 
 ## Example (abridged)
 

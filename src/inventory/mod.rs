@@ -8541,8 +8541,11 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         presentation,
     );
     // Additive (v1): logical vs forwarding-layer entry totals. Provider
-    // edges are logical; closure-array edges observe those same calls
-    // from the forwarding layer and are never summed into logical.
+    // edges, plus the layer edges of callers with no entries at any
+    // non-closure module or with a refused backend, are logical;
+    // closure-array edges of provider-active callers without a refused
+    // backend observe those same calls from the forwarding layer and are
+    // never summed into logical.
     {
         let (logical, forwarding) = crate::inventory_present::layer_entry_totals(presentation);
         document["layer_totals"] = serde_json::json!({

@@ -206,28 +206,31 @@ reserve-capped leading-templates prefix instead of published-only
 admission, because a remote client's tables are handed out before any
 export probe can observe the return.
 
-When a forwarding layer attaches beside an active provider below it —
-one that counted a call, an error, or an in-flight entry in the same
-capture (per caller in `inventory`) — every call-count headline total
-counts one logical call once, at its provider; the forwarding layer's
-own calls print on a separate `Forwarding layers counted separately`
-line (per layer) and never sum into the totals, and `inventory` prints
-the same split as `Forwarding-layer entries counted separately`. In
-JSON, every `functions[]` row carries `forwarding_layer` (true at the
-layer, false at providers) with top-level `layer_totals`
-(`logical`/`forwarding`); `inventory` carries `layer_totals`
-(`logical_entries`/`forwarding_entries`). Consumers that sum `calls`
-must skip `forwarding_layer` rows. With no active provider — a lone
-remote client, or providers attached but quiet — the layer's calls stay
-in the totals and no forwarding line prints. Calls the layer answers
-itself, including its errors, appear only in the forwarding line, and
-one layer call that reaches several providers counts at each;
-per-mechanism, per-session and per-login sections still observe both
-layers. Known limitation: a whole-admitted layer's own named rows plus
-its unknown stub rows can total ~2x the logical calls in the separate
-forwarding count; that intra-layer fan-out is shown, not deduplicated.
-Residual: in `--system` captures rows carry no caller, so the render
-gate applies capture-wide, and a misclassified provider beside another
+When a forwarding layer attaches beside any active attributed non-layer
+row — one with a non-null module that counted a call, an error, or an
+in-flight entry in the same capture (any caller flips the render gate
+capture-wide; per caller in `inventory`) — and no non-layer provider is
+refused, every call-count headline total counts one logical call once, at
+its provider; the forwarding layer's own calls print on a separate
+`Forwarding layers counted separately` line (per layer) and never sum into
+the totals, and `inventory` prints the same split as `Forwarding-layer
+entries counted separately`. In JSON, every `functions[]` row carries
+`forwarding_layer` (true at the layer, false at providers) with top-level
+`layer_totals` (`logical`/`forwarding`); `inventory` carries `layer_totals`
+(`logical_entries`/`forwarding_entries`). Consumers that sum `calls` must
+skip `forwarding_layer` rows. With no active attributed row — a lone remote
+client, providers attached but quiet, providers observed only through
+unattributed rows, or any refused backend — the layer's calls stay in the
+totals and no forwarding line prints. In live views the headline drops when
+the gate flips (a newly active provider moves the layer's calls to the
+forwarding line). Calls the layer answers itself, including its errors,
+appear only in the forwarding line, and one layer call that reaches several
+providers counts at each; per-mechanism, per-session and per-login sections
+still observe both layers. Known limitation: a whole-admitted layer's own
+named rows plus its unknown stub rows can total ~2x the logical calls in the
+separate forwarding count; that intra-layer fan-out is shown, not
+deduplicated. Residual: render rows carry no caller in any scope, so the
+render gate applies capture-wide, and a misclassified provider beside another
 active provider would still split out.
 
 The commands below begin with **passive diagnostics**. Without an accepted

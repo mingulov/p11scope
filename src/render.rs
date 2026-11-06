@@ -915,10 +915,11 @@ pub struct DiscoveredModule {
     #[serde(skip)]
     pub id: ModuleId,
     /// The deciding admission class label, renderer metadata like `id`:
-    /// `closure_array` marks a forwarding layer even when it was
-    /// admitted whole with no gap (counter/broad policies). Absent from
-    /// the schema; the JSON layer split travels in `functions[]` and
-    /// `layer_totals` instead.
+    /// `closure_array` marks a forwarding-layer candidate even when it was
+    /// admitted whole with no gap (counter/broad policies); the split
+    /// additionally needs an active attributed row and no refused backend.
+    /// Absent from the schema; the JSON layer split travels in `functions[]`
+    /// and `layer_totals` instead.
     #[serde(skip)]
     pub admission_class: Option<&'static str>,
     pub dev: (u64, u64),
@@ -2284,7 +2285,8 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
         if ev.discovery.modules.is_empty() {
             return "; no provider below it was captured".into();
         }
-        return "; the attached provider files counted 0 calls".into();
+        return "; no other attached provider counted calls; the layer's own calls stay in the totals"
+            .into();
     }
     let mut list: Vec<String> = providers
         .iter()
@@ -2312,12 +2314,16 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
 /// Identified structurally — never by path, name or vendor — from the
 /// deciding admission class first (this also catches whole-admitted
 /// closures under counter/broad policies, which carry no gap) and from
-/// the planner's closure gaps beside it. The split additionally needs a
-/// watched, attributed, active provider below the layer in the same
-/// capture: without one (a lone remote client, an unattached or quiet
-/// provider) the layer's calls are the only observation and stay
-/// logical, so the set is empty. Render rows carry no caller, so the
-/// gate applies capture-wide.
+/// the planner's closure gaps beside it. The split additionally needs any
+/// watched, attributed, active non-layer row in the same capture — not
+/// necessarily the provider below the layer, any active non-layer module
+/// flips the gate — and no refused (whole, non-closure) provider gap: a
+/// refused backend keeps the layer logical, since a disclosed overcount
+/// beats hiding the application's calls. Without an active attributed row
+/// (a lone remote client, a quiet provider, or backend rows observed only
+/// through unattributed rows) the layer's calls are the only attributed
+/// observation and stay logical, so the set is empty. Render rows carry no
+/// caller in any scope, so the gate applies capture-wide.
 fn forwarding_module_ids(
     ev: &Evidence,
     reports: &[SlotReport],
@@ -2339,6 +2345,13 @@ fn forwarding_module_ids(
         })
         .map(|module| module.id)
         .collect();
+    let backend_refused = ev.discovery.modules_skipped.iter().any(|skipped| {
+        !crate::plan::is_partial_coverage(&skipped.reason)
+            && !crate::plan::is_closure_array_refusal(&skipped.reason)
+    });
+    if backend_refused {
+        return std::collections::BTreeSet::new();
+    }
     let provider_active = reports.iter().any(|row| {
         row.module.is_some_and(|id| !candidates.contains(&id))
             && (row.calls > 0 || row.errors > 0 || row.in_flight > 0)
@@ -2539,7 +2552,8 @@ fn forwarding_layer_lines(
     format!(
         "Forwarding layers counted separately (not in the totals above): {}.\n\
          The totals above count calls at the attached providers; \
-         calls a layer answered itself, including its errors, appear only here, \
+         calls a layer answered itself or forwarded to a provider that was not attached, \
+         including its errors, appear only here, \
          and a layer call that reaches several providers counts at each.\n",
         layers.join("; ")
     )
@@ -2813,13 +2827,38 @@ pub fn live_scoped_with_verbosity(
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
         s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
         let forwarding = forwarding_module_ids(ev, reports);
-        // The name field fits the longest standard name plus the
-        // forwarding-layer marker, so marked rows keep the columns aligned.
-        s.push_str(&format!(
-            "{:<40} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            "FUNCTION", "PROVIDER", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
-        ));
+        // The name field fits the longest rendered name in this frame (min 28),
+        // so marked rows keep the columns aligned without fixed padding.
+        let mut rendered: Vec<(String, &SlotReport)> = Vec::with_capacity(rows.len());
         for r in rows {
+            let mut name = label(r);
+            if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
+                name.push_str(init.text_suffix());
+            }
+            if row_is_forwarding(r, &forwarding, &ev.discovery.modules) {
+                name.push_str(" (forwarding layer)");
+            }
+            rendered.push((escape_controls(&name).into_owned(), r));
+        }
+        let width = rendered
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0)
+            .max(28);
+        s.push_str(&format!(
+            "{:<w$} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+            "FUNCTION",
+            "PROVIDER",
+            "CALLS",
+            "ERR",
+            "p50~",
+            "p95~",
+            "p99~",
+            "IN-FLIGHT",
+            w = width
+        ));
+        for (name, r) in rendered {
             let percentiles = if r.mode.has_histogram() {
                 [
                     percentile_ns(&r.buckets, 0.50),
@@ -2829,23 +2868,17 @@ pub fn live_scoped_with_verbosity(
             } else {
                 [None; 3]
             };
-            let mut name = label(r);
-            if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
-                name.push_str(init.text_suffix());
-            }
-            if row_is_forwarding(r, &forwarding, &ev.discovery.modules) {
-                name.push_str(" (forwarding layer)");
-            }
             s.push_str(&format!(
-                "{:<40} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-                escape_controls(&name),
+                "{:<w$} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+                name,
                 provider_cell(r, &ev.discovery.modules),
                 r.calls,
                 r.errors,
                 fmt_ns(percentiles[0]),
                 fmt_ns(percentiles[1]),
                 fmt_ns(percentiles[2]),
-                r.in_flight
+                r.in_flight,
+                w = width
             ));
         }
     }

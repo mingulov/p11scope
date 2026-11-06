@@ -1439,7 +1439,7 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
 /// Closure-array (forwarding-layer) module ids, by admission class.
 /// Matches the planner's `closure_array` label and its hyphenated test
 /// spelling. The split set; whether an edge at one splits out is per
-/// caller ([`provider_active_callers`]).
+/// caller ([`provider_active_callers`], minus [`refused_backend_callers`]).
 fn closure_module_ids(presentation: &Presentation) -> std::collections::BTreeSet<ModuleId> {
     presentation
         .modules
@@ -1456,8 +1456,9 @@ fn closure_module_ids(presentation: &Presentation) -> std::collections::BTreeSet
 
 /// Callers with entries at a watched provider: an edge with
 /// `entry_count > 0` at a non-closure module. A closure edge splits to
-/// forwarding only for these callers; a closure-only caller's edges
-/// stay logical, since nothing below the layer observed them.
+/// forwarding only for these callers; a caller with no entries at any
+/// non-closure module stays logical, since nothing below the layer
+/// observed them.
 fn provider_active_callers(
     presentation: &Presentation,
     closure: &std::collections::BTreeSet<ModuleId>,
@@ -1470,25 +1471,56 @@ fn provider_active_callers(
         .collect()
 }
 
+/// Callers with a refused (non-closure) backend: an edge at a non-closure
+/// module whose admission is refused. A refused backend keeps the caller's
+/// layer edges logical — a disclosed overcount beats hiding the caller's
+/// calls — even when the caller also entered an unrelated active provider.
+fn refused_backend_callers(
+    presentation: &Presentation,
+    closure: &std::collections::BTreeSet<ModuleId>,
+) -> std::collections::BTreeSet<CallerId> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let admission: BTreeMap<ModuleId, AdmissionState> = presentation
+        .modules
+        .iter()
+        .map(|module| (module.id, module.admission))
+        .collect();
+    presentation
+        .edges
+        .iter()
+        .filter(|edge| {
+            !closure.contains(&edge.module)
+                && admission.get(&edge.module) == Some(&AdmissionState::Refused)
+        })
+        .map(|edge| edge.caller)
+        .collect::<BTreeSet<CallerId>>()
+}
+
 /// True when an edge's entries are forwarding-layer observations: the
-/// edge sits at a closure-array module and its caller also entered a
-/// watched provider, whose edge is the logical count.
+/// edge sits at a closure-array module, its caller also entered a watched
+/// provider (whose edge is the logical count), and the caller has no
+/// refused backend (which keeps the layer logical).
 fn edge_is_forwarding(
     edge: &EdgeView,
     closure: &std::collections::BTreeSet<ModuleId>,
     active: &std::collections::BTreeSet<CallerId>,
+    refused: &std::collections::BTreeSet<CallerId>,
 ) -> bool {
-    closure.contains(&edge.module) && active.contains(&edge.caller)
+    closure.contains(&edge.module)
+        && active.contains(&edge.caller)
+        && !refused.contains(&edge.caller)
 }
 
 /// Forwarding-layer (closure-array admission) modules with entries on
-/// their edges, each with its entry total. Provider edges are the
-/// logical totals and these stay separate, never summed in. Only
-/// edges of provider-active callers count here; a closure-only
-/// caller's edges stay logical (see [`provider_active_callers`]).
+/// their edges, each with its entry total. Provider edges, plus the layer
+/// edges of callers with no entries at any non-closure module, are the
+/// logical totals and these stay separate, never summed in. Only edges of
+/// provider-active callers without a refused backend count here (see
+/// [`provider_active_callers`] and [`refused_backend_callers`]).
 pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(String, u64)> {
     let closure = closure_module_ids(presentation);
     let active = provider_active_callers(presentation, &closure);
+    let refused = refused_backend_callers(presentation, &closure);
     let mut layers: Vec<(String, u64)> = presentation
         .modules
         .iter()
@@ -1498,7 +1530,8 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
                 .edges
                 .iter()
                 .filter(|edge| {
-                    edge.module == module.id && edge_is_forwarding(edge, &closure, &active)
+                    edge.module == module.id
+                        && edge_is_forwarding(edge, &closure, &active, &refused)
                 })
                 .map(|edge| edge.entry_count)
                 .fold(0u64, u64::saturating_add);
@@ -1516,16 +1549,18 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
 }
 
 /// Logical vs forwarding-layer entry totals over every edge. Provider
-/// edges are logical; closure-array edges of provider-active callers
-/// are forwarding observations of those same calls, and closure-only
-/// callers' edges stay logical.
+/// edges, plus the layer edges of callers with no entries at any
+/// non-closure module or with a refused backend, are logical;
+/// closure-array edges of provider-active callers without a refused
+/// backend are forwarding observations of those same calls.
 pub(crate) fn layer_entry_totals(presentation: &Presentation) -> (u64, u64) {
     let closure = closure_module_ids(presentation);
     let active = provider_active_callers(presentation, &closure);
+    let refused = refused_backend_callers(presentation, &closure);
     let mut logical = 0u64;
     let mut forwarding_entries = 0u64;
     for edge in &presentation.edges {
-        if edge_is_forwarding(edge, &closure, &active) {
+        if edge_is_forwarding(edge, &closure, &active, &refused) {
             forwarding_entries = forwarding_entries.saturating_add(edge.entry_count);
         } else {
             logical = logical.saturating_add(edge.entry_count);
@@ -2130,7 +2165,7 @@ fn render_snapshot_inner(
             let _ = writeln!(
                 out,
                 "Forwarding-layer entries counted separately (not independent calls): {}. \
-                 Provider edges are the logical totals; \
+                 Provider edges, plus the layer edges of callers that entered no watched provider, are the logical totals; \
                  entries a layer answered itself appear only here, \
                  and a layer entry that reaches several providers counts at each.",
                 parts.join("; ")

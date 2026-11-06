@@ -1339,6 +1339,75 @@ mod tests {
         }
     }
 
+    /// The self-probe attaches through an uprobe-multi link, never through
+    /// `perf_event_open`: the paranoid sysctl gates per-probe uprobes
+    /// (CAP_SYS_ADMIN at 3+), while BPF links need only CAP_BPF. The load
+    /// site flags the program multi-capable and the attach site creates
+    /// one child-filtered return link; either site regressing to the perf
+    /// path reintroduces the CAP_SYS_ADMIN need. Fails while the load
+    /// still uses `load()` or the attach still uses `UProbe::attach`.
+    #[test]
+    fn the_self_probe_attaches_through_uprobe_multi() {
+        fn contract(source: &str) -> std::result::Result<(), String> {
+            fn body<'a>(source: &'a str, signature: &str) -> std::result::Result<&'a str, String> {
+                source
+                    .split_once(signature)
+                    .ok_or_else(|| format!("{signature} not found"))?
+                    .1
+                    .split_once("\n}\n")
+                    .map(|(body, _)| body)
+                    .ok_or_else(|| format!("{signature} body end not found"))
+            }
+            let load = body(
+                source,
+                "#[cfg(target_arch = \"x86_64\")]\nfn probe_kernel_inner()",
+            )?;
+            if !load.contains("load_multi()") {
+                return Err("self-probe load lacks load_multi()".to_string());
+            }
+            if load.contains("program.load()") {
+                return Err("self-probe load still uses the perf-compatible load".to_string());
+            }
+            let attach = body(source, "fn probe_parent(")?;
+            for marker in [
+                "attach_group(",
+                "SELF_PROBE_PROGRAM",
+                "ProbeKind::Return",
+                "child",
+            ] {
+                if !attach.contains(marker) {
+                    return Err(format!("self-probe attach lacks {marker}"));
+                }
+            }
+            for forbidden in [".attach(", "UProbeScope", "UProbeAttachPoint", "perf_event"] {
+                if attach.contains(forbidden) {
+                    return Err(format!("self-probe attach still uses {forbidden}"));
+                }
+            }
+            Ok(())
+        }
+
+        let source = include_str!("uretprobe_hazard.rs");
+        contract(source).unwrap();
+        for (original, replacement, role) in [
+            (
+                "program.load_multi()",
+                "program.load()",
+                "self-probe load lacks load_multi()",
+            ),
+            (
+                "attach_group(",
+                "program.attach(",
+                "self-probe attach lacks attach_group(",
+            ),
+        ] {
+            let mutant = source.replacen(original, replacement, 1);
+            assert_ne!(mutant, source, "{role} mutation changes production source");
+            let error = contract(&mutant).expect_err("the changed path must be rejected");
+            assert!(error.contains(role), "{role}: {error}");
+        }
+    }
+
     /// `SELF_PROBE_PROGRAM` must name a real `uretprobe`-section program
     /// in the embedded object: aya derives return-vs-entry attach from the
     /// ELF section, and only a real return trampoline exercises the hazard

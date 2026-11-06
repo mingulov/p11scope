@@ -605,13 +605,59 @@ fn apply_isolated_with(
     seccomp()
 }
 
-/// Apply the isolated fence: the architecture gate, then Landlock, then
-/// seccomp. `out` is the full `-o` path, or `None` for stdout output
-/// (the whole tree stays read-only). The `-o` parent must be a dedicated
-/// directory, opened once and checked on the same descriptor the Landlock
-/// rule is built on. On success the caller may load the provider; on
-/// failure it must exit before `dlopen` — provider code never runs.
+/// The calling context the fence requires. Landlock `restrict_self`
+/// and seccomp fence only the calling thread, and both need
+/// `no_new_privs` for unprivileged use — so the fence is applied only by
+/// a single-threaded, non-root, no-new-privs caller, never by whatever
+/// thread happens to call it after a fork or a dropped guard.
+struct FenceContext {
+    no_new_privs: libc::c_int,
+    euid: libc::uid_t,
+    threads: u32,
+}
+
+fn read_fence_context() -> Result<FenceContext, String> {
+    let no_new_privs = unsafe { libc::prctl(libc::PR_GET_NO_NEW_PRIVS, 0, 0, 0, 0) };
+    if no_new_privs < 0 {
+        return Err(os_error("isolated profile: cannot read no_new_privs"));
+    }
+    let euid = unsafe { libc::geteuid() };
+    let status = std::fs::read_to_string("/proc/self/status")
+        .map_err(|error| format!("isolated profile: cannot read /proc/self/status: {error}"))?;
+    let threads = status
+        .lines()
+        .find_map(|line| line.strip_prefix("Threads:"))
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .ok_or_else(|| "isolated profile: cannot count process threads".to_string())?;
+    Ok(FenceContext {
+        no_new_privs,
+        euid,
+        threads,
+    })
+}
+
+fn check_fence_context(context: &FenceContext) -> Result<(), String> {
+    if context.no_new_privs != 1 {
+        return Err("isolated profile: refusing to fence without no_new_privs".into());
+    }
+    if context.euid == 0 {
+        return Err("isolated profile: refusing to fence as root".into());
+    }
+    if context.threads != 1 {
+        return Err("isolated profile: refusing to fence a multithreaded process".into());
+    }
+    Ok(())
+}
+
+/// Apply the isolated fence: the caller-context check, then the
+/// architecture gate, then Landlock, then seccomp. `out` is the full
+/// `-o` path, or `None` for stdout output (the whole tree stays
+/// read-only). The `-o` parent must be a dedicated directory, opened
+/// once and checked on the same descriptor the Landlock rule is built
+/// on. On success the caller may load the provider; on failure it must
+/// exit before `dlopen` — provider code never runs.
 pub fn apply_isolated(out: Option<&Path>) -> Result<(), String> {
+    check_fence_context(&read_fence_context()?)?;
     apply_isolated_with(
         cfg!(target_arch = "x86_64"),
         out,
@@ -1017,6 +1063,61 @@ mod tests {
                 "arch {arch:#x} escapes the gate"
             );
         }
+    }
+
+    #[test]
+    fn fence_context_checks_reject_every_weak_caller() {
+        // Landlock `restrict_self` and seccomp fence only the calling
+        // thread and need `no_new_privs`: anything else refuses.
+        let weak = [
+            (
+                FenceContext {
+                    no_new_privs: 0,
+                    euid: 1000,
+                    threads: 1,
+                },
+                "no_new_privs",
+            ),
+            (
+                FenceContext {
+                    no_new_privs: 1,
+                    euid: 0,
+                    threads: 1,
+                },
+                "root",
+            ),
+            (
+                FenceContext {
+                    no_new_privs: 1,
+                    euid: 1000,
+                    threads: 2,
+                },
+                "multithreaded",
+            ),
+        ];
+        for (context, cause) in weak {
+            let error = check_fence_context(&context).unwrap_err();
+            assert!(
+                error.starts_with("isolated profile: refusing to fence"),
+                "{cause}: {error}"
+            );
+        }
+        assert!(
+            check_fence_context(&FenceContext {
+                no_new_privs: 1,
+                euid: 1000,
+                threads: 1,
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn fence_context_reads_the_calling_process() {
+        let context = read_fence_context().unwrap();
+        assert_eq!(context.euid, unsafe { libc::geteuid() });
+        assert!(context.threads >= 1, "a process has at least one thread");
+        assert!(context.no_new_privs == 0 || context.no_new_privs == 1);
     }
 
     #[test]

@@ -580,7 +580,9 @@ still waiting for its pause cycle when the capture ends is reported as
 after resuming the child, so a later loader hit is paused like any other;
 each incomplete cycle stays a counted partial attempt while the chain
 continues, and four straight incompletes retire the chain with a counted
-named gap. Under `--pause always` the run fails instead: no profile
+named gap (the retirement count is
+`evidence.pause_engine_incomplete_retirements`). Under `--pause always`
+the run fails instead: no profile
 report is published (a trace `-o` stream keeps only the lines already
 written), and a `--duration` child is terminated rather than handed back. A
 signal that lands inside an active pause cycle (which has a 500 ms deadline)

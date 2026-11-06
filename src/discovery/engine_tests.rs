@@ -3896,6 +3896,15 @@ fn awaiting_layer_seed_from_real_export_collects_and_stays_terminal() {
     assert!(collected.required_seed_complete);
     assert_eq!(collected.count_only_seeds.len(), 1);
     assert_eq!(collected.count_only_seeds[0].object, object);
+    let mut owners = candidate
+        .plan
+        .modules
+        .iter()
+        .filter(|module| module.object == collected.count_only_seeds[0].object);
+    assert!(
+        owners.next().is_none(),
+        "the awaiting seed has no plan owner: it takes the seed loop's ownerless branch"
+    );
     assert!(
         seed_without_owner_is_terminal(&candidate, &collected.count_only_seeds[0]),
         "the awaiting layer's real seed is terminal"
@@ -14346,6 +14355,7 @@ fn evidence_verdict(
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -34587,6 +34597,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,

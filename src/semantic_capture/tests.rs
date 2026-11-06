@@ -7439,6 +7439,7 @@ mod b17_wire_projection {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,

@@ -5920,6 +5920,9 @@ fn capture_profile(
                 engine.pinned().provider_changed(),
                 profile,
                 owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                owned
+                    .as_deref()
+                    .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
                 owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
                 scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
@@ -6623,6 +6626,10 @@ fn capture_profile(
                 .2
                 .as_deref()
                 .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+            context
+                .2
+                .as_deref()
+                .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
             context.2.as_deref().map(|owned| owned.still_running),
             capture_tracking_degraded,
             consumers
@@ -7483,39 +7490,42 @@ fn capture_trace(
                         .scheduling
                         .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
                     consumers.scheduling.sync_tail_stats(context.0);
-                    let mut evidence = evidence_for(
-                        context.0,
-                        context.0.capture_facts(),
-                        context.1.attached_probes(),
-                        context.1.dynamic_per_offset_attached(),
-                        context.1.static_multi_attached(),
-                        context.1.attach_backend_evidence(),
-                        context.1.object_capture_evidence(),
-                        context.1.attach_failures(),
-                        &reports,
-                        terminal_kernel,
-                        consumers.tracker.evidence(),
-                        *consumers.malformed_records,
-                        consumers.state,
-                        context.0.pinned().provider_changed(),
-                        true,
-                        context
-                            .2
-                            .as_deref()
-                            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
-                        context.2.as_deref().map(|owned| owned.still_running),
-                        capture_tracking_degraded,
-                        consumers
-                            .scheduling
-                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-                        uretprobe_override.clone(),
-                        context
-                            .2
-                            .as_deref()
-                            .and_then(|owned| owned.still_running.then_some(owned.pid)),
-                        None,
-                        context.1.unpublished_mechanisms(),
-                    );
+                    let mut evidence =
+                        evidence_for(
+                            context.0,
+                            context.0.capture_facts(),
+                            context.1.attached_probes(),
+                            context.1.dynamic_per_offset_attached(),
+                            context.1.static_multi_attached(),
+                            context.1.attach_backend_evidence(),
+                            context.1.object_capture_evidence(),
+                            context.1.attach_failures(),
+                            &reports,
+                            terminal_kernel,
+                            consumers.tracker.evidence(),
+                            *consumers.malformed_records,
+                            consumers.state,
+                            context.0.pinned().provider_changed(),
+                            true,
+                            context.2.as_deref().map_or_else(Default::default, |owned| {
+                                owned.coordinator.counters()
+                            }),
+                            context.2.as_deref().map_or(0, |owned| {
+                                owned.coordinator.engine_incomplete_retirements()
+                            }),
+                            context.2.as_deref().map(|owned| owned.still_running),
+                            capture_tracking_degraded,
+                            consumers
+                                .scheduling
+                                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                            uretprobe_override.clone(),
+                            context
+                                .2
+                                .as_deref()
+                                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                            None,
+                            context.1.unpublished_mechanisms(),
+                        );
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();
@@ -8962,6 +8972,7 @@ pub(crate) fn evidence_for(
     provider_changed: bool,
     include_selection: bool,
     pause: crate::discovery::pause::PauseCounters,
+    pause_engine_incomplete_retirements: u64,
     child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
     scheduling: render::SchedulingEvidence,
@@ -9078,6 +9089,7 @@ pub(crate) fn evidence_for(
         pause_confirmed: pause.confirmed,
         pause_partial: pause.partial,
         pause_unavailable: pause.unavailable,
+        pause_engine_incomplete_retirements,
         child_still_running,
         discovery_ring_loss,
         discovery_state_failures,
@@ -9166,6 +9178,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         false,
         true,
         Default::default(),
+        0,
         None,
         false,
         render::SchedulingEvidence::default(),
@@ -10083,6 +10096,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,
@@ -17773,6 +17787,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,
@@ -19801,6 +19816,7 @@ mod tests {
                 false,
                 include_selection,
                 Default::default(),
+                0,
                 None,
                 false,
                 render::SchedulingEvidence::default(),
@@ -19862,8 +19878,8 @@ mod tests {
         let state = semantics::State::new(engine.plan());
         let mut facts = engine.capture_facts();
         facts.loader_discovery.hits = 17;
-        for (pause, status, unprotected) in [
-            (PauseCounters::default(), "none", 1),
+        for (pause, status, unprotected, retirements) in [
+            (PauseCounters::default(), "none", 1, 0),
             (
                 PauseCounters {
                     attempts: 5,
@@ -19872,6 +19888,7 @@ mod tests {
                     unavailable: 0,
                 },
                 "sigstop",
+                0,
                 0,
             ),
             (
@@ -19882,6 +19899,7 @@ mod tests {
                     unavailable: 0,
                 },
                 "partial",
+                1,
                 1,
             ),
         ] {
@@ -19905,6 +19923,7 @@ mod tests {
                     false,
                     true,
                     pause,
+                    retirements,
                     child_still_running,
                     false,
                     render::SchedulingEvidence::default(),
@@ -19942,6 +19961,7 @@ mod tests {
                     assert_eq!(document["pause_attempts"], pause.attempts);
                     assert_eq!(document["pause_confirmed"], pause.confirmed);
                     assert_eq!(document["pause_partial"], pause.partial);
+                    assert_eq!(document["pause_engine_incomplete_retirements"], retirements);
                     match child_still_running {
                         Some(running) => {
                             assert_eq!(document["child_still_running"], running);
@@ -19980,6 +20000,7 @@ mod tests {
                 false,
                 true,
                 PauseCounters::default(),
+                0,
                 None,
                 false,
                 render::SchedulingEvidence::default(),
@@ -20022,6 +20043,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             render::SchedulingEvidence::default(),
@@ -20078,6 +20100,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             true,
             render::SchedulingEvidence::default(),

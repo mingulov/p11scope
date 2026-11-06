@@ -12401,6 +12401,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -12660,6 +12661,7 @@ fn the_capture_loop_consumer_map_is_frozen() {
         "pause_confirmed: pause.confirmed",
         "pause_partial: pause.partial",
         "pause_unavailable: pause.unavailable",
+        "pause_engine_incomplete_retirements,",
     ] {
         assert!(evidence.contains(marker), "consumer map lost {marker:?}");
     }
@@ -12696,6 +12698,10 @@ fn the_capture_loop_consumer_map_is_frozen() {
                     ".map_or_else(Default::default, |owned| owned.coordinator.counters())"
                 ),
                 "{mode} coordinator counter source"
+            );
+            assert!(
+                args.contains("owned.coordinator.engine_incomplete_retirements()"),
+                "{mode} coordinator retirement source"
             );
             assert!(
                 args.contains(".as_deref().map(|owned| owned.still_running)"),

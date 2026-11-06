@@ -700,6 +700,13 @@ always` degrades that collected unpaused instead of aborting. Each forces
 `PARTIAL` via the `pause_unavailable` gap cause; `evidence.pause` reads
 `partial` when either `pause_partial` or `pause_unavailable` is nonzero.
 
+`evidence.pause_engine_incomplete_retirements` (integer, required, default
+0) counts `--pause auto` chains that retired after four straight
+engine-incomplete cycles. Each retirement is already one counted
+`pause_partial`; the count is a subset annotation (never above
+`pause_partial`), so JSON consumers can tell a retired chain from
+scattered partials.
+
 ## Migration
 
 Consumers must migrate live profile dispatch from

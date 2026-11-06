@@ -968,6 +968,7 @@ mod tests {
             pause_confirmed: 0,
             pause_partial: 0,
             pause_unavailable: 0,
+            pause_engine_incomplete_retirements: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,

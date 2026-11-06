@@ -1094,6 +1094,11 @@ pub struct Evidence {
     /// `--pause always` degrades that collected unpaused instead of
     /// aborting (never-stop). Each forces `PARTIAL`.
     pub pause_unavailable: u64,
+    /// Engine-incomplete cap retirements: `--pause auto` chains that
+    /// ended after four straight incomplete cycles. Each is already one
+    /// counted `pause_partial`; this count is a subset annotation, not
+    /// a lattice member.
+    pub pause_engine_incomplete_retirements: u64,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -4020,6 +4025,7 @@ pub(crate) mod tests {
             pause_confirmed: 0,
             pause_partial: 0,
             pause_unavailable: 0,
+            pause_engine_incomplete_retirements: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,

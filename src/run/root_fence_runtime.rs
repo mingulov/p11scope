@@ -226,6 +226,7 @@ fn document(
         engine.pinned().provider_changed(),
         true,
         Default::default(),
+        0,
         None,
         initial_tracking_evidence(
             scope,

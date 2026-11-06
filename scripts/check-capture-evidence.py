@@ -448,7 +448,11 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "attached_probes",
     "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
-    *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
+    *PAUSE_COUNTERS,
+    # Subset annotation, not a lattice member: each retirement is already
+    # one counted pause_partial. Kept out of PAUSE_COUNTERS on purpose.
+    "pause_engine_incomplete_retirements",
+    "loader_discovery", "templates_truncated", "provider_changed",
     "scheduling",
     "completeness",
     *RESIDUAL_EVIDENCE_KEYS,
@@ -2655,6 +2659,7 @@ PUBLISHED_LOADER_PAUSE_FIELDS = {
     # run lane and to `child_still_running`.
     "handoff_child_pid",
     *PAUSE_COUNTERS,
+    "pause_engine_incomplete_retirements",
 }
 
 
@@ -2780,6 +2785,12 @@ def exact_live_discovery_evidence(evidence, *, run=False):
     require(
         confirmed + partial + unavailable == attempts,
         f"pause counters do not add up: {attempts} != {confirmed} + {partial} + {unavailable}",
+    )
+    retirements = evidence["pause_engine_incomplete_retirements"]
+    require(u64(retirements), f"pause_engine_incomplete_retirements: {retirements!r}")
+    require(
+        retirements <= partial,
+        f"retirements are counted partials: {retirements} > {partial}",
     )
     # The published value is exactly the lattice, never an independent label.
     wanted = (
@@ -3773,8 +3784,9 @@ def validate_canary(lane, document, target_bits=64):
             require(
                 (evidence["pause"], evidence["pause_attempts"],
                  evidence["pause_confirmed"], evidence["pause_partial"],
-                 evidence["pause_unavailable"])
-                == ("none", 0, 0, 0, 0),
+                 evidence["pause_unavailable"],
+                 evidence["pause_engine_incomplete_retirements"])
+                == ("none", 0, 0, 0, 0, 0),
                 "owned metrics requires exact never-pause evidence",
             )
     elif policy == "object":
@@ -4159,6 +4171,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "attach_gap_ms": None,
         "pause": "none",
         **{name: 0 for name in PAUSE_COUNTERS},
+        "pause_engine_incomplete_retirements": 0,
         "loader_discovery": loader_discovery_fixture(),
         **{name: 0 for name in COUNTERS},
         # A fixture is self-consistent: a module only the manifest described is

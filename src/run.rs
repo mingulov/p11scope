@@ -990,6 +990,8 @@ impl ChildIdentity {
         // rather than truncating the name.
         let bytes = std::os::unix::ffi::OsStrExt::as_bytes(user);
         let record = if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) {
+            // Like `from_ids`, uid 2^32-1 is no account: `setresuid(-1)`
+            // would be a silent no-change, so refuse before any lookup.
             let uid: libc::uid_t = bytes
                 .iter()
                 .fold(0u64, |acc, digit| {
@@ -997,13 +999,16 @@ impl ChildIdentity {
                         .saturating_add(u64::from(digit - b'0'))
                 })
                 .try_into()
-                .map_err(|_| unknown())?;
+                .map_err(|_| unknown())
+                .and_then(|uid: libc::uid_t| {
+                    (uid != u32::MAX).then_some(uid).ok_or_else(unknown)
+                })?;
             (probes.passwd)(uid).filter(|record| record.uid == uid)
         } else {
             (probes.passwd_by_name)(user)
         };
         let record = record
-            .filter(|record| !record.name.is_empty())
+            .filter(|record| !record.name.is_empty() && record.uid != u32::MAX)
             .ok_or_else(unknown)?;
         let session = finish_account_session(record.uid, &record, probes).ok_or_else(|| {
             io::Error::new(

@@ -24901,3 +24901,71 @@ fn joint_machine_idle_fresh_birth_finish_with_waiting_caller_is_clean() {
         "the idle caller has nothing staged to count"
     );
 }
+
+/// Observer-first twin of the idle fresh birth: the caller is born
+/// from its exec marker (not a late attach) but is seen only through
+/// a non-key record and then stays idle. Its fresh seal has no staged
+/// history of its own, so it must wait as future input exactly like
+/// the late-attach case: the frame publishes and the lane-wide bound
+/// never trips.
+#[test]
+fn joint_machine_observer_first_exec_birth_idle_waits_as_future_input() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    // predating_births stays false: the exec stamp equals the sealed
+    // generation, so a marked birth is ExecMarker.
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        held.io
+            .enqueue(std::process::id(), 0, "C_CreateObject", 0, 0);
+        let mut record = held.io.script.records.pop_back().unwrap();
+        record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+        record.base.event.duration_ns = 1;
+        record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        assert_ne!(record.base.event.pid_tgid as u32, 0);
+        assert_eq!(
+            record.base.event.target_function,
+            p11scope_ebpf_common::FUNCTION_NONE
+        );
+        let bytes = crate::events::record_bytes(&record.base);
+        drop(held);
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::ExecMarker)),
+        "precondition: the caller is born from its exec marker: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the observer-first idle birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(7),
+    ));
+    for n in 0..64 {
+        if let Err(reason) = fixture.service(1) {
+            panic!("idle poll {n} past the bound must not stop the lane: {reason:?}");
+        }
+    }
+    assert!(audit_no_progress_gaps(&fixture).is_empty(), "no stop gap");
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}

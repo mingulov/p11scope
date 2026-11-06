@@ -22269,6 +22269,147 @@ fn overflowing_export_cookie_id_refuses_dynamic_work_with_partial_evidence() {
 }
 
 #[test]
+fn seed_for_unadmitted_closure_skips_the_owner_check() {
+    // A proxy closure array awaiting publication is deliberately
+    // unadmitted (0 published tables): its C_GetFunctionList seed can
+    // hook nothing, and the closure gap already discloses the
+    // non-coverage. The seed must skip benignly instead of failing the
+    // batch (which would kill pause protection for the whole capture).
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert!(plan.slots.is_empty(), "the closure takes no slot");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "the skip names the awaiting closure: {}",
+        plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: closure.path.clone(),
+        file_offset: 60384,
+    };
+    assert!(
+        seed_object_is_unadmitted_closure(&plan, &seed),
+        "the closure seed skips benignly"
+    );
+}
+
+#[test]
+fn seed_for_admitted_provider_keeps_the_owner_check() {
+    // The downgrade applies only to deliberately unadmitted objects:
+    // a seed for an admitted provider module keeps the exact owner
+    // requirement.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
+    let mut engine = Engine::empty();
+    let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(
+            candidate_pins,
+            vec![closure.clone(), provider.clone()],
+            skipped,
+        )
+        .expect("the provider beside the closure rebuilds");
+    let provider_object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert!(
+        candidate
+            .plan
+            .modules
+            .iter()
+            .any(|summary| summary.object == provider_object),
+        "the provider is admitted"
+    );
+    let seed = CountOnlySeedWork {
+        object: provider_object,
+        object_path: provider.path.clone(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&candidate.plan, &seed),
+        "an admitted provider seed keeps the owner check"
+    );
+}
+
+#[test]
+fn seed_for_unknown_or_refused_object_keeps_the_owner_check() {
+    // Unknown objects and non-closure refusals (capacity, safety)
+    // still fail: only the awaiting-publication closure downgrades.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let mut plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let unknown = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: "/opt/unknown-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&plan, &unknown),
+        "an unknown object keeps the owner check"
+    );
+    plan.modules_skipped.push(crate::discovery::scan::Skipped {
+        subject: "/opt/capped-provider.so".to_string(),
+        reason: "module needs 5 more; only 3 attach slots are available".to_string(),
+    });
+    let refused = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: "/opt/capped-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&plan, &refused),
+        "a non-closure refusal keeps the owner check"
+    );
+}
+
+#[test]
 fn expired_deadline_names_live_export_snapshot_refusal() {
     let (_fixture, _view, module, pins) = loaded_seed_provider();
     let mut engine = Engine::empty();

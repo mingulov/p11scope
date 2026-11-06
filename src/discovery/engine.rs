@@ -5027,6 +5027,25 @@ struct CollectedExportWork {
     required_seed_complete: bool,
 }
 
+/// Whether a count-only seed names a proxy closure array awaiting
+/// publication: deliberately unadmitted (0 published tables), so the
+/// seed can hook nothing. Skipping such a seed is benign — the closure
+/// gap already discloses the non-coverage — while failing the batch
+/// over it would kill pause protection for the whole capture (a
+/// short-lived tool then captures 0 calls). Anything else (admitted
+/// providers, unknown objects, non-closure refusals) keeps the exact
+/// owner requirement.
+fn seed_object_is_unadmitted_closure(plan: &plan::AttachPlan, seed: &CountOnlySeedWork) -> bool {
+    !plan
+        .modules
+        .iter()
+        .any(|module| module.object == seed.object)
+        && plan.modules_skipped.iter().any(|skipped| {
+            skipped.subject == seed.object_path
+                && plan::is_closure_awaiting_publication(&skipped.reason)
+        })
+}
+
 /// One queued record envelope: move-only, so each record crosses dispatch
 /// through exactly one owned envelope. The payload (`DiscoveryRecord`, a
 /// frozen `Copy` ABI type) is still read by value for field checks, but a
@@ -7418,7 +7437,10 @@ fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
 /// incomplete work. Keyed on the merge-time refusal kind and the exact
 /// object — rewording the gap text cannot change this decision.
 fn seed_without_owner_is_terminal(candidate: &LiveCandidate, seed: &CountOnlySeedWork) -> bool {
+    // Either source proves an awaiting-publication closure: the typed
+    // refusal kind, or the skip record's own subject and reason.
     candidate.plan.object_awaits_publication(seed.object)
+        || seed_object_is_unadmitted_closure(&candidate.plan, seed)
 }
 
 /// Placement of one count-only seed against the candidate plan: the

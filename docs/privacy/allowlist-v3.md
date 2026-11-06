@@ -73,24 +73,46 @@ provider export, readable pointer, equal path/hash, scan result, or successful
 return alone is insufficient. Ambiguous slots remain count-only.
 Public inventory must retain modules and callers when semantics are withheld.
 
-Semantic authority comes from exactly one of two sources:
+Semantic authority comes from exactly one of three sources:
 
 - an operator-attested claim (`--manifest`), as before; or
-- a scan-derived claim, only in `inventory --key-operations` runs started
-  without a manifest (the explicit key-operations opt-in), and only for a
-  scanned function table that meets every condition: its publication is
-  proved by standard interface linkage (`C_GetInterfaceList` /
-  `C_GetInterface` naming the table) or by a live function-list return —
-  export-name agreement alone never grants it; and every required key lives
-  in the provider's own object (a provider whose table entries point into
-  another object, such as the p11-kit trust shim, is refused). A non-full
-  walk or an unpinned affecting entry refuses the provider whole; a rival,
-  aliased or degraded entry, including one reached only through an
-  exports-only table, stays count-only at that entry, with no argument reads
-  there.
+- a scan-derived publication-proved claim, only in `inventory --key-operations`
+  runs started without a manifest (the explicit key-operations opt-in), and
+  only for a scanned function table that meets every condition: its
+  publication is proved by standard interface linkage (`C_GetInterfaceList` /
+  `C_GetInterface` naming the table), by a live function-list return, or by
+  manifest corroboration — export-name agreement alone never grants it; and
+  every required key lives in the provider's own object (a provider whose
+  table entries point into another object, such as the p11-kit trust shim,
+  is refused). A non-full walk or an unpinned affecting entry refuses the
+  provider whole; a rival, aliased or degraded entry, including one reached
+  only through an exports-only table, stays count-only at that entry, with
+  no argument reads there; or
+- a scan-derived sole-complete-table claim, only in the same no-manifest
+  `inventory --key-operations` opt-in, and only when every condition holds
+  together: (a) the provider object holds exactly one function-table
+  candidate (no rival, aliased or degraded second candidate, including no
+  exports-only second table, and no vendor or opaque interface claiming
+  this table's layout); (b) that table's published walk is full with a
+  version-consistent 2.x 68-slot layout (a 3.x label with a proven complete
+  68-slot legacy prefix counts as full; any other walk, version or slot
+  count refuses), with a complete export witness and no 3.x interface
+  getter; (c) every slot is either NULL (an unimplemented function, which
+  gets no probe and no argument reads) or resolves to code inside the
+  provider's own executable mapping, with every 2.x key-operation entry
+  the decoder reads non-NULL and in own code (`C_CreateObject`,
+  `C_CopyObject`, `C_DestroyObject`, `C_GetObjectSize`,
+  `C_GetAttributeValue`, `C_SetAttributeValue`, `C_FindObjects`,
+  `C_EncryptInit`, `C_DecryptInit`, `C_DigestKey`, `C_SignInit`,
+  `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
+  `C_GenerateKey`, `C_GenerateKeyPair`, `C_WrapKey`, `C_UnwrapKey`,
+  `C_DeriveKey`, `C_SetOperationState`); (d) the object exports
+  `C_GetFunctionList`; (e) the provider is not a forwarding layer under
+  the Route A classification (a single load, not a closure array).
+  Anything else stays refused as today.
 
 Every other scan result, including every ordinary (non-`--key-operations`)
-capture, stays count-only. The read set is the same in both sources: a
+capture, stays count-only. The read set is the same in all sources: a
 scan-derived claim never adds a field, an argument or a read beyond the rows
 below; it only replaces the operator attestation as the source of the
 function/offset claim, and the run discloses it as the

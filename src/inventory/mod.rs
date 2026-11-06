@@ -11609,6 +11609,117 @@ mod tests {
     }
 
     #[test]
+    fn text_module_detail_omits_unidentified_use_for_identified_caller_rows() {
+        use crate::discovery::caller_registry::tests::ScriptedSource;
+        let source = ScriptedSource::default();
+        source.spawn(7, 500);
+        source.spawn(8, 600);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let bound = coordinator
+            .adapter_mut()
+            .admit(7, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let mapped = coordinator
+            .adapter_mut()
+            .admit(8, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        // The module registers through the mapped caller only, so the
+        // bound caller's witness row has no mapping edge to it: its
+        // caller is identified and the gap names it.
+        coordinator.registry_mut().note_mapping(
+            mapped,
+            8,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator
+            .registry_mut()
+            .note_bound_witness(bound, vec![key], 110);
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_mapping_edge": 1}),
+            "identified-caller row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        assert_eq!(document["modules"][0]["unbound_use"]["entries"], 0);
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(text.contains("/lib/a.so"), "module detail renders:\n{text}");
+        assert!(
+            !text.contains("unidentified use"),
+            "identified-caller rows are not unidentified use:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_module_detail_omits_unidentified_use_for_a_zero_entry_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // An unbound row that held no entries at drop: the record exists
+        // but its lower bound carries no information.
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            0,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_live_caller": 1}),
+            "unbound row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unidentified use"),
+            "a zero lower bound states nothing:\n{text}"
+        );
+    }
+
+    #[test]
     fn the_stop_line_reads_as_one_sentence() {
         let line = stop_line(&lane_summary(
             crate::inventory_capture::Retirement::Unsettled("budget passed".into()),

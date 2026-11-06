@@ -190,6 +190,81 @@ fn d3b_owned_installation_reads_only_while_custody_is_live() {
     assert!(!session.scope.ready());
 }
 
+/// A nested install runs only the anchor program, which never reads the
+/// scope bitmap, and every nested target run re-establishes the
+/// permissive bitmap before reading: the install must skip the
+/// selective write (a full clear plus refill, ~131k bpf syscalls,
+/// inside the witness deadline) while still authorizing the anchor run.
+#[test]
+fn nested_install_skips_the_selective_scope_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "held.so");
+    let mut custody = custody(1, BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, file));
+    let pins = PinnedObjects::empty();
+    let pass = AnchorPass::prepare(&pins, [], custody);
+    let mut session = fixture_session();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (ready, words) = crate::pidns::test_seam::with_numbering(
+        crate::pidns::test_seam::nested(),
+        || {
+            let installed = session
+                .install_anchors(pass, 1, deadline)
+                .expect("a nested install authorizes its anchor run");
+            let ready = installed.session.scope.ready();
+            let words = match &installed.session.object {
+                SessionObject::Fixture { scope_words, .. } => scope_words.borrow().clone(),
+                SessionObject::Kernel(_) => panic!("a fixture session lost its object"),
+            };
+            drop(installed);
+            (ready, words)
+        },
+    );
+    assert!(
+        ready,
+        "a write-less install must still authorize the anchor run"
+    );
+    assert!(
+        words.is_empty(),
+        "a nested install wrote scope: {words:?}"
+    );
+}
+
+/// The agreed-numbering twin: a non-nested install still installs the
+/// selective observer scope the target runs narrow from.
+#[test]
+fn agreed_install_writes_the_selective_observer_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "held.so");
+    let mut custody = custody(1, BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, file));
+    let pins = PinnedObjects::empty();
+    let pass = AnchorPass::prepare(&pins, [], custody);
+    let mut session = fixture_session();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let installed = session
+        .install_anchors(pass, 1, deadline)
+        .expect("an agreed install authorizes its anchor run");
+    assert!(
+        installed.session.scope.ready(),
+        "an agreed install authorizes its runs"
+    );
+    match &installed.session.object {
+        SessionObject::Fixture { scope_words, .. } => {
+            let words = scope_words.borrow();
+            assert_eq!(
+                words.len(),
+                1,
+                "an agreed install writes exactly the observer word: {words:?}"
+            );
+        }
+        SessionObject::Kernel(_) => panic!("a fixture session lost its object"),
+    }
+    drop(installed);
+}
+
 fn mapped(address: u64) -> bool {
     let mut residency = 0u8;
     // SAFETY: mincore observes one aligned page and does not dereference it.

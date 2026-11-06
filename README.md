@@ -230,7 +230,10 @@ The system packages install the same static observer binary plus the glibc
 discovery helper (same bytes as the tarballs, no rebuild) to `/usr/bin`,
 with licenses and provenance under `/usr/share/doc/p11scope`. They carry
 no file capabilities, set-id bits, services or maintainer scripts. The musl
-helper stays tarball-only for musl systems. Download the package and
+helper stays tarball-only for musl systems. The packages are
+install-tested on Ubuntu 26.04 and Fedora 44. The bundled helper needs
+glibc 2.34 or newer, so it does not run on older distributions. Download
+the package and
 `SHA256SUMS`, verify the checksum and the build attestation, then install
 the file (Debian/Ubuntu shown; Fedora/RHEL uses `dnf install` with the
 `.rpm` file):

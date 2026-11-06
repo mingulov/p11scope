@@ -150,7 +150,9 @@ The v0.6.0 release provides `p11scope_0.6.0_amd64.deb` (Debian/Ubuntu) and
 installs the same static observer plus the glibc discovery helper to
 `/usr/bin`, with licenses and provenance under `/usr/share/doc/p11scope`,
 and carries no file capabilities, set-id bits, services or maintainer
-scripts. Every release file carries a GitHub build-provenance attestation;
+scripts. Installs are tested on Ubuntu 26.04 (DEB) and Fedora 44 (RPM).
+The bundled helper needs glibc 2.34 or newer, so it does not run on older
+distributions. Every release file carries a GitHub build-provenance attestation;
 [Install](../README.md#install) has the full bundle table. Download the
 package and `SHA256SUMS`, verify both, then install the file:
 

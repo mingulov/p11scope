@@ -7864,6 +7864,30 @@ mod tests {
     }
 
     #[test]
+    fn sole_complete_unfinished_tables_scan_refuses() {
+        // "Exactly one table" is only proven when the scan that found one
+        // finished with no truncation, I/O, budget or table-cap stop. An
+        // otherwise perfect single table from an unfinished scan refuses.
+        let mut module = sole_complete_module();
+        module.scanned.tables_scan_finished = false;
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unfinished tables scan refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_finished_tables_scan_mints() {
+        // Healthy twin: the same single table from a finished scan mints.
+        let mut module = sole_complete_module();
+        module.scanned.tables_scan_finished = true;
+        assert!(
+            sole_scan_semantic(&module),
+            "a finished single-table scan mints the sole-table grant"
+        );
+    }
+
+    #[test]
     fn native_short_prefix_without_bad_targets_remains_semantically_incomplete() {
         for words in [0, 1, 3, 67] {
             let mut module = scanned_with(

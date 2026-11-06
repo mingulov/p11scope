@@ -921,6 +921,193 @@ fn native_semantic_scan_subset_refuses_exports_only_tables() {
     );
 }
 
+/// A sole-complete-table module over a fixture's pins: 68-entry 2.x full
+/// table, no linkage or live return, export witness agreeing, single load,
+/// finished scan. Tests clear the flag for refuse twins; exports always
+/// agree so unfinished-ness is the only refusal leg under test.
+fn sole_complete_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let object = fixture.pins.pinned().next().unwrap().id;
+    let key = fixture.pins.raw_keys_for(object)[0];
+    let view =
+        crate::process::ProcessView::open(crate::process::ProcessViewId(0), std::process::id())
+            .unwrap();
+    let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .map(|field| field.name)
+        .collect();
+    assert_eq!(names.len(), 68);
+    let entries: Vec<ScannedEntry> = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ScannedEntry {
+            name,
+            object: key,
+            object_path: fixture.manifest.module_path.clone(),
+            file_offset: 0x1000 + (index as u64) * 8,
+        })
+        .collect();
+    let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+        entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect::<Vec<_>>(),
+    );
+    ReconciledModule {
+        scanned: ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            path: fixture.manifest.module_path.clone(),
+            tables_scan_finished: true,
+            decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries,
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+                file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
+                extension_impossible: false,
+            }],
+            interfaces: vec![],
+        },
+        object,
+        entry_objects: vec![vec![object; 68]],
+        exports,
+        getter_present: false,
+        witness_fault: false,
+    }
+}
+
+/// The sole-complete grant through the real mint, not just the plan seam:
+/// a finished single table mints 68 semantic slots without linkage or live
+/// return.
+#[test]
+fn native_semantic_scan_subset_sole_complete_mints_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let sole = sole_complete_source(&fixture);
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("a finished sole complete table mints through the real seam");
+    assert_eq!(subset.plan().slots.len(), 68);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "sole-complete slots carry semantics"
+    );
+}
+
+/// Blocking twin: the same single table from an unfinished scan refuses
+/// through the real mint.
+#[test]
+fn native_semantic_scan_subset_sole_complete_unfinished_refuses_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut sole = sole_complete_source(&fixture);
+    sole.scanned.tables_scan_finished = false;
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an unfinished sole table refuses through the real seam"
+    );
+}
+
+/// A second table candidate refuses the sole grant even when it is
+/// exports-only (agreeing exports, no linkage or live return): any second
+/// candidate — exports-only or otherwise — fails the exactly-one gate.
+#[test]
+fn native_semantic_scan_subset_sole_complete_exports_only_second_table_refuses() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut sole = sole_complete_source(&fixture);
+    let mut second = sole.scanned.tables[0].clone();
+    second.address = 0x8000;
+    second.file_offset = Some(0x1000);
+    sole.scanned.tables.push(second);
+    sole.entry_objects
+        .push(vec![sole.object; sole.scanned.tables[0].entries.len()]);
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an exports-only second table refuses the sole grant"
+    );
+}
+
+/// Dedupe twin: two views of one object disagree on tables (one sees a
+/// single table, the other sees two). Both orders refuse — the mint keeps
+/// the maximum, so a truncated single-table view never grants sole.
+#[test]
+fn native_semantic_scan_subset_sole_complete_one_vs_two_views_refuse_both_orders() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let one = sole_complete_source(&fixture);
+    let mut two = one.clone();
+    let mut second = two.scanned.tables[0].clone();
+    second.address = 0x8000;
+    second.file_offset = Some(0x1000);
+    two.scanned.tables.push(second);
+    two.entry_objects
+        .push(vec![two.object; two.scanned.tables[0].entries.len()]);
+    for (label, modules) in [
+        ("one-first", vec![one.clone(), two.clone()]),
+        ("two-first", vec![two.clone(), one.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: 1-vs-2 views of one object refuse the sole grant"
+        );
+    }
+}
+
+/// Real-seam twin of the exports-only plan test above: export-name
+/// agreement alone (no linkage, live return or sole legs) mints nothing
+/// through the mint, while the live-return twin mints.
+#[test]
+fn native_semantic_scan_subset_refuses_exports_only_tables_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut exports_only = fixture.source(["C_SignInit", "C_Sign"]);
+    exports_only.scanned.tables[0].live_return = false;
+    let symbols: Vec<(String, u64)> = exports_only.scanned.tables[0]
+        .entries
+        .iter()
+        .map(|entry| (entry.name.to_string(), entry.file_offset))
+        .collect();
+    exports_only.exports = std::sync::Arc::from(symbols);
+    let engine = engine_for_test(Vec::new(), vec![exports_only], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an exports-only table mints nothing through the real seam"
+    );
+    let live = fixture.source(["C_SignInit", "C_Sign"]);
+    let engine = engine_for_test(Vec::new(), vec![live], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("the live-return twin mints through the real seam");
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
 /// The cross-object twin of the huge-incomplete regression: a
 /// cross-object provider can never mint, so it must not consume the
 /// 512-slot subset plan either. Created (and so planned) first, its

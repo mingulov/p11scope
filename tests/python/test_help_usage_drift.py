@@ -6,9 +6,11 @@ and scoped help texts, and docs/usage.md. Syntax equality between the help
 texts is pinned in Rust (`scoped_help_syntax_lines_are_verbatim_from_global_usage`);
 these tests pin the other two directions statically, without building:
 
-- every `--flag` the parser accepts appears in USAGE (a silent flag fails);
-- every `--flag` USAGE advertises appears in docs/usage.md (undocumented
-  flags like the old `--attach-backend`/`--version` gap fail).
+- every `--flag` the parser accepts appears in USAGE or a scoped help
+  text (a silent flag fails);
+- every `--flag` USAGE or a scoped help advertises appears in
+  docs/usage.md (undocumented flags like the old
+  `--attach-backend`/`--version` gap fail).
 
 CI runs this file (help-drift step). The Rust test
 `usage_doc_documents_every_cli_flag` is the same agreement inside
@@ -29,11 +31,24 @@ FLAG = re.compile(r"--[a-z][a-z0-9-]*")
 
 
 def usage_text():
-    """The USAGE const body out of src/cli.rs."""
+    """USAGE plus every scoped help const body out of src/cli.rs.
+
+    Lane B shortened the global USAGE into per-command topics: a flag
+    named by any scoped `*_HELP` const is advertised, not silent. The
+    assembled helps (`trace_help()`, `inventory_diff_help()`) only add
+    numeric bound lines, so the const bodies carry every flag.
+    """
     text = CLI_RS.read_text(encoding="utf-8")
-    match = re.search(r'pub const USAGE: &str = "(.*?)";', text, re.DOTALL)
-    assert match is not None, "USAGE const missing from src/cli.rs"
-    return match.group(1)
+    bodies = [
+        match.group(1)
+        for match in re.finditer(
+            r'(?:pub )?const (?:USAGE|[A-Z0-9_]*HELP[A-Z0-9_]*)[^=]*= "(.*?)";',
+            text,
+            re.DOTALL,
+        )
+    ]
+    assert bodies, "no help consts found in src/cli.rs"
+    return "\n".join(bodies)
 
 
 def parser_flags():

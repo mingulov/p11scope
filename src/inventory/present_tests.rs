@@ -576,10 +576,7 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
         assert!(line.contains(&format!("entries {} (", edge.entry_count)));
     }
     assert!(overview[0].contains("At least 128 entries observed"));
-    assert_eq!(
-        snapshot.lines().nth(1).unwrap(),
-        "coverage: COMPLETE (nothing known was lost)"
-    );
+    assert_eq!(snapshot.lines().nth(1).unwrap(), "coverage: complete");
     let marker = "Details: retained paths, identities, states and coverage follow.";
     assert!(snapshot.contains(&format!("\n{marker}\nbudgets: ")));
     assert_eq!(
@@ -594,6 +591,45 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
     let empty = render_snapshot(&presentation);
     assert!(empty.contains("No application/module associations observed; this does not prove that no PKCS#11 activity occurred."));
     assert!(!empty.lines().any(|line| line.starts_with("application ")));
+}
+
+/// Item 24: the inventory coverage line uses the one lowercase
+/// format and omits zero counts — `coverage: complete`, or
+/// `coverage: partial — 2 gaps, 1 refused, 3 more not shown` with
+/// zero segments dropped.
+#[test]
+fn coverage_line_uses_lowercase_verdict_and_omits_zero_counts() {
+    let coverage_of = |gaps: usize, refused: u64, suppressed: u64| {
+        let harness = varied_harness();
+        let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+        presentation.gaps.clear();
+        for index in 0..gaps {
+            presentation.gaps.push(GapView {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("scope-{index}"),
+                reason: "reason".into(),
+                budget: None,
+                repeats: 1,
+            });
+        }
+        presentation.budgets.callers_refused = 0;
+        presentation.budgets.modules_refused = 0;
+        presentation.budgets.edges_refused = 0;
+        presentation.budgets.endpoints_refused = refused;
+        presentation.gaps_suppressed = suppressed;
+        let snapshot = render_snapshot(&presentation);
+        snapshot.lines().nth(1).unwrap().to_string()
+    };
+    assert_eq!(coverage_of(0, 0, 0), "coverage: complete");
+    assert_eq!(coverage_of(2, 0, 0), "coverage: partial — 2 gaps");
+    assert_eq!(coverage_of(1, 1, 0), "coverage: partial — 1 gap, 1 refused");
+    assert_eq!(coverage_of(0, 0, 3), "coverage: partial — 3 more not shown");
+    assert_eq!(
+        coverage_of(2, 1, 3),
+        "coverage: partial — 2 gaps, 1 refused, 3 more not shown"
+    );
 }
 
 #[test]
@@ -2004,7 +2040,7 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
         snapshot,
         concat!(
             "inventory f7 (1 pass, 2 callers, 2 provider files, 2 edges)\n",
-            "coverage: PARTIAL — 1 gap, 0 refused, 0 more not shown\n",
+            "coverage: partial — 1 gap\n",
             "key operations: not available — per-key tracking never started, so no key can be named yet (reason: bootstrap_unavailable)\n",
             "application f7-app0 [c0 pid 70000 incarnation 0] -> module m0.so [m0]: At least 34 entries observed\n",
             "application f7-app1 [c1 pid 70001 incarnation 0] -> module m1.so [m1]: At least 55 entries observed\n",
@@ -2670,7 +2706,7 @@ fn concise_snapshot_groups_gap_reasons_with_counts() {
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    assert!(out.contains("coverage: PARTIAL"), "{out}");
+    assert!(out.contains("coverage: partial"), "{out}");
     // Both plain reasons appear with counts; no per-gap flood.
     assert!(
         out.contains("no key session was offered to track"),
@@ -2872,10 +2908,7 @@ fn coverage_line_carries_a_complete_or_partial_verdict() {
     clean.budgets.edges_refused = 0;
     clean.budgets.endpoints_refused = 0;
     let out = render_snapshot_with_verbosity(&clean, crate::cli::TextVerbosity::Concise);
-    assert!(
-        out.contains("coverage: COMPLETE (nothing known was lost)"),
-        "{out}"
-    );
+    assert!(out.contains("coverage: complete"), "{out}");
     let varied = varied_harness();
     let mut presentation = Presentation::capture(varied.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.push(GapView {
@@ -2888,7 +2921,7 @@ fn coverage_line_carries_a_complete_or_partial_verdict() {
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    assert!(out.contains("coverage: PARTIAL"), "{out}");
+    assert!(out.contains("coverage: partial"), "{out}");
     assert!(!out.contains("suppressed"), "{out}");
 }
 

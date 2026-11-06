@@ -2143,19 +2143,26 @@ fn render_snapshot_inner(
             "s"
         },
     );
+    // One coverage format everywhere (profile, inspect, inventory):
+    // `coverage: complete`, or `coverage: partial` with the nonzero
+    // segments — gaps, refusals, suppressed-but-unretained. Zero
+    // counts stay out; the gaps block below names the reasons.
     if presentation.gaps.is_empty() && budgets.refusals() == 0 && presentation.gaps_suppressed == 0
     {
-        let _ = writeln!(out, "coverage: COMPLETE (nothing known was lost)");
+        let _ = writeln!(out, "coverage: complete");
     } else {
         let gaps = presentation.gaps.len();
-        let _ = writeln!(
-            out,
-            "coverage: PARTIAL — {} gap{}, {} refused, {} more not shown",
-            gaps,
-            if gaps == 1 { "" } else { "s" },
-            budgets.refusals(),
-            presentation.gaps_suppressed,
-        );
+        let mut segments = Vec::new();
+        if gaps > 0 {
+            segments.push(format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" }));
+        }
+        if budgets.refusals() > 0 {
+            segments.push(format!("{} refused", budgets.refusals()));
+        }
+        if presentation.gaps_suppressed > 0 {
+            segments.push(format!("{} more not shown", presentation.gaps_suppressed));
+        }
+        let _ = writeln!(out, "coverage: partial — {}", segments.join(", "));
     }
     // The edge list below never carries module-level use no caller could
     // claim: short-lived callers exit before their witness rows bind, so

@@ -22109,7 +22109,7 @@ mod promotion_driver_tests {
                             // is pinned in concise.
                             let text = String::from_utf8(stdout.bytes).unwrap();
                             assert!(
-                                text.contains("coverage: PARTIAL"),
+                                text.contains("coverage: partial"),
                                 "concise zero-pass coverage: {case}: {text}"
                             );
                             assert!(

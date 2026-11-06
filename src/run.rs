@@ -12173,17 +12173,37 @@ mod tests {
     #[test]
     fn runtime_dir_parent_trusted_rejects_untrusted_parents() {
         // M1: root-owned and not group/other-writable, not a symlink, a dir.
-        // / is the success witness (0755 root); /tmp fails on writability;
-        // a test-owned tempdir fails on ownership; a symlink fails outright.
+        // / is the success witness (0755 root); /tmp fails on writability.
         assert!(runtime_dir_parent_trusted(Path::new("/")), "/ must trust");
         assert!(
             !runtime_dir_parent_trusted(Path::new("/tmp")),
             "/tmp is writable"
         );
         let directory = tempfile::tempdir().unwrap();
+        // Ownership: a dir not owned by root never vouches. When running as
+        // root (privileged lanes, containers), chown one to a non-root uid
+        // first; 65534 need not name an account for the ownership check.
+        let owned = directory.path().join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            let path =
+                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(owned.as_os_str()))
+                    .unwrap();
+            // SAFETY: path is NUL-terminated.
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
+        }
         assert!(
-            !runtime_dir_parent_trusted(directory.path()),
-            "test-owned dir is not root-owned"
+            !runtime_dir_parent_trusted(&owned),
+            "a non-root-owned dir never vouches"
+        );
+        // Perms: group/other-writable never vouches, even when root-owned.
+        let writable = directory.path().join("writable");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            !runtime_dir_parent_trusted(&writable),
+            "a writable dir never vouches"
         );
         let link = directory.path().join("link");
         std::os::unix::fs::symlink("/", &link).unwrap();

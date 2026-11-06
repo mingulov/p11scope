@@ -2794,9 +2794,11 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
 }
 
 /// F1: the readable gaps block lists every group on its own indented
-/// line under `gaps: N` — no top-three fold, no "and K more".
+/// line under `gaps: N` while the group count stays within the fold
+/// boundary (twenty; beyond that the block folds, pinned by
+/// `gaps_block_folds_beyond_twenty_groups`).
 #[test]
-fn concise_gap_summary_lists_every_group_without_fold() {
+fn concise_gap_summary_lists_small_groups_without_fold() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();

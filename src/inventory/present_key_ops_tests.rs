@@ -1668,10 +1668,11 @@ fn gaps_line_lists_one_reason_per_line() {
     );
 }
 
-/// The gaps block lists every group: no top-three fold, no "and K
-/// more".
+/// The gaps block lists every group while the group count stays
+/// within the fold boundary (twenty; beyond that the block folds,
+/// pinned by `gaps_block_folds_beyond_twenty_groups`).
 #[test]
-fn gaps_block_lists_every_group_without_fold() {
+fn gaps_block_lists_small_groups_without_fold() {
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.gaps.clear();
@@ -1691,6 +1692,71 @@ fn gaps_block_lists_every_group_without_fold() {
         !block.iter().any(|line| line.contains("more")),
         "nothing folds: {block:?}"
     );
+}
+
+/// CLI-1: the concise gaps block stays bounded — beyond twenty
+/// distinct groups it shows the first twenty (most frequent first)
+/// plus one fold line, while the header count stays exact.
+#[test]
+fn gaps_block_folds_beyond_twenty_groups() {
+    fn block_for(groups: usize) -> Vec<String> {
+        let mut presentation =
+            key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+        presentation.gaps.clear();
+        for i in 0..groups {
+            let subject = format!("scope-{i:02}");
+            presentation.gaps.push(named_gap(&subject, "reason-x"));
+        }
+        let concise =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        gaps_block(&concise)
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect()
+    }
+    let at_boundary = block_for(20);
+    assert_eq!(
+        at_boundary.len(),
+        21,
+        "twenty groups still list every group: {at_boundary:?}"
+    );
+    assert!(
+        !at_boundary.iter().any(|line| line.contains("more")),
+        "nothing folds at the boundary: {at_boundary:?}"
+    );
+    let one_over = block_for(21);
+    assert_eq!(
+        one_over.len(),
+        22,
+        "header plus twenty groups plus the fold line: {one_over:?}"
+    );
+    assert_eq!(one_over[0], "gaps: 21");
+    assert_eq!(
+        one_over[21],
+        "  and 1 more group (--json has every item)",
+        "the fold line names the remainder: {one_over:?}"
+    );
+    let many = block_for(25);
+    assert_eq!(
+        many.len(),
+        22,
+        "header plus twenty groups plus the fold line: {many:?}"
+    );
+    assert_eq!(many[0], "gaps: 25", "the header count stays exact");
+    assert_eq!(many[1], "  1 × scope-00 — reason-x");
+    assert_eq!(many[20], "  1 × scope-19 — reason-x");
+    assert_eq!(
+        many[21],
+        "  and 5 more groups (--json has every item)",
+        "the fold line names the remainder: {many:?}"
+    );
+    for line in &many {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{}",
+            many.join("\n")
+        );
+    }
 }
 
 /// A very long gap subject truncates to keep the group line at most

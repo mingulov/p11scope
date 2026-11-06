@@ -206,9 +206,8 @@ fn nested_install_skips_the_selective_scope_write() {
     let pass = AnchorPass::prepare(&pins, [], custody);
     let mut session = fixture_session();
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    let (ready, words) = crate::pidns::test_seam::with_numbering(
-        crate::pidns::test_seam::nested(),
-        || {
+    let (ready, words) =
+        crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
             let installed = session
                 .install_anchors(pass, 1, deadline)
                 .expect("a nested install authorizes its anchor run");
@@ -219,16 +218,12 @@ fn nested_install_skips_the_selective_scope_write() {
             };
             drop(installed);
             (ready, words)
-        },
-    );
+        });
     assert!(
         ready,
         "a write-less install must still authorize the anchor run"
     );
-    assert!(
-        words.is_empty(),
-        "a nested install wrote scope: {words:?}"
-    );
+    assert!(words.is_empty(), "a nested install wrote scope: {words:?}");
 }
 
 /// The agreed-numbering twin: a non-nested install still installs the

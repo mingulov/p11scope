@@ -2391,7 +2391,17 @@ impl IdentitySession {
             slots,
             crate::attach::identity_iter::observer_tgid_for_config(),
         );
-        self.replace_scope(&[std::process::id()])?;
+        // The anchor program never reads the scope bitmap (see
+        // `p11_anchor_vma`), and every nested target run re-establishes
+        // the permissive bitmap before reading: a nested install skips
+        // the selective write, saving a full clear plus refill (~131k
+        // bpf syscalls) per pass inside the witness deadline. The ready
+        // latch still authorizes the anchor run below.
+        if !crate::pidns::numbering().agrees() {
+            self.scope.mark_ready_without_write();
+        } else {
+            self.replace_scope(&[std::process::id()])?;
+        }
         self.configure(config)?;
         let binding = PassBinding {
             session: self.token.clone(),

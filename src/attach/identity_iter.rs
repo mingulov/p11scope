@@ -2461,8 +2461,10 @@ pub(crate) struct ScopeBitmap {
     /// The map currently holds the permissive bitmap (see
     /// [`write_permissive_scope_bitmap`]): a later selective replace
     /// must clear every word first, since the tracked `words` do not
-    /// cover it. Sessions never transition back (numbering is fixed
-    /// per process), so the full clear is a correctness backstop only.
+    /// cover it. No production path transitions back (nested installs
+    /// skip the selective write and non-nested sessions never go
+    /// permissive; numbering is fixed per process), so the full clear
+    /// is a correctness backstop only.
     permissive: bool,
 }
 
@@ -2494,6 +2496,18 @@ impl ScopeBitmap {
         self.ready = false;
     }
 
+    /// Authorize the install's anchor run without touching the map.
+    /// Nested installs only: the anchor program never reads the bitmap
+    /// (see `p11_anchor_vma`), and every nested target run
+    /// re-establishes the permissive bitmap before reading, so the
+    /// skipped selective write can neither widen nor narrow any run.
+    /// The `permissive` flag is untouched: a sticky permissive map
+    /// stays sticky, and a fresh zero map stays zero until the first
+    /// nested target run fills it.
+    pub(crate) fn mark_ready_without_write(&mut self) {
+        self.ready = true;
+    }
+
     pub(crate) fn replace(
         &mut self,
         ebpf: &mut aya::Ebpf,
@@ -2501,8 +2515,9 @@ impl ScopeBitmap {
     ) -> Result<(), ProbeError> {
         self.ready = false;
         // A permissive map is not covered by the tracked words: clear
-        // every word before the selective rewrite (sessions never take
-        // this transition; numbering is fixed per process).
+        // every word before the selective rewrite. No production path
+        // takes this transition (nested installs skip the selective
+        // write), so the clear is a backstop only.
         if self.permissive {
             write_permissive_cleared(ebpf)?;
             self.permissive = false;

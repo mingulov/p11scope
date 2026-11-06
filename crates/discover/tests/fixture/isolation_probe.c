@@ -1,6 +1,11 @@
-/* Isolation probe fixture: the constructor probes three accesses the isolated
+/* Isolation probe fixture: the constructor probes accesses the isolated
  * profile fences (AF_INET socket creation, file creation beside the provider,
- * overwrite of a test-owned sibling) and reports each as a stderr marker.
+ * overwrite of a test-owned sibling) and reports each as a stderr marker,
+ * plus the review-PoC probes: io_uring setup, AF_UNIX connect to a
+ * test-owned listener, execve of /bin/true in a child, chmod of a
+ * test-owned path outside the output, and overwrite beneath the -o
+ * directory. The ISOLATION_*_PATH environment variables name test-owned
+ * scratch paths only; without them the matching probe reports unknown.
  * The provider itself is healthy: a
  * sparse 2.40 legacy table, one all-NULL "PKCS 11" interface, and a lazily
  * dlopen'd backend (never DT_NEEDED; link with -Wl,-rpath,$ORIGIN).
@@ -12,9 +17,15 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/io_uring.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/syscall.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 typedef unsigned char CK_BYTE;
@@ -84,6 +95,101 @@ __attribute__((constructor)) static void ctor(void) {
         }
     } else {
         fprintf(stderr, "ISOLATION_OVERWRITE=unknown(dladdr failed)\n");
+    }
+    /* Review-PoC probes: io_uring setup would bypass the seccomp network
+     * denials, so it must fail closed like the plain socket above. */
+    {
+        struct io_uring_params params;
+        memset(&params, 0, sizeof params);
+        int ring = syscall(__NR_io_uring_setup, 4, &params);
+        if (ring >= 0) {
+            fprintf(stderr, "ISOLATION_URING_SETUP=allowed\n");
+            close(ring);
+        } else {
+            fprintf(stderr, "ISOLATION_URING_SETUP=denied(errno=%d)\n", errno);
+        }
+    }
+    /* AF_UNIX creation stays allowed for the loader, but connect must not:
+     * the test owns a listener at ISOLATION_UNIX_PATH. */
+    {
+        const char *upath = getenv("ISOLATION_UNIX_PATH");
+        if (!upath) {
+            fprintf(stderr, "ISOLATION_UNIX_CONNECT=unknown(no listener)\n");
+        } else {
+            int ufd = socket(AF_UNIX, SOCK_STREAM, 0);
+            if (ufd < 0) {
+                fprintf(stderr, "ISOLATION_UNIX_CONNECT=unknown(socket errno=%d)\n", errno);
+            } else {
+                struct sockaddr_un sun;
+                memset(&sun, 0, sizeof sun);
+                sun.sun_family = AF_UNIX;
+                strncpy(sun.sun_path, upath, sizeof sun.sun_path - 1);
+                int connected = connect(ufd, (struct sockaddr *)&sun, sizeof sun);
+                if (connected == 0) {
+                    fprintf(stderr, "ISOLATION_UNIX_CONNECT=allowed\n");
+                } else {
+                    fprintf(stderr, "ISOLATION_UNIX_CONNECT=denied(errno=%d)\n", errno);
+                }
+                close(ufd);
+            }
+        }
+    }
+    /* execve runs in a child so an allowed call cannot replace this image:
+     * exit 0 means the child ran /bin/true, 42 means it reported denial. */
+    {
+        pid_t child = fork();
+        if (child < 0) {
+            fprintf(stderr, "ISOLATION_EXECVE=unknown(fork errno=%d)\n", errno);
+        } else if (child == 0) {
+            char *const argv[] = { "true", NULL };
+            execve("/bin/true", argv, NULL);
+            fprintf(stderr, "ISOLATION_EXECVE=denied(errno=%d)\n", errno);
+            _exit(42);
+        } else {
+            int status = 0;
+            while (waitpid(child, &status, 0) < 0 && errno == EINTR) { }
+            if (WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+                fprintf(stderr, "ISOLATION_EXECVE=allowed\n");
+            } else if (!(WIFEXITED(status) && WEXITSTATUS(status) == 42)) {
+                fprintf(stderr, "ISOLATION_EXECVE=unknown(status=%d)\n", status);
+            }
+        }
+    }
+    /* chmod outside the output must fail: Landlock cannot restrict it, so
+     * the seccomp denylist must. The test owns ISOLATION_CHMOD_PATH. */
+    {
+        const char *target = getenv("ISOLATION_CHMOD_PATH");
+        if (!target) {
+            fprintf(stderr, "ISOLATION_CHMOD=unknown(no target)\n");
+        } else if (chmod(target, 0666) == 0) {
+            fprintf(stderr, "ISOLATION_CHMOD=allowed\n");
+        } else {
+            fprintf(stderr, "ISOLATION_CHMOD=denied(errno=%d)\n", errno);
+        }
+    }
+    /* Overwrite beneath the -o directory: the fence grants the -o parent
+     * as a subtree, so the helper only accepts a dedicated directory and
+     * this probe must never run against a foreign victim. */
+    {
+        const char *target = getenv("ISOLATION_SUBTREE_PATH");
+        if (!target) {
+            fprintf(stderr, "ISOLATION_SUBTREE=unknown(no target)\n");
+        } else {
+            int sfd = open(target, O_WRONLY | O_TRUNC);
+            if (sfd >= 0) {
+                ssize_t written = write(sfd, "pwned\n", 6);
+                close(sfd);
+                if (written == 6) {
+                    fprintf(stderr, "ISOLATION_SUBTREE=allowed\n");
+                } else {
+                    fprintf(stderr, "ISOLATION_SUBTREE=unknown(short write)\n");
+                }
+            } else if (errno == ENOENT) {
+                fprintf(stderr, "ISOLATION_SUBTREE=unknown(no target file)\n");
+            } else {
+                fprintf(stderr, "ISOLATION_SUBTREE=denied(errno=%d)\n", errno);
+            }
+        }
     }
     fflush(stderr);
 }

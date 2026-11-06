@@ -848,3 +848,241 @@ fn isolation_overwrite_of_existing_file_is_denied() {
     );
     std::fs::remove_file(&sibling).unwrap();
 }
+
+/// io_uring socket/connect syscalls never hit the seccomp network checks,
+/// so the ring setup itself must be denied: the constructor's probe fails
+/// with `EACCES` under the fence. Trusted proves the probe exercises a
+/// working `io_uring_setup` on this host.
+#[test]
+fn isolation_io_uring_setup_is_denied() {
+    let dir = scratch("isolation-uring");
+    let provider = build_isolation_probe(&dir);
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_URING_SETUP=allowed"),
+        "the probe must exercise a working io_uring_setup: {stderr}"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_URING_SETUP=denied(errno=13)"),
+        "io_uring_setup was not fenced: {stderr}"
+    );
+}
+
+/// Landlock cannot restrict chmod, so the seccomp denylist must: the
+/// constructor's chmod of a test-owned file outside the output fails with
+/// `EACCES` under the fence and the mode is untouched. Trusted proves the
+/// probe changes the mode when unfenced.
+#[test]
+fn isolation_chmod_outside_the_output_is_denied() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("isolation-chmod");
+    let provider = build_isolation_probe(&dir);
+    let trusted_target = dir.join("chmod-trusted.tmp");
+    let isolated_target = dir.join("chmod-isolated.tmp");
+    std::fs::write(&trusted_target, b"chmod probe").unwrap();
+    std::fs::write(&isolated_target, b"chmod probe").unwrap();
+    std::fs::set_permissions(&trusted_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    std::fs::set_permissions(&isolated_target, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .env("ISOLATION_CHMOD_PATH", &trusted_target)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_CHMOD=allowed"),
+        "trusted must chmod the scratch file: {stderr}"
+    );
+    assert_eq!(
+        std::fs::metadata(&trusted_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o666,
+        "the trusted probe must change the mode"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .env("ISOLATION_CHMOD_PATH", &isolated_target)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_CHMOD=denied(errno=13)"),
+        "chmod was not fenced: {stderr}"
+    );
+    assert_eq!(
+        std::fs::metadata(&isolated_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600,
+        "the fenced probe must not change the mode"
+    );
+    assert_eq!(
+        std::fs::read(&isolated_target).unwrap(),
+        b"chmod probe",
+        "the fenced probe must not modify the scratch file"
+    );
+}
+
+/// AF_UNIX creation stays allowed for the loader, but connecting to a
+/// live test listener and `execve` of /bin/true in a child are both
+/// denied with `EACCES` under the fence. Trusted proves both probes
+/// succeed when unfenced.
+#[test]
+fn isolation_unix_connect_and_execve_are_denied() {
+    use std::os::unix::net::UnixListener;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let dir = scratch("isolation-unixexec");
+    let provider = build_isolation_probe(&dir);
+    // The listener lives directly under TMPDIR: the cargo scratch nesting
+    // blows past SUN_LEN (108 bytes).
+    let socket = std::env::temp_dir().join(format!("p11scope-iso-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&socket);
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    // The listener stays open for both runs; the acceptor drains any
+    // unexpected allowed connect so it never blocks the suite.
+    let done = Arc::new(AtomicBool::new(false));
+    let acceptor = std::thread::spawn({
+        let done = done.clone();
+        move || {
+            while !done.load(Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((connection, _)) => drop(connection),
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(std::time::Duration::from_millis(5));
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    });
+    let run = |extra: &[&str]| {
+        let mut args: Vec<&std::ffi::OsStr> = extra.iter().map(std::ffi::OsStr::new).collect();
+        args.push(std::ffi::OsStr::new("--module"));
+        args.push(provider.as_os_str());
+        Command::new(BIN)
+            .args(&args)
+            .env("ISOLATION_UNIX_PATH", &socket)
+            .output()
+            .unwrap()
+    };
+    let trusted = run(&[]);
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_UNIX_CONNECT=allowed"),
+        "trusted must connect to the listener: {stderr}"
+    );
+    assert!(
+        stderr.contains("ISOLATION_EXECVE=allowed"),
+        "trusted must exec /bin/true in the child: {stderr}"
+    );
+    let isolated = run(&["--isolation", "isolated"]);
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_UNIX_CONNECT=denied(errno=13)"),
+        "AF_UNIX connect was not fenced: {stderr}"
+    );
+    assert!(
+        stderr.contains("ISOLATION_EXECVE=denied(errno=13)"),
+        "execve was not fenced: {stderr}"
+    );
+    done.store(true, Ordering::Relaxed);
+    acceptor.join().unwrap();
+    std::fs::remove_file(&socket).unwrap();
+}
+
+/// Landlock path rules grant a whole subtree, so a `-o` parent that is
+/// not empty (or holding only the target name) refuses before provider
+/// load: no constructor marker may appear and the planted victim beneath
+/// the directory keeps its bytes.
+#[test]
+fn isolation_nonempty_output_directory_is_refused_before_provider_load() {
+    let dir = scratch("isolation-nonempty");
+    let provider = build_isolation_probe(&dir);
+    let out = dir.join("out");
+    let sub = out.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let victim = sub.join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    let outfile = out.join("manifest.json");
+    let refused = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&outfile)
+        .env("ISOLATION_SUBTREE_PATH", &victim)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("not empty; use a dedicated directory"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the output refusal: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"keep",
+        "a refusal must not let the provider near the victim"
+    );
+    assert!(!outfile.exists(), "a refusal must not create a manifest");
+}
+
+/// The dedicated-directory rule keeps the rename-over case working: a
+/// `-o` parent holding only the target name is accepted and the stale
+/// file is replaced with a private manifest.
+#[test]
+fn isolation_output_directory_holding_only_the_target_is_accepted() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = scratch("isolation-only-target");
+    let provider = build_isolation_probe(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let outfile = out.join("manifest.json");
+    std::fs::write(&outfile, b"stale").unwrap();
+    std::fs::set_permissions(&outfile, std::fs::Permissions::from_mode(0o644)).unwrap();
+    let run = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&outfile)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(0), "{run:?}");
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&std::fs::read(&outfile).unwrap()).unwrap();
+    assert_eq!(m.schema, "p11scope-manifest/5");
+    assert_eq!(
+        std::fs::metadata(&outfile).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(litter(&out), Vec::<String>::new());
+}

@@ -680,4 +680,201 @@ mod tests {
         .unwrap_err();
         assert_eq!(error, "landlock stage failed");
     }
+
+    /// A classic-BPF interpreter over (arch, nr, arg0): the executable
+    /// meaning of the built filter. Every denylisted number below is
+    /// evaluated to its verdict, so a mistargeted jump or a flipped patch
+    /// fails here instead of silently fencing the wrong syscall.
+    fn eval_filter(insns: &[SockFilter], arch: u32, nr: u32, arg0: u32) -> u32 {
+        let mut acc = 0u32;
+        let mut pc = 0usize;
+        for _ in 0..insns.len() + 16 {
+            let insn = &insns[pc];
+            match insn.code {
+                BPF_LD_W_ABS => {
+                    acc = match insn.k {
+                        NR_OFFSET => nr,
+                        ARCH_OFFSET => arch,
+                        ARG0_LO_OFFSET => arg0,
+                        other => panic!("evaluator hit an unexpected load offset {other}"),
+                    };
+                    pc += 1;
+                }
+                BPF_JMP_JEQ_K => {
+                    pc += 1 + if acc == insn.k { insn.jt } else { insn.jf } as usize;
+                }
+                BPF_RET_K => return insn.k,
+                other => panic!("evaluator hit an unexpected opcode {other:#x}"),
+            }
+        }
+        panic!("filter did not return");
+    }
+
+    #[test]
+    fn every_denied_syscall_evaluates_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // Each number is keyed to libc, not to itself: a wrong constant
+        // fails the equality instead of fencing the wrong syscall.
+        let keyed: &[(u32, libc::c_long, &str)] = &[
+            (SYS_CONNECT, libc::SYS_connect, "connect"),
+            (SYS_BIND, libc::SYS_bind, "bind"),
+            (SYS_LISTEN, libc::SYS_listen, "listen"),
+            (SYS_ACCEPT, libc::SYS_accept, "accept"),
+            (SYS_ACCEPT4, libc::SYS_accept4, "accept4"),
+            (SYS_EXECVE, libc::SYS_execve, "execve"),
+            (SYS_EXECVEAT, libc::SYS_execveat, "execveat"),
+            (SYS_MOUNT, libc::SYS_mount, "mount"),
+            (SYS_UMOUNT2, libc::SYS_umount2, "umount2"),
+            (SYS_PIVOT_ROOT, libc::SYS_pivot_root, "pivot_root"),
+            (SYS_MOVE_MOUNT, libc::SYS_move_mount, "move_mount"),
+            (SYS_OPEN_TREE, libc::SYS_open_tree, "open_tree"),
+            (SYS_FSOPEN, libc::SYS_fsopen, "fsopen"),
+            (SYS_FSMOUNT, libc::SYS_fsmount, "fsmount"),
+            (SYS_PTRACE, libc::SYS_ptrace, "ptrace"),
+            (
+                SYS_PROCESS_VM_WRITEV,
+                libc::SYS_process_vm_writev,
+                "process_vm_writev",
+            ),
+            (SYS_BPF, libc::SYS_bpf, "bpf"),
+            (
+                SYS_PERF_EVENT_OPEN,
+                libc::SYS_perf_event_open,
+                "perf_event_open",
+            ),
+            (SYS_USERFAULTFD, libc::SYS_userfaultfd, "userfaultfd"),
+            (
+                SYS_NAME_TO_HANDLE_AT,
+                libc::SYS_name_to_handle_at,
+                "name_to_handle_at",
+            ),
+            (
+                SYS_OPEN_BY_HANDLE_AT,
+                libc::SYS_open_by_handle_at,
+                "open_by_handle_at",
+            ),
+            (SYS_KEYCTL, libc::SYS_keyctl, "keyctl"),
+            (SYS_ADD_KEY, libc::SYS_add_key, "add_key"),
+            (SYS_REQUEST_KEY, libc::SYS_request_key, "request_key"),
+            (SYS_INIT_MODULE, libc::SYS_init_module, "init_module"),
+            (SYS_FINIT_MODULE, libc::SYS_finit_module, "finit_module"),
+            (SYS_DELETE_MODULE, libc::SYS_delete_module, "delete_module"),
+            (SYS_KEXEC_LOAD, libc::SYS_kexec_load, "kexec_load"),
+            (SYS_REBOOT, libc::SYS_reboot, "reboot"),
+            (SYS_IOPL, libc::SYS_iopl, "iopl"),
+            (SYS_IOPERM, libc::SYS_ioperm, "ioperm"),
+            (SYS_SWAPON, libc::SYS_swapon, "swapon"),
+            (SYS_SWAPOFF, libc::SYS_swapoff, "swapoff"),
+            (SYS_SETHOSTNAME, libc::SYS_sethostname, "sethostname"),
+            (SYS_SETDOMAINNAME, libc::SYS_setdomainname, "setdomainname"),
+            (SYS_ACCT, libc::SYS_acct, "acct"),
+        ];
+        assert_eq!(
+            keyed.len(),
+            DENY_ALWAYS.len(),
+            "the libc-keyed table must cover the whole denylist"
+        );
+        for (ours, want, name) in keyed {
+            assert_eq!(*ours, *want as u32, "wrong number for {name}");
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, *ours, 0),
+                denied,
+                "{name} escapes the fence"
+            );
+        }
+        // io_uring, chmod/chown/xattr and timestamp entries, keyed to
+        // libc directly until their named constants land with the fix.
+        // (setxattrat/removexattrat postdate libc 0.2.189; their numbers
+        // are from asm/unistd_64.h: 463 and 466.)
+        let added: &[(u32, &str)] = &[
+            (libc::SYS_io_uring_setup as u32, "io_uring_setup"),
+            (libc::SYS_io_uring_enter as u32, "io_uring_enter"),
+            (libc::SYS_io_uring_register as u32, "io_uring_register"),
+            (libc::SYS_chmod as u32, "chmod"),
+            (libc::SYS_fchmod as u32, "fchmod"),
+            (libc::SYS_fchmodat as u32, "fchmodat"),
+            (libc::SYS_fchmodat2 as u32, "fchmodat2"),
+            (libc::SYS_chown as u32, "chown"),
+            (libc::SYS_fchown as u32, "fchown"),
+            (libc::SYS_lchown as u32, "lchown"),
+            (libc::SYS_fchownat as u32, "fchownat"),
+            (libc::SYS_setxattr as u32, "setxattr"),
+            (libc::SYS_lsetxattr as u32, "lsetxattr"),
+            (libc::SYS_fsetxattr as u32, "fsetxattr"),
+            (libc::SYS_removexattr as u32, "removexattr"),
+            (libc::SYS_lremovexattr as u32, "lremovexattr"),
+            (libc::SYS_fremovexattr as u32, "fremovexattr"),
+            (463, "setxattrat"),
+            (466, "removexattrat"),
+            (libc::SYS_utime as u32, "utime"),
+            (libc::SYS_utimes as u32, "utimes"),
+            (libc::SYS_futimesat as u32, "futimesat"),
+            (libc::SYS_utimensat as u32, "utimensat"),
+        ];
+        for (nr, name) in added {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, *nr, 0),
+                denied,
+                "{name} escapes the fence"
+            );
+        }
+        // socket() with an IP domain is denied; AF_UNIX and AF_NETLINK
+        // stay allowed for the loader.
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, 2 /* AF_INET */),
+            denied,
+            "AF_INET socket escapes the fence"
+        );
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_UNIX),
+            SECCOMP_RET_ALLOW,
+            "AF_UNIX socket must stay allowed"
+        );
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_SOCKET, AF_NETLINK),
+            SECCOMP_RET_ALLOW,
+            "AF_NETLINK socket must stay allowed"
+        );
+        // An ordinary syscall stays allowed.
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, libc::SYS_read as u32, 0),
+            SECCOMP_RET_ALLOW,
+            "read must stay allowed"
+        );
+    }
+
+    #[test]
+    fn a_foreign_arch_gets_enosys() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        for arch in [
+            62,          // bare EM_X86_64, never the seccomp_data value
+            0x4000_0003, // AUDIT_ARCH_I386
+        ] {
+            assert_eq!(
+                eval_filter(&insns, arch, libc::SYS_read as u32, 0),
+                enosys,
+                "arch {arch:#x} escapes the gate"
+            );
+        }
+    }
+
+    #[test]
+    fn x32_syscall_numbers_get_enosys() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;
+        for nr in [
+            0x4000_0000 | libc::SYS_read as u32,
+            0x4000_0000 | SYS_SOCKET,
+            0x4000_0000 | SYS_EXECVE,
+            u32::MAX,
+        ] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0),
+                enosys,
+                "x32 nr {nr:#x} escapes the fence"
+            );
+        }
+    }
 }

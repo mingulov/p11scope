@@ -2119,11 +2119,6 @@ impl CallerRegistry {
         &self.joint_keyuse
     }
 
-    /// Joint seal deliveries held, by cause (diagnostics only).
-    pub(crate) fn joint_seal_held(&self) -> [u64; 5] {
-        self.joint_seal_held
-    }
-
     /// Joint calls reduced S1Only-direct for lack of H8 staging.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn joint_direct_fallback(&self) -> u64 {
@@ -2143,19 +2138,13 @@ impl CallerRegistry {
     ) -> crate::semantics_key_use::SealBatchProgress {
         use crate::semantics_key_use::SealBatchProgress;
         let Some(record) = self.instance_state.semantics.get_mut(&id) else {
-            self.joint_seal_held[0] = self.joint_seal_held[0].saturating_add(1);
             return SealBatchProgress::Held;
         };
         if !record.feed.accepts_seal(batch.seal()) {
-            self.joint_seal_held[1] = self.joint_seal_held[1].saturating_add(1);
             return SealBatchProgress::Held;
         }
         let was_joint = record.feed.mode() == FeedMode::Joint;
-        if !was_joint {
-            self.joint_seal_held[2] = self.joint_seal_held[2].saturating_add(1);
-        }
         let Some(reducer) = record.semantics.as_mut() else {
-            self.joint_seal_held[3] = self.joint_seal_held[3].saturating_add(1);
             return SealBatchProgress::Held;
         };
         let mut outer = NoSink;
@@ -2172,9 +2161,6 @@ impl CallerRegistry {
         );
         self.instance_state.semantic_refused =
             self.instance_state.semantic_refused.saturating_add(refused);
-        if was_joint && matches!(outcome, SealBatchProgress::Held) {
-            self.joint_seal_held[4] = self.joint_seal_held[4].saturating_add(1);
-        }
         // Project once for the original completed consumer, rather than
         // rebuilding the whole model projection for each budget-one effect.
         if matches!(outcome, SealBatchProgress::Complete { .. }) {

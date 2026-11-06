@@ -864,7 +864,8 @@ class StreamTwins(unittest.TestCase):
                     line["event"]["version"] = object_version
                 elif line["kind"] == "key_operations_observed":
                     row = line["event"]["row"]
-                    if (row["instance"], row["object"], row["category"],
+                    if line["event"]["bucket"] == "known" and (
+                            row["instance"], row["object"], row["category"],
                             row["role"], row["metadata_at_use"]) == old_key:
                         row["metadata_at_use"] = "ml_dsa_65"
                     line["event"]["version"] = key_version

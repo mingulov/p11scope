@@ -67,6 +67,7 @@ OBSERVATIONS_VERSION = 1
 OBSERVATIONS_VERSION_V2 = 2
 OBSERVATIONS_VERSION_V3 = 3
 OBSERVATIONS_VERSION_V4 = 4
+OBSERVATIONS_VERSION_V5 = 5
 ROW_BUDGET_LIMIT = 65536
 GAPS_CAPACITY = 256
 
@@ -87,6 +88,9 @@ CREATIONS_V2 = CREATIONS + ("encapsulate", "decapsulate")
 LIFETIMES = ("live", "destroyed", "access_ended", "retired")
 ATTRIBUTIONS = ("valid", "downgraded")
 METADATA_KEYS = ("class", "key_type", "token", "value_len", "modulus_bits", "ec_params")
+# H9 section v5 (PQC parameter sets): the requested/established/query
+# blocks gain the parameter_set key; v1-v4 tables stay frozen.
+METADATA_KEYS_V5 = METADATA_KEYS + ("parameter_set",)
 FIELD_STATUSES = ("unknown", "value", "conflict", "invalidated")
 METADATA_FIELD_VALUES = {
     "class": (0, 1, 2, 3, 4),
@@ -94,6 +98,14 @@ METADATA_FIELD_VALUES = {
     "token": (0, 1),
     "value_len": (16, 24, 32),
     "modulus_bits": (1024, 2048, 3072, 4096, 8192),
+}
+# H9 section v5 scalar values: the frozen values above, the PQC
+# key-type codes 73/74/75 (ML-KEM/ML-DSA/SLH-DSA) beside key_type,
+# and the CKP_* union 1..=12 beside parameter_set.
+METADATA_FIELD_VALUES_V5 = {
+    **METADATA_FIELD_VALUES,
+    "key_type": METADATA_FIELD_VALUES["key_type"] + (73, 74, 75),
+    "parameter_set": tuple(range(1, 13)),
 }
 CURVE_LABELS = ("secp256r1", "secp384r1", "secp521r1")
 QUERY_STATUSES = ("not_queried", "established", "unavailable", "size_only", "unsupported",
@@ -106,6 +118,24 @@ METADATA_LABELS = ("rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", 
 # v4 is accepted structurally so such a section fails by name,
 # never as an unsupported version.
 METADATA_LABELS_V4 = METADATA_LABELS + ("unknown",)
+# H9 section v5 (PQC parameter sets): the eighteen combined labels
+# (each parameter-set code joined with its established key type)
+# row at use and on object views. Key rows accept the v4 labels
+# plus all eighteen; object views accept the twelve established
+# labels plus the eighteen (`unknown` stays row-level only). The
+# qualification cells still demand the exact CELL_METADATA below;
+# v5 is accepted structurally so such a section fails by name,
+# never as an unsupported version.
+PQC_METADATA_LABELS = ("ml_dsa_44", "ml_dsa_65", "ml_dsa_87",
+                       "ml_kem_512", "ml_kem_768", "ml_kem_1024",
+                       "slh_dsa_sha2_128s", "slh_dsa_shake_128s",
+                       "slh_dsa_sha2_128f", "slh_dsa_shake_128f",
+                       "slh_dsa_sha2_192s", "slh_dsa_shake_192s",
+                       "slh_dsa_sha2_192f", "slh_dsa_shake_192f",
+                       "slh_dsa_sha2_256s", "slh_dsa_shake_256s",
+                       "slh_dsa_sha2_256f", "slh_dsa_shake_256f")
+METADATA_LABELS_V5 = METADATA_LABELS_V4 + PQC_METADATA_LABELS
+OBJECT_LABELS_V5 = METADATA_LABELS + PQC_METADATA_LABELS
 CATEGORIES = ("digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt", "message_sign",
               "message_verify", "generate_key", "generate_key_pair", "wrap", "unwrap",
@@ -300,9 +330,10 @@ def read_observer_file(path):
     return doc
 
 
-def _metadata_block(block):
-    _keys(block, METADATA_KEYS)
-    for name in METADATA_KEYS:
+def _metadata_block(block, keys=METADATA_KEYS,
+                    values=METADATA_FIELD_VALUES):
+    _keys(block, keys)
+    for name in keys:
         cell = block[name]
         _keys(cell, FIELD_KEYS)
         _label(cell["status"], FIELD_STATUSES, "metadata field status")
@@ -312,7 +343,7 @@ def _metadata_block(block):
                      "unexpected metadata curve")
         else:
             _require(value is None or (type(value) is int
-                                       and value in METADATA_FIELD_VALUES[name]),
+                                       and value in values[name]),
                      "invalid metadata scalar")
 
 
@@ -330,7 +361,8 @@ def _check_sessions(rows):
     return ids
 
 
-def _check_objects(rows, sessions, creations):
+def _check_objects(rows, sessions, creations, labels=METADATA_LABELS,
+                   keys=METADATA_KEYS, values=METADATA_FIELD_VALUES):
     _require(type(rows) is list, "unexpected fields")
     ids = set()
     for row in rows:
@@ -349,14 +381,14 @@ def _check_objects(rows, sessions, creations):
         _label(row["attribution"], ATTRIBUTIONS, "object attribution")
         if row["attribution_reason"] is not None:
             _label(row["attribution_reason"], GAP_REASONS, "attribution reason")
-        _metadata_block(row["requested"])
-        _metadata_block(row["established"])
+        _metadata_block(row["requested"], keys, values)
+        _metadata_block(row["established"], keys, values)
         queries = row["queries"]
-        _keys(queries, METADATA_KEYS)
-        for name in METADATA_KEYS:
+        _keys(queries, keys)
+        for name in keys:
             _label(queries[name], QUERY_STATUSES, "query status")
         if row["label"] is not None:
-            _label(row["label"], METADATA_LABELS, "object metadata")
+            _label(row["label"], labels, "object metadata")
         _require(_u64(row["successful_references"])
                  and _u64(row["successful_key_references"])
                  and _u64(row["accessing_sessions"]), "invalid object counters")
@@ -472,16 +504,31 @@ def check_section(section):
     """Validate the section shape and return the checked facts."""
     version = section.get("version") if type(section) is dict else None
     _keys(section, SECTION_KEYS_V3
-          if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4)
+          if version in (OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
+                         OBSERVATIONS_VERSION_V5)
           else SECTION_KEYS)
     _require(type(version) is int
              and version in (OBSERVATIONS_VERSION, OBSERVATIONS_VERSION_V2,
-                             OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4),
+                             OBSERVATIONS_VERSION_V3, OBSERVATIONS_VERSION_V4,
+                             OBSERVATIONS_VERSION_V5),
              "unsupported observations version")
     roles = ROLES_V2 if version >= OBSERVATIONS_VERSION_V2 else ROLES
     creations = CREATIONS_V2 if version >= OBSERVATIONS_VERSION_V2 else CREATIONS
-    labels = (METADATA_LABELS_V4 if version >= OBSERVATIONS_VERSION_V4
-              else METADATA_LABELS)
+    if version >= OBSERVATIONS_VERSION_V5:
+        labels = METADATA_LABELS_V5
+        obj_labels = OBJECT_LABELS_V5
+        keys = METADATA_KEYS_V5
+        values = METADATA_FIELD_VALUES_V5
+    elif version >= OBSERVATIONS_VERSION_V4:
+        labels = METADATA_LABELS_V4
+        obj_labels = METADATA_LABELS
+        keys = METADATA_KEYS
+        values = METADATA_FIELD_VALUES
+    else:
+        labels = METADATA_LABELS
+        obj_labels = METADATA_LABELS
+        keys = METADATA_KEYS
+        values = METADATA_FIELD_VALUES
     unattributed = (_check_unattributed(
                         section["unattributed"],
                         allow_empty=version >= OBSERVATIONS_VERSION_V4)
@@ -491,7 +538,8 @@ def check_section(section):
     reason = _label(section["reason"], REASONS, "reason")
     _require((reason == "none") == (status == "populated"), "status and reason disagree")
     sessions = _check_sessions(section["sessions"])
-    objects = _check_objects(section["objects"], sessions, creations)
+    objects = _check_objects(section["objects"], sessions, creations,
+                             obj_labels, keys, values)
     tallies = {}
     order = []
     _require(type(section["key_operations"]) is list, "unexpected fields")

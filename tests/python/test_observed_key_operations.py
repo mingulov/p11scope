@@ -736,11 +736,18 @@ class ObservedRsaTests(unittest.TestCase):
                 set(ORACLE.METADATA_FIELD_VALUES_V5["parameter_set"]),
                 set(param_set) - {None})
             for field, accepted in ORACLE.METADATA_FIELD_VALUES.items():
+                if field == "key_type":
+                    continue
                 self.assertEqual(
                     tuple(ORACLE.METADATA_FIELD_VALUES_V5[field]),
                     tuple(accepted), field)
 
     def test_h9_v5_section_checks_structurally(self):
+        # v5 shape with the cell's RSA key rows: the PQC content rides
+        # the object views (key_type 74, parameter_set 2, ml_dsa_65
+        # object label). Key rows carry the cell pin (rsa_2048): a
+        # PQC or unknown key row is accepted by the v5 vocabulary
+        # and then refused by name, never as an unsupported version.
         section = observed("clean.json")
         section["version"] = 5
         section["unattributed"] = []
@@ -756,16 +763,26 @@ class ObservedRsaTests(unittest.TestCase):
                                                       "value": 2}
         pqc_object["queries"]["parameter_set"] = "established"
         pqc_object["label"] = "ml_dsa_65"
-        section["key_operations"][0]["metadata_at_use"] = "ml_dsa_65"
         with self.subTest("v5 shape checks"):
             facts = ORACLE.check_section(copy.deepcopy(section))
             self.assertEqual(len(facts["rows"]), 2)
             self.assertEqual(len(facts["unknown"]), 0)
-        with self.subTest("v4 unknown label still validates at v5"):
+        with self.subTest("PQC key rows fail by name, never by version"):
+            mutated = copy.deepcopy(section)
+            mutated["key_operations"][0]["metadata_at_use"] = "ml_dsa_65"
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE.check_section(mutated)
+            self.assertIn("unexpected key metadata", str(caught.exception))
+            self.assertNotIn("unsupported observations version",
+                             str(caught.exception))
+        with self.subTest("v4 unknown key rows fail by name at v5"):
             mutated = copy.deepcopy(section)
             mutated["key_operations"][1]["metadata_at_use"] = "unknown"
-            facts = ORACLE.check_section(mutated)
-            self.assertEqual(len(facts["rows"]), 2)
+            with self.assertRaises(ORACLE.OracleRefusal) as caught:
+                ORACLE.check_section(mutated)
+            self.assertIn("unexpected key metadata", str(caught.exception))
+            self.assertNotIn("unsupported observations version",
+                             str(caught.exception))
         with self.subTest("v5 content at v4 refused"):
             mutated = copy.deepcopy(section)
             mutated["version"] = 4
@@ -783,12 +800,24 @@ class ObservedRsaTests(unittest.TestCase):
             mutated = copy.deepcopy(section)
             mutated["version"] = 4
             mutated["objects"][0]["label"] = "rsa_2048"
-            mutated["key_operations"][0]["metadata_at_use"] = "rsa_2048"
             for row in mutated["objects"]:
                 for block in (row["requested"], row["established"]):
                     del block["parameter_set"]
                 del row["queries"]["parameter_set"]
-            with self.assertRaises(ORACLE.OracleRefusal):
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "invalid metadata scalar"):
+                ORACLE.check_section(mutated)
+        with self.subTest("PQC object label below v5 refused"):
+            mutated = copy.deepcopy(section)
+            mutated["version"] = 4
+            mutated["objects"][0]["established"]["key_type"] = {
+                "status": "value", "value": 0}
+            for row in mutated["objects"]:
+                for block in (row["requested"], row["established"]):
+                    del block["parameter_set"]
+                del row["queries"]["parameter_set"]
+            with self.assertRaisesRegex(ORACLE.OracleRefusal,
+                                        "unexpected object metadata label"):
                 ORACLE.check_section(mutated)
         with self.subTest("unknown versions refused"):
             for version in (0, 6, 99):

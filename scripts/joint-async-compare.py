@@ -54,6 +54,22 @@ LABELS = {"rsa_1024", "rsa_2048", "rsa_3072", "rsa_4096", "rsa_other", "aes_128"
 # H9 section v4 (DEMO-4 late attach): a first-observed key whose
 # type/size were never established rows under "unknown".
 LABELS_V4 = LABELS | {"unknown"}
+# H9 section v5 (PQC parameter sets): the eighteen combined labels
+# (each parameter-set code joined with its established key type).
+# Key rows accept the v4 labels plus all eighteen; object views
+# accept the twelve established labels plus the eighteen
+# (`unknown` stays row-level only). Feed declarations stay on the
+# frozen twelve: no PQC feed fixture exists yet.
+PQC_LABELS = {"ml_dsa_44", "ml_dsa_65", "ml_dsa_87",
+              "ml_kem_512", "ml_kem_768", "ml_kem_1024",
+              "slh_dsa_sha2_128s", "slh_dsa_shake_128s",
+              "slh_dsa_sha2_128f", "slh_dsa_shake_128f",
+              "slh_dsa_sha2_192s", "slh_dsa_shake_192s",
+              "slh_dsa_sha2_192f", "slh_dsa_shake_192f",
+              "slh_dsa_sha2_256s", "slh_dsa_shake_256s",
+              "slh_dsa_sha2_256f", "slh_dsa_shake_256f"}
+LABELS_V5 = LABELS_V4 | PQC_LABELS
+OBJECT_LABELS_V5 = LABELS | PQC_LABELS
 CATEGORIES = {"digest", "sign", "verify", "encrypt", "decrypt", "sign_recover",
               "verify_recover", "message_encrypt", "message_decrypt",
               "message_sign", "message_verify", "generate_key",
@@ -71,7 +87,7 @@ CREATIONS = {"create", "copy", "generate", "generate_pair", "derive",
              "unwrap"}
 # H9 section v2 additions (packet 6.07c): v1 tables stay frozen.
 CREATIONS_V2 = CREATIONS | {"encapsulate", "decapsulate"}
-SNAPSHOT_VERSIONS = (1, 2, 3, 4)
+SNAPSHOT_VERSIONS = (1, 2, 3, 4, 5)
 UNITS = {"operations", "message_contexts"}
 UNKNOWN_REASONS = {"unbound", "key_join_lost", "metadata_unknown",
                    "metadata_conflicting", "role_unavailable", "not_applicable"}
@@ -538,7 +554,7 @@ def _check_unknown_row(row, where):
     return (row["category"], row["reason"])
 
 
-def _check_object_row(row, where, creations=CREATIONS):
+def _check_object_row(row, where, creations=CREATIONS, labels=LABELS):
     _require(type(row) is dict, f"{where}: object row must be an object")
     _keys(row, {"object", "session", "origin", "creation", "birth", "lifetime",
                 "lifetime_reason", "attribution", "attribution_reason",
@@ -548,7 +564,7 @@ def _check_object_row(row, where, creations=CREATIONS):
     _require(_integer(row["object"]), f"{where}: object id out of range")
     _require(row["creation"] is None or row["creation"] in creations,
              f"{where}: object creation invalid")
-    _require(row["label"] is None or row["label"] in LABELS,
+    _require(row["label"] is None or row["label"] in labels,
              f"{where}: object label invalid")
     return row["object"]
 
@@ -566,7 +582,17 @@ def _snapshot_labels(document, tag):
     version = document["version"]
     _require(type(version) is int and version in SNAPSHOT_VERSIONS,
              f"{tag}: snapshot version mismatch")
+    if version >= 5:
+        return LABELS_V5
     return LABELS_V4 if version >= 4 else LABELS
+
+
+def _snapshot_object_labels(document, tag):
+    """Object-label vocabulary governed by the snapshot's section version."""
+    version = document["version"]
+    _require(type(version) is int and version in SNAPSHOT_VERSIONS,
+             f"{tag}: snapshot version mismatch")
+    return OBJECT_LABELS_V5 if version >= 5 else LABELS
 
 
 def _snapshot_creations(document, tag):
@@ -607,10 +633,10 @@ def _check_unattributed(document, tag):
     """Validate not-attributed counters: present iff version >= 3.
 
     Version 3 requires a nonempty list (it is emitted iff a count
-    exists); version 4 always carries the key and it may be empty.
+    exists); versions 4 and 5 always carry the key and it may be empty.
     """
     version = document["version"]
-    if version not in (3, 4):
+    if version not in (3, 4, 5):
         _require("unattributed" not in document,
                  f"{tag}: unattributed counters before section version 3")
         return
@@ -638,12 +664,13 @@ def validate_snapshot(document, tag):
     keys = {"version", "revision", "status", "reason", "sessions",
             "objects", "key_operations", "unknown_key_operations",
             "gaps", "budgets"}
-    if type(document) is dict and document.get("version") in (3, 4):
+    if type(document) is dict and document.get("version") in (3, 4, 5):
         keys |= {"unattributed"}
     _keys(document, keys)
     _check_unattributed(document, tag)
     roles = _snapshot_roles(document, tag)
     labels = _snapshot_labels(document, tag)
+    obj_labels = _snapshot_object_labels(document, tag)
     creations = _snapshot_creations(document, tag)
     _require(_integer(document["revision"]), f"{tag}: snapshot revision out of range")
     _require(document["status"] in STATUSES, f"{tag}: snapshot status invalid")
@@ -671,7 +698,7 @@ def validate_snapshot(document, tag):
     _require(type(document["objects"]) is list,
              f"{tag}: snapshot objects must be a list")
     object_ids = [_check_object_row(row, f"{tag} snapshot object {position}",
-                                         creations)
+                                         creations, obj_labels)
                   for position, row in enumerate(document["objects"])]
     _check_sorted_unique(object_ids, f"{tag} snapshot objects")
     _require(type(document["key_operations"]) is list,
@@ -1117,15 +1144,20 @@ def compare_stream(events, collision, snapshot, view):
         if kind == "object_observed":
             version = _row_event_version(event, where, {"revision", "row"})
             _, creations = _row_vocabularies(version)
+            obj_labels = OBJECT_LABELS_V5 if version >= 5 else LABELS
             _require(_integer(event["revision"]), f"{where}: revision out of range")
-            key = ("object", _check_object_row(event["row"], where, creations))
+            key = ("object", _check_object_row(event["row"], where, creations,
+                                                obj_labels))
             series.setdefault(key, []).append(
                 (event["revision"], line["at_ns"], event["row"]))
         elif kind == "key_operations_observed":
             version = _row_event_version(event, where,
                                          {"revision", "bucket", "row"})
             roles, _ = _row_vocabularies(version)
-            labels = LABELS_V4 if version >= 4 else LABELS
+            if version >= 5:
+                labels = LABELS_V5
+            else:
+                labels = LABELS_V4 if version >= 4 else LABELS
             _require(_integer(event["revision"]), f"{where}: revision out of range")
             _require(event["bucket"] in ("known", "unknown"),
                      f"{where}: bucket invalid")

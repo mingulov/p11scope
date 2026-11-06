@@ -24785,3 +24785,119 @@ fn joint_machine_idle_fresh_birth_waits_as_future_input() {
     );
     assert_eq!(fixture.machine.disposition_reason(), None);
 }
+
+/// An idle fresh birth that never calls again finishes cleanly: the
+/// waiting Future consumer disposes with the frame, the finish
+/// publishes with no no-progress gap, no trip and no disposition, the
+/// reduced count is unchanged and nothing was ever staged.
+#[test]
+fn joint_machine_idle_fresh_birth_finish_with_waiting_caller_is_clean() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    fixture.native.predating_births = true;
+    fixture.push_quiet();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::AttachObserved)),
+        "precondition: the caller is born attach-observed: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the idle fresh birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    let before = fixture.reduced_for(0);
+    let target = {
+        let table = fixture.machine.retained_births_for_test();
+        let mut found = None;
+        for (candidate, _) in fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_history_targets()
+        {
+            if let Some(witness) = table.find_ready(&candidate)
+                && witness.candidate.receipt.endpoint().file_slot == 0
+            {
+                found = Some(candidate);
+                break;
+            }
+        }
+        found.expect("the idle caller has a ready Joint target before finish")
+    };
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_staged_count(&target),
+        Some(0),
+        "the idle caller stages nothing before finish"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut finish_published = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(_) => {
+                finish_published = true;
+                break;
+            }
+            JointCommitProgress::Pending => {}
+        }
+    }
+    assert!(
+        finish_published,
+        "finish publishes with the idle caller still waiting: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    assert!(
+        no_progress_gaps(&fixture).is_empty(),
+        "no joint finish no-progress gap: {:?}",
+        no_progress_gaps(&fixture)
+    );
+    assert!(
+        audit_no_progress_gaps(&fixture).is_empty(),
+        "no joint audit no-progress gap: {:?}",
+        audit_no_progress_gaps(&fixture)
+    );
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(
+        fixture.reduced_for(0),
+        before,
+        "finish preserves the idle caller reduced count"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_staged_count(&target),
+        Some(0),
+        "the idle caller has nothing staged to count"
+    );
+}

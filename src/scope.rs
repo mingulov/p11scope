@@ -138,6 +138,15 @@ pub fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
         .map(|path| path.strip_prefix('/').unwrap_or(path))
 }
 
+/// Proves the owned path's scope names the owned child: PID scope by
+/// exact equality, cgroup scope by live membership through the retained
+/// descriptor (never the path). System scope never names one child.
+/// Scaffolding: the body lands with the implementation.
+pub fn scope_names_child(scope: &Scope, pid: u32) -> Result<()> {
+    let _ = (scope, pid);
+    anyhow::bail!("scope-names-child scaffolding");
+}
+
 /// `--cgroup` as an operator names it (M-3): [`cgroup`] plus proof, taken
 /// from the retained directory with `fstatfs`, that it lives on cgroup v2.
 /// A plain directory would otherwise be accepted as a scope whose inode no
@@ -1137,6 +1146,53 @@ mod tests {
         let path = group.path().to_path_buf();
         drop(group);
         assert!(!path.exists(), "the emptied run cgroup is removed");
+    }
+
+    #[test]
+    fn scope_names_child_accepts_the_exact_pid() {
+        scope_names_child(&Scope::Pid(4242), 4242).expect("the exact PID is named");
+    }
+
+    #[test]
+    fn scope_names_child_refuses_a_different_pid() {
+        let error = scope_names_child(&Scope::Pid(18), 17).expect_err("another PID is not named");
+        assert!(
+            format!("{error:#}").contains("not the owned child"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
+    fn scope_names_child_accepts_a_cgroup_member() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "4242\n").unwrap();
+        let scope = cgroup(dir.path()).unwrap();
+        scope_names_child(&scope, 4242).expect("a member is named");
+    }
+
+    #[test]
+    fn scope_names_child_refuses_a_cgroup_nonmember() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "99999999\n").unwrap();
+        let scope = cgroup(dir.path()).unwrap();
+        let error = scope_names_child(&scope, 4242).expect_err("a nonmember is not named");
+        assert!(format!("{error:#}").contains("not a member"), "{error:#}");
+    }
+
+    #[test]
+    fn scope_names_child_refuses_an_unreadable_cgroup() {
+        let dir = tempfile::tempdir().unwrap();
+        let scope = cgroup(dir.path()).unwrap();
+        let error =
+            scope_names_child(&scope, 4242).expect_err("an unreadable cgroup names nothing");
+        assert!(format!("{error:#}").contains("membership"), "{error:#}");
+    }
+
+    #[test]
+    fn scope_names_child_refuses_system_scope() {
+        let error =
+            scope_names_child(&Scope::System, 4242).expect_err("system scope names no child");
+        assert!(format!("{error:#}").contains("never names"), "{error:#}");
     }
 
     #[test]

@@ -640,6 +640,20 @@ fn root_seed_authority<'fd>(
     original_pidfd.context("borrowing original owned-child pidfd for root seed")
 }
 
+/// Which PID lifecycle tap a session carries: the single process under
+/// `OneProcess`, the owned child beside a process-wide owned run, and
+/// none anywhere else. Scaffolding: the body lands with the
+/// implementation.
+#[cfg(test)]
+fn pid_lifecycle_tap_for(
+    uprobe_scope: UProbeScope,
+    owned_pid: Option<NonZeroU32>,
+    domain: &events::DiscoveryDomain,
+) -> Option<PidLifecycleTap> {
+    let _ = (uprobe_scope, owned_pid, domain);
+    None
+}
+
 fn owner_limit_for_start(actual: ExactMapMetadata) -> Result<u64> {
     // These are the two existing START object shapes. Accepting the small
     // shape here does not relax the normal frozen object inventory elsewhere.
@@ -13982,6 +13996,74 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn root_seed_authority_accepts_a_cgroup_naming_the_child() {
+        use std::os::fd::{AsFd as _, AsRawFd as _};
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "4242\n").unwrap();
+        let scope = crate::scope::cgroup(dir.path()).unwrap();
+        let process = tempfile::tempfile().unwrap();
+        let pidfd = process.as_fd();
+        assert_eq!(
+            super::root_seed_authority(&scope, 4242, Ok(pidfd))
+                .expect("a cgroup naming the child seeds")
+                .as_raw_fd(),
+            process.as_raw_fd()
+        );
+    }
+
+    #[test]
+    fn root_seed_authority_refuses_a_cgroup_missing_the_child() {
+        use std::os::fd::AsFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "99999999\n").unwrap();
+        let scope = crate::scope::cgroup(dir.path()).unwrap();
+        let process = tempfile::tempfile().unwrap();
+        let error = super::root_seed_authority(&scope, 4242, Ok(process.as_fd()))
+            .expect_err("a cgroup missing the child seeds nothing");
+        assert!(format!("{error:#}").contains("not a member"), "{error:#}");
+    }
+
+    #[test]
+    fn pid_lifecycle_tap_keeps_unowned_process_wide_arms_empty() {
+        use super::{UProbeScope, pid_lifecycle_tap_for};
+        use std::num::NonZeroU32;
+        let domain = crate::events::DiscoveryDomain::test_standin(801);
+        assert!(
+            pid_lifecycle_tap_for(UProbeScope::AllProcesses, None, &domain).is_none(),
+            "unowned all-processes carries no tap"
+        );
+        assert!(
+            pid_lifecycle_tap_for(UProbeScope::CallingProcess, NonZeroU32::new(7), &domain)
+                .is_none(),
+            "the calling-process arm stays empty even with an owned pid"
+        );
+    }
+
+    #[test]
+    fn pid_lifecycle_tap_keeps_the_one_process_arm() {
+        use super::{UProbeScope, pid_lifecycle_tap_for};
+        use std::num::NonZeroU32;
+        let domain = crate::events::DiscoveryDomain::test_standin(802);
+        let tap = pid_lifecycle_tap_for(
+            UProbeScope::OneProcess(NonZeroU32::new(7).unwrap()),
+            None,
+            &domain,
+        )
+        .expect("one-process keeps its tap");
+        assert_eq!(tap.test_pid(), 7);
+    }
+
+    #[test]
+    fn pid_lifecycle_tap_covers_the_owned_child_beside_all_processes() {
+        use super::{UProbeScope, pid_lifecycle_tap_for};
+        use std::num::NonZeroU32;
+        let domain = crate::events::DiscoveryDomain::test_standin(803);
+        let tap = pid_lifecycle_tap_for(UProbeScope::AllProcesses, NonZeroU32::new(9), &domain)
+            .expect("all-processes with an owned child taps the child");
+        assert_eq!(tap.test_pid(), 9);
     }
 
     #[test]

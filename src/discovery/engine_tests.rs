@@ -15769,6 +15769,88 @@ fn owned_prearmed_seed_route(
     (fixture, child, engine, context, exec, session)
 }
 
+/// The owned pre-exec loader arming accepts a run cgroup scope naming
+/// the held child, exactly as it accepts the exact PID scope: the
+/// barrier-held child is discovered, armed, and never released here
+/// (dropping it exits 127 behind the closed barrier).
+#[test]
+fn owned_loader_prearm_arms_beside_a_run_cgroup_naming_the_child() {
+    let (fixture, _, _, _) = loaded_seed_provider();
+    let child = OwnedChild::spawn(
+        fixture._dir.path().join("seed-runner").into_os_string(),
+        vec![
+            fixture
+                ._dir
+                .path()
+                .join("seed-provider.so")
+                .into_os_string(),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{}\n", child.pid()),
+    )
+    .unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = crate::scope::cgroup(dir.path()).unwrap();
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    assert!(matches!(
+        engine
+            .arm_owned_loader_before_release(
+                &child,
+                &mut session,
+                &mut true,
+                &mut PendingViewRetirements::new()
+            )
+            .unwrap(),
+        OwnedLoaderPrearmOutcome::Armed
+    ));
+}
+
+/// A run cgroup scope missing the held child refuses the prearm by
+/// name, never arming blind.
+#[test]
+fn owned_loader_prearm_refuses_a_run_cgroup_missing_the_child() {
+    let (fixture, _, _, _) = loaded_seed_provider();
+    let child = OwnedChild::spawn(
+        fixture._dir.path().join("seed-runner").into_os_string(),
+        vec![
+            fixture
+                ._dir
+                .path()
+                .join("seed-provider.so")
+                .into_os_string(),
+        ],
+    )
+    .unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("cgroup.procs"), "99999999\n").unwrap();
+    let mut engine = Engine::empty();
+    engine.scope = crate::scope::cgroup(dir.path()).unwrap();
+    engine.next_view_id = 1;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), child.pid()).unwrap());
+    let mut session = ScriptedSession::default();
+    session.dynamic_loader_reports_added = true;
+    let error = engine
+        .arm_owned_loader_before_release(
+            &child,
+            &mut session,
+            &mut true,
+            &mut PendingViewRetirements::new(),
+        )
+        .expect_err("a cgroup missing the child arms nothing");
+    assert!(format!("{error:#}").contains("not a member"), "{error:#}");
+}
+
 /// The generic EXEC refresh must not undo the successful owned prearm
 /// revalidation. A later ADD still discovers the provider and its next-tick
 /// fallback runs once without replaying the hit.

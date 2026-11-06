@@ -145,8 +145,11 @@ pub(crate) fn resolve_selection(
     spec: &str,
     broad_plan: &AttachPlan,
     scope: &Scope,
+    owned: Option<u32>,
 ) -> Result<ResolvedSelection, SelectedDriverRefusal> {
     use SelectedDriverRefusal::{Detail, EndpointUnknown, Promotion};
+    // Scaffolding: the owned-cgroup branch lands with the implementation.
+    let _ = owned;
     if !matches!(broad_plan.admission_policy(), AdmissionPolicy::Counters(_)) {
         return Err(Detail(SelectedDetailRefusal::BroadPlanTopology));
     }
@@ -921,9 +924,10 @@ pub(crate) fn run_metrics_selection_stage(
     name: &str,
     broad_plan: &AttachPlan,
     scope: &Scope,
+    owned: Option<u32>,
     ledger: &mut SelectionLedger,
 ) -> Option<ResolvedSelection> {
-    match resolve_selection(name, broad_plan, scope) {
+    match resolve_selection(name, broad_plan, scope, owned) {
         Ok(resolved) => {
             ledger.record_selection(name, &resolved);
             Some(resolved)
@@ -2290,23 +2294,23 @@ mod tests {
         let pool = test_pool();
         let scene = stage_single_provider(pool, 8);
         let scope = Scope::Pid(std::process::id());
-        let resolved =
-            resolve_selection("C_Toggle0007", &scene.plan, &scope).expect("one live slot resolves");
+        let resolved = resolve_selection("C_Toggle0007", &scene.plan, &scope, None)
+            .expect("one live slot resolves");
         assert_eq!(resolved.slot, 7);
         assert_eq!(resolved.physical.object, scene.object);
         assert_eq!(resolved.physical.file_offset, 0x80 + 7 * 0x10);
         assert_eq!(resolved.names, vec!["C_Toggle0007".to_string()]);
         assert_eq!(resolved.original.pid(), std::process::id());
 
-        let unknown = resolve_selection("C_NoSuchEndpoint", &scene.plan, &scope).unwrap_err();
+        let unknown = resolve_selection("C_NoSuchEndpoint", &scene.plan, &scope, None).unwrap_err();
         assert_eq!(unknown, SelectedDriverRefusal::EndpointUnknown);
         assert_eq!(unknown.name(), "endpoint_unknown");
-        let empty = resolve_selection("", &scene.plan, &scope).unwrap_err();
+        let empty = resolve_selection("", &scene.plan, &scope, None).unwrap_err();
         assert_eq!(empty, SelectedDriverRefusal::EndpointUnknown);
 
         let pool = test_pool();
         let multi = stage_two_providers(pool);
-        let ambiguous = resolve_selection("C_Sign", &multi.plan, &scope).unwrap_err();
+        let ambiguous = resolve_selection("C_Sign", &multi.plan, &scope, None).unwrap_err();
         assert_eq!(
             ambiguous,
             SelectedDriverRefusal::Promotion(PromotionRefusal::EndpointAmbiguous)
@@ -2316,7 +2320,8 @@ mod tests {
         aliased.slots[0].names = vec!["C_Sign".into(), "C_SignAlias".into()];
         aliased.slots[0].aliased = true;
         aliased.slots.truncate(1);
-        let grouped = resolve_selection("C_SignAlias", &aliased, &scope).expect("group resolves");
+        let grouped =
+            resolve_selection("C_SignAlias", &aliased, &scope, None).expect("group resolves");
         assert_eq!(grouped.slot, 0);
         assert_eq!(grouped.names.len(), 2);
     }
@@ -2330,17 +2335,23 @@ mod tests {
         // an adaptation.
         let pool = test_pool();
         let scene = stage_single_provider(pool, 4);
-        let live = resolve_selection("C_Toggle0001", &scene.plan, &Scope::Pid(std::process::id()))
-            .expect("live pid pins");
+        let live = resolve_selection(
+            "C_Toggle0001",
+            &scene.plan,
+            &Scope::Pid(std::process::id()),
+            None,
+        )
+        .expect("live pid pins");
         assert_eq!(live.original.pid(), std::process::id());
 
-        let no_such =
-            resolve_selection("C_Toggle0001", &scene.plan, &Scope::Pid(u32::MAX)).unwrap_err();
+        let no_such = resolve_selection("C_Toggle0001", &scene.plan, &Scope::Pid(u32::MAX), None)
+            .unwrap_err();
         assert_eq!(
             no_such,
             SelectedDriverRefusal::Promotion(PromotionRefusal::UnknownCaller)
         );
-        let system = resolve_selection("C_Toggle0001", &scene.plan, &Scope::System).unwrap_err();
+        let system =
+            resolve_selection("C_Toggle0001", &scene.plan, &Scope::System, None).unwrap_err();
         assert_eq!(
             system,
             SelectedDriverRefusal::Promotion(PromotionRefusal::ScopeUnsupported)
@@ -2356,6 +2367,7 @@ mod tests {
                 path: dir.path().to_path_buf(),
                 dir: held,
             },
+            None,
         )
         .unwrap_err();
         assert_eq!(
@@ -2363,12 +2375,98 @@ mod tests {
             SelectedDriverRefusal::Promotion(PromotionRefusal::ScopeUnsupported)
         );
         let detailed = AttachPlan::from_slots(scene.plan.slots.clone());
-        let topology =
-            resolve_selection("C_Toggle0001", &detailed, &Scope::Pid(std::process::id()))
-                .unwrap_err();
+        let topology = resolve_selection(
+            "C_Toggle0001",
+            &detailed,
+            &Scope::Pid(std::process::id()),
+            None,
+        )
+        .unwrap_err();
         assert_eq!(
             topology,
             SelectedDriverRefusal::Detail(SelectedDetailRefusal::BroadPlanTopology)
+        );
+    }
+
+    #[test]
+    fn resolve_selection_resolves_an_owned_cgroup_original() {
+        // An owned run beside its cgroup scope resolves to the owned
+        // child: the pin opens on the direct child, never a descendant.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let dir = tempfile::tempdir().unwrap();
+        let held =
+            std::sync::Arc::new(std::fs::File::open(dir.path()).expect("cgroup stand-in opens"));
+        let scope = Scope::Cgroup {
+            id: 7,
+            path: dir.path().to_path_buf(),
+            dir: held,
+        };
+        let resolved = resolve_selection(
+            "C_Toggle0001",
+            &scene.plan,
+            &scope,
+            Some(std::process::id()),
+        )
+        .expect("an owned cgroup resolves its original");
+        assert_eq!(resolved.original.pid(), std::process::id());
+    }
+
+    #[test]
+    fn resolve_selection_refuses_a_zero_owned_pid() {
+        // Degenerate owned marker: pid 0 is no process, so the scope
+        // refusal stands exactly as without an owner.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let dir = tempfile::tempdir().unwrap();
+        let held =
+            std::sync::Arc::new(std::fs::File::open(dir.path()).expect("cgroup stand-in opens"));
+        let scope = Scope::Cgroup {
+            id: 7,
+            path: dir.path().to_path_buf(),
+            dir: held,
+        };
+        let refused = resolve_selection("C_Toggle0001", &scene.plan, &scope, Some(0)).unwrap_err();
+        assert_eq!(
+            refused,
+            SelectedDriverRefusal::Promotion(PromotionRefusal::ScopeUnsupported)
+        );
+    }
+
+    #[test]
+    fn metrics_selection_stage_records_an_owned_cgroup_resolution() {
+        // The stage records an owned-cgroup resolution like a PID one:
+        // slot resolves, no refusal, and no raw PID publishes.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let dir = tempfile::tempdir().unwrap();
+        let held =
+            std::sync::Arc::new(std::fs::File::open(dir.path()).expect("cgroup stand-in opens"));
+        let scope = Scope::Cgroup {
+            id: 7,
+            path: dir.path().to_path_buf(),
+            dir: held,
+        };
+        let mut ledger = SelectionLedger::new();
+        let resolved = run_metrics_selection_stage(
+            "C_Toggle0002",
+            &scene.plan,
+            &scope,
+            Some(std::process::id()),
+            &mut ledger,
+        )
+        .expect("an owned cgroup resolves for the K0 window");
+        assert_eq!(resolved.slot, 2);
+        assert_eq!(resolved.original.pid(), std::process::id());
+        let record = ledger.selection.as_ref().expect("selection records");
+        assert_eq!(record.refusal, None, "resolution alone refuses nothing");
+        let composed = with_selected_detail(serde_json::json!({"evidence": {}}), &ledger);
+        let resolved_record = composed["evidence"]["selected_detail"]["selection"]
+            .as_object()
+            .expect("resolved selection composes");
+        assert!(
+            resolved_record.get("original_pid").is_none(),
+            "no raw PID publishes: {resolved_record:?}"
         );
     }
 
@@ -2385,7 +2483,7 @@ mod tests {
         let scope = Scope::Pid(std::process::id());
         let mut ledger = SelectionLedger::new();
         let resolved =
-            run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
+            run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, None, &mut ledger)
                 .expect("live name resolves for the K0 window");
         assert_eq!(resolved.slot, 2);
         assert_eq!(
@@ -2418,7 +2516,8 @@ mod tests {
         }
 
         let mut refused = SelectionLedger::new();
-        let none = run_metrics_selection_stage("C_Missing", &scene.plan, &scope, &mut refused);
+        let none =
+            run_metrics_selection_stage("C_Missing", &scene.plan, &scope, None, &mut refused);
         assert!(none.is_none(), "unknown names resolve to nothing");
         let record = refused.selection.as_ref().expect("refusal records");
         assert_eq!(record.slot, None);
@@ -2470,7 +2569,7 @@ mod tests {
         let mut ledger = SelectionLedger::new();
         assert_eq!(ledger.selection_outcome(), None, "no attempt yet");
         let resolved =
-            run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
+            run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, None, &mut ledger)
                 .expect("live name resolves");
         assert_eq!(resolved.slot, 2);
         assert_eq!(
@@ -2479,7 +2578,8 @@ mod tests {
             "a live resolution refuses nothing"
         );
         let mut refused = SelectionLedger::new();
-        let none = run_metrics_selection_stage("C_Missing", &scene.plan, &scope, &mut refused);
+        let none =
+            run_metrics_selection_stage("C_Missing", &scene.plan, &scope, None, &mut refused);
         assert!(none.is_none(), "unknown names resolve to nothing");
         assert_eq!(
             refused.selection_outcome(),
@@ -4803,7 +4903,13 @@ mod tests {
         name: &str,
         ledger: &mut SelectionLedger,
     ) -> Option<ResolvedSelection> {
-        run_metrics_selection_stage(name, &scene.plan, &Scope::Pid(std::process::id()), ledger)
+        run_metrics_selection_stage(
+            name,
+            &scene.plan,
+            &Scope::Pid(std::process::id()),
+            None,
+            ledger,
+        )
     }
 
     fn k0_exec_record(pid: u32, ts: u64) -> DiscoveryRecord {
@@ -5250,7 +5356,7 @@ mod tests {
         let scope = Scope::Pid(std::process::id());
         let mut ledger = SelectionLedger::new();
         assert!(
-            run_metrics_selection_stage("C_Sign", &multi.plan, &scope, &mut ledger).is_none(),
+            run_metrics_selection_stage("C_Sign", &multi.plan, &scope, None, &mut ledger).is_none(),
             "ambiguous names open nothing"
         );
         assert_eq!(
@@ -5267,8 +5373,14 @@ mod tests {
         let scene = stage_single_provider(pool, 4);
         let mut ledger = SelectionLedger::new();
         assert!(
-            run_metrics_selection_stage("C_Toggle0001", &scene.plan, &Scope::System, &mut ledger)
-                .is_none(),
+            run_metrics_selection_stage(
+                "C_Toggle0001",
+                &scene.plan,
+                &Scope::System,
+                None,
+                &mut ledger
+            )
+            .is_none(),
             "system scope opens nothing"
         );
         assert_eq!(
@@ -5288,6 +5400,7 @@ mod tests {
                     path: dir.path().to_path_buf(),
                     dir: held,
                 },
+                None,
                 &mut ledger,
             )
             .is_none(),

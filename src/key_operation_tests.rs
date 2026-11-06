@@ -16992,6 +16992,176 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     );
 }
 
+/// C5: retiring a caller whose staged Init+terminal pair was fully
+/// observed preserves the definite completion as an unknown-key row
+/// (the proof left with the caller; the S1 stands), while the
+/// disposed calls still count as `record_lost` and live S1 is
+/// untouched. Without preservation a workload of short-lived
+/// callers reads zero rows with only a counted gap.
+#[test]
+fn key_operation_c5_retirement_preserves_observed_pair_as_unknown() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Retirement, position, retirement,
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Definite history first (it also retains the projection): one
+    // completed Sign through Joint seals.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // A second pair stages but no seal ever settles it: the caller
+    // bursts, then exits.
+    let (facts_init, pos_init) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, pos_init, facts_init);
+    let (facts_sign, pos_sign) = guarded.admit_shape(&sign);
+    guarded.observe(&joint_key, pos_sign, facts_sign);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        2,
+        "the exiting pair is queued"
+    );
+    let retire_at = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(retire_at > pos_sign, "non-vacuous: retirement above the queue");
+    guarded.registry.retire_instance(retirement(
+        Retirement::Exact(joint_key.clone()),
+        position(guarded.domain, retire_at),
+        InstanceReason::InstanceRetired,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        0,
+        "retirement disposes the owned queue"
+    );
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        2,
+        "disposal never reduces through live S1"
+    );
+    // The observed completion rows unknown-key beside the counted
+    // proof loss; the proved history stands.
+    let observations = guarded.registry.joint_observations(16);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost")
+    );
+    let preserved = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("the observed Init+terminal pair rows unknown-key");
+    assert_eq!((preserved.completed, preserved.active), (1, 0));
+    assert!(
+        observations
+            .key_operations
+            .iter()
+            .any(|row| row.category == "sign" && row.completed == 1),
+        "the proved history stands beside the preserved row"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 2,
+        }]
+    );
+}
+
+/// C5 negative twin: a truncated staged Init (start observed, end
+/// lost) rows no completion when its caller retires — only the
+/// counted `record_lost` names it. Preservation never fabricates
+/// terminals.
+#[test]
+fn key_operation_c5_retirement_truncated_init_rows_no_completion() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Retirement, position, retirement,
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Only an Init stages before the exit: no completion observed.
+    let (facts_init, pos_init) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, pos_init, facts_init);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let retire_at = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(retire_at > pos_init, "non-vacuous: retirement above the queue");
+    guarded.registry.retire_instance(retirement(
+        Retirement::Exact(joint_key.clone()),
+        position(guarded.domain, retire_at),
+        InstanceReason::InstanceRetired,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.edge_calls(joint_id), 2, "history only");
+    let observations = guarded.registry.joint_observations(17);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost")
+    );
+    assert!(
+        observations
+            .unknown_key_operations
+            .iter()
+            .find(|row| row.category == "sign" && row.reason == "unbound")
+            .is_none_or(|row| row.completed == 0),
+        "a start without its terminal never rows a completion"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 1,
+        }]
+    );
+}
+
 /// The capture owner holds ONE ledger: a staged H9 charge plus its
 /// association mint account together in one census/total, so either
 /// release frees allowance for the other role. Scalar-role charges

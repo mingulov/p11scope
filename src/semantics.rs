@@ -293,6 +293,67 @@ mod corrective_tests {
     }
 
     #[test]
+    fn pending_mechanism_init_records_no_row_or_cell_until_completion() {
+        // PENDING diverts to the async queue upstream of every
+        // mechanism recorder (`observe_process`): the queued Init
+        // records no row and no provider cell, and its completion is
+        // recorded once with the final `rv`.
+        let p = plan(&["C_SignInit", "C_AsyncComplete"]);
+        let mut state = State::new(&p);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, CkRv::PENDING.0));
+        assert!(
+            state.mechanisms().get(&0x1087).is_none(),
+            "a PENDING Init queues, it does not record"
+        );
+        assert_eq!(state.pending_at_end(), 1);
+
+        let mut complete = event(&p, "C_AsyncComplete", 7, CkRv::OK.0);
+        complete.target_function = crate::kinds::function_id("C_SignInit").unwrap();
+        complete.async_value = CkRv::OK.0;
+        state.observe(&complete);
+
+        assert_eq!(state.pending_at_end(), 0);
+        let row = &state.mechanisms()[&0x1087];
+        assert_eq!((row.calls, row.errors), (1, 0));
+        let cell = &row.by_module[&crate::plan::ModuleId(0)];
+        assert_eq!((cell.calls, cell.errors), (1, 0));
+    }
+
+    #[test]
+    fn module_cell_refused_while_cgroup_cell_admitted() {
+        // Limit-4 twin of `module_cells_share_the_state_key_budget`:
+        // the first event admits history, cgroup, row and
+        // cgroup-mechanism keys (1-4) and refuses only the module
+        // cell, so the cgroup cell's presence plus the module cell's
+        // absence pins module-specific refusal. The drop count stays
+        // unpinned: `apply_init`'s binding admission also refuses.
+        let p = plan(&["C_SignInit"]);
+        let mut state = State::with_limit(&p, 4);
+        state.observe(&mechanism(&p, "C_SignInit", 7, 0x1087, 0));
+
+        let row = state
+            .mechanisms()
+            .get(&0x1087)
+            .expect("row admitted before its breakdown");
+        assert_eq!(row.calls, 1);
+        assert!(
+            row.by_module.is_empty(),
+            "refused module cell records nothing: {row:?}"
+        );
+        let cgroup_cell = state.cgroups()[&0]
+            .mechanisms
+            .get(&0x1087)
+            .expect("cgroup cell admitted before the module cell");
+        assert_eq!((cgroup_cell.calls, cgroup_cell.errors), (1, 0));
+        assert!(state.semantic_evidence().semantic_state_drops > 0);
+        assert!(
+            state.retained_dynamic_keys() <= 4,
+            "retained {} keys",
+            state.retained_dynamic_keys()
+        );
+    }
+
+    #[test]
     fn purge_modules_drops_the_provider_breakdown_with_its_rows() {
         let p = two_module_plan();
         let mut state = State::new(&p);

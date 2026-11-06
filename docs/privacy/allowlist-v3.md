@@ -1778,3 +1778,76 @@ Allowlist-v1 bytes are unchanged.**
 Owner ruling KG-1/KG-2 also covers key creation/derivation counts as
 not secret; this section implements the mechanism-count half only.
 Creation/derivation counts remain future work and gain no row here.
+
+## Short-lived tracking widened to trace, metrics, `--pid` and owned run (7.10b)
+
+**Status: DRAFT for owner privacy approval (v0.7.0 task 7.10b,
+v0.6.0 finish-plan answer B8: the 5a scope stays for v0.6.0 and
+widening needs a new privacy approval first). This section proposes
+the widened read/retention contract; an Opus privacy review follows
+before integration, and the 614b P1 narrow authorization above stays
+in force until the owner approves this draft. The implementation on
+`task/v070-shortlived-wide` follows this draft. No new kernel read,
+no new retained field, no argv, environment, path, payload, PIN or
+key-material read or publication: the single captured field stays
+the Row A exe identity (`(dev, ino)` file metadata only), behind
+the same opt-in `--track-short-lived` (default off). Allowlist-v1
+bytes are unchanged. Counter modes still refuse the flag by name;
+inventory still never arms.**
+
+What widens, per mode and scope (Detailed policies only, flag armed;
+disarmed captures record nothing, as today):
+
+| Capture | New consumer | New publication |
+| --- | --- | --- |
+| trace `--cgroup`/`--system` | Novel unmatched exits, as profile today | `gap_exe_hints` + `gap_exit_mappings` in the terminal `EVIDENCE` object (the trace lane already renders through `versioned_evidence`) |
+| `--mode metrics` `--cgroup`/`--system` (non-counter) | Novel unmatched exits, as profile today | `gap_exe_hints` + `gap_exit_mappings` in the metrics evidence object (same closed shapes as profile) |
+| profile/trace/metrics `--pid`, owned `run` (any lane) | Validated target execs (below) | `target_exec_hints` in that lane's evidence; the gap keys stay absent (no descendant-gap subpopulation exists under PID scope) |
+| profile/trace/metrics `--cgroup`/`--system` | — | `target_exec_hints` stays absent (no single target; per-member exec classification is out of scope) |
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Exe identity read (Row A, unchanged) | At `sched_process_exec` the kernel reads `current->mm->exe_file`'s `(dev, ino)` into the EXEC record whenever `FLAG_TRACK_SHORT_LIVED` is set. No new read: the stanza already stamps the pair in every flavor and scope once the bit is set; only userspace arming widens. Under PID scope the pair rides the named target's EXEC records; the EXEC ticket stays unavailable there by design (number-only admission cannot bind it), exactly as the v2 ticket row requires. | Unchanged: private capture-local identity/cache tuples only; never published. | Unchanged: absent pair reads `unknown`. |
+| Aggregate-policy stash seeding (seeding-rule amendment, userspace only) | Under `--mode metrics` (aggregate policy) over `--cgroup`/`--system`, scope-admitted EXEC records seed the exe-identity stash without a kernel ticket. Justification: the exe pair is read directly from the exec'ing task and does not depend on ticket allocation; cgroup admission is membership-based and system scope covers the whole machine, so admission plus the unchanged timestamp-ordering and consume-once discipline binds as strongly as the ticketed Detailed path. The v2 ticket row stands unamended — the kernel still stamps no ticket under aggregate policy (and none under PID scope, where the gap stash still never seeds: number-only admission cannot bind). Detailed (non-aggregate) seeding still requires the ticket, so the qualified profile path is byte-identical. No BPF change exists in 7.10b. | Unchanged stash bounds (256 entries, smallest PID evicted first, consumed at most once, in timestamp order). | Unchanged: missing/reordered/absent entries classify `unknown` without analysis. Required evidence: ticketless-seed and ticketed-refusal twins at the stash seam. |
+| Validated target exec (PID scope, new consumer) | Under exact-`--pid` scope (profile `--pid`, owned `run`) each EXEC record that matches the retained target view through the existing lifecycle matcher, while that view is still the same generation (`still_the_same`, pidfd-backed), validates as one target exec. Unmatched EXECs and EXECs against a dead/retired view validate nothing and carry no hint. At validation the observer learns the target's exe path with the same `readlink /proc/<pid>/exe` + `fstat` read inside the same `run_while_same` bracket that scan learning uses — the same file the observer already reads on every scan of the named target, timed at exec instead of at scan — then runs the unchanged Row B/D analysis on the recorded pair. | No per-exec retention: the learn feeds the shared capture-local path cache (4,096 entries, no-retain-when-full) and the analysis feeds the shared verdict cache (1,024 entries) under the shared Row D capture budget (64 MiB; per-analysis 1 MiB, 32 objects, 128 edges, 255-byte names). Only the four saturating `target_exec_hints` counts publish, with the `STATIC HINT` label and the D-transitive scope string. A target exec is never a call, verdict, share, birth, admission or completeness input (Row C, R57). | A re-exec between the record and the learn fails the reopen `fstat` equality and reads `unknown`; a dead target fails the bracket and reads `unknown`; an absent pair reads `unknown` without analysis. A fast exec chain degrades superseded images to `unknown`, never to a wrong image's hint. Required evidence: validated-exec, stale-view, absent-pair and re-exec-race twins at the dispatch seam. |
+| `target_exec_hints` publication (new key) | The validated-target-exec subpopulation above: exactly one hint per validated target exec. | Present if and only if the capture armed extensive mode under PID scope (profile `--pid` or owned `run`, profile/trace/metrics lanes); absent, never null, otherwise. Closed shape identical to `gap_exe_hints`: `label`, `scope`, `links_provider`, `links_pkcs11_loader`, `no_static_link_within_scope`, `unknown`. Zeros mean no validated target exec was observed, never "no provider use". | Unvalidated execs are outside the subpopulation (like admissions/overflow for gaps): they add no count, not even `unknown`. Required evidence: exact-shape, absent-when-disarmed, gap-keys-absent-under-PID and target-key-absent-under-cgroup/system twins per lane. |
+
+Kernel-bit forwarding is unchanged: the bit publishes if and only if
+the engine armed extensive mode (either consumer) under a Detailed
+policy; a counter policy still refuses the flag by name before any
+map write. The kind-7 exit record already flows under the armed bit
+in every Detailed lane and scope; under PID scope it retires the
+target view exactly like kind 6 and is never classified (no gap
+subpopulation; target mappings stay directly observed through scans),
+so it adds no retention and no publication there. Text output is
+unchanged (hints are JSON-evidence-only, as today): concise stays
+concise, `-v` adds no hint lines, and the JSON lanes carry the
+complete new keys.
+
+Residuals (same class as the Row A note): PID reuse under discovery
+ring loss can attribute one image-correct hint to the wrong
+generation's count (the `still_the_same` gate plus the reopen
+re-verify bound it to the lost-exit case, which already forces
+`PARTIAL` through `discovery_ring_loss`); target execs before attach
+are invisible; metrics ticketless seeding trusts membership admission
+(the same admission that authorizes every other metrics lifecycle
+record). An owned `run` whose child never execs (spawn failure aside,
+the child always execs its command once) publishes a zero split.
+
+The CLI-text finding 32 contradiction is removed with this widening:
+`run` accepts `--track-short-lived` and arms the PID consumer for its
+child, so the "records nothing beside run" refusal is gone; the
+profile, trace and run help texts each describe what the flag arms on
+their own surface (gap splits on `--cgroup`/`--system`, target-exec
+hints on `--pid`/owned run), and all three keep the `--counter-mode`
+refusal line. `docs/usage.md`, `README.md`,
+`docs/known-limitations.md` and `docs/schema/observed-profile-v3.md`
+carry the same widened rule; the lifecycle-cli oracle's `--pid` cell
+keeps asserting the gap keys absent and now accepts the target key.
+
+Required evidence beyond this lane's V1 twins: per-mode live cells
+(trace-armed `EVIDENCE`, metrics-armed evidence, a `--pid`/run cell
+whose target execs mid-capture) through the privileged lanes, and
+equal-coverage cost cells (armed versus disarmed over the identical
+workload: identical call/attribution surfaces plus the measured
+arm/disarm cost delta) before release claims.

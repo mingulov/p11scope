@@ -335,6 +335,208 @@ fn o_publishes_a_private_file_atomically() {
     assert_eq!(litter(&dir), Vec::<String>::new());
 }
 
+/// Build the isolation probe provider and its lazy backend in a fresh
+/// scratch directory. The backend is resolved by the probe's getter via
+/// `$ORIGIN`, never through `DT_NEEDED`.
+fn build_isolation_probe(dir: &Path) -> std::path::PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    let backend = dir.join("isolation-backend.so");
+    let provider = dir.join("isolation-probe.so");
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&backend)
+            .arg(source.join("isolation_backend.c"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(source.join("isolation_probe.c"))
+            .arg("-ldl")
+            .arg("-Wl,-rpath,$ORIGIN")
+            .status()
+            .unwrap()
+            .success()
+    );
+    let dynamic = Command::new("readelf")
+        .args(["-d"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert!(dynamic.status.success());
+    assert!(
+        !String::from_utf8_lossy(&dynamic.stdout).contains("isolation-backend"),
+        "backend must be acquired lazily, not through DT_NEEDED"
+    );
+    provider
+}
+
+fn build_isolation_needy(dir: &Path) -> std::path::PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    let provider = dir.join("isolation-needy.so");
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(source.join("isolation_needy.c"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    provider
+}
+
+/// R1: only the two named profiles exist.
+#[test]
+fn isolation_unknown_profile_is_usage_error() {
+    let out = Command::new(BIN)
+        .args(["--isolation", "bogus", "--module", "/dev/null"])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--isolation must be trusted or isolated"),
+        "{stderr}"
+    );
+}
+
+/// The isolated fence is active before provider code runs: the probe
+/// constructor's socket creation and file write are both denied, while the
+/// healthy sparse provider still discovers fully.
+#[test]
+fn isolation_constructor_access_is_enforced_before_provider_load() {
+    use p11scope_discover::manifest::{Acquisition, Resolution, WalkOutcome};
+    let dir = scratch("isolation-enforced");
+    let provider = build_isolation_probe(&dir);
+    let out = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("ISOLATION_SOCKET=denied(errno=13)"),
+        "socket creation was not fenced: {stderr}"
+    );
+    assert!(
+        stderr.contains("ISOLATION_WRITE=denied(errno=13)"),
+        "file write was not fenced: {stderr}"
+    );
+    let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(m.schema, "p11scope-manifest/5");
+    let legacy = &m.surfaces[0];
+    assert!(matches!(legacy.acquisition, Acquisition::Ok));
+    assert!(matches!(legacy.walk, WalkOutcome::Full));
+    assert_eq!(legacy.functions.len(), 68);
+    let nulls = legacy
+        .functions
+        .iter()
+        .filter(|f| matches!(f.resolution, Resolution::NullPointer))
+        .count();
+    assert_eq!(nulls, 3, "the sparse NULLs must survive the fence");
+    assert!(
+        m.provenance_objects
+            .iter()
+            .any(|object| object.path.ends_with("isolation-backend.so")),
+        "the lazy backend must load under the fence"
+    );
+}
+
+/// Twin: a healthy sparse/all-NULL/lazy provider discovers byte-identically
+/// with and without the fence; the fence changes nothing it need not.
+#[test]
+fn isolation_healthy_sparse_lazy_provider_matches_trusted() {
+    use p11scope_discover::manifest::{Acquisition, WalkOutcome};
+    let dir = scratch("isolation-twin");
+    let provider = build_isolation_probe(&dir);
+    let run = |extra: &[&str]| {
+        let mut args: Vec<&std::ffi::OsStr> = extra.iter().map(std::ffi::OsStr::new).collect();
+        args.push(std::ffi::OsStr::new("--module"));
+        args.push(provider.as_os_str());
+        Command::new(BIN).args(&args).output().unwrap()
+    };
+    let default = run(&[]);
+    let trusted = run(&["--isolation", "trusted"]);
+    let isolated = run(&["--isolation", "isolated"]);
+    for (name, out) in [("default", &default), ("trusted", &trusted), ("isolated", &isolated)] {
+        assert_eq!(out.status.code(), Some(0), "{name}: {out:?}");
+    }
+    assert_eq!(default.stdout, trusted.stdout, "explicit trusted differs from default");
+    assert_eq!(
+        default.stdout, isolated.stdout,
+        "the fence changed a healthy provider's manifest"
+    );
+    for (name, out) in [("default", &default), ("trusted", &trusted)] {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(stderr.contains("ISOLATION_SOCKET=allowed"), "{name}: {stderr}");
+        assert!(stderr.contains("ISOLATION_WRITE=allowed"), "{name}: {stderr}");
+    }
+    let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&isolated.stdout).unwrap();
+    assert_eq!(m.surfaces.len(), 2);
+    assert!(matches!(m.interface_list, Acquisition::Ok));
+    let null_surface = &m.surfaces[1];
+    assert!(matches!(null_surface.acquisition, Acquisition::Ok));
+    assert!(null_surface.version.is_none());
+    assert!(matches!(null_surface.walk, WalkOutcome::NotWalked));
+    assert!(null_surface.functions.is_empty());
+    assert!(
+        m.objects.iter().any(|object| {
+            object.path.ends_with("isolation-backend.so") && object.identity.reusable
+        }),
+        "the lazy backend must get its own reusable object identity"
+    );
+}
+
+/// R8: a getter that needs a denied socket fails plainly. Trusted walks its
+/// table; isolated records the acquisition error in the manifest and names
+/// the profile on stderr. Neither hides nor crashes.
+#[test]
+fn isolation_socket_needy_getter_is_recorded_not_hidden() {
+    use p11scope_discover::manifest::{Acquisition, WalkOutcome};
+    let dir = scratch("isolation-needy");
+    let provider = build_isolation_needy(&dir);
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let m: p11scope_discover::manifest::Manifest = serde_json::from_slice(&trusted.stdout).unwrap();
+    assert!(matches!(m.surfaces[0].acquisition, Acquisition::Ok));
+    assert!(matches!(m.surfaces[0].walk, WalkOutcome::Full));
+    assert_eq!(m.surfaces[0].functions.len(), 68);
+
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&isolated.stdout).unwrap();
+    match &m.surfaces[0].acquisition {
+        Acquisition::Error { detail } => assert!(
+            detail.contains("C_GetFunctionList returned 0x00000030"),
+            "{detail}"
+        ),
+        other => panic!("a denied getter must record its error, got {other:?}"),
+    }
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("isolated profile: C_GetFunctionList failed"),
+        "{stderr}"
+    );
+}
+
 /// F-56: `--help` is an exit-0 answer, so it goes to stdout like
 /// `--version` and like `p11scope --help`.
 #[test]

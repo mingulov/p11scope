@@ -22474,7 +22474,10 @@ fn seed_loop_skips_an_unadmitted_closure_seed_benignly() {
     let mut loop_engine = Engine::empty();
     let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
     assert!(complete, "the closure seed leaves the batch complete");
-    assert!(candidate.delta.new.is_empty(), "the closure seed takes no slot");
+    assert!(
+        candidate.delta.new.is_empty(),
+        "the closure seed takes no slot"
+    );
     assert!(
         loop_engine.counters.object_skips.is_empty(),
         "the closure seed marks no partial: {:?}",
@@ -22520,8 +22523,14 @@ fn seed_loop_still_fails_a_non_closure_seed_without_an_owner() {
     let mut candidate = seed_loop_candidate(plan, engine.pinned);
     let mut loop_engine = Engine::empty();
     let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
-    assert!(!complete, "a non-closure seed without an owner fails the batch");
-    assert!(candidate.delta.new.is_empty(), "the failed seed takes no slot");
+    assert!(
+        !complete,
+        "a non-closure seed without an owner fails the batch"
+    );
+    assert!(
+        candidate.delta.new.is_empty(),
+        "the failed seed takes no slot"
+    );
     assert_eq!(loop_engine.counters.object_skips.len(), 1);
     let skipped = &loop_engine.counters.object_skips[0];
     assert_eq!(skipped.subject, "live export hook");

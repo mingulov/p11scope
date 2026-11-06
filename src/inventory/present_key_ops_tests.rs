@@ -376,6 +376,87 @@ fn key_ops_line_counts_not_attributed_beside_exact_rows() {
     );
 }
 
+/// v0.7.0 issue 2: a partial section whose rows continue never reads
+/// "stopped" — the reason names the loss while the exact rows beside
+/// it continue. Both key rows and unknown rows count as continuing
+/// rows; the machine reason stays `authority_lost` (verbose only).
+#[test]
+fn key_ops_line_partial_authority_lost_with_rows_names_continuing_rows() {
+    for (label, mut observations) in [
+        ("key row", {
+            let mut observations = populated(9);
+            observations.status = ObsStatus::Partial;
+            observations.reason = "authority_lost";
+            observations
+                .key_operations
+                .push(key_row("sign", "key", 4, 0, 0, "operations"));
+            observations
+        }),
+        ("unknown row", {
+            let mut observations = populated(9);
+            observations.status = ObsStatus::Partial;
+            observations.reason = "authority_lost";
+            observations
+                .unknown_key_operations
+                .push(unknown_row("sign", 4, 0, 0, "operations"));
+            observations
+        }),
+    ] {
+        observations.add_unattributed("record_lost", 2);
+        let presentation = key_ops_presentation(observations);
+        let snapshot = render_snapshot(&presentation);
+        let block = key_ops_block(&snapshot);
+        let reason = block
+            .iter()
+            .find(|line| line.contains("per-key tracking lost some calls"))
+            .unwrap_or_else(|| panic!("{label}: the reason line: {snapshot}"));
+        assert_eq!(
+            *reason,
+            "  per-key tracking lost some calls; exact rows continue",
+            "{label}: the reason matches the continuing rows: {snapshot}"
+        );
+        let text = block.join("\n");
+        assert!(
+            !text.contains("stopped"),
+            "{label}: nothing reads stopped while rows continue: {snapshot}"
+        );
+        assert!(
+            !text.contains("authority_lost"),
+            "{label}: concise keeps the machine reason out: {snapshot}"
+        );
+        let verbose =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        let verbose_block = key_ops_block(&verbose);
+        assert!(
+            verbose_block
+                .iter()
+                .any(|line| line.contains("(reason: authority_lost)")),
+            "{label}: verbose keeps the machine reason: {verbose}"
+        );
+    }
+}
+
+/// v0.7.0 issue 2 (pin): a partial `authority_lost` section with no
+/// rows at all (counts only) keeps reading "stopped" — nothing
+/// continues, so the stopped wording is accurate there, as in the
+/// unavailable section.
+#[test]
+fn key_ops_line_partial_authority_lost_without_rows_keeps_stopped() {
+    let mut observations = populated(9);
+    observations.status = ObsStatus::Partial;
+    observations.reason = "authority_lost";
+    observations.add_unattributed("record_lost", 2);
+    assert!(observations.key_operations.is_empty());
+    assert!(observations.unknown_key_operations.is_empty());
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        block.contains(&"  per-key tracking stopped; plain counts are unaffected"),
+        "counts-only partial keeps stopped: {snapshot}"
+    );
+}
+
 /// DEMO-4: a first-observed key row under the `unknown` metadata
 /// label reads in text as type unknown (not established while
 /// observed), beside the exact tallies. The text claims no timing it

@@ -2562,7 +2562,18 @@ fn render_snapshot_inner(
             // stays short, with the machine reason beside it in verbose
             // text (JSON keeps it).
             if observations.reason != "none" {
-                let plain = key_observation_plain_reason(observations.reason);
+                // v0.7.0 issue 2: the reason must match the rows. A
+                // partial `authority_lost` section whose rows continue
+                // never reads "stopped" — it names the loss while the
+                // exact rows beside it continue. With no rows at all
+                // (counts only) the stopped wording stays accurate.
+                let rows_continue = !observations.key_operations.is_empty()
+                    || !observations.unknown_key_operations.is_empty();
+                let plain = if observations.reason == "authority_lost" && rows_continue {
+                    "per-key tracking lost some calls; exact rows continue"
+                } else {
+                    key_observation_plain_reason(observations.reason)
+                };
                 if verbose && plain != observations.reason {
                     let _ = writeln!(out, "  {plain} (reason: {})", observations.reason);
                 } else {

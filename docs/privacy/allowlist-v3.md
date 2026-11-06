@@ -1337,9 +1337,9 @@ a row exists; versions 1, 2 and 3 stay frozen and byte-stable.
 **Status: IMPLEMENTED in v0.7.0 by owner decision 2026-11-06 evening
 (release lane F16), overriding the v0.7.0 "no new captured field"
 non-goal for this one field only; Opus privacy second-tier review
-follows. The approving capture contract is
-`docs/superpowers/specs/2026-11-06-v070-pqc-capture-contract.md` (plan
-item 7.05a).** This section scopes section version 5 of
+follows. The approving capture contract is the owner-approved
+v0.7.0 PQC capture contract (plan item 7.05a).** This section scopes
+section version 5 of
 [docs/schema/inventory-v1-object-observations-v5.schema.json](../schema/inventory-v1-object-observations-v5.schema.json):
 the two read rows below plus the finite eighteen-label publication.
 It supersedes the M2 "no ML-KEM/PQC labels, vocabulary unchanged"

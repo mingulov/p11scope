@@ -202,6 +202,16 @@ pub(crate) fn note_lacking(bits: &[u32]) {
     }
 }
 
+/// The keep mask after setup: a multi session sheds the transient
+/// `CAP_SYS_ADMIN` (no `perf_event_open` remains past attach, measured
+/// lane F15); a singles session keeps it for dynamic perf re-attach.
+pub(crate) fn post_setup_keep(multi: bool, effective: u64) -> u64 {
+    // Scaffolding: the next commit sheds the transient bit; until
+    // then the mask passes through unchanged.
+    let _ = multi;
+    effective
+}
+
 /// This process's effective capabilities, from `/proc/self/status`
 /// `CapEff`; `None` when unreadable or unparsable.
 pub(crate) fn read_effective() -> Option<u64> {
@@ -460,6 +470,20 @@ mod tests {
              /usr/bin/p11scope"
         );
         assert_eq!(line.lines().count(), 1);
+    }
+
+    /// Post-setup least privilege: multi sheds the transient
+    /// `CAP_SYS_ADMIN`, singles keeps it, and a setcap process without
+    /// it is untouched either way.
+    #[test]
+    fn post_setup_keep_sheds_only_the_transient_sys_admin() {
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        let live = minimal_live_mask();
+        assert_eq!(post_setup_keep(true, live | sys_admin), live);
+        assert_eq!(post_setup_keep(true, live), live);
+        assert_eq!(post_setup_keep(true, u64::MAX), u64::MAX & !sys_admin);
+        assert_eq!(post_setup_keep(false, live | sys_admin), live | sys_admin);
+        assert_eq!(post_setup_keep(false, live), live);
     }
 
     fn parse(argv: &[&str]) -> crate::cli::Command {

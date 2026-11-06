@@ -128,7 +128,10 @@ Each grant was removed in turn on kind (Linux 7.0.0-34, cgroup v2,
 while capturing two ledgered pods: **A**, root, provider at its package path,
 6 x 400 calls; **P**, uid 1000, provider copied into a 0700 directory, 6 x 300
 calls. "exact" means every one of the six functions counted the ledger and
-nothing else was counted.
+nothing else was counted. The table predates the uprobe-multi self-probe and
+live-discovery move: the `without SYS_ADMIN` row's failure mode (the
+self-probe's `perf_event_open` EACCES) no longer applies on the default
+lane, which attaches every probe through links paranoid does not gate.
 
 | Variant | A (root, public provider) | P (uid 1000, private provider) |
 | --- | --- | --- |
@@ -148,14 +151,15 @@ Why each grant:
 
 - **hostPID** — the target's processes must be visible to scan their memory
   and open `/proc/<pid>/root`.
-- **CAP_SYS_ADMIN** — BPF load and perf-event attach. The uretprobe
-  self-probe always attaches through `perf_event_open()` (even where the
-  capture itself uses uprobe-multi), and `perf_event_paranoid >= 3` (the
-  Debian/Ubuntu default) refuses that without CAP_SYS_ADMIN. While it is held
-  the kernel accepts it for every CAP_BPF/CAP_PERFMON check, so those two
-  are not listed. It also grants `/proc/<pid>/map_files` access (otherwise
-  `CAP_CHECKPOINT_RESTORE`), which `inventory` needs to attribute callers
-  past its scan cap.
+- **CAP_SYS_ADMIN** — BPF load and the singles-fallback perf-event
+  attach. The self-probe, live-discovery and static probes attach through
+  uprobe-multi links, which `perf_event_paranoid >= 3` (the Debian/Ubuntu
+  default) does not gate; only an explicit `--attach-backend singles`
+  fallback still opens per-probe `perf_event` uprobes there. While it is
+  held the kernel accepts it for every CAP_BPF/CAP_PERFMON check, so those
+  two are not listed. It also grants `/proc/<pid>/map_files` access
+  (otherwise `CAP_CHECKPOINT_RESTORE`), which `inventory` needs to
+  attribute callers past its scan cap.
 - **CAP_SYS_PTRACE** — ptrace-mode access to other processes'
   `/proc/<pid>/mem` and `maps` (Yama scope 1, other UIDs).
 - **CAP_DAC_READ_SEARCH** — the memory scan without CAP_DAC_OVERRIDE, and
@@ -166,16 +170,16 @@ Why each grant:
   (nothing is pinned), tracefs/debugfs (raw and BTF tracepoints, uprobes via
   the perf PMU), a `/sys/kernel/btf` mount (the container's sysfs shows it).
 
-**Gated variant**: on nodes with `kernel.perf_event_paranoid <= 2` the
-`perf_event_open()` refusal does not apply, but **do not simply drop
-`SYS_ADMIN`**: it also covers `/proc/<pid>/map_files`, which `inventory`'s
-caller attribution past the scan cap reads and which needs `CAP_SYS_ADMIN` or
+**Gated variant**: the five-capability minimal set (`BPF` + `PERFMON` +
+`CHECKPOINT_RESTORE` + `SYS_PTRACE` + `DAC_READ_SEARCH`, no `SYS_ADMIN`)
+is expected to suffice at any paranoid on the default lane — measured at
+host level, but this repository has **not** measured the kind removal, so
+the shipped manifest keeps its grant. **Do not simply drop `SYS_ADMIN`**:
+it also covers `/proc/<pid>/map_files`, which `inventory`'s caller
+attribution past the scan cap reads and which needs `CAP_SYS_ADMIN` or
 `CAP_CHECKPOINT_RESTORE` (without either, those callers are reported as
-`map_files_unavailable`). The variant is therefore `BPF` + `PERFMON` +
-`CHECKPOINT_RESTORE` in place of `SYS_ADMIN` (plus `SYS_PTRACE` and
-`DAC_READ_SEARCH` as before). This repository has **not** measured it (the
-sysctl is host-global). Prove a node with `--command doctor`: `uprobe attach
-(self) ... ok` and `verdict: capture available`.
+`map_files_unavailable`). Prove a node with `--command doctor`: `uprobe
+attach (self) ... ok` and `verdict: capture available`.
 
 ### Blast radius
 

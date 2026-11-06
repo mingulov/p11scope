@@ -1172,7 +1172,14 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         // sessions never run here) the emitted initial-namespace tgids
         // are unknowable, so target runs bind by pidfd with a permissive
         // bitmap and match the sole emitter instead of numbered pids.
-        let nested = !crate::pidns::numbering().agrees();
+        // pidfd_open resolves in the observer's own namespace while
+        // request pids come from the mounted /proc, so the pidfd path
+        // is sound only when /proc is our own namespace's /proc (a
+        // foreign /proc is allowed for --system scans, but its pids
+        // must never bind a pidfd or key a sole-emitter match).
+        let numbering = crate::pidns::numbering();
+        let nested = !numbering.agrees();
+        let own_proc = numbering.proc_view == crate::pidns::ProcView::Own;
         // A nested pidfd-bound promotion proves its single emitter is
         // the request's task by construction; match it without numbers.
         // Mirrors the promotion below (single Confirm with a pidfd).
@@ -1390,10 +1397,13 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             // A nested run without pidfd promotion cannot attribute:
             // emitted initial-namespace tgids are unknowable, so the
             // numeric lookup below would compare across PID-numbering
-            // domains and could join another process's verdicts. Fail
-            // closed before the scope write; the witness refuses
-            // userspace proof by construction and reports the gap.
-            if nested && !nested_per_pid {
+            // domains and could join another process's verdicts. A
+            // foreign /proc voids the promotion itself: its pids name
+            // another namespace's tasks, so the pidfd could bind the
+            // wrong task. Fail closed before the scope write; the
+            // witness refuses userspace proof by construction and
+            // reports the gap.
+            if nested && (!nested_per_pid || !own_proc) {
                 return self.userspace(batch, RunFailure::Scope);
             }
             // Nested runs bind by pidfd (below): the bitmap goes
@@ -1493,9 +1503,10 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             // Nested pidfd-bound runs match the sole emitter (the
             // pidfd already bound the request's task); anywhere else the
             // numbered pid keys the run. A nested run without promotion
-            // (no pidfd) never reaches this match: it fails closed to
-            // userspace above, since the numbered lookup would compare
-            // across PID-numbering domains.
+            // (no pidfd) or without our own /proc never reaches this
+            // match: it fails closed to userspace above, since the
+            // numbered lookup would compare across PID-numbering
+            // domains and the pidfd could bind the wrong task.
             let demoted = if nested_per_pid {
                 !run.demoted_pids.is_empty()
             } else {

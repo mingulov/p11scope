@@ -8761,6 +8761,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             ),
         );
         true
+    }
+
     /// Track one EXEC hook for a never-admitted pid: pending until a
     /// scan examination covers it or two consecutive examinations miss
     /// it. Bounded: repeat hooks for a tracked pid change nothing, and

@@ -95,6 +95,20 @@ fn errno_name(errno: i32) -> String {
         .to_string()
 }
 
+/// The `Denied` refusal over explicit privilege facts: names each
+/// missing load capability with what it enables, plus the one-line
+/// recipe; when the load set is complete the refusal is other
+/// enforcement (lockdown, LSM, seccomp), never more privilege.
+#[allow(dead_code)]
+fn denied_line(operation: &str, reason: &str, _effective: u64, _binary: &str) -> String {
+    // Scaffolding: the next commit names the missing capabilities; the
+    // old root-only text keeps today's behavior until then.
+    format!(
+        "live capture needs root: the kernel refused to {operation}{reason}. \
+         Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture."
+    )
+}
+
 impl std::fmt::Display for MultiHostRefusal {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         // One plain line, no internal codes: the default text an operator
@@ -377,6 +391,62 @@ mod tests {
             assert_eq!(text.lines().count(), 1);
             assert!(text.len() < 1_024, "{text}");
         }
+    }
+
+    /// Per-capability twins for the denied refusal: each missing load
+    /// capability gives its exact `needs` clause plus the one-line
+    /// recipe, never "needs root"; a complete load set reads as other
+    /// enforcement, never more privilege.
+    #[test]
+    fn denied_line_names_the_missing_load_cap_and_the_recipe() {
+        use crate::caps;
+        let full = caps::minimal_live_mask();
+        let binary = "/usr/bin/p11scope";
+        let recipe = caps::setcap_command(binary);
+        for (bit, needs) in [
+            (
+                caps::CAP_BPF_BIT,
+                "needs CAP_BPF (load BPF programs and attach probes)",
+            ),
+            (
+                caps::CAP_PERFMON_BIT,
+                "needs CAP_PERFMON (load BPF programs alongside CAP_BPF)",
+            ),
+        ] {
+            let line = super::denied_line(
+                "load p11scope's BPF programs",
+                " (Operation not permitted)",
+                full & !(1u64 << bit),
+                binary,
+            );
+            assert!(line.contains(needs), "{line}");
+            assert!(line.contains(&recipe), "{line}");
+            assert!(
+                line.contains("the kernel refused to load p11scope's BPF programs"),
+                "{line}"
+            );
+            assert!(!line.contains("needs root"), "{line}");
+            assert!(!line.contains("Run with sudo"), "{line}");
+            assert!(line.contains("p11scope inspect --pid N"), "{line}");
+            assert_eq!(line.lines().count(), 1);
+            assert!(line.len() < 1_024, "{line}");
+        }
+        // The load set complete: other enforcement, never privilege.
+        let line = super::denied_line(
+            "attach p11scope's probes",
+            " (Operation not permitted)",
+            u64::MAX,
+            binary,
+        );
+        assert!(
+            line.contains("the kernel refused to attach p11scope's probes"),
+            "{line}"
+        );
+        assert!(line.contains("lockdown"), "{line}");
+        assert!(!line.contains("needs CAP_"), "{line}");
+        assert!(!line.contains("needs root"), "{line}");
+        assert_eq!(line.lines().count(), 1);
+        assert!(line.len() < 1_024, "{line}");
     }
 
     #[test]

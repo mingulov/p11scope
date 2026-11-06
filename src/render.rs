@@ -8665,7 +8665,8 @@ pub(crate) mod tests {
         assert!(
             text.contains(
                 "The totals above count calls at the attached providers; \
-                 calls a layer answered itself, including its errors, appear only here, \
+                 calls a layer answered itself or forwarded to a provider that was not attached, \
+                 including its errors, appear only here, \
                  and a layer call that reaches several providers counts at each."
             ),
             "honest counting rule stated: {text}"
@@ -8817,6 +8818,198 @@ pub(crate) mod tests {
         assert_eq!(document["layer_totals"]["logical"]["calls"], 0);
         assert_eq!(document["layer_totals"]["logical"]["errors"], 3);
         assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// A provider row with in-flight entries but no completed calls or
+    /// errors still proves an active provider below the layer: the split
+    /// stays on (kills M3, which drops the in-flight arm of the gate).
+    #[test]
+    fn provider_in_flight_alone_keeps_the_forwarding_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut open = report("C_Sign", 0, 2, false);
+        open.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), open.clone()], &ev);
+        assert!(
+            text.contains(
+                "0 completed calls; 0 returned errors; 2 entries without an observed return."
+            ),
+            "provider in-flight stays logical while the layer splits out: {text}"
+        );
+        assert!(
+            text.contains("Forwarding layers counted separately"),
+            "an in-flight-only provider keeps the split: {text}"
+        );
+        let document = json(&[outer, open], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 0);
+        assert_eq!(document["layer_totals"]["logical"]["in_flight"], 2);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// P1 shape (controller ruling): a forwarding layer beside a refused
+    /// backend and an unrelated active provider. The gate sees the
+    /// unrelated 2 calls, but the refused backend keeps the layer logical:
+    /// a disclosed overcount (697) beats hiding the app's 695 calls.
+    #[test]
+    fn refused_backend_keeps_layer_calls_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut unrelated = discovered_fixture();
+        unrelated.id = ModuleId(9);
+        unrelated.admission_class = Some("corroborated");
+        unrelated.ino = 93;
+        unrelated.path = "/opt/libunrelated.so".into();
+        let mut outer = report("C_Sign", 695, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut other = report("C_Initialize", 2, 0, false);
+        other.module = Some(ModuleId(9));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, unrelated];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libbackend.so".into(),
+            reason: "module needs 100 more; only 512 attach slots are available; 412 are in use \
+                 (412 active, 0 retired) — refusing to attach a prefix; to capture one provider, \
+                 name it with --module <path>; to free slots, exclude an unneeded module with \
+                 --exclude-module <name>"
+                .into(),
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let text = scope_summary("pid", &[outer.clone(), other.clone()], &ev);
+        assert!(
+            text.contains("697 completed calls;"),
+            "a refused backend keeps the layer logical (disclosed overcount): {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line when the backend is refused: {text}"
+        );
+        assert!(
+            text.contains("/opt/libbackend.so: not attached — "),
+            "the refused backend is still named as a gap: {text}"
+        );
+        let document = json(&[outer, other], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 697);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert!(
+            functions.iter().all(|row| row["forwarding_layer"] == false),
+            "no row splits when the backend is refused: {document}"
+        );
+    }
+
+    /// P2 shape: an unattributed backend row does not activate the gate —
+    /// the layer stays logical and the total double-counts (1000) with the
+    /// ownership gap naming the 500. Disclosed, not hidden.
+    #[test]
+    fn unattributed_backend_rows_keep_the_layer_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.dev = (8, 1);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut stray = report("unknown#3", 500, 0, false);
+        stray.module = None;
+        stray.module_unresolved = true;
+        stray.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 82,
+            sha256: None,
+        });
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        let text = scope_summary("pid", &[outer.clone(), stray.clone()], &ev);
+        assert!(
+            text.contains("1000 completed calls;"),
+            "an unattributed backend keeps the layer logical (disclosed double count): {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no split without an attributed provider row: {text}"
+        );
+        assert!(
+            text.contains("\n500 completed calls have unresolved module ownership.\n"),
+            "the ownership gap names the unattributed share: {text}"
+        );
+        let document = json(&[outer, stray], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 1000);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// P3 shape: a lone layer with an attributed row and an unresolved stub
+    /// matched by file identity stays fully logical (44/0) — the file match
+    /// never splits without an active provider.
+    #[test]
+    fn lone_layer_attributed_and_identity_matched_rows_stay_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut named = report("C_Sign", 22, 0, false);
+        named.module = Some(ModuleId(7));
+        let mut stub = report("unknown#3", 22, 0, false);
+        stub.module = None;
+        stub.module_unresolved = true;
+        stub.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[named.clone(), stub.clone()], &ev);
+        assert!(
+            text.contains("44 completed calls;"),
+            "a lone layer stays fully logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let document = json(&[named, stub], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 44);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert!(
+            functions.iter().all(|row| row["forwarding_layer"] == false),
+            "no row splits without an active provider: {document}"
+        );
     }
 
     /// Ownership-gap lines explain headline attribution gaps, so they
@@ -9096,7 +9289,9 @@ pub(crate) mod tests {
             scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(!ev.discovery.modules.is_empty());
         assert!(
-            text.contains("the attached provider files counted 0 calls"),
+            text.contains(
+                "no other attached provider counted calls; the layer's own calls stay in the totals"
+            ),
             "{text}"
         );
         assert!(
@@ -9595,6 +9790,77 @@ pub(crate) mod tests {
             &plain[calls_col..calls_col + 5],
             "  744",
             "unmarked row CALLS aligns with the header: {out}"
+        );
+    }
+
+    /// The live name field sizes to the longest rendered name (min 28),
+    /// not a fixed width: short frames stay compact, long marked rows expand.
+    #[test]
+    fn live_table_name_field_sizes_to_longest_rendered_name() {
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut row = report("C_Sign", 10, 0, false);
+        row.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header = out
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col = header.find("CALLS").expect("CALLS column");
+        assert_eq!(
+            calls_col,
+            28 + 1 + 3,
+            "a short frame uses the min width 28: {out}"
+        );
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend2 = discovered_fixture();
+        backend2.id = ModuleId(8);
+        backend2.admission_class = Some("corroborated");
+        backend2.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_GetAttributeValue", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev2 = evidence();
+        ev2.discovery.modules = vec![layer, backend2];
+        ev2.verdict();
+        let out2 = live_scoped(
+            &[outer, inner],
+            &ev2,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header2 = out2
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col2 = header2.find("CALLS").expect("CALLS column");
+        assert_eq!(
+            calls_col2,
+            38 + 1 + 3,
+            "a long marked row expands the field to its rendered name: {out2}"
         );
     }
 

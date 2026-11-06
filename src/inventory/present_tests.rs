@@ -2161,7 +2161,7 @@ fn forwarding_entries_line_states_the_counting_rule() {
     let summary = render_snapshot_summary(&presentation);
     assert!(
         summary.contains(
-            "Provider edges are the logical totals; \
+            "Provider edges, plus the layer edges of callers that entered no watched provider, are the logical totals; \
              entries a layer answered itself appear only here, \
              and a layer entry that reaches several providers counts at each."
         ),
@@ -2280,6 +2280,78 @@ fn lone_forwarding_layer_edges_stay_logical() {
     );
     let document = crate::inventory::render_json_from_presentation(&presentation);
     assert_eq!(document["layer_totals"]["logical_entries"], 22);
+    assert_eq!(document["layer_totals"]["forwarding_entries"], 0);
+}
+
+/// P1 shape per caller (controller ruling): a caller with a refused
+/// backend keeps its layer edges logical even beside an unrelated active
+/// provider. A disclosed overcount (697) beats hiding the caller's calls.
+#[test]
+fn refused_backend_keeps_caller_layer_edges_logical() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let admitted: Vec<crate::discovery::caller_registry::ModuleId> = presentation
+        .modules
+        .iter()
+        .filter(|module| module.admission == AdmissionState::Admitted)
+        .map(|module| module.id)
+        .collect();
+    assert!(
+        admitted.len() >= 2,
+        "the twin needs two admitted modules: {}",
+        admitted.len()
+    );
+    let refused_id = presentation
+        .modules
+        .iter()
+        .find(|module| module.admission == AdmissionState::Refused)
+        .expect("varied harness carries a refused module")
+        .id;
+    let fwd_id = admitted[0];
+    let unrelated_id = admitted[1];
+    for module in &mut presentation.modules {
+        if module.id == fwd_id {
+            module.paths = vec!["/opt/libforward.so".into()];
+            module.admission_class = Some("closure_array".into());
+        } else if module.id == unrelated_id {
+            module.paths = vec!["/opt/libunrelated.so".into()];
+            module.admission_class = Some("exact".into());
+        } else if module.id == refused_id {
+            module.paths = vec!["/opt/libbackend.so".into()];
+            module.admission_class = Some("exact".into());
+        }
+    }
+    let caller = presentation
+        .edges
+        .iter()
+        .find(|edge| edge.module == refused_id)
+        .expect("an edge to the refused backend")
+        .caller;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id && edge.caller == caller)
+        .expect("the refused caller's layer edge")
+        .entry_count = 695;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == unrelated_id && edge.caller == caller)
+        .expect("the refused caller's unrelated provider edge")
+        .entry_count = 2;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        !summary.contains("Forwarding-layer entries counted separately"),
+        "no forwarding line when the caller's backend is refused: {summary}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(
+        document["layer_totals"]["logical_entries"], 697,
+        "a refused backend keeps the layer logical: {summary}"
+    );
     assert_eq!(document["layer_totals"]["forwarding_entries"], 0);
 }
 

@@ -1352,6 +1352,152 @@ pub(crate) fn key_operation_tallies(
         .collect()
 }
 
+/// One provider's proved-key tallies for the readable key-operations
+/// block: per-category terminals over the group's non-secondary rows
+/// (H9 §82, like [`key_operation_tallies`]), with the provider's
+/// display name and the group's sorted instance labels (verbose
+/// only). Rows whose instance resolves to no snapshot module share
+/// the one unidentified group, never the raw label in concise text.
+struct KeyProviderGroup {
+    name: String,
+    unidentified: bool,
+    instances: Vec<String>,
+    tallies: Vec<KeyOpTally>,
+}
+
+/// Proved rows grouped by resolved provider module: instances on one
+/// module merge into its group; unresolvable labels share the
+/// unidentified group. Groups form from non-secondary rows only, so
+/// the header's provider count matches the lines below it. Sorted by
+/// display name with the unidentified group last.
+fn key_provider_groups(
+    presentation: &Presentation,
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<KeyProviderGroup> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let secondary = crate::key_operation_projection::SECONDARY_ROLE;
+    let mut modules: BTreeMap<String, ModuleId> = BTreeMap::new();
+    for instance in &presentation.instances {
+        modules
+            .entry(instance.id.label())
+            .or_insert(instance.module);
+    }
+    // (tallies by category, instance labels) per resolved module, plus
+    // the unidentified residual under `None`.
+    type TalliesByCategory<'a> = BTreeMap<&'a str, (u64, u64, u64, &'a str)>;
+    let mut groups: BTreeMap<Option<ModuleId>, (TalliesByCategory<'_>, BTreeSet<String>)> =
+        BTreeMap::new();
+    for row in &observations.key_operations {
+        if row.role == secondary {
+            continue;
+        }
+        let module = modules.get(&row.instance).copied();
+        let (tallies, instances) = groups.entry(module).or_default();
+        instances.insert(row.instance.clone());
+        let slot = tallies.entry(row.category).or_insert((0, 0, 0, row.unit));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+    }
+    let mut out: Vec<KeyProviderGroup> = groups
+        .into_iter()
+        .map(|(module, (tallies, instances))| {
+            let (name, unidentified) = match module {
+                Some(module) => (module_label(presentation, module), false),
+                None => ("unidentified provider".to_string(), true),
+            };
+            let tallies = tallies
+                .into_iter()
+                .map(|(category, (completed, failed, active, unit))| KeyOpTally {
+                    category,
+                    completed,
+                    failed,
+                    active,
+                    unit,
+                })
+                .collect();
+            KeyProviderGroup {
+                name,
+                unidentified,
+                instances: instances.into_iter().collect(),
+                tallies,
+            }
+        })
+        .collect();
+    out.sort_by(|left, right| {
+        left.unidentified
+            .cmp(&right.unidentified)
+            .then_with(|| left.name.cmp(&right.name))
+    });
+    out
+}
+
+/// Capture-wide unknown-key rows grouped by category with their sorted
+/// machine reasons (verbose only), never merged into a provider's
+/// tallies. Sorted by category.
+fn unknown_keys_tallies(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<(KeyOpTally, Vec<&'static str>)> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let mut categories: BTreeMap<&str, (u64, u64, u64, &str, BTreeSet<&str>)> = BTreeMap::new();
+    for row in &observations.unknown_key_operations {
+        let slot = categories
+            .entry(row.category)
+            .or_insert((0, 0, 0, row.unit, BTreeSet::new()));
+        slot.0 = slot.0.saturating_add(row.completed);
+        slot.1 = slot.1.saturating_add(row.failed);
+        slot.2 = slot.2.saturating_add(row.active);
+        slot.4.insert(row.reason);
+    }
+    categories
+        .into_iter()
+        .map(|(category, (completed, failed, active, unit, reasons))| {
+            (
+                KeyOpTally {
+                    category,
+                    completed,
+                    failed,
+                    active,
+                    unit,
+                },
+                reasons.into_iter().collect(),
+            )
+        })
+        .collect()
+}
+
+/// One per-category tally segment: what happened to the call, not an
+/// observer failure (JSON keeps `failed`).
+fn key_tally_segment(tally: &KeyOpTally) -> String {
+    let failed_noun = if tally.failed == 1 {
+        "returned an error"
+    } else {
+        "returned errors"
+    };
+    format!(
+        "{} {} completed, {} {}, {} active {}",
+        tally.category, tally.completed, tally.failed, failed_noun, tally.active, tally.unit
+    )
+}
+
+/// One indented key-operations detail line: `  {name}: {segment}{suffix}`.
+/// A provider file name shrinks first so the tally stays exact; fixed
+/// labels never shrink (they are short — only a pathological tally
+/// beside one may exceed the cap, since counts are never truncated).
+fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -> String {
+    let rest = format!(": {segment}{suffix}");
+    let fixed = 2 + rest.chars().count();
+    if name.chars().count() + fixed <= SUMMARY_LINE_MAX_CHARS {
+        return format!("  {name}{rest}");
+    }
+    let budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(fixed);
+    if shrink_name && budget >= 2 {
+        let kept: String = name.chars().take(budget - 1).collect();
+        return format!("  {kept}…{rest}");
+    }
+    format!("  {name}{rest}")
+}
+
 /// The subject every Joint birth refusal discloses under
 /// (`disclose_s1_birth_refusal`).
 pub(crate) const JOINT_BIRTH_UNAVAILABLE_SUBJECT: &str = "Joint birth unavailable; retained S1";
@@ -1618,15 +1764,51 @@ fn key_operations_manifest_line(presentation: &Presentation) -> Option<String> {
     )
 }
 
-/// The concise gap summary (F1): one line grouping gaps by plain
-/// subject/reason with counts, top three plus "and K more". Plain
-/// words only (reusing `gap_plain_*`); per-gap `gap [` lines stay
-/// verbose-only. Counts distinct gap rows like the coverage line, not
-/// `repeats` (JSON carries `repeats`). `None` when no gaps are
-/// retained; suppressed-but-unretained gaps stay in the coverage line.
-fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String> {
+/// The readable summary blocks (key operations, gaps) keep every line
+/// at most this many chars: one item per line, with unbounded names
+/// (provider files, gap subjects) truncated and marked. Tallies and
+/// counts are never truncated — exact digits win over the cap.
+const SUMMARY_LINE_MAX_CHARS: usize = 100;
+
+/// Char-safe truncation to `max_chars` chars, marked with `…`. Fits
+/// already return unchanged.
+fn ellipsize_to(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max_chars.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
+
+/// One concise gap group line: `  {count} × {subject} — {reason}`. The
+/// subject (often a long path) shrinks first so the count and reason
+/// stay intact; only a reason overflowing on its own truncates the
+/// whole line.
+fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
+    let head = format!("  {count} × ");
+    let tail = format!(" — {reason}");
+    let fixed = head.chars().count() + tail.chars().count();
+    if subject.chars().count() + fixed <= SUMMARY_LINE_MAX_CHARS {
+        return format!("{head}{subject}{tail}");
+    }
+    let budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(fixed);
+    if budget >= 2 {
+        let kept: String = subject.chars().take(budget - 1).collect();
+        return format!("{head}{kept}…{tail}");
+    }
+    ellipsize_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS)
+}
+
+/// The concise gap summary (F1): a `gaps: N` header plus one indented
+/// line per plain subject/reason group, every group listed, most
+/// frequent first. Plain words only (reusing `gap_plain_*`); per-gap
+/// `gap [` lines stay verbose-only. Counts distinct gap rows like the
+/// coverage line, not `repeats` (JSON carries `repeats`). Empty when no
+/// gaps are retained; suppressed-but-unretained gaps stay in the
+/// coverage line.
+fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     if gaps.is_empty() {
-        return None;
+        return Vec::new();
     }
     // Deleted mappings are unloaded libraries, not loss: fold them to one
     // plain trailing group instead of leading per-path groups.
@@ -1641,28 +1823,21 @@ fn concise_gap_summary_line(gaps: &[GapView], _suppressed: u64) -> Option<String
     }
     let mut ranked: Vec<((String, String), usize)> = groups.into_iter().collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    const SHOWN: usize = 3;
-    let shown = ranked.len().min(SHOWN);
-    let mut parts: Vec<String> = ranked
-        .iter()
-        .take(shown)
-        .map(|((subject, reason), count)| format!("{count} × {subject} — {reason}"))
-        .collect();
+    let mut lines = vec![format!("gaps: {}", gaps.len())];
+    for ((subject, reason), count) in &ranked {
+        lines.push(gap_group_line(*count, subject, reason));
+    }
     if !deleted.is_empty() {
-        parts.push(format!(
-            "{} × unloaded librar{} — mapped files were deleted (not loss)",
+        lines.push(gap_group_line(
             deleted.len(),
-            if deleted.len() == 1 { "y" } else { "ies" },
+            &format!(
+                "unloaded librar{}",
+                if deleted.len() == 1 { "y" } else { "ies" },
+            ),
+            "mapped files were deleted (not loss)",
         ));
     }
-    let more = ranked.len().saturating_sub(shown);
-    if more > 0 {
-        parts.push(format!("and {more} more"));
-    }
-    Some(format!(
-        "gaps: {} (--json has every item)",
-        parts.join("; ")
-    ))
+    lines
 }
 
 /// The concise limits line (INV-1): the headline budgets in words.
@@ -2070,95 +2245,103 @@ fn render_snapshot_inner(
                 }
             }
         } else {
-            let status = if observations.reason == "none" {
-                observations.status.label().to_string()
-            } else {
+            // Readable block: one header line plus one indented line per
+            // provider and category, then the unknown, unattributed and
+            // unknown-type lines. Same counts and vocabulary as the old
+            // one-line enumeration, only laid out; JSON is unchanged.
+            let groups = key_provider_groups(presentation, observations);
+            let unknown = unknown_keys_tallies(observations);
+            let sessions = observations.sessions.len();
+            let keys = observations.objects.len();
+            let providers = groups.len();
+            let _ = writeln!(
+                out,
+                "key operations: {keys} key{} on {providers} provider{}; rev {} {}; {sessions} session{}",
+                if keys == 1 { "" } else { "s" },
+                if providers == 1 { "" } else { "s" },
+                observations.revision,
+                observations.status.label(),
+                if sessions == 1 { "" } else { "s" },
+            );
+            // A non-`none` reason reads on its own line so the header
+            // stays short, with the machine reason beside it in verbose
+            // text (JSON keeps it).
+            if observations.reason != "none" {
                 let plain = key_observation_plain_reason(observations.reason);
                 if verbose && plain != observations.reason {
-                    format!(
-                        "{} ({plain}; reason: {})",
-                        observations.status.label(),
-                        observations.reason
-                    )
+                    let _ = writeln!(out, "  {plain} (reason: {})", observations.reason);
                 } else {
-                    format!("{} ({plain})", observations.status.label())
+                    let _ = writeln!(out, "  {plain}");
                 }
-            };
-            let sessions = observations.sessions.len();
-            let objects = observations.objects.len();
-            let mut line = format!(
-                "key operations: rev {} {}; {} session{}, {} object{}; ",
-                observations.revision,
-                status,
-                sessions,
-                if sessions == 1 { "" } else { "s" },
-                objects,
-                if objects == 1 { "" } else { "s" },
-            );
-            // Not-attributed counters sit beside the exact rows:
-            // counts per finite reason, never a guessed key.
-            let unattributed_suffix = if observations.unattributed.is_empty() {
-                String::new()
-            } else {
-                let parts: Vec<String> = observations
-                    .unattributed
-                    .iter()
-                    .map(|row| format!("{} {}", row.reason, row.count))
-                    .collect();
-                format!("; not attributed: {}", parts.join(", "))
-            };
+            }
+            let any_tallies =
+                groups.iter().any(|group| !group.tallies.is_empty()) || !unknown.is_empty();
+            if !any_tallies {
+                let _ = writeln!(out, "  no key operations observed");
+            }
+            for group in &groups {
+                // The group's sorted instance labels stay verbose-only;
+                // concise names the provider, never internal ids.
+                // Instance labels are projection strings: escaped like
+                // every other snapshot field.
+                let suffix = if verbose {
+                    let labels: Vec<String> = group
+                        .instances
+                        .iter()
+                        .map(|label| escape_controls(label).into_owned())
+                        .collect();
+                    format!(" ({})", labels.join(", "))
+                } else {
+                    String::new()
+                };
+                for tally in &group.tallies {
+                    let _ = writeln!(
+                        out,
+                        "{}",
+                        key_detail_line(
+                            &group.name,
+                            &key_tally_segment(tally),
+                            &suffix,
+                            !group.unidentified
+                        )
+                    );
+                }
+            }
+            for (tally, reasons) in &unknown {
+                let suffix = if verbose {
+                    format!(" ({})", reasons.join(", "))
+                } else {
+                    String::new()
+                };
+                let _ = writeln!(
+                    out,
+                    "{}",
+                    key_detail_line("unknown keys", &key_tally_segment(tally), &suffix, false)
+                );
+            }
+            // Not-attributed counters sit beside the exact rows, one
+            // line per finite reason: counts only, never a guessed key.
+            for row in &observations.unattributed {
+                let _ = writeln!(out, "  not attributed: {} {}", row.reason, row.count);
+            }
             // First-observed keys with unestablished type keep their
             // rows under the `unknown` metadata label (DEMO-4): say
             // so beside the tallies, counts only, never a guessed
             // label.
-            let unknown_type_suffix = {
-                let rows = observations
-                    .key_operations
-                    .iter()
-                    .filter(|row| {
-                        row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN
-                    })
-                    .count();
-                if rows == 0 {
-                    String::new()
-                } else {
-                    format!(
-                        "; type unknown (not established while observed) ({rows} key row{})",
-                        if rows == 1 { "" } else { "s" }
-                    )
-                }
-            };
-            let tallies = key_operation_tallies(observations);
-            if tallies.is_empty() {
-                line.push_str("no key operations observed");
-                line.push_str(&unattributed_suffix);
-            } else {
-                let parts: Vec<String> = tallies
-                    .iter()
-                    .map(|tally| {
-                        // What happened to the call, not an observer
-                        // failure (JSON keeps `failed`).
-                        let failed_noun = if tally.failed == 1 {
-                            "returned an error"
-                        } else {
-                            "returned errors"
-                        };
-                        format!(
-                            "{} {} completed, {} {}, {} active {}",
-                            tally.category,
-                            tally.completed,
-                            tally.failed,
-                            failed_noun,
-                            tally.active,
-                            tally.unit
-                        )
-                    })
-                    .collect();
-                line.push_str(&parts.join("; "));
-                line.push_str(&unattributed_suffix);
-                line.push_str(&unknown_type_suffix);
+            let unknown_type_rows = observations
+                .key_operations
+                .iter()
+                .filter(|row| {
+                    row.metadata_at_use == crate::key_operation_projection::METADATA_UNKNOWN
+                })
+                .count();
+            if unknown_type_rows > 0 {
+                let _ = writeln!(
+                    out,
+                    "  type unknown (not established while observed) ({unknown_type_rows} key row{})",
+                    if unknown_type_rows == 1 { "" } else { "s" }
+                );
             }
-            let _ = writeln!(out, "{line}");
         }
     }
     {
@@ -2210,9 +2393,7 @@ fn render_snapshot_inner(
     }
     if verbosity == crate::cli::TextVerbosity::Concise {
         render_limits_line(&mut out, budgets);
-        if let Some(line) =
-            concise_gap_summary_line(&presentation.gaps, presentation.gaps_suppressed)
-        {
+        for line in concise_gap_summary_block(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);

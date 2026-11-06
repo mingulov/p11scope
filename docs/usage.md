@@ -1160,10 +1160,20 @@ Limits that matter in pods:
 
   <!-- EXCERPT: p11scope inventory --pid <fixture-pid> --capture scan -->
 
-  The header also carries a key-operation summary line. Once key
-  operations populate (opt in with `--key-operations`), it counts
+  The header also carries a key-operation summary block: one header
+  line plus one indented line per provider and operation category. Once
+  key operations populate (opt in with `--key-operations`), it counts
   completions per operation category, e.g.
-  `key operations: rev 1 populated; 1 session, 3 objects; sign 1 completed, 0 failed, 2 active operations`.
+
+  ```text
+  key operations: 3 keys on 1 provider; rev 1 populated; 1 session
+    libsofthsm2.so: sign 1 completed, 0 returned errors, 2 active operations
+  ```
+
+  ("Returned errors" are calls that returned an error, never observer
+  failures.) With `-v`, each provider line pairs its machine instance
+  label in parentheses; rows no provider can be proved for read under
+  `unknown keys` instead.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.
@@ -1185,7 +1195,7 @@ Limits that matter in pods:
   the manifest`. When the journal start itself is refused, the line
   names the request and the cause: `key operations: requested, but
   per-key tracking did not start (<cause>)`.
-  The line shows counts per operation category from the
+  The block shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.
 

@@ -2713,12 +2713,32 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
         });
     }
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    // Plain reasons stay intact on their group lines.
     for plain in [
         "per-key tracking ended early",
         "per-key tracking fell back to plain counts",
-        "per-key tracking is off; function and mechanism counts are unaffected",
+        "per-key tracking is off in this run",
     ] {
         assert!(out.contains(plain), "{plain} missing: {out}");
+    }
+    // Long plain subjects truncate (marked) to hold the 100-char cap;
+    // verbose and JSON keep them whole.
+    for stem in [
+        "Per-key tracking did not start",
+        "per-key tracking is off; function",
+    ] {
+        assert!(out.contains(stem), "{stem} missing: {out}");
+    }
+    let lines: Vec<&str> = out.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| *line == "gaps: 3")
+        .expect("gaps header");
+    for line in &lines[start..start + 4] {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{out}"
+        );
     }
     for machine in [
         "joint_seal_",
@@ -2728,11 +2748,19 @@ fn concise_gap_summary_uses_plain_words_for_joint_gaps() {
     ] {
         assert!(!out.contains(machine), "{machine} leaked: {out}");
     }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for full in [
+        "Per-key tracking did not start for this process; function counts above are unaffected",
+        "per-key tracking is off; function and mechanism counts are unaffected",
+    ] {
+        assert!(verbose.contains(full), "{full} missing: {verbose}");
+    }
 }
 
-/// F1: more than three gap groups fold the tail into "and K more".
+/// F1: the readable gaps block lists every group on its own indented
+/// line under `gaps: N` — no top-three fold, no "and K more".
 #[test]
-fn concise_gap_summary_folds_beyond_three_groups() {
+fn concise_gap_summary_lists_every_group_without_fold() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();
@@ -2754,7 +2782,27 @@ fn concise_gap_summary_folds_beyond_three_groups() {
         });
     }
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    assert!(out.contains("and 1 more"), "{out}");
+    let lines: Vec<&str> = out.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| *line == "gaps: 4")
+        .expect("gaps header");
+    let block = &lines[start..start + 5];
+    assert_eq!(
+        block,
+        &[
+            "gaps: 4",
+            "  1 × scope-a — reason-a",
+            "  1 × scope-b — reason-b",
+            "  1 × scope-c — reason-c",
+            "  1 × scope-d — reason-d",
+        ],
+        "{out}"
+    );
+    assert!(
+        !block.iter().any(|line| line.contains("more")),
+        "nothing folds: {block:?}"
+    );
     assert!(!out.contains("gap ["), "{out}");
 }
 
@@ -2862,10 +2910,24 @@ fn concise_gap_summary_uses_plain_words_for_scan_identity_gap() {
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    // The long plain subject truncates (marked) to hold the 100-char
+    // cap; the reason stays intact and verbose keeps the full subject.
+    assert!(out.contains("process identity checked from /proc"), "{out}");
     assert!(
-        out.contains("process identity checked from /proc (PID and start time), not by the kernel"),
+        out.contains("some processes were identified from /proc only"),
         "{out}"
     );
+    let lines: Vec<&str> = out.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| *line == "gaps: 1")
+        .expect("gaps header");
+    for line in &lines[start..start + 2] {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{out}"
+        );
+    }
     assert!(!out.contains("exact image authority unavailable"), "{out}");
     assert!(!out.contains("pidfd/start-time"), "{out}");
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
@@ -2976,16 +3038,25 @@ fn concise_deleted_gaps_fold_last_in_plain_words() {
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    let gaps = out
-        .lines()
-        .find(|line| line.starts_with("gaps:"))
-        .unwrap_or_else(|| panic!("no gaps line: {out}"));
-    assert!(gaps.contains("fixture reason"), "{gaps}");
-    // Deleted mappings fold to one plain trailing group.
-    let deleted = gaps.find("deleted").expect("deleted group missing: {gaps}");
-    let fixture = gaps.find("fixture reason").unwrap();
-    assert!(fixture < deleted, "deleted mappings must not lead: {gaps}");
-    assert!(!gaps.contains("libpcre2"), "{gaps}");
+    let lines: Vec<&str> = out.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| *line == "gaps: 3")
+        .expect("gaps header");
+    let block = &lines[start..start + 3];
+    assert_eq!(
+        block,
+        &[
+            "gaps: 3",
+            "  1 × fixture scope — fixture reason",
+            "  2 × unloaded libraries — mapped files were deleted (not loss)",
+        ],
+        "deleted mappings fold to one plain trailing group: {out}"
+    );
+    assert!(
+        !block.iter().any(|line| line.contains("libpcre2")),
+        "no per-path groups: {block:?}"
+    );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains("libpcre2-8.so (deleted)"), "{verbose}");
 }

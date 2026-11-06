@@ -3153,7 +3153,7 @@ impl CallerRegistry {
         boundary: Option<u64>,
         reason: InstanceReason,
         retire: bool,
-        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        mut shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) {
         // Joint accounting is active for this feed's S1 (same latch
         // as the reduce path): its starts teed, so its loss
@@ -3173,14 +3173,24 @@ impl CallerRegistry {
         // publication, once per payload/terminal. Staged payloads at
         // or below the barrier dispose as history (releases pend: no
         // ledger on this path — the ledger-bearing publish flushes);
-        // above-barrier staging stays queued for its seals. Live S1
+        // above-barrier staging stays queued for its seals. Disposal
+        // preserves observed S1 completions as unknown-key rows (the
+        // proof left with the caller; the S1 stands) beside the
+        // counted `record_lost`; live S1 is untouched. Live S1
         // invalidates with terminals teed into shared key-use while
         // Joint accounting is active, else plainly as before.
         // Completed history stands; siblings untouched; repeats
         // no-op (empty staging, no live machines).
         let (feed, reducer_slot) = (&mut state.feed, &mut state.semantics);
         if feed.mode() == FeedMode::Joint {
-            feed.dispose_below_barrier(boundary, None);
+            feed.preserve_and_dispose_below_barrier(
+                boundary,
+                None,
+                id,
+                &mut self.joint_keyuse,
+                shared.as_deref_mut(),
+                Some(&mut self.assoc_fallback),
+            );
         }
         if let Some(reducer) = reducer_slot.as_mut() {
             if joint_accounting {

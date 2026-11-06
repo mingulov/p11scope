@@ -21,7 +21,7 @@
 use crate::discovery::caller_registry::instance_input::RegistryInstanceId;
 use crate::key_operation_projection::KEY_OP_ROW_CAPACITY;
 use crate::semantics_edge::{
-    EdgeSemantics, EffectOrigin, KeyReceipt, KeyRole, OperationEffect, OperationId,
+    EdgeSemantics, EffectOrigin, KeyReceipt, KeyRole, NoSink, OperationEffect, OperationId,
     OperationOutcome, OperationSink, SemanticCall,
 };
 #[cfg(test)]
@@ -1372,7 +1372,11 @@ impl JointStaging {
     /// seals. `None` (a barrier-less exhaustion void) disposes
     /// everything: nothing above an unknown void is provable.
     /// Releases go to the ledger when present, else pend for the
-    /// next ledger contact. Returns the disposed count.
+    /// next ledger contact. Returns the disposed count. Test-only:
+    /// production C5 preserves observed completions through
+    /// [`Self::preserve_and_dispose_below_barrier`]; this pure form
+    /// is the tests' barrier/frontier/custody handle.
+    #[cfg(test)]
     pub(crate) fn dispose_below_barrier(
         &mut self,
         barrier: Option<u64>,
@@ -1392,6 +1396,57 @@ impl JointStaging {
             self.history_disposed = self.history_disposed.saturating_add(1);
             disposed += 1;
         }
+        disposed
+    }
+
+    /// Dispose staged payloads at or below `barrier` like
+    /// [`Self::dispose_below_barrier`], but preserve their observed
+    /// S1 completions first: each popped head reduces through a
+    /// throwaway S1 — never the live reducer, so live machines,
+    /// counts and pairing are untouched — with effects into a
+    /// throwaway key-use reducer, which then invalidates (truncated
+    /// opens close as Unknown, never fabricated completions) and
+    /// merges its unknown summaries and evidence into `keyuse`.
+    /// Every popped head still advances the frontier, releases
+    /// custody and counts as disposed history (`record_lost`); late
+    /// seals hold as before. Payloads above the barrier stay queued.
+    /// Returns the disposed count.
+    pub(crate) fn preserve_and_dispose_below_barrier(
+        &mut self,
+        barrier: Option<u64>,
+        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        instance: RegistryInstanceId,
+        keyuse: &mut KeyUseReducer,
+        shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+        fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        debug_assert!(
+            shared.is_some() || fallback.is_some(),
+            "preservation association mints need a ledger"
+        );
+        let mut throwaway = EdgeSemantics::default();
+        let mut preserved = KeyUseReducer::new();
+        let mut outer = NoSink;
+        let mut disposed = 0;
+        {
+            let mut tee = KeyUseTee::new(&mut outer, &mut preserved, instance, shared, fallback);
+            while let Some(front) = self.staged.front() {
+                if !barrier.is_none_or(|at| front.position <= at) {
+                    break;
+                }
+                let head = self.staged.pop_front().expect("front verified above");
+                throwaway.observe_with_effects(&head.facts, &head.origin, &mut tee);
+                let bytes = head.charged_bytes();
+                let (position, native) = (head.position, head.resource_native);
+                drop(head);
+                self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
+                self.frontier = self.frontier.max(position);
+                self.history_disposed = self.history_disposed.saturating_add(1);
+                disposed += 1;
+            }
+            throwaway.invalidate_with_effects(&mut tee);
+        }
+        keyuse.absorb_preserved(preserved);
         disposed
     }
 
@@ -2107,6 +2162,54 @@ impl KeyUseReducer {
     fn unknown_activate(&mut self, index: usize) {
         self.unknown_ever_live[index] = true;
         self.unknown[index].active = self.unknown[index].active.saturating_add(1);
+    }
+
+    /// Merge a fully-closed preservation reducer's unknown summaries
+    /// and evidence (bulk-disposal preservation): fixed unknown
+    /// counters add (never refuse, never re-partition), ever-live
+    /// ORs (N9), evidence counts add. The preserved reducer holds
+    /// no opens, refused opens, proved aggregates (receipt-less by
+    /// construction) or pended releases — anything left would be a
+    /// pairing leak across the loss boundary.
+    pub(crate) fn absorb_preserved(&mut self, other: KeyUseReducer) {
+        debug_assert!(other.open.is_empty() && other.refused.is_empty());
+        debug_assert!(other.aggregates.is_empty());
+        debug_assert!(other.pending_shared_releases.is_empty());
+        for (slot, add) in self.unknown.iter_mut().zip(other.unknown.iter()) {
+            debug_assert_eq!(add.active, 0, "preservation closes every open");
+            slot.completed = slot.completed.saturating_add(add.completed);
+            slot.failed = slot.failed.saturating_add(add.failed);
+            slot.cancelled = slot.cancelled.saturating_add(add.cancelled);
+            slot.unknown = slot.unknown.saturating_add(add.unknown);
+            slot.active = slot.active.saturating_add(add.active);
+        }
+        for (live, add) in self
+            .unknown_ever_live
+            .iter_mut()
+            .zip(other.unknown_ever_live.iter())
+        {
+            *live |= add;
+        }
+        let (mine, theirs) = (&mut self.evidence, other.evidence);
+        mine.unknown_key_rows = mine
+            .unknown_key_rows
+            .saturating_add(theirs.unknown_key_rows);
+        mine.orphan_ends = mine.orphan_ends.saturating_add(theirs.orphan_ends);
+        mine.unclassified_roles = mine
+            .unclassified_roles
+            .saturating_add(theirs.unclassified_roles);
+        mine.partial |= theirs.partial;
+        mine.rows_refused = mine.rows_refused.saturating_add(theirs.rows_refused);
+        mine.refused_terminals = mine
+            .refused_terminals
+            .saturating_add(theirs.refused_terminals);
+        mine.dropped_receipts = mine
+            .dropped_receipts
+            .saturating_add(theirs.dropped_receipts);
+        mine.join_lost = mine.join_lost.saturating_add(theirs.join_lost);
+        mine.duplicate_starts = mine
+            .duplicate_starts
+            .saturating_add(theirs.duplicate_starts);
     }
 
     #[cfg_attr(not(test), allow(dead_code))]

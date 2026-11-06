@@ -357,6 +357,11 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witne
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback
+# R1 no-route collect cell (own loop overlays per mode, SoftHSM
+# provider): collect_system_with_identity twice (Auto, scripted
+# no-kernel checks) plus one single-shot collect; fresh-upper joins,
+# stale-lower refuses, the shared witness window advances by spent.
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains

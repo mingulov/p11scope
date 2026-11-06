@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 219,
+  "default_floor": 220,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -136,6 +136,7 @@
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness",
     "discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4",
     "discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4",
     "events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains",

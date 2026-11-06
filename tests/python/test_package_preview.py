@@ -456,9 +456,19 @@ else:
                              f"{name} must inherit the read-only top-level permissions")
         attest = document["jobs"]["attest"]
         self.assertEqual(attest["needs"], "package")
+        downloads = [item for item in attest["steps"] if "download-artifact" in item.get("uses", "")]
+        self.assertEqual(len(downloads), 1)
+        # The download must fetch every built mode's artifact (FULL and P0
+        # share the release-preview-public-assets* prefix); a bare name
+        # would drop one mode's files, and merging would mix their trees.
+        self.assertEqual(downloads[0]["with"].get("pattern"), "release-preview-public-assets*")
+        self.assertIs(downloads[0]["with"].get("merge-multiple"), False)
+        self.assertEqual(downloads[0]["with"].get("path"), "./attested")
         subjects = [item for item in attest["steps"] if "attest-build-provenance" in item.get("uses", "")]
         self.assertEqual(len(subjects), 1)
-        self.assertIn("attested", subjects[0]["with"]["subject-path"])
+        # The attestation subject must cover every downloaded file; a
+        # narrowed path would leave release files unattested.
+        self.assertEqual(subjects[0]["with"].get("subject-path"), "./attested/**/*")
         install = document["jobs"]["install-test"]
         self.assertEqual(install["needs"], "package")
         bodies = "\n".join(item.get("run", "") for item in install["steps"])

@@ -275,7 +275,9 @@ v0.6.0 reports key operations when opted in with `inventory
 counts completions per operation category, and the JSON report carries
 the rows under `object_observations`. Without the opt-in, or on a build
 without the journal object, the line reads `not reported (per-key
-tracking is off)`. A
+tracking is off)`. With `--key-operations` but a refused subset or
+journal start, the line reads `unavailable (<refusal>)`; the gap below
+names the remedy. A
 linked capture whose tracking never starts reads `unavailable
 (bootstrap_unavailable)`. Mechanisms and API results are reported as
 before. An ordinary native-retirement refusal during a `--manifest`

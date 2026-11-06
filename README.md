@@ -681,8 +681,9 @@ losing capabilities, and a sudo-root observer requires valid non-root
 them before the release barrier. Root without that explicit target and set-id
 invocations are refused; those environment values select the target account
 but do not authenticate that the launcher was `sudo`. The child also receives
-`no_new_privs`, no capabilities, a small environment allowlist, and no
-unrelated inherited file descriptors. Its executable is opened before fork
+`no_new_privs`, no capabilities, the observer's environment unchanged
+except `SUDO_*`/`P11SCOPE_*` control variables (named on stderr when
+withheld), and no unrelated inherited file descriptors. Its executable is opened before fork
 and executed by descriptor; scripts must be invoked through an explicit ELF
 interpreter such as `/bin/sh script`.
 For now, the sudo path clears supplementary groups, so workloads needing an

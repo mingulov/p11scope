@@ -1147,7 +1147,9 @@ Limits that matter in pods:
   `provider function tables ...`); when the refusal happens on the
   manifest path, it instead reads `key operations: <file>'s function
   table cannot be verified from the supplied --manifest inputs; check
-  the manifest`.
+  the manifest`. When the journal start itself is refused, the line
+  names the request and the cause: `key operations: requested, but
+  per-key tracking did not start (<cause>)`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.

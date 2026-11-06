@@ -596,6 +596,68 @@ fn isolation_o_writes_through_the_fenced_output_directory() {
     assert!(!missing.exists());
 }
 
+/// R7/R9: a loader failure under the fence keeps its ordinary diagnosis
+/// and additionally names the profile; the trusted twin has no suffix.
+#[test]
+fn isolation_loader_failure_names_the_profile() {
+    let dir = scratch("isolation-broken");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    let vanishing = dir.join("libvanishing.so");
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&vanishing)
+            .arg(source.join("isolation_backend.c"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    let provider = dir.join("isolation-broken.so");
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(source.join("isolation_probe.c"))
+            .arg("-ldl")
+            .arg(format!("-L{}", dir.display()))
+            .arg("-Wl,--no-as-needed")
+            .arg("-lvanishing")
+            .status()
+            .unwrap()
+            .success()
+    );
+    std::fs::remove_file(&vanishing).unwrap();
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(1), "{trusted:?}");
+    let trusted_stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(trusted_stderr.contains("cannot dlopen"), "{trusted_stderr}");
+    assert!(
+        !trusted_stderr.contains("isolated"),
+        "trusted failure must never name the isolated profile: {trusted_stderr}"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(1), "{isolated:?}");
+    let isolated_stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        isolated_stderr.contains("cannot dlopen"),
+        "{isolated_stderr}"
+    );
+    assert!(
+        isolated_stderr.contains("(under the isolated profile)"),
+        "{isolated_stderr}"
+    );
+}
+
 /// F-56: `--help` is an exit-0 answer, so it goes to stdout like
 /// `--version` and like `p11scope --help`.
 #[test]

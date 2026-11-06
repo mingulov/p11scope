@@ -7719,6 +7719,101 @@ mod tests {
     }
 
     #[test]
+    fn sole_complete_getter_present_refuses() {
+        // A 3.x interface getter in any symbol type refuses the
+        // legacy-prefix reading the sole-table grant relies on.
+        let mut module = sole_complete_module();
+        module.getter_present = true;
+        assert!(
+            !sole_scan_semantic(&module),
+            "a 3.x interface getter refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_witness_fault_refuses() {
+        // A faulted exports walk may hide a getter or a disagreeing
+        // export, so the export witness cannot prove the table.
+        let mut module = sole_complete_module();
+        module.witness_fault = true;
+        assert!(
+            !sole_scan_semantic(&module),
+            "a faulted export witness refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_unpinned_entry_refuses() {
+        // A record reconciliation moved aside stays unusable: the slot
+        // count still covers it, but the grant needs every slot bound.
+        // The moved entry's export symbol goes with it, so export
+        // disagreement cannot also refuse — the twin isolates the
+        // unpinned gate.
+        let mut module = sole_complete_module();
+        let table = &mut module.scanned.tables[0];
+        let position = table
+            .entries
+            .iter()
+            .position(|entry| entry.name == "C_GetInfo")
+            .expect("non-required entry");
+        let entry = table.entries.remove(position);
+        module.entry_objects[0].remove(position);
+        table.unpinned.push(Skipped {
+            subject: entry.name.to_string(),
+            reason: "target not pinned to a comparable object".into(),
+        });
+        let exports: Vec<(String, u64)> = module
+            .exports
+            .iter()
+            .filter(|(name, _)| *name != "C_GetInfo")
+            .cloned()
+            .collect();
+        module.exports = std::sync::Arc::from(exports);
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unpinned entry refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_null_interface_claim_refuses() {
+        // A null interface record claiming the table refuses like the
+        // vendor claim: only an exact-standard linkage proves the layout.
+        let mut module = sole_complete_module();
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "null",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        assert!(
+            !sole_scan_semantic(&module),
+            "a null interface claim refuses the sole-table grant"
+        );
+    }
+
+    #[test]
+    fn sole_complete_unreadable_interface_claim_refuses() {
+        // An unreadable interface record claiming the table refuses like
+        // the vendor claim: only an exact-standard linkage proves it.
+        let mut module = sole_complete_module();
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "unreadable",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        assert!(
+            !sole_scan_semantic(&module),
+            "an unreadable interface claim refuses the sole-table grant"
+        );
+    }
+
+    #[test]
     fn sole_complete_required_names_match_object_descriptors() {
         let computed: BTreeSet<&str> = pkcs11_module::FUNCTION_LIST_FIELDS
             .iter()

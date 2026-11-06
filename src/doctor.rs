@@ -921,10 +921,12 @@ fn bpf_checks_with_seccomp<T>(
     checks
 }
 
-/// The singles self-probe row: `(self)` because the anchor is the
-/// observer's own libc mapping, falling back to its own entry point for
-/// static linkage — never libc alone. One constant for the producer and
-/// the tier classifier, so the two cannot drift again (F-09).
+/// The self-probe row: `(self)` because the anchor is the observer's
+/// own libc mapping, falling back to its own entry point for static
+/// linkage — never libc alone. The diagnostic session links it on
+/// multi hosts and keeps the perf single elsewhere. One constant for
+/// the producer and the tier classifier, so the two cannot drift
+/// again (F-09).
 const UPROBE_ATTACH_SELF_ROW: &str = "uprobe attach (self)";
 
 fn bpf_checks_with<T>(

@@ -262,9 +262,10 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
             };
             live | sys_admin | out(&a.out) | ids
         }
-        // Transient: SYS_ADMIN for the diagnostic perf attach until the
-        // diagnostic probe moves to uprobe-multi.
-        Command::Doctor(_) => live | sys_admin,
+        // The diagnostic session links its self-probe on multi hosts,
+        // so doctor needs no SYS_ADMIN even at paranoid 4; the perf
+        // fallback on pre-multi hosts degrades to a failed row.
+        Command::Doctor(_) => live,
         // `inspect` reads memory and files only ("No BPF" is its module
         // contract, and it has no `-o`); the witness still needs
         // checkpoint/restore.
@@ -416,9 +417,9 @@ mod tests {
         for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
             assert_eq!(keep_mask_for_command(&parse(&argv)), inspect, "{argv:?}");
         }
-        // Transient: doctor keeps SYS_ADMIN for the diagnostic perf attach
-        // until the diagnostic probe moves to uprobe-multi.
-        assert_eq!(keep_mask_for_command(&parse(&["doctor"])), live | sys_admin);
+        // Doctor needs no SYS_ADMIN: its self-probe links on multi
+        // hosts, and the perf fallback only degrades a row elsewhere.
+        assert_eq!(keep_mask_for_command(&parse(&["doctor"])), live);
         // `diff` reads two inputs and optionally writes one output.
         let dac_read_search = 1u64 << CAP_DAC_READ_SEARCH_BIT;
         assert_eq!(

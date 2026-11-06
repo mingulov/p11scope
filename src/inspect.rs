@@ -1995,6 +1995,7 @@ mod tests {
                 },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: None,
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![],

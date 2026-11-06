@@ -397,9 +397,10 @@ fn actual_trace_formatter_is_accepted_by_canary_privacy_consumer() {
     };
     let line = trace::format_line(&event, 0, "C_Sign", None);
     let text = format!(
-        "{}\n{}\n{line}\n",
+        "{}\n{}\n{}\n{line}\n",
         trace::capture_line(CapturePolicy::Allowlisted),
-        trace::identity_note()
+        trace::identity_note(),
+        trace::zone_note()
     );
     // Production always prints the zone line (`trace::header`
     // assembles CAPTURE, identity, zone, then the unverified note);
@@ -442,12 +443,13 @@ fn singular_trace_tail_is_accepted_by_canary_privacy_consumer() {
     // The singular totals line the producer emits for (1, 0, 1) (pinned
     // by `totals_line_singularizes_one`); the consumer must accept it.
     let text = format!(
-        "{}\n{}\n{}\n{line}\nCOUNT_EVIDENCE {{\"stats_entered\": 1}}\nEVIDENCE \
+        "{}\n{}\n{}\n{}\n{line}\nCOUNT_EVIDENCE {{\"stats_entered\": 1}}\nEVIDENCE \
          {{\"privacy_mode\": \"allowlisted\"}}\n1 completed call; 0 returned errors; 1 entry \
          without an observed return.\ncoverage: partial — nothing known was \
          lost\nrun with -v for details\n",
         trace::capture_line(CapturePolicy::Allowlisted),
         trace::identity_note(),
+        trace::zone_note(),
         trace::unverified_note(),
     );
     // Production always prints the zone line (`trace::header`

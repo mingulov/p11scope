@@ -310,13 +310,13 @@ pub(crate) struct JointStaging {
     /// The ending that opened the current degraded window, if a
     /// segment has ended and not yet resumed. Cleared on resume.
     degraded_window: Option<DegradedWindow>,
-    /// Staged calls left unsealed when the no-progress watchdog
-    /// tripped, snapshotted once at the trip: counted as not
-    /// attributed (`watchdog_no_progress`). The calls themselves
-    /// stay staged — never reduced, never replayed.
+    /// Staged calls taken out at the no-progress watchdog trip,
+    /// plus later direct key calls in the watchdog window: each
+    /// counted once as not attributed (`watchdog_no_progress`).
+    /// Taken out history-only — never reduced, never replayed.
     watchdog_unsealed: u64,
     /// True once the watchdog trip has been noted for this feed:
-    /// the snapshot above is taken exactly once.
+    /// the take-out above runs exactly once.
     watchdog_tripped: bool,
     correlation_refusals: u64,
     /// True once real loss (not proof-only refusal) ended this

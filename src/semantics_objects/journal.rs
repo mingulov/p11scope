@@ -5533,7 +5533,10 @@ impl JournalAdapter {
         }
         // Unclaimed staged history barriers every seal past it: an
         // entry no bound key can account for is never silently
-        // excluded. Only an explicit void drops it.
+        // excluded. It drops only through an explicit void or a
+        // recorded refusal disposal (image taint, disposed raw, or
+        // refused S1-only subjects), each with its gap and ledger
+        // accounting.
         if self.has_unbound_staging(frontier) {
             return Err(self.failure(JournalGap::BoundNotReady));
         }

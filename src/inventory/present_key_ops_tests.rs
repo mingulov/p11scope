@@ -6,6 +6,8 @@
 
 use super::*;
 use crate::discovery::caller_registry::RegistryLimits;
+use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
+use crate::discovery::caller_registry::ModuleId;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory_dashboard::{DashboardState, DisplayFrame, LogTail, Viewport, render_frame};
 use crate::key_operation_projection::{
@@ -139,6 +141,86 @@ fn key_ops_line(snapshot: &str) -> &str {
         "exactly one key operations line:\n{snapshot}"
     );
     lines[0]
+}
+
+/// A proved-key row on one instance and object: the per-provider tests'
+/// handle for attributing tallies to providers.
+fn key_row_on(
+    instance: &str,
+    object: u64,
+    category: &'static str,
+    role: &'static str,
+    completed: u64,
+    failed: u64,
+    active: u64,
+    unit: &'static str,
+) -> KeyAggRow {
+    let mut row = key_row(category, role, completed, failed, active, unit);
+    row.instance = instance.to_string();
+    row.object = object;
+    row
+}
+
+/// Four keys over two providers: two sessions, four object rows, and
+/// proved rows on instances `i0`/`i1` resolving to two provider
+/// modules. The per-provider wrap test's fixture.
+fn two_provider_presentation() -> Presentation {
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.sessions.push(SessionRow {
+        session: 8,
+        origin: "opened",
+        status: "live",
+    });
+    for object in [11, 12, 13, 14] {
+        observations.objects.push(object_row(object));
+    }
+    observations
+        .key_operations
+        .push(key_row_on("i0", 11, "sign", "key", 2, 1, 0, "operations"));
+    observations
+        .key_operations
+        .push(key_row_on("i0", 12, "sign", "key", 3, 0, 1, "operations"));
+    observations
+        .key_operations
+        .push(key_row_on("i1", 13, "decrypt", "key", 4, 0, 0, "operations"));
+    observations
+        .key_operations
+        .push(key_row_on("i1", 14, "decrypt", "key", 1, 2, 0, "operations"));
+    let mut presentation = key_ops_presentation(observations);
+    presentation.modules[0].paths =
+        vec!["/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so".into()];
+    let first_module = presentation.modules[0].id;
+    let next_module = presentation
+        .modules
+        .iter()
+        .map(|module| module.id.0)
+        .max()
+        .unwrap()
+        + 1;
+    let mut second = presentation.modules[0].clone();
+    second.id = ModuleId(next_module);
+    second.paths = vec!["/opt/vendor/libfoo-pkcs11.so".into()];
+    presentation.modules.push(second);
+    let caller = presentation.callers[0].id;
+    // Only the fixture's instances resolve, whatever the harness carried.
+    presentation.instances.clear();
+    for (raw, module) in [(0u32, first_module), (1, ModuleId(next_module))] {
+        presentation.instances.push(InstanceView {
+            id: RegistryInstanceId::from_raw(raw),
+            caller,
+            module,
+            state: InstanceLifecycle::Observed,
+            reason: None,
+            first_seen_ns: 100,
+            last_seen_ns: 200,
+        });
+    }
+    presentation
 }
 
 /// The dashboard H9 projection line at a wide viewport (mirrors
@@ -1217,4 +1299,360 @@ fn overlay_witness_gap_reasons_render_plain_words_with_machine_tokens() {
     for (reason, _) in cases {
         assert!(stored.contains(&reason), "{reason} missing: {stored:?}");
     }
+}
+
+/// The key-operations block: the header plus every indented detail line
+/// that follows it, stopping at the next flush-left line.
+fn key_ops_block(snapshot: &str) -> Vec<&str> {
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("key operations:"))
+        .expect("key operations header");
+    let mut block = vec![lines[start]];
+    for line in &lines[start + 1..] {
+        if line.starts_with(' ') {
+            block.push(line);
+        } else {
+            break;
+        }
+    }
+    block
+}
+
+/// The concise gaps block: the `gaps: N` header plus every indented
+/// group line that follows it.
+fn gaps_block(snapshot: &str) -> Vec<&str> {
+    let lines: Vec<&str> = snapshot.lines().collect();
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("gaps:"))
+        .expect("gaps header");
+    let mut block = vec![lines[start]];
+    for line in &lines[start + 1..] {
+        if line.starts_with(' ') {
+            block.push(line);
+        } else {
+            break;
+        }
+    }
+    block
+}
+
+/// Readable key operations: four keys over two providers render one
+/// header line plus one line per provider, every line at most 100
+/// chars, with no machine instance labels in concise text. The JSON
+/// section keeps every per-key row.
+#[test]
+fn key_operations_line_wraps_per_provider() {
+    let presentation = two_provider_presentation();
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 4 keys on 2 providers; rev 3 populated; 2 sessions",
+            "  libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations",
+            "  libsofthsm2.so: sign 5 completed, 1 returned an error, 1 active operations",
+        ],
+        "header plus one line per provider:\n{concise}"
+    );
+    for line in &block {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{concise}"
+        );
+    }
+    assert!(!concise.contains("(i0)"), "{concise}");
+    assert!(!concise.contains("(i1)"), "{concise}");
+    // Positive control: the JSON section still carries every per-key row.
+    let document =
+        serde_json::to_value(object_observations_json(&presentation.object_observations)).unwrap();
+    assert_eq!(
+        document
+            .get("key_operations")
+            .and_then(serde_json::Value::as_array)
+            .map(Vec::len),
+        Some(4),
+        "JSON keeps all four rows"
+    );
+}
+
+/// Verbose keeps the machine instance labels beside the provider names.
+#[test]
+fn key_ops_verbose_provider_lines_keep_instance_labels() {
+    let presentation = two_provider_presentation();
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 4 keys on 2 providers; rev 3 populated; 2 sessions",
+            "  libfoo-pkcs11.so: decrypt 5 completed, 2 returned errors, 0 active operations (i1)",
+            "  libsofthsm2.so: sign 5 completed, 1 returned an error, 1 active operations (i0)",
+        ],
+        "verbose keeps instance labels in parentheses:\n{verbose}"
+    );
+    for line in &block {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{verbose}"
+        );
+    }
+}
+
+/// Rows whose instance resolves to no provider read under a fixed
+/// label in concise text (never the raw instance string); verbose
+/// names the instance in parentheses.
+#[test]
+fn key_ops_unresolved_instance_reads_unidentified_provider() {
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 2, 1, 0, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 1 key on 1 provider; rev 3 populated; 1 session",
+            "  unidentified provider: sign 2 completed, 1 returned an error, 0 active operations",
+        ],
+        "unresolved instances read as unidentified:\n{concise}"
+    );
+    assert!(
+        !block.iter().any(|line| line.contains("test-instance")),
+        "raw instance label leaked:\n{concise}"
+    );
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block[1],
+        "  unidentified provider: sign 2 completed, 1 returned an error, 0 active operations \
+         (test-instance)",
+        "verbose names the instance:\n{verbose}"
+    );
+}
+
+/// Capture-wide unknown-key rows (no instance) read on their own
+/// `unknown keys` lines, never merged into a provider's tallies.
+#[test]
+fn key_ops_unknown_bucket_reads_unknown_keys_lines() {
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    observations
+        .unknown_key_operations
+        .push(unknown_row("sign", 3, 0, 1, "operations"));
+    let presentation = key_ops_presentation(observations);
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 1 key on 0 providers; rev 3 populated; 1 session",
+            "  unknown keys: sign 3 completed, 0 returned errors, 1 active operations",
+        ],
+        "unknown rows stay separate:\n{concise}"
+    );
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block[1],
+        "  unknown keys: sign 3 completed, 0 returned errors, 1 active operations (unbound)",
+        "verbose names the machine reason:\n{verbose}"
+    );
+}
+
+/// A very long provider file name truncates to keep the provider line
+/// at most 100 chars; the tally itself is never truncated.
+#[test]
+fn key_ops_long_provider_name_truncates_line_to_100_chars() {
+    let mut observations = populated(3);
+    observations
+        .key_operations
+        .push(key_row_on("i0", 11, "sign", "key", 2, 1, 0, "operations"));
+    let mut presentation = key_ops_presentation(observations);
+    let basename = format!("lib{}.so", "p".repeat(110));
+    presentation.modules[0].paths = vec![format!("/opt/vendor/{basename}")];
+    let caller = presentation.callers[0].id;
+    let module = presentation.modules[0].id;
+    presentation.instances.clear();
+    presentation.instances.push(InstanceView {
+        id: RegistryInstanceId::from_raw(0),
+        caller,
+        module,
+        state: InstanceLifecycle::Observed,
+        reason: None,
+        first_seen_ns: 100,
+        last_seen_ns: 200,
+    });
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(block.len(), 2, "header plus one provider line:\n{concise}");
+    let tally = "sign 2 completed, 1 returned an error, 0 active operations";
+    assert!(
+        block[1].ends_with(tally),
+        "the tally stays exact: {:?}",
+        block[1]
+    );
+    assert!(
+        block[1].chars().count() <= 100,
+        "over 100 chars: {:?}",
+        block[1]
+    );
+    assert!(block[1].contains('…'), "truncation is marked: {:?}", block[1]);
+    assert!(block[1].starts_with("  lib"), "{:?}", block[1]);
+}
+
+/// A non-`none` publication reason reads on its own indented line so
+/// the header stays short; verbose pairs it with the machine reason.
+#[test]
+fn key_ops_stale_reason_reads_on_own_line() {
+    let mut observations = ObjectObservations::unavailable(9, "bootstrap_unavailable");
+    observations.status = ObsStatus::Stale;
+    observations.reason = "publication_budget_exhausted";
+    let presentation = key_ops_presentation(observations);
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = key_ops_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "key operations: 0 keys on 0 providers; rev 9 stale; 0 sessions",
+            "  key publication hit its budget; plain counts are unaffected",
+            "  no key operations observed",
+        ],
+        "stale names its reason on its own line:\n{concise}"
+    );
+    for line in &block {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{concise}"
+        );
+    }
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(
+        block[1],
+        "  key publication hit its budget; plain counts are unaffected \
+         (reason: publication_budget_exhausted)",
+        "verbose pairs the machine reason:\n{verbose}"
+    );
+}
+
+/// Readable gaps: three gap reasons render `gaps: 3` plus one indented
+/// line each, every line at most 100 chars, in plain words; verbose
+/// keeps the machine tokens in parentheses.
+#[test]
+fn gaps_line_lists_one_reason_per_line() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    presentation.gaps.push(named_gap("scope-a", "reason-a"));
+    presentation.gaps.push(named_gap("scope-b", "reason-b"));
+    presentation
+        .gaps
+        .push(named_gap("key row", "foreign_or_unproven_caller"));
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "gaps: 3",
+            "  1 × key row — caller not confirmed",
+            "  1 × scope-a — reason-a",
+            "  1 × scope-b — reason-b",
+        ],
+        "one indented line per reason:\n{concise}"
+    );
+    for line in &block {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{concise}"
+        );
+    }
+    assert!(
+        !block.iter().any(|line| line.contains("--json has every item")),
+        "no collapsed suffix remains: {block:?}"
+    );
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("(foreign_or_unproven_caller)"),
+        "verbose keeps the machine reason:\n{verbose}"
+    );
+}
+
+/// The gaps block lists every group: no top-three fold, no "and K
+/// more".
+#[test]
+fn gaps_block_lists_every_group_without_fold() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    for (subject, reason) in [
+        ("scope-a", "reason-a"),
+        ("scope-b", "reason-b"),
+        ("scope-c", "reason-c"),
+        ("scope-d", "reason-d"),
+    ] {
+        presentation.gaps.push(named_gap(subject, reason));
+    }
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(block.len(), 5, "header plus four group lines: {block:?}");
+    assert_eq!(block[0], "gaps: 4");
+    assert!(
+        !block.iter().any(|line| line.contains("more")),
+        "nothing folds: {block:?}"
+    );
+}
+
+/// A very long gap subject truncates to keep the group line at most
+/// 100 chars; the count and reason stay intact.
+#[test]
+fn gaps_long_subject_truncates_line_to_100_chars() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    let subject = format!("/proc/11/root/{}_deleted.so", "d".repeat(150));
+    presentation.gaps.push(named_gap(&subject, "reason-x"));
+    let concise =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(block.len(), 2, "header plus one group line: {block:?}");
+    assert_eq!(block[0], "gaps: 1");
+    assert!(
+        block[1].ends_with(" — reason-x"),
+        "the reason stays intact: {:?}",
+        block[1]
+    );
+    assert!(
+        block[1].chars().count() <= 100,
+        "over 100 chars: {:?}",
+        block[1]
+    );
+    assert!(block[1].contains('…'), "truncation is marked: {:?}", block[1]);
 }

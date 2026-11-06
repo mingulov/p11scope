@@ -229,6 +229,9 @@ class PackageReleaseTests(unittest.TestCase):
         deb = self.output / "p11scope_0.1.0_amd64.deb"
         rpm = self.output / "p11scope-0.1.0-1.x86_64.rpm"
         release = json.loads((self.output / "RELEASE.json").read_bytes())
+        docs = [*PACKAGE.LICENSES, "notices/notices.json",
+                *(f"notices/{name}" for name in self.notice_manifest["files"]),
+                "RELEASE.json"]
         # DEB data: same observer and glibc helper bytes, docs under
         # /usr/share/doc/p11scope, no set-id bits, no private bytes.
         deb_root = self.base / "deb-root"
@@ -273,6 +276,31 @@ class PackageReleaseTests(unittest.TestCase):
                                  capture_output=True, text=True, timeout=30).stdout
         self.assertIn("./usr/bin/p11scope\n", listing)
         self.assertIn("./usr/bin/p11scope-discover\n", listing)
+        # Exact data set: any stray payload (a service unit, cron file,
+        # ...) fails here, not just maintainer scripts.
+        expected_data = {"./usr/bin/p11scope", "./usr/bin/p11scope-discover"}
+        expected_data.update(f"./usr/share/doc/p11scope/{name}" for name in docs)
+        expected_dirs = {"./"}
+        for path in expected_data:
+            parts = path.split("/")
+            for end in range(2, len(parts)):
+                expected_dirs.add("/".join(parts[:end]) + "/")
+        self.assertEqual(sorted(line.split()[-1] for line in listing.splitlines()),
+                         sorted(expected_data | expected_dirs))
+        # No file capabilities: the data tar carries no xattr records and
+        # no non-file members.
+        fsys = subprocess.run(["dpkg-deb", "--fsys-tarfile", str(deb)], check=True,
+                              capture_output=True, timeout=30).stdout
+        with tarfile.open(fileobj=io.BytesIO(fsys)) as archive:
+            members = list(archive)
+        self.assertEqual({member.name for member in members},
+                         expected_data | {"." if name == "./" else name[:-1] for name in expected_dirs})
+        for member in members:
+            self.assertTrue(member.isdir() or member.isfile(),
+                            f"unexpected member type: {member.name}")
+            self.assertEqual([key for key in member.pax_headers
+                              if key.startswith("SCHILY.xattr.")], [],
+                             f"xattr record on {member.name}")
         # RPM queries (no root needed): same bytes by digest, same docs,
         # no scriptlets, no set-id modes.
         entries = {}
@@ -309,6 +337,20 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertIn("/usr/bin/p11scope\n", file_list)
         self.assertIn("/usr/bin/p11scope-discover\n", file_list)
         self.assertIn("/usr/share/doc/p11scope/LICENSE\n", file_list)
+        # Exact file set, as on the DEB side: a stray service unit or
+        # other payload addition fails here.
+        expected_rpm = {"/usr/bin/p11scope", "/usr/bin/p11scope-discover",
+                        "/usr/share/doc/p11scope"}
+        expected_rpm.update(f"/usr/share/doc/p11scope/{name}" for name in docs)
+        self.assertEqual(sorted(file_list.splitlines()), sorted(expected_rpm))
+        self.assertEqual(set(entries), expected_rpm)
+        # No file capabilities on any packaged path.
+        caps = subprocess.run(["rpm", "-qp", "--filecaps", str(rpm)], check=True,
+                              capture_output=True, text=True, timeout=30).stdout
+        capped = dict(line.partition("\t")[::2] for line in caps.splitlines())
+        self.assertEqual(set(capped), expected_rpm)
+        for name, value in capped.items():
+            self.assertEqual(value, "", f"file capability on {name}")
 
     def test_default_provenance_is_full_capture(self):
         result = self.package()

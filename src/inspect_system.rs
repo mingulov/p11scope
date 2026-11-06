@@ -3646,7 +3646,7 @@ impl ProbeDir {
         if roots[0] != fallback {
             roots.push(fallback);
         }
-        for (nth, root) in roots.iter().enumerate() {
+        for root in roots.iter() {
             let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             // Unpredictable as well as unique: a local squatter cannot
             // precreate the probe path of a privileged run.
@@ -3667,13 +3667,10 @@ impl ProbeDir {
                 Err(_) => continue,
             };
             if dir.supports_exec_map() {
-                if nth > 0 {
-                    eprintln!(
-                        "p11scope: probe dir fell back to {} ({} is not exec-capable)",
-                        root.display(),
-                        roots[0].display(),
-                    );
-                }
+                // CLI-1: informational notes stay silent by default; the
+                // `-v` lane resurfaces this fallback ("probe dir fell back
+                // to {root} ({temp} is not exec-capable)") in verbose
+                // output. A failed fallback still errors below.
                 return Ok(dir);
             }
             // Not exec-capable: dropping removes the empty just-created

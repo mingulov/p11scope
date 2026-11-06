@@ -304,6 +304,22 @@ impl Write for CountingWriter {
 }
 
 #[test]
+fn module_evidence_states_folded_unbound_entries() {
+    let mut before = document();
+    before["modules"][0]["unbound_use"] = json!({
+        "first_ns": 111, "rows": 1,
+        "reasons": {"before_admission": 1}, "entries": 10
+    });
+    let mut after = before.clone();
+    after["modules"][0]["unbound_use"]["entries"] = json!(25);
+    let output = text(&report(&before, &after));
+    assert!(
+        output.contains("Unbound use: 1 rows, 25 entries;"),
+        "module evidence states the folded entries:\n{output}"
+    );
+}
+
+#[test]
 fn long_module_name_fanout_does_not_expand_a_shared_path_per_edge() {
     let mut before = document();
     let module_name = "m".repeat(12_000);

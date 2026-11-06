@@ -344,8 +344,8 @@ are still in progress.
 > **`run` safety boundary:** `sudo p11scope run` requires valid non-root
 > `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and
 > drops the child to that identity before releasing its private barrier. Root
-> without that explicit target and set-id invocations are refused. These
-> environment values select the target account but do not authenticate that
+> without that explicit target (or --user) and set-id invocations are refused.
+> These environment values select the target account but do not authenticate that
 > the launcher was `sudo`. The child has no capabilities, cannot gain
 > privilege across exec, inherits the observer's environment unchanged (so
 > the workload behaves as without p11scope), and does not inherit unrelated
@@ -354,35 +354,40 @@ are still in progress.
 > `env NAME=value ...` after the `--`. Conversely, anything exported in a
 > root shell (`sudo -i`/`-s`) now reaches the unprivileged child. Only
 > p11scope's own control inputs are withheld from the child by name, with
-> one stderr line naming them: `SUDO_*` (the whole sudo namespace: the
-> target-account selection plus anything else describing the sudo
+> one stderr line under -v naming them: `SUDO_*` (the whole sudo namespace:
+> the target-account selection plus anything else describing the sudo
 > invocation a bare execution has none of) and `P11SCOPE_*` (p11scope's
-> own control namespace). Values of inherited variables are never
-> inspected or logged. The
-> command is an opened ELF executable; invoke scripts explicitly as
-> `/bin/sh /path/to/script`. Owned launch requires procfs mounted
-> at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
-> later path replacement cannot change the selected inode. If that descriptor
-> path is unavailable, `run` reports the exec failure and refuses to retry the
-> command's original path. The sudo path runs the child as the invoker
-> with the invoker's supplementary groups and home environment, as if the
-> user had run the command directly: `HOME`/`USER`/`LOGNAME`/`SHELL` come
-> from the invoker's passwd entry, `XDG_RUNTIME_DIR` from
-> `/run/user/<uid>` when that directory exists and is owned by the invoker,
-> and `MAIL` is dropped (no passwd field names a mailbox).
+> own control namespace). Apart from PATH, used to find CMD, values of
+> inherited variables are never inspected or logged. The
+> command is an opened ELF executable, opened by root before any drop and run
+> by descriptor; invoke scripts explicitly as `/bin/sh /path/to/script`.
+> Owned launch requires procfs mounted at `/proc`: the opened executable is
+> invoked through `/proc/self/fd`, so the target account needs no directory
+> search permission on its path and a later path replacement cannot change the
+> selected inode. If that descriptor path is unavailable, `run` reports the exec
+> failure and refuses to retry the command's original path. The sudo path runs
+> the child as the invoker with the invoker's supplementary groups from the
+> account database (glibc may return only the primary group) and home
+> environment, as if the user had run the command directly:
+> `HOME`/`USER`/`LOGNAME`/`SHELL` come from the invoker's passwd entry,
+> `XDG_RUNTIME_DIR` from `/run/user/<uid>` when that directory exists and is
+> owned by the invoker, and `MAIL` is dropped (no passwd field names a mailbox).
 > `-v`/`--verbose` prints the restored identity as one stderr line,
-> `running <cmd> as <user> (groups and home restored)`; without it `run`
-> stays quiet about the identity. An account the observer cannot resolve
+> `running <cmd> as <user> (uid <uid>) (groups and home restored)`; without it
+> `run` stays quiet about the identity. An account the observer cannot resolve
 > refuses with a plain message before anything starts.
 > `--user <name|uid>` (root only, like `strace -u`) starts the command as
-> that account instead of the invoker, with its groups and home
-> environment from its passwd entry; `--user root` stays root on purpose.
-> Without root, for an unknown account, when its group list cannot be
-> resolved, or for a set-id observer it refuses with a plain message
-> (exit 2), and `-v` prints `running <cmd> as <user>`. A sudoers rule
-> allowing `p11scope run` lets that user start commands as any account
-> via `--user`; restrict it with sudoers argument matching or do not
-> grant `run`. When the observer
+> that account instead of the invoker, with its groups from the account database
+> (glibc may return only the primary group) and home environment from its passwd
+> entry; `--user root` stays root on purpose. Without root, for an unknown
+> account, when its group list cannot be resolved, or for a set-id observer it
+> refuses with a plain message (exit 2), and `-v` prints
+> `running <cmd> as <user> (uid <uid>)`. A sudoers grant of `p11scope run` is a
+> root grant: `--user` lets that user start commands as any account, including
+> `--user root`, where capless uid 0 still owns root files (owner DAC reads
+> `/etc/shadow`) and user namespaces restore privilege; do not delegate it.
+> Restrict it with sudoers argument matching or do not grant `run`. When the
+> observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and

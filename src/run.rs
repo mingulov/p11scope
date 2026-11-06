@@ -1007,9 +1007,18 @@ impl ChildIdentity {
         } else {
             (probes.passwd_by_name)(user)
         };
+        // M3: gid 2^32-1 is no account either (like uid MAX, setresgid(-1)
+        // would be a silent no-change).
         let record = record
-            .filter(|record| !record.name.is_empty() && record.uid != u32::MAX)
+            .filter(|record| {
+                !record.name.is_empty() && record.uid != u32::MAX && record.gid != u32::MAX
+            })
             .ok_or_else(unknown)?;
+        // M4: only "root" and "0" may resolve to uid 0; any other spelling
+        // naming uid 0 (an alias, "00", "000") refuses as unknown.
+        if record.uid == 0 && bytes != b"root" && bytes != b"0" {
+            return Err(unknown());
+        }
         let session = finish_account_session(record.uid, &record, probes).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -1085,7 +1094,8 @@ fn resolve_invoker_account_with(
     gid: libc::gid_t,
     probes: &InvokerProbes,
 ) -> io::Result<InvokerAccount> {
-    let record = (probes.passwd)(uid).filter(|record| !record.name.is_empty());
+    // M2: the row must name the requested uid, not just a non-empty name.
+    let record = (probes.passwd)(uid).filter(|record| !record.name.is_empty() && record.uid == uid);
     let Some(record) = record else {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
@@ -1238,8 +1248,29 @@ fn production_group_lookup(user: &OsStr, gid: libc::gid_t) -> Option<Vec<libc::g
 }
 
 fn production_dir_owner(path: &Path) -> Option<(bool, libc::uid_t)> {
-    let metadata = std::fs::metadata(path).ok()?;
+    // M1: the runtime dir proves only under a trusted /run/user (root-owned,
+    // not group/other-writable, not a symlink); a symlink at the target is
+    // not a dir (lstat, never stat).
+    if !runtime_dir_parent_trusted(Path::new("/run/user")) {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
     Some((metadata.is_dir(), metadata.uid()))
+}
+
+/// Whether a `/run/user`-style parent may vouch for a runtime dir: a real
+/// dir (not a symlink), owned by root, not group/other-writable.
+fn runtime_dir_parent_trusted(parent: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    if metadata.uid() != 0 {
+        return false;
+    }
+    metadata.mode() & 0o022 == 0
 }
 
 /// Whether `run` withholds an environment variable from its owned child.
@@ -1342,6 +1373,22 @@ fn strip_drop_mail(environment: &mut Vec<CString>) {
     });
 }
 
+/// Drops an inherited `XDG_RUNTIME_DIR` from an already-filtered child
+/// environment on every account-drop path, before the overrides re-add
+/// only a provable directory. The inherited value names the observer's
+/// runtime dir (under sudo, root's `/run/user/0`), which would misdescribe
+/// the new account; without a drop the inherited value already describes
+/// the child and is kept. Name-matched; the value is never read.
+fn strip_drop_xdg_runtime_dir(environment: &mut Vec<CString>) {
+    environment.retain(|entry| {
+        entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .is_none_or(|name| name != b"XDG_RUNTIME_DIR")
+    });
+}
+
 /// Applies account-drop overrides to an already-filtered child environment:
 /// every entry naming an overridden variable is replaced by the
 /// account-database value. An empty override list changes nothing, so
@@ -1377,23 +1424,26 @@ fn apply_env_overrides(
 
 /// The one `-v` line naming the sudo-drop identity. Plain text, one
 /// line, stderr only: the command spelling is the operator's own argv
-/// and the user is the passwd name, never `SUDO_USER`. Both are escaped,
-/// so a hostile argv or account name cannot inject a terminal escape.
-fn sudo_drop_notice(program: &OsStr, user: &OsStr) -> String {
+/// and the user is the passwd name, never `SUDO_USER`, with its uid.
+/// Both are escaped, so a hostile argv or account name cannot inject a
+/// terminal escape.
+fn sudo_drop_notice(program: &OsStr, user: &OsStr, uid: libc::uid_t) -> String {
     format!(
-        "running {} as {} (groups and home restored)",
+        "running {} as {} (uid {}) (groups and home restored)",
         crate::render::escape_controls(&program.to_string_lossy()),
-        crate::render::escape_controls(&user.to_string_lossy())
+        crate::render::escape_controls(&user.to_string_lossy()),
+        uid
     )
 }
 
-/// The one `-v` line naming the `--user` identity: the requested account,
-/// likewise escaped and stderr-only.
-fn run_as_notice(program: &OsStr, user: &OsStr) -> String {
+/// The one `-v` line naming the `--user` identity: the requested account
+/// with its uid, likewise escaped and stderr-only.
+fn run_as_notice(program: &OsStr, user: &OsStr, uid: libc::uid_t) -> String {
     format!(
-        "running {} as {}",
+        "running {} as {} (uid {})",
         crate::render::escape_controls(&program.to_string_lossy()),
-        crate::render::escape_controls(&user.to_string_lossy())
+        crate::render::escape_controls(&user.to_string_lossy()),
+        uid
     )
 }
 
@@ -2047,9 +2097,12 @@ impl OwnedChild {
         let mut environment = child_environment(variables.iter().cloned())?;
         if let Some(drop) = identity.restored() {
             strip_drop_mail(&mut environment);
+            strip_drop_xdg_runtime_dir(&mut environment);
             apply_env_overrides(&mut environment, &drop_env_overrides(drop))?;
         }
-        if let Some(notice) = child_env_removal_notice(variables.iter().cloned()) {
+        // M10 (CLI-1): the removal notice is a -v detail, like the identity
+        // notices below; without -v the spawn stays quiet.
+        if verbose && let Some(notice) = child_env_removal_notice(variables.iter().cloned()) {
             emit_capture_diagnostic(&notice);
         }
         let envp: Vec<*const libc::c_char> = environment
@@ -2084,9 +2137,9 @@ impl OwnedChild {
         if verbose {
             let command = OsStr::from_bytes(program.to_bytes());
             if let Some(drop) = identity.sudo_drop.as_ref() {
-                emit_capture_diagnostic(&sudo_drop_notice(command, &drop.user));
+                emit_capture_diagnostic(&sudo_drop_notice(command, &drop.user, identity.uid));
             } else if let Some(run_as) = identity.run_as.as_ref() {
-                emit_capture_diagnostic(&run_as_notice(command, &run_as.user));
+                emit_capture_diagnostic(&run_as_notice(command, &run_as.user, identity.uid));
             }
         }
 
@@ -11389,6 +11442,133 @@ mod tests {
     }
 
     #[test]
+    fn production_dir_owner_rejects_symlink_runtime_dir() {
+        // M1: a symlink at /run/user/<uid> is not a provable dir, even when
+        // it points at a dir owned by the uid (lstat, not stat).
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let owner = production_dir_owner(&link);
+        assert!(
+            !matches!(owner, Some((true, _))),
+            "symlink must not prove as a runtime dir: {owner:?}"
+        );
+    }
+
+    #[test]
+    fn sudo_drop_refuses_passwd_row_with_mismatched_uid() {
+        // M2: the sudo-path row must name the requested uid, not just a
+        // non-empty name with a matching gid.
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1000);
+                Some(fake_passwd(
+                    "testuser",
+                    "/home/testuser",
+                    "/bin/bash",
+                    9999,
+                    1001,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("the sudo path resolves by uid, never by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+    }
+
+    #[test]
+    fn run_user_refuses_gid_max_as_unknown() {
+        // M3: a passwd row with gid 2^32-1 is no account on the --user path,
+        // by name and by uid alike.
+        for user in ["alice", "1001"] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                    Some(fake_passwd(
+                        "alice",
+                        "/home/alice",
+                        "/bin/bash",
+                        1001,
+                        u32::MAX,
+                    ))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    Some(fake_passwd(
+                        "alice",
+                        "/home/alice",
+                        "/bin/bash",
+                        1001,
+                        u32::MAX,
+                    ))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+                dir_owner: &|_: &Path| None,
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(user)),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {user}: unknown account"),
+                "user {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_user_refuses_non_root_name_with_uid_zero() {
+        // M4: only "root" and "0" may resolve to uid 0; any other spelling
+        // (including a numeric alias like "00") refuses as unknown.
+        for user in ["alice", "00", "000"] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                    Some(fake_passwd("alice", "/root", "/bin/bash", 0, 0))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    Some(fake_passwd("alice", "/root", "/bin/bash", 0, 0))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![0]),
+                dir_owner: &|_: &Path| Some((true, 0)),
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(user)),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {user}: unknown account"),
+                "user {user}"
+            );
+        }
+    }
+
+    #[test]
     fn production_probes_resolve_the_current_user() {
         // SAFETY: getuid/getgid have no preconditions.
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
@@ -11448,6 +11628,9 @@ mod tests {
             ),
         ])
         .unwrap();
+        // I1: the drop path strips before overrides; a provable dir is re-added.
+        strip_drop_mail(&mut environment);
+        strip_drop_xdg_runtime_dir(&mut environment);
         apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
         let environment: Vec<_> = environment
             .iter()
@@ -11483,6 +11666,10 @@ mod tests {
                 (OsString::from("LOGNAME"), OsString::from("testuser")),
             ]
         );
+        // I1: an unprovable runtime dir strips the inherited value (root's
+        // /run/user/0 must not leak to the target); empty HOME/SHELL still
+        // leave the inherited values alone. The strips mirror spawn_prepared's
+        // drop path (strip before overrides, re-add only when provable).
         let mut environment = child_environment([
             (OsString::from("HOME"), OsString::from("/root")),
             (OsString::from("SHELL"), OsString::from("/bin/sh")),
@@ -11492,6 +11679,8 @@ mod tests {
             ),
         ])
         .unwrap();
+        strip_drop_mail(&mut environment);
+        strip_drop_xdg_runtime_dir(&mut environment);
         apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
         let environment: Vec<_> = environment
             .iter()
@@ -11502,7 +11691,6 @@ mod tests {
             [
                 "HOME=/root",
                 "SHELL=/bin/sh",
-                "XDG_RUNTIME_DIR=/run/user/0",
                 "USER=testuser",
                 "LOGNAME=testuser",
             ]
@@ -11523,11 +11711,12 @@ mod tests {
 
     #[test]
     fn sudo_drop_notice_is_one_plain_line() {
+        // M4: the -v notice names the uid alongside the account.
         assert_eq!(
-            sudo_drop_notice(OsStr::new("/usr/bin/id"), OsStr::new("testuser")),
-            "running /usr/bin/id as testuser (groups and home restored)"
+            sudo_drop_notice(OsStr::new("/usr/bin/id"), OsStr::new("testuser"), 1000),
+            "running /usr/bin/id as testuser (uid 1000) (groups and home restored)"
         );
-        let notice = sudo_drop_notice(OsStr::new("id"), OsStr::new("testuser"));
+        let notice = sudo_drop_notice(OsStr::new("id"), OsStr::new("testuser"), 1000);
         assert_eq!(notice.lines().count(), 1, "{notice:?}");
     }
 
@@ -11883,19 +12072,20 @@ mod tests {
 
     #[test]
     fn run_as_notice_is_one_plain_line() {
+        // M4: the -v notice names the uid alongside the account.
         assert_eq!(
-            run_as_notice(OsStr::new("/usr/bin/id"), OsStr::new("alice")),
-            "running /usr/bin/id as alice"
+            run_as_notice(OsStr::new("/usr/bin/id"), OsStr::new("alice"), 1001),
+            "running /usr/bin/id as alice (uid 1001)"
         );
-        let notice = run_as_notice(OsStr::new("id"), OsStr::new("alice"));
+        let notice = run_as_notice(OsStr::new("id"), OsStr::new("alice"), 1001);
         assert_eq!(notice.lines().count(), 1, "{notice:?}");
     }
 
     #[test]
     fn identity_notices_escape_hostile_names() {
         for notice in [
-            sudo_drop_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb")),
-            run_as_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb")),
+            sudo_drop_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb"), 1000),
+            run_as_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb"), 1001),
         ] {
             assert_eq!(notice.lines().count(), 1, "{notice:?}");
             assert!(notice.contains(r"/bin/x\nINJECTED"), "{notice:?}");
@@ -11945,6 +12135,76 @@ mod tests {
         let before = bare.clone();
         strip_drop_mail(&mut bare);
         assert_eq!(bare, before);
+    }
+
+    #[test]
+    fn drop_xdg_runtime_dir_strips_only_the_runtime_name() {
+        // I1: exact-name match; near-miss names and other variables stay.
+        let mut environment = child_environment([
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+            (OsString::from("XDG_RUNTIME_DIRS"), OsString::from("kept")),
+            (OsString::from("XXDG_RUNTIME_DIR"), OsString::from("kept")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        strip_drop_xdg_runtime_dir(&mut environment);
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "XDG_RUNTIME_DIRS=kept",
+                "XXDG_RUNTIME_DIR=kept",
+                "PATH=/bin"
+            ]
+        );
+        let mut bare =
+            child_environment([(OsString::from("PATH"), OsString::from("/bin"))]).unwrap();
+        let before = bare.clone();
+        strip_drop_xdg_runtime_dir(&mut bare);
+        assert_eq!(bare, before);
+    }
+
+    #[test]
+    fn runtime_dir_parent_trusted_rejects_untrusted_parents() {
+        // M1: root-owned and not group/other-writable, not a symlink, a dir.
+        // / is the success witness (0755 root); /tmp fails on writability;
+        // a test-owned tempdir fails on ownership; a symlink fails outright.
+        assert!(runtime_dir_parent_trusted(Path::new("/")), "/ must trust");
+        assert!(
+            !runtime_dir_parent_trusted(Path::new("/tmp")),
+            "/tmp is writable"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        assert!(
+            !runtime_dir_parent_trusted(directory.path()),
+            "test-owned dir is not root-owned"
+        );
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(
+            !runtime_dir_parent_trusted(&link),
+            "a symlink parent never vouches"
+        );
+        let missing = directory.path().join("missing");
+        assert!(
+            !runtime_dir_parent_trusted(&missing),
+            "a missing parent never vouches"
+        );
+        // The live parent vouches on a normal host (root-owned 0755); when
+        // /run/user is absent (a container without logind), the check fails
+        // closed and the runtime dir is simply never re-added.
+        if Path::new("/run/user").exists() {
+            assert!(
+                runtime_dir_parent_trusted(Path::new("/run/user")),
+                "/run/user must trust when present"
+            );
+        }
     }
 
     /// One process's post-exec environment as `NAME=value` strings
@@ -12038,6 +12298,12 @@ mod tests {
             &probes,
         )
         .unwrap();
+        let expected_groups = identity
+            .sudo_drop
+            .as_ref()
+            .expect("the sudo-drop session resolves")
+            .groups
+            .clone();
         let mut child = OwnedChild::spawn_for_test(
             OsString::from("/bin/sleep"),
             vec![OsString::from("30")],
@@ -12048,6 +12314,10 @@ mod tests {
                 (
                     OsString::from("MAIL"),
                     OsString::from("/var/spool/mail/root"),
+                ),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/0"),
                 ),
                 (
                     OsString::from("RUN_SPAWN_SENTINEL"),
@@ -12066,6 +12336,14 @@ mod tests {
             !environ.iter().any(|entry| entry.starts_with("MAIL=")),
             "{environ:?}"
         );
+        // I1: nobody has no provable /run/user/<uid>, so the inherited
+        // runtime dir strips rather than leaks.
+        assert!(
+            !environ
+                .iter()
+                .any(|entry| entry.starts_with("XDG_RUNTIME_DIR=")),
+            "{environ:?}"
+        );
         assert!(
             environ
                 .iter()
@@ -12079,6 +12357,31 @@ mod tests {
             target.uid, target.uid, target.uid, target.uid
         );
         assert!(status.lines().any(|line| line == uids), "{status}");
+        // M9: the drop's groups plus the hardening (no caps, no_new_privs).
+        let groups_line = status
+            .lines()
+            .find(|line| line.starts_with("Groups:"))
+            .expect("status carries a Groups line");
+        let mut actual: Vec<libc::gid_t> = groups_line
+            .strip_prefix("Groups:")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|gid| gid.parse().expect("a decimal gid"))
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected_groups;
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "{status}");
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapEff:\t0000000000000000"),
+            "{status}"
+        );
+        assert!(
+            status.lines().any(|line| line == "NoNewPrivs:\t1"),
+            "{status}"
+        );
         child.terminate_and_reap().unwrap();
     }
 

@@ -651,7 +651,7 @@ scan-only discovery names functions from the standard table without confirming t
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
-CMD inherits the observer's environment unchanged, except SUDO_* and P11SCOPE_* (named on stderr when withheld).
+CMD inherits the observer's environment unchanged, except SUDO_* and P11SCOPE_* (named on stderr under -v when withheld).
 Under sudo the child runs as the invoker with the invoker's groups and HOME/USER/LOGNAME/SHELL from the passwd entry (plus XDG_RUNTIME_DIR when /run/user/<uid> is the invoker's own); -v prints the restored identity.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
@@ -669,7 +669,7 @@ The selection attempt is recorded in the report; aggregate and detail counts are
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends the capture cleanly.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
--v/--verbose prints one line naming the run-as identity (running CMD as USER; the sudo-drop path adds (groups and home restored)).
+-v/--verbose prints one line naming the run-as identity (running CMD as USER (uid N); the sudo-drop path adds (groups and home restored)).
 --user <name|uid> (root only, like strace -u) starts CMD as that account with its groups and home environment; --user root stays root on purpose.
 exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
 ";

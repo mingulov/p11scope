@@ -467,6 +467,9 @@ pub fn stop_gate_admit_with(mut read: impl FnMut() -> u64, mut add: impl FnMut(i
 
 /// A loaded program may observe only an explicitly selected scope under one
 /// immutable capture policy. Unknown and multi-bit configurations fail closed.
+/// Pause rides beside PID scope, or beside a cgroup scope carrying the
+/// owned child's PID_FILTER row (run-tree sessions); system scope never
+/// pauses, since no one process owns a machine-wide receipt.
 pub const fn valid_config(flags: u64) -> bool {
     let scope = flags & (FLAG_PID_FILTER | FLAG_CGROUP_FILTER | FLAG_SYSTEM_FILTER);
     let policy = flags
@@ -488,7 +491,9 @@ pub const fn valid_config(flags: u64) -> bool {
         policy,
         FLAG_POLICY_ALLOWLISTED | FLAG_POLICY_UNSAFE_UNVALIDATED_METADATA | FLAG_POLICY_AGGREGATE
     ) && flags & !known == 0
-        && (flags & FLAG_PAUSE_ENABLED == 0 || scope == FLAG_PID_FILTER)
+        && (flags & FLAG_PAUSE_ENABLED == 0
+            || scope == FLAG_PID_FILTER
+            || scope == FLAG_CGROUP_FILTER)
 }
 
 pub const DISCOVERY_KIND_FUNCTION_LIST_RETURN: u8 = 1;
@@ -3869,15 +3874,20 @@ mod tests {
         assert!(!valid_discovery_record(&discovery_record(8)));
     }
 
-    /// Mutation caught: pause can be enabled for a cgroup or without the PID
-    /// filter that supplies the exact nonzero generation token.
+    /// Mutation caught: pause can be enabled for system scope or without
+    /// the scope filter that supplies the exact nonzero generation token.
+    /// (A cgroup scope supplies it through the owned child's PID_FILTER
+    /// row; see `pause_accepts_cgroup_beside_pid_while_system_stays_refused`.)
     #[test]
-    fn pause_config_is_pid_only() {
+    fn pause_config_is_pid_or_cgroup_only() {
         assert!(valid_config(
             FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
         ));
-        assert!(!valid_config(
+        assert!(valid_config(
             FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+        ));
+        assert!(!valid_config(
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
         ));
         assert!(!valid_config(FLAG_PAUSE_ENABLED | FLAG_POLICY_ALLOWLISTED));
     }
@@ -4008,16 +4018,15 @@ mod safe_capture {
         assert!(!valid_config(FLAG_PAUSE_ENABLED | FLAG_POLICY_ALLOWLISTED));
     }
 
+    /// The system-scope half of the pause matrix, kept beside the
+    /// run-tree acceptance test so a regression names its scope.
     #[test]
-    fn pause_stays_pid_only_when_system_scope_is_selected() {
-        assert!(valid_config(
-            FLAG_PID_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
-        ));
+    fn pause_stays_off_system_scope() {
         assert!(!valid_config(
             FLAG_SYSTEM_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
         ));
         assert!(!valid_config(
-            FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED
+            FLAG_SYSTEM_FILTER | FLAG_POLICY_AGGREGATE | FLAG_PAUSE_ENABLED
         ));
     }
 

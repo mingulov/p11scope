@@ -647,11 +647,18 @@ fn scope_auth() -> Option<ScopeAuth> {
     if flags & FLAG_CGROUP_FILTER != 0 {
         match CGROUP_FILTER.current_task_under_cgroup(0) {
             Ok(true) => {
+                // Run-tree sessions publish PID_FILTER[owned child]
+                // beside the cgroup: the child alone regains its
+                // pause token, backstopping the owned loader arm.
+                // Unowned cgroup sessions publish no PID rows, so
+                // every other member reads zero — exactly the
+                // pre-run-tree receipt.
+                let token = unsafe { PID_FILTER.get(&tgid) }.copied().unwrap_or(0);
                 return Some(ScopeAuth {
                     flags,
                     tgid,
                     _pad: 0,
-                    generation_token: 0,
+                    generation_token: token,
                 });
             }
             Ok(false) => return None,
@@ -664,7 +671,7 @@ fn scope_auth() -> Option<ScopeAuth> {
     // `valid_config` above guarantees exactly one scope bit, so reaching here
     // with the system bit set means PID and cgroup bits are both clear: every
     // task passes after the owner-health and config gates. No pause token —
-    // pause stays PID-scoped (`valid_config` refuses the combination).
+    // pause stays off system scope (`valid_config` refuses the combination).
     if flags & FLAG_SYSTEM_FILTER != 0 {
         return Some(ScopeAuth {
             flags,

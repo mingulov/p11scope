@@ -649,7 +649,8 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
-run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
+run starts CMD itself and captures the command with its child processes; it takes no --pid/--cgroup/--system.
+Without permission to create its cgroup, run observes only CMD itself and names the gap in the report.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 CMD inherits the observer's environment unchanged, except SUDO_* and P11SCOPE_* (named on stderr under -v when withheld).
 Under sudo the child runs as the invoker with the invoker's groups and HOME/USER/LOGNAME/SHELL from the passwd entry (plus XDG_RUNTIME_DIR when /run/user/<uid> is the invoker's own); -v prints the restored identity.

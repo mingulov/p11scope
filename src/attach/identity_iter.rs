@@ -1360,6 +1360,8 @@ pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 10;
 /// peak: the 2 anchor files, the observer pidfd, and one attach link
 /// plus its iterator (runs are sequential). The fork pipe's read end
 /// closes before the first iterator runs, so it is not counted.
+/// Nested, the child pidfd replaces the observer pidfd (closed first),
+/// so the peak stays 5 there too.
 pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 5;
 
 /// FDs a session setup may hold at peak: the probe load (10) plus the
@@ -2847,6 +2849,10 @@ pub fn run_functional_probe(
     })?;
     let mut anchor_outcomes: Vec<(u32, AnchorOutcome)> = anchor_run.anchors.into_iter().collect();
     anchor_outcomes.sort_by_key(|(slot, _)| *slot);
+    // The observer pidfd served only the anchor run above: close it
+    // before the child pidfd opens, so the nested probe holds 5
+    // transient fds like the pin counts, never 6.
+    drop(pidfd);
     // Target run: whole-system with only the child in scope where
     // numbering agrees, else pidfd-bound on the live child (its
     // initial-namespace tgid is unknowable nested).

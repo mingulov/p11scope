@@ -48,6 +48,18 @@ pub(crate) const OVERLAY_WITNESS_QUERIES_PER_SCAN: u32 = 8;
 /// Attempt-cap, cgroup and oversized paths take no witness query.
 pub(crate) const OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS: u32 = 8;
 
+/// Witness queries per sweep pass with no kernel route at all (auto
+/// fell back: a nested observer's numbering mismatch, missing BTF).
+/// Every refused overlay candidate proves through the private session
+/// — the only prover on such passes — so the budget covers the whole
+/// refused set of an inventory-sized sweep (cells need ~300) instead
+/// of the rare-exclusion bound above. Queries run sub-millisecond
+/// after the one-time session load, so a full budget costs about a
+/// second per pass worst case; the capture deadline still fail-closes
+/// each query, and the rotation accumulates past the bound across
+/// passes exactly like the kernel-pass window.
+pub(crate) const OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE: u32 = 1024;
+
 /// The sweep's kernel witness for overlay keys with no sweep route.
 /// Production runs the private session below; tests script verdicts.
 pub(crate) trait SweepWitness {
@@ -60,17 +72,36 @@ pub(crate) trait SweepWitness {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict;
+
+    /// This pass's witness budget: the window covers one budget of
+    /// consecutive refused candidates. The kernel-pass bound unless
+    /// overridden.
+    fn queries_per_pass(&self) -> u32 {
+        OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS
+    }
 }
 
 /// Production sweep witness: the private session with no attach-set
-/// exclusions, under the per-pass D-P1 budget.
+/// exclusions, under a per-pass budget (the D-P1 bound, or the
+/// no-route bound where no kernel run exists at all).
 pub(crate) struct KernelSweepWitness {
     used: u32,
+    cap: u32,
 }
 
 impl KernelSweepWitness {
     pub(crate) fn new() -> Self {
-        Self { used: 0 }
+        Self {
+            used: 0,
+            cap: OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS,
+        }
+    }
+
+    pub(crate) fn with_budget(queries_per_pass: u32) -> Self {
+        Self {
+            used: 0,
+            cap: queries_per_pass,
+        }
     }
 
     /// Queries spent so far: the pass advances its witness rotation
@@ -91,11 +122,15 @@ impl SweepWitness for KernelSweepWitness {
         ranges: &[(u64, u64)],
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict {
-        if self.used >= OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS {
+        if self.used >= self.cap {
             return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
         }
         self.used += 1;
         prove_original_file(pid, file, held, key, ranges, budget)
+    }
+
+    fn queries_per_pass(&self) -> u32 {
+        self.cap
     }
 }
 

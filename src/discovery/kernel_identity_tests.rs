@@ -7534,6 +7534,10 @@ mod sweep_witness_mixed {
             self.calls.lock().unwrap().push((pid, key, ranges.to_vec()));
             self.verdict
         }
+
+        fn queries_per_pass(&self) -> u32 {
+            self.limit
+        }
     }
 
     struct MixedIo {

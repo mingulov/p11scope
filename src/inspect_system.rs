@@ -4647,11 +4647,52 @@ pub(crate) fn collect_system_with_identity(
     };
     let segment_policy = identity_confirmation_policy(held, census).map_err(anyhow::Error::msg)?;
     let reservations = held.owner.clone();
+    // No-route userspace passes prove their refused overlay keys through
+    // the private witness session under the no-route budget — the only
+    // prover where no kernel run exists — rotating past them exactly
+    // like the kernel-pass window.
+    let witness_userspace = no_route_userspace_witness(explicit_userspace, has_proof, &attempt);
+    let (window_start, window_denominator) = if witness_userspace {
+        let shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.witness_window()
+    } else {
+        (0, 0)
+    };
+    let mut witness_window: (u32, Option<usize>) = (0, None);
     let attributed = with_confirmation_pools(
         shards,
         segment_policy,
         proof_stat_threads(),
         |pools| match attempt {
+            PassAttempt::Userspace if witness_userspace => attribute_sweep_with(
+                &mut collection,
+                &bound,
+                &bound.aggregate,
+                |sweep, unavailable, selected, index, budget| {
+                    let mut witness =
+                        crate::discovery::overlay_witness::KernelSweepWitness::with_budget(
+                            crate::discovery::overlay_witness::OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE,
+                        );
+                    let (out, refused) =
+                        crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
+                            sweep,
+                            unavailable,
+                            selected,
+                            index,
+                            budget,
+                            segment_policy,
+                            &reservations,
+                            shards,
+                            &|| OsConfirmIo::with_pools(pools),
+                            &bound.aggregate,
+                            &mut witness,
+                            window_start,
+                            window_denominator,
+                        );
+                    witness_window = (witness.used(), Some(refused));
+                    out
+                },
+            ),
             PassAttempt::Userspace => attribute_sweep_with(
                 &mut collection,
                 &bound,
@@ -4684,6 +4725,11 @@ pub(crate) fn collect_system_with_identity(
             ),
         },
     );
+    if witness_userspace {
+        let (spent, refused) = witness_window;
+        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.advance_witness_rotation(spent, refused);
+    }
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
     prepare_count_manifests(
         &mut collection,
@@ -4761,6 +4807,22 @@ fn decide_pass_attempt(shared: &IdentityShared, has_proof: bool) -> PassAttempt 
             PassAttempt::Kernel { threshold }
         }
     }
+}
+
+/// Whether a userspace-mechanics pass proves its refused overlay keys
+/// through the private witness session: the selection allows BPF, the
+/// sweep planned proof, but this pass runs no kernel run (auto fell
+/// back: a nested observer's numbering mismatch, missing BTF). A
+/// userspace attempt under auto with proof demand is exactly that
+/// shape — an eligible auto pass would attempt the kernel run.
+/// Explicit userspace never loads BPF; kernel passes already prove
+/// through their own run; without proof demand nothing loads.
+fn no_route_userspace_witness(
+    explicit_userspace: bool,
+    has_proof: bool,
+    attempt: &PassAttempt,
+) -> bool {
+    has_proof && !explicit_userspace && matches!(attempt, PassAttempt::Userspace)
 }
 
 /// One pass's exclusive session takeout: the capture-owned session plus

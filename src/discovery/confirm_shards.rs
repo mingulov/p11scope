@@ -7,7 +7,7 @@
 //! any proof; rejected records and speculative tails drop before fresh reads.
 
 use crate::discovery::identity::PinnedObjects;
-use crate::discovery::overlay_witness::{OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS, SweepWitness};
+use crate::discovery::overlay_witness::SweepWitness;
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::{
     CaptureWorkBudget, ConfirmMark, MapsReadBudget, MapsReadBuffers, MapsReadLimits,
@@ -98,12 +98,12 @@ pub(crate) trait SegmentProof {
 
 /// Whether refused candidate `index` (counted across the whole pass,
 /// in segment order) falls in this pass's witness window: the
-/// per-pass budget covers 8 consecutive candidates starting at
-/// `start`, modulo the previous pass's refused count. The window
-/// walks over refused candidates rather than sweep positions, so
-/// sparse refused sets still rotate instead of pinning one tail
+/// per-pass budget covers one budget of consecutive candidates
+/// starting at `start`, modulo the previous pass's refused count. The
+/// window walks over refused candidates rather than sweep positions,
+/// so sparse refused sets still rotate instead of pinning one tail
 /// caller every pass.
-fn witness_window_member(index: usize, start: u64, denominator: usize) -> bool {
+fn witness_window_member(index: usize, start: u64, denominator: usize, per_pass: u32) -> bool {
     let candidates = denominator.max(1) as u64;
     // Distance forward from `start` to `index` modulo the count (a
     // wrapping subtraction would skew past `u64::MAX`, since 2^64 is
@@ -115,7 +115,7 @@ fn witness_window_member(index: usize, start: u64, denominator: usize) -> bool {
     } else {
         candidates - (start - position)
     };
-    distance < u64::from(OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS)
+    distance < u64::from(per_pass)
 }
 
 /// Prove overlay-refused ranges via the private witness session (K1-R2,
@@ -165,7 +165,12 @@ fn witness_overlay_refused(
     // decides which candidates prove this pass.
     let keys: Vec<(ObjectKey, Vec<(u64, u64)>)> = by_key.into_iter().collect();
     for (key, ranges) in keys {
-        let member = witness_window_member(*refused_counter, window_start, window_denominator);
+        let member = witness_window_member(
+            *refused_counter,
+            window_start,
+            window_denominator,
+            witness.queries_per_pass(),
+        );
         *refused_counter += 1;
         if !member {
             continue;

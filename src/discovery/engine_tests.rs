@@ -37282,8 +37282,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// Part 0: the admitted prefix is reported as a partial-coverage record
 /// naming the covered templates, not as silence; the reported total counts
 /// the linked table beside the heuristic ones.
-/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
-/// prefix applies; closure-alone would take published-only and spill nothing.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan and is
+/// operator-named, so the prefix applies.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -37293,12 +37293,14 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     };
     // Reported attached tables: heuristic plus the linked one.
     let reported_attached = admitted_heuristics + 1;
-    // Plus the sidecar provider's single slot: a closure alone in the first
-    // plan takes no prefix (PA-9/C1), so the prefix mechanics under test
-    // hold a provider beside the closure; the closure stays unnamed.
+    // Plus the sidecar provider's single slot: the prefix mechanics under
+    // test hold a provider beside the closure, and the closure is
+    // operator-named — unlinked templates attach only through the
+    // named-prefix path in a per-call capture.
     let expected_slots = ((admitted_heuristics + 1) * 104) as usize + 1;
     let expected_spill = 63 - admitted_heuristics;
-    let raw = p11kit_like_64_table_module();
+    let mut raw = p11kit_like_64_table_module();
+    raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
@@ -37384,12 +37386,58 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
 }
 
+/// Unnamed twin of the resource-bound test: without `--module` the same
+/// 64-table layer attaches only its published table 63 beside the sidecar
+/// provider — 105 slots, no gap, 63 templates spilled as uncorroborated
+/// evidence. Both builds give the same values: published-only admission
+/// does not depend on the resource bound.
+#[test]
+fn ordered_admission_unnamed_closure_attaches_only_its_published_table() {
+    let raw = p11kit_like_64_table_module();
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert!(
+        plan.modules_skipped.is_empty(),
+        "published-only admission carries no gap: {:?}",
+        plan.modules_skipped
+    );
+    assert_eq!(
+        plan.slots.len(),
+        105,
+        "table 63 plus the sidecar's one slot"
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 63,
+        "unpublished templates spill as evidence, never slots"
+    );
+    assert_eq!(
+        plan.entries_seen, 6657,
+        "seen counts every decoded record, admitted or spilled, plus the sidecar's one"
+    );
+
+    // Evidence order, not discovery order: only the linked table (index
+    // 63) attaches, via the published bypass.
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..64u64 {
+        let first_entry = 0x10000 + table * 104 * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table == 63,
+            "table {table} attaches only when published"
+        );
+    }
+}
+
 /// Task 1.3 mislabel guard on the 64-table replica: every admitted
 /// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
 /// labels — while the linked table keeps its names. Every table carries
 /// (file_offset, entry count, linkage kind) into published evidence.
-/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
-/// prefix (whose labels this guards) applies; the closure stays unnamed.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan and is
+/// operator-named, so the prefix (whose labels this guards) applies.
 #[test]
 fn admitted_heuristic_tables_are_unknown_with_provenance() {
     // Two, like the resource-bound twin: the reserve-capped 384-slot prefix
@@ -37400,7 +37448,10 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
     } else {
         2u64
     };
-    let raw = p11kit_like_64_table_module();
+    let mut raw = p11kit_like_64_table_module();
+    // Operator-named layer: unlinked templates attach only through the
+    // named-prefix path in a per-call capture.
+    raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
@@ -37493,6 +37544,43 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
             }
         );
     }
+}
+
+/// Unnamed twin of the mislabel guard: without `--module` only table 63's
+/// entries attach beside the sidecar provider — 105 slots — keeping their
+/// interface-linked names, while no heuristic table contributes a slot
+/// that could carry an ordinal label. Both builds give the same values.
+#[test]
+fn unnamed_closure_attaches_only_its_published_table_without_heuristic_names() {
+    let raw = p11kit_like_64_table_module();
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert_eq!(
+        plan.slots.len(),
+        105,
+        "table 63 plus the sidecar's one slot"
+    );
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..64u64 {
+        let first_entry = 0x10000 + table * 104 * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table == 63,
+            "table {table} attaches only when published"
+        );
+    }
+
+    // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
+    let linked = plan
+        .slots
+        .iter()
+        .find(|slot| slot.file_offset == 0x10000 + 63 * 104 * 8)
+        .unwrap();
+    assert_eq!(linked.names, ["C_Initialize"]);
 }
 
 /// Task 1.3: a table returned by a live provider export carries publication
@@ -37973,7 +38061,7 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
 }
 
 // Audit F5/F7 spill-then-settle publication pair: five distinct one-target
-// heuristic tables, four admitted under K=4, one omitted; the second
+// heuristic tables, admitted whole beside the sidecar provider; the second
 // publication corroborates the fifth table with a live return and rebuilds
 // through the same stable-ID extension path the engine uses.
 // PA-9/C1: every build holds a sidecar provider beside the closure, so the
@@ -38018,34 +38106,31 @@ fn publish_fifth_table_live(engine: &mut Engine, mut raw: ScannedModule) {
     engine.publish_current_capture_facts().unwrap();
 }
 
-/// Route A: five heuristic tables are a Detailed closure array, so
-/// they take no slots beside the sidecar provider (one slot); the five
-/// stay uncorroborated evidence. A later live publication then settles
-/// through the same stable-ID extension path — the published table
-/// attaches, the rest stay evidence — and upgrades its linkage.
+/// Audit F5 (round-1 vehicle retired): five heuristic tables are a closure
+/// array by the classifier, so round 1 admits the fitting five whole rather
+/// than spilling the fifth past K=4 — a K=4 spill is unrepresentable for a
+/// scan-only module this size, and spill-history retention stays covered by
+/// the growth-omission (G-03) tests. What remains here is the live half: a
+/// later live publication settles through the same stable-ID extension path
+/// with no spill at any point, and upgrades the table's linkage.
+/// PA-9/C1: whole needs a provider beside the closure in the first plan;
+/// the pair holds a sidecar provider, so six slots admit, none spill.
 #[test]
 fn whole_closure_module_settles_live_publication_without_spill() {
     let (mut engine, raw) = spill_history_engine();
-    assert_eq!(engine.plan.uncorroborated_candidates, 5);
-    assert_eq!(engine.discovery.uncorroborated_candidates, 5);
-    assert_eq!(engine.plan.slots.len(), 1, "only the sidecar attaches");
+    assert_eq!(engine.plan.uncorroborated_candidates, 0);
+    assert_eq!(engine.discovery.uncorroborated_candidates, 0);
+    assert_eq!(engine.plan.slots.len(), 6);
     let offset = raw.tables[4].file_offset;
     publish_fifth_table_live(&mut engine, raw);
-    // One publication leaves four unresolved tables, at the classifier
-    // cap: the object is no longer a closure array, so the extension
-    // admits it whole beside the sidecar (6 slots).
-    assert_eq!(
-        engine.plan.slots.len(),
-        6,
-        "sidecar plus now-corroborated module"
-    );
+    assert_eq!(engine.plan.slots.len(), 6);
     assert_eq!(
         engine.plan.uncorroborated_candidates, 0,
-        "whole admission leaves no uncorroborated tables"
+        "the live merge settles with no spill"
     );
     assert_eq!(
-        engine.discovery.uncorroborated_candidates, 5,
-        "lifetime evidence retains the earlier unpublished count"
+        engine.discovery.uncorroborated_candidates, 0,
+        "lifetime evidence carries no spill that never happened"
     );
     let current = engine
         .plan

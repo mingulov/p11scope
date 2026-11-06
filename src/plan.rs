@@ -12566,22 +12566,27 @@ mod tests {
         );
     }
 
-    /// Route A twin: a shared-scope Detailed closure array beside a
-    /// provider attaches only published tables (none here).
+    /// Healthy twin: a shared-scope closure array whose complete target
+    /// union fits one standard function list is still admitted whole
+    /// beside a provider, with no gap — the bounded whole (unnamed,
+    /// already-loaded, no provider loss ahead).
     #[test]
-    fn shared_scope_keeps_small_closure_array_published_only_beside_a_provider() {
+    fn shared_scope_admits_a_small_closure_array_whole_beside_a_provider() {
         let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
         let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
         let shared = scoped_plan(&[family, sidecar], AdmissionScope::Shared);
 
         assert_eq!(slots_of(&shared, 42), 68, "provider admitted first");
-        assert_eq!(slots_of(&shared, 41), 0, "published-only, not whole");
-        assert_eq!(shared.uncorroborated_candidates, 5);
-        let refusal = refusal_of(&shared, "/opt/small-closure.so").expect("gap reported");
+        assert_eq!(
+            slots_of(&shared, 41),
+            15,
+            "closure admitted whole, not a prefix"
+        );
+        assert_eq!(shared.uncorroborated_candidates, 0);
         assert!(
-            is_closure_awaiting_publication(&refusal.reason),
-            "{}",
-            refusal.reason
+            shared.modules_skipped.is_empty(),
+            "whole admission carries no gap: {:?}",
+            shared.modules_skipped
         );
     }
 
@@ -12715,11 +12720,12 @@ mod tests {
     }
 
     /// A small closure family is still a closure array — five lookalike
-    /// tables never take a strongest-four prefix. In a Detailed capture
-    /// it attaches only published tables (none here) alone or beside a
-    /// provider, and reads as awaiting publication either way.
+    /// tables never take a strongest-four prefix — but whole admission
+    /// needs a provider beside it in the first plan (PA-9/C1): alone it is
+    /// refused whole even though it would fit, beside a provider it is
+    /// admitted whole.
     #[test]
-    fn named_scope_keeps_small_closure_array_published_only_beside_a_provider() {
+    fn named_scope_admits_a_small_closure_array_whole_only_beside_a_provider() {
         let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
         let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
 
@@ -12733,12 +12739,57 @@ mod tests {
 
         let beside = scoped_plan(&[family, sidecar], AdmissionScope::Named);
         assert_eq!(slots_of(&beside, 42), 68, "provider admitted first");
-        assert_eq!(slots_of(&beside, 41), 0, "published-only, not whole");
+        assert_eq!(slots_of(&beside, 41), 15, "admitted whole, not a K4 prefix");
+        assert_eq!(beside.uncorroborated_candidates, 0);
+        assert!(beside.modules_skipped.is_empty());
+    }
+
+    /// Bounded-whole ceiling twin: a 105-target unnamed layer beside a
+    /// provider is one target over a standard function list, so it stays
+    /// published-only (awaiting publication) instead of admitting whole.
+    #[test]
+    fn named_scope_keeps_105_target_closure_published_only_beside_a_provider() {
+        let family = provider_with_tables(41, "/opt/small-closure.so", 5, 21, false);
+        let sidecar = provider_with_tables(42, "/opt/sidecar.so", 1, 68, false);
+        let beside = scoped_plan(&[family, sidecar], AdmissionScope::Named);
+
+        assert_eq!(slots_of(&beside, 42), 68, "provider admitted first");
+        assert_eq!(slots_of(&beside, 41), 0, "105 targets exceed the bounded whole");
         assert_eq!(beside.uncorroborated_candidates, 5);
         let refusal = refusal_of(&beside, "/opt/small-closure.so").expect("gap reported");
         assert!(
             is_closure_awaiting_publication(&refusal.reason),
             "{}",
+            refusal.reason
+        );
+    }
+
+    /// Bounded-whole loss twin: a fitting unnamed layer behind a refused
+    /// provider admits nothing whole — a provider loss ahead blocks the
+    /// bounded whole like it blocks the prefix.
+    #[test]
+    fn named_scope_refuses_small_closure_whole_when_a_provider_is_refused() {
+        let filler = provider_with_tables(50, "/opt/filler.so", 1, 400, true);
+        let trust = provider_with_tables(32, TRUST, 1, 68, false);
+        let crowded = provider_with_tables(33, SOFTHSM, 1, 68, false);
+        let family = provider_with_tables(41, "/opt/small-closure.so", 5, 3, false);
+        let modules = [filler, trust, crowded, family];
+        let named = scoped_plan(&modules, AdmissionScope::Named);
+
+        assert_eq!(slots_of(&named, 50), 400);
+        assert_eq!(slots_of(&named, 32), 68);
+        assert_eq!(slots_of(&named, 33), 0, "provider crowded out");
+        assert_eq!(slots_of(&named, 41), 0, "no whole behind a loss");
+        assert!(refusal_of(&named, SOFTHSM).is_some());
+        let refusal = refusal_of(&named, "/opt/small-closure.so").expect("closure gap reported");
+        assert!(
+            is_closure_awaiting_publication(&refusal.reason),
+            "published-only behind a refused provider: {}",
+            refusal.reason
+        );
+        assert!(
+            !refusal.reason.contains("--module"),
+            "published-only refusal names no module remedy: {}",
             refusal.reason
         );
     }
@@ -13487,8 +13538,10 @@ mod tests {
 
     /// An opaque live-return publication admits its table without granting
     /// semantic permission: the slots stay count-only and unauthorized.
-    /// Without the publication the five lookalikes are a Detailed closure
-    /// array and attach nothing beside a provider (published-only).
+    /// Without the publication the five lookalikes are a closure array and
+    /// decide whole beside a provider — admitted whole here, since they
+    /// fit — with every name still `unknown` (alone they take no whole
+    /// under PA-9/C1).
     #[test]
     fn opaque_publication_admits_without_semantic_permission() {
         let observed = opaque_fifth_publication();
@@ -13519,18 +13572,18 @@ mod tests {
             &raw.scanned.tables[4],
             &name_score
         ));
-        // Route A: the unobserved shape is a Detailed closure array and
-        // attaches only published tables (none) beside the provider.
+        // Closure-alone takes no whole under PA-9/C1, so the unobserved
+        // shape decides beside a provider: whole, with unknown names.
         let sidecar = provider_with_tables(90, "/opt/sidecar.so", 1, 68, false);
         let plan = build_from_reconciled_modules(&[raw, sidecar]);
-        assert_eq!(slots_of(&plan, 91), 0, "published-only, no whole");
+        assert_eq!(slots_of(&plan, 91), 5);
         assert_eq!(slots_of(&plan, 90), 68);
-        assert_eq!(plan.uncorroborated_candidates, 5);
-        let refusal = refusal_of(&plan, "/opt/opaque-published.so").expect("gap reported");
+        assert_eq!(plan.uncorroborated_candidates, 0);
         assert!(
-            is_closure_awaiting_publication(&refusal.reason),
-            "{}",
-            refusal.reason
+            plan.slots
+                .iter()
+                .filter(|slot| slot.object == PinnedObjectId(91))
+                .all(|slot| slot.names == [UNKNOWN_FUNCTION_NAME] && !slot.semantic_authorized)
         );
     }
 

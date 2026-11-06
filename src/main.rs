@@ -74,7 +74,15 @@ fn run() -> Result<i32> {
     // dispositions captured here for every signal the observer changes.
     capture_startup_signal_dispositions();
     // `args_os`: `std::env::args()` panics on a non-UTF-8 argument (M-9).
-    match cli::parse(std::env::args_os().skip(1)) {
+    let parsed = cli::parse(std::env::args_os().skip(1));
+    // Least privilege: shed every capability this command never needs
+    // before it runs. Fail closed: a refused drop means the kernel or the
+    // sandbox is not what the keep sets assume.
+    if let Ok(command) = &parsed {
+        p11scope::caps::drop_unneeded_for_command(command)
+            .context("cannot drop unneeded capabilities")?;
+    }
+    match parsed {
         Ok(Command::Version) => {
             print_stdout(format_args!("p11scope {}\n", env!("CARGO_PKG_VERSION")))
         }

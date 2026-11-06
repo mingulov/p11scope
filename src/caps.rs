@@ -71,25 +71,33 @@ pub(crate) const MINIMAL_LIVE: [KnownCap; 5] = [
 
 /// The minimal live-capture set as a `CapEff` mask.
 pub(crate) fn minimal_live_mask() -> u64 {
-    0
+    MINIMAL_LIVE
+        .iter()
+        .fold(0u64, |mask, cap| mask | (1u64 << cap.bit))
 }
 
 /// The minimal-set capabilities absent from `effective`, in canonical
 /// order. Empty when the set is complete.
+// Temporary: the first production callers (doctor rows, capture hints)
+// land later in this lane; each `allow` below goes away with its caller.
+#[allow(dead_code)]
 pub(crate) fn missing_for_live(effective: u64) -> Vec<&'static KnownCap> {
-    let _ = effective;
-    Vec::new()
+    MINIMAL_LIVE
+        .iter()
+        .filter(|cap| effective & (1u64 << cap.bit) == 0)
+        .collect()
 }
 
 /// The exact remediation line for one missing capability.
+#[allow(dead_code)]
 pub(crate) fn needs_line(cap: &KnownCap) -> String {
-    let _ = cap;
-    String::new()
+    format!("needs {} ({})", cap.name, cap.enables)
 }
 
 /// The `setcap(8)` capability list granting exactly the minimal live set:
 /// canonical order, `=ep` (effective + permitted, never ambient: the `run`
 /// child must not inherit any).
+#[allow(dead_code)]
 fn setcap_spec() -> String {
     let names: Vec<String> = MINIMAL_LIVE
         .iter()
@@ -101,6 +109,7 @@ fn setcap_spec() -> String {
 /// Shell-quote `binary` for the recipe line: bare when it is plain path
 /// characters, single-quoted otherwise, so a hostile path cannot break
 /// out of the one-liner.
+#[allow(dead_code)]
 fn quote_binary(binary: &str) -> String {
     const PLAIN: fn(char) -> bool = |c| {
         c.is_ascii_alphanumeric()
@@ -115,17 +124,20 @@ fn quote_binary(binary: &str) -> String {
 
 /// The exact one-line `setcap` command granting exactly the minimal live
 /// set to `binary`.
+#[allow(dead_code)]
 pub(crate) fn setcap_command(binary: &str) -> String {
-    let _ = binary;
-    String::new()
+    format!("sudo setcap '{}' {}", setcap_spec(), quote_binary(binary))
 }
 
 /// This process's effective capabilities, from `/proc/self/status`
 /// `CapEff`; `None` when unreadable or unparsable.
+#[allow(dead_code)]
 pub(crate) fn read_effective() -> Option<u64> {
-    None
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_cap_eff(&status)
 }
 
+#[allow(dead_code)]
 fn parse_cap_eff(status: &str) -> Option<u64> {
     let hex = status
         .lines()
@@ -156,7 +168,50 @@ struct CapData {
 /// Detaching BPF links, draining rings and reaping children need no
 /// capabilities, so a correct keep set never breaks cleanup.
 pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
-    let _ = keep;
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut current = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: version-3 header with pid 0 addresses this thread; the two
+    // data words are caller-owned stack with the kernel's layout.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, current.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // The two words cover capabilities 0-31 and 32-63; intersect each
+    // set with the kept half, keeping effective inside permitted.
+    let half = |word: CapData, shift: u32| {
+        let keep_half = (keep >> shift) as u32;
+        let permitted = word.permitted & keep_half;
+        CapData {
+            effective: word.effective & permitted,
+            permitted,
+            inheritable: word.inheritable & keep_half,
+        }
+    };
+    let masked = [half(current[0], 0), half(current[1], 32)];
+    // SAFETY: same header and caller-owned words as the `capget` above.
+    if unsafe { libc::syscall(libc::SYS_capset, &mut header, masked.as_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `PR_CAP_AMBIENT_CLEAR_ALL` takes no pointer arguments.
+    if unsafe {
+        libc::syscall(
+            libc::SYS_prctl,
+            libc::PR_CAP_AMBIENT,
+            libc::PR_CAP_AMBIENT_CLEAR_ALL,
+            0,
+            0,
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
     Ok(())
 }
 
@@ -166,14 +221,26 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// (it reports the invoking set, so it must not drop first); `inspect`
 /// never loads BPF; offline commands keep nothing.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
-    let _ = command;
-    0
+    use crate::cli::Command;
+    let live = minimal_live_mask();
+    match command {
+        Command::Profile(_)
+        | Command::Trace(_)
+        | Command::Run(_)
+        | Command::Inventory(_)
+        | Command::Doctor(_) => live,
+        // `inspect` reads memory and files only ("No BPF" is its module
+        // contract); the witness still needs checkpoint/restore.
+        Command::Inspect(_) => live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT)),
+        Command::InventoryDiff(_) | Command::Version => 0,
+    }
 }
 
 /// Drop what `command` never needs, before it runs. Returns the kept mask.
 pub fn drop_unneeded_for_command(command: &crate::cli::Command) -> io::Result<u64> {
-    let _ = command;
-    Ok(0)
+    let keep = keep_mask_for_command(command);
+    drop_to_keep(keep)?;
+    Ok(keep)
 }
 
 #[cfg(test)]
@@ -299,21 +366,23 @@ mod tests {
         assert_eq!(read_effective(), expected);
     }
 
-    /// The drop runs in a fork child and the parent reads the child's own
-    /// `CapEff`: dropping to zero must zero it (non-vacuous as root, where
-    /// the child starts with capabilities), and ambient must clear too.
-    /// The parent's sets are untouched, so this is safe in every lane.
-    #[test]
-    fn drop_to_keep_zeroes_a_child_without_touching_the_parent() {
-        let parent_before = read_effective();
-        // SAFETY: the child only issues syscalls and `_exit`.
+    /// Runs `action` (syscalls only, no allocation) in a fork child and
+    /// polls the child's own `/proc/<pid>/status` until its
+    /// (`CapEff`, `CapAmb`) reaches `expect`, or a one-second deadline.
+    /// Returns the last observed pair. The child is killed and reaped, so
+    /// the parent's sets are untouched and this is safe in every lane.
+    fn child_cap_sets_after(
+        expect: (u64, u64),
+        action: impl FnOnce() -> std::io::Result<u64>,
+    ) -> (Option<u64>, Option<u64>) {
+        // SAFETY: the child runs only the syscall-only action, then spins
+        // on `usleep` until killed; it `_exit`s on every path, so no
+        // destructors run post-fork.
         let child = unsafe { libc::fork() };
         assert!(child >= 0, "fork failed");
         if child == 0 {
+            let outcome = action();
             unsafe {
-                let outcome = drop_to_keep(0);
-                // Signal readiness through the exit path is racy; spin
-                // instead so the parent can poll our status first.
                 if outcome.is_err() {
                     libc::_exit(41);
                 }
@@ -325,25 +394,22 @@ mod tests {
         }
         let child = child as u32;
         let status_path = format!("/proc/{child}/status");
-        let mut observed = None;
+        let mut observed = (None, None);
         for _ in 0..200 {
             std::thread::sleep(std::time::Duration::from_millis(5));
             let Ok(status) = std::fs::read_to_string(&status_path) else {
                 break;
             };
-            let eff = status
-                .lines()
-                .find_map(|line| line.strip_prefix("CapEff:"))
-                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok());
-            let amb = status
-                .lines()
-                .find_map(|line| line.strip_prefix("CapAmb:"))
-                .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok());
-            if eff == Some(0) && amb == Some(0) {
-                observed = Some((eff, amb));
+            let at = |label: &str| {
+                status
+                    .lines()
+                    .find_map(|line| line.strip_prefix(label))
+                    .and_then(|hex| u64::from_str_radix(hex.trim(), 16).ok())
+            };
+            observed = (at("CapEff:"), at("CapAmb:"));
+            if observed == (Some(expect.0), Some(expect.1)) {
                 break;
             }
-            observed = Some((eff, amb));
         }
         unsafe {
             libc::kill(child as i32, libc::SIGKILL);
@@ -352,10 +418,39 @@ mod tests {
         unsafe {
             libc::waitpid(child as i32, &mut status, 0);
         }
+        observed
+    }
+
+    /// The drop runs in a fork child and the parent reads the child's own
+    /// `CapEff`: dropping to zero must zero it (non-vacuous as root, where
+    /// the child starts with capabilities), and ambient must clear too.
+    /// The parent's sets are untouched, so this is safe in every lane.
+    #[test]
+    fn drop_to_keep_zeroes_a_child_without_touching_the_parent() {
+        let parent_before = read_effective();
+        let observed = child_cap_sets_after((0, 0), || drop_to_keep(0).map(|()| 0));
         assert_eq!(
             observed,
-            Some((Some(0), Some(0))),
+            (Some(0), Some(0)),
             "the child must reach zero effective+ambient capabilities"
+        );
+        assert_eq!(read_effective(), parent_before, "the parent keeps its sets");
+    }
+
+    /// The startup entry keeps exactly the command's keep set intersected
+    /// with what the process holds (non-vacuous as root: `inspect` keeps
+    /// three of the five minimal capabilities there).
+    #[test]
+    fn drop_unneeded_for_command_applies_per_command_keep_sets() {
+        let parent_before = read_effective();
+        let command = parse(&["inspect", "--pid", "1"]);
+        let keep = keep_mask_for_command(&command);
+        let expected = parent_before.unwrap_or(0) & keep;
+        let observed = child_cap_sets_after((expected, 0), || drop_unneeded_for_command(&command));
+        assert_eq!(
+            observed,
+            (Some(expected), Some(0)),
+            "the child must keep exactly the inspect set"
         );
         assert_eq!(read_effective(), parent_before, "the parent keeps its sets");
     }

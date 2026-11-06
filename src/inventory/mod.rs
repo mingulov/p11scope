@@ -11995,6 +11995,223 @@ mod tests {
     }
 
     #[test]
+    fn text_summary_states_unattributed_use_totals() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        for (ino, sha, path) in [
+            (11u64, "sha0011", "/lib/a.so"),
+            (12u64, "sha0012", "/lib/b.so"),
+        ] {
+            let key = ModuleKey::physical(8, 1, ino, Some(sha.into()), path);
+            coordinator.registry_mut().note_mapping(
+                caller,
+                pid,
+                ModuleInfo {
+                    path: path.into(),
+                    key: key.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("mountinfo".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(2),
+                    admission_reasons: Vec::new(),
+                },
+                100,
+            );
+        }
+        let key_a = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        let key_b = ModuleKey::physical(8, 1, 12, Some("sha0012".into()), "/lib/b.so");
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_a],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_b.clone()],
+            111,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_b],
+            112,
+            crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+            56,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(text.contains("/lib/a.so"), "both modules render:\n{text}");
+        assert!(text.contains("/lib/b.so"), "both modules render:\n{text}");
+        let line = "unattributed use: at least 900 entries in 3 witness rows never bound to a caller";
+        assert!(text.contains(line), "summary states the totals:\n{text}");
+        let lines: Vec<_> = text.lines().collect();
+        let coverage = lines
+            .iter()
+            .position(|candidate| candidate.starts_with("coverage:"))
+            .expect("coverage line renders");
+        let summary = lines
+            .iter()
+            .position(|candidate| candidate.contains("unattributed use:"))
+            .expect("summary line renders");
+        let details = lines
+            .iter()
+            .position(|candidate| candidate.starts_with("Details:"))
+            .expect("details tail renders");
+        assert!(
+            coverage < summary && summary < details,
+            "the hint sits in the summary head, ahead of the edge list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_states_a_single_unattributed_row_in_singular() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            text.contains("unattributed use: at least 744 entries in 1 witness row never bound"),
+            "singular row renders:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_omits_unattributed_use_for_a_zero_entry_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            0,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["rows"], 1,
+            "unbound row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unattributed use:"),
+            "a zero lower bound states nothing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_omits_unattributed_use_for_identified_caller_rows() {
+        use crate::discovery::caller_registry::tests::ScriptedSource;
+        let source = ScriptedSource::default();
+        source.spawn(7, 500);
+        source.spawn(8, 600);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let bound = coordinator
+            .adapter_mut()
+            .admit(7, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let mapped = coordinator
+            .adapter_mut()
+            .admit(8, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            mapped,
+            8,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator
+            .registry_mut()
+            .note_bound_witness(bound, vec![key], 110);
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_mapping_edge": 1}),
+            "identified-caller row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unattributed use:"),
+            "identified-caller rows are attributed, never unattributed:\n{text}"
+        );
+    }
+
+    #[test]
     fn the_stop_line_reads_as_one_sentence() {
         let line = stop_line(&lane_summary(
             crate::inventory_capture::Retirement::Unsettled("budget passed".into()),

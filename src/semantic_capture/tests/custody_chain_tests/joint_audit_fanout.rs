@@ -203,6 +203,10 @@ struct MachineNativeRows {
     )>,
     fail_after_preparation: bool,
     fail_births: bool,
+    // Unmarked births stamp exec_attach_gen 0: the task predates the
+    // lane's closure (a late attach), so the attach-observed fallback
+    // applies deterministically, whatever the global attachment counter.
+    predating_births: bool,
     absence_reads: Vec<(u64, ImageIdentity, u32)>,
     birth_outcomes: Vec<(
         u32,
@@ -718,7 +722,11 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             } else {
                 &["0", "0"]
             },
-            self.attached.generation(),
+            if unmarked && self.native.predating_births {
+                0
+            } else {
+                self.attached.generation()
+            },
         );
         let mut rows = NativeBirthRows { row, control };
         let mut owned = self.h0.0.borrow_mut();
@@ -1259,6 +1267,7 @@ impl MachineScene {
                 preparations: Vec::new(),
                 fail_after_preparation: false,
                 fail_births: false,
+                predating_births: false,
                 absence_reads: Vec::new(),
                 birth_outcomes: Vec::new(),
                 pending_q_resolutions: 0,
@@ -24716,6 +24725,7 @@ fn joint_machine_idle_fresh_birth_waits_as_future_input() {
     use crate::inventory_semantics::JointServiceProgress;
     use crate::semantics_objects::journal::BirthKind;
     let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    fixture.native.predating_births = true;
     fixture.push_quiet();
     let mut published = false;
     for _ in 0..512 {

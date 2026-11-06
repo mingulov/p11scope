@@ -392,7 +392,7 @@ are still in progress.
 > and user namespaces restore privilege; do not delegate it. When the
 > observer
 > binary instead carries file capabilities (`setcap
-> 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
+> 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and
 > group-gated providers (e.g. opencryptoki's group-owned shared memory) keep
 > working under observation. Such an observer starts in the loader's
@@ -896,16 +896,17 @@ kubectl -n p11scope cp "$OBS:/tmp/capture.json" capture.json
 Privileges, each removed in turn on kind and shown to break or degrade the
 capture (kernel 7.0, `perf_event_paranoid=4`; table and reasons in
 [deploy/k8s/README.md](../deploy/k8s/README.md#privileges-and-why)):
-`hostPID`, `CAP_SYS_ADMIN` (the uretprobe self-probe always uses
-`perf_event_open()`, which paranoid >= 3 refuses without it, uprobe-multi
-or not; with it held, `CAP_BPF`/`CAP_PERFMON` add nothing),
+`hostPID`, `CAP_SYS_ADMIN` (measured with the self-probe on
+`perf_event_open()`; the current self-probe attaches through uprobe-multi
+links instead, so with it held, `CAP_BPF`/`CAP_PERFMON` add nothing),
 `CAP_SYS_PTRACE` (target `/proc/<pid>/mem`), `CAP_DAC_READ_SEARCH` (the
 memory scan, and providers in directories only their application can read),
 and a read-only hostPath of `/sys/fs/cgroup`. No bpffs, tracefs, debugfs or
 BTF mount, no `privileged: true`, no hostNetwork; read-only root, seccomp
-`RuntimeDefault`. On `perf_event_paranoid <= 2` nodes `CAP_BPF` +
-`CAP_PERFMON` + `CAP_CHECKPOINT_RESTORE` instead of `CAP_SYS_ADMIN` is
-expected to suffice but is not measured here; check with `--command doctor`.
+`RuntimeDefault`. The five-capability minimal set is expected to replace
+`CAP_SYS_ADMIN` at any paranoid on the default lane — measured at host
+level, but the kind removal is not measured here, so the shipped manifest
+keeps its grant; check with `--command doctor`.
 Do not drop `CAP_SYS_ADMIN` without adding `CAP_CHECKPOINT_RESTORE`:
 `inventory` attributes callers past the scan cap through
 `/proc/<pid>/map_files`, which needs one of the two, and otherwise reports
@@ -1707,7 +1708,7 @@ roles, and the exact set depends on the target, attach backend and host policy:
 | `CAP_SYS_PTRACE` | Read a target's memory when ptrace/Yama or cross-UID checks require it. |
 | `CAP_DAC_READ_SEARCH` | Open provider files or traverse target paths otherwise unreadable to the observer. |
 | `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` | Follow target `map_files` for Inventory's past-scan-cap identity proof. |
-| `CAP_SYS_ADMIN` | Current self-probe/live-discovery perf-event paths on restrictive `perf_event_paranoid >= 3` hosts; also covers the BPF/perf checks. |
+| `CAP_SYS_ADMIN` | Only the `--attach-backend singles` fallback on restrictive `perf_event_paranoid >= 3` hosts (per-probe `perf_event` uprobes); the default uprobe-multi lane needs none of it. Also covers the BPF/perf checks. |
 
 This is a conditional roles list, not one portable minimum or a reason to grant
 all listed capabilities. Offline processing needs no BPF privileges. Capabilities
@@ -1734,14 +1735,16 @@ preflight: unavailable-in-build` (builds that omit the production journal
 object only; other `unavailable` reasons still refuse). A
 `kernel.yama.ptrace_scope` restriction is `ok` when doctor holds the
 capability that lifts it (`CAP_SYS_PTRACE` for Yama 1-2), as under `sudo`.
-A `kernel.perf_event_paranoid` restriction is `ok` when doctor holds
-`CAP_SYS_ADMIN`. At 3 or above (the Debian/Ubuntu level that refuses every
-`perf_event_open` to a process without `CAP_SYS_ADMIN`; `CAP_PERFMON` does not
-lift it) the row warns without `CAP_SYS_ADMIN` on every kernel: static
-uprobe-multi links are not gated, but the uretprobe self-probe and the
-live-discovery loader/export probes are per-probe `perf_event` uprobes
-everywhere. Below 3, `CAP_BPF`+`CAP_PERFMON` suffice. The `PID namespace` row
-is described under [PID namespaces](#pid-namespaces).
+A `kernel.perf_event_paranoid` value below 3 is `ok`: it does not limit
+uprobe attach for `CAP_PERFMON`. At 3 or above (the Debian/Ubuntu level
+that refuses every `perf_event_open` to a process without
+`CAP_SYS_ADMIN`; `CAP_PERFMON` does not lift it) the row warns without
+`CAP_SYS_ADMIN` on every kernel, but the warning is scoped: the
+self-probe, the live-discovery loader/export probes and the static set
+all attach through uprobe-multi links, which paranoid does not gate.
+Only an explicit `--attach-backend singles` fallback still opens
+per-probe `perf_event` uprobes and needs `CAP_SYS_ADMIN` there. The
+`PID namespace` row is described under [PID namespaces](#pid-namespaces).
 
 The `journal pair preflight` row preflights this build's production journal
 object: it reads `available` only when both journal roots are present and the
@@ -1828,25 +1831,36 @@ no new privileged experiment.
 | `CAP_SYS_ADMIN` + `CAP_SYS_PTRACE` | memory scan | available | 136/136 probes |
 
 The `CAP_BPF` + `CAP_PERFMON` multi row is the static probes of an
-unconfined `--pid` target only. It does not mean `CAP_BPF`+`CAP_PERFMON`
-suffice at `perf_event_paranoid >= 3` (DR-K8S-3, measured 2026-10-03 on
-7.0.0-34-generic at paranoid 4, observer running as root with exactly
+unconfined `--pid` target only: those two alone never suffice for a full
+capture. The DR-K8S-3 matrix below is historical: measured 2026-10-03 on
+7.0.0-34-generic at paranoid 4, before the self-probe and the
+live-discovery probes moved to uprobe-multi links. Then, an observer
+running as root with exactly
 `CAP_BPF CAP_PERFMON CAP_SYS_PTRACE CAP_DAC_READ_SEARCH`, as a Kubernetes
-DaemonSet without `CAP_SYS_ADMIN` would):
+DaemonSet without `CAP_SYS_ADMIN` would, saw:
 
-| Command | Result |
+| Command | Result (2026-10-03, pre-multi-discovery) |
 | --- | --- |
 | `profile --pid` (unconfined SoftHSM2 target, memory scan) | 136/136 probes via uprobe-multi, exact 6 x 100 counts, but `PARTIAL`: live discovery unavailable (`skipped: discovery unavailable`, `loader_discovery.strategies.unavailable: 1`) |
 | `profile --system` (and `--cgroup`, `run`, a confined `--pid` target) | refused before attach: the uretprobe self-probe's `perf_event_open` gets EACCES, and the refusal names `kernel.perf_event_paranoid` and `CAP_SYS_ADMIN` |
 | `doctor` | paranoid row `warn`; `uprobe attach (self)` FAIL; tier T0 |
 
-So, stated plainly: at `perf_event_paranoid >= 3`, capturing needs
-`CAP_SYS_ADMIN` (root normally has it). The self-probe could in principle
-attach through uprobe-multi instead, but the live-discovery probes and the
-`doctor` self-uprobe would still need `perf_event_open`, so that change would
-not remove the requirement; it is not made. On the per-probe path a
-restrictive paranoid needs `CAP_SYS_ADMIN` too (2026-08-25:
-`CAP_BPF`+`CAP_PERFMON` attached 0/136, every failure `perf_event_open`).
+That requirement is gone on the default lane: the self-probe, the
+live-discovery loader/export probes and the `doctor` self-uprobe all
+attach through uprobe-multi links now, which `perf_event_paranoid` does
+not gate. Measured 2026-11-07 on 7.0.0-38-generic at paranoid 3 and 4,
+observer running as the unprivileged `nobody` user with exactly the
+five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
+`CAP_DAC_READ_SEARCH`, `CAP_PERFMON`, `CAP_SYS_PTRACE`, no
+`CAP_SYS_ADMIN`): `profile --pid` observed 120/123 completed calls with
+`attach_mechanisms: ["uprobe-multi"]` and no attach failures, and
+`inventory --system` and `run` completed the same way
+(`scripts/ci/minimal-setcap.sh`, 18/18 rows; the same cell runs on the
+v6.6 and 7.x guest kernels in CI). Stated plainly: at
+`perf_event_paranoid >= 3`, capturing on the default lane needs the
+minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
+keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,
+every failure `perf_event_open`).
 On every kernel, manifest-free scanning of this same-UID non-descendant
 additionally needs `CAP_SYS_PTRACE`. A target that is a descendant of the
 observer, a target that opts in with `PR_SET_PTRACER`, or a permissive
@@ -1857,6 +1871,41 @@ measurements, not a portable promise; run
 
 There is no `CAP_LEASE`, `fs.suid_dumpable=0`, or root-owned trusted exec dir
 requirement.
+
+### Run without sudo
+
+On a 6.6+ kernel the observer captures as an ordinary user with exactly
+five file capabilities, no sudo and no `CAP_SYS_ADMIN`. `p11scope doctor`
+prints the exact one-line command for its own binary in the `minimal
+setcap` row; for a binary at `/usr/local/bin/p11scope` it is:
+
+```sh
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' /usr/local/bin/p11scope
+```
+
+File capabilities follow execution, not the user: anyone who can execute
+the binary captures with those privileges, which include reading other
+users' processes and loading BPF programs. Restrict execution to a
+dedicated group, setting ownership and mode before the capabilities
+(changing them afterwards can clear the set), then verify:
+
+```sh
+sudo groupadd -r p11scope
+sudo usermod -aG p11scope "$USER"
+sudo chgrp p11scope /usr/local/bin/p11scope
+sudo chmod 750 /usr/local/bin/p11scope
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' /usr/local/bin/p11scope
+getcap /usr/local/bin/p11scope
+```
+
+Log out and back in for the group membership to apply, then run
+`p11scope doctor` as yourself: the `effective capabilities` row lists the
+held set, and any gap names the missing capability with what it enables.
+A capture missing a capability refuses or degrades with a plain `needs
+CAP_...` line rather than a raw errno. After setup the observer drops
+capabilities the rest of the capture does not need, and a `run` child
+never inherits any. The DEB/RPM packages set no capabilities by default:
+granting the set is always the local administrator's explicit step.
 
 ## PID namespaces
 

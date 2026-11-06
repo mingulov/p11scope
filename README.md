@@ -271,6 +271,33 @@ locked Cargo dependencies, plus the Rust/BPF and host build tools described
 above. The [offline build guide](docs/build-offline.md) describes an optional
 full export assembled separately.
 
+### Run without sudo
+
+On a 6.6+ kernel the observer captures as an ordinary user with exactly
+five file capabilities, no sudo and no `CAP_SYS_ADMIN`:
+
+```sh
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' /usr/local/bin/p11scope
+```
+
+File capabilities follow execution: anyone who can execute the binary
+captures with those privileges, so restrict it to a dedicated group
+before granting the set, then verify:
+
+```sh
+sudo groupadd -r p11scope
+sudo usermod -aG p11scope "$USER"
+sudo chgrp p11scope /usr/local/bin/p11scope
+sudo chmod 750 /usr/local/bin/p11scope
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' /usr/local/bin/p11scope
+getcap /usr/local/bin/p11scope
+```
+
+`p11scope doctor` prints the exact command for its own binary and names
+any missing capability. The system packages set no capabilities by
+default. See [Privileges, per environment](docs/usage.md#privileges-per-environment)
+for the full matrix.
+
 ### Build locally from source
 
 `cargo install` is not supported: the root manifest patches two crates whose
@@ -331,24 +358,20 @@ does not launch it automatically. Never give it capabilities or a set-id bit.
 **Kernel and privileges.** Live capture requires a Multi-capable Linux x86-64
 host (normally 6.6+ or a working backport), BTF (`/sys/kernel/btf/vmlinux`) and
 root or appropriate capabilities. General host eligibility is separate from
-the safe scoped attachment backend. With multi active,
-`CAP_BPF`+`CAP_PERFMON` suffice for the static probes of an unconfined
-`--pid` target (measured 136/136 at `perf_event_paranoid=4`); full capture
-at paranoid ≥ 3 (live discovery, uretprobe self-probe) needs `CAP_SYS_ADMIN`,
-and on the per-probe `perf_event` path a restrictive paranoid needs
-`CAP_SYS_ADMIN` too
-([roles and measured matrix](docs/usage.md#privileges-per-environment)). A broad
-compatibility set is shown below. This is not a minimal set: `CAP_SYS_ADMIN`
-already covers the BPF/perf permission checks.
+the safe scoped attachment backend. With multi active, the five-capability
+minimal set captures at any paranoid with no `CAP_SYS_ADMIN`
+([roles and measured matrix](docs/usage.md#privileges-per-environment)):
 
 ```sh
-sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep' \
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
   /usr/local/bin/p11scope
 ```
 
-Anyone who can execute a capability-carrying observer can observe other
-users' processes, so restrict who may execute it (for example, a dedicated
-group and mode `0750`).
+Only an explicit `--attach-backend singles` fallback still needs
+`CAP_SYS_ADMIN` at paranoid ≥ 3. Anyone who can execute a
+capability-carrying observer can observe other users' processes, so
+restrict who may execute it (for example, a dedicated group and mode
+`0750`); see [Run without sudo](#run-without-sudo).
 
 **Check the install:**
 

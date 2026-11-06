@@ -82,12 +82,18 @@ fn unchanged_and_partial_evidence_still_exit_zero_with_honest_limits() {
         "unknown",
         "independent observation windows",
         "Instance and detailed semantic changes are not compared",
-        "fixture coverage unknown",
     ] {
         assert!(text.contains(expected), "missing {expected:?}: {text}");
     }
     assert!(!text.contains("machine unchanged"));
     assert!(!text.as_bytes().contains(&0x1b));
+    let output = command(&before, &after).arg("-v").output().unwrap();
+    success(&output);
+    let verbose = String::from_utf8(output.stdout).unwrap();
+    assert!(
+        verbose.contains("fixture coverage unknown"),
+        "missing per-gap detail: {verbose}"
+    );
 }
 
 #[test]

@@ -1301,7 +1301,7 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
 /// dual-outcome test that forgets the call fails here by name.
 ///
 /// Exempt by design, not by omission:
-/// - `j2_unprivileged_profile_names_inspect_and_doctor`,
+/// - `j2_unprivileged_profile_names_inspect_and_next_step`,
 ///   `t3_f7_attach_refusal_points_at_doctor` and
 ///   `high1_missing_privilege_is_named_and_never_offers_the_override` pin
 ///   the unprivileged refusal itself and assert nothing once capture
@@ -1321,7 +1321,7 @@ fn every_capture_branch_names_the_require_guard() {
         "the require guard no longer reads the variable in {path}"
     );
     let exempt = [
-        "j2_unprivileged_profile_names_inspect_and_doctor",
+        "j2_unprivileged_profile_names_inspect_and_next_step",
         "t3_f7_attach_refusal_points_at_doctor",
         "high1_missing_privilege_is_named_and_never_offers_the_override",
         "high4_a_closed_stdout_reader_never_panics",

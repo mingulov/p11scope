@@ -176,12 +176,21 @@ fn aggregate_scope_has_no_application_allocation() {
         text.contains("Aggregate across the selected scope; counts are not per application"),
         "{text}"
     );
+    assert!(text.contains("names unconfirmed"), "{text}");
+    let aliased = text
+        .lines()
+        .find(|line| line.contains("C_Sign|C_Encrypt"))
+        .unwrap();
     assert!(
-        text.contains("7 completed calls have ambiguous module ownership"),
+        aliased.contains("two providers") && aliased.contains('7'),
         "{text}"
     );
+    let unowned = text
+        .lines()
+        .find(|line| line.contains("unknown"))
+        .unwrap();
     assert!(
-        text.contains("5 completed calls have unresolved module ownership"),
+        unowned.contains("C_Sign") && unowned.contains('5'),
         "{text}"
     );
 }
@@ -347,7 +356,12 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
             scope < duration && duration < counts && counts < table,
             "{text}"
         );
-        assert!(text.contains(&format!("Scope: {label} scope")), "{text}");
+        // The header carries the validated kind; the body keeps no Scope: line.
+        assert!(
+            header.starts_with(&format!("p11scope — {label} scope — ")),
+            "{text}"
+        );
+        assert!(!text.contains("Scope: "), "{text}");
         assert_eq!(
             render::json(&reports, &ev, &capture(kind))["capture"]["scope"],
             kind
@@ -357,7 +371,12 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
     assert!(legacy.contains("selected scope"), "{legacy}");
     for invalid in ["/proc/4242", "4242", "system\n\u{1b}[2J"] {
         let summary = render::scope_summary(invalid, &reports, &ev);
-        assert!(summary.starts_with("Scope: selected scope\n"), "{summary}");
+        assert!(
+            summary.starts_with(
+                "Aggregate across the selected scope; counts are not per application.\n"
+            ),
+            "{summary}"
+        );
         assert!(!summary.contains(invalid), "{summary}");
     }
     assert!(trace::identity_note().contains("completed call events in arrival order"));

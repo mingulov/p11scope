@@ -11900,7 +11900,9 @@ impl Engine {
     /// the gap counter it never moves calls or attribution; unlike it,
     /// the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exe_hints(&self) -> Option<&elf_needed::GapExeHints> {
-        self.extensive.enabled().then_some(self.extensive.hints())
+        self.extensive
+            .gap_active()
+            .then_some(self.extensive.hints())
     }
 
     /// 7.10b PID-scope target-exec split, present only when the PID
@@ -11929,23 +11931,54 @@ impl Engine {
         &self.exit_map.reasons
     }
 
-    /// 6.14 Option B: arm extensive mode from `--track-short-lived`
-    /// before the session starts (run flow only; inventory never calls
-    /// this, so its surface is unchanged). Arming snapshots the pinned
-    /// watched providers; the kernel bit publishes with the session.
-    /// 614b P1: the engine itself refuses to arm on a scope that never
-    /// classifies descendant gaps, so no caller can arm the
-    /// exe-identity read (or retain its stash/caches) for an exact-PID
-    /// capture however it computed its request.
-    pub(crate) fn arm_extensive(&mut self, track_short_lived: bool) {
-        let armed = track_short_lived && self.admits_generations();
-        self.extensive.set_enabled(armed);
-        // 6.14 Option A: the exit-mapping split arms with the same
-        // flag; `gap_exit_mappings` reads `None` unless armed.
-        self.exit_map.set_enabled(armed);
-        if armed {
+    /// 7.10b: arm extensive mode from `--track-short-lived` before
+    /// the session starts (run flow only; inventory never calls this,
+    /// so its surface is unchanged). Arming splits by scope: the gap
+    /// consumer on generation-admitting scopes, the PID target-exec
+    /// consumer on exact-PID scope (profile `--pid`, owned `run`).
+    /// A counter policy arms neither consumer, even if asked.
+    /// Arming snapshots the pinned watched providers; the kernel bit
+    /// publishes with the session.
+    pub(crate) fn arm_extensive(&mut self, track_short_lived: bool, policy: CapturePolicy) {
+        let detailed = track_short_lived && policy.allows_track_short_lived();
+        let gap = detailed && self.admits_generations();
+        let pid = detailed && matches!(self.scope, Scope::Pid(_));
+        self.extensive.set_enabled(gap || pid);
+        self.extensive.set_pid_target(pid);
+        // 7.10b: aggregate policy stamps no EXEC ticket, so the gap
+        // stash seeds ticketless there. Detailed keeps the ticket
+        // rule; PID scope never seeds the gap stash.
+        self.extensive
+            .set_seed_without_ticket(gap && matches!(policy, CapturePolicy::AggregateOnly));
+        // 6.14 Option A: the exit-mapping split arms with the gap
+        // consumer only; `gap_exit_mappings` reads `None` unless armed.
+        self.exit_map.set_enabled(gap);
+        if gap || pid {
             self.extensive.snapshot_watched(&self.pinned);
         }
+    }
+
+    /// 7.10b: classify one validated target EXEC under exact-PID
+    /// scope (profile `--pid`, owned `run`). Validation is the
+    /// existing lifecycle match (record to retained view) plus a
+    /// live-generation check, since PID-scope EXEC records carry no
+    /// kernel ticket. At validation the observer learns the target's
+    /// exe path with the same bracketed read the scans use, then
+    /// runs the shared analysis on the recorded pair. Unvalidated
+    /// EXECs carry no hint — not even `unknown`.
+    fn classify_pid_target_exec(&mut self, record: &DiscoveryRecord, view: ProcessViewId) {
+        if !self.extensive.pid_active() || !matches!(self.scope, Scope::Pid(_)) {
+            return;
+        }
+        let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view) else {
+            return;
+        };
+        if !retained.still_the_same() {
+            return;
+        }
+        elf_needed::learn_view_exe(&mut self.extensive, retained);
+        self.extensive
+            .classify_target_exec(record.pointers[0], record.pointers[1]);
     }
 
     pub(crate) fn multi_rebuild_gaps(&self) -> u64 {
@@ -21405,6 +21438,12 @@ impl Engine {
             self.exit_map.note_exec(pid, record.hook_ts_ns);
         }
         if let Some((view, cause)) = self.admitted_lifecycle_match(record) {
+            // 7.10b: validate a target EXEC under exact-PID scope
+            // before any other handling (including the owned-initial
+            // acknowledgment below, which returns early).
+            if record.kind == DISCOVERY_KIND_EXEC {
+                self.classify_pid_target_exec(record, view);
+            }
             if record.kind == DISCOVERY_KIND_EXEC && self.acknowledge_owned_initial_exec(view) {
                 // The validated prearm now also serves ordinary live loader
                 // discovery. Keep the existing per-load-kind classification;

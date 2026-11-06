@@ -336,6 +336,13 @@ impl ExtensiveState {
         self.seed_without_ticket = on;
     }
 
+    /// 7.10b: select the PID target-exec consumer instead of the gap
+    /// consumer (exact-`--pid` scope only; the engine sets this from
+    /// the capture scope at arm time).
+    pub(crate) fn set_pid_target(&mut self, on: bool) {
+        self.pid_target = on;
+    }
+
     pub(crate) fn enabled(&self) -> bool {
         self.enabled
     }
@@ -419,8 +426,15 @@ impl ExtensiveState {
     /// producer ticket, and consumption requires the stash timestamp to
     /// precede the exit timestamp. A re-exec overwrites (latest wins);
     /// a full stash evicts the smallest PID first (deterministic).
+    /// 7.10b: the gap stash seeds on generation-admitting scopes
+    /// only (PID scope validates target execs directly instead), and
+    /// an aggregate-policy stash seeds from the admitted record
+    /// itself, since the kernel stamps no ticket there.
     pub(crate) fn note_exec_record(&mut self, record: &DiscoveryRecord) {
-        if !self.enabled || record.exec_task_ticket().is_none() {
+        if !self.gap_active() {
+            return;
+        }
+        if record.exec_task_ticket().is_none() && !self.seed_without_ticket {
             return;
         }
         let pid = (record.pid_tgid >> 32) as u32;
@@ -451,7 +465,7 @@ impl ExtensiveState {
     /// exe pair counts `unknown` without analysis. Disabled captures
     /// neither consume nor count.
     pub(crate) fn classify_gap(&mut self, record: &DiscoveryRecord) -> StaticHint {
-        if !self.enabled {
+        if !self.gap_active() {
             return StaticHint::Unknown;
         }
         let pid = (record.pid_tgid >> 32) as u32;
@@ -470,6 +484,24 @@ impl ExtensiveState {
             _ => StaticHint::Unknown,
         };
         self.hints.count(hint);
+        hint
+    }
+
+    /// 7.10b: classify one validated target exec under exact-PID
+    /// scope: run the shared Row B/D analysis on the recorded pair
+    /// and count exactly one target hint. An absent pair counts
+    /// `unknown` without analysis. The PID consumer alone feeds this
+    /// split; gap and disabled captures neither analyze nor count.
+    pub(crate) fn classify_target_exec(&mut self, dev: u64, ino: u64) -> StaticHint {
+        if !self.pid_active() {
+            return StaticHint::Unknown;
+        }
+        let hint = if (ExeIdentity { dev, ino }).absent() {
+            StaticHint::Unknown
+        } else {
+            self.analyze_executable(dev, ino)
+        };
+        self.target_hints.count(hint);
         hint
     }
 

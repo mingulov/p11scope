@@ -4990,7 +4990,7 @@ fn armed_cgroup_engine() -> Engine {
         path: PathBuf::from("/sys/fs/cgroup/test"),
         dir: Arc::new(File::open("/dev/null").unwrap()),
     };
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     engine
 }
 
@@ -5393,7 +5393,7 @@ fn exit_mappings_routed_record_is_gap_not_live_loss() {
     child.kill().unwrap();
     child.wait().unwrap();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     let mut exit = exit_mappings_record(pid, 1);
     exit.pointers[0] = 3;
     let mut session = ScriptedSession::with_records([], 0);
@@ -5493,7 +5493,7 @@ fn exit_mappings_overflow_sentinel_carries_no_split() {
 fn exit_mappings_coalesced_exit_carries_no_split() {
     let pid = std::process::id();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     let mut exit = exit_mappings_record(pid, 0);
     exit.pointers[0] = 3;
     let mut session = ScriptedSession::with_records([], 0);
@@ -6431,7 +6431,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             .unwrap_or_else(|error| panic!("{what}: cgroup scope failed: {error:#}"));
         let mut engine = Engine::discover(&args, &scope, None).expect("live discovery");
         if armed {
-            engine.arm_extensive(true);
+            engine.arm_extensive(true, CapturePolicy::Allowlisted);
         }
         let mut session = engine
             .start_session(
@@ -64461,7 +64461,7 @@ fn gap_exe_identity_shares_unchanged_twin() {
 #[test]
 fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
     let mut pid_engine = Engine::empty();
-    pid_engine.arm_extensive(true);
+    pid_engine.arm_extensive(true, CapturePolicy::Allowlisted);
     assert!(
         pid_engine.target_exec_hints().is_some(),
         "exact-PID scope arms the target-exec consumer"
@@ -64473,7 +64473,7 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
     assert_eq!(pid_engine.target_exec_hints().unwrap().total(), 0);
     let pid = std::process::id();
     let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
-    cgroup_engine.arm_extensive(true);
+    cgroup_engine.arm_extensive(true, CapturePolicy::Allowlisted);
     assert!(
         cgroup_engine.gap_exe_hints().is_some(),
         "cgroup scope arms the gap consumer"
@@ -64482,9 +64482,9 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
         cgroup_engine.target_exec_hints().is_none(),
         "cgroup scope has no single target"
     );
-    cgroup_engine.arm_extensive(false);
+    cgroup_engine.arm_extensive(false, CapturePolicy::Allowlisted);
     assert!(cgroup_engine.gap_exe_hints().is_none());
-    pid_engine.arm_extensive(false);
+    pid_engine.arm_extensive(false, CapturePolicy::Allowlisted);
     assert!(pid_engine.target_exec_hints().is_none());
 }
 
@@ -64496,7 +64496,7 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
 fn pid_target_exec_validates_a_live_matched_exec_and_counts_one_hint() {
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64524,7 +64524,7 @@ fn pid_target_exec_validates_a_live_matched_exec_and_counts_one_hint() {
 fn pid_target_exec_without_a_learned_path_counts_unknown() {
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64547,7 +64547,7 @@ fn pid_target_exec_without_a_learned_path_counts_unknown() {
 #[test]
 fn pid_target_exec_ignores_execs_that_match_no_retained_view() {
     let mut engine = Engine::empty();
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     // Past every admission bracket, deterministically.
     let ts = u64::MAX;
     let mut pending = PendingViewRetirements::new();
@@ -64579,7 +64579,7 @@ fn pid_target_exec_ignores_execs_against_a_dead_view() {
     child.wait().expect("reap sleeper");
     assert!(!view.still_the_same());
     let mut engine = Engine::empty();
-    engine.arm_extensive(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
     engine.views.push(view);
     // Past every admission bracket, deterministically.
     let ts = u64::MAX;
@@ -64594,6 +64594,28 @@ fn pid_target_exec_ignores_execs_against_a_dead_view() {
         .target_exec_hints()
         .expect("armed target split stays present");
     assert_eq!(hints.total(), 0);
+}
+
+// 7.10b: arming under aggregate policy (`--mode metrics`) seeds the
+// gap stash ticketless, so a ticketless EXEC plus a novel unmatched
+// exit classifies a real gap hint end to end.
+#[test]
+fn aggregate_arm_classifies_ticketless_gap_hints_end_to_end() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.arm_extensive(true, CapturePolicy::AggregateOnly);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    dispatch_gap_exe(
+        &mut engine,
+        &gap_exe_exec_record(pid, 100, dev, ino, 0),
+        &gap_exe_exit_record(pid, 200),
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.target_exec_hints().is_none());
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
 }
 
 /// Build knobs of the stamped legacy-only fixture

@@ -11,7 +11,7 @@
 #   prearm-late-dlopen-noflag twin without the flag; documented late-load gap
 #   track-short-lived-cgroup  20 short-lived callers; hint counts match
 #   track-short-lived-refused --track-short-lived with --counter-mode refused by name
-#   track-short-lived-pid     flag under --pid records nothing
+#   track-short-lived-pid     flag under --pid: target split, no gap split
 #
 # Requires root for live cells. Writes OUTDIR/results.jsonl, one row per cell.
 # Exit 0 when every qualified cell passes, 1 when a cell fails, 2 on harness
@@ -433,7 +433,9 @@ else
   result "$cell" 0 "rc=$rc without the named refusal" failed
 fi
 
-# track-short-lived-pid: the flag under --pid records nothing extra.
+# track-short-lived-pid: the flag under --pid arms the PID consumer
+# (target_exec_hints, zero here since the workload never execs) while
+# the gap splits stay absent.
 cell=track-short-lived-pid
 gate=$OUT/$cell.gate
 rm -f -- "$gate" "$cell.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"

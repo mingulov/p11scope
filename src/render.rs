@@ -3829,7 +3829,7 @@ fn layer_totals_json(
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
     let forwarding = forwarding_module_ids(ev, reports);
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "schema": "p11scope/observed-profile/v3-metrics",
         // Machine-readable lane discriminator (SYSPLAN residual F-12): the
         // metrics lane embeds `Evidence` directly (the four profile-only
@@ -3845,7 +3845,26 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "evidence": ev,
         "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
         "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
-    })
+    });
+    // 7.10b: the metrics lane embeds `Evidence` directly, so the
+    // skipped armed-only splits are hoisted here with the same closed
+    // shapes the profile lane publishes. Present if and only if
+    // armed; absent, never null, otherwise.
+    {
+        let evidence = document["evidence"]
+            .as_object_mut()
+            .expect("metrics renderer emits an evidence object");
+        if let Some(hints) = ev.gap_exe_hints {
+            evidence.insert("gap_exe_hints".into(), static_hint_split_json(&hints));
+        }
+        if let Some(split) = ev.discovery.gap_exit_mappings {
+            evidence.insert("gap_exit_mappings".into(), exit_mappings_split_json(&split));
+        }
+        if let Some(hints) = ev.target_exec_hints {
+            evidence.insert("target_exec_hints".into(), static_hint_split_json(&hints));
+        }
+    }
+    document
 }
 
 /// Only a protected accepted snapshot can supply this optional derived data.
@@ -3905,6 +3924,29 @@ impl<'a> VersionedEvidence<'a> {
     }
 }
 
+/// 7.10b: the closed STATIC HINT split shape, shared by the
+/// profile, metrics and trace lanes so the three can never drift
+/// apart. Both the gap split and the PID target-exec split use it.
+fn static_hint_split_json(hints: &GapExeHints) -> serde_json::Value {
+    serde_json::json!({
+        "label": STATIC_HINT_LABEL,
+        "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
+        "links_provider": hints.links_provider,
+        "links_pkcs11_loader": hints.links_pkcs11_loader,
+        "no_static_link_within_scope": hints.no_static_link_within_scope,
+        "unknown": hints.unknown,
+    })
+}
+
+/// 7.10b: the closed exit-mapping split shape, shared like the hint
+/// shape above.
+fn exit_mappings_split_json(split: &GapExitMappings) -> serde_json::Value {
+    serde_json::json!({
+        "mapped": split.mapped,
+        "unknown": split.unknown,
+    })
+}
+
 pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     let mut evidence = serde_json::to_value(ev).expect("Evidence serializes");
     let object = evidence.as_object_mut().expect("Evidence is an object");
@@ -3926,30 +3968,21 @@ pub(crate) fn versioned_evidence(ev: &Evidence) -> serde_json::Value {
     // label and scope ride every publication (Row C); the counts never
     // feed shares, verdicts, or completeness.
     if let Some(hints) = ev.gap_exe_hints {
-        object.insert(
-            "gap_exe_hints".into(),
-            serde_json::json!({
-                "label": STATIC_HINT_LABEL,
-                "scope": STATIC_HINT_SCOPE_D_TRANSITIVE,
-                "links_provider": hints.links_provider,
-                "links_pkcs11_loader": hints.links_pkcs11_loader,
-                "no_static_link_within_scope": hints.no_static_link_within_scope,
-                "unknown": hints.unknown,
-            }),
-        );
+        object.insert("gap_exe_hints".into(), static_hint_split_json(&hints));
+    }
+    // 7.10b: the PID target-exec split rides the same shape. Present
+    // if and only if the PID consumer armed; absent, never null,
+    // otherwise. The counts never feed shares, verdicts, or
+    // completeness.
+    if let Some(hints) = ev.target_exec_hints {
+        object.insert("target_exec_hints".into(), static_hint_split_json(&hints));
     }
     // 6.14 Option A: present if and only if extensive mode armed. A
     // kernel exit-time observation, not a hint: no label or scope
     // rides it, only the two counts, which never feed shares,
     // verdicts, or completeness.
     if let Some(split) = ev.discovery.gap_exit_mappings {
-        object.insert(
-            "gap_exit_mappings".into(),
-            serde_json::json!({
-                "mapped": split.mapped,
-                "unknown": split.unknown,
-            }),
-        );
+        object.insert("gap_exit_mappings".into(), exit_mappings_split_json(&split));
     }
     // B17 W2: present whenever the capture produced reload evidence:
     // a disclosed tainted identity, or nonzero count snapshots with
@@ -4957,10 +4990,13 @@ pub(crate) mod tests {
                 "unknown": 3,
             })
         );
-        // The metrics lane embeds `Evidence` directly: profile-only
-        // fields stay absent even when armed.
+        // 7.10b: the metrics lane hoists the armed split with the
+        // same closed shape the profile lane publishes.
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
-        assert!(metrics["evidence"].get("gap_exe_hints").is_none());
+        assert_eq!(
+            metrics["evidence"]["gap_exe_hints"],
+            profile["evidence"]["gap_exe_hints"]
+        );
     }
 
     // 614b P2#5: the shares-unchanged twin over a nonzero observed
@@ -5079,11 +5115,13 @@ pub(crate) mod tests {
             profile["evidence"]["gap_exit_mappings"],
             serde_json::json!({"mapped": 2, "unknown": 3})
         );
-        // The metrics lane embeds `Evidence` directly: the
-        // serde-skipped carrier keeps this profile-only key absent
-        // even when armed.
+        // 7.10b: the metrics lane hoists the armed split with the
+        // same closed shape the profile lane publishes.
         let metrics = json(&reports_fixture(), &ev, &capture_fixture());
-        assert!(metrics["evidence"].get("gap_exit_mappings").is_none());
+        assert_eq!(
+            metrics["evidence"]["gap_exit_mappings"],
+            profile["evidence"]["gap_exit_mappings"]
+        );
     }
 
     #[test]
@@ -5099,11 +5137,9 @@ pub(crate) mod tests {
     }
 
     // The trace lane renders through the shared `versioned_evidence`
-    // hoist (not a direct `Evidence` embed like metrics), so an armed
-    // `Evidence` publishes the split key in a trace terminal record
-    // too; absence in real traces holds only via the arming gate
-    // (trace never arms: `extensive_effective` requires
-    // `Kind::Profile`).
+    // hoist, so an armed `Evidence` publishes the split key in a
+    // trace terminal record too; 7.10b arms trace captures, so real
+    // armed traces carry it.
     #[test]
     fn trace_evidence_line_hoists_armed_gap_exit_mappings() {
         let line_for = |ev: &Evidence| {

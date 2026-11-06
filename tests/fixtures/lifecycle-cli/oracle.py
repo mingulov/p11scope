@@ -368,10 +368,26 @@ def judge_short_pid(report, ledger_text, receipt):
     evidence = report.get("evidence", {})
     require(evidence.get("gap_exe_hints") is None,
             "flag recorded exe hints under --pid")
+    require(evidence.get("gap_exit_mappings") is None,
+            "flag recorded exit mappings under --pid")
+    # 7.10b: the widened --pid cell arms the PID consumer. The gated
+    # workload performs no mid-capture exec, so the split is present
+    # with a zero total.
+    target = evidence.get("target_exec_hints")
+    require(isinstance(target, dict), "target_exec_hints missing")
+    require(target.get("label") == "STATIC HINT",
+            f"target_exec_hints label wrong: {target!r}")
+    counts = [target.get(key) for key in
+              ("links_provider", "links_pkcs11_loader",
+               "no_static_link_within_scope", "unknown")]
+    require(all(type(count) is int and count >= 0 for count in counts),
+            f"target_exec_hints counts wrong: {target!r}")
+    require(sum(counts) == 0,
+            f"target_exec_hints total {sum(counts)} != 0: {target!r}")
     provider = receipt["provider_before"]
     matched = check_report_counts(report, expected, cell, provider)
     shown = {name: matched.get(name, 0) for name in sorted(expected)}
-    return passed(cell, f"pid exact, no hints: {shown}")
+    return passed(cell, f"pid exact, target split zero: {shown}")
 
 
 def main(argv):

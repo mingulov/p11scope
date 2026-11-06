@@ -131,9 +131,11 @@ pub struct CaptureArgs {
     pub allow_confined_uretprobe: bool,
     /// `--attach-backend`: static attach backend; Auto follows the policy.
     pub attach_backend: BackendSelection,
-    /// `--track-short-lived`: extensive mode (6.14 Option B). The kernel
-    /// records exec-time exe identity and the engine classifies novel
-    /// unmatched exits into static-linkage hints. Default off.
+    /// `--track-short-lived`: extensive mode (6.14 Option B, widened
+    /// by 7.10b). The kernel records exec-time exe identity; the
+    /// engine classifies novel unmatched exits into static-linkage
+    /// hints on cgroup/system scopes and validated target execs on
+    /// exact-PID scope. Default off.
     pub track_short_lived: bool,
     /// `-v`/`--verbose`: full text detail plus informational stderr
     /// notes. Default off; refused beside `--quiet`.
@@ -192,8 +194,9 @@ pub struct RunArgs {
     /// `--kill-on-timeout`: `--duration` expiry ends the child too, instead of
     /// handing it back still running.
     pub kill_on_timeout: bool,
-    /// `--track-short-lived`: extensive mode (6.14 Option B), same as
-    /// profile. Default off.
+    /// `--track-short-lived`: extensive mode (6.14 Option B, widened
+    /// by 7.10b), same as profile: an owned run arms the PID
+    /// target-exec consumer for its child. Default off.
     pub track_short_lived: bool,
     /// `-v`/`--verbose`: full text detail plus informational stderr
     /// notes. Default off; refused beside `--quiet`.
@@ -583,7 +586,7 @@ Exactly one of --pid, --cgroup, or --system is required; --cgroup includes desce
 --track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
 executable identity and unmatched exits are grouped by linkage.
 Refused beside --counter-mode: it arms Detailed captures only.
-Arms only on profile --cgroup/--system captures; elsewhere it records nothing.
+On --cgroup/--system captures it groups unmatched exits by linkage; on --pid it groups the target's own execs.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends capture cleanly and writes the final -o report.
@@ -596,6 +599,7 @@ const TRACE_HELP_HEAD: &str = "usage:
   p11scope trace   [same scope and discovery options] [--duration <…>] [--max-events <n>] [-o <out.file>]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>]
                    [--attach-backend auto|multi|singles]
+                   [--track-short-lived]
                    [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
@@ -611,6 +615,9 @@ Provider identity is pinned by SHA-256 at attach and checked for in-place change
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
+--track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
+executable identity and unmatched exits are grouped by linkage.
+On --cgroup/--system captures it groups unmatched exits by linkage; on --pid it groups the target's own execs.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 ";
@@ -636,6 +643,7 @@ const RUN_HELP: &str = "usage:
   p11scope run     [same discovery options] [--mode profile|metrics | --trace] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <…>]
                    [-o <out>] [--pause never|auto|always] [--kill-on-timeout] [--user <name|uid>]
                    [--attach-backend auto|multi|singles]
+                   [--track-short-lived]
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
 
 example:
@@ -665,6 +673,8 @@ while a leader exit that is the last lifecycle record ends the window cleanly.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
+--track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
+executable identity and the child's own execs are grouped by linkage.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends the capture cleanly.
@@ -2138,15 +2148,8 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         }
     }
 
-    // Beside an owned run the flag records nothing (6.14 Option B
-    // authorizes it only on Detailed profile --cgroup/--system
-    // captures), so taking it silently would lie about coverage.
-    if common.track_short_lived {
-        return Err(usage_err(
-            "--track-short-lived records nothing beside run; remove it \
-             (it arms only Detailed profile --cgroup/--system captures)",
-        ));
-    }
+    // 7.10b: an owned run arms the PID target-exec consumer for
+    // its child, so the flag is accepted here like everywhere else.
     // No `--`, nothing after it, and an empty program name are the same
     // refusal: there is no command for this observer to start and own.
     if command.first().is_none_or(|program| program.is_empty()) {

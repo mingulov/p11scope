@@ -3467,17 +3467,11 @@ fn capture_with_host(
     refuse_if_interrupted_before_attach(&stop)?;
     let mut engine = discovered?;
     engine.retain_return_probe_admission(return_admission);
-    // 6.14 Option B: arm extensive mode before the session publishes
-    // its CONFIG bit; inventory never reaches this flow. Counter
-    // policies never arm (the CLI combination already refused), and
-    // neither do captures that cannot publish hints (614b P1).
-    engine.arm_extensive(extensive_effective(
-        a.track_short_lived,
-        kind,
-        a.metrics,
-        &scope,
-        policy,
-    ));
+    // 7.10b: arm extensive mode before the session publishes its
+    // CONFIG bit; inventory never reaches this flow. Counter policies
+    // never arm (the CLI combination already refused). The engine
+    // splits the gap and PID consumers by scope itself.
+    engine.arm_extensive(extensive_effective(a.track_short_lived, policy), policy);
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     // A named pid that died after scope resolution fails below with the one
@@ -3557,27 +3551,15 @@ fn no_profile_duration_notice() -> String {
         .to_string()
 }
 
-/// 614b P1 narrow authorization: whether `--track-short-lived`
-/// actually arms the kernel exe-identity read for this capture. The
-/// read is granted only where the resulting STATIC HINT split can
-/// publish: a Detailed (non-counter) profile-kind, non-metrics
-/// capture over a generation-admitting scope (cgroup/system), the
-/// only shape that classifies descendant gaps. Everywhere else the
-/// flag stays accepted but records nothing — no exe identity is
-/// captured for a counter, trace, metrics, exact-PID or owned-`run`
-/// capture, where no hint could ever be published.
-pub(crate) fn extensive_effective(
-    track_short_lived: bool,
-    kind: Kind,
-    metrics: bool,
-    scope: &Scope,
-    policy: CapturePolicy,
-) -> bool {
-    track_short_lived
-        && policy.allows_track_short_lived()
-        && kind == Kind::Profile
-        && !metrics
-        && matches!(scope, Scope::Cgroup { .. } | Scope::System)
+/// 7.10b widening: whether `--track-short-lived` actually arms the
+/// kernel exe-identity read for this capture. The read is granted on
+/// every Detailed (non-counter) lane and scope that publishes a hint:
+/// profile, trace and metrics lanes over cgroup/system scopes (gap
+/// splits) and over exact-PID scope, including owned `run` (the PID
+/// target-exec split). Counter policies never arm (the CLI
+/// combination already refused); inventory never reaches this flow.
+pub(crate) fn extensive_effective(track_short_lived: bool, policy: CapturePolicy) -> bool {
+    track_short_lived && policy.allows_track_short_lived()
 }
 
 pub(crate) fn capture_policy(
@@ -4589,18 +4571,11 @@ fn run_owned_inner_with_host(
     let out = OutputSink::open(args.kind, args.out.as_deref())
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
-    // 6.14 Option B: arm extensive mode before the session publishes
-    // its CONFIG bit. Counter policies never arm (the CLI
-    // combination already refused), and neither do captures that
-    // cannot publish hints (614b P1): an owned `run` is an exact-PID
-    // scope, which never classifies descendant gaps.
-    engine.arm_extensive(extensive_effective(
-        args.track_short_lived,
-        args.kind,
-        args.metrics,
-        &scope,
-        policy,
-    ));
+    // 7.10b: arm extensive mode before the session publishes its
+    // CONFIG bit. Counter policies never arm (the CLI combination
+    // already refused). An owned `run` is an exact-PID scope, which
+    // arms the PID target-exec consumer for the child.
+    engine.arm_extensive(extensive_effective(args.track_short_lived, policy), policy);
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -17427,74 +17402,33 @@ mod tests {
     }
 
     // 7.10b widening: the exe-identity read arms on every Detailed
-    // lane and scope that publishes a hint — trace and metrics as
-    // well as profile, exact-PID (target-exec hints) as well as
-    // cgroup/system (gap splits). Counter policies still never arm.
+    // lane and scope that publishes a hint — the helper only needs
+    // the flag and the policy, since trace, metrics and exact-PID
+    // all publish now (gap splits on cgroup/system, target-exec
+    // hints on PID scope). Counter policies still never arm.
     #[test]
-    fn extensive_arms_all_detailed_lanes_and_scopes() {
-        let cgroup = Scope::Cgroup {
-            id: 1,
-            path: "/".into(),
-            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
-        };
-        let detailed = CapturePolicy::Allowlisted;
-        // The 5a publishing shape arms, on either admitting scope.
-        assert!(extensive_effective(
-            true,
-            Kind::Profile,
-            false,
-            &cgroup,
-            detailed
-        ));
-        assert!(extensive_effective(
-            true,
-            Kind::Profile,
-            false,
-            &Scope::System,
-            detailed
-        ));
-        // Default off stays off everywhere.
-        assert!(!extensive_effective(
-            false,
-            Kind::Profile,
-            false,
-            &cgroup,
-            detailed
-        ));
-        // Trace publishes the gap splits in its terminal EVIDENCE.
-        assert!(extensive_effective(
-            true,
-            Kind::Trace,
-            false,
-            &cgroup,
-            detailed
-        ));
-        // Metrics publishes the gap splits in its evidence object.
-        assert!(extensive_effective(
-            true,
-            Kind::Profile,
-            true,
-            &cgroup,
-            CapturePolicy::AggregateOnly
-        ));
-        // Exact-PID scope publishes target-exec hints for the named
-        // target. (An owned `run` is this shape.)
-        assert!(extensive_effective(
-            true,
-            Kind::Profile,
-            false,
-            &Scope::Pid(41),
-            detailed
-        ));
+    fn extensive_arms_all_detailed_policies() {
+        // Every Detailed policy arms with the flag set.
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+            CapturePolicy::AggregateOnly,
+        ] {
+            assert!(extensive_effective(true, policy), "{policy:?}");
+            assert!(!extensive_effective(false, policy), "{policy:?}");
+        }
         // P2#2 confinement still holds inside the helper: a counter
         // policy never arms, whatever the other inputs.
-        assert!(!extensive_effective(
-            true,
-            Kind::Profile,
-            false,
-            &cgroup,
-            CapturePolicy::Counter(p11scope_ebpf_common::CounterMode::Counts)
-        ));
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            assert!(
+                !extensive_effective(true, CapturePolicy::Counter(mode)),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

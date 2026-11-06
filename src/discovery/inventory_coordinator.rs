@@ -8069,7 +8069,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// A `NoLiveCaller`/`CallerExited` row provably after a holder's
     /// admission (its `first_seen_ns` is at or before `row_ns`) reads
     /// `caller_exited_before_match`: the caller exited before the row
-    /// could be matched, not before admission.
+    /// could be matched, not before admission. A retained row that an
+    /// exec record voids still reads `use_before_admission` even when
+    /// its admission provably predates the row: only exit-miss rows get
+    /// the post-admission wording (residual pending a wording ruling —
+    /// exec-voids are never relabeled as exits).
     fn note_preadmission(
         &mut self,
         pid: u32,

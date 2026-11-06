@@ -453,8 +453,16 @@ non-null values needs a new allowlist row.
     same way but reads `caller_exited_before_match`: the caller exited
     before the row could be matched, not before admission. A short-lived
     caller whose retained identity is unambiguous (exactly one retained
-    incarnation holds the tgid, the row falls inside its lifetime, no
-    exec or PID reuse recorded) binds instead and counts on the edge.
+    incarnation held the tgid when the row was read, the row falls inside
+    its lifetime, and no exec, lost lifecycle evidence, or competing image
+    is recorded at or after its admission) binds instead and counts on the
+    edge. A second holder admitted after the row was read does not void
+    the binding: the holder count is evaluated once, at the read. A
+    retained row that an exec record voids still reads
+    `use_before_admission` even when its admission provably predates the
+    row: only exit-miss rows carry the post-admission wording, and no
+    post-admission exec-void label exists (residual pending a wording
+    ruling — exec-voids are never relabeled as exits).
   - `pending_first_use` (native lane, transient): a `CALLER_USE` row of
     this caller's pid on this module is read but undecided — its
     lifecycle and health horizons have not arrived yet, so the edge may

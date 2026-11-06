@@ -46,11 +46,16 @@
 //! A row with no live answer (no live incarnation held `T` when it was
 //! read, or the pin died during the query) may still bind through the
 //! retained scan-time identity, and only then: exactly one retained
-//! incarnation holds `T` with a proven start time and exe identity, `t0`
-//! falls inside its monotonic lifetime (admitted at or before `t0`, and
-//! strictly before the observed exit when retired), and no exec, lost
-//! lifecycle evidence, PID reuse (a second retained holder of `T`) or
-//! competing image is recorded. The checks run under the same horizons;
+//! incarnation held `T` when the row was read, with a proven start time
+//! and exe identity; `t0` falls inside its monotonic lifetime (admitted
+//! at or before `t0`, and strictly before the observed exit when
+//! retired); and no exec, lost lifecycle evidence, or competing image is
+//! recorded at or after its admission. The holder count is evaluated
+//! once, when the row is read: a second retained holder of `T` (PID
+//! reuse) admitted after the read does not void the binding — reuse
+//! requires the old task dead, and the old task was alive at the event,
+//! so the row is still its use. The exec, loss, coverage, and
+//! competing-image checks run at decision time under the same horizons;
 //! anything else keeps its [`UnboundReason::NoLiveCaller`] or
 //! [`UnboundReason::CallerExited`] gap, never a merge by pid.
 //!
@@ -243,8 +248,9 @@ pub(crate) struct LiveCaller<'a, Pin> {
 /// One retained incarnation for a pid, as the binder's unambiguous
 /// post-exit fallback sees it: the scan-time identity (PID plus start
 /// time and exe identity) with its monotonic lifetime. The binder binds
-/// through it only when exactly one retained incarnation matches the
-/// row's tgid and the row's instant falls inside its lifetime.
+/// through it only when exactly one retained incarnation held the row's
+/// tgid when the row was read (a reuse admitted later does not void the
+/// binding) and the row's instant falls inside its lifetime.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetainedCaller {
     pub id: CallerId,

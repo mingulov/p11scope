@@ -2869,9 +2869,16 @@ fn merge_discovered_module(
     }
     // The incoming snapshot's interval state supersedes: a module that lost
     // its pre-arm source is genuinely unwatched, and a live watch's current
-    // state is always fresher than the retained one. Attach keys only move
+    // state is always fresher than the retained one. The deciding admission
+    // class likewise supersedes when present: early evidence may show a
+    // closure array as heuristic/corroborated before all its lookalike
+    // tables decode, and the retained record must end at the deciding
+    // class, never the first impression. Attach keys only move
     // forward into set, never back to unset: assembly runs once at capture
     // end, and a later snapshot must not clobber assembled keys with `None`.
+    if incoming.admission_class.is_some() {
+        retained.admission_class = incoming.admission_class;
+    }
     retained.watch = incoming.watch;
     if incoming.attached_at_ns.is_some() {
         retained.attached_at_ns = incoming.attached_at_ns;

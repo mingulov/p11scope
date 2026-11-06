@@ -45,7 +45,7 @@
 # count every second, but only once the observer runs the measured binary
 # (the env/taskset images before exec are not samples). readiness.txt
 # records when the observer was ready (inventory: its first stage-timed pass;
-# profile: its "capturing: N probe(s) attached" line).
+# profile: its "capturing: N probes attached" line).
 #
 # --observer-ns (default population): where the observer, the churn and the
 # latency probe run. `population` is C1b's shape: inside the population's PID

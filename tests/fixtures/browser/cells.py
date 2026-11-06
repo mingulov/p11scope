@@ -240,12 +240,16 @@ def wait_for_mapping(pid: int, needles: tuple[str, ...], timeout_seconds: float 
 
 
 def _parse_capture_ready(line: str) -> int | None:
-    """Parse ``p11scope: capturing: N probe(s) attached``; None otherwise."""
+    """Parse ``p11scope: capturing: N probe`` / ``N probes attached``; None otherwise."""
     prefix = "p11scope: capturing: "
     if not line.startswith(prefix):
         return None
+    head = line[len(prefix):].split(" attached", 1)[0]
+    count_text, space, unit = head.rpartition(" ")
+    if not space or unit not in ("probe", "probes"):
+        return None
     try:
-        return int(line[len(prefix):].split(" probe(s) attached", 1)[0])
+        return int(count_text)
     except ValueError:
         return None
 

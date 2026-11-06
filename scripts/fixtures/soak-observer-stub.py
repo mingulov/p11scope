@@ -95,7 +95,7 @@ def main(argv):
     print("p11scope: discovery: 1 module(s), 2 attach slot(s), scan 1ms, "
           "conflicts 0, uncorroborated 0", file=sys.stderr, flush=True)
     time.sleep(args.attach_delay)
-    print("p11scope: capturing: 2 probe(s) attached; stop with Ctrl-C",
+    print("p11scope: capturing: 2 probes attached; stop with Ctrl-C",
           file=sys.stderr, flush=True)
     # Sleep the full duration in slices so a harness interrupt lands fast.
     deadline = time.monotonic() + args.duration

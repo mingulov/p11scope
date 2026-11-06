@@ -316,7 +316,7 @@ EOF
     printf '%s\n' 'p11scope: sweeping 440 process maps (cap 256)...' \
         'p11scope: pass 0: 256 scanned (1 maps-matched; 0 native, 256 scan-pinned)' > "$stub/ready.err"
     wait_ready ready 999999 || { echo "pass-0 readiness missed" >&2; exit 1; }
-    printf '%s\n' 'p11scope: capturing: 3 probe(s) attached; stop with Ctrl-C' \
+    printf '%s\n' 'p11scope: capturing: 3 probes attached; stop with Ctrl-C' \
         'p11scope: sweeping 440 process maps (cap 256)...' > "$stub/early.err"
     if wait_ready early 999999 >/dev/null 2>&1; then
         echo "inventory readiness accepted without pass 0" >&2

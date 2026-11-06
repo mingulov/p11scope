@@ -331,7 +331,7 @@ c3_capture_self_test() {
     cst_stub=$1
     # Profile readiness: the capture line only.
     printf '%s\n' 'pod cgroup: /sys/fs/cgroup/x' \
-        'p11scope: capturing: 3 probe(s) attached; stop with Ctrl-C' > "$cst_stub/work/ready.err"
+        'p11scope: capturing: 3 probes attached; stop with Ctrl-C' > "$cst_stub/work/ready.err"
     WORK=$cst_stub/work wait_ready ready 999999 \
         || { echo "capture readiness missed" >&2; exit 1; }
     printf '%s\n' 'pod cgroup: /sys/fs/cgroup/x' > "$cst_stub/work/early.err"

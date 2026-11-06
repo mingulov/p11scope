@@ -30561,18 +30561,13 @@ impl Engine {
             return Ok(());
         }
         // Rebuilds lower Detailed plans, so a manifest-authorized
-        // slot would refuse the Counters policy below. Counters
-        // never read arguments: shed the authority first, keeping
-        // every slot's identity and names. The budget refuses
+        // slot would refuse the Counters policy below. The shared
+        // helper sheds that authority counters never use, keeping
+        // every slot's identity and names; the budget refuses
         // before any mutation, so a refusal leaves the plan
         // untouched.
-        budget
-            .validate_count(self.plan.slots.len())
-            .map_err(|refusal| anyhow!("{refusal}"))?;
-        self.plan.demote_slots_to_count_only();
-        self.plan = self
-            .plan
-            .with_counters_policy(budget)
+        self.plan
+            .admit_counters_under_budget(budget)
             .map_err(|refusal| anyhow!("{refusal}"))?;
         self.plan_rebuild_stable = false;
         Ok(())
@@ -30757,17 +30752,12 @@ impl Engine {
             let budget = Self::counter_start_budget(mode, self.counter_preflight_cpus())?;
             // Discovery lowers a Detailed plan, so manifest inputs
             // arrive with argument-read authority the Counters
-            // policy refuses. Counters never read arguments: shed
-            // that authority first, keeping identities and names.
-            // The budget refuses before any mutation, so a refusal
-            // leaves the plan untouched.
-            budget
-                .validate_count(self.plan.slots.len())
-                .map_err(|refusal| anyhow!("{refusal}"))?;
-            self.plan.demote_slots_to_count_only();
-            self.plan = self
-                .plan
-                .with_counters_policy(budget)
+            // policy refuses. The shared helper sheds that
+            // authority counters never use, keeping identities and
+            // names; the budget refuses before any mutation, so a
+            // refusal leaves the plan untouched.
+            self.plan
+                .admit_counters_under_budget(budget)
                 .map_err(|refusal| anyhow!("{refusal}"))?;
             self.plan_rebuild_stable = false;
             Some(budget)

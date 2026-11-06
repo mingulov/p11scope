@@ -1502,6 +1502,22 @@ impl AttachPlan {
         }
     }
 
+    /// The one counter re-admission triple both engine sites share:
+    /// validate the budget before any mutation (a refusal leaves the
+    /// plan untouched), shed argument-read authority counters never
+    /// use, then flip to the Counters policy. A future site that
+    /// admits counters must call this, never the preserving
+    /// [`with_counters_policy`](Self::with_counters_policy) directly.
+    pub(crate) fn admit_counters_under_budget(
+        &mut self,
+        budget: crate::capacity::CounterBudget,
+    ) -> Result<(), String> {
+        budget.validate_count(self.slots.len())?;
+        self.demote_slots_to_count_only();
+        *self = self.with_counters_policy(budget)?;
+        Ok(())
+    }
+
     /// Restore the staged counter prefix on a freshly rebuilt plan, which
     /// always starts unconsumed. The caller passes the committed staged
     /// length (the directory high-water); lengths past the slots refuse.
@@ -7623,6 +7639,53 @@ mod tests {
         converted
             .validate_slot_index()
             .expect("a demoted plan validates under Counters");
+    }
+
+    #[test]
+    fn counter_readmission_helper_admits_semantic_slots_under_budget() {
+        // The shared re-admission triple both engine sites call: the
+        // budget refuses before any mutation, semantic slots demote,
+        // the policy flips, and the demoted plan validates.
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Encrypt", 0x20)]);
+        let mut plan =
+            build_from_test_sources_with_policy(&[], &[manifest], AdmissionPolicy::detailed());
+        assert!(
+            plan.slots.iter().any(|slot| slot.descriptor_index != 0),
+            "precondition: the manifest discovery plan carries semantic slots"
+        );
+        let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+        plan.admit_counters_under_budget(budget).unwrap();
+        assert!(
+            matches!(
+                plan.admission_policy(),
+                AdmissionPolicy::Counters(kept) if kept == budget
+            ),
+            "the helper flips to Counters under the budget"
+        );
+        for slot in &plan.slots {
+            assert_eq!(slot.descriptor_index, 0, "slot {} demoted", slot.index);
+            assert_eq!(slot.semantics, SlotSemantics::COUNT_ONLY);
+            assert!(
+                !slot.semantic_authorized,
+                "slot {} unauthorized",
+                slot.index
+            );
+        }
+        plan.validate_slot_index()
+            .expect("a helper-admitted plan validates under Counters");
+        // Over-budget admission refuses without mutating the source.
+        let manifest = manifest_with(vec![resolved("C_Sign", 0x10), resolved("C_Encrypt", 0x20)]);
+        let mut over =
+            build_from_test_sources_with_policy(&[], &[manifest], AdmissionPolicy::detailed());
+        let before = over.clone();
+        let tight_limit = u64::try_from(over.slots.len().saturating_sub(1)).unwrap();
+        let tight = crate::capacity::CounterBudget::new(tight_limit).unwrap();
+        assert!(over.admit_counters_under_budget(tight).is_err());
+        assert_eq!(over.slots, before.slots, "slots untouched on refusal");
+        assert!(
+            matches!(over.admission_policy(), AdmissionPolicy::Detailed),
+            "refusal leaves the Detailed plan untouched"
+        );
     }
 
     #[test]

@@ -58,6 +58,36 @@ fn counters_plan_on(count: u32, object: PinnedObjectId) -> plan::AttachPlan {
     .unwrap()
 }
 
+fn semantic_slot(index: u32, object: PinnedObjectId, name: &str, file_offset: u64) -> plan::Slot {
+    let descriptor_index = crate::kinds::function_id(name).unwrap() + 1;
+    plan::Slot {
+        index,
+        descriptor_index,
+        object,
+        object_path: "/counter-provider.so".into(),
+        file_offset,
+        names: vec![name.into()],
+        aliased: false,
+        semantics: crate::kinds::DESCRIPTORS[descriptor_index as usize],
+        semantic_authorized: true,
+        semantic_ambiguous: false,
+        fork_safe: false,
+        module_ids: vec![plan::ModuleId(0)],
+    }
+}
+
+fn detailed_semantic_plan() -> plan::AttachPlan {
+    let object = PinnedObjectId(7);
+    plan::AttachPlan::from_slots_with_policy(
+        vec![
+            semantic_slot(0, object, "C_Sign", 0x10),
+            semantic_slot(1, object, "C_Encrypt", 0x20),
+        ],
+        plan::AdmissionPolicy::Detailed,
+    )
+    .unwrap()
+}
+
 #[test]
 fn counter_spec_for_startup_routes_policy() {
     let engine = Engine::empty_for_test();
@@ -785,5 +815,100 @@ fn counter_retain_restore_refuses_an_over_budget_plan_with_its_named_reason() {
     assert_eq!(
         engine.plan.slots, before.slots,
         "slots untouched on refusal"
+    );
+}
+
+/// Healthy twin of the empty-plan restore test with manifest-shaped
+/// semantic slots: the restore site must shed argument-read authority
+/// before flipping to Counters, keeping identities and names, and the
+/// demoted plan must validate.
+#[test]
+fn counter_retain_restore_demotes_semantic_slots_before_policy_flip() {
+    let mut engine = Engine::empty_for_test();
+    engine.plan = detailed_semantic_plan();
+    assert!(
+        engine
+            .plan
+            .slots
+            .iter()
+            .any(|slot| slot.descriptor_index != 0),
+        "precondition: the restore plan carries semantic slots"
+    );
+    let before: Vec<(u32, PinnedObjectId, u64, Vec<String>)> = engine
+        .plan
+        .slots
+        .iter()
+        .map(|slot| {
+            (
+                slot.index,
+                slot.object,
+                slot.file_offset,
+                slot.names.clone(),
+            )
+        })
+        .collect();
+    let budget = crate::capacity::CounterBudget::new(8192).unwrap();
+    engine.restore_counters_policy_after_retain(budget).unwrap();
+    assert!(
+        matches!(
+            engine.plan.admission_policy(),
+            plan::AdmissionPolicy::Counters(kept) if kept == budget
+        ),
+        "the retained plan is re-admitted under the unchanged start budget"
+    );
+    for slot in &engine.plan.slots {
+        assert_eq!(slot.descriptor_index, 0, "slot {} demoted", slot.index);
+        assert_eq!(slot.semantics, crate::kinds::DESCRIPTORS[0]);
+        assert!(
+            !slot.semantic_authorized,
+            "slot {} unauthorized",
+            slot.index
+        );
+    }
+    assert_eq!(
+        engine.plan.slots.len(),
+        before.len(),
+        "demotion keeps every slot"
+    );
+    for (slot, (index, object, offset, names)) in engine.plan.slots.iter().zip(before.iter()) {
+        assert_eq!(&slot.index, index);
+        assert_eq!(&slot.object, object);
+        assert_eq!(&slot.file_offset, offset);
+        assert_eq!(&slot.names, names, "names survive for selection");
+    }
+    engine
+        .plan
+        .validate_slot_index()
+        .expect("a demoted plan validates under Counters");
+}
+
+/// Both counter re-admission sites funnel through the shared helper,
+/// so a future site cannot forget the demote step. The start site has
+/// no live-`Session` unit seam; this pins its wiring beside the
+/// runtime-covered restore site.
+#[test]
+fn counter_readmission_sites_share_the_demote_helper() {
+    let source = include_str!("engine.rs");
+    let start_route = source
+        .split_once("    fn start_session_with(")
+        .expect("start_session_with exists")
+        .1
+        .split_once("\n    }\n}")
+        .expect("start_session_with body ends")
+        .0;
+    assert!(
+        start_route.contains("admit_counters_under_budget"),
+        "the start site funnels through the shared helper"
+    );
+    let restore_route = source
+        .split_once("    fn restore_counters_policy_after_retain(")
+        .expect("restore site exists")
+        .1
+        .split_once("    fn counter_preflight_cpus(")
+        .expect("restore site ends before the next method")
+        .0;
+    assert!(
+        restore_route.contains("admit_counters_under_budget"),
+        "the restore site funnels through the shared helper"
     );
 }

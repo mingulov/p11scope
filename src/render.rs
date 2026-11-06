@@ -8623,7 +8623,10 @@ pub(crate) mod tests {
         ev.discovery.modules = vec![layer, backend];
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libforward.so".into(),
-            reason: "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix of its 67 lookalike function tables (a proxy closure array is admitted whole under this capture policy)".into(),
+            reason: format!(
+                "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix of its 67 lookalike function tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_WHOLE
+            ),
         });
         ev.verdict();
         let document = json(&[outer, inner], &ev, &capture_fixture());

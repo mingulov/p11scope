@@ -1436,13 +1436,12 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
     render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
-/// Forwarding-layer (closure-array admission) modules with entries on
-/// their edges, each with its entry total. A forwarding entry contains
-/// one provider entry on the same thread, so provider edges are the
-/// logical totals and these stay separate, never summed in. Matches the
-/// planner's `closure_array` label and its hyphenated test spelling.
-pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(String, u64)> {
-    let mut layers: Vec<(String, u64)> = presentation
+/// Closure-array (forwarding-layer) module ids, by admission class.
+/// Matches the planner's `closure_array` label and its hyphenated test
+/// spelling. The split set; whether an edge at one splits out is per
+/// caller ([`provider_active_callers`]).
+fn closure_module_ids(presentation: &Presentation) -> std::collections::BTreeSet<ModuleId> {
+    presentation
         .modules
         .iter()
         .filter(|module| {
@@ -1451,11 +1450,56 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
                 Some("closure_array" | "closure-array")
             )
         })
+        .map(|module| module.id)
+        .collect()
+}
+
+/// Callers with entries at a watched provider: an edge with
+/// `entry_count > 0` at a non-closure module. A closure edge splits to
+/// forwarding only for these callers; a closure-only caller's edges
+/// stay logical, since nothing below the layer observed them.
+fn provider_active_callers(
+    presentation: &Presentation,
+    closure: &std::collections::BTreeSet<ModuleId>,
+) -> std::collections::BTreeSet<CallerId> {
+    presentation
+        .edges
+        .iter()
+        .filter(|edge| !closure.contains(&edge.module) && edge.entry_count > 0)
+        .map(|edge| edge.caller)
+        .collect()
+}
+
+/// True when an edge's entries are forwarding-layer observations: the
+/// edge sits at a closure-array module and its caller also entered a
+/// watched provider, whose edge is the logical count.
+fn edge_is_forwarding(
+    edge: &EdgeView,
+    closure: &std::collections::BTreeSet<ModuleId>,
+    active: &std::collections::BTreeSet<CallerId>,
+) -> bool {
+    closure.contains(&edge.module) && active.contains(&edge.caller)
+}
+
+/// Forwarding-layer (closure-array admission) modules with entries on
+/// their edges, each with its entry total. Provider edges are the
+/// logical totals and these stay separate, never summed in. Only
+/// edges of provider-active callers count here; a closure-only
+/// caller's edges stay logical (see [`provider_active_callers`]).
+pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(String, u64)> {
+    let closure = closure_module_ids(presentation);
+    let active = provider_active_callers(presentation, &closure);
+    let mut layers: Vec<(String, u64)> = presentation
+        .modules
+        .iter()
+        .filter(|module| closure.contains(&module.id))
         .map(|module| {
             let entries = presentation
                 .edges
                 .iter()
-                .filter(|edge| edge.module == module.id)
+                .filter(|edge| {
+                    edge.module == module.id && edge_is_forwarding(edge, &closure, &active)
+                })
                 .map(|edge| edge.entry_count)
                 .fold(0u64, u64::saturating_add);
             let path = module
@@ -1472,24 +1516,16 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
 }
 
 /// Logical vs forwarding-layer entry totals over every edge. Provider
-/// edges are logical; closure-array edges are forwarding observations
-/// of those same calls.
+/// edges are logical; closure-array edges of provider-active callers
+/// are forwarding observations of those same calls, and closure-only
+/// callers' edges stay logical.
 pub(crate) fn layer_entry_totals(presentation: &Presentation) -> (u64, u64) {
-    let forwarding: std::collections::BTreeSet<ModuleId> = presentation
-        .modules
-        .iter()
-        .filter(|module| {
-            matches!(
-                module.admission_class.as_deref(),
-                Some("closure_array" | "closure-array")
-            )
-        })
-        .map(|module| module.id)
-        .collect();
+    let closure = closure_module_ids(presentation);
+    let active = provider_active_callers(presentation, &closure);
     let mut logical = 0u64;
     let mut forwarding_entries = 0u64;
     for edge in &presentation.edges {
-        if forwarding.contains(&edge.module) {
+        if edge_is_forwarding(edge, &closure, &active) {
             forwarding_entries = forwarding_entries.saturating_add(edge.entry_count);
         } else {
             logical = logical.saturating_add(edge.entry_count);

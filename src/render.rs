@@ -2312,8 +2312,16 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
 /// Identified structurally — never by path, name or vendor — from the
 /// deciding admission class first (this also catches whole-admitted
 /// closures under counter/broad policies, which carry no gap) and from
-/// the planner's closure gaps beside it.
-fn forwarding_module_ids(ev: &Evidence) -> std::collections::BTreeSet<ModuleId> {
+/// the planner's closure gaps beside it. The split additionally needs a
+/// watched, attributed, active provider below the layer in the same
+/// capture: without one (a lone remote client, an unattached or quiet
+/// provider) the layer's calls are the only observation and stay
+/// logical, so the set is empty. Render rows carry no caller, so the
+/// gate applies capture-wide.
+fn forwarding_module_ids(
+    ev: &Evidence,
+    reports: &[SlotReport],
+) -> std::collections::BTreeSet<ModuleId> {
     let mut names = std::collections::BTreeSet::new();
     for skipped in &ev.discovery.modules_skipped {
         if crate::plan::is_closure_array_prefix(&skipped.reason)
@@ -2322,14 +2330,23 @@ fn forwarding_module_ids(ev: &Evidence) -> std::collections::BTreeSet<ModuleId> 
             names.insert(skipped.name.as_str());
         }
     }
-    ev.discovery
+    let candidates: std::collections::BTreeSet<ModuleId> = ev
+        .discovery
         .modules
         .iter()
         .filter(|module| {
             module.admission_class == Some("closure_array") || names.contains(module.path.as_str())
         })
         .map(|module| module.id)
-        .collect()
+        .collect();
+    let provider_active = reports.iter().any(|row| {
+        row.module.is_some_and(|id| !candidates.contains(&id))
+            && (row.calls > 0 || row.errors > 0 || row.in_flight > 0)
+    });
+    if !provider_active {
+        return std::collections::BTreeSet::new();
+    }
+    candidates
 }
 
 /// True when a slot row counts calls at a forwarding layer. Attributed
@@ -2515,7 +2532,7 @@ pub fn scope_summary_with_verbosity(
     // a forwarding layer and the provider it forwards into counts in the
     // provider (logical) total only. Forwarding-layer calls are stated
     // separately below, never summed in.
-    let forwarding = forwarding_module_ids(ev);
+    let forwarding = forwarding_module_ids(ev, reports);
     let [(calls, errors, open), (fwd_calls, fwd_errors, fwd_open)] =
         layer_call_totals(reports, &forwarding, &ev.discovery.modules);
     let mut text = String::new();
@@ -2756,7 +2773,7 @@ pub fn live_scoped_with_verbosity(
     if !rows.is_empty() {
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
         s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
-        let forwarding = forwarding_module_ids(ev);
+        let forwarding = forwarding_module_ids(ev, reports);
         s.push_str(&format!(
             "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
             "FUNCTION", "PROVIDER", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
@@ -3721,7 +3738,7 @@ fn layer_totals_json(
 }
 
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
-    let forwarding = forwarding_module_ids(ev);
+    let forwarding = forwarding_module_ids(ev, reports);
     serde_json::json!({
         "schema": "p11scope/observed-profile/v3-metrics",
         // Machine-readable lane discriminator (SYSPLAN residual F-12): the
@@ -4148,7 +4165,7 @@ pub fn profile_json(
     capture: &CaptureMeta,
 ) -> serde_json::Value {
     let ev = versioned.evidence();
-    let forwarding = forwarding_module_ids(ev);
+    let forwarding = forwarding_module_ids(ev, reports);
     let mechanisms: Vec<MechanismOut> = state
         .mechanisms()
         .iter()

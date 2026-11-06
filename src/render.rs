@@ -2372,6 +2372,26 @@ fn row_is_forwarding(
     false
 }
 
+/// Ownership-gap rows behind the headline: logical rows only, since
+/// the gap lines explain headline attribution. Forwarding rows are
+/// stated in the forwarding line, never summed here.
+fn owner_gap_total(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+    gap: fn(&SlotReport) -> bool,
+) -> (bool, u64) {
+    let mut any = false;
+    let mut total = 0u64;
+    for row in reports {
+        if gap(row) && !row_is_forwarding(row, forwarding, modules) {
+            any = true;
+            total = total.saturating_add(row.calls);
+        }
+    }
+    (any, total)
+}
+
 /// Per-layer completed/error/in-flight totals over slot rows: logical
 /// (provider) calls first, forwarding-layer calls second. One logical
 /// call observed at both layers counts once, in the logical total.
@@ -2464,7 +2484,28 @@ fn forwarding_layer_lines(
         if !row_is_forwarding(report, forwarding, &ev.discovery.modules) {
             continue;
         }
-        let key = report.module.unwrap_or(ModuleId(u32::MAX));
+        // Attributed rows group under their module; unattributed rows
+        // group under the forwarding layer their attach target
+        // identifies (the same file-identity match as
+        // `row_is_forwarding`), so the per-layer line names the
+        // matched layer.
+        let key = report
+            .module
+            .or_else(|| {
+                report.target_object.as_ref().and_then(|target| {
+                    ev.discovery
+                        .modules
+                        .iter()
+                        .filter(|module| {
+                            forwarding.contains(&module.id)
+                                && module.dev == target.dev
+                                && module.ino == target.ino
+                        })
+                        .map(|module| module.id)
+                        .next()
+                })
+            })
+            .unwrap_or(ModuleId(u32::MAX));
         let slot = per_layer.entry(key).or_insert((0, 0, 0));
         slot.0 = slot.0.saturating_add(report.calls);
         slot.1 = slot.1.saturating_add(report.errors);
@@ -2524,11 +2565,6 @@ pub fn scope_summary_with_verbosity(
 ) -> String {
     use crate::cli::TextVerbosity;
     let verbose = verbosity == TextVerbosity::Verbose;
-    let sum = |field: fn(&SlotReport) -> u64| {
-        reports
-            .iter()
-            .fold(0u64, |total, row| total.saturating_add(field(row)))
-    };
     // Headline totals count logical calls once: a call observed at both
     // a forwarding layer and the provider it forwards into counts in the
     // provider (logical) total only. Forwarding-layer calls are stated
@@ -2587,15 +2623,17 @@ pub fn scope_summary_with_verbosity(
     }
     text.push_str(&excluded_lines(ev));
     if verbose {
-        for (has_owner_gap, total, description) in [
+        for ((has_owner_gap, total), description) in [
             (
-                reports.iter().any(|row| row.module_ambiguous),
-                sum(|row| if row.module_ambiguous { row.calls } else { 0 }),
+                owner_gap_total(reports, &forwarding, &ev.discovery.modules, |row| {
+                    row.module_ambiguous
+                }),
                 "ambiguous",
             ),
             (
-                reports.iter().any(|row| row.module_unresolved),
-                sum(|row| if row.module_unresolved { row.calls } else { 0 }),
+                owner_gap_total(reports, &forwarding, &ev.discovery.modules, |row| {
+                    row.module_unresolved
+                }),
                 "unresolved",
             ),
         ] {
@@ -2775,8 +2813,10 @@ pub fn live_scoped_with_verbosity(
         s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
         s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
         let forwarding = forwarding_module_ids(ev, reports);
+        // The name field fits the longest standard name plus the
+        // forwarding-layer marker, so marked rows keep the columns aligned.
         s.push_str(&format!(
-            "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+            "{:<40} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
             "FUNCTION", "PROVIDER", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
         ));
         for r in rows {
@@ -2797,7 +2837,7 @@ pub fn live_scoped_with_verbosity(
                 name.push_str(" (forwarding layer)");
             }
             s.push_str(&format!(
-                "{:<28} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+                "{:<40} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
                 escape_controls(&name),
                 provider_cell(r, &ev.discovery.modules),
                 r.calls,

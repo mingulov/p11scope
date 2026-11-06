@@ -97,7 +97,7 @@ class ParserTests(unittest.TestCase):
             parse_time_rss("no rss here\n")
 
     def test_readiness_detailed_pid(self):
-        lines = ["noise", "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"]
+        lines = ["noise", "p11scope: capturing: 136 probes attached; stop with Ctrl-C"]
         index, probes = parse_readiness(lines, "detailed-pid")
         self.assertEqual((index, probes), (1, 136))
 

@@ -1703,6 +1703,13 @@ mod tests {
             not_permitted_message(
                 why,
                 PrivilegeFacts {
+                    sys_admin: None,
+                    ..facts(true, false, Some(2))
+                },
+            ),
+            not_permitted_message(
+                why,
+                PrivilegeFacts {
                     init_user_ns: Some(false),
                     ..facts(true, true, Some(4))
                 },

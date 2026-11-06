@@ -1091,6 +1091,17 @@ class ReadinessPatternTests(unittest.TestCase):
             readiness.search(b"p11scope: capturing: waiting for the command to load a provider; "
                              b"stop with Ctrl-C\n"))
 
+    def test_observer_spawn_restores_diagnostics_on_a_copied_env(self):
+        text = (ROOT / "scripts/qualify-operator-output.py").read_text(encoding="utf-8")
+        self.assertIn("observer_env = dict(env)", text)
+        self.assertIn("env=observer_env", text)
+        self.assertIn("text=True, env=env", text)
+        assigns = [line.strip() for line in text.splitlines()
+                   if "P11SCOPE_CAPTURE_DIAGNOSTICS" in line and "=" in line
+                   and not line.strip().startswith("#")]
+        self.assertEqual(assigns, ["observer_env['P11SCOPE_CAPTURE_DIAGNOSTICS'] = '1'"])
+        self.assertNotIn("os.environ", text)
+
 
 class InventorySavedCaptureTests(unittest.TestCase):
     def test_only_committed_owned_positive_milestones_release_calls(self):

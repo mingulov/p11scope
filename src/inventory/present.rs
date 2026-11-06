@@ -1488,7 +1488,7 @@ fn render_snapshot_inner(presentation: &Presentation, summary_only: bool) -> Str
                     String::new()
                 } else {
                     format!(
-                        "; type not established in the observed window ({rows} key row{})",
+                        "; type unknown (not established while observed) ({rows} key row{})",
                         if rows == 1 { "" } else { "s" }
                     )
                 }

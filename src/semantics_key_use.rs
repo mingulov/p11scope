@@ -1235,17 +1235,18 @@ impl JointStaging {
     }
 
     /// Apply one seal failure: real loss invalidates live operation
-    /// authority before history-only disposal; proof-only refusal
-    /// with an explicit complete H3 stream replays retained calls
-    /// once in order through ordinary S1; anything transient or
-    /// completeness-unproven holds staging intact. The H3 receipt is
-    /// borrowed from the same original completed audit; this path never
-    /// takes the finalizer again. Invalidation terminals and fallback
-    /// effects feed the key-use reducer too (open rows close as
-    /// Unknown on loss; fallback rows are unknown-key S1Only —
-    /// object facts are never invented in fallback). Returns the
-    /// outcome plus fallback per-edge bound refusals for
-    /// `semantic_refused`.
+    /// authority before history-only disposal, preserving observed
+    /// S1 completions as unknown-key rows beside the counted loss;
+    /// proof-only refusal with an explicit complete H3 stream
+    /// replays retained calls once in order through ordinary S1;
+    /// anything transient or completeness-unproven holds staging
+    /// intact. The H3 receipt is borrowed from the same original
+    /// completed audit; this path never takes the finalizer again.
+    /// Invalidation terminals and fallback effects feed the key-use
+    /// reducer too (open rows close as Unknown on loss; fallback
+    /// rows are unknown-key S1Only — object facts are never
+    /// invented in fallback). Returns the outcome plus fallback
+    /// per-edge bound refusals for `semantic_refused`.
     #[allow(clippy::too_many_arguments)] // Staging borrows the exact pipeline facts plus the model for retirement.
     #[cfg(test)]
     fn apply_failure_inner<S: OperationSink>(
@@ -1291,7 +1292,19 @@ impl JointStaging {
                     Some(&mut *ledger),
                     assoc_fallback.as_deref_mut(),
                 );
-                let disposed = self.drain_staged(Some(ledger));
+                // Bulk loss disposal preserves observed S1
+                // completions as unknown-key rows beside the counted
+                // `record_lost`; custody still releases to the ledger
+                // and association mints ride the fallback (the ledger
+                // cannot back both roles at once).
+                let disposed = self.preserve_and_dispose_below_barrier(
+                    None,
+                    Some(ledger),
+                    instance,
+                    keyuse,
+                    None,
+                    assoc_fallback.as_deref_mut(),
+                );
                 self.close_segment(true, segment_resumable_after(failure.gap));
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
@@ -1318,8 +1331,12 @@ impl JointStaging {
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }
                     H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
-                        // H3's own stream is lossy: the staged calls'
-                        // S1 proof with it. Real-loss treatment.
+                        // H3's own stream is lossy, so object proof
+                        // for the staged calls is gone with it:
+                        // real-loss treatment (invalidate, then
+                        // dispose), with their observed S1
+                        // completions preserved as unknown-key rows
+                        // beside the counted `record_lost`.
                         keyuse.apply_invalidations(&failure.effects, model);
                         self.dispose_as_loss(
                             reducer,
@@ -1327,9 +1344,16 @@ impl JointStaging {
                             instance,
                             sink,
                             Some(&mut *ledger),
-                            assoc_fallback,
+                            assoc_fallback.as_deref_mut(),
                         );
-                        let disposed = self.drain_staged(Some(ledger));
+                        let disposed = self.preserve_and_dispose_below_barrier(
+                            None,
+                            Some(ledger),
+                            instance,
+                            keyuse,
+                            None,
+                            assoc_fallback.as_deref_mut(),
+                        );
                         self.close_segment(true, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
@@ -1380,6 +1404,18 @@ impl JointStaging {
     pub(crate) fn dispose_below_barrier(
         &mut self,
         barrier: Option<u64>,
+        ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
+    ) -> usize {
+        self.dispose_pure_below_barrier(barrier, ledger)
+    }
+
+    /// The pure disposal core shared by the test-only handle above
+    /// and the ledger-less preservation fallback below: pop heads at
+    /// or below `barrier`, release custody, advance the frontier and
+    /// count disposed history. Never reduces.
+    fn dispose_pure_below_barrier(
+        &mut self,
+        barrier: Option<u64>,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
         let mut disposed = 0;
@@ -1410,7 +1446,10 @@ impl JointStaging {
     /// Every popped head still advances the frontier, releases
     /// custody and counts as disposed history (`record_lost`); late
     /// seals hold as before. Payloads above the barrier stay queued.
-    /// Returns the disposed count.
+    /// Without any association ledger (direct unit-test delivery
+    /// only; production always carries the scene fallback) there is
+    /// nothing to mint preserved associations from, so disposal
+    /// stays pure counts-only. Returns the disposed count.
     pub(crate) fn preserve_and_dispose_below_barrier(
         &mut self,
         barrier: Option<u64>,
@@ -1420,10 +1459,9 @@ impl JointStaging {
         shared: Option<&mut crate::semantics_objects::journal::StagingLedger>,
         fallback: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> usize {
-        debug_assert!(
-            shared.is_some() || fallback.is_some(),
-            "preservation association mints need a ledger"
-        );
+        if shared.is_none() && fallback.is_none() {
+            return self.dispose_pure_below_barrier(barrier, ledger);
+        }
         let mut throwaway = EdgeSemantics::default();
         let mut preserved = KeyUseReducer::new();
         let mut outer = NoSink;

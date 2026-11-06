@@ -2524,11 +2524,12 @@ fn current_static_sides_from(links: &[RegisteredLink]) -> BTreeSet<StaticEndpoin
         .collect()
 }
 
-/// How one dynamic (loader/export) hook is linked: a perf `uprobe` in
-/// aya's link table, or a raw uprobe-multi link fd outside it. The program,
-/// hook identity and registry handling are identical; only the link
-/// lifetime differs (aya detach vs drop).
-enum DynamicLinkId {
+/// How one individually attached (dynamic loader/export, diagnostic)
+/// hook is linked: a perf `uprobe` in aya's link table, or a raw
+/// uprobe-multi link fd outside it. The program, hook identity and
+/// registry handling are identical; only the link lifetime differs (aya
+/// detach vs drop).
+enum IndividualLinkId {
     Perf(UProbeLinkId),
     Multi(OwnedFd),
 }
@@ -2561,7 +2562,7 @@ enum RegisteredLink {
     },
     DiagnosticUProbe {
         program: &'static str,
-        id: UProbeLinkId,
+        id: IndividualLinkId,
     },
     DynamicUProbe {
         program: &'static str,
@@ -2570,7 +2571,7 @@ enum RegisteredLink {
         file_offset: u64,
         cookie: u64,
         abi: Option<HookAbi>,
-        id: DynamicLinkId,
+        id: IndividualLinkId,
     },
 }
 
@@ -8491,7 +8492,7 @@ impl Session {
                     "{program} at object {object:?}+{file_offset:#x}: {error:#}"
                 ))
             })?;
-            DynamicLinkId::Multi(fd)
+            IndividualLinkId::Multi(fd)
         } else {
             let point = UProbeAttachPoint {
                 location: UProbeAttachLocation::AbsoluteOffset(file_offset),
@@ -8520,7 +8521,7 @@ impl Session {
                     error_chain(&error)
                 ))
             })?;
-            DynamicLinkId::Perf(id)
+            IndividualLinkId::Perf(id)
         };
         self.links.push(RegisteredLink::DynamicUProbe {
             program,
@@ -8592,7 +8593,7 @@ impl Session {
                         cookie,
                         is_return,
                     )
-                    .map(DynamicLinkId::Multi)
+                    .map(IndividualLinkId::Multi)
                     .map_err(|error| {
                         anyhow!("{program} at object {object:?}+{file_offset:#x}: {error:#}")
                     });
@@ -8603,7 +8604,7 @@ impl Session {
                     .try_into()?;
                 probe
                     .attach([point()], &path, scope)
-                    .map(DynamicLinkId::Perf)
+                    .map(IndividualLinkId::Perf)
                     .map_err(|error| {
                         anyhow!(
                             "{program} at object {:?}+{file_offset:#x}: {}",
@@ -8614,7 +8615,7 @@ impl Session {
             },
             |ebpf, return_id| {
                 match return_id {
-                    DynamicLinkId::Perf(return_id) => {
+                    IndividualLinkId::Perf(return_id) => {
                         let result = ebpf
                             .program_mut(return_program)
                             .with_context(|| {
@@ -8630,7 +8631,7 @@ impl Session {
                         }
                     }
                     // A multi link detaches by drop.
-                    DynamicLinkId::Multi(fd) => drop(fd),
+                    IndividualLinkId::Multi(fd) => drop(fd),
                 }
             },
         );
@@ -10265,13 +10266,23 @@ impl Session {
     }
 
     pub(crate) fn diagnostic() -> Result<Self> {
+        // Multi where the host proves link_create: the self-probe links
+        // instead of opening a perf event, so doctor needs no
+        // CAP_SYS_ADMIN at any paranoid. Only the host verdict gates
+        // this — the probe attaches and detaches without measuring
+        // delivery, so pid-filter coverage is irrelevant. Singles keeps
+        // today's behavior on pre-multi hosts.
+        let backend = match require_multi_capable_host() {
+            Ok(_) => AttachBackend::Multi,
+            Err(_) => AttachBackend::Singles,
+        };
         Self::start_inner(
             &Scope::Pid(std::process::id()),
             CapturePolicy::Allowlisted,
             None,
             None,
             None,
-            AttachBackend::Singles,
+            backend,
             None,
             None,
             None,
@@ -10282,19 +10293,49 @@ impl Session {
     pub(crate) fn attach_diagnostic_probe(&mut self, path: &Path, offset: u64) -> Result<()> {
         stopped_attachment_admission(self.mutation_stopped(), "diagnostic")?;
         self.admit_diagnostic()?;
-        let probe: &mut UProbe = self
-            .ebpf
-            .program_mut("p11_entry")
-            .context("diagnostic p11_entry program")?
-            .try_into()?;
-        let id = probe.attach(
-            [UProbeAttachPoint {
-                location: UProbeAttachLocation::AbsoluteOffset(offset),
-                cookie: None,
-            }],
-            path,
-            UProbeScope::CallingProcess,
-        )?;
+        // A multi session links the self-probe: uprobe-multi attach is not
+        // gated by perf_event_paranoid, so doctor needs no CAP_SYS_ADMIN
+        // where the host proves link_create. Coverage is irrelevant (this
+        // attaches and detaches without measuring delivery), so only the
+        // host verdict gates the session, never the pid-filter probe. A
+        // refused link falls back to the perf single: today's behavior on
+        // a host that proves link_create but refuses a pid-filtered link.
+        let multi = if self.backend == AttachBackend::Multi {
+            multi_prog_fd(&mut self.ebpf, "p11_entry")
+                .and_then(|prog_fd| {
+                    attach_group(
+                        prog_fd,
+                        std::process::id(),
+                        path,
+                        std::slice::from_ref(&offset),
+                        &[1],
+                        false,
+                    )
+                    .map_err(anyhow::Error::from)
+                })
+                .ok()
+        } else {
+            None
+        };
+        let id = match multi {
+            Some(fd) => IndividualLinkId::Multi(fd),
+            None => {
+                let probe: &mut UProbe = self
+                    .ebpf
+                    .program_mut("p11_entry")
+                    .context("diagnostic p11_entry program")?
+                    .try_into()?;
+                let id = probe.attach(
+                    [UProbeAttachPoint {
+                        location: UProbeAttachLocation::AbsoluteOffset(offset),
+                        cookie: None,
+                    }],
+                    path,
+                    UProbeScope::CallingProcess,
+                )?;
+                IndividualLinkId::Perf(id)
+            }
+        };
         self.links.push(RegisteredLink::DiagnosticUProbe {
             program: "p11_entry",
             id,
@@ -11013,8 +11054,7 @@ fn take_collected_owned_link(ebpf: &mut Ebpf, original: RegisteredLink) -> Resul
 fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLink>> {
     match link {
         RegisteredLink::MultiUProbe { fds, .. } => Ok(vec![OwnedLink::Multi(fds)]),
-        RegisteredLink::UProbe { program, id, .. }
-        | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
+        RegisteredLink::UProbe { program, id, .. } => (|| {
             let probe: &mut UProbe = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing during detach"))?
@@ -11047,8 +11087,9 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                 .with_context(|| format!("detaching {program}"))?;
             Ok(vec![OwnedLink::Fd(taken.into())])
         })(),
-        RegisteredLink::DynamicUProbe { program, id, .. } => match id {
-            DynamicLinkId::Perf(id) => (|| {
+        RegisteredLink::DynamicUProbe { program, id, .. }
+        | RegisteredLink::DiagnosticUProbe { program, id } => match id {
+            IndividualLinkId::Perf(id) => (|| {
                 let probe: &mut UProbe = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing during detach"))?
@@ -11061,7 +11102,7 @@ fn take_owned_links(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<Vec<OwnedLi
                     Err(link) => Ok(vec![OwnedLink::Probe(link)]),
                 }
             })(),
-            DynamicLinkId::Multi(fd) => Ok(vec![OwnedLink::Multi(vec![fd])]),
+            IndividualLinkId::Multi(fd) => Ok(vec![OwnedLink::Multi(vec![fd])]),
         },
     }
 }
@@ -11074,8 +11115,7 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
             drop(fds);
             Ok(())
         }
-        RegisteredLink::UProbe { program, id, .. }
-        | RegisteredLink::DiagnosticUProbe { program, id } => (|| {
+        RegisteredLink::UProbe { program, id, .. } => (|| {
             let probe: &mut UProbe = ebpf
                 .program_mut(program)
                 .with_context(|| format!("program {program} missing during detach"))?
@@ -11102,8 +11142,9 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
                 .detach(id)
                 .with_context(|| format!("detaching {program}"))
         })(),
-        RegisteredLink::DynamicUProbe { program, id, .. } => match id {
-            DynamicLinkId::Perf(id) => (|| {
+        RegisteredLink::DynamicUProbe { program, id, .. }
+        | RegisteredLink::DiagnosticUProbe { program, id } => match id {
+            IndividualLinkId::Perf(id) => (|| {
                 let probe: &mut UProbe = ebpf
                     .program_mut(program)
                     .with_context(|| format!("program {program} missing during detach"))?
@@ -11113,7 +11154,7 @@ fn detach_registered_link(ebpf: &mut Ebpf, link: RegisteredLink) -> Result<()> {
                     .with_context(|| format!("detaching {program}"))
             })(),
             // Detach is drop: closing the fd detaches the link.
-            DynamicLinkId::Multi(fd) => {
+            IndividualLinkId::Multi(fd) => {
                 drop(fd);
                 Ok(())
             }
@@ -15037,7 +15078,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: Some(HookAbi::FunctionList),
-            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         assert_eq!(
             DetachQuarantine::of_link(&link),
@@ -15056,7 +15097,7 @@ mod tests {
     /// identity.
     #[test]
     fn quarantine_of_link_ignores_the_dynamic_link_id_variant() {
-        use super::DynamicLinkId;
+        use super::IndividualLinkId;
         let multi_fd =
             || -> std::os::fd::OwnedFd { std::fs::File::open("/dev/null").unwrap().into() };
         let perf = RegisteredLink::DynamicUProbe {
@@ -15066,7 +15107,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         let multi = RegisteredLink::DynamicUProbe {
             program: "dl_debug_state",
@@ -15075,7 +15116,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: DynamicLinkId::Multi(multi_fd()),
+            id: IndividualLinkId::Multi(multi_fd()),
         };
         assert_eq!(
             DetachQuarantine::of_link(&perf),
@@ -15097,7 +15138,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         let export = RegisteredLink::DynamicUProbe {
             program: "function_list_return",
@@ -15106,7 +15147,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: Some(HookAbi::FunctionList),
-            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         assert_eq!(
             DetachQuarantine::of_link(&loader),
@@ -15118,7 +15159,7 @@ mod tests {
     fn quarantine_of_link_maps_unattributed_links_globally() {
         let diagnostic = RegisteredLink::DiagnosticUProbe {
             program: "p11_entry",
-            id: dummy_uprobe_link_id(),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         let raw = RegisteredLink::RawTracePoint {
             program: "sched_process_exec",
@@ -15233,7 +15274,7 @@ mod tests {
             file_offset: 0x1000,
             cookie: 0x5555,
             abi: None,
-            id: DynamicLinkId::Perf(dummy_uprobe_link_id()),
+            id: IndividualLinkId::Perf(dummy_uprobe_link_id()),
         };
         let keys = DetachQuarantine::of_link(&link);
         let mut quarantine = std::collections::BTreeSet::new();

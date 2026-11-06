@@ -524,12 +524,13 @@ report format.
 - `inspect` shows every provider-shaped module mapped by the target; an
   optional `--module` only narrows that set. A target whose memory maps it
   cannot read is an error (exit 1), never an empty module list. On the
-  measured p11-kit stack, the one-shot `inspect` verdict refuses p11-kit's
-  fixed closure array whole — it exceeds the 512-slot ceiling — while the
+  measured p11-kit stack, the one-shot `inspect` verdict leaves p11-kit's
+  closure array unattached by design — only its published tables would
+  attach, and none of the lookalike tables is published yet — while the
   later-fitting SoftHSM2 backend attaches; the report is explicitly
   `PARTIAL`, not a claim that the proxy layer was captured. A live capture
-  instead admits the forwarding layer by what it publishes (below), so the
-  layer itself is never refused outright.
+  instead admits the forwarding layer by what it publishes (below), with
+  an unpublished layer staying a named gap while the capture continues.
 - Detailed per-call capture has 512 attach slots in release builds; this is
   separate from Inventory's endpoint budget (32,768 by default on
   `inventory --system` with uprobe_multi, up to 131,072 with
@@ -540,13 +541,16 @@ report format.
   publishes: only tables the application actually received attach, taking
   no heuristic slots, so the layer can never crowd out a real provider.
   Calls it forwards are counted at the attached backend providers, named
-  with counts on the gap line; calls the layer answers itself are not
-  counted. An operator-named layer (`--module <path>`) is the sole
-  exception: it keeps a reserve-capped leading-templates prefix, because
-  a remote client's tables are handed out before any export probe can
-  observe the return. The prefix leaves at least the reserve (128 of 512
-  slots) free, so one later standard function list (at most 104 entries)
-  always fits. A `--cgroup` or `--system`
+  with counts on the gap line; calls the layer answered itself, including
+  its errors, appear only on the separate forwarding line, and one layer
+  call that reaches several providers counts at each. An operator-named
+  layer (`--module <path>`) is the sole exception: it keeps a
+  reserve-capped leading-templates prefix, because a remote client's
+  tables are handed out before any export probe can observe the return.
+  The prefix leaves at least the reserve (128 of 512 slots) free, so one
+  later standard function list (at most 104 entries) always fits. Under
+  inventory, counter and broad admission a closure array that does not
+  fit whole is refused whole with its demand stated. A `--cgroup` or `--system`
   capture without `--module` admits each provider by value —
   `--manifest` providers first, then providers whose function table
   is corroborated, then heuristic finds, forwarding layers last. An

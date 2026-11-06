@@ -26,35 +26,32 @@ Readiness bounds are disclosed harness parameters, never a cold-start SLA.
 
 ## Known limitations in 0.6.0
 
-The following limits apply to the v0.6.0 release. Entries marked
-"verify at candidate" rest on the current integration tip and the final
-integration may still move them; the candidate pass confirms the numbers.
+The following limits apply to the v0.6.0 release. Rate, latency and
+start-up figures below were measured on the pre-freeze integration
+lane; the [Qualification record](../CHANGELOG.md#qualification-of-this-release)
+names the source SHA behind each check the release rounds re-measured.
 
 - Key operations sustain 6,250 calls/s for 60 s with exact per-key rows
   and no capture loss in every measured run at that rate; plain call
   counts stay exact at 10,000 calls/s for 60 s. Above 6,250 calls/s the
   16 MiB event ring can overflow between reads and key-operation
   tracking ends with a named gap. Sustained 10,000 calls/s for key
-  operations is planned for 0.7.0. (verify at candidate: the final
-  integration re-runs the rate campaign)
+  operations is planned for 0.7.0.
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
   qualified 60 s runs), against the 1.5 s target; under host load it
-  rises toward about 4 s. (verify at candidate)
+  rises toward about 4 s.
 - Key-operation tracking may not start at all in about 1 in 4 runs (3
   of 12 measured cells, at every call rate): no birth is offered for
   the tracked process, reported as `joint_birth_unoffered` with "Joint
   birth unavailable; retained S1". Plain call counts stay exact in
-  those runs. (verify at candidate: a diagnosis lane is still working
-  this startup race)
+  those runs; re-running the capture is the workaround.
 - On busy hosts the kernel can skip re-entrant runs of the mapping
   hooks; each skip raises a new fault era. Calls across the skip are
   shed with exact counts and a named cause, affected instance rows read
   `uncertain`, and key operations the observer cannot attribute with
   certainty are counted in named `not attributed` reasons while exact
-  rows continue for the rest. (verify at candidate: the final
-  integration adds an explicit "continuity uncertain" flag on merged
-  rows plus hook-miss totals on the stop line)
+  rows continue for the rest.
 - A call from an untracked process that is still in progress when key
   operations are sealed cannot be accounted for, so it is counted in
   named `not attributed` reasons instead of waiting for the run
@@ -71,15 +68,14 @@ integration may still move them; the candidate pass confirms the numbers.
   for the whole run, so the child runs unwatched. Those runs report
   PARTIAL (incomplete) with the named cause "loader BPF delivery
   failure suspected"; no run reports a wrong count. No miss was seen on
-  quiet hosts (0/120 on Fedora). (verify at candidate)
+  quiet hosts (0/120 on Fedora).
 - A child process can use a provider before it is watched: calls made
   before the watch starts are missed, and the affected watch reads
   `unknown` with reason `use_before_admission`; the JSON also carries a
   `before_semantic_boundary` gap ("physical provider use preceded first
   observed semantic registration") and the late provider's unwatched
   window. Affected runs read PARTIAL. Hold the child with `run --pause
-  auto` or keep it alive past attach. (verify at candidate: confirm the
-  exact incomplete marking)
+  auto` or keep it alive past attach.
 - `run` (and `profile --pid`) observe exactly the started (named)
   process, never its descendants: a fork/exec child, `subprocess`
   worker, or `multiprocessing` spawn child that loads a provider gets
@@ -112,13 +108,12 @@ integration may still move them; the candidate pass confirms the numbers.
   passes while the rest keep the named loss (`original_file_unproven`
   for deep scans, `overlay_kernel_unavailable` for sweeps). While a
   caller waits for its turn, its edge reads uncertain and its in-flight
-  operations end as unknown. (verify at candidate: the live turn-taking
-  rate is a candidate measurement)
+  operations end as unknown.
 - Strict speed claims apply only on kernels with working uprobe_multi,
   normally 6.6 and newer: the rate and latency numbers above were
   measured there. Older kernels stay correct with a finite stop but are
   not speed-qualified; live capture refuses there with a `live capture ...`
-  refusal (`unavailable` or `did not start`). (verify at candidate)
+  refusal (`unavailable` or `did not start`).
 - Per-key rows cover operations that start after the attach.
   Attaching to an already-running process (for example a running
   Firefox or Chromium) works: operations that start after the attach
@@ -143,6 +138,19 @@ integration may still move them; the candidate pass confirms the numbers.
   slot count times CPU count and are not equally cheap to raise.
   Caller-pair, discovery-owner and work limits stay separate, and
   selecting a larger endpoint budget does not increase them.
+- Counts seen through the p11-kit proxy can include the backend's
+  own internal calls, and can miss calls made before the observer
+  attached. Direct providers are exact. For exact counts, point the
+  capture at the backend provider directly.
+- The key-operations section reason can latch `authority_lost`,
+  rendered "per-key tracking stopped", after a watchdog trip or
+  disposed staged history, even while exact per-key rows continue
+  beside counted loss. The latch names the loss, not a stopped view:
+  read the rows and the `not attributed` counts.
+- `inventory --pid` leaves a one-shot caller's use unattributed: a
+  caller that uses a provider and exits between two passes shows no
+  edge entries while its calls fold to the module as unattributed
+  use. Use `profile --pid` for one-shot flows (full entry below).
 
 Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
 calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring
@@ -182,16 +190,20 @@ decided after all providers in every scope and admitted by what it
 publishes: only tables with publication evidence (a live
 `C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
 a manifest, or export agreement) attach, taking no heuristic slots, so
-the layer can never crowd out a real provider and is never refused
-outright. Calls it forwards are counted at the attached backend
-providers, named with counts on the gap line; calls the layer answers
-itself are not counted. When nothing is published yet, a named gap says
-so and the capture continues. An operator-named layer (`--module
+the layer can never crowd out a real provider. Calls it forwards are
+counted at the attached backend providers, named with counts on the
+gap line; calls the layer answered itself, including its errors,
+appear only on the separate forwarding line, and one layer call that
+reaches several providers counts at each. When nothing is published
+yet, a named gap says so and the capture continues. An operator-named
+layer (`--module
 <path>`) is the sole exception: it keeps a reserve-capped
 leading-templates prefix, because a remote client's tables are handed
 out before any export probe can observe the return (costs of covering
 the layer are measured in
-`docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
+`docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`). Under
+inventory, counter and broad admission a closure array that does not
+fit whole is refused whole with its demand stated.
 An ordinary provider that does not fit whole in a shared-scope Detailed
 capture is admitted on the leading-tables prefix that fits,
 with a named `provider_prefix` partial gap stating attached versus
@@ -568,9 +580,12 @@ With `--key-operations`, the v0.6.0 measurements in
 older lane numbers: key operations sustain 6,250 calls/s for 60 s with
 exact rows (plain counts stay exact at 10,000 calls/s), and
 key-operation rows lag their calls by about 1.6-1.9 s p99 in quiet
-runs. The older 1,000 calls/s ceiling and mid-run `authority_lost`
-stall describe the pre-integration lane, not this release. (verify at
-candidate: the final integration re-runs the rate campaign)
+runs. The older 1,000 calls/s ceiling describes the pre-integration
+lane, not this release. The `authority_lost` reason is still live: it
+latches after a watchdog trip or disposed staged history and renders
+"per-key tracking stopped" even while exact rows continue beside
+counted loss (see
+[Known limitations in 0.6.0](#known-limitations-in-060)).
 
 In long system-wide runs, a live publication can rarely stop making
 progress for one session or operation. The affected operations are

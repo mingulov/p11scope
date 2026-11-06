@@ -24,15 +24,12 @@ User-facing limits live in
 
 ### Added
 
-- Text output is concise by default on every user-facing command
-  (`inspect`, `inventory`, `profile`, `run`): the main results, one
-  coverage line, and the hint `run with -v for details`.
-  `-v`/`--verbose` shows the full detail, `--quiet` stays
-  summary-head-only for scripts, and JSON is unchanged and always
-  complete.
 - `p11scope inventory --key-operations` opts in to live per-key tracking
   (default off; needs `--capture auto` or `native`). No manifest is
-  needed for per-key rows. Ordinary builds now carry the journal and
+  needed when the tables qualify by standard interface linkage, an
+  observed live function-list return, or a scan-proved sole complete
+  table; anything else needs a rerun with `--manifest`. Ordinary builds
+  now carry the journal and
   the birth marker, so no special build is needed; `P11SCOPE_JOURNAL=0`
   or `P11SCOPE_BIRTH_MARKER=0` builds without them. When rows populate,
   the snapshot carries a summary such as `key operations: rev 1
@@ -41,8 +38,9 @@ User-facing limits live in
   per-object and per-category rows under `object_observations`. Attaching to an
   already-running process works: rows cover operations that start after
   the attach, earlier operations are counted in named gaps, and a key
-  first seen before the attach reads `type unknown: first seen before
-  attach`, never dropped. Starting the observer first also works, and
+  first seen before the attach reads `type unknown (not established
+  while observed)`, never dropped. Starting the observer first also
+  works, and
   no restart is needed either way. Views never stop as a whole:
   operations the observer cannot attribute with certainty are counted
   in named `not attributed` reasons instead of ending tracking; see
@@ -130,10 +128,6 @@ User-facing limits live in
   `sudo --preserve-env=NAME` or as `env NAME=value ...` after the `--`),
   while anything exported in a root shell now reaches the unprivileged child.
 
-- Inventory holds more endpoints: `inventory --system` defaults to
-  32,768 endpoints on hosts with uprobe_multi, and `--max-endpoints`
-  raises any inventory capture to 131,072. A host with several p11-kit
-  copies (about 20,000 endpoints) is covered with no flag.
 - Terminal text is concise by default on every user-facing command
   (`inspect`, `inventory`, `profile`, `run`): the main results, one
   coverage status line, and a `run with -v for details` hint.
@@ -157,18 +151,22 @@ User-facing limits live in
   4 MiB default, about 1.9 s of 10,000 calls/s between reads). Costs are
   disclosed in the operator's guide.
 - The forwarding layer (such as the p11-kit proxy) never crowds out
-  real providers and is never refused outright: it is admitted by what
-  it publishes — only tables the application actually received attach,
-  taking no heuristic slots. Calls it forwards are counted at the
-  attached backend providers, named with counts on the gap line; calls
-  the layer answers itself are not counted. When nothing is published
-  yet, a named gap says so and the capture continues; an operator-named
-  layer keeps a reserve-capped prefix for the remote-client case. A
-  real provider that still does not fit is admitted on the leading
-  prefix that fits, with a named partial gap, and refused whole only
-  when not even its strongest table fits.
+  real providers: it is admitted by what it publishes — only tables
+  the application actually received attach, taking no heuristic
+  slots. Calls it forwards are counted at the attached backend
+  providers, named with counts on the gap line; calls the layer
+  answered itself, including its errors, appear only on the separate
+  forwarding line, and one layer call that reaches several providers
+  counts at each. When nothing is published yet, a named gap says so
+  and the capture continues; an operator-named layer keeps a
+  reserve-capped prefix for the remote-client case. Under inventory,
+  counter and broad admission a closure array that does not fit whole
+  is refused whole with its demand stated. A real provider that still
+  does not fit is admitted on the leading prefix that fits, with a
+  named partial gap, and refused whole only when not even its
+  strongest table fits.
 - Inventory's endpoint budget rises to a 32768 default and a 131072
-  maximum (`--max-endpoints`, 1..=131072), so a host with several
+  maximum (`--max-endpoints`, 1–131072), so a host with several
   p11-kit copies (about 20K endpoints) is covered by
   `inventory --system` with no flag. The raise is measured on
   uprobe_multi hosts; Detailed's 512-slot budget and the counter
@@ -254,8 +252,8 @@ User-facing limits live in
 The v0.6.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-060).
 Known issues in this release. Rate, latency and start-up figures below
-were measured on the integration lane; the freeze campaign re-runs them
-(see Qualification):
+were measured on the integration lane (see Qualification for the source
+SHA behind each check the release rounds re-measured):
 
 - Key operations sustain 6,250 calls/s for 60 s with exact rows; plain
   counts stay exact at 10,000 calls/s. 10,000 calls/s sustained for key
@@ -287,22 +285,38 @@ were measured on the integration lane; the freeze campaign re-runs them
   older kernels stay correct and finite, not fast.
 - Per-key rows cover operations that start after the attach; earlier
   operations are counted in named gaps, and a key first seen before
-  the attach reads `type unknown: first seen before attach`. No
-  restart is needed: attaching to an already-running application and
-  starting the observer first both work.
+  the attach reads `type unknown (not established while observed)`.
+  No restart is needed: attaching to an already-running application
+  and starting the observer first both work.
+- Counts through the p11-kit proxy can include the backend's own
+  internal calls and miss calls made before the attach; direct
+  providers are exact.
+- The key-operations reason can latch `authority_lost` ("per-key
+  tracking stopped") while exact rows continue; read the rows and
+  the `not attributed` counts.
+- `inventory --pid` misses a short-lived caller's use; its calls
+  fold to the module as unattributed use. Use `profile --pid` for
+  one-shot flows.
+- `run` (and `profile --pid`) observe exactly the started command,
+  never its descendants. Capture multi-process workloads with
+  `inventory --system` (or `--cgroup`).
 
 ### Qualification of this release
 
-The following scoped checks qualify the release candidate
-(source SHA: `<fill at candidate>`):
+The following scoped checks qualify the release candidate. Each row
+names the source SHA it was measured on; SHAs differ because each
+round measured on its own tip. The last row is the controller's
+final-candidate gate:
 
-| Environment | Checked behavior |
+| Check | Measured result |
 | --- | --- |
-| Linux 6.6.157, 6.12.111, 6.18.58 and 7.3.1 guests (BPF kernel matrix) | Every capture program loads on each kernel; the 6.1 refusal control holds. Result: `<fill at candidate>` |
-| Fedora Linux 7.2.9, quiet host | Key-operation rate campaign (6,250 calls/s for 60 s, exact rows, p99), plain counts at 10,000 calls/s, system-scale and soak cells. Result: `<fill at candidate>` |
-| Hosted CI `ci.yml` | Complete gate on the exact candidate source (fmt, check, tests, clippy, contracts, coverage, Python suites, packaging). Run `<fill at candidate>`: `<fill at candidate>` |
-| Hosted CI `privileged-tests.yml` | Privileged library shards, system-scale capture cells, public CLI cells, real Firefox and Chromium cells on the exact candidate source. Run `<fill at candidate>`: `<fill at candidate>` |
-| Containers (one kind node, Docker) | Shared layers and copy-up, DaemonSet, attach into a pod, pre-attached provider, Knative warm/cold, node-wide late provider. Result: `<fill at candidate>` |
+| Privileged library campaign and quiet pressure set on Fedora 7.2.9 (source `762b289d7`, RC round 2) | Campaign 211/214: the 3 reds pin text RC2 intentionally changed (concise renderer), capture healthy in all three; pressure 5/5 under quiet exclusive; earlier reds closed except the `inventory --pid` one-shot shape, which stays a known issue (see Known limitations). |
+| Strict browser cells and demo rehearsal on Fedora 7.2.9 (source `762b289d7`) | 48/48 strict browser cells; demo 4/4 in both orders (Firefox and Chromium) at the exact 60 s task command; an earlier rehearsal miss root-caused to the rehearsal script on `40808c51e` (script fix, no product change). |
+| SoftHSM and Kryoptic sign flows on Fedora 7.2.9 (source `762b289d7`) | `run` and `profile --pid` PASS on both providers; the `inventory --pid` one-shot shape is a known issue (see Known limitations). |
+| Guest kernel matrix CLI and inventory on 6.6.157, 6.12.111, 6.18.58, 7.0.14 and 7.3.1 (sources `762b289d7`, `324ac067f`) | CLI 23 pass, 0 fail, 1 nonqualifying, 5 expected-fail on every kernel with byte-identical summaries; inventory overlay+cap FAIL systematic on `762b289d7` (predates the overlay-witness fix), PASS on all 5 kernels on `324ac067f` (RC round 3). |
+| Local release gates (sources `e2fd74b67`, `762b289d7`, `08906062e`, RC rounds 1-3) | fmt, check and clippy green; main library suite 7988/8129/8213 passed with 0 failed; `artifact_contracts` 202/202/202; Python suites 122/122; privileged no-route collect cell PASS. |
+| Hosted CI on the round tips | `ci`, `privileged-tests` and `bpf-kernels` runs queued per round and not awaited there (round 3: 42235605621, 42235605493, 42235605637 on `08906062e`); round-2 CI on `762b289d7` failed all three workflows in areas the rounds never touched, triaged in the CI lane. The binding CI record is the final-candidate gate below. |
+| Final candidate (source SHA filled by the controller) | `ci.yml`, `privileged-tests.yml` and `bpf-kernels.yml` green on the exact candidate source, with the run URLs recorded. Result: `TBD-QUALIFIED`. |
 
 The full privacy matrix and extracted-package recipient checks are separate
 release gates. The limitation disclosures above also apply to successful

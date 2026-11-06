@@ -211,19 +211,24 @@ classification consequences, never the name bytes.
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
-the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
-it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
-attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
-layer was captured. A live Detailed capture admits a forwarding layer (such
-as the p11-kit proxy) only through its published tables — publication
-evidence (a live `C_GetFunctionList` / `C_GetInterface(List)` return,
-interface linkage, a manifest, or export agreement) — in every scope and
-arrival order. Unpublished templates take
-no slots, so the layer can never crowd out a real provider and is never
-refused outright. Calls it forwards are counted at the attached backend
-providers, named with counts on the gap line; calls the layer answers
-itself are not counted. The terminal report names each refused or
-partially covered module with its reason: with `-v`, `run` and `profile`
+the one-shot `inspect` verdict leaves p11-kit's closure array unattached by
+design — only its published tables would attach, and none of the lookalike
+tables is published yet — while the later-fitting SoftHSM2 backend attaches;
+the report is explicitly `PARTIAL`, not a claim that the proxy layer was
+captured. A live Detailed capture admits a forwarding layer (such as the
+p11-kit proxy) only through its published tables — publication evidence (a
+live `C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
+a manifest, or export agreement) — in every scope and arrival order.
+Unpublished templates take no slots, so the layer can never crowd out a real
+provider; a layer with nothing published yet stays a named gap while the
+capture continues. Calls it forwards are counted at the attached backend
+providers, named with counts on the gap line; calls the layer answered
+itself, including its errors, appear only on the separate forwarding line,
+and one layer call that reaches several providers counts at each (below).
+Under inventory, counter and broad admission a closure array that does not
+fit whole is refused whole with its demand stated. The terminal report names
+each refused or partially covered module with its reason: with `-v`, `run`
+and `profile`
 print a `Module gaps` section with the first five and an "and K more" line,
 and `inventory` prints the admission reason under each refused module. A
 capture whose only mapped provider is the forwarding layer (a process that

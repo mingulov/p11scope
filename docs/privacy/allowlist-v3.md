@@ -46,7 +46,9 @@ which gaps shed approval ids by count only,
 and [legacy collection gaps](#legacy-collection-gaps-v060),
 which names the `legacy_collection` counts-and-reasons projection,
 and [counter bank gaps](#counter-bank-gaps-v060),
-which names the `bank_gaps` counts-and-flags projection.**
+which names the `bank_gaps` counts-and-flags projection,
+and [derived count projections](#derived-count-projections-v060),
+which are derived counts with no new capture.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1698,3 +1700,11 @@ unchanged.**
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Bank gap object (`evidence.counter_collection.bank_gaps`) | A pure projection of the counter acquisition's per-bank failure flags: how many slots failed to fold, and whether the health or kernel evidence read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted bank reads; a missing bank map or a global quarantine/routing refusal still voids via the existing failure cause. The key stays absent (never null) when the acquisition was exact. | Public profile/metrics JSON only, inside `counter_collection`: `failed_slots` (saturating u64 count of slots that failed to fold), `health_failed` (whether the health read failed), and `kernel_failed` (whether the kernel evidence read failed). Counts and finite flags only; no per-slot index, offset, timing, RV value, health word or control word reaches output. A gap read publishes the last good values (stale) until the next exact read telescopes, except the first read of a generation, which publishes its current rows with zeros as unknown for the failed slots; either way the report reads PARTIAL with cause `counter_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, health word, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and false flags is never emitted. Required evidence: per-bank partition and evidence-degradation twins at the counter acquisition seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
+## Derived count projections (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0: `forwarding_layer`, `layer_totals`,
+`observation.semantic_capture.events_lost` and `selected_detail` are
+derived counts over already-observed calls, admission decisions and
+loss counters — no new capture, no new read, no new retained field.
+Allowlist-v1 bytes are unchanged.**

@@ -245,7 +245,7 @@ pub(crate) fn prove_and_finish_prepared<Io: ConfirmIo>(
 /// Scalar confirm with an optional sweep witness for overlay refusals
 /// with no sweep route (live capture watched providers). `None` keeps
 /// today's named loss; `Some` proves each refused overlay key through
-/// the private session under the D-P1 budget.
+/// the private session under this pass's witness budget.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prove_and_finish_prepared_with_witness<Io: ConfirmIo>(
     io: &mut Io,
@@ -1275,7 +1275,7 @@ where
 /// Kernel sweep with an optional private witness for overlay refusals
 /// with no sweep route (live capture watched providers). `None` keeps
 /// today's named loss; `Some` proves each refused overlay key through
-/// the private session under the D-P1 per-pass budget. The window
+/// the private session under this pass's witness budget. The window
 /// (`start`, previous refused count) walks the budget over refused
 /// candidates across passes; the returned count is this pass's
 /// refused total, the next pass's denominator.
@@ -1642,8 +1642,8 @@ where
             None
         };
         // K1-R2: watched overlay keys with no sweep route prove via the
-        // private witness session (no attach-set exclusions) under the
-        // D-P1 per-pass budget. Attempt-cap and other run failures keep
+        // private witness session (no attach-set exclusions) under this
+        // pass's witness budget. Attempt-cap and other run failures keep
         // the named loss with no query.
         if let Some(decision) = decision.as_ref()
             && witness_qualifies(decision)

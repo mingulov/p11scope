@@ -705,36 +705,79 @@ fn help_documents_each_profile_in_its_own_paragraph() {
 
 /// A `-o` parent of `/` must refuse before provider load: granting the
 /// whole tree write access would void the read-only promise (contract
-/// §2/D6) while the operator believes the provider is fenced.
+/// §2/D6) while the operator believes the provider is fenced. Every
+/// spelling of the root refuses: direct, `.`, `..`, double slash and a
+/// symlink to `/` all resolve before the comparison, as does a bare `-o`
+/// name when the helper runs from `/`.
 #[test]
 fn isolation_output_directory_filesystem_root_is_refused() {
     let dir = scratch("isolation-root");
     let provider = build_isolation_probe(&dir);
-    let outfile = Path::new("/").join(format!(
+    let name = format!(
         "p11scope-helper-iso-root-test-{}.json",
         std::process::id()
-    ));
-    let _ = std::fs::remove_file(&outfile);
+    );
+    let link = dir.join("rootlink");
+    std::os::unix::fs::symlink("/", &link).unwrap();
+    let outputs = [
+        Path::new("/").join(&name),
+        Path::new("/.").join(&name),
+        Path::new("/tmp").join("..").join(&name),
+        Path::new("//").join(&name),
+        link.join(&name),
+    ];
+    for outfile in &outputs {
+        let _ = std::fs::remove_file(outfile);
+        let out = Command::new(BIN)
+            .args(["--isolation", "isolated", "--module"])
+            .arg(&provider)
+            .args(["-o"])
+            .arg(outfile)
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(1), "{outfile:?}: {out:?}");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains(
+                "isolated profile: output directory / is unusable: refusing the filesystem root"
+            ),
+            "{outfile:?}: {stderr}"
+        );
+        assert!(
+            !stderr.contains("ISOLATION_"),
+            "provider ran before the root refusal: {outfile:?}: {stderr}"
+        );
+        assert!(
+            !outfile.exists(),
+            "a refusal must not create a manifest: {outfile:?}"
+        );
+    }
+    // A bare `-o` name resolves its parent (`.`) against the working
+    // directory; from `/` that is the root as well.
     let out = Command::new(BIN)
+        .current_dir("/")
         .args(["--isolation", "isolated", "--module"])
         .arg(&provider)
         .args(["-o"])
-        .arg(&outfile)
+        .arg(&name)
         .output()
         .unwrap();
-    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert_eq!(out.status.code(), Some(1), "cwd=/ bare name: {out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains(
             "isolated profile: output directory / is unusable: refusing the filesystem root"
         ),
-        "{stderr}"
+        "cwd=/ bare name: {stderr}"
     );
     assert!(
         !stderr.contains("ISOLATION_"),
-        "provider ran before the root refusal: {stderr}"
+        "provider ran before the root refusal from cwd=/: {stderr}"
     );
-    assert!(!outfile.exists(), "a refusal must not create a manifest");
+    assert!(
+        !Path::new("/").join(&name).exists(),
+        "a refusal must not create a manifest"
+    );
 }
 
 /// An unusable `-o` parent refuses with the contract §3 step-1 shape

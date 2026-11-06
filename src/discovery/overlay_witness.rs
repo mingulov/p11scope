@@ -779,7 +779,7 @@ fn witness_deadline_with_clock(
     let mut deadline = now + Duration::from_millis(500);
     if let Some(limit) = limit {
         let Some(clock) = clock else {
-            return Ok(None);
+            return Err(WitnessStage::DeadlineClock);
         };
         let Some(left) = limit.checked_sub(clock) else {
             return Ok(None);

@@ -1036,8 +1036,11 @@ Limits that matter in pods:
   after the application fetched the list). Then the subset refuses with
   `incomplete_provider`, the summary reads `key operations: <file>'s
   function table cannot be verified without --manifest; rerun with --manifest`
-  (naming the provider by its file name),
-  and per-key rows need a rerun with `--manifest <manifest.json>`. A sealed
+  (naming the provider by its file name; with zero or several modules
+  the line stays generic, `provider function tables ...`),
+  and per-key rows need a rerun with `--manifest <manifest.json>`. When
+  manifests were supplied but the subset still refuses, the gap and
+  summary instead name checking the manifest inputs. A sealed
   scan lane carries a `semantic subset scan-derived` gap naming that provenance;
   a manifest still adds operator attestation when supplied. A build without the
   journal object, or a refused journal start, keeps the S1 capture with a
@@ -1078,7 +1081,11 @@ Limits that matter in pods:
   opt-in but a refused semantic subset (unverifiable scan tables, see
   above), it names the rerun instead: `key operations: <file>'s
   function table cannot be verified without --manifest; rerun with
-  --manifest`.
+  --manifest` (with zero or several modules the line stays generic,
+  `provider function tables ...`); when the refusal happens on the
+  manifest path, it instead reads `key operations: <file>'s function
+  table cannot be verified from the supplied --manifest inputs; check
+  the manifest`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.

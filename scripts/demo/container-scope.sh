@@ -18,7 +18,6 @@
 set -eu
 
 IMAGE=p11scope-demo-sign:1
-IMAGE_LABEL=p11scope.demo.signloop=1
 CTR_A=p11scope-demo-a
 CTR_B=p11scope-demo-b
 # Pinned base reused from deploy/Dockerfile.holder (same digest, same window).

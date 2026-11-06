@@ -537,3 +537,29 @@ fn object_producer_uninspected_marker_is_honest_only() {
     inspected[128 + 33] = 1;
     assert!(validate_object_tail(&inspected, &descriptor));
 }
+
+// F16 (7.05 PQC) RED: a classified parameter-set cell (raw kind 7)
+// validates in a requested list, while kind 8 still refuses. The
+// kind-7 assertion fails before GREEN (`OBJECT_ATTR_KIND_MAX` is 6);
+// the kind-8 refusal guards the bound on both sides.
+#[test]
+fn pqc_parameter_set_tail_accepts_kind_seven() {
+    let descriptor = create_descriptor();
+    let mut tail = valid_create_tail();
+    tail[128] = 7;
+    tail[128 + 1] = 1;
+    tail[128 + 2] = 2;
+    tail[128 + 32] = 1;
+    tail[128 + 33] = 1;
+    assert!(validate_object_tail(&tail, &descriptor), "kind 7 validates");
+    let mut bad = valid_create_tail();
+    bad[128] = 8;
+    bad[128 + 1] = 1;
+    bad[128 + 2] = 2;
+    bad[128 + 32] = 1;
+    bad[128 + 33] = 1;
+    assert!(
+        !validate_object_tail(&bad, &descriptor),
+        "kind 8 still refuses"
+    );
+}

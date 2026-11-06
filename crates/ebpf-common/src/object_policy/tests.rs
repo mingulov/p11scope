@@ -767,3 +767,23 @@ fn s2s3_kem_descriptors_are_named_scalar_result_without_templates() {
         assert!(!valid_object_descriptor(id, &templated), "{name}");
     }
 }
+
+// F16 (7.05 PQC) RED: the parameter-set selector classifies and the
+// three PQC key types classify. Existing-API only (raw selector,
+// frozen KeyType kind): compiles before GREEN, fails on the
+// membership assertions. The closed-set tables gain their reviewed
+// rows with GREEN.
+#[test]
+fn pqc_parameter_set_selector_and_key_type_scalars() {
+    assert!(
+        safe_attribute_kind(0x061d).is_some(),
+        "CKA_PARAMETER_SET selects"
+    );
+    for key_type in [0x49u64, 0x4a, 0x4b] {
+        assert_eq!(
+            classify_attribute_scalar(SafeAttributeKind::KeyType, key_type),
+            Some(key_type as u16),
+            "key type {key_type:#x}"
+        );
+    }
+}

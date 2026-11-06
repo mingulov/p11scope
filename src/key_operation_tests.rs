@@ -22297,3 +22297,183 @@ fn key_operation_schema_v4_pins_unknown_metadata_contract() {
     assert_eq!(METADATA_LABELS_V4.len(), METADATA_LABELS.len() + 1);
     assert_eq!(METADATA_LABELS_V4[12], "unknown");
 }
+
+// ==================== F16 (7.05 PQC): parameter-set metadata ====================
+
+/// F16 RED: a parameter set beside partial-error neighbors establishes
+/// from its own slot evidence only, on OK and on every partial-result
+/// RV (`CKR_ATTRIBUTE_SENSITIVE`, `CKR_ATTRIBUTE_TYPE_INVALID`,
+/// `CKR_BUFFER_TOO_SMALL`); the unreadable neighbor records
+/// Unavailable without poisoning the use, and the sign proves its
+/// `ml_dsa_65` row. The error twin (a failed GET) establishes nothing
+/// anywhere and the use partitions `metadata_unknown`. Wire kinds and
+/// field indexes stay numeric (kind 7, field 6): no new-variant
+/// reference, so this compiles before GREEN and fails on the
+/// establishment/proved-row assertions.
+#[test]
+fn pqc_parameter_set_partial_error_preserves_neighbors() {
+    use crate::key_operation_projection::ObsStatus;
+    use crate::key_operation_projection::producer::commit;
+    use crate::semantics_key_use::KeyUseReducer;
+    use crate::semantics_objects::QueryStatus;
+
+    const CKM_ML_DSA: u64 = 0x1d;
+    const CLASS_PRIVATE: (u8, u8, u16) = (1, 1, 3);
+    const KEY_TYPE_ML_DSA: (u8, u8, u16) = (2, 1, 0x4a);
+    const PARAM_SET_65: (u8, u8, u16) = (7, 1, 2);
+    const MODBITS_UNREADABLE: (u8, u8, u16) = (5, 3, 0);
+    for (name, rv) in [
+        ("OK", CkRv::OK.0),
+        ("ATTRIBUTE_SENSITIVE", CkRv::ATTRIBUTE_SENSITIVE.0),
+        ("ATTRIBUTE_TYPE_INVALID", CkRv::ATTRIBUTE_TYPE_INVALID.0),
+        ("BUFFER_TOO_SMALL", CkRv::BUFFER_TOO_SMALL.0),
+    ] {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let get = ShapedS1 {
+            getattr_cells: vec![
+                CLASS_PRIVATE,
+                KEY_TYPE_ML_DSA,
+                PARAM_SET_65,
+                MODBITS_UNREADABLE,
+            ],
+            ..ShapedS1::shaped("C_GetAttributeValue", rv, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &get,
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, CKM_ML_DSA, init_capture()),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        );
+        let key = scene.model.project().objects[0].id;
+        let flags = scene
+            .model
+            .key_metadata_flags(key)
+            .expect("key view exists");
+        assert!(flags.is_established(0), "{name}: Class established");
+        assert!(flags.is_established(1), "{name}: PQC key type established");
+        assert!(flags.is_established(6), "{name}: parameter set established");
+        assert!(
+            !flags.is_established(4),
+            "{name}: the unreadable neighbor establishes nothing"
+        );
+        let view = scene.model.project().objects[0].clone();
+        assert_eq!(
+            view.queries[4],
+            QueryStatus::Unavailable,
+            "{name}: the neighbor query is recorded"
+        );
+        let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+        assert_eq!(
+            (committed.status, committed.reason),
+            (ObsStatus::Populated, "none"),
+            "{name}"
+        );
+        let row = committed
+            .key_operations
+            .iter()
+            .find(|row| row.category == "sign");
+        let row = row.unwrap_or_else(|| panic!("{name}: the sign proves its row"));
+        assert_eq!(row.metadata_at_use, "ml_dsa_65", "{name}");
+        assert_eq!((row.role, row.completed), ("key", 1), "{name}");
+        assert!(
+            committed.unknown_key_operations.is_empty(),
+            "{name}: no unknown rows: {:?}",
+            committed.unknown_key_operations
+        );
+    }
+    // Error twin: a failed GET establishes nothing; the use partitions
+    // metadata_unknown exactly once.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failed = ShapedS1 {
+        getattr_cells: vec![CLASS_PRIVATE, KEY_TYPE_ML_DSA, PARAM_SET_65],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::FUNCTION_FAILED.0, 0, 0)
+    };
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &failed,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_SignInit", CkRv::OK.0, CKM_ML_DSA, init_capture()),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    let key = scene.model.project().objects[0].id;
+    let flags = scene
+        .model
+        .key_metadata_flags(key)
+        .expect("key view exists");
+    assert!(
+        !flags.is_established(0) && !flags.is_established(1) && !flags.is_established(6),
+        "a failed GET establishes nothing"
+    );
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    assert!(
+        committed.key_operations.is_empty(),
+        "no proved row without establishment"
+    );
+    let unknown: Vec<_> = committed
+        .unknown_key_operations
+        .iter()
+        .map(|row| (row.category, row.reason, row.completed))
+        .collect();
+    assert_eq!(unknown, vec![("sign", "metadata_unknown", 1)]);
+}

@@ -60,6 +60,9 @@ const CKA_MODULUS_BITS: u64 = 0x0121;
 const CKA_VALUE_LEN: u64 = 0x0161;
 const CKA_EC_PARAMS: u64 = 0x0180;
 const CKA_ID: u64 = 0x0102;
+const CKA_VALUE: u64 = 0x0011;
+const CKA_SEED: u64 = 0x0637;
+const CKA_PARAMETER_SET: u64 = 0x061d;
 const SECP256R1: [u8; 10] = [0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 
 fn sess(raw: u64) -> SessionHandle {
@@ -4709,4 +4712,141 @@ fn s2s3_session_handle_reuse_retires_old_mints_new() {
         Lifetime::Retired(ObjectGap::HandleReuse),
         "old views retire"
     );
+}
+
+// ---------------------------------------------------------------------------
+// F16 (7.05 PQC): parameter-set metadata provenance
+// ---------------------------------------------------------------------------
+
+/// F16 RED: hostile-width twins for the parameter-set row (P1) and its
+/// PQC key-type qualifier (P2). Healthy shapes establish on both
+/// layouts; OR-aliased selectors stay excluded, OR-aliased or
+/// out-of-range values stay unsupported, and wrong lengths stay
+/// malformed. Raw selectors only: no new-variant reference, so this
+/// compiles before GREEN and fails on the Establishment assertions.
+#[test]
+fn pqc_parameter_set_hostile_width() {
+    let l = LinuxLayout::Lp64;
+    let i = LinuxLayout::Ilp32;
+    // Healthy shapes establish on both layouts: codes 1..=12 for the
+    // set, the three PQC key types for the qualifier.
+    for (layout, w) in [(l, 8), (i, 4)] {
+        for set in 1..=12u64 {
+            assert_eq!(
+                AttrObservation::scalar(CKA_PARAMETER_SET, w, set, layout).status(),
+                QueryStatus::Established,
+                "set {set} {layout:?}"
+            );
+        }
+        for key_type in [0x49u64, 0x4a, 0x4b] {
+            assert_eq!(
+                AttrObservation::scalar(CKA_KEY_TYPE, w, key_type, layout).status(),
+                QueryStatus::Established,
+                "key type {key_type:#x} {layout:?}"
+            );
+        }
+        // Exact length: one target word, never a short or wide span.
+        for len in [0u64, 1, 2, 7, 10, w + 1, 2 * w] {
+            assert_eq!(
+                AttrObservation::scalar(CKA_PARAMETER_SET, len, 2, layout).status(),
+                QueryStatus::Malformed,
+                "len {len} {layout:?}"
+            );
+        }
+    }
+    // Full-width selector equality: ORed high bits are unknown selectors.
+    for high in [1u64 << 16, 1u64 << 32] {
+        assert_eq!(
+            AttrObservation::scalar(CKA_PARAMETER_SET | high, 8, 2, l).status(),
+            QueryStatus::Excluded,
+            "selector|{high:#x}"
+        );
+        assert_eq!(
+            AttrObservation::scalar(CKA_KEY_TYPE | high, 8, 0x4a, l).status(),
+            QueryStatus::Excluded,
+            "key-type selector|{high:#x}"
+        );
+    }
+    // Full-width value equality: ORed high bits are unsupported, never
+    // narrowed back into the accepted set.
+    for high in [1u64 << 16, 1u64 << 32] {
+        assert_eq!(
+            AttrObservation::scalar(CKA_PARAMETER_SET, 8, 2 | high, l).status(),
+            QueryStatus::Unsupported,
+            "set|{high:#x}"
+        );
+        assert_eq!(
+            AttrObservation::scalar(CKA_KEY_TYPE, 8, 0x4a | high, l).status(),
+            QueryStatus::Unsupported,
+            "key type|{high:#x}"
+        );
+    }
+    // Out-of-range codes refuse on the scalar path, however wide.
+    for set in [0u64, 13, 14, 0x100, u32::MAX as u64, u64::MAX] {
+        assert_eq!(
+            AttrObservation::scalar(CKA_PARAMETER_SET, 8, set, l).status(),
+            QueryStatus::Unsupported,
+            "set {set:#x}"
+        );
+    }
+    // The parameter set is scalar-only: the curve path never classifies it.
+    assert_eq!(
+        AttrObservation::curve(CKA_PARAMETER_SET, &[2], l).status(),
+        QueryStatus::Malformed,
+        "curve path refuses the scalar kind"
+    );
+}
+
+/// F16 RED: secret-alias twins. The parameter-set selector establishes
+/// (the RED member) while the seed, value and id selectors stay
+/// excluded at every width, length and value, on both layouts — no
+/// read is authorized for them, so nothing classifies however the
+/// words look. A hostile caller ORing high bits onto a secret
+/// selector, or pointing a parameter-set value word at secrets,
+/// changes nothing: exclusion is by selector, classification by
+/// finite value membership.
+#[test]
+fn pqc_parameter_set_secret_alias_twins() {
+    let l = LinuxLayout::Lp64;
+    let i = LinuxLayout::Ilp32;
+    // The RED member: the approved selector establishes its word.
+    assert_eq!(
+        AttrObservation::scalar(CKA_PARAMETER_SET, 8, 2, l).status(),
+        QueryStatus::Established,
+        "the parameter-set word establishes"
+    );
+    assert_eq!(
+        AttrObservation::scalar(CKA_KEY_TYPE, 8, 0x4a, l).status(),
+        QueryStatus::Established,
+        "the PQC qualifier establishes"
+    );
+    // Secret selectors stay silent: seed, private value, id.
+    for layout in [l, i] {
+        for selector in [CKA_SEED, CKA_VALUE, CKA_ID] {
+            for (len, value) in [(0, 0), (1, 1), (4, 2), (8, 2), (8, u64::MAX)] {
+                assert_eq!(
+                    AttrObservation::scalar(selector, len, value, layout).status(),
+                    QueryStatus::Excluded,
+                    "selector {selector:#x} len {len} {layout:?}"
+                );
+            }
+            for high in [1u64 << 16, 1u64 << 32] {
+                assert_eq!(
+                    AttrObservation::scalar(selector | high, 8, 2, layout).status(),
+                    QueryStatus::Excluded,
+                    "secret selector|{high:#x} {layout:?}"
+                );
+            }
+            assert_eq!(
+                AttrObservation::size_only(selector).status(),
+                QueryStatus::Excluded,
+                "size-only selector {selector:#x}"
+            );
+            assert_eq!(
+                AttrObservation::unavailable(selector).status(),
+                QueryStatus::Excluded,
+                "unavailable selector {selector:#x}"
+            );
+        }
+    }
 }

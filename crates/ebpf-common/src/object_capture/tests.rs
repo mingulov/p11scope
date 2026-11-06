@@ -237,6 +237,9 @@ const SEL_KEYTYPE: u64 = 0x0100;
 const SEL_MODBITS: u64 = 0x0121;
 const SEL_VALUELEN: u64 = 0x0161;
 const SEL_ECPARAMS: u64 = 0x0180;
+const SEL_PARAMETER_SET: u64 = 0x061d;
+const SEL_VALUE: u64 = 0x0011;
+const SEL_SEED: u64 = 0x0637;
 
 const EC_P256: &[u8] = &[0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07];
 const EC_P384: &[u8] = &[0x06, 0x05, 0x2b, 0x81, 0x04, 0x00, 0x22];
@@ -5757,5 +5760,123 @@ fn selector_for_kind_inverts_policy_mapping() {
             Some(kind),
             "{kind:?}"
         );
+    }
+}
+
+// F16 (7.05 PQC) RED: the parameter-set wire kind (raw code 7)
+// selects and decodes. Compiles before GREEN, fails on both
+// assertions; the kind tables gain their reviewed row with GREEN.
+#[test]
+fn pqc_parameter_set_wire_kind_selected() {
+    assert!(slot_kind_selected(7), "kind 7 selects");
+    assert!(kind_from_code(7).is_some(), "kind 7 decodes");
+}
+
+// F16 (7.05 PQC) RED: request-template secrets twins. A healthy
+// parameter-set word reads exactly its word and classifies; secret
+// bytes behind a parameter-set value pointer refuse; the seed and
+// value selectors stay silent (their value words are never read,
+// and no value-byte read happens anywhere). The parameter-set cell
+// assertions fail before GREEN (unknown selector, all-zero cell);
+// the seed/value silence assertions guard the boundary on both sides.
+#[test]
+fn pqc_parameter_set_request_slot_reads_exact_word() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        const BASE: u64 = 0x5000;
+        const VAL: u64 = 0x9000;
+        // Slot 0: a healthy parameter-set word (ML-DSA-65 code).
+        prog_attr(&target, BASE, 0, w, SEL_PARAMETER_SET, VAL, w);
+        target.borrow_mut().set_word(VAL, 2);
+        // Slot 1: secret bytes behind the value pointer refuse.
+        prog_attr(&target, BASE, 1, w, SEL_PARAMETER_SET, VAL + 0x100, w);
+        target
+            .borrow_mut()
+            .set_word(VAL + 0x100, 0x5EED_5EED_5EED_5EED);
+        // Slots 2-3: seed/value selectors stay silent even when their
+        // words would classify under the approved selector.
+        prog_attr(&target, BASE, 2, w, SEL_SEED, VAL + 0x200, w);
+        prog_attr(&target, BASE, 3, w, SEL_VALUE, VAL + 0x300, w);
+        target.borrow_mut().set_word(VAL + 0x200, 2);
+        target.borrow_mut().set_word(VAL + 0x300, 2);
+        let (mut read_word, mut read_bytes) = readers(&target);
+        let outcome =
+            inspect_request_template(BASE, 4, None, layout, &mut read_word, &mut read_bytes);
+        assert_eq!(outcome.inspected, 4, "{layout:?}");
+        assert_eq!(
+            (
+                outcome.cells[0].kind,
+                outcome.cells[0].status,
+                outcome.cells[0].value
+            ),
+            (7, ast::VALUE, 2),
+            "healthy set classifies {layout:?}"
+        );
+        assert_eq!(
+            (
+                outcome.cells[1].kind,
+                outcome.cells[1].status,
+                outcome.cells[1].value
+            ),
+            (7, ast::UNSUPPORTED, 0),
+            "secret bytes refuse {layout:?}"
+        );
+        for slot in [2usize, 3] {
+            assert_eq!(
+                outcome.cells[slot],
+                AttrCell {
+                    kind: 0,
+                    status: 0,
+                    value: 0
+                },
+                "secret selector silent at slot {slot} {layout:?}"
+            );
+        }
+        assert_no_read_of(&target, VAL + 0x200);
+        assert_no_read_of(&target, VAL + 0x300);
+        assert_no_bytes_reads(&target);
+    }
+}
+
+// F16 (7.05 PQC) RED: Get entry retains the parameter-set header and
+// the return establishes it, beside a silent seed neighbor. The
+// slot-count and establishment assertions fail before GREEN (the
+// selector retains nothing); the seed silence guards the boundary.
+#[test]
+fn pqc_parameter_set_get_roundtrip_establishes() {
+    for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
+        let w = layout.word_bytes() as u64;
+        let target = fresh(w);
+        prog_attr(&target, 0x4000, 0, w, SEL_PARAMETER_SET, 0x8000, w);
+        target.borrow_mut().set_word(0x8000, 2);
+        prog_attr(&target, 0x4000, 1, w, SEL_SEED, 0x8100, w);
+        target.borrow_mut().set_word(0x8100, 2);
+        let mut state = GetEntryState::default();
+        let verdict = capture_get_entry(0x4000, 2, layout, &mut state, word_reader(&target));
+        assert_eq!(verdict.inspected, 2, "{layout:?}");
+        assert_eq!(verdict.slot_count, 1, "{layout:?}: the set header retains");
+        let (r, b) = readers(&target);
+        let outcome = capture_get_return(&state, CKR_OK, ReturnAuthority::AUTHORIZED, layout, r, b);
+        assert_eq!(
+            (
+                outcome.cells[0].kind,
+                outcome.cells[0].status,
+                outcome.cells[0].value
+            ),
+            (7, ast::VALUE, 2),
+            "the set establishes {layout:?}"
+        );
+        assert_eq!(
+            outcome.cells[1],
+            AttrCell {
+                kind: 0,
+                status: 0,
+                value: 0
+            },
+            "the seed neighbor stays silent {layout:?}"
+        );
+        assert_no_read_of(&target, 0x8100);
+        assert_no_bytes_reads(&target);
     }
 }

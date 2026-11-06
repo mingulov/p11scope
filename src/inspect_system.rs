@@ -7435,8 +7435,7 @@ mod tests {
                 line.contains("partial:"),
                 "the text verdict must read partial, got: {line}"
             );
-            let verbose =
-                render_text_with_verbosity(&unaimed, crate::cli::TextVerbosity::Verbose);
+            let verbose = render_text_with_verbosity(&unaimed, crate::cli::TextVerbosity::Verbose);
             let vline = verbose
                 .lines()
                 .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))

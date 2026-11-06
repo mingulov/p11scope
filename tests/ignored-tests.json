@@ -1946,6 +1946,12 @@
       "path": "output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker",
       "reason": "privileged: sudo -o ownership cell (root via sudo; invoker-owned reports in an invoker-owned dir, root-owned elsewhere)",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness",
+      "reason": "root: loop overlay mounts drive the no-route collect cell",
+      "cell": "privileged"
     }
   ]
 }

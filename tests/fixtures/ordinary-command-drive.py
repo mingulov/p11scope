@@ -77,7 +77,7 @@ def commands(binary, helper, root):
         raw = success(run([binary, "inspect", "--pid", str(pid), "--json"]))
         document = json.loads(raw)
         identity(document, text, pid, expected, metadata)
-        require(document["modules"] == [] and "0 PKCS#11 modules mapped" in text,
+        require(document["modules"] == [] and "0 provider files mapped" in text,
                 "owned no-provider observation was not reported honestly")
         require(target.poll() is None, "owned target exited during inspection")
         print(f"ordinary-inspect text:\n{text}", end="")

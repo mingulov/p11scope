@@ -997,6 +997,94 @@ fn watched_no_use_with_pre_watch_mapping_discloses_window() {
     }
 }
 
+/// F4: verbose coverage names the pre-watch window beside the
+/// observation, never a bare "no use" when calls before the watch
+/// were missed. Zero (unknown) or post-watch sightings keep the
+/// plain "no use" coverage.
+#[test]
+fn watched_no_use_coverage_names_pre_watch_window() {
+    for (first_seen, discloses) in [(40u64, true), (0, false), (100, false), (150, false)] {
+        let harness = varied_harness();
+        let mut presentation = capture_for(&harness, &harness.render());
+        presentation.edges.truncate(1);
+        let edge = &mut presentation.edges[0];
+        edge.entry_count = 0;
+        edge.entry_saturated = false;
+        edge.coverage = UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: None,
+        };
+        edge.mapping_first_seen_ns = first_seen;
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        let overview = snapshot
+            .lines()
+            .find(|line| line.starts_with("application "))
+            .unwrap_or_else(|| panic!("missing overview:\n{snapshot}"));
+        let coverage_part = overview
+            .split("; coverage ")
+            .nth(1)
+            .unwrap_or_else(|| panic!("missing coverage clause:\n{overview}"));
+        if discloses {
+            assert!(
+                coverage_part.contains("mapped at least 60ns before the watch started"),
+                "coverage names the window:\n{overview}"
+            );
+            assert!(
+                coverage_part.contains("earlier calls are not counted"),
+                "coverage names the miss:\n{overview}"
+            );
+        } else {
+            assert!(
+                !coverage_part.contains("mapped at least"),
+                "no window without a pre-watch mapping:\n{overview}"
+            );
+        }
+    }
+}
+
+/// F4: concise module status names the pre-watch window, never a
+/// bare "no use in the covered interval" when calls before the
+/// watch were missed. Zero (unknown) or post-watch sightings keep
+/// the plain line.
+#[test]
+fn concise_module_status_names_pre_watch_window() {
+    for (first_seen, discloses) in [(40u64, true), (0, false), (100, false), (150, false)] {
+        let harness = varied_harness();
+        let mut presentation = capture_for(&harness, &harness.render());
+        presentation.edges.truncate(1);
+        let edge = &mut presentation.edges[0];
+        edge.entry_count = 0;
+        edge.entry_saturated = false;
+        edge.coverage = UseCoverage::WatchedNoUse {
+            since_ns: 100,
+            until_ns: None,
+        };
+        edge.mapping_first_seen_ns = first_seen;
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+        let line = snapshot
+            .lines()
+            .find(|line| line.contains("mapped by 1 application"))
+            .unwrap_or_else(|| panic!("missing concise module line:\n{snapshot}"));
+        if discloses {
+            assert!(
+                line.contains("mapped at least 60ns before the watch started"),
+                "concise names the window:\n{line}"
+            );
+            assert!(
+                line.contains("earlier calls are not counted"),
+                "concise names the miss:\n{line}"
+            );
+        } else {
+            assert!(
+                !line.contains("mapped at least"),
+                "no window without a pre-watch mapping:\n{line}"
+            );
+        }
+    }
+}
+
 #[test]
 fn snapshot_and_json_agree_on_identities_states_totals_and_gaps() {
     let harness = varied_harness();

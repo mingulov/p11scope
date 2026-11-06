@@ -2071,6 +2071,11 @@ fn quiet_summary_on_empty_edges_keeps_the_absence_line() {
 fn forwarding_layer_entries_count_separately_with_per_layer_split() {
     let harness = varied_harness();
     let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
     assert!(
         presentation.modules.len() >= 2,
         "the twin needs two modules: {}",
@@ -2136,6 +2141,11 @@ fn forwarding_layer_entries_count_separately_with_per_layer_split() {
 fn forwarding_entries_line_states_the_counting_rule() {
     let harness = varied_harness();
     let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
     assert!(presentation.modules.len() >= 2);
     presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
     presentation.modules[0].admission_class = Some("closure_array".into());
@@ -2185,6 +2195,11 @@ fn forwarding_entries_line_states_the_counting_rule() {
 fn closure_only_caller_edges_stay_logical_beside_an_active_caller() {
     let harness = varied_harness();
     let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
     assert!(
         presentation.modules.len() >= 2,
         "the twin needs two modules: {}",

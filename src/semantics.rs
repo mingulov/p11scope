@@ -54,6 +54,16 @@ pub struct MechStat {
     /// fixed for the capture, so a later observation without the bit
     /// would indicate a producer bug, surfaced as unregistered.
     pub unregistered: bool,
+    /// Per-provider partition of this row's `calls`/`errors`: sole-owner
+    /// module id -> calls/errors observed on that module's slots, using
+    /// the row's own error rule (any nonzero `rv`). Each new key takes
+    /// one key from the shared monotonic state budget, like
+    /// `param_combos` entries; observations on slots with no sole owner
+    /// count in the row but in no cell, so the cells sum to at most the
+    /// row totals. Living inside the row keeps the breakdown inseparable
+    /// from it: purge and reconciliation drop both together, and a cell
+    /// can never outlive its row.
+    pub by_module: BTreeMap<ModuleId, MechCallStat>,
 }
 
 #[cfg(test)]
@@ -237,15 +247,17 @@ mod corrective_tests {
     #[test]
     fn mechanism_without_sole_owner_module_counts_row_only() {
         // Neither an unclaimed slot nor a doubly claimed slot names a
-        // provider: the capture-wide row still counts the calls, but no
-        // provider cell is recorded for either shape.
+        // provider, and neither grows a provider cell. The unclaimed
+        // slot's Init still counts in the capture-wide row; the doubly
+        // claimed slot is count-only by construction
+        // (`effective_semantics`), so it records nothing at all.
         let p = unowned_plan();
         let mut state = State::new(&p);
         state.observe(&mechanism_at(&p, "C_SignInit", 0, 7, 0x1087, 0));
         state.observe(&mechanism_at(&p, "C_SignInit", 1, 7, 0x1087, 0));
 
         let row = &state.mechanisms()[&0x1087];
-        assert_eq!(row.calls, 2);
+        assert_eq!(row.calls, 1);
         assert!(
             row.by_module.is_empty(),
             "no sole owner, no provider cell: {row:?}"
@@ -1963,19 +1975,20 @@ pub struct SessionStats {
     pub peak_concurrent: u64,
 }
 
-/// Calls/errors attributed to one mechanism id, scoped to one cgroup — a
-/// `CgroupStat::mechanisms` entry. Deliberately a smaller sibling of
-/// `MechStat`, not that type reused: per-cgroup breakdown only needs to
-/// answer "how much of this cgroup's traffic used this mechanism", not
-/// carry its own latency histogram or parameter combos (those stay
-/// capture-wide in `State::mechanisms`, the single source for them).
+/// Calls/errors attributed to one mechanism id, scoped to one partition —
+/// a `CgroupStat::mechanisms` entry or a `MechStat::by_module` cell.
+/// Deliberately a smaller sibling of `MechStat`, not that type reused: a
+/// scoped breakdown only needs to answer "how much of this partition's
+/// traffic used this mechanism", not carry its own latency histogram or
+/// parameter combos (those stay capture-wide in `State::mechanisms`, the
+/// single source for them).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct MechCallStat {
     pub calls: u64,
     pub errors: u64,
     /// The Detailed return path published this id with
     /// `capture::MECHANISM_UNREGISTERED` — the same sticky flag as
-    /// the capture-wide row, so the cgroup breakdown names registry
+    /// the capture-wide row, so a scoped breakdown names registry
     /// membership too.
     pub unregistered: bool,
 }
@@ -2598,6 +2611,11 @@ impl State {
                 .values()
                 .map(|stat| stat.param_combos.len())
                 .sum::<usize>()
+            + self
+                .mechanisms
+                .values()
+                .map(|stat| stat.by_module.len())
+                .sum::<usize>()
             + self.templates.len()
             + self
                 .templates
@@ -2811,6 +2829,12 @@ impl State {
             ev.rv,
             ev.capture & capture::MECHANISM_UNREGISTERED != 0,
         );
+        self.record_module_mechanism(
+            mechanism,
+            meta.module,
+            ev.rv,
+            ev.capture & capture::MECHANISM_UNREGISTERED != 0,
+        );
     }
 
     fn apply_init(&mut self, process: ProcessKey, ev: &Event, meta: &SlotMeta) {
@@ -2871,12 +2895,16 @@ impl State {
             let is_new = !self.mechanisms.contains_key(&mechanism);
             if is_new && !self.admit(1) {
                 self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
+                // No module cell here, unlike the cgroup cell: the
+                // breakdown renders inside its row, so a cell without a
+                // row could never reach output.
                 continue;
             }
             let stat = self.mechanisms.entry(mechanism).or_default();
             stat.unregistered |= unregistered;
             record_call(stat, ev);
             self.record_cgroup_mechanism(ev.cgroup_id, mechanism, ev.rv, unregistered);
+            self.record_module_mechanism(mechanism, meta.module, ev.rv, unregistered);
         }
 
         let retain = match meta.semantics.transition {
@@ -3434,6 +3462,43 @@ impl State {
         stat.calls += 1;
         if rv != CkRv::OK.0 && rv != CkRv::PENDING.0 {
             stat.errors += 1;
+        }
+    }
+
+    /// Attribute one mechanism observation to its event's sole-owner
+    /// module, inside the capture-wide row. Slots with no sole owner
+    /// (`MODULE_UNRESOLVED`) count in the row but in no cell — a guess
+    /// at a provider is never recorded. Each new cell takes one key
+    /// from the shared monotonic budget; a refused cell records nothing
+    /// and counts the usual disclosed drop. The error rule mirrors
+    /// [`record_call`] (any nonzero `rv`), not the cgroup recorder's
+    /// PENDING exclusion, so the cells partition the row exactly.
+    fn record_module_mechanism(
+        &mut self,
+        mechanism: u64,
+        module: ModuleId,
+        rv: u64,
+        unregistered: bool,
+    ) {
+        if module == MODULE_UNRESOLVED {
+            return;
+        }
+        // The capture-wide row always exists at our call sites; without
+        // a rendered row there is no breakdown to record into.
+        let is_new = match self.mechanisms.get(&mechanism) {
+            None => return,
+            Some(stat) => !stat.by_module.contains_key(&module),
+        };
+        if is_new && !self.admit(1) {
+            return;
+        }
+        if let Some(stat) = self.mechanisms.get_mut(&mechanism) {
+            let cell = stat.by_module.entry(module).or_default();
+            cell.unregistered |= unregistered;
+            cell.calls += 1;
+            if rv != 0 {
+                cell.errors += 1;
+            }
         }
     }
 

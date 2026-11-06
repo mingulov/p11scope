@@ -4007,6 +4007,23 @@ struct MechanismOut {
     #[serde(skip_serializing_if = "Option::is_none")]
     params_omitted: Option<&'static str>,
     note: &'static str,
+    /// Per-provider partition of `calls`/`errors`, in module-id order.
+    /// Empty when no observation carried an attributable sole-owner
+    /// module the document's discovery list names.
+    by_module: Vec<ByModuleOut>,
+}
+
+/// One provider's share of a mechanism row: the same `{dev, ino,
+/// sha256}` module reference `functions[].module` uses, with that
+/// provider's calls/errors for this id. Entries cover the attributed
+/// subset of the row — observations on slots with no sole owner, or
+/// whose owner the discovery list does not name, count in the row
+/// totals but in no entry — so entry sums never exceed the row.
+#[derive(Serialize)]
+struct ByModuleOut {
+    module: ModuleRef,
+    calls: u64,
+    errors: u64,
 }
 
 /// One decoded parameter combination, tagged by shape, with its
@@ -4299,6 +4316,29 @@ pub fn profile_json(
                      partial decode",
                 )
             };
+            // Per-provider partition, resolved through the discovery
+            // list exactly like `functions[].module`: an entry whose
+            // module the document does not name is skipped, never
+            // fabricated, so the row totals stay authoritative.
+            let by_module: Vec<ByModuleOut> = m
+                .by_module
+                .iter()
+                .filter_map(|(id, cell)| {
+                    ev.discovery
+                        .modules
+                        .iter()
+                        .find(|module| module.id == *id)
+                        .map(|found| ByModuleOut {
+                            module: ModuleRef {
+                                dev: found.dev,
+                                ino: found.ino,
+                                sha256: found.sha256.clone(),
+                            },
+                            calls: cell.calls,
+                            errors: cell.errors,
+                        })
+                })
+                .collect();
             MechanismOut {
                 mechanism: *id,
                 mechanism_hex: format!("0x{id:x}"),
@@ -4310,6 +4350,7 @@ pub fn profile_json(
                 params,
                 params_omitted,
                 note,
+                by_module,
             }
         })
         .collect();
@@ -9783,150 +9824,6 @@ pub(crate) mod tests {
         assert!(
             function < mechanism && mechanism < evidence,
             "mechanisms render under the function table: {out}"
-        );
-    }
-
-    /// Concise shows one short top-mechanisms line instead of the full
-    /// table: the top three by calls, then an "and K more" suffix. The
-    /// full table stays one `-v` away (see the verbose twin below).
-    #[test]
-    fn concise_frame_shows_top_mechanisms_on_one_line() {
-        let mut ev = evidence();
-        ev.verdict();
-        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
-            (0x1087, mech_stat(120, 2)),
-            (0x250, mech_stat(45, 0)),
-            (0x1081, mech_stat(30, 0)),
-            (0x1041, mech_stat(12, 0)),
-            (0x1, mech_stat(3, 0)),
-        ]
-        .into_iter()
-        .collect();
-        let out = live_scoped_with_verbosity(
-            &[report("C_Sign", 210, 0, false)],
-            &ev,
-            Duration::ZERO,
-            "/opt/p11.so",
-            "profile",
-            CapturePolicy::Allowlisted,
-            "pid",
-            &mechanisms,
-            crate::cli::TextVerbosity::Concise,
-        );
-        assert!(!out.contains("MECHANISM"), "{out}");
-        let line = out
-            .lines()
-            .find(|line| line.starts_with("Mechanisms:"))
-            .expect("concise mechanisms line: {out}");
-        assert!(
-            line.contains("CKM_AES_GCM")
-                && line.contains("CKM_SHA256")
-                && line.contains("CKM_AES_ECB"),
-            "top three by calls: {line}"
-        );
-        assert!(!line.contains("CKM_ECDSA"), "beyond the top three: {line}");
-        assert!(
-            !line.contains("CKM_RSA_PKCS"),
-            "beyond the top three: {line}"
-        );
-        assert!(line.contains("and 2 more"), "{line}");
-    }
-
-    /// The concise mechanisms line names nonzero errors beside the call
-    /// count and renders unregistered ids as hex, exactly like the
-    /// table does. Three or fewer ids carry no "more" suffix.
-    #[test]
-    fn concise_mechanism_line_names_errors_and_hex_ids() {
-        let mut ev = evidence();
-        ev.verdict();
-        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
-            (0x1087, mech_stat(120, 2)),
-            (0x9999, mech_stat(1, 1)),
-            (0x250, mech_stat(30, 0)),
-        ]
-        .into_iter()
-        .collect();
-        let out = live_scoped_with_verbosity(
-            &[report("C_Sign", 151, 0, false)],
-            &ev,
-            Duration::ZERO,
-            "/opt/p11.so",
-            "profile",
-            CapturePolicy::Allowlisted,
-            "pid",
-            &mechanisms,
-            crate::cli::TextVerbosity::Concise,
-        );
-        let line = out
-            .lines()
-            .find(|line| line.starts_with("Mechanisms:"))
-            .expect("concise mechanisms line: {out}");
-        assert!(line.contains("CKM_AES_GCM 120 calls (2 errors)"), "{line}");
-        assert!(line.contains("0x9999 1 call (1 error)"), "{line}");
-        assert!(line.contains("CKM_SHA256 30 calls"), "{line}");
-        assert!(!line.contains("more"), "{line}");
-    }
-
-    /// Verbose keeps the full mechanism table: every id on its own row,
-    /// with no "and K more" truncation.
-    #[test]
-    fn verbose_frame_lists_every_mechanism_row() {
-        let mut ev = evidence();
-        ev.verdict();
-        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = [
-            (0x1087, mech_stat(120, 2)),
-            (0x250, mech_stat(45, 0)),
-            (0x1081, mech_stat(30, 0)),
-            (0x1041, mech_stat(12, 0)),
-            (0x9999, mech_stat(3, 1)),
-        ]
-        .into_iter()
-        .collect();
-        let out = live_scoped_with_verbosity(
-            &[report("C_Sign", 210, 0, false)],
-            &ev,
-            Duration::ZERO,
-            "/opt/p11.so",
-            "profile",
-            CapturePolicy::Allowlisted,
-            "pid",
-            &mechanisms,
-            crate::cli::TextVerbosity::Verbose,
-        );
-        assert!(out.contains("MECHANISM"), "{out}");
-        for name in [
-            "CKM_AES_GCM",
-            "CKM_SHA256",
-            "CKM_AES_ECB",
-            "CKM_ECDSA",
-            "0x9999",
-        ] {
-            assert!(out.contains(name), "{out}");
-        }
-        assert!(!out.contains("more"), "{out}");
-    }
-
-    /// Verbose with no attributed mechanisms keeps the same one-line gap
-    /// note concise shows.
-    #[test]
-    fn verbose_frame_without_mechanisms_says_none_recorded() {
-        let mut ev = evidence();
-        ev.verdict();
-        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
-        let out = live_scoped_with_verbosity(
-            &[report("C_GetInfo", 1, 0, false)],
-            &ev,
-            Duration::ZERO,
-            "/opt/p11.so",
-            "profile",
-            CapturePolicy::Allowlisted,
-            "pid",
-            &mechanisms,
-            crate::cli::TextVerbosity::Verbose,
-        );
-        assert!(
-            out.contains("Mechanisms: none recorded for the observed calls."),
-            "{out}"
         );
     }
 

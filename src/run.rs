@@ -4474,6 +4474,47 @@ fn run_owned_inner(args: &RunArgs, stop: Arc<SignalState>) -> Result<OwnedRunOut
     run_owned_inner_with_host(args, stop, &crate::attach::require_multi_capable_host)
 }
 
+/// One categorical I/O kind word for a run-tree gap reason: names the
+/// denial class, never a path. Scaffolding: the body lands with the
+/// implementation.
+#[cfg(test)]
+fn io_kind_word(kind: std::io::ErrorKind) -> &'static str {
+    let _ = kind;
+    ""
+}
+
+/// One run-tree degradation reason: the failed step plus the I/O kind
+/// when the failure carries one, always ending in the honest scope.
+/// Scaffolding: the body lands with the implementation.
+#[cfg(test)]
+fn run_tree_gap_reason(step: &str, error: &anyhow::Error) -> String {
+    let _ = (step, error);
+    String::new()
+}
+
+/// Builds the owned capture scope from a placed run cgroup: the cgroup
+/// scope on success, else the exact child PID with the scope-build gap
+/// reason (the group drops and cleans itself up on that path).
+/// Scaffolding: the body lands with the implementation.
+#[cfg(test)]
+fn run_tree_scope_or_exact(
+    child_pid: u32,
+    group: crate::scope::RunCgroup,
+) -> (Scope, Option<crate::scope::RunCgroup>, Option<String>) {
+    let _ = group;
+    (Scope::Pid(child_pid), None, None)
+}
+
+/// Turns a run-end membership read into the published fact and gap: the
+/// survivor count when measured, a handed-back gap above zero, and a
+/// fail-closed gap when the membership itself could not be read.
+/// Scaffolding: the body lands with the implementation.
+#[cfg(test)]
+fn run_tree_survivors_gap(read: std::io::Result<u64>) -> (Option<u64>, Option<String>) {
+    let _ = read;
+    (None, None)
+}
+
 fn run_owned_inner_with_host(
     args: &RunArgs,
     stop: Arc<SignalState>,
@@ -14105,6 +14146,107 @@ mod tests {
             outcome(Some(128 + libc::SIGTERM), false).exit_code(),
             128 + libc::SIGTERM,
             "an unrequested signal death keeps the child's status"
+        );
+    }
+
+    #[test]
+    fn run_tree_kind_word_names_common_denials() {
+        use std::io::ErrorKind;
+        for (kind, word) in [
+            (ErrorKind::PermissionDenied, "permission denied"),
+            (ErrorKind::NotFound, "not found"),
+            (ErrorKind::ReadOnlyFilesystem, "read-only filesystem"),
+            (ErrorKind::AlreadyExists, "already exists"),
+        ] {
+            assert_eq!(super::io_kind_word(kind), word, "{kind:?}");
+        }
+        assert_eq!(super::io_kind_word(ErrorKind::TimedOut), "I/O error");
+    }
+
+    #[test]
+    fn run_tree_gap_reason_words_io_failures() {
+        let denied = anyhow::anyhow!(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "mkdir"
+        ));
+        assert_eq!(
+            super::run_tree_gap_reason("the run cgroup could not be created", &denied),
+            "the run cgroup could not be created (permission denied); \
+             only the started command is observed"
+        );
+        let verify = anyhow::anyhow!("process 4242 did not land in its cgroup");
+        assert_eq!(
+            super::run_tree_gap_reason(
+                "the started command could not be placed in the run cgroup",
+                &verify
+            ),
+            "the started command could not be placed in the run cgroup; \
+             only the started command is observed"
+        );
+    }
+
+    #[test]
+    fn run_tree_scope_or_exact_degrades_off_a_non_cgroup_dir() {
+        // A placed group that is not a cgroup v2 scope (here tmpfs)
+        // falls back to the exact child PID with the scope-build gap;
+        // the group drops and its empty dir goes with it.
+        let base = tempfile::tempdir().unwrap();
+        let group = crate::scope::RunCgroup::create(base.path()).unwrap();
+        let path = group.path().to_path_buf();
+        let (scope, kept, gap) = super::run_tree_scope_or_exact(4242, group);
+        assert!(
+            matches!(scope, crate::attach::Scope::Pid(pid) if pid == 4242),
+            "degraded scope names the child exactly"
+        );
+        assert!(kept.is_none(), "no group is kept on the exact path");
+        let reason = gap.expect("the scope-build gap is named");
+        assert!(
+            reason.contains("not a usable scope") && reason.contains("only the started command"),
+            "{reason}"
+        );
+        assert!(!path.exists(), "the unused group dir is removed");
+    }
+
+    #[test]
+    fn run_tree_survivors_gap_names_handed_back_members() {
+        assert_eq!(
+            super::run_tree_survivors_gap(Ok(0)),
+            (Some(0), None),
+            "an empty tree at run end is a measured zero, not a gap"
+        );
+        assert_eq!(
+            super::run_tree_survivors_gap(Ok(1)),
+            (
+                Some(1),
+                Some(
+                    "1 process-tree member was still present when the command exited; \
+                     its calls after the run end are out of scope"
+                        .to_string()
+                )
+            )
+        );
+        assert_eq!(
+            super::run_tree_survivors_gap(Ok(3)),
+            (
+                Some(3),
+                Some(
+                    "3 process-tree members were still present when the command exited; \
+                     their calls after the run end are out of scope"
+                        .to_string()
+                )
+            )
+        );
+        let (count, gap) = super::run_tree_survivors_gap(Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "cgroup.procs",
+        )));
+        assert_eq!(count, None, "an unread membership is unknown, never zero");
+        assert_eq!(
+            gap.as_deref(),
+            Some(
+                "the run cgroup membership could not be read at run end; \
+                 handed-back descendants are unknown"
+            )
         );
     }
 

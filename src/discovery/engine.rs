@@ -11042,6 +11042,23 @@ impl Engine {
         self.mark_partial("owned pause", reason);
     }
 
+    /// Whether discovery retained a live view for `pid`: the owned path
+    /// proves its held child survived discovery on the run-tree scope.
+    /// Scaffolding: the body lands with the implementation.
+    #[cfg(test)]
+    pub(crate) fn retains_pid(&self, pid: u32) -> bool {
+        let _ = pid;
+        false
+    }
+
+    /// Publishes a run-tree coverage gap: the command's descendants a
+    /// degraded or ended run did not follow.
+    /// Scaffolding: the body lands with the implementation.
+    #[cfg(test)]
+    pub(crate) fn note_run_tree_gap(&mut self, reason: &str) {
+        let _ = reason;
+    }
+
     fn cancellation_requested(&self) -> bool {
         self.cancel_flag
             .as_ref()

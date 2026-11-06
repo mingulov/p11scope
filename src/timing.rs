@@ -291,6 +291,10 @@ impl GapHistogram {
         self.quantile_ms(99)
     }
 
+    /// Nearest-rank quantile over the buckets, clamped to the exact
+    /// maximum: bucket bounds are upper estimates, and a quantile
+    /// never exceeds the max (the clamp keeps the upper bound
+    /// valid). Overflow stays missing, never invented.
     fn quantile_ms(&self, percent: u64) -> Option<u64> {
         if self.samples == 0 {
             return None;
@@ -302,7 +306,7 @@ impl GapHistogram {
         for (bucket, bound) in GAP_BUCKET_BOUNDS_MS.iter().enumerate() {
             cumulative = cumulative.saturating_add(self.buckets[bucket]);
             if cumulative >= rank {
-                return Some(*bound);
+                return Some((*bound).min(self.max_ms));
             }
         }
         // The quantile falls in the overflow bucket: above the bucketed
@@ -689,9 +693,10 @@ mod tests {
             gaps.observe_ms(gap);
         }
         assert_eq!(gaps.samples(), 10);
-        // Rank ceil(0.50*10)=5 lands in the ≤8 bucket; p99 (rank 10) in ≤128.
+        // Rank ceil(0.50*10)=5 lands in the ≤8 bucket; p99 (rank 10)
+        // lands in ≤128 but clamps to the exact maximum.
         assert_eq!(gaps.p50_ms(), Some(8));
-        assert_eq!(gaps.p99_ms(), Some(128));
+        assert_eq!(gaps.p99_ms(), Some(100));
         assert_eq!(gaps.max_ms(), Some(100));
         // Buckets: ≤1 ×1, ≤2 ×1, ≤4 ×2, ≤8 ×4, ≤16 ×1, ≤128 ×1.
         assert_eq!(
@@ -705,6 +710,17 @@ mod tests {
         );
         assert_eq!(gaps.bucket_for_test(3), 4);
         assert_eq!(gaps.bucket_for_test(16), 0);
+    }
+
+    /// A quantile never exceeds the exact maximum: bucket upper
+    /// bounds clamp to it, so `p50/p99/max` reads ordered.
+    #[test]
+    fn gap_quantiles_never_exceed_the_exact_max() {
+        let mut gaps = GapHistogram::new();
+        gaps.observe_ms(73);
+        assert_eq!(gaps.max_ms(), Some(73));
+        assert_eq!(gaps.p50_ms(), Some(73));
+        assert_eq!(gaps.p99_ms(), Some(73));
     }
 
     #[test]

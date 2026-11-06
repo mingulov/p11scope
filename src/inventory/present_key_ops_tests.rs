@@ -527,11 +527,11 @@ fn key_ops_line_manifest_path_refusal_without_single_module_stays_generic() {
 }
 
 #[test]
-fn key_ops_line_requested_but_refused_names_unavailable_not_tracking_off() {
+fn key_ops_line_requested_but_refused_names_request_not_tracking_off() {
     // The flag was given but the seal refused (subset or journal
     // start): the `key operations unavailable` gap proves tracking was
-    // wanted, so the header reads unavailable with the refusal, never
-    // tracking-off — the same shape as every other unavailable reason.
+    // wanted, so the header names the request and the cause, never
+    // tracking-off.
     for reason in [
         "subset refused; broad inventory continues with S1 mechanisms and API results",
         "journal-pair-missing: p11scope-journal-btf; broad inventory continues with S1 mechanisms and API results",
@@ -550,8 +550,8 @@ fn key_ops_line_requested_but_refused_names_unavailable_not_tracking_off() {
         let snapshot = render_snapshot(&presentation);
         let line = key_ops_line(&snapshot);
         let want = format!(
-            "key operations: unavailable ({})",
-            reason.split(';').next().unwrap()
+            "key operations: requested, but per-key tracking did not start ({})",
+            reason.split(';').next().unwrap().trim()
         );
         assert_eq!(line, want, "reason={reason:?}:\n{snapshot}");
         assert!(

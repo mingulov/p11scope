@@ -4856,9 +4856,11 @@ mod tests {
         };
         assert!(!a.verbose);
         assert_eq!(a.command, ["/bin/true", "-v"]);
+        // Short help spells the flag `[-v]` on every command's synopsis
+        // line; the `--verbose` spelling stays in the notes.
         for (topic, help) in [("global", USAGE), ("run", RUN_HELP)] {
             assert!(
-                help.contains("[-v|--verbose]"),
+                help.contains("[-v]"),
                 "{topic} help must advertise the verbose flag"
             );
         }
@@ -4895,11 +4897,13 @@ mod tests {
                 help.contains("[--user <name|uid>]"),
                 "{topic} help must advertise the user flag"
             );
-            assert!(
-                help.contains("--user <name|uid> (root only, like strace -u)"),
-                "{topic} help must document the user flag"
-            );
         }
+        // Short global help carries the synopsis only; the flag's notes
+        // live in scoped help.
+        assert!(
+            RUN_HELP.contains("--user <name|uid> (root only, like strace -u)"),
+            "run help must document the user flag"
+        );
         assert!(
             RUN_HELP.contains("sudo p11scope run --user alice -- pkcs11-tool --module ... -L"),
             "run help must carry the --user example"

@@ -3210,6 +3210,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// `EVIDENCE_UNREGISTERED_MECHANISMS`; plus their comment lines):
 /// 148571 B, measured with this same lexer on the integrated source;
 /// the previous pin matches its parent.
+/// Re-baselined for the run-tree pause token (the only BPF source
+/// change: the cgroup arm of `scope_auth` reads the owned child's
+/// PID_FILTER row as its generation token instead of returning zero,
+/// plus its comment lines and the pause comment on the system arm):
+/// 148761 B, measured with this same lexer on the integrated source;
+/// the previous pin matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3219,8 +3225,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            148571,
-            "5ac6d6d74915a4f2b5675ca00693179eeed7ba523dda9e39642f24c5928cf87b"
+            148761,
+            "190b35531dd398d723d9e7752d0f0c4df661c2d31aca5e06d8b884e2e50626ac"
         ),
         "stripped BPF dump must stay byte-identical"
     );

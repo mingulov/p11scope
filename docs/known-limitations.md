@@ -104,8 +104,9 @@ integration may still move them; the candidate pass confirms the numbers.
   Attaching to an already-running process (for example a running
   Firefox or Chromium) works: operations that start after the attach
   get rows, earlier operations are counted in named gaps, and a key
-  first seen before the attach reads `type unknown: first seen before
-  attach`, never dropped. Starting the observer first (`--system`, or
+  first seen before the attach reads `type unknown (not established
+  while observed)`, never dropped. Starting the observer first
+  (`--system`, or
   a cgroup scope) and then launching the application also works; no
   restart is needed either way. Call counts, mechanisms and the rest
   of the inventory still work in every case.

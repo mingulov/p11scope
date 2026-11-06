@@ -4667,12 +4667,124 @@ fn lower_scanned(module: &ReconciledModule) -> Discovered<'_> {
     lower_scanned_with(module, false)
 }
 
+/// The 2.x key-operation entries a sole-complete-table grant requires
+/// non-NULL and in own code: every 2.x function with an object-capture
+/// descriptor (the decoder's read set). Pinned by test against
+/// `kinds::object_descriptor` over `FUNCTION_LIST_FIELDS`.
+const SOLE_COMPLETE_REQUIRED_2X: [&str; 20] = [
+    "C_CreateObject",
+    "C_CopyObject",
+    "C_DestroyObject",
+    "C_GetObjectSize",
+    "C_GetAttributeValue",
+    "C_SetAttributeValue",
+    "C_FindObjects",
+    "C_EncryptInit",
+    "C_DecryptInit",
+    "C_DigestKey",
+    "C_SignInit",
+    "C_SignRecoverInit",
+    "C_VerifyInit",
+    "C_VerifyRecoverInit",
+    "C_GenerateKey",
+    "C_GenerateKeyPair",
+    "C_WrapKey",
+    "C_UnwrapKey",
+    "C_DeriveKey",
+    "C_SetOperationState",
+];
+
+/// Sole-complete-table scan authority (no-manifest key operations):
+/// a single static 2.x table with no rival proves the table a caller
+/// reaches without interface linkage or a live return. All five legs
+/// hold or nothing grants; anything else stays refused.
+fn sole_complete_table_authorized(
+    module: &ReconciledModule,
+    index: usize,
+    exports: &ObjectExports<'_>,
+) -> bool {
+    let scanned = &module.scanned;
+    if scanned.tables.len() != 1 || index != 0 {
+        return false;
+    }
+    if scanned
+        .interfaces
+        .iter()
+        .any(|interface| interface.table == Some(index) && interface.name_class != "exact_standard")
+    {
+        return false;
+    }
+    let table = &scanned.tables[index];
+    if published_walk(index, &scanned.tables, &scanned.interfaces, exports) != "full" {
+        return false;
+    }
+    if table.decoded_slot_count() != 68 {
+        return false;
+    }
+    if !(table.version.0 == 2 || (table.version.0 == 3 && table.extension_impossible)) {
+        return false;
+    }
+    if module.getter_present || module.witness_fault {
+        return false;
+    }
+    if !table.unpinned.is_empty() {
+        return false;
+    }
+    let Some(objects) = module.entry_objects.get(index) else {
+        return false;
+    };
+    if objects.len() != table.entries.len() {
+        return false;
+    }
+    if !table
+        .entries
+        .iter()
+        .zip(objects.iter())
+        .all(|(entry, object)| entry.object == scanned.key && *object == module.object)
+    {
+        return false;
+    }
+    let present: BTreeSet<&str> = table.entries.iter().map(|entry| entry.name).collect();
+    if !SOLE_COMPLETE_REQUIRED_2X
+        .iter()
+        .all(|name| present.contains(name))
+    {
+        return false;
+    }
+    if !module
+        .exports
+        .iter()
+        .any(|(name, _)| name == "C_GetFunctionList")
+    {
+        return false;
+    }
+    if scanned.double_loaded || scanned.same_file_loads != 1 {
+        return false;
+    }
+    let unresolved = scanned
+        .tables
+        .iter()
+        .enumerate()
+        .filter(|(at, table)| {
+            !table_observation_authorized(
+                table,
+                &table_evidence_score(*at, &scanned.tables, &scanned.interfaces, &[], &[], exports),
+            )
+        })
+        .count();
+    if unresolved > MAX_TABLES_PER_OBJECT {
+        return false;
+    }
+    true
+}
+
 /// Scan lowering for the no-manifest semantic subset (DEMO-4): when
 /// `scan_authorized`, targets of name-authorized tables whose
 /// publication evidence is interface linkage, a live function-list
-/// return or manifest corroboration (never export agreement alone)
-/// carry semantic authority inside this lowering only. Every other
-/// lowering keeps scan targets count-only, exactly as before.
+/// return, manifest corroboration, or the sole-complete-table leg
+/// (never export agreement alone) carry semantic authority inside
+/// this lowering only. Every other lowering keeps scan targets
+/// count-only, exactly as before.
 fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Discovered<'_> {
     let scanned = &module.scanned;
     // The module object's own `.dynsym`: the export-linkage witness for
@@ -4714,11 +4826,14 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         let authorized = table_name_authorized(&score);
         // Argument-read (semantic) authority from a scan needs the
         // table a caller actually reaches: standard interface
-        // linkage, a live function-list return, or manifest
-        // corroboration. Export-name agreement alone proves names,
-        // not the table in use, so it stays count-only here.
-        let scan_semantic =
-            scan_authorized && authorized && (score.linked || score.live_return || score.manifest);
+        // linkage, a live function-list return, manifest
+        // corroboration, or the sole-complete-table leg. Export-name
+        // agreement alone proves names, not the table in use, so it
+        // stays count-only here.
+        let sole = sole_complete_table_authorized(module, index, &exports);
+        let scan_semantic = scan_authorized
+            && authorized
+            && (score.linked || score.live_return || score.manifest || sole);
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),

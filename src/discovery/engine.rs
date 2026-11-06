@@ -43,7 +43,8 @@ use crate::discovery::scan::{
     target_layout,
 };
 use crate::discovery::scheduler::{
-    DiscoveryScheduler, InventoryCadence, MAX_PENDING_REFRESH, MAX_POLLING_RESCANS,
+    DiscoveryScheduler, InventoryCadence, MAX_NEWCOMER_ADMISSIONS_PER_TICK, MAX_PENDING_REFRESH,
+    MAX_POLLING_RESCANS,
 };
 use crate::discovery::sweep_shards;
 use crate::manifest_input::{read_manifest, selection_surface_usable, validate_structure};
@@ -24089,23 +24090,28 @@ impl Engine {
         // before selecting this tick's window. Failed opens/scans must not
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
+        // Newcomers first: new pids with no arrival mark yet were first
+        // observed this pass, so they sort ahead of marked backlog up to a
+        // bounded share; the backlog keeps its existing order (Lane-A P2a
+        // pending-first while view slots are scarce — a reconcile pass
+        // that just evicted still owes its freed slots to event-driven
+        // work first — plain rotation with free slots).
         let max_new_views = self.scheduler.max_new_views_per_tick();
-        let mut new_pids = if self.views.len() >= self.max_scan_pids || reconcile_evicted {
-            // Lane-A P2a: view slots are scarce, so event-driven newcomers
-            // sort ahead of rotation candidates for whatever frees up. A
-            // reconcile pass that just evicted dropped the count below the
-            // cap, but the freed slots still belong to event-driven work
-            // first. With free slots the plain pid order stands (fairness
-            // pins).
-            let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
-            self.scheduler
-                .new_view_order_pending_first(&new_pids, &pending)
-                .into_iter()
-        } else {
-            self.scheduler.new_view_order(&new_pids).into_iter()
-        };
-        let admitted: Vec<u32> = new_pids.by_ref().take(max_new_views).collect();
-        let deferred: Vec<u32> = new_pids.collect();
+        let scarce = self.views.len() >= self.max_scan_pids || reconcile_evicted;
+        let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
+        let newcomers: BTreeSet<u32> = new_pids
+            .iter()
+            .copied()
+            .filter(|pid| !self.newcomer_first_seen.contains_key(pid))
+            .collect();
+        let (admitted, deferred) = self.scheduler.new_view_window_newcomers_first(
+            &new_pids,
+            &newcomers,
+            &pending,
+            scarce,
+            max_new_views,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
         // Arrival marks in processing order (first diff wins; the admitted
         // window marks first so cap pressure lands on the deferred tail).
         let arrival_now = crate::attach::monotonic_ns();

@@ -294,11 +294,13 @@ impl DiscoveryScheduler {
     /// One admission tick's window with newcomers first: `newcomers` (the
     /// subset of `pids` first seen this pass) ahead of backlog, up to
     /// `newcomer_share` of the `max_new_views` batch; the rest of the batch
-    /// serves backlog in its existing order (`pending`-first when `scarce`,
-    /// rotation otherwise). Either class fills batch slots the other cannot
-    /// use, so the window stays full. Returns `(admitted, deferred)` in
-    /// admission order. Every input list must be sorted ascending; `newcomers`
-    /// and `pending` must be subsets of `pids`.
+    /// serves backlog in its existing order. Within each class the order is
+    /// `pending`-first when `scarce` (Lane-A P2a) and rotation otherwise, so
+    /// with no backlog the window is exactly today's order. Either class
+    /// fills batch slots the other cannot use, so the window stays full.
+    /// Returns `(admitted, deferred)` in admission order. Every input list
+    /// must be sorted ascending; `newcomers` and `pending` must be subsets
+    /// of `pids`.
     pub(crate) fn new_view_window_newcomers_first(
         &self,
         pids: &[u32],
@@ -308,15 +310,42 @@ impl DiscoveryScheduler {
         max_new_views: usize,
         newcomer_share: usize,
     ) -> (Vec<u32>, Vec<u32>) {
-        // Test scaffold: single-class order; the two-class split lands next.
-        let _ = (newcomers, newcomer_share);
-        let ordered = if scarce {
-            self.new_view_order_pending_first(pids, pending)
+        let (fresh, backlog): (Vec<u32>, Vec<u32>) = pids
+            .iter()
+            .copied()
+            .partition(|pid| newcomers.contains(pid));
+        // Lane-A P2a inside each class while slots are scarce, so a tick
+        // with no backlog keeps exactly today's pending-first order and
+        // only the fresh/backlog boundary reorders.
+        let fresh_order = if scarce {
+            self.new_view_order_pending_first(&fresh, pending)
         } else {
-            self.new_view_order(pids)
+            self.new_view_order(&fresh)
         };
-        let admitted = ordered.iter().copied().take(max_new_views).collect();
-        let deferred = ordered.iter().copied().skip(max_new_views).collect();
+        let backlog_order = if scarce {
+            self.new_view_order_pending_first(&backlog, pending)
+        } else {
+            self.new_view_order(&backlog)
+        };
+        // Newcomers take at most their share, plus any batch slots the
+        // backlog cannot fill; the backlog fills the rest. Callers keep
+        // the share below the batch, so a non-empty backlog keeps at
+        // least the difference every tick. Either class empty leaves
+        // today's single-class window untouched.
+        let newcomer_share = newcomer_share.min(max_new_views);
+        let fresh_take = fresh_order
+            .len()
+            .min(newcomer_share.max(max_new_views.saturating_sub(backlog_order.len())));
+        let backlog_take = backlog_order
+            .len()
+            .min(max_new_views.saturating_sub(fresh_take));
+        let mut admitted = Vec::with_capacity(fresh_take + backlog_take);
+        admitted.extend_from_slice(&fresh_order[..fresh_take]);
+        admitted.extend_from_slice(&backlog_order[..backlog_take]);
+        let mut deferred =
+            Vec::with_capacity(fresh_order.len() + backlog_order.len() - admitted.len());
+        deferred.extend_from_slice(&fresh_order[fresh_take..]);
+        deferred.extend_from_slice(&backlog_order[backlog_take..]);
         (admitted, deferred)
     }
 
@@ -703,6 +732,28 @@ mod tests {
             rest,
             scheduler.new_view_order_pending_first(&backlog, &pending),
             "scarce backlog order is otherwise unchanged"
+        );
+    }
+
+    /// With no backlog, a scarce tick keeps exactly today's Lane-A P2a
+    /// order: pending fresh pids first, then the rest by rotation. Only
+    /// the fresh/backlog boundary reorders.
+    #[test]
+    fn scarce_tick_without_backlog_keeps_pending_first_order() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        let pids: Vec<u32> = (1..=100).collect();
+        let newcomers: BTreeSet<u32> = pids.iter().copied().collect();
+        let pending: BTreeSet<u32> = [7, 42, 99].into_iter().collect();
+        let scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) = scheduler
+            .new_view_window_newcomers_first(&pids, &newcomers, &pending, true, batch, share);
+        assert_eq!(admitted[0], 7, "pending fresh pids stay first");
+        let window: Vec<u32> = admitted.into_iter().chain(deferred).collect();
+        assert_eq!(
+            window,
+            scheduler.new_view_order_pending_first(&pids, &pending),
+            "no backlog means exactly today's order"
         );
     }
 

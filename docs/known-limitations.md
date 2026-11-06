@@ -2104,16 +2104,24 @@ release commitment is made.
 BTF, permissions, scope, identity/ABI and required feature checks still apply.
 Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 
-### `run` under `sudo` clears supplementary groups (DR-56)
+### `run` under `sudo` restores groups and home (DR-56, fixed in v0.6.0)
 
-- What the user sees: a workload that needs an HSM/device group fails under
-  `sudo p11scope run`; interpreters and `/proc/self/fd` edges behave as
-  documented.
+- What the user sees: `sudo p11scope run -- tool` starts `tool` as the
+  invoking user with the invoker's supplementary groups, so HSM and
+  device-group providers (opencryptoki, group-owned SoftHSM token
+  directories, pcscd) keep working; `HOME`/`USER`/`LOGNAME`/`SHELL`
+  come from the invoker's passwd entry and `XDG_RUNTIME_DIR` from
+  `/run/user/<uid>` when that directory exists and is owned by the
+  invoker. Interpreters and `/proc/self/fd` edges behave as documented.
+  An account the observer cannot resolve refuses with a plain message
+  before anything starts.
 - Kernels/conditions: sudo launches.
 - Disclosure: usage `run` safety boundary.
-- Workaround: `profile`/`trace` against an already-running target, or a
-  capability-carrying observer (`setcap ...`, groups intact).
-- Planned: v0.3.0 docs review (keep documented or preserve groups).
+- Status: shipped fixed in v0.6.0. The child keeps `no_new_privs` with
+  clear capabilities; `-v`/`--verbose` prints the restored identity as
+  `running <cmd> as <user> (groups and home restored)`. The old
+  workaround (`profile`/`trace` against an already-running target, or a
+  capability-carrying observer) is no longer needed for this.
 
 ### One observer per target assumed (DR-52)
 

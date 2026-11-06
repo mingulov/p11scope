@@ -646,6 +646,7 @@ Provider identity is pinned by SHA-256 at attach and checked for in-place change
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
 Everything after -- belongs to CMD, including its flags and non-UTF-8 arguments.
 CMD inherits the observer's environment unchanged, except SUDO_UID/SUDO_GID/SUDO_USER/SUDO_COMMAND and P11SCOPE_* (named on stderr when withheld).
+Under sudo the child runs as the invoker with the invoker's groups and HOME/USER/LOGNAME/SHELL from the passwd entry (plus XDG_RUNTIME_DIR when /run/user/<uid> is the invoker's own); -v prints the restored identity.
 Profile and metrics counts are aggregate, not per application; --trace selects completed events.
 --counter-mode counts|timestamps|latency selects the metrics measurement for profile or run with --mode metrics.
 counts reports calls and errors without timing; timestamps adds total and max call time; latency adds a latency histogram.
@@ -662,6 +663,7 @@ The selection attempt is recorded in the report; aggregate and detail counts are
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends the capture cleanly.
 Default text output is concise: totals, coverage, and the function and mechanism tables. -v, --verbose adds every gap and reason, Evidence, and timing plus informational stderr notes. --quiet prints only the totals and coverage. Evidence counts probes: one entry and one return probe per watched function, so probes run at twice functions. Under --trace, events print the same at every level; -v adds stderr notes.
+-v/--verbose prints one line naming the sudo-drop identity (running CMD as USER (groups and home restored)).
 exit codes: the command's exit status; 1 if observing failed; 2 for wrong arguments.
 ";
 
@@ -4809,6 +4811,33 @@ mod tests {
         // Everything after `--` is the command verbatim, flags included: the
         // observer must never consume an argument meant for the child.
         assert_eq!(a.command, ["/usr/bin/app", "--pid", "7"]);
+    }
+
+    #[test]
+    fn run_verbose_parses_short_and_long_and_defaults_off() {
+        let Command::Run(a) = parse(args(&["run", "--", "/bin/true"])).unwrap() else {
+            panic!("expected run")
+        };
+        assert!(!a.verbose);
+        for flag in ["-v", "--verbose"] {
+            let Command::Run(a) = parse(args(&["run", flag, "--", "/bin/true"])).unwrap() else {
+                panic!("expected run")
+            };
+            assert!(a.verbose, "{flag} must opt in");
+            assert_eq!(a.command, ["/bin/true"]);
+        }
+        // A `-v` after `--` is the child's own argument, never the flag.
+        let Command::Run(a) = parse(args(&["run", "--", "/bin/true", "-v"])).unwrap() else {
+            panic!("expected run")
+        };
+        assert!(!a.verbose);
+        assert_eq!(a.command, ["/bin/true", "-v"]);
+        for (topic, help) in [("global", USAGE), ("run", RUN_HELP)] {
+            assert!(
+                help.contains("[-v|--verbose]"),
+                "{topic} help must advertise the verbose flag"
+            );
+        }
     }
 
     /// M-9: paths and the `run` command are bytes; they survive parsing

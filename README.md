@@ -686,9 +686,11 @@ except `SUDO_*`/`P11SCOPE_*` control variables (named on stderr when
 withheld), and no unrelated inherited file descriptors. Its executable is opened before fork
 and executed by descriptor; scripts must be invoked through an explicit ELF
 interpreter such as `/bin/sh script`.
-For now, the sudo path clears supplementary groups, so workloads needing an
-HSM/device group should use an already-running target until explicit run-as
-group selection is implemented.
+The sudo path restores the invoker's supplementary groups and home
+environment (`HOME`/`USER`/`LOGNAME`/`SHELL` from the passwd entry,
+`XDG_RUNTIME_DIR` when `/run/user/<uid>` is the invoker's own), so
+HSM/device-group workloads run as if launched directly; `-v` prints the
+restored identity.
 
 The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 identify final tagged-artifact qualification and hosted CI. The

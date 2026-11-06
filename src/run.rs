@@ -809,11 +809,61 @@ fn check_owned_target_runnable_with(
     Err(script_refusal_error(&resolved, token, &error))
 }
 
+/// The credential selection for the owned child, before any account
+/// lookup: `sudo_drop` names the sudo path, where the parent still has
+/// to resolve the invoker's account below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    sudo_drop: bool,
+}
+
+/// One passwd row the sudo-drop path consumes: the account name, home
+/// directory, and login shell. Values come from the account database,
+/// never from the environment — the child-environment rule that values
+/// are never read still holds, because nothing here reads env values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdRecord {
+    name: OsString,
+    home: OsString,
+    shell: OsString,
+    gid: libc::gid_t,
+}
+
+/// The invoker's session as the sudo-drop path restores it: passwd
+/// identity plus the supplementary group list (mirroring initgroups, so
+/// the primary group is included) and the runtime directory, but only
+/// when that directory is provably the invoker's own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvokerAccount {
+    user: OsString,
+    home: OsString,
+    shell: OsString,
+    groups: Vec<libc::gid_t>,
+    xdg_runtime_dir: Option<OsString>,
+}
+
+/// Account-database probes for invoker resolution, injectable for tests:
+/// `passwd` reads one passwd row, `grouplist` reads the initgroups list
+/// for a name, `dir_owner` reports `(is_dir, owner)` for a path.
+/// Production passes the real database; behavior is identical.
+struct InvokerProbes<'a> {
+    passwd: &'a dyn Fn(libc::uid_t) -> Option<PasswdRecord>,
+    grouplist: &'a dyn Fn(&OsStr, libc::gid_t) -> Option<Vec<libc::gid_t>>,
+    dir_owner: &'a dyn Fn(&Path) -> Option<(bool, libc::uid_t)>,
+}
+
+/// What `setgroups` accepts on Linux (`NGROUPS_MAX`); a longer resolved
+/// list is refused in the parent with the plain groups message rather
+/// than failing inside the fork child.
+const MAX_SUPPLEMENTARY_GROUPS: usize = 65536;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildIdentity {
     uid: libc::uid_t,
     gid: libc::gid_t,
-    clear_groups: bool,
+    sudo_drop: Option<InvokerAccount>,
 }
 
 impl ChildIdentity {
@@ -826,16 +876,41 @@ impl ChildIdentity {
         {
             return Err(io::Error::last_os_error());
         }
-        let identity = Self::from_ids(
+        Self::for_invoker_with(
             uids,
             gids,
             std::env::var_os("SUDO_UID").as_deref(),
             std::env::var_os("SUDO_GID").as_deref(),
-        )?;
-        if identity.clear_groups {
-            validate_account_pair(identity.uid, identity.gid)?;
-        }
-        Ok(identity)
+            &InvokerProbes {
+                passwd: &production_passwd_lookup,
+                grouplist: &production_group_lookup,
+                dir_owner: &production_dir_owner,
+            },
+        )
+    }
+
+    fn for_invoker_with(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        sudo_uid: Option<&OsStr>,
+        sudo_gid: Option<&OsStr>,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        let selected = Self::from_ids(uids, gids, sudo_uid, sudo_gid)?;
+        let sudo_drop = if selected.sudo_drop {
+            Some(resolve_invoker_account_with(
+                selected.uid,
+                selected.gid,
+                probes,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            uid: selected.uid,
+            gid: selected.gid,
+            sudo_drop,
+        })
     }
 
     fn from_ids(
@@ -843,7 +918,7 @@ impl ChildIdentity {
         gids: [libc::gid_t; 3],
         sudo_uid: Option<&OsStr>,
         sudo_gid: Option<&OsStr>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<SelectedIdentity> {
         if uids != [uids[1]; 3] || gids != [gids[1]; 3] {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -857,10 +932,10 @@ impl ChildIdentity {
                     "refusing owned child with root group credentials",
                 ));
             }
-            return Ok(Self {
+            return Ok(SelectedIdentity {
                 uid: uids[1],
                 gid: gids[1],
-                clear_groups: false,
+                sudo_drop: false,
             });
         }
         let parse = |name: &str, value: Option<&OsStr>| -> io::Result<u32> {
@@ -879,38 +954,135 @@ impl ChildIdentity {
                 })?;
             Ok(value)
         };
-        Ok(Self {
+        Ok(SelectedIdentity {
             uid: parse("SUDO_UID", sudo_uid)?,
             gid: parse("SUDO_GID", sudo_gid)?,
-            clear_groups: true,
+            sudo_drop: true,
         })
     }
 }
 
-fn validate_account_pair(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-    let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
-    let mut result = std::ptr::null_mut();
-    let mut buffer = vec![0; 16 * 1024];
-    // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut account,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut result,
-        )
+/// Resolves the sudo-drop target account in the parent, before the fork;
+/// the child only applies the resolved list through raw syscalls (name
+/// service calls are not async-signal-safe). The passwd row must exist
+/// and name `gid` as its primary group (message unchanged), and the
+/// initgroups list must resolve to a non-empty settable list. An
+/// unresolvable account refuses with a plain message before anything is
+/// forked, attached, or released.
+fn resolve_invoker_account_with(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    probes: &InvokerProbes,
+) -> io::Result<InvokerAccount> {
+    let record = (probes.passwd)(uid).filter(|record| !record.name.is_empty());
+    let Some(record) = record else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SUDO_UID/SUDO_GID do not name one existing account",
+        ));
     };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status));
-    }
-    if result.is_null() || account.pw_gid != gid {
+    if record.gid != gid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "SUDO_UID/SUDO_GID do not name one existing account",
         ));
     }
-    Ok(())
+    let mut groups = (probes.grouplist)(&record.name, gid).unwrap_or_default();
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.is_empty() || groups.len() > MAX_SUPPLEMENTARY_GROUPS {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot resolve supplementary groups for the sudo invoker",
+        ));
+    }
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    let xdg_runtime_dir = match (probes.dir_owner)(&runtime_dir) {
+        Some((true, owner)) if owner == uid => Some(runtime_dir.into_os_string()),
+        _ => None,
+    };
+    Ok(InvokerAccount {
+        user: record.name,
+        home: record.home,
+        shell: record.shell,
+        groups,
+        xdg_runtime_dir,
+    })
+}
+
+/// Copies one passwd string field out of the `getpwuid_r` buffer.
+unsafe fn passwd_field(value: *mut libc::c_char) -> Option<OsString> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees a live NUL-terminated string.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes();
+    Some(OsStr::from_bytes(bytes).to_os_string())
+}
+
+fn production_passwd_lookup(uid: libc::uid_t) -> Option<PasswdRecord> {
+    let mut capacity = 16 * 1024;
+    loop {
+        let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0; capacity];
+        // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
+        let status = unsafe {
+            libc::getpwuid_r(
+                uid,
+                &mut account,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status == libc::ERANGE {
+            capacity *= 2;
+            if capacity > 1024 * 1024 {
+                return None;
+            }
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: on success the pointers name NUL-terminated strings owned by `buffer`.
+        return Some(PasswdRecord {
+            name: unsafe { passwd_field(account.pw_name) }?,
+            home: unsafe { passwd_field(account.pw_dir) }?,
+            shell: unsafe { passwd_field(account.pw_shell) }?,
+            gid: account.pw_gid,
+        });
+    }
+}
+
+/// The initgroups list for `user` with primary group `gid`, mirroring
+/// what a direct login would set: `getgrouplist` includes `gid` itself.
+fn production_group_lookup(user: &OsStr, gid: libc::gid_t) -> Option<Vec<libc::gid_t>> {
+    let name = CString::new(user.as_bytes()).ok()?;
+    let mut capacity: usize = 16;
+    loop {
+        let mut groups = vec![0 as libc::gid_t; capacity];
+        let mut count = capacity as libc::c_int;
+        // SAFETY: name is NUL-terminated; groups and count are valid writable storage.
+        let status =
+            unsafe { libc::getgrouplist(name.as_ptr(), gid, groups.as_mut_ptr(), &mut count) };
+        if status == -1 {
+            let needed = usize::try_from(count).unwrap_or(0);
+            if needed <= capacity || needed > MAX_SUPPLEMENTARY_GROUPS {
+                return None;
+            }
+            capacity = needed;
+            continue;
+        }
+        groups.truncate(usize::try_from(count).unwrap_or(0).min(groups.len()));
+        return Some(groups);
+    }
+}
+
+fn production_dir_owner(path: &Path) -> Option<(bool, libc::uid_t)> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some((metadata.is_dir(), metadata.uid()))
 }
 
 /// Whether `run` withholds an environment variable from its owned child.
@@ -975,6 +1147,73 @@ fn child_env_removal_notice(
         if removed.len() == 1 { "" } else { "s" },
         removed.join(", ")
     ))
+}
+
+/// The sudo-drop environment overrides: `USER`/`LOGNAME` always, `HOME`
+/// and `SHELL` from the invoker's passwd row when the row names them,
+/// `XDG_RUNTIME_DIR` when the runtime directory is provably the
+/// invoker's own. Names and values alike come from the account database
+/// and these fixed override names — never from reading the inherited
+/// environment's values. An empty passwd field leaves the inherited
+/// value alone rather than writing an empty one.
+fn drop_env_overrides(drop: &InvokerAccount) -> Vec<(OsString, OsString)> {
+    let mut overrides = Vec::with_capacity(5);
+    overrides.push((OsString::from("USER"), drop.user.clone()));
+    overrides.push((OsString::from("LOGNAME"), drop.user.clone()));
+    if !drop.home.is_empty() {
+        overrides.push((OsString::from("HOME"), drop.home.clone()));
+    }
+    if !drop.shell.is_empty() {
+        overrides.push((OsString::from("SHELL"), drop.shell.clone()));
+    }
+    if let Some(dir) = &drop.xdg_runtime_dir {
+        overrides.push((OsString::from("XDG_RUNTIME_DIR"), dir.clone()));
+    }
+    overrides
+}
+
+/// Applies sudo-drop overrides to an already-filtered child environment:
+/// every entry naming an overridden variable is replaced by the
+/// account-database value. An empty override list changes nothing, so
+/// the non-sudo path keeps byte-identical passthrough.
+fn apply_env_overrides(
+    environment: &mut Vec<CString>,
+    overrides: &[(OsString, OsString)],
+) -> io::Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    environment.retain(|entry| {
+        let name = entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap_or_default();
+        !overrides.iter().any(|(key, _)| key.as_bytes() == name)
+    });
+    for (name, value) in overrides {
+        let mut entry = name.clone().into_vec();
+        entry.push(b'=');
+        entry.extend(value.clone().into_vec());
+        environment.push(CString::new(entry).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "environment override contains NUL",
+            )
+        })?);
+    }
+    Ok(())
+}
+
+/// The one `-v` line naming the sudo-drop identity. Plain text, one
+/// line, stderr only: the command spelling is the operator's own argv
+/// and the user is the passwd name, never `SUDO_USER`.
+fn sudo_drop_notice(program: &OsStr, user: &OsStr) -> String {
+    format!(
+        "running {} as {} (groups and home restored)",
+        program.to_string_lossy(),
+        user.to_string_lossy()
+    )
 }
 
 #[repr(C)]
@@ -1297,7 +1536,7 @@ unsafe fn close_sweep_range(first: u32, last: u32) -> std::result::Result<(), i3
     Ok(())
 }
 
-unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
+unsafe fn harden_owned_child(identity: &ChildIdentity) -> std::result::Result<(), i32> {
     if unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
         || unsafe {
             libc::syscall(
@@ -1312,10 +1551,15 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
     {
         return Err(unsafe { last_errno() });
     }
-    if identity.clear_groups
-        && unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) } != 0
-    {
-        return Err(unsafe { last_errno() });
+    if let Some(drop) = identity.sudo_drop.as_ref() {
+        // Before setresgid/setresuid: only root may change the group list.
+        // The list was resolved in the parent (name service calls are not
+        // async-signal-safe); the child only applies it.
+        if unsafe { libc::syscall(libc::SYS_setgroups, drop.groups.len(), drop.groups.as_ptr()) }
+            != 0
+        {
+            return Err(unsafe { last_errno() });
+        }
     }
     if unsafe {
         libc::syscall(
@@ -1388,9 +1632,7 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
     }
     if uids != [identity.uid; 3]
         || gids != [identity.gid; 3]
-        || (identity.clear_groups
-            && unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null::<libc::gid_t>()) }
-                != 0)
+        || !unsafe { child_groups_match(identity) }
         || actual_caps
             .iter()
             .any(|caps| caps.effective != 0 || caps.permitted != 0 || caps.inheritable != 0)
@@ -1399,6 +1641,45 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
         return Err(libc::EPERM);
     }
     Ok(())
+}
+
+/// Proves the child runs with the intended group list. The non-sudo
+/// child keeps whatever it inherited, so there is nothing to prove;
+/// the sudo-dropped child must show exactly the restored list. The
+/// count check is unbounded; the exact sorted compare runs when the
+/// list fits a small stack buffer (beyond that the count stands alone).
+/// The parent sorts the expected list; the child sorts its readback the
+/// same way. Async-signal-safe: stack data and raw syscalls only —
+/// `identity` is read-only mapped memory, never a lock.
+unsafe fn child_groups_match(identity: &ChildIdentity) -> bool {
+    const STACK_GROUPS: usize = 128;
+    let Some(drop) = identity.sudo_drop.as_ref() else {
+        return true;
+    };
+    let expected = drop.groups.as_slice();
+    // SAFETY: raw getgroups syscalls; the stack buffer is valid writable storage.
+    let count = unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null::<libc::gid_t>()) };
+    if count < 0 || usize::try_from(count).unwrap_or(usize::MAX) != expected.len() {
+        return false;
+    }
+    if expected.len() > STACK_GROUPS {
+        return true;
+    }
+    let mut actual = [0 as libc::gid_t; STACK_GROUPS];
+    let read = unsafe { libc::syscall(libc::SYS_getgroups, expected.len(), actual.as_mut_ptr()) };
+    if read < 0 || usize::try_from(read).unwrap_or(usize::MAX) != expected.len() {
+        return false;
+    }
+    let actual = &mut actual[..expected.len()];
+    for index in 1..actual.len() {
+        let mut at = index;
+        while at > 0 && actual[at - 1] > actual[at] {
+            actual.swap(at - 1, at);
+            at -= 1;
+        }
+    }
+    let actual: &[libc::gid_t] = actual;
+    actual == expected
 }
 
 #[cfg(test)]
@@ -1518,7 +1799,16 @@ pub(crate) struct OwnedChild {
 }
 
 impl OwnedChild {
+    #[cfg(test)]
     pub(crate) fn spawn(program: OsString, args: Vec<OsString>) -> io::Result<Self> {
+        Self::spawn_verbose(program, args, false)
+    }
+
+    pub(crate) fn spawn_verbose(
+        program: OsString,
+        args: Vec<OsString>,
+        verbose: bool,
+    ) -> io::Result<Self> {
         let identity = ChildIdentity::for_invoker()?;
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
@@ -1544,7 +1834,10 @@ impl OwnedChild {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let environment = child_environment(std::env::vars_os())?;
+        let mut environment = child_environment(std::env::vars_os())?;
+        if let Some(drop) = identity.sudo_drop.as_ref() {
+            apply_env_overrides(&mut environment, &drop_env_overrides(drop))?;
+        }
         if let Some(notice) = child_env_removal_notice(std::env::vars_os()) {
             emit_capture_diagnostic(&notice);
         }
@@ -1574,6 +1867,15 @@ impl OwnedChild {
         let test_parent = unsafe { libc::getpid() };
         #[cfg(test)]
         let test_parent_death = TEST_PARENT_DEATH_SIGNAL.with(std::cell::Cell::get);
+        // The `-v` identity line, after every fallible setup step: it names a
+        // child that is actually about to be forked, and only on the
+        // sudo-drop path. The non-sudo path stays silent.
+        if verbose && let Some(drop) = identity.sudo_drop.as_ref() {
+            emit_capture_diagnostic(&sudo_drop_notice(
+                OsStr::from_bytes(program.to_bytes()),
+                &drop.user,
+            ));
+        }
 
         // SAFETY: all allocations and C strings were prepared above. The child
         // executes only async-signal-safe syscalls before exec/_exit.
@@ -1632,7 +1934,7 @@ impl OwnedChild {
                 if libc::setsid() < 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
-                if let Err(errno) = harden_owned_child(identity) {
+                if let Err(errno) = harden_owned_child(&identity) {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
                 // Again after the identity change, which clears it when the
@@ -3959,7 +4261,7 @@ fn run_owned_inner_with_host(
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
-    let mut child = OwnedChild::spawn(program, command.collect())
+    let mut child = OwnedChild::spawn_verbose(program, command.collect(), args.verbose)
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
@@ -10477,10 +10779,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             nonroot,
-            ChildIdentity {
+            SelectedIdentity {
                 uid: 1000,
                 gid: 1001,
-                clear_groups: false,
+                sudo_drop: false,
             }
         );
 
@@ -10493,10 +10795,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             sudo,
-            ChildIdentity {
+            SelectedIdentity {
                 uid: 1000,
                 gid: 1001,
-                clear_groups: true,
+                sudo_drop: true,
             }
         );
 
@@ -10553,8 +10855,9 @@ mod tests {
 
     #[test]
     fn child_environment_passes_the_user_environment_through_unchanged() {
-        // Identity-independent: the sudo-dropped and the direct child get
-        // the same passthrough, so the workload behaves as without p11scope.
+        // The base passthrough both paths share; the sudo-drop path then
+        // replaces only the account-database variables on top of it
+        // (apply_env_overrides), so the workload behaves as without p11scope.
         let environment = child_environment([
             (OsString::from("PATH"), OsString::from("/user/bin:/bin")),
             (OsString::from("HOME"), OsString::from("/home/user")),
@@ -10651,6 +10954,299 @@ mod tests {
         assert!(!notice.contains("1000"), "{notice:?}");
         assert!(!notice.contains("s3cret"), "{notice:?}");
         assert!(!notice.contains("HOME"), "{notice:?}");
+    }
+
+    fn fake_passwd(name: &str, home: &str, shell: &str, gid: libc::gid_t) -> PasswdRecord {
+        PasswdRecord {
+            name: OsString::from(name),
+            home: OsString::from(home),
+            shell: OsString::from(shell),
+            gid,
+        }
+    }
+
+    #[test]
+    fn sudo_drop_restores_the_invokers_groups_home_and_runtime_dir() {
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1000);
+                Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001))
+            },
+            grouplist: &|user: &OsStr, gid: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                assert_eq!(user, OsStr::new("testuser"));
+                assert_eq!(gid, 1001);
+                Some(vec![27, 1001, 27, 44])
+            },
+            dir_owner: &|path: &Path| -> Option<(bool, libc::uid_t)> {
+                assert_eq!(path, Path::new("/run/user/1000"));
+                Some((true, 1000))
+            },
+        };
+        let identity = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1000);
+        assert_eq!(identity.gid, 1001);
+        let restored = identity
+            .sudo_drop
+            .as_ref()
+            .expect("sudo selects the drop path");
+        assert_eq!(restored.user, OsString::from("testuser"));
+        assert_eq!(restored.groups, vec![27, 44, 1001]);
+        assert_eq!(
+            restored.xdg_runtime_dir.as_deref(),
+            Some(OsStr::new("/run/user/1000"))
+        );
+    }
+
+    #[test]
+    fn sudo_drop_without_sudo_touches_no_account_database() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("non-sudo run must not read passwd");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("non-sudo run must not read groups");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("non-sudo run must not stat the runtime dir");
+            },
+        };
+        let identity = ChildIdentity::for_invoker_with(
+            [1000; 3],
+            [1001; 3],
+            Some(OsStr::new("not-an-id")),
+            Some(OsStr::new("also-not-an-id")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1000);
+        assert_eq!(identity.gid, 1001);
+        assert_eq!(identity.sudo_drop, None);
+    }
+
+    #[test]
+    fn sudo_drop_refuses_an_unresolvable_account() {
+        let resolve = |passwd: Option<PasswdRecord>, groups: Option<Vec<libc::gid_t>>| {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| passwd.clone(),
+                grouplist: &|_: &OsStr, _: libc::gid_t| groups.clone(),
+                dir_owner: &|_: &Path| Some((true, 1000)),
+            };
+            ChildIdentity::for_invoker_with(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1001")),
+                &probes,
+            )
+        };
+        let missing = resolve(None, Some(vec![1001])).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let empty_name = resolve(
+            Some(fake_passwd("", "/home/x", "/bin/sh", 1001)),
+            Some(vec![1001]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_name.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let gid_mismatch = resolve(
+            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 9999)),
+            Some(vec![9999]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            gid_mismatch.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let no_groups = resolve(
+            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001)),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            no_groups.to_string(),
+            "cannot resolve supplementary groups for the sudo invoker"
+        );
+        let empty_groups = resolve(
+            Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001)),
+            Some(Vec::new()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_groups.to_string(),
+            "cannot resolve supplementary groups for the sudo invoker"
+        );
+    }
+
+    #[test]
+    fn sudo_drop_skips_a_runtime_dir_it_cannot_prove() {
+        for dir_owner in [None, Some((false, 1000)), Some((true, 0))] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| {
+                    Some(fake_passwd("testuser", "/home/testuser", "/bin/bash", 1001))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+                dir_owner: &|_: &Path| dir_owner,
+            };
+            let identity = ChildIdentity::for_invoker_with(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1001")),
+                &probes,
+            )
+            .unwrap();
+            let restored = identity.sudo_drop.as_ref().expect("account resolves");
+            assert_eq!(restored.xdg_runtime_dir, None, "{dir_owner:?}");
+        }
+    }
+
+    #[test]
+    fn production_probes_resolve_the_current_user() {
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let record = production_passwd_lookup(uid).expect("the test user has a passwd entry");
+        assert!(!record.name.is_empty());
+        let groups = production_group_lookup(&record.name, record.gid)
+            .expect("the test user has a group list");
+        assert!(
+            groups.contains(&record.gid),
+            "initgroups list carries the primary group: {groups:?}"
+        );
+        let probes = InvokerProbes {
+            passwd: &production_passwd_lookup,
+            grouplist: &production_group_lookup,
+            dir_owner: &production_dir_owner,
+        };
+        let account = resolve_invoker_account_with(uid, gid, &probes);
+        // The full resolution agrees with the passwd row: it succeeds for
+        // the test user's own primary group and refuses any other.
+        assert_eq!(account.is_ok(), record.gid == gid, "{account:?}");
+        if record.gid == gid {
+            let account = account.unwrap();
+            assert_eq!(account.user, record.name);
+            assert!(account.groups.contains(&gid), "{:?}", account.groups);
+        }
+    }
+
+    #[test]
+    fn child_env_overrides_rewrite_only_the_account_variables() {
+        let account = InvokerAccount {
+            user: OsString::from("testuser"),
+            home: OsString::from("/home/testuser"),
+            shell: OsString::from("/bin/bash"),
+            groups: vec![1001],
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000")),
+        };
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/root")),
+            (OsString::from("USER"), OsString::from("root")),
+            (OsString::from("LOGNAME"), OsString::from("root")),
+            (OsString::from("SHELL"), OsString::from("/bin/sh")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (
+                OsString::from("SOFTHSM2_CONF"),
+                OsString::from("/tmp/x.conf"),
+            ),
+        ])
+        .unwrap();
+        apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "PATH=/usr/bin:/bin",
+                "SOFTHSM2_CONF=/tmp/x.conf",
+                "USER=testuser",
+                "LOGNAME=testuser",
+                "HOME=/home/testuser",
+                "SHELL=/bin/bash",
+                "XDG_RUNTIME_DIR=/run/user/1000",
+            ]
+        );
+    }
+
+    #[test]
+    fn child_env_overrides_leave_empty_passwd_fields_alone() {
+        let account = InvokerAccount {
+            user: OsString::from("testuser"),
+            home: OsString::new(),
+            shell: OsString::new(),
+            groups: vec![1001],
+            xdg_runtime_dir: None,
+        };
+        assert_eq!(
+            drop_env_overrides(&account),
+            [
+                (OsString::from("USER"), OsString::from("testuser")),
+                (OsString::from("LOGNAME"), OsString::from("testuser")),
+            ]
+        );
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/root")),
+            (OsString::from("SHELL"), OsString::from("/bin/sh")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+        ])
+        .unwrap();
+        apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "HOME=/root",
+                "SHELL=/bin/sh",
+                "XDG_RUNTIME_DIR=/run/user/0",
+                "USER=testuser",
+                "LOGNAME=testuser",
+            ]
+        );
+    }
+
+    #[test]
+    fn child_env_overrides_with_no_drop_change_nothing() {
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        let before = environment.clone();
+        apply_env_overrides(&mut environment, &[]).unwrap();
+        assert_eq!(environment, before);
+    }
+
+    #[test]
+    fn sudo_drop_notice_is_one_plain_line() {
+        assert_eq!(
+            sudo_drop_notice(OsStr::new("/usr/bin/id"), OsStr::new("testuser")),
+            "running /usr/bin/id as testuser (groups and home restored)"
+        );
+        let notice = sudo_drop_notice(OsStr::new("id"), OsStr::new("testuser"));
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
     }
 
     #[test]
@@ -15087,6 +15683,7 @@ mod tests {
             pause,
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
+            verbose: false,
             command: command.iter().map(OsString::from).collect(),
         }
     }

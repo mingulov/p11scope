@@ -212,6 +212,18 @@ User-facing limits live in
   instead of aborting.
 - `run --pause always` collects unpaused with a named gap when the arm
   fails, instead of failing the run.
+- `sudo p11scope run -- tool` starts `tool` as the invoking user with
+  the invoker's supplementary groups and home environment, as if the
+  user had run it directly: groups come from the group database (HSM
+  and device-group providers keep working),
+  `HOME`/`USER`/`LOGNAME`/`SHELL` from the invoker's passwd entry, and
+  `XDG_RUNTIME_DIR` from `/run/user/<uid>` when that directory exists
+  and is owned by the invoker. The child keeps `no_new_privs` with
+  clear capabilities. New `-v`/`--verbose` flag for `run` prints the
+  restored identity as `running <cmd> as <user> (groups and home
+  restored)`; without it `run` stays quiet about the identity. An
+  account the observer cannot resolve refuses with a plain message
+  before anything starts (DR-56).
 
 ### Known limitations
 

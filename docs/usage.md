@@ -360,9 +360,15 @@ are still in progress.
 > at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
 > later path replacement cannot change the selected inode. If that descriptor
 > path is unavailable, `run` reports the exec failure and refuses to retry the
-> command's original path. The sudo path currently clears
-> supplementary groups; use `profile`/`trace` against an already-running
-> workload when the application needs an HSM/device group. When the observer
+> command's original path. The sudo path runs the child as the invoker
+> with the invoker's supplementary groups and home environment, as if the
+> user had run the command directly: `HOME`/`USER`/`LOGNAME`/`SHELL` come
+> from the invoker's passwd entry and `XDG_RUNTIME_DIR` from
+> `/run/user/<uid>` when that directory exists and is owned by the invoker.
+> `-v`/`--verbose` prints the restored identity as one stderr line,
+> `running <cmd> as <user> (groups and home restored)`; without it `run`
+> stays quiet about the identity. An account the observer cannot resolve
+> refuses with a plain message before anything starts. When the observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and

@@ -3072,7 +3072,9 @@ fn joint_machine_in_flight_unbound_call_degrades_only_its_image() {
         .collect();
     assert_eq!(released.len(), 1, "the release is named once: {released:?}");
     assert!(
-        released[0].1.contains("1 in-flight call of 1 process image"),
+        released[0]
+            .1
+            .contains("1 in-flight call of 1 process image"),
         "the dropped count is named: {}",
         released[0].1
     );
@@ -3089,12 +3091,33 @@ fn joint_machine_in_flight_unbound_call_degrades_only_its_image() {
     );
     assert!(unbound_staging(&fixture).is_empty(), "its staging dropped");
     assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
-    assert_eq!(fixture.machine.disposition_reason(), None, "nothing latches");
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "nothing latches"
+    );
     // The bound caller's call publishes through its Joint feed.
     fixture.published_labeled("released-stall", None);
     let registry = fixture.scene.real.scene.coordinator.registry();
     assert_eq!(registry.joint_feeds(), 1, "the bound Joint feed continues");
     assert_eq!(fixture.machine.disposition_reason(), None);
+    // Conservation: the bound caller's one call is attributed and nothing
+    // is counted twice. The foreign BEGIN never completed and was never an
+    // S1 call, so it is named by the release gap, not counted as a call.
+    let observations = registry.joint_observations(1);
+    assert!(
+        observations.unattributed.is_empty(),
+        "no bound call is unattributed: {:?}",
+        observations.unattributed
+    );
+    assert_eq!(
+        (observations.status, observations.reason),
+        (
+            crate::key_operation_projection::ObsStatus::Populated,
+            "none"
+        ),
+        "the bound caller's section stays populated"
+    );
 }
 
 /// The live step-3 shape: a foreign process's finished call that S1 sheds

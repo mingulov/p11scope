@@ -2296,6 +2296,54 @@ fn render_concise_edges(out: &mut String, presentation: &Presentation) {
     }
 }
 
+/// One concise per-caller scope line (F10): the per-caller entry total
+/// plus the container/pod label. Only callers with a label get a line —
+/// host callers stay covered by the provider lines above, and missing or
+/// unavailable metadata yields `None` (no line, never a wrong ID).
+fn concise_caller_scope_line(
+    app: &str,
+    pid: u32,
+    entries: u64,
+    metadata: Option<crate::caller_metadata::presentation::CallerMetadata>,
+) -> Option<String> {
+    let label =
+        crate::caller_metadata::presentation::concise_scope_label(metadata.as_ref()?, false)?;
+    let noun = if entries == 1 { "entry" } else { "entries" };
+    Some(format!(
+        "caller {app} pid {pid}: {entries} {noun} observed, {label}"
+    ))
+}
+
+/// Concise per-caller scope lines, in caller order, only when the
+/// `--caller-metadata cgroup` opt-in frame is on. Callers without an
+/// edge print nothing; the view degrades to the provider lines alone.
+fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentation) {
+    use std::collections::BTreeMap;
+    use std::fmt::Write as _;
+    if !presentation.caller_metadata.summary.enabled {
+        return;
+    }
+    let mut totals: BTreeMap<CallerId, u64> = BTreeMap::new();
+    for edge in &presentation.edges {
+        let total = totals.entry(edge.caller).or_default();
+        *total = total.saturating_add(edge.entry_count);
+    }
+    for caller in &presentation.callers {
+        let Some(total) = totals.get(&caller.id) else {
+            continue;
+        };
+        let metadata = presentation.caller_metadata.metadata(caller.id);
+        if let Some(line) = concise_caller_scope_line(
+            &application_label(presentation, caller.id),
+            caller.pid,
+            *total,
+            metadata,
+        ) {
+            let _ = writeln!(out, "{line}");
+        }
+    }
+}
+
 fn render_snapshot_inner(
     presentation: &Presentation,
     summary_only: bool,
@@ -2598,13 +2646,18 @@ fn render_snapshot_inner(
         }
     }
     // Verbose keeps one line per edge with internal ids; concise and
-    // quiet group per provider (see `render_concise_edges`).
+    // quiet group per provider (see `render_concise_edges`). Concise
+    // adds one scope line per labeled caller when the cgroup metadata
+    // opt-in is on; quiet stays a bare summary.
     if verbose {
         for edge in &presentation.edges {
             render_verbose_edge(&mut out, presentation, edge);
         }
     } else {
         render_concise_edges(&mut out, presentation);
+        if verbosity == crate::cli::TextVerbosity::Concise {
+            render_concise_caller_scope_lines(&mut out, presentation);
+        }
     }
     if presentation.edges.is_empty() {
         let _ = writeln!(
@@ -2682,8 +2735,8 @@ fn render_snapshot_inner(
             .as_ref()
             .and_then(|exe| exe.path.as_deref())
             .unwrap_or("?");
-        let _ = writeln!(
-            out,
+        let metadata = presentation.caller_metadata.metadata(caller.id);
+        let mut caller_line = format!(
             "caller {} pid {} incarnation {} {} ({})",
             caller.id.label(),
             caller.pid,
@@ -2691,7 +2744,15 @@ fn render_snapshot_inner(
             caller.lifecycle.label(),
             escape_controls(exe)
         );
-        if let Some(metadata) = presentation.caller_metadata.metadata(caller.id) {
+        if let Some(label) = metadata
+            .as_ref()
+            .and_then(|m| crate::caller_metadata::presentation::concise_scope_label(m, true))
+        {
+            caller_line.push_str(", ");
+            caller_line.push_str(&label);
+        }
+        let _ = writeln!(out, "{caller_line}");
+        if let Some(metadata) = metadata {
             let _ = writeln!(
                 out,
                 "  {}",

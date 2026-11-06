@@ -1426,6 +1426,8 @@ actual old/new immutable frame overlap and retained job/completion ownership.
 Cancellation cannot preempt a blocked kernel operation; its owned job retains
 original custody and reservations until it actually returns and joins.
 
+Concise inventory text shows a 12-hex container prefix (8-hex pod prefix) on one scope line per labeled caller, while verbose text and JSON carry the full canonical IDs; the prefixes are a display projection of the allowlisted IDs above, not a new captured field.
+
 ## Extensive-mode executable dependency hints (6.14 Option B, D-transitive)
 
 **Status: APPROVED (owner ratification 2026-10-29, batch item 5,

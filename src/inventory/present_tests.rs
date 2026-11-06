@@ -3139,3 +3139,90 @@ fn deleted_only_gaps_keep_coverage_complete_with_notes() {
         "the notes line discloses the deleted mapping: {out}"
     );
 }
+
+const SCOPE_DOCKER_ID: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+const SCOPE_POD_UID: &str = "12345678-1234-abcd-9876-1234567890ab";
+
+fn scope_metadata_for(path: &str) -> crate::caller_metadata::presentation::CallerMetadata {
+    let bytes = format!("0::/{path}\n").into_bytes();
+    let membership = crate::caller_metadata::parse_cgroup_membership(&bytes);
+    let now = std::time::Instant::now();
+    let sample = crate::caller_metadata::acquisition::UncommittedSample {
+        membership,
+        validity: crate::caller_metadata::acquisition::SampleValidity::EndpointSampleOnly,
+        numeric: crate::caller_metadata::acquisition::NumericAbsence::NamespaceUnresolved,
+        started: now,
+        ended: now,
+    };
+    crate::caller_metadata::presentation::CallerMetadata::sampled(1, 10, 20, &sample)
+}
+
+/// F10: the concise per-caller scope line names a Docker container with
+/// its 12-hex prefix and per-caller entry total.
+#[test]
+fn concise_caller_scope_line_names_docker_container() {
+    let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    assert_eq!(
+        concise_caller_scope_line("pkcs11-tool", 4242, 17, Some(metadata)).as_deref(),
+        Some("caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker)")
+    );
+}
+
+/// F10: the concise per-caller scope line names a Kubernetes pod with
+/// 8-hex pod and 12-hex container prefixes.
+#[test]
+fn concise_caller_scope_line_names_pod_and_container() {
+    let metadata = scope_metadata_for(&format!(
+        "kubepods/burstable/pod{SCOPE_POD_UID}/{SCOPE_DOCKER_ID}"
+    ));
+    assert_eq!(
+        concise_caller_scope_line("gated", 7, 1, Some(metadata)).as_deref(),
+        Some("caller gated pid 7: 1 entry observed, pod 12345678 / container 0123456789ab")
+    );
+}
+
+/// F10: host callers and missing metadata print no scope line.
+#[test]
+fn concise_caller_scope_line_silent_without_label() {
+    let host = scope_metadata_for("user.slice/user-1000.slice/session-2.scope");
+    assert_eq!(concise_caller_scope_line("tool", 1, 5, Some(host)), None);
+    assert_eq!(concise_caller_scope_line("tool", 1, 5, None), None);
+}
+
+/// F10: with the opt-in off, concise prints no caller scope lines and
+/// verbose caller lines carry no scope suffix.
+#[test]
+fn concise_opt_off_prints_no_scope_lines() {
+    let harness = varied_harness();
+    let presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    assert!(
+        !presentation.caller_metadata.summary.enabled,
+        "fixture must be opt-off"
+    );
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller ")),
+        "{out}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(!verbose.contains(", container "), "{verbose}");
+    assert!(!verbose.contains(", pod "), "{verbose}");
+}
+
+/// F10: an enabled-but-unavailable metadata frame degrades to no scope
+/// lines; the view continues.
+#[test]
+fn concise_unavailable_metadata_prints_no_scope_lines() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::unavailable(
+        crate::caller_metadata::presentation::MetadataReason::LookupLimit,
+    );
+    assert!(presentation.caller_metadata.summary.enabled);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller ")),
+        "{out}"
+    );
+    assert!(out.contains("inventory "), "{out}");
+}

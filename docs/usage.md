@@ -1328,8 +1328,10 @@ Limits that matter in pods:
   coordinates. Sampling targets1s within fixed budgets; a sample older than10s
   becomes stale, and failures clear current hints. Text/dashboard detail shows
   sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
-  intervening migration. Required installed multi-container/pod qualification
-  remains open.
+  intervening migration. Concise text prints one scope line per labeled caller,
+  e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker)`;
+  verbose text and JSON show the full 64-hex ID. Required installed multi-container/pod
+  qualification remains open.
 
   `--capture auto|scan|native` selects the usage lane. `scan` reads
   `/proc` without loading usage BPF: every edge's usage coverage

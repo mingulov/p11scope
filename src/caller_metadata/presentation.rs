@@ -307,6 +307,47 @@ fn hint_source_label(source: HintSource) -> &'static str {
     }
 }
 
+/// Short container/pod scope label for inventory text lines.
+///
+/// Concise callers show a 12-hex container prefix (8-hex pod prefix);
+/// verbose callers show the full canonical IDs. A lone container keeps
+/// its runtime in parentheses; a pod pair reads `pod <uid> / container
+/// <id>` with no runtime suffix. A sample with no hints — a host
+/// cgroup, an unrecognized runtime, a pending or an unavailable sample —
+/// yields `None`: host callers carry no scope suffix, and unavailable
+/// samples are already named by the gap line. Stale and historical rows
+/// keep their preserved hints, like the detail view.
+pub(crate) fn concise_scope_label(metadata: &CallerMetadata, verbose: bool) -> Option<String> {
+    let pod = metadata.pod.uid.map(|uid| {
+        let full = uid.as_str();
+        if verbose {
+            full.to_string()
+        } else {
+            full[..8].to_string()
+        }
+    });
+    let shown_container = metadata.container.id.map(|id| {
+        let full = id.as_str();
+        if verbose {
+            full.to_string()
+        } else {
+            full[..12].to_string()
+        }
+    });
+    match (pod, shown_container) {
+        (Some(pod), Some(container)) => Some(format!("pod {pod} / container {container}")),
+        (Some(pod), None) => Some(format!("pod {pod}")),
+        (None, Some(container)) => match metadata.container.runtime {
+            Some(runtime) => Some(format!(
+                "container {container} ({})",
+                runtime_label(runtime)
+            )),
+            None => Some(format!("container {container}")),
+        },
+        (None, None) => None,
+    }
+}
+
 /// Cgroup membership component: stable-read status plus optional
 /// mount-proofed numeric identity. `Sampled` means the two endpoint reads
 /// agreed and parsed as valid v2 membership; `directory_inode` and
@@ -776,6 +817,10 @@ mod tests {
         }
     }
 
+    fn committed_for(path: &str) -> CallerMetadata {
+        CallerMetadata::sampled(1, 10, 20, &uncommitted_for(path))
+    }
+
     #[test]
     fn pending_has_no_claims_and_zero_revision() {
         let pending = CallerMetadata::pending();
@@ -1175,6 +1220,152 @@ mod tests {
     fn failed_refresh_keeps_unknown_reason_when_age_is_checked() {
         let unknown = CallerMetadata::from_refusal(SampleRefusal::MembershipReadFailed, 7);
         assert_eq!(unknown.to_stale(), unknown);
+    }
+
+    #[test]
+    fn concise_label_docker_container() {
+        let m = committed_for(&format!("system.slice/docker-{DOCKER_ID}.scope"));
+        assert_eq!(
+            concise_scope_label(&m, false).as_deref(),
+            Some(&*format!("container {} (docker)", &DOCKER_ID[..12]))
+        );
+        assert_eq!(
+            concise_scope_label(&m, true).as_deref(),
+            Some(&*format!("container {DOCKER_ID} (docker)"))
+        );
+    }
+
+    #[test]
+    fn concise_label_kubernetes_pod() {
+        let m = committed_for(&format!("kubepods/burstable/pod{POD_UID}/{DOCKER_ID}"));
+        assert_eq!(
+            concise_scope_label(&m, false).as_deref(),
+            Some(&*format!(
+                "pod {} / container {}",
+                &POD_UID[..8],
+                &DOCKER_ID[..12]
+            ))
+        );
+    }
+
+    #[test]
+    fn concise_label_unrecognised_and_host() {
+        assert_eq!(
+            concise_scope_label(
+                &committed_for("user.slice/user-1000.slice/session-2.scope"),
+                false
+            ),
+            None
+        );
+        // Lane ruling T5-1: the parser has no libpod grammar, so a
+        // container-looking libpod path parses to CallerMetadata identical
+        // to a host path (Sampled, no hints); a pure label function cannot
+        // tell them apart, and the host-must-be-None rule governs both.
+        // The "container: not recognised" string needs a parser
+        // container-looking signal (a new derived field, out of scope here).
+        assert_eq!(
+            concise_scope_label(&committed_for("machine.slice/libpod-zzzz.scope"), false),
+            None
+        );
+    }
+
+    #[test]
+    fn concise_label_podman_fixture_unrecognized_today() {
+        // The parser recognises no libpod grammar and has no Podman
+        // runtime, so a well-formed libpod unit is unrecognized, exactly
+        // like a host cgroup: no label, never a wrong ID.
+        let id = "a".repeat(64);
+        let m = committed_for(&format!("machine.slice/libpod-{id}.scope"));
+        assert_eq!(m.container.id, None);
+        assert_eq!(m.pod.uid, None);
+        assert_eq!(concise_scope_label(&m, false), None);
+        assert_eq!(concise_scope_label(&m, true), None);
+    }
+
+    #[test]
+    fn concise_label_verbose_pod_expands_both_ids() {
+        let m = committed_for(&format!("kubepods/burstable/pod{POD_UID}/{DOCKER_ID}"));
+        assert_eq!(
+            concise_scope_label(&m, true).as_deref(),
+            Some(&*format!("pod {POD_UID} / container {DOCKER_ID}"))
+        );
+    }
+
+    #[test]
+    fn concise_label_other_runtimes_use_canonical_labels() {
+        let containerd = committed_for(&format!("system.slice/cri-containerd-{DOCKER_ID}.scope"));
+        assert_eq!(
+            concise_scope_label(&containerd, false).as_deref(),
+            Some(&*format!("container {} (containerd)", &DOCKER_ID[..12]))
+        );
+        let crio = committed_for(&format!("system.slice/crio-{DOCKER_ID}.scope"));
+        assert_eq!(
+            concise_scope_label(&crio, false).as_deref(),
+            Some(&*format!("container {} (cri_o)", &DOCKER_ID[..12]))
+        );
+        // A container hint without a recognized runtime keeps the uniform
+        // shape with the canonical "unknown" label.
+        let mut unknown = committed_for(&format!("docker/{DOCKER_ID}"));
+        unknown.container.runtime = Some(crate::caller_metadata::RuntimeHint::Unknown);
+        assert_eq!(
+            concise_scope_label(&unknown, false).as_deref(),
+            Some(&*format!("container {} (unknown)", &DOCKER_ID[..12]))
+        );
+        // A missing runtime claim (never produced by the parser) renders
+        // the bare ID rather than asserting a runtime.
+        unknown.container.runtime = None;
+        assert_eq!(
+            concise_scope_label(&unknown, false).as_deref(),
+            Some(&*format!("container {}", &DOCKER_ID[..12]))
+        );
+    }
+
+    #[test]
+    fn concise_label_unavailable_samples_yield_none() {
+        assert_eq!(concise_scope_label(&CallerMetadata::pending(), false), None);
+        assert_eq!(
+            concise_scope_label(
+                &CallerMetadata::from_refusal(
+                    crate::caller_metadata::acquisition::SampleRefusal::MembershipReadFailed,
+                    3
+                ),
+                false
+            ),
+            None
+        );
+        // Refused membership (oversize bytes) is unavailable too: the gap
+        // line already names it, so the scope label stays silent.
+        let oversized = vec![b'x'; crate::caller_metadata::MAX_CGROUP_BYTES + 1];
+        let refused = CallerMetadata::sampled(2, 70, 80, &uncommitted_bytes(&oversized));
+        assert_eq!(refused.status, MetadataStatus::Unknown);
+        assert_eq!(concise_scope_label(&refused, false), None);
+        assert_eq!(concise_scope_label(&refused, true), None);
+    }
+
+    #[test]
+    fn concise_label_stale_and_historical_keep_hints() {
+        let healthy = committed_for(&format!("docker/{DOCKER_ID}"));
+        let expected = format!("container {} (docker)", &DOCKER_ID[..12]);
+        assert_eq!(
+            concise_scope_label(&healthy.to_stale(), false).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            concise_scope_label(&healthy.to_historical(), false).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn concise_label_pod_without_container_names_pod_only() {
+        // Defensive: the parser always pairs pod and container hints, but
+        // a pod-only value must still render honestly.
+        let mut m = committed_for(&format!("kubepods/burstable/pod{POD_UID}/{DOCKER_ID}"));
+        m.container.id = None;
+        assert_eq!(
+            concise_scope_label(&m, false).as_deref(),
+            Some(&*format!("pod {}", &POD_UID[..8]))
+        );
     }
 
     #[test]

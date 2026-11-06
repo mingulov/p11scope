@@ -7582,6 +7582,7 @@ impl Session {
                         generation_token,
                         track_short_lived,
                         pid_start,
+                        None,
                     )
                     .context("publishing scope and capture policy")?;
                     debug_assert!(process_creation_capture_enabled(scope, policy));
@@ -19736,6 +19737,48 @@ mod tests {
         assert_eq!(key.pad, 0);
         assert_eq!(key.generation_token, 99);
         assert!(pause_key_for(&Scope::Pid(42), None).unwrap().is_none());
+    }
+
+    /// A run-tree session binds its owned generation to the run
+    /// cgroup: the key names the owned child, proven by live
+    /// membership through the retained descriptor, never the path.
+    #[test]
+    fn pause_key_accepts_run_cgroup_naming_the_owned_child() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "4242\n").unwrap();
+        let scope = crate::scope::cgroup(dir.path()).unwrap();
+        let capability = OwnedPauseGeneration {
+            tgid: 4242,
+            generation: std::num::NonZeroU64::new(99).unwrap(),
+        };
+        let key = pause_key_for(&scope, Some(&capability)).unwrap().unwrap();
+        assert_eq!(key.tgid, 4242);
+        assert_eq!(key.pad, 0);
+        assert_eq!(key.generation_token, 99);
+    }
+
+    /// A cgroup that does not hold the owned child binds no key, and
+    /// system scope still binds none: the refusal names the missing
+    /// membership instead of demanding PID scope.
+    #[test]
+    fn pause_key_refuses_cgroup_or_system_missing_the_owned_child() {
+        let capability = OwnedPauseGeneration {
+            tgid: 4242,
+            generation: std::num::NonZeroU64::new(99).unwrap(),
+        };
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("cgroup.procs"), "7\n").unwrap();
+        let foreign = crate::scope::cgroup(dir.path()).unwrap();
+        let error = format!(
+            "{:#}",
+            pause_key_for(&foreign, Some(&capability)).unwrap_err()
+        );
+        assert!(error.contains("not a member"), "{error}");
+        let error = format!(
+            "{:#}",
+            pause_key_for(&Scope::System, Some(&capability)).unwrap_err()
+        );
+        assert!(error.contains("run-cgroup"), "{error}");
     }
 
     #[test]

@@ -347,6 +347,7 @@ pub(crate) fn publish(
     generation_token: Option<u64>,
     track_short_lived: bool,
     pid_start: Option<u64>,
+    owned_pid: Option<u32>,
 ) -> Result<()> {
     publish_detailed_with(
         scope,
@@ -354,6 +355,7 @@ pub(crate) fn publish(
         generation_token,
         track_short_lived,
         pid_start,
+        owned_pid,
         &mut EbpfScopeIo(ebpf),
     )
 }
@@ -461,8 +463,13 @@ fn publish_detailed_with(
     generation_token: Option<u64>,
     track_short_lived: bool,
     pid_start: Option<u64>,
+    owned_pid: Option<u32>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
+    // The run-tree wiring consumes the owned child: a cgroup scope
+    // beside a generation publishes the child's pause row. Until
+    // then the parameter rides through untouched.
+    let _ = owned_pid;
     if generation_token == Some(0) {
         bail!("pause generation token must be non-zero");
     }
@@ -498,6 +505,7 @@ fn publish_detailed_with(
         config,
         false,
         pid_start,
+        owned_pid,
         io,
     )
 }
@@ -509,7 +517,7 @@ fn publish_inventory_with(scope: &Scope, io: &mut impl ScopePublicationIo) -> Re
     }
     // Inventory objects never carry the witness map, so no witness is
     // published here even for PID scope.
-    publish_validated_scope_with(scope, 1, config, true, None, io)
+    publish_validated_scope_with(scope, 1, config, true, None, None, io)
 }
 
 // Only the two mode-specific wrappers above construct the validated config.
@@ -520,8 +528,11 @@ fn publish_validated_scope_with(
     config: u64,
     reserved_config_zero: bool,
     pid_start: Option<u64>,
+    owned_pid: Option<u32>,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
+    // See `publish_detailed_with`: the run-tree wiring consumes this.
+    let _ = owned_pid;
     let mut expected_pids = BTreeMap::new();
     let mut expected_starts = BTreeMap::new();
     match scope {
@@ -846,6 +857,7 @@ mod tests {
             None,
             false,
             Some(777),
+            None,
             &mut maps,
         )
         .unwrap();
@@ -876,6 +888,7 @@ mod tests {
                 None,
                 false,
                 Some(777),
+                None,
                 &mut maps,
             )
             .unwrap_err();
@@ -895,6 +908,7 @@ mod tests {
             None,
             false,
             Some(777),
+            None,
             &mut maps,
         )
         .unwrap();
@@ -916,11 +930,146 @@ mod tests {
                 None,
                 false,
                 pid_start_tick_of(&scope, None).unwrap(),
+                None,
                 &mut maps,
             )
             .unwrap();
             assert!(maps.starts.is_empty());
         }
+    }
+
+    /// A run-tree session publishes the cgroup filter beside one
+    /// PID_FILTER row: the owned child's pause token. Membership is
+    /// proven through the retained descriptor before any map write.
+    #[test]
+    fn publish_run_cgroup_writes_owned_child_pause_row() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::write(root.path().join("cgroup.procs"), "4242\n").unwrap();
+        let scope = cgroup(root.path()).unwrap();
+        let mut maps = WitnessMaps::default();
+        publish_detailed_with(
+            &scope,
+            CapturePolicy::Allowlisted,
+            Some(99),
+            false,
+            None,
+            Some(4242),
+            &mut maps,
+        )
+        .unwrap();
+        assert_eq!(maps.pids, BTreeMap::from([(4242, 99)]));
+        assert_eq!(
+            maps.config.get(&CFG_FLAGS),
+            Some(&(FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED | FLAG_PAUSE_ENABLED))
+        );
+        assert!(valid_config(maps.config[&CFG_FLAGS]));
+    }
+
+    /// A pause generation on a cgroup scope without the owned child
+    /// refuses loudly: no token source, no anonymous pause row.
+    #[test]
+    fn publish_cgroup_pause_without_owned_child_refuses() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = cgroup(root.path()).unwrap();
+        let mut maps = WitnessMaps::default();
+        let error = publish_detailed_with(
+            &scope,
+            CapturePolicy::Allowlisted,
+            Some(99),
+            false,
+            None,
+            None,
+            &mut maps,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("requires the owned child"),
+            "{error:#}"
+        );
+        assert!(maps.pids.is_empty());
+    }
+
+    /// An owned child that is not the selected PID refuses: only the
+    /// exact child, or none, rides beside a PID scope.
+    #[test]
+    fn publish_pid_scope_rejects_foreign_owned_child() {
+        let mut maps = WitnessMaps::default();
+        let error = publish_detailed_with(
+            &Scope::Pid(41),
+            CapturePolicy::Allowlisted,
+            Some(99),
+            false,
+            None,
+            Some(42),
+            &mut maps,
+        )
+        .unwrap_err();
+        assert!(format!("{error:#}").contains("does not match"), "{error:#}");
+        assert!(maps.pids.is_empty());
+    }
+
+    /// System scope never names one owned child; the combination is
+    /// a caller bug and refuses instead of publishing.
+    #[test]
+    fn publish_system_scope_rejects_owned_child() {
+        let mut maps = WitnessMaps::default();
+        let error = publish_detailed_with(
+            &Scope::System,
+            CapturePolicy::Allowlisted,
+            None,
+            false,
+            None,
+            Some(42),
+            &mut maps,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("never names one owned child"),
+            "{error:#}"
+        );
+    }
+
+    /// Without a pause generation the owned child rides through
+    /// untouched: an unpaused run-tree session publishes the bare
+    /// cgroup filter, exactly like an unowned cgroup scope.
+    #[test]
+    fn publish_cgroup_without_generation_ignores_owned_child() {
+        let root = tempfile::tempdir().unwrap();
+        let scope = cgroup(root.path()).unwrap();
+        let mut maps = WitnessMaps::default();
+        publish_detailed_with(
+            &scope,
+            CapturePolicy::Allowlisted,
+            None,
+            false,
+            None,
+            Some(4242),
+            &mut maps,
+        )
+        .unwrap();
+        assert!(maps.pids.is_empty());
+        assert_eq!(
+            maps.config.get(&CFG_FLAGS),
+            Some(&(FLAG_CGROUP_FILTER | FLAG_POLICY_ALLOWLISTED))
+        );
+    }
+
+    /// A degraded exact-PID run carries its owned child beside the
+    /// matching PID scope: the publication is the ordinary PID row.
+    #[test]
+    fn publish_pid_scope_accepts_matching_owned_child() {
+        let mut maps = WitnessMaps::default();
+        publish_detailed_with(
+            &Scope::Pid(42),
+            CapturePolicy::Allowlisted,
+            Some(99),
+            false,
+            None,
+            Some(42),
+            &mut maps,
+        )
+        .unwrap();
+        assert_eq!(maps.pids, BTreeMap::from([(42, 99)]));
     }
 
     #[test]

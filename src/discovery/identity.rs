@@ -865,7 +865,15 @@ pub(crate) fn self_mapped_file(file: &std::fs::File) -> Result<MappedFile, Strin
             map_files_entry_file(&format!("/proc/self/map_files/{range}"))
                 .map_err(|e| format!("map_files of the held object: {e}"))
         }
-        Err(error) => Err(format!("map_files of the held object: {error}")),
+        Err(error) => {
+            // Without CAP_CHECKPOINT_RESTORE (or CAP_SYS_ADMIN) the
+            // self-mapping proof is unavailable: name the capability
+            // once, then fail exactly as before.
+            if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+                crate::caps::note_lacking(&crate::caps::MAP_FILES_BITS);
+            }
+            Err(format!("map_files of the held object: {error}"))
+        }
     }
 }
 

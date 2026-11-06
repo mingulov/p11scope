@@ -99,14 +99,27 @@ fn errno_name(errno: i32) -> String {
 /// missing load capability with what it enables, plus the one-line
 /// recipe; when the load set is complete the refusal is other
 /// enforcement (lockdown, LSM, seccomp), never more privilege.
-#[allow(dead_code)]
-fn denied_line(operation: &str, reason: &str, _effective: u64, _binary: &str) -> String {
-    // Scaffolding: the next commit names the missing capabilities; the
-    // old root-only text keeps today's behavior until then.
-    format!(
-        "live capture needs root: the kernel refused to {operation}{reason}. \
-         Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture."
-    )
+pub(crate) fn denied_line(operation: &str, reason: &str, effective: u64, binary: &str) -> String {
+    let missing = crate::caps::missing_in(effective, &crate::caps::LOAD_BITS);
+    if missing.is_empty() {
+        format!(
+            "live capture refused: the kernel refused to {operation}{reason} with CAP_BPF and \
+             CAP_PERFMON held — a kernel lockdown, an LSM policy, or a container's seccomp \
+             profile is refusing BPF here. Run 'p11scope doctor' for host readiness, or use \
+             'p11scope inspect --pid N' for a scan without capture."
+        )
+    } else {
+        let needs: Vec<String> = missing
+            .iter()
+            .map(|cap| crate::caps::needs_line(cap))
+            .collect();
+        format!(
+            "live capture {}: the kernel refused to {operation}{reason}. Grant the minimal \
+             set: {}, or use 'p11scope inspect --pid N' for a scan without capture.",
+            needs.join("; "),
+            crate::caps::setcap_command(binary)
+        )
+    }
 }
 
 impl std::fmt::Display for MultiHostRefusal {
@@ -131,10 +144,16 @@ impl std::fmt::Display for MultiHostRefusal {
         };
         match self.cause {
             MultiHostCause::Denied => {
+                let effective = crate::caps::read_effective().unwrap_or(0);
                 write!(
                     out,
-                    "live capture needs root: the kernel refused to {operation}{reason}. \
-                     Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture."
+                    "{}",
+                    denied_line(
+                        operation,
+                        &reason,
+                        effective,
+                        &crate::caps::current_binary()
+                    )
                 )
             }
             MultiHostCause::Unavailable => {
@@ -302,14 +321,25 @@ mod tests {
                 (stage, Some(errno), cause)
             );
             let text = error.to_string();
-            assert!(
-                text.starts_with("live capture needs root: ")
-                    || text.starts_with("live capture unavailable: ")
-                    || text.starts_with("live capture did not start: "),
-                "{text}"
-            );
+            // The denied wording depends on the test runner's own
+            // capabilities (missing set vs complete set): both read
+            // below, and the exact bytes are pinned on `denied_line`.
+            if cause == MultiHostCause::Denied {
+                assert!(
+                    text.starts_with("live capture needs ")
+                        || text.starts_with("live capture refused: "),
+                    "{text}"
+                );
+            } else {
+                assert!(
+                    text.starts_with("live capture unavailable: ")
+                        || text.starts_with("live capture did not start: "),
+                    "{text}"
+                );
+                assert!(!text.contains("/"), "{text}");
+            }
             assert!(!text.contains("uprobe-multi-required"), "{text}");
-            assert!(!text.contains("upgrade") && !text.contains("6.6") && !text.contains("/"));
+            assert!(!text.contains("upgrade") && !text.contains("6.6"));
             assert_eq!(text.lines().count(), 1);
             assert!(text.len() < 1_024, "{text}");
         }
@@ -352,13 +382,21 @@ mod tests {
     }
 
     #[test]
-    fn denied_refusal_is_one_plain_line_naming_root_and_the_scan_fallback() {
-        // The first-run no-root refusal, byte for byte.
+    fn denied_refusal_is_one_plain_line_naming_caps_and_the_scan_fallback() {
+        // The deprived first-run refusal, byte for byte over explicit
+        // privilege facts (the `Display` reads the runner's own mask).
         assert_eq!(
-            MultiHostRefusal::at(MultiHostStage::ProgramLoad, Some(libc::EPERM)).to_string(),
-            "live capture needs root: the kernel refused to load p11scope's BPF programs \
-             (Operation not permitted). Run with sudo, or use 'p11scope inspect --pid N' \
-             for a scan without capture."
+            super::denied_line(
+                "load p11scope's BPF programs",
+                " (Operation not permitted)",
+                0,
+                "/usr/bin/p11scope",
+            ),
+            "live capture needs CAP_BPF (load BPF programs and attach probes); needs CAP_PERFMON \
+             (load BPF programs alongside CAP_BPF): the kernel refused to load p11scope's BPF programs \
+             (Operation not permitted). Grant the minimal set: sudo setcap \
+             'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
+             /usr/bin/p11scope, or use 'p11scope inspect --pid N' for a scan without capture."
         );
         for (stage, errno, operation) in [
             (
@@ -380,9 +418,12 @@ mod tests {
             let refusal = MultiHostRefusal::at(stage, Some(errno));
             assert_eq!(refusal.cause, MultiHostCause::Denied);
             let text = refusal.to_string();
-            assert!(text.starts_with("live capture needs root: "), "{text}");
+            assert!(
+                text.starts_with("live capture needs ")
+                    || text.starts_with("live capture refused: "),
+                "{text}"
+            );
             assert!(text.contains(operation), "{text}");
-            assert!(text.contains("Run with sudo"), "{text}");
             assert!(text.contains("p11scope inspect --pid N"), "{text}");
             assert!(text.contains("for a scan without capture"), "{text}");
             assert!(!text.contains("uprobe-multi-required"), "{text}");

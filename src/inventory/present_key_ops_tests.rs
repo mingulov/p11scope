@@ -447,9 +447,12 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
     let mut presentation =
         key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
     presentation.gaps.clear();
-    let stored = "live capture refused (live capture needs root: the kernel refused to load \
-        p11scope's BPF programs (Operation not permitted). Run with sudo, or use 'p11scope \
-        inspect --pid N' for a scan without capture.); run with sudo for full capture";
+    let stored = "live capture refused (live capture needs CAP_BPF (load BPF programs and attach \
+        probes); needs CAP_PERFMON (load BPF programs alongside CAP_BPF): the kernel refused to load \
+        p11scope's BPF programs (Operation not permitted). Grant the minimal set: sudo setcap \
+        'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
+        /usr/bin/p11scope, or use 'p11scope inspect --pid N' for a scan without capture.); grant \
+        the minimal capability set for full capture (see 'p11scope doctor')";
     presentation
         .gaps
         .push(named_gap("native usage feed unavailable", stored));
@@ -460,8 +463,8 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
         .expect("the concise gaps line");
     assert_eq!(
         gaps,
-        "gaps: 1 × native usage feed unavailable — live capture refused (needs root); run \
-         with sudo for full capture (--json has every item)"
+        "gaps: 1 × native usage feed unavailable — live capture refused (missing capabilities); \
+         run 'p11scope doctor' for the one-line setcap (--json has every item)"
     );
     assert!(!concise.contains("Operation not permitted"), "{concise}");
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);

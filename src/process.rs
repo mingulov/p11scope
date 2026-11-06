@@ -319,8 +319,12 @@ pub struct MountNamespaceId {
 }
 
 fn mount_namespace_id(pid: u32) -> Result<MountNamespaceId, String> {
-    mount_namespace_id_io(pid)
-        .map_err(|error| format!("cannot identify process mount namespace: {error}"))
+    mount_namespace_id_io(pid).map_err(|error| {
+        if matches!(error.raw_os_error(), Some(libc::EACCES | libc::EPERM)) {
+            crate::caps::note_lacking(&crate::caps::TARGET_READ_BITS);
+        }
+        format!("cannot identify process mount namespace: {error}")
+    })
 }
 
 fn mount_namespace_id_io(pid: u32) -> io::Result<MountNamespaceId> {

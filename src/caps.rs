@@ -93,9 +93,6 @@ pub(crate) fn minimal_live_mask() -> u64 {
 
 /// The minimal-set capabilities absent from `effective`, in canonical
 /// order. Empty when the set is complete.
-// Temporary: the first production callers (doctor rows, capture hints)
-// land later in this lane; each `allow` below goes away with its caller.
-#[allow(dead_code)]
 pub(crate) fn missing_for_live(effective: u64) -> Vec<&'static KnownCap> {
     MINIMAL_LIVE
         .iter()
@@ -104,7 +101,6 @@ pub(crate) fn missing_for_live(effective: u64) -> Vec<&'static KnownCap> {
 }
 
 /// The exact remediation line for one missing capability.
-#[allow(dead_code)]
 pub(crate) fn needs_line(cap: &KnownCap) -> String {
     format!("needs {} ({})", cap.name, cap.enables)
 }
@@ -112,7 +108,6 @@ pub(crate) fn needs_line(cap: &KnownCap) -> String {
 /// The `setcap(8)` capability list granting exactly the minimal live set:
 /// canonical order, `=ep` (effective + permitted, never ambient: the `run`
 /// child must not inherit any).
-#[allow(dead_code)]
 fn setcap_spec() -> String {
     let names: Vec<String> = MINIMAL_LIVE
         .iter()
@@ -124,7 +119,6 @@ fn setcap_spec() -> String {
 /// Shell-quote `binary` for the recipe line: bare when it is plain path
 /// characters, single-quoted otherwise, so a hostile path cannot break
 /// out of the one-liner.
-#[allow(dead_code)]
 fn quote_binary(binary: &str) -> String {
     const PLAIN: fn(char) -> bool = |c| {
         c.is_ascii_alphanumeric()
@@ -139,7 +133,6 @@ fn quote_binary(binary: &str) -> String {
 
 /// The exact one-line `setcap` command granting exactly the minimal live
 /// set to `binary`.
-#[allow(dead_code)]
 pub(crate) fn setcap_command(binary: &str) -> String {
     format!("sudo setcap '{}' {}", setcap_spec(), quote_binary(binary))
 }
@@ -157,7 +150,6 @@ pub(crate) const MAP_FILES_BITS: [u32; 1] = [CAP_CHECKPOINT_RESTORE_BIT];
 
 /// Among `bits`, the known minimal-live entries absent from `effective`,
 /// in canonical order. Empty when the gated operation's set is complete.
-#[allow(dead_code)]
 pub(crate) fn missing_in(effective: u64, bits: &[u32]) -> Vec<&'static KnownCap> {
     MINIMAL_LIVE
         .iter()
@@ -167,7 +159,6 @@ pub(crate) fn missing_in(effective: u64, bits: &[u32]) -> Vec<&'static KnownCap>
 
 /// This binary's path for the recipe line: the running executable, or a
 /// bare `p11scope` when it cannot be determined.
-#[allow(dead_code)]
 pub(crate) fn current_binary() -> String {
     std::env::current_exe()
         .map(|path| path.display().to_string())
@@ -177,7 +168,6 @@ pub(crate) fn current_binary() -> String {
 /// The plain clause for a refusal gated by `missing`: each capability
 /// with what it enables, then the one-line setcap recipe. Never empty:
 /// callers use it only for a non-empty missing set.
-#[allow(dead_code)]
 pub(crate) fn lacking_line(missing: &[&KnownCap], binary: &str) -> String {
     let needs: Vec<String> = missing.iter().map(|cap| needs_line(cap)).collect();
     format!(
@@ -187,15 +177,38 @@ pub(crate) fn lacking_line(missing: &[&KnownCap], binary: &str) -> String {
     )
 }
 
+/// Name the missing ones of `bits` on stderr, once per process per
+/// capability: a missing capability gets its line exactly where its
+/// operation fails, without repeating for every object in a scan. A
+/// closed stderr drops the line instead of panicking.
+pub(crate) fn note_lacking(bits: &[u32]) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NOTED: AtomicU64 = AtomicU64::new(0);
+    let Some(effective) = read_effective() else {
+        return;
+    };
+    let mut newly = Vec::new();
+    for cap in missing_in(effective, bits) {
+        let bit = 1u64 << cap.bit;
+        if NOTED.fetch_or(bit, Ordering::Relaxed) & bit == 0 {
+            newly.push(cap);
+        }
+    }
+    if !newly.is_empty() {
+        let _ = crate::try_stderr_line(&format!(
+            "p11scope: {}",
+            lacking_line(&newly, &current_binary())
+        ));
+    }
+}
+
 /// This process's effective capabilities, from `/proc/self/status`
 /// `CapEff`; `None` when unreadable or unparsable.
-#[allow(dead_code)]
 pub(crate) fn read_effective() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     parse_cap_eff(&status)
 }
 
-#[allow(dead_code)]
 fn parse_cap_eff(status: &str) -> Option<u64> {
     let hex = status
         .lines()

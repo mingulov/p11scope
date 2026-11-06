@@ -1760,10 +1760,13 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(captured) = reason.strip_prefix("live capture refused (") {
         // The PID auto-fallback gap carries the full host summary
         // (JSON and verbose keep it); concise folds it to one short
-        // clause. Only a Denied refusal carries the sudo tail, so its
-        // presence is the privilege signal.
-        if captured.ends_with("; run with sudo for full capture") {
-            return "live capture refused (needs root); run with sudo for full capture";
+        // clause. Only a Denied refusal with capabilities actually
+        // missing carries the grant tail, so its presence is the
+        // privilege signal.
+        if captured.ends_with(
+            "; grant the minimal capability set for full capture (see 'p11scope doctor')",
+        ) {
+            return "live capture refused (missing capabilities); run 'p11scope doctor' for the one-line setcap";
         }
         return "live capture refused (see 'p11scope doctor')";
     }

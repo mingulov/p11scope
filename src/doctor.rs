@@ -193,6 +193,7 @@ fn probe_with_host(
             }),
         ),
         capabilities_check(),
+        setcap_check(),
         pid_namespace_check(crate::pidns::numbering(), pid.is_some()),
         object_capture_check(),
     ];
@@ -611,16 +612,16 @@ fn sysctl_status(
     }
 }
 
-/// The `kernel.perf_event_paranoid` row, backend-aware. Static uprobe-multi
+/// The `kernel.perf_event_paranoid` row, backend-aware. Uprobe-multi
 /// links on an eligible host never call
 /// `perf_event_open`, so a restrictive paranoid does not limit them
-/// (measured 136/136 at paranoid=4 with `CAP_BPF`+`CAP_PERFMON`,
-/// `scripts/matrix/verify-fork-scope.sh` Part 2). But the uretprobe
-/// self-probe and live-discovery loader/export probes are per-probe
-/// `perf_event` uprobes on every kernel, and at paranoid ≥ 3 those need
-/// `CAP_SYS_ADMIN` (DR-K8S-3), so the row warns there unless it is held.
-/// The Multi fact comes from the functional load/self-link, never a release
-/// number. A failed fact does not promise the per-offset fallback is eligible.
+/// (measured 136/136 at paranoid=4 with the minimal set, no
+/// `CAP_SYS_ADMIN`). Every probe attaches through links now; only the
+/// per-probe singles fallback still opens perf events, and at paranoid
+/// ≥ 3 those need `CAP_SYS_ADMIN` (DR-K8S-3), so the row warns there
+/// unless it is held. The Multi fact comes from the functional
+/// load/self-link, never a release number. A failed fact does not promise
+/// the per-offset fallback is eligible.
 fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
     Check {
         name: "kernel.perf_event_paranoid".to_string(),
@@ -635,9 +636,10 @@ fn paranoid_check(held_sysadmin: bool, multi_capable: bool) -> Check {
 
 /// Pure over the sysctl read and the backend decision, mirroring
 /// `sysctl_status` outcomes: on a multi-capable kernel a value below 3 is
-/// `Ok` and 3 or above warns unless CAP_SYS_ADMIN is held (the per-probe
-/// self-probe and live-discovery probes); without a proven Multi fact the
-/// restrictive perf-event rule stays visible as a separate diagnostic.
+/// `Ok` and 3 or above warns unless CAP_SYS_ADMIN is held (the singles
+/// fallback is the only remaining perf_event_open user); without a
+/// proven Multi fact the restrictive perf-event rule stays visible as a
+/// separate diagnostic.
 fn paranoid_status(
     read: std::io::Result<String>,
     path: &str,
@@ -663,14 +665,17 @@ fn paranoid_status(
             let trimmed = content.trim();
             match trimmed.parse::<i64>() {
                 Ok(v) if v >= crate::uretprobe_hazard::PERF_OPEN_RESTRICT_PARANOID => {
-                    let limit = "does not gate static uprobe-multi links, but refuses every \
-                                 perf_event_open without CAP_SYS_ADMIN (CAP_PERFMON does not \
-                                 lift it): the uretprobe self-probe (--cgroup, --system, run, \
-                                 confined --pid targets) and live-discovery loader/export probes";
                     if held_sysadmin {
-                        Status::Ok(format!("{v} — {limit}; this process has CAP_SYS_ADMIN"))
+                        Status::Ok(format!(
+                            "{v} — uprobe-multi links are not gated; this process holds \
+                             CAP_SYS_ADMIN for the singles fallback"
+                        ))
                     } else {
-                        Status::Warn(format!("{v} — {limit} need CAP_SYS_ADMIN"))
+                        Status::Warn(format!(
+                            "{v} — refuses perf_event_open without CAP_SYS_ADMIN (CAP_PERFMON does \
+                             not lift it); the default uprobe-multi lane is unaffected, only \
+                             --attach-backend singles needs it"
+                        ))
                     }
                 }
                 Ok(v) => Status::Ok(format!(
@@ -873,28 +878,58 @@ fn capabilities_check() -> Check {
 
 /// The one-line `setcap` recipe row; `next_line` reads its severity
 /// back to point a deprived operator at the grant instead of root.
-#[allow(dead_code)]
 const MINIMAL_SETCAP_ROW: &str = "minimal setcap";
 
-/// Scaffolding: the next commit renders the recipe, warning while any
-/// minimal-live capability is missing.
-#[allow(dead_code)]
-fn setcap_status(_read: Result<u64, String>, _binary: &str) -> Status {
-    Status::Ok(String::new())
+/// The recipe row for one mask read: the exact one-line `setcap`
+/// command, warning with the missing names while the minimal live set
+/// is incomplete. A read failure reports the failure, like the
+/// capabilities row.
+fn setcap_status(read: Result<u64, String>, binary: &str) -> Status {
+    match read {
+        Ok(mask) => {
+            let recipe = crate::caps::setcap_command(binary);
+            let missing = crate::caps::missing_for_live(mask);
+            if missing.is_empty() {
+                Status::Ok(recipe)
+            } else {
+                let names: Vec<&str> = missing.iter().map(|cap| cap.name).collect();
+                Status::Warn(format!("missing {}: {recipe}", names.join(", ")))
+            }
+        }
+        Err(e) => Status::Warn(e),
+    }
+}
+
+fn setcap_check() -> Check {
+    Check {
+        name: MINIMAL_SETCAP_ROW.to_string(),
+        status: setcap_status(read_cap_eff(), &crate::caps::current_binary()),
+    }
 }
 
 /// The capabilities row for one mask read: a read/parse failure is
 /// reported, never coerced into "none" — an unmeasured mask must not read
-/// the same as a genuinely empty one. A genuinely empty mask warns: live
-/// capture needs privilege.
+/// the same as a genuinely empty one. Any mask missing minimal-live
+/// capabilities warns with each one and what it enables; only the
+/// complete set reads Ok.
 fn capabilities_status(read: Result<u64, String>) -> Status {
     match read {
         Ok(mask) => {
             let names = decode_caps(mask);
-            if names.is_empty() {
-                Status::Warn("none — live capture needs root".into())
-            } else {
+            let missing = crate::caps::missing_for_live(mask);
+            if missing.is_empty() {
                 Status::Ok(names.join(" "))
+            } else {
+                let have = if names.is_empty() {
+                    "none".to_string()
+                } else {
+                    names.join(" ")
+                };
+                let needs: Vec<String> = missing
+                    .iter()
+                    .map(|cap| crate::caps::needs_line(cap))
+                    .collect();
+                Status::Warn(format!("{have} — missing: {}", needs.join("; ")))
             }
         }
         Err(e) => Status::Warn(e),
@@ -1753,9 +1788,14 @@ fn next_line(
     };
     let scope = scope_assessment(checks);
     let privileged = process_is_privileged();
+    // Render stays pure: the lacking set is read back from the recipe
+    // row the probe already rendered, never from a fresh CapEff read.
+    let caps_lacking = checks
+        .iter()
+        .any(|check| check.name == MINIMAL_SETCAP_ROW && matches!(check.status, Status::Warn(_)));
     let next = match problem {
         Some(check) if matches!(check.status, Status::Fail(_)) || extra_strict => {
-            next_step_with_host(check, host, privileged)
+            next_step_with_host(check, host, privileged, caps_lacking)
         }
         // No requested lane failed: point at the capture to run next,
         // not at the warning rows below.
@@ -1767,9 +1807,11 @@ fn next_line(
     format!("Next: {}.\n", crate::render::escape_controls(&next))
 }
 
-/// The Next step when every requested lane passed: the capture to run.
+/// The Next step when every requested lane passed: the capture to
+/// run. No `sudo`: the lanes passed, so this process's grant already
+/// captures; a deprived operator never sees this line.
 const ACTIONABLE_NEXT: &str =
-    "sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target)";
+    "p11scope profile --pid <PID> (or doctor --pid <PID> to check a target)";
 
 /// Whether this process runs as uid 0. Only used to pick operator
 /// guidance, never to prove capability.
@@ -1786,6 +1828,7 @@ fn next_step_with_host(
     check: &Check,
     host: Option<crate::attach::MultiHostVerdict>,
     privileged: bool,
+    caps_lacking: bool,
 ) -> String {
     if check.name == UPROBE_MULTI_ROW
         && matches!(host, Some(Err(refusal)) if refusal.is_premulti_kernel())
@@ -1794,10 +1837,10 @@ fn next_step_with_host(
                 p11scope inspect --pid <PID> works here without live capture"
             .into();
     }
-    next_step_for(check, privileged)
+    next_step_for(check, privileged, caps_lacking)
 }
 
-fn next_step_for(check: &Check, privileged: bool) -> String {
+fn next_step_for(check: &Check, privileged: bool, caps_lacking: bool) -> String {
     let detail = status_detail(&check.status);
     // These suffixes come from the existing independent EPERM classifier.
     // Seccomp mode or CapEff alone must never select a causal recommendation.
@@ -1806,6 +1849,15 @@ fn next_step_for(check: &Check, privileged: bool) -> String {
     }
     if detail.ends_with("(origin: missing required capability)") {
         return "review the required capabilities for the failed operation".into();
+    }
+    // A permission-shaped denial while the recipe row warns names the
+    // grant, never root: the row carries the exact command.
+    if caps_lacking
+        && ["EPERM", "EACCES", "permitted", "denied"]
+            .iter()
+            .any(|cause| detail.contains(cause))
+    {
+        return "grant the minimal capability set (see 'minimal setcap') and retry".into();
     }
     if is_pid_namespace_row(&check.name) {
         return "use an observer in the initial PID namespace with a matching /proc view".into();
@@ -2466,9 +2518,13 @@ mod tests {
             .unwrap_or_default();
         let scan = "use 'p11scope inspect --pid N' for a scan without capture.";
         match cause {
-            "denied" => format!(
-                "live capture needs root: the kernel refused to {operation}{reason}. \
-                 Run with sudo, or {scan}"
+            // The denied wording reads the runner's own mask, exactly
+            // like the producer's `Display` it mirrors.
+            "denied" => crate::attach::denied_line(
+                operation,
+                &reason,
+                crate::caps::read_effective().unwrap_or(0),
+                &crate::caps::current_binary(),
             ),
             "unavailable" => format!(
                 "live capture unavailable: {doing} is not supported on this host{reason}; \
@@ -2589,7 +2645,7 @@ mod tests {
             // Privilege is explicit, never read from the test runner's
             // own uid: the same assertions hold as root and as a user.
             assert_eq!(
-                next_step_with_host(&multi, Some(Err(refusal)), false),
+                next_step_with_host(&multi, Some(Err(refusal)), false, false),
                 next,
                 "{refusal}"
             );
@@ -2599,12 +2655,12 @@ mod tests {
                 next
             };
             assert_eq!(
-                next_step_with_host(&multi, Some(Err(refusal)), true),
+                next_step_with_host(&multi, Some(Err(refusal)), true, false),
                 privileged_next,
                 "{refusal}"
             );
             assert!(
-                !next_step_for(&multi, process_is_privileged()).contains("Linux 6.6"),
+                !next_step_for(&multi, process_is_privileged(), false).contains("Linux 6.6"),
                 "untyped Next must not claim a kernel age: {refusal}"
             );
         }
@@ -3428,8 +3484,9 @@ mod tests {
         // 13 host/target rows, eight §10.1 rows, five finite preflight rows
         // (host, inventory, journal pair, lifecycle, scope), the cgroup
         // version row, the uprobe-multi self-link row, the PID namespace
-        // row, and the object-attribute capture build row.
-        assert_eq!(checks.len(), 30, "{checks:?}");
+        // row, the minimal-setcap recipe row, and the object-attribute
+        // capture build row.
+        assert_eq!(checks.len(), 31, "{checks:?}");
         // Never FAIL without --pid: a nested observer only warns here.
         assert!(!matches!(
             by_name_status(&checks, PID_NAMESPACE_ROW),
@@ -4868,18 +4925,22 @@ mod tests {
     }
 
     #[test]
-    fn unclassified_denial_points_unprivileged_operators_at_sudo() {
+    fn denial_next_names_sudo_only_when_no_caps_are_lacking() {
         let denied = Check {
             name: "BPF map create".into(),
             status: Status::Fail("Operation not permitted".into()),
         };
         assert_eq!(
-            next_step_for(&denied, false),
+            next_step_for(&denied, false, false),
             "run as root: sudo p11scope doctor"
         );
         assert_eq!(
-            next_step_for(&denied, true),
+            next_step_for(&denied, true, false),
             "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges"
+        );
+        assert_eq!(
+            next_step_for(&denied, false, true),
+            "grant the minimal capability set (see 'minimal setcap') and retry"
         );
     }
 }

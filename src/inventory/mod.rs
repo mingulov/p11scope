@@ -6734,15 +6734,23 @@ fn open_native_lane_with(
             // process maps, and the gap names the missing live capture.
             if mode == CaptureMode::Auto && pid_scope {
                 let summary = crate::attach::summarize_native_preparation_error(&error);
-                // The sudo advice is gated on the typed cause: only a
-                // `Denied` refusal (permission/policy) can sudo fix. An
-                // old kernel or a verifier-shaped refusal points at
-                // doctor through the summary itself.
+                // The grant advice is gated on the typed cause and the
+                // live mask: only a `Denied` refusal with capabilities
+                // actually missing can the setcap grant fix. An old
+                // kernel, a verifier-shaped refusal, or a denial with
+                // the set complete (lockdown/LSM) points at doctor
+                // through the summary itself.
                 let denied = error
                     .downcast_ref::<crate::attach::MultiHostRefusal>()
                     .is_some_and(crate::attach::MultiHostRefusal::needs_privilege_hint);
-                let reason = if denied {
-                    format!("live capture refused ({summary}); run with sudo for full capture")
+                let lacking =
+                    !crate::caps::missing_for_live(crate::caps::read_effective().unwrap_or(0))
+                        .is_empty();
+                let reason = if denied && lacking {
+                    format!(
+                        "live capture refused ({summary}); grant the minimal capability set for \
+                         full capture (see 'p11scope doctor')"
+                    )
                 } else {
                     format!("live capture refused ({summary})")
                 };

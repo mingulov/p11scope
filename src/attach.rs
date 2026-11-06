@@ -58,6 +58,8 @@ mod multi_host;
 #[allow(dead_code)] // Collected carrier is staged before its coordinator activation.
 mod native_retirement;
 #[cfg(test)]
+pub(crate) use multi_host::denied_line;
+#[cfg(test)]
 pub(crate) use multi_host::{MultiCapableHost, MultiHostStage};
 pub(crate) use multi_host::{MultiHostRefusal, MultiHostVerdict, require_multi_capable_host};
 mod object_stop;

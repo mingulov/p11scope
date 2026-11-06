@@ -1623,6 +1623,7 @@ pub(crate) fn role_label(role: KeyRole) -> &'static str {
 /// admission and publication cannot disagree on buckets.
 pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'static str {
     use crate::semantics_objects::KeyLabel;
+    use crate::semantics_objects::PqcCode;
     use p11scope_ebpf_common::object_policy::SafeCurve;
     match label {
         KeyLabel::Rsa { modulus_bits } => match modulus_bits {
@@ -1642,6 +1643,28 @@ pub(crate) fn metadata_label(label: crate::semantics_objects::KeyLabel) -> &'sta
             SafeCurve::Secp256r1 => "ec_p256",
             SafeCurve::Secp384r1 => "ec_p384",
             SafeCurve::Secp521r1 => "ec_p521",
+        },
+        // F16 (7.05 PQC): the closed eighteen-value vocabulary,
+        // exhaustive by construction (see `PqcCode`).
+        KeyLabel::Pqc(code) => match code {
+            PqcCode::MlDsa44 => "ml_dsa_44",
+            PqcCode::MlDsa65 => "ml_dsa_65",
+            PqcCode::MlDsa87 => "ml_dsa_87",
+            PqcCode::MlKem512 => "ml_kem_512",
+            PqcCode::MlKem768 => "ml_kem_768",
+            PqcCode::MlKem1024 => "ml_kem_1024",
+            PqcCode::SlhDsaSha2128s => "slh_dsa_sha2_128s",
+            PqcCode::SlhDsaShake128s => "slh_dsa_shake_128s",
+            PqcCode::SlhDsaSha2128f => "slh_dsa_sha2_128f",
+            PqcCode::SlhDsaShake128f => "slh_dsa_shake_128f",
+            PqcCode::SlhDsaSha2192s => "slh_dsa_sha2_192s",
+            PqcCode::SlhDsaShake192s => "slh_dsa_shake_192s",
+            PqcCode::SlhDsaSha2192f => "slh_dsa_sha2_192f",
+            PqcCode::SlhDsaShake192f => "slh_dsa_shake_192f",
+            PqcCode::SlhDsaSha2256s => "slh_dsa_sha2_256s",
+            PqcCode::SlhDsaShake256s => "slh_dsa_shake_256s",
+            PqcCode::SlhDsaSha2256f => "slh_dsa_sha2_256f",
+            PqcCode::SlhDsaShake256f => "slh_dsa_shake_256f",
         },
     }
 }
@@ -1675,6 +1698,13 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
             (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
                 | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
                 | (1 << crate::semantics_objects::field_index(SafeAttributeKind::EcParams))
+        }
+        // F16 (7.05 PQC): a usable PQC label needs its class, key
+        // type and parameter set all non-conflicting.
+        KeyLabel::Pqc(..) => {
+            (1 << crate::semantics_objects::field_index(SafeAttributeKind::Class))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::KeyType))
+                | (1 << crate::semantics_objects::field_index(SafeAttributeKind::ParameterSet))
         }
     };
     if receipt.metadata.conflicted & required != 0 {

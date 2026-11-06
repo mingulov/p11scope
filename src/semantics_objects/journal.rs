@@ -2693,6 +2693,9 @@ fn attribute_cell(kind: u8, status: u8, value: u16) -> AttrObservation {
         4 => Some(SafeAttributeKind::ValueLen),
         5 => Some(SafeAttributeKind::ModulusBits),
         6 => Some(SafeAttributeKind::EcParams),
+        // F16 (7.05 PQC): the parameter-set scalar re-checks
+        // full-width membership below like every scalar kind.
+        7 => Some(SafeAttributeKind::ParameterSet),
         _ => None,
     };
     let (status, value) = match status {

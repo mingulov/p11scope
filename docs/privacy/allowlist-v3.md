@@ -48,7 +48,10 @@ which names the `legacy_collection` counts-and-reasons projection,
 and [counter bank gaps](#counter-bank-gaps-v060),
 which names the `bank_gaps` counts-and-flags projection,
 and [derived count projections](#derived-count-projections-v060),
-which are derived counts with no new capture.**
+which are derived counts with no new capture,
+and [PQC parameter-set metadata](#pqc-parameter-set-metadata-f16-2026-11-06),
+which reads `CKA_PARAMETER_SET` with its PQC key-type qualifier and publishes
+the finite eighteen-label vocabulary below.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1328,6 +1331,40 @@ type, later uses row under their exact label; earlier uses are never
 backfilled. No `CKA_ID`, object handle, label, PIN or payload is read
 or published for these rows. Version 4 is present exactly when such
 a row exists; versions 1, 2 and 3 stay frozen and byte-stable.
+
+## PQC parameter-set metadata (F16, 2026-11-06)
+
+**Status: IMPLEMENTED in v0.7.0 by owner decision 2026-11-06 evening
+(release lane F16), overriding the v0.7.0 "no new captured field"
+non-goal for this one field only; Opus privacy second-tier review
+follows. The approving capture contract is
+`docs/superpowers/specs/2026-11-06-v070-pqc-capture-contract.md` (plan
+item 7.05a).** This section scopes section version 5 of
+[docs/schema/inventory-v1-object-observations-v5.schema.json](../schema/inventory-v1-object-observations-v5.schema.json):
+the two read rows below plus the finite eighteen-label publication.
+It supersedes the M2 "no ML-KEM/PQC labels, vocabulary unchanged"
+clause for parameter-set labels only; KEM T0 (no template read on
+encapsulate/decapsulate), the terminal states and every other M2
+behavior stay in force. Allowlist-v1 bytes are unchanged.
+
+The observed value is a provider-reported attribute word from an
+application buffer, not independent proof of a physical key's
+properties. The `CKP_*` numbers overlap across families, so a label
+always joins an established parameter-set code with the established
+key type from the same object view; a code alone, a type alone, or a
+recognized mechanism never labels.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| `CKA_PARAMETER_SET` (P1) | Exact selector 0x061d at full target width before any pointer/length read, on the already template-authorized creation calls (requested) and `C_GetAttributeValue` (established) only; KEM calls gain no read. One target word (`W` bytes LP64/ia32, `ulValueLen` exact, ia32 zero-extended with high-bit refusal); the word must be `1..=12`. The H7-E4 request/Get protocols (selector-first, capacity, alias/overlap, header recheck, accepted partial RVs, duplicate/conflict rules, Set invalidation, pair separation) apply unchanged; no new read site or descriptor exists. | Raw code `1..=12` in the existing side-row cell and per-view seventh metadata field; scrubbed/deleted on every terminal path like the six existing kinds. Public: the `parameter_set` key (`{status, value}`) in the v5 requested/established/query blocks, and the eighteen `metadata_at_use`/object labels of Section 5 of the capture contract. Concise text spotlights PQC uses (`ML-DSA-65 sign: 12`); `-v` adds failed/active; JSON/JSONL carry every row; dashboard, profile, trace and metrics gain nothing. | Out-of-range code, valid-code/wrong-family pair, conflict, incompatible class or missing key type: no label (`metadata_unknown`/`metadata_conflicting` as today); the field reads unknown. P0 builds read nothing (`UNINSPECTED`, `not_enabled`). Required evidence: partial-error neighbor preservation, hostile-width (ia32 high-bit, `1<<16`, `1<<32` OR-alias) and secret-alias (`CKA_SEED`/`CKA_VALUE` silence, secret bytes behind the value pointer classify to nothing) twins; `object_producer_compiled_frames_are_bounded` unmodified; a live PQC-provider capture showing one PQC segment with matching v5 JSON. |
+| PQC `CKA_KEY_TYPE` qualifier (P2) | Exact selector 0x0100 (already approved); additionally accepted values `0x49` (`CKK_ML_KEM`), `0x4a` (`CKK_ML_DSA`), `0x4b` (`CKK_SLH_DSA`) from PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1. Same source/ABI/span rules as every key-type value; establishes the key-type field exactly like the nine existing types. | Same retention as the key-type field; public only as the numeric scalar beside `parameter_set` and inside the eighteen combined labels. Never a standalone PQC key-type label, never taken from a mechanism. | Any other key-type value (including XMSS and vendor types) stays refused with no numeric fallback; a PQC type without a valid same-view parameter set labels nothing. The M2 `!is_established(1)` pin for key type 73 is the one superseded assertion (contract Section 10). |
+
+`CKA_SEED` (0x637) and `CKA_VALUE` (0x11) — the FIPS 203/204/205 seed
+and private values, Table 13 footnote 7 — stay excluded: no selector
+match, no pointer/length read, no value retained. The parameter set
+itself carries no footnote 7, matching the specification's
+revealable-metadata treatment. Version 5 is emitted exactly when PQC
+content is present; versions 1–4 stay frozen and byte-stable.
 
 ## DR04 caller metadata (2026-10-18)
 

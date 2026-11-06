@@ -41,6 +41,12 @@ pub(crate) const OBSERVATIONS_VERSION_V3: u8 = 3;
 /// The renderer emits v4 only when such a row is present; the
 /// `unattributed` key is then always present (possibly empty).
 pub(crate) const OBSERVATIONS_VERSION_V4: u8 = 4;
+/// Section version 5 (F16, 7.05 PQC): v4 vocabulary plus the
+/// eighteen PQC parameter-set labels and the `parameter_set` key in
+/// the requested/established/query metadata blocks. The renderer
+/// emits v5 exactly when PQC content is present; v1–v4 output stays
+/// byte-stable.
+pub(crate) const OBSERVATIONS_VERSION_V5: u8 = 5;
 /// The metadata label of a first-observed key at use: its identity
 /// and counts are proved, its type/size are not (first seen before
 /// attach). Frozen v4 vocabulary; never a guessed label.
@@ -156,6 +162,18 @@ pub(crate) mod contract {
         "modulus_bits",
         "ec_params",
     ];
+    /// H9 section v5 metadata block keys (F16, 7.05 PQC): the six
+    /// frozen keys plus `parameter_set`. Pins both the
+    /// requested/established blocks and the query block.
+    pub(crate) const METADATA_KEYS_V5: [&str; 7] = [
+        "class",
+        "key_type",
+        "token",
+        "value_len",
+        "modulus_bits",
+        "ec_params",
+        "parameter_set",
+    ];
     pub(crate) const FIELD_KEYS: [&str; 2] = ["status", "value"];
     pub(crate) const FIELD_STATUSES: [&str; 4] = ["unknown", "value", "conflict", "invalidated"];
     pub(crate) const QUERY_STATUSES: [&str; 7] = [
@@ -204,6 +222,42 @@ pub(crate) mod contract {
         "ec_p384",
         "ec_p521",
         "unknown",
+    ];
+
+    /// H9 section v5 metadata vocabulary (F16, 7.05 PQC): the v4
+    /// labels plus the eighteen PQC parameter-set labels.
+    pub(crate) const METADATA_LABELS_V5: [&str; 31] = [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521",
+        "unknown",
+        "ml_dsa_44",
+        "ml_dsa_65",
+        "ml_dsa_87",
+        "ml_kem_512",
+        "ml_kem_768",
+        "ml_kem_1024",
+        "slh_dsa_sha2_128s",
+        "slh_dsa_shake_128s",
+        "slh_dsa_sha2_128f",
+        "slh_dsa_shake_128f",
+        "slh_dsa_sha2_192s",
+        "slh_dsa_shake_192s",
+        "slh_dsa_sha2_192f",
+        "slh_dsa_shake_192f",
+        "slh_dsa_sha2_256s",
+        "slh_dsa_shake_256s",
+        "slh_dsa_sha2_256f",
+        "slh_dsa_shake_256f",
     ];
 
     /// Frozen operation categories: 11 machine operations, 9 direct
@@ -421,7 +475,9 @@ pub(crate) struct MetadataField {
     pub curve: Option<&'static str>,
 }
 
-/// The six fixed metadata slots, requested or established.
+/// The seven fixed metadata slots, requested or established. The
+/// `parameter_set` slot renders only in section version 5 (see
+/// [`observations_version`]); v1–v4 sections carry the six frozen keys.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataBlock {
     pub class: MetadataField,
@@ -430,9 +486,11 @@ pub(crate) struct MetadataBlock {
     pub value_len: MetadataField,
     pub modulus_bits: MetadataField,
     pub ec_params: MetadataField,
+    pub parameter_set: MetadataField,
 }
 
-/// One query outcome per field (latest status, not validity).
+/// One query outcome per field (latest status, not validity). The
+/// `parameter_set` outcome renders only in section version 5.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct QueriesBlock {
     pub class: &'static str,
@@ -441,6 +499,35 @@ pub(crate) struct QueriesBlock {
     pub value_len: &'static str,
     pub modulus_bits: &'static str,
     pub ec_params: &'static str,
+    pub parameter_set: &'static str,
+}
+
+/// Whether a `metadata_at_use`/object label is one of the eighteen
+/// F16 PQC parameter-set labels. The single version trigger behind
+/// v5 sections; the contract test pins agreement with
+/// `contract::METADATA_LABELS_V5`.
+pub(crate) fn is_pqc_metadata_label(label: &str) -> bool {
+    matches!(
+        label,
+        "ml_dsa_44"
+            | "ml_dsa_65"
+            | "ml_dsa_87"
+            | "ml_kem_512"
+            | "ml_kem_768"
+            | "ml_kem_1024"
+            | "slh_dsa_sha2_128s"
+            | "slh_dsa_shake_128s"
+            | "slh_dsa_sha2_128f"
+            | "slh_dsa_shake_128f"
+            | "slh_dsa_sha2_192s"
+            | "slh_dsa_shake_192s"
+            | "slh_dsa_sha2_192f"
+            | "slh_dsa_shake_192f"
+            | "slh_dsa_sha2_256s"
+            | "slh_dsa_shake_256s"
+            | "slh_dsa_sha2_256f"
+            | "slh_dsa_shake_256f"
+    )
 }
 
 /// One session row: public id, origin, status. No instance: the
@@ -679,28 +766,49 @@ pub(crate) fn metadata_field_json(field: &MetadataField, curve: bool) -> serde_j
     })
 }
 
-/// Render one six-slot metadata block (requested or established).
-pub(crate) fn metadata_block_json(block: &MetadataBlock) -> serde_json::Value {
-    serde_json::json!({
+/// Render one seven-slot metadata block (requested or established).
+/// The `parameter_set` key renders only at v5+: v1–v4 sections keep
+/// the six frozen keys byte-stable.
+pub(crate) fn metadata_block_json(block: &MetadataBlock, version: u8) -> serde_json::Value {
+    let mut out = serde_json::json!({
         "class": metadata_field_json(&block.class, false),
         "key_type": metadata_field_json(&block.key_type, false),
         "token": metadata_field_json(&block.token, false),
         "value_len": metadata_field_json(&block.value_len, false),
         "modulus_bits": metadata_field_json(&block.modulus_bits, false),
         "ec_params": metadata_field_json(&block.ec_params, true),
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V5
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert(
+            "parameter_set".to_string(),
+            metadata_field_json(&block.parameter_set, false),
+        );
+    }
+    out
 }
 
-/// Render one per-field query-outcome block.
-pub(crate) fn queries_block_json(block: &QueriesBlock) -> serde_json::Value {
-    serde_json::json!({
+/// Render one per-field query-outcome block. The `parameter_set`
+/// outcome renders only at v5+.
+pub(crate) fn queries_block_json(block: &QueriesBlock, version: u8) -> serde_json::Value {
+    let mut out = serde_json::json!({
         "class": block.class,
         "key_type": block.key_type,
         "token": block.token,
         "value_len": block.value_len,
         "modulus_bits": block.modulus_bits,
         "ec_params": block.ec_params,
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V5
+        && let Some(map) = out.as_object_mut()
+    {
+        map.insert(
+            "parameter_set".to_string(),
+            serde_json::Value::from(block.parameter_set),
+        );
+    }
+    out
 }
 
 /// Render one session row: the exact frozen keys.
@@ -712,8 +820,10 @@ pub(crate) fn session_row_json(row: &SessionRow) -> serde_json::Value {
     })
 }
 
-/// Render one object row: the exact frozen keys.
-pub(crate) fn object_row_json(row: &ObjectRow) -> serde_json::Value {
+/// Render one object row: the exact frozen keys. Callers pass the
+/// section version from [`observations_version`]; the metadata
+/// blocks carry `parameter_set` only at v5+.
+pub(crate) fn object_row_json(row: &ObjectRow, version: u8) -> serde_json::Value {
     serde_json::json!({
         "object": row.object,
         "session": row.session,
@@ -727,9 +837,9 @@ pub(crate) fn object_row_json(row: &ObjectRow) -> serde_json::Value {
         "lifetime_reason": row.lifetime_reason,
         "attribution": row.attribution,
         "attribution_reason": row.attribution_reason,
-        "requested": metadata_block_json(&row.requested),
-        "established": metadata_block_json(&row.established),
-        "queries": queries_block_json(&row.queries),
+        "requested": metadata_block_json(&row.requested, version),
+        "established": metadata_block_json(&row.established, version),
+        "queries": queries_block_json(&row.queries, version),
         "label": row.label,
         "successful_references": row.successful_references,
         "successful_key_references": row.successful_key_references,
@@ -803,13 +913,41 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
     })
 }
 
-/// The H9 section version for these observations: v4 iff a key row
+/// The H9 section version for these observations: v5 iff PQC
+/// content is present (a PQC label, a PQC key-type scalar, or a
+/// non-blank parameter-set field/query), else v4 iff a key row
 /// carries the `unknown` metadata label, else v3 iff a
 /// not-attributed count is present, else v2 iff a KEM creation or
 /// role label is present, otherwise v1. The single version
 /// authority behind the JSON section, the JSONL row payloads and
 /// the pass marker.
+fn has_pqc_content(observations: &ObjectObservations) -> bool {
+    const PQC_KEY_TYPES: [u16; 3] = [0x49, 0x4a, 0x4b];
+    if observations
+        .key_operations
+        .iter()
+        .any(|row| is_pqc_metadata_label(row.metadata_at_use))
+    {
+        return true;
+    }
+    observations.objects.iter().any(|row| {
+        row.label.is_some_and(is_pqc_metadata_label)
+            || [row.requested, row.established].iter().any(|block| {
+                block
+                    .key_type
+                    .scalar
+                    .is_some_and(|scalar| PQC_KEY_TYPES.contains(&scalar))
+                    || block.parameter_set.scalar.is_some()
+                    || block.parameter_set.curve.is_some()
+            })
+            || row.queries.parameter_set != "not_queried"
+    })
+}
+
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if has_pqc_content(observations) {
+        return OBSERVATIONS_VERSION_V5;
+    }
     if observations
         .key_operations
         .iter()
@@ -856,7 +994,7 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
         "status": observations.status.label(),
         "reason": observations.reason,
         "sessions": observations.sessions.iter().map(session_row_json).collect::<Vec<_>>(),
-        "objects": observations.objects.iter().map(object_row_json).collect::<Vec<_>>(),
+        "objects": observations.objects.iter().map(|row| object_row_json(row, version)).collect::<Vec<_>>(),
         "key_operations": observations.key_operations.iter().map(key_row_json).collect::<Vec<_>>(),
         "unknown_key_operations": observations.unknown_key_operations.iter().map(unknown_row_json).collect::<Vec<_>>(),
         "gaps": {
@@ -1325,6 +1463,9 @@ pub(crate) mod producer {
                     view.queries[field_index(SafeAttributeKind::ModulusBits)],
                 ),
                 ec_params: query_label(view.queries[field_index(SafeAttributeKind::EcParams)]),
+                parameter_set: query_label(
+                    view.queries[field_index(SafeAttributeKind::ParameterSet)],
+                ),
             },
             label: view.label.map(crate::semantics_key_use::metadata_label),
             successful_references: view.references,
@@ -1341,6 +1482,7 @@ pub(crate) mod producer {
             value_len: metadata_field(view.field(SafeAttributeKind::ValueLen)),
             modulus_bits: metadata_field(view.field(SafeAttributeKind::ModulusBits)),
             ec_params: metadata_field(view.field(SafeAttributeKind::EcParams)),
+            parameter_set: metadata_field(view.field(SafeAttributeKind::ParameterSet)),
         }
     }
 

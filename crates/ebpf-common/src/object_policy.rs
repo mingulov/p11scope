@@ -17,6 +17,11 @@ pub enum SafeAttributeKind {
     ValueLen,
     ModulusBits,
     EcParams,
+    /// F16 (7.05 PQC): `CKA_PARAMETER_SET` (0x061d), one target-word
+    /// `CK_*_PARAMETER_SET_TYPE` scalar. The raw code is uninterpretable
+    /// alone (the `CKP_*` numbers overlap across families); only the
+    /// established key type from the same object view qualifies it.
+    ParameterSet,
 }
 
 /// Only complete, exact encodings of these curves may be classified.
@@ -37,6 +42,7 @@ pub const fn safe_attribute_kind(raw: u64) -> Option<SafeAttributeKind> {
         0x0121 => Some(SafeAttributeKind::ModulusBits),
         0x0161 => Some(SafeAttributeKind::ValueLen),
         0x0180 => Some(SafeAttributeKind::EcParams),
+        0x061d => Some(SafeAttributeKind::ParameterSet),
         _ => None,
     }
 }
@@ -58,13 +64,19 @@ pub const fn valid_safe_attribute_length(
 /// Return the exact approved scalar only after full-width membership checks.
 /// A size fact alone establishes no key type, and requested facts establish no
 /// result properties. `EcParams` requires complete bytes instead of a scalar.
+/// F16 (7.05 PQC): the KeyType arm additionally accepts the three PQC key
+/// types (`CKK_ML_KEM`/`CKK_ML_DSA`/`CKK_SLH_DSA`), which qualify a
+/// parameter set but never label alone; the ParameterSet arm accepts the
+/// union `1..=12` of the three `CKP_*` ranges, with per-family validity
+/// decided at label time.
 pub const fn classify_attribute_scalar(kind: SafeAttributeKind, value: u64) -> Option<u16> {
     match (kind, value) {
         (SafeAttributeKind::Class, 0..=4)
-        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41)
+        | (SafeAttributeKind::KeyType, 0x00..=0x04 | 0x10 | 0x1f | 0x40 | 0x41 | 0x49..=0x4b)
         | (SafeAttributeKind::Token, 0 | 1)
         | (SafeAttributeKind::ValueLen, 16 | 24 | 32)
-        | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192) => Some(value as u16),
+        | (SafeAttributeKind::ModulusBits, 1024 | 2048 | 3072 | 4096 | 8192)
+        | (SafeAttributeKind::ParameterSet, 1..=12) => Some(value as u16),
         _ => None,
     }
 }

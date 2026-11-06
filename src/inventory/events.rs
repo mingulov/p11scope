@@ -2185,7 +2185,7 @@ fn projection_row_events(
         let payload = serde_json::json!({
             "revision": observations.revision,
             "version": version,
-            "row": object_row_json(row),
+            "row": object_row_json(row, version),
         });
         events.push((object_event_key(row.object), "object_observed", payload));
     }

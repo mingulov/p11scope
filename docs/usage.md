@@ -1174,7 +1174,11 @@ Limits that matter in pods:
   ("Returned errors" are calls that returned an error, never observer
   failures.) With `-v`, each provider line pairs its machine instance
   label in parentheses; rows no provider can be proved for read under
-  `unknown keys` instead.
+  `unknown keys` instead. Proved post-quantum uses are spotlighted per
+  parameter set on their own line after the provider lines (for example
+  `  pqc keys: ML-DSA-65 sign: 12`), with failed/active terminals
+  under `-v`; `--json` carries the matching `metadata_at_use` label
+  (`ml_dsa_65`) on every key row.
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.

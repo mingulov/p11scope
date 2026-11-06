@@ -56,7 +56,8 @@ pub const OBJECT_DERIVE_ECDH1: u8 = 3;
 pub const OBJECT_DERIVE_ECDH1_COFACTOR: u8 = 4;
 
 /// Largest valid attribute kind, attribute status and handle status codes.
-pub const OBJECT_ATTR_KIND_MAX: u8 = 6;
+/// F16 (7.05 PQC): kind 7 (`CKA_PARAMETER_SET`) validates; 8+ refuses.
+pub const OBJECT_ATTR_KIND_MAX: u8 = 7;
 pub const OBJECT_ATTR_STATUS_MAX: u8 = 10;
 pub const OBJECT_HANDLE_STATUS_MAX: u8 = 9;
 /// Only object-flags bits 0..=7 and find-flags bits 0..=5 are defined.

@@ -10,13 +10,17 @@ const SELECTORS: &[(u64, SafeAttributeKind)] = &[
     (0x0121, SafeAttributeKind::ModulusBits),
     (0x0161, SafeAttributeKind::ValueLen),
     (0x0180, SafeAttributeKind::EcParams),
+    // F16 (7.05 PQC) reviewed row: the parameter-set selector.
+    (0x061d, SafeAttributeKind::ParameterSet),
 ];
 
 const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
     (SafeAttributeKind::Class, &[0, 1, 2, 3, 4]),
     (
         SafeAttributeKind::KeyType,
-        &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41],
+        &[
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x49, 0x4a, 0x4b,
+        ],
     ),
     (SafeAttributeKind::Token, &[0, 1]),
     (SafeAttributeKind::ValueLen, &[16, 24, 32]),
@@ -25,6 +29,11 @@ const SCALARS: &[(SafeAttributeKind, &[u64])] = &[
         &[1024, 2048, 3072, 4096, 8192],
     ),
     (SafeAttributeKind::EcParams, &[]),
+    // F16 (7.05 PQC) reviewed row: the CKP_* union 1..=12.
+    (
+        SafeAttributeKind::ParameterSet,
+        &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
+    ),
 ];
 
 const CURVES: &[(&[u8], SafeCurve)] = &[
@@ -83,7 +92,11 @@ fn s2s3_safe_attribute_sets_are_closed() {
 // Edwards/Montgomery at 0x3a/0x3b (those are BLAKE2b HMAC and stay refused).
 #[test]
 fn s2s3_key_types_pin_oasis_numbers() {
-    const ACCEPTED: &[u64] = &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41];
+    // F16 (7.05 PQC) reviewed values: CKK_ML_KEM/CKK_ML_DSA/CKK_SLH_DSA
+    // from OASIS PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1.
+    const ACCEPTED: &[u64] = &[
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x49, 0x4a, 0x4b,
+    ];
     for value in ACCEPTED {
         assert_eq!(
             classify_attribute_scalar(SafeAttributeKind::KeyType, *value),

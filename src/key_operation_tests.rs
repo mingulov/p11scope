@@ -8146,6 +8146,7 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
             value_len: blank,
             modulus_bits: blank,
             ec_params: blank,
+            parameter_set: blank,
         };
         observations.objects.push(ObjectRow {
             object,
@@ -8166,6 +8167,7 @@ fn key_operation_emitter_tracking_bounded_across_object_churn() {
                 value_len: "not_queried",
                 modulus_bits: "not_queried",
                 ec_params: "not_queried",
+                parameter_set: "not_queried",
             },
             label: None,
             successful_references: 1,
@@ -9438,9 +9440,10 @@ fn referenced_effects(success: &SealSuccess) -> Vec<crate::semantics_objects::Ob
         .collect()
 }
 
-/// Genuine ML-KEM input establishment: class plus an unclassifiable
-/// ML-KEM key type (73). The GET lands (non-vacuous) but no usable
-/// label can form under the frozen vocabulary.
+/// Genuine ML-KEM input establishment: class plus the ML-KEM key
+/// type (73), established as a field (F16) but with no usable label:
+/// no parameter set arrives in this scene. The GET lands
+/// (non-vacuous) but no usable label can form.
 fn kem_mlkem_get(word: u64) -> ShapedS1 {
     ShapedS1 {
         input0: Some((word, 1)),
@@ -9484,7 +9487,16 @@ fn key_operation_kem_encapsulate_binds_input_role() {
         .key_metadata_flags(key)
         .expect("key view exists");
     assert!(flags.is_established(0), "the GET established Class");
-    assert!(!flags.is_established(1), "ML-KEM key type stays untyped");
+    // F16 (7.05 PQC) supersedes the M2 "stays untyped" pin under the
+    // 2026-11-06 owner approval: the genuine ML-KEM key type (73) now
+    // establishes field 1 exactly like any classified key type. The
+    // M2 no-fabrication pins below hold unchanged: without a
+    // parameter set in this scene there is still no usable label, no
+    // proved encapsulate row, and the same metadata_unknown summary.
+    assert!(
+        flags.is_established(1),
+        "the GET established the PQC key type"
+    );
     let (_, _, success) = drive_kem_quantum(
         &mut scene,
         &mut staging,
@@ -22476,4 +22488,302 @@ fn pqc_parameter_set_partial_error_preserves_neighbors() {
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
     assert_eq!(unknown, vec![("sign", "metadata_unknown", 1)]);
+}
+
+/// F16: the v5 schema file mirrors the frozen contract tables: same
+/// section keys as v3/v4, the version constant 5, the metadata enum
+/// extended by exactly the eighteen PQC labels, both metadata-block
+/// shapes extended by exactly `parameter_set`, and the key-type enum
+/// extended by exactly the three PQC codes. Every `PqcCode` renders
+/// its label, and the v5 trigger agrees with the table on all 31
+/// labels.
+#[test]
+fn key_operation_schema_v5_pins_pqc_metadata_contract() {
+    use crate::key_operation_projection::contract::{
+        METADATA_KEYS, METADATA_KEYS_V5, METADATA_LABELS_V4, METADATA_LABELS_V5, SECTION_KEYS_V3,
+    };
+    use crate::key_operation_projection::is_pqc_metadata_label;
+    use crate::semantics_key_use::metadata_label;
+    use crate::semantics_objects::{KeyLabel, PqcCode};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v5.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    let numbers = |pointer: &str| -> Vec<u64> {
+        schema
+            .pointer(pointer)
+            .expect("pointer present")
+            .as_array()
+            .expect("array")
+            .iter()
+            .filter_map(|value| value.as_u64())
+            .collect()
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 5);
+    assert_eq!(
+        required("/required"),
+        sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/metadata_label/enum"),
+        sorted(
+            METADATA_LABELS_V5
+                .iter()
+                .map(|label| label.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(
+        required("/$defs/metadata_block/required"),
+        sorted(METADATA_KEYS_V5.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/query_block/required"),
+        sorted(METADATA_KEYS_V5.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        numbers("/$defs/metadata_field_key_type/properties/value/enum"),
+        vec![0, 1, 2, 3, 4, 16, 31, 64, 65, 73, 74, 75],
+        "key-type enum gains exactly the three PQC codes"
+    );
+    assert_eq!(
+        numbers("/$defs/metadata_field_parameter_set/properties/value/enum"),
+        (1..=12u64).collect::<Vec<_>>(),
+        "parameter-set enum is exactly the CKP_* union"
+    );
+    // The v5 tables extend their frozen parents by exactly the PQC rows.
+    assert_eq!(METADATA_LABELS_V5.len(), METADATA_LABELS_V4.len() + 18);
+    assert_eq!(
+        METADATA_LABELS_V5[..13].to_vec(),
+        METADATA_LABELS_V4.to_vec()
+    );
+    assert_eq!(METADATA_KEYS_V5.len(), METADATA_KEYS.len() + 1);
+    assert_eq!(METADATA_KEYS_V5[..6].to_vec(), METADATA_KEYS.to_vec());
+    assert_eq!(METADATA_KEYS_V5[6], "parameter_set");
+    // Every code renders its label; every v5 label past index 12 is a
+    // PQC label and trips the v5 trigger; the trigger agrees with the
+    // table on all 31 labels.
+    let pairs: [(PqcCode, &str); 18] = [
+        (PqcCode::MlDsa44, "ml_dsa_44"),
+        (PqcCode::MlDsa65, "ml_dsa_65"),
+        (PqcCode::MlDsa87, "ml_dsa_87"),
+        (PqcCode::MlKem512, "ml_kem_512"),
+        (PqcCode::MlKem768, "ml_kem_768"),
+        (PqcCode::MlKem1024, "ml_kem_1024"),
+        (PqcCode::SlhDsaSha2128s, "slh_dsa_sha2_128s"),
+        (PqcCode::SlhDsaShake128s, "slh_dsa_shake_128s"),
+        (PqcCode::SlhDsaSha2128f, "slh_dsa_sha2_128f"),
+        (PqcCode::SlhDsaShake128f, "slh_dsa_shake_128f"),
+        (PqcCode::SlhDsaSha2192s, "slh_dsa_sha2_192s"),
+        (PqcCode::SlhDsaShake192s, "slh_dsa_shake_192s"),
+        (PqcCode::SlhDsaSha2192f, "slh_dsa_sha2_192f"),
+        (PqcCode::SlhDsaShake192f, "slh_dsa_shake_192f"),
+        (PqcCode::SlhDsaSha2256s, "slh_dsa_sha2_256s"),
+        (PqcCode::SlhDsaShake256s, "slh_dsa_shake_256s"),
+        (PqcCode::SlhDsaSha2256f, "slh_dsa_sha2_256f"),
+        (PqcCode::SlhDsaShake256f, "slh_dsa_shake_256f"),
+    ];
+    for (code, expected) in pairs {
+        assert_eq!(metadata_label(KeyLabel::Pqc(code)), expected);
+        assert!(METADATA_LABELS_V5.contains(&expected));
+        assert!(is_pqc_metadata_label(expected));
+    }
+    for label in METADATA_LABELS_V5 {
+        assert_eq!(
+            is_pqc_metadata_label(label),
+            !METADATA_LABELS_V4.contains(&label),
+            "{label}"
+        );
+    }
+}
+
+/// F16: the section version follows the content. A scene whose
+/// object carries an established parameter set renders v5 with the
+/// `parameter_set` key in every metadata block and the PQC label on
+/// its key row; the same scene with RSA metadata renders v1 with
+/// six-key blocks (negative control: no PQC content, no v5).
+#[test]
+fn key_operation_pqc_version_follows_content() {
+    use crate::key_operation_projection::producer::commit;
+    use crate::key_operation_projection::{
+        OBSERVATIONS_VERSION_V5, object_observations_json, observations_version,
+    };
+    use crate::semantics_key_use::KeyUseReducer;
+    // Both scenes sign with the ML-DSA mechanism id (0x1d): labels
+    // come from established key metadata, never from the mechanism.
+    fn commit_scene(
+        getattr_cells: Vec<(u8, u8, u16)>,
+    ) -> crate::key_operation_projection::ObjectObservations {
+        let mut scene = JointScene::new();
+        let bootstrap = scene.bootstrap();
+        let mut staging = JointStaging::select_joint(Some(&bootstrap));
+        let mut joint = EdgeSemantics::default();
+        let mut keyuse = KeyUseReducer::new();
+        let mut sink = Vec::new();
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+        );
+        let get = ShapedS1 {
+            getattr_cells,
+            ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+        };
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &get,
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_SignInit", CkRv::OK.0, 0x1d, init_capture()),
+        );
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut joint,
+            &mut keyuse,
+            &mut sink,
+            &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+        );
+        commit(1, &[&staging], &scene.model.project(), &keyuse)
+    }
+    let pqc = commit_scene(vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0x4a), (7u8, 1u8, 2u16)]);
+    assert_eq!(observations_version(&pqc), OBSERVATIONS_VERSION_V5);
+    let section = object_observations_json(&pqc);
+    assert_eq!(section["version"], 5);
+    assert_eq!(
+        section["key_operations"][0]["metadata_at_use"], "ml_dsa_65",
+        "the key row carries the PQC label"
+    );
+    let established = &section["objects"][0]["established"];
+    assert_eq!(established["key_type"]["value"], 0x4a);
+    assert_eq!(established["parameter_set"]["status"], "value");
+    assert_eq!(established["parameter_set"]["value"], 2);
+    assert_eq!(
+        section["objects"][0]["queries"]["parameter_set"],
+        "established"
+    );
+    assert_eq!(section["objects"][0]["label"], "ml_dsa_65");
+    // Negative control: RSA metadata renders v1 with six-key blocks.
+    let rsa = commit_scene(vec![
+        (1u8, 1u8, 3u16),
+        (2u8, 1u8, 0u16),
+        (5u8, 1u8, 2048u16),
+    ]);
+    assert_eq!(
+        observations_version(&rsa),
+        crate::key_operation_projection::OBSERVATIONS_VERSION
+    );
+    let legacy = object_observations_json(&rsa);
+    assert_eq!(legacy["version"], 1);
+    assert_eq!(
+        legacy["key_operations"][0]["metadata_at_use"], "rsa_2048",
+        "the control row proves the scene is live"
+    );
+    for block in ["requested", "established"] {
+        // JSON maps iterate sorted; the contract pins the set.
+        let mut keys: Vec<&str> = legacy["objects"][0][block]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        let mut expected = vec![
+            "class",
+            "key_type",
+            "token",
+            "value_len",
+            "modulus_bits",
+            "ec_params",
+        ];
+        expected.sort_unstable();
+        assert_eq!(keys, expected, "{block} keeps six keys");
+    }
+    assert!(
+        legacy["objects"][0]["queries"]
+            .as_object()
+            .unwrap()
+            .get("parameter_set")
+            .is_none(),
+        "no parameter_set query outcome at v1"
+    );
+}
+
+/// F16: the PQC constructor refuses everything outside the valid
+/// family/code pairs — wrong families, out-of-range codes and zero —
+/// while every valid pair builds.
+#[test]
+fn key_operation_pqc_label_constructor_refuses_invalid_pairs() {
+    use crate::semantics_objects::{KeyLabel, PqcCode};
+    for (key_type, set, code) in [
+        (0x4a, 1, PqcCode::MlDsa44),
+        (0x4a, 2, PqcCode::MlDsa65),
+        (0x4a, 3, PqcCode::MlDsa87),
+        (0x49, 1, PqcCode::MlKem512),
+        (0x49, 2, PqcCode::MlKem768),
+        (0x49, 3, PqcCode::MlKem1024),
+        (0x4b, 1, PqcCode::SlhDsaSha2128s),
+        (0x4b, 6, PqcCode::SlhDsaShake192s),
+        (0x4b, 12, PqcCode::SlhDsaShake256f),
+    ] {
+        assert_eq!(
+            KeyLabel::pqc(key_type, set),
+            Some(KeyLabel::Pqc(code)),
+            "({key_type:#x}, {set}) builds"
+        );
+    }
+    for (key_type, set) in [
+        (0x4a, 0),
+        (0x4a, 4),
+        (0x4a, 12),
+        (0x49, 0),
+        (0x49, 4),
+        (0x49, 13),
+        (0x4b, 0),
+        (0x4b, 13),
+        (0x4b, 0xffff),
+        (0x48, 2),
+        (0x4c, 2),
+        (0x00, 2),
+        (0x03, 2),
+    ] {
+        assert_eq!(
+            KeyLabel::pqc(key_type, set),
+            None,
+            "({key_type:#x}, {set}) refuses"
+        );
+    }
 }

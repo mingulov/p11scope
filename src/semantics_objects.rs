@@ -50,8 +50,10 @@ pub(crate) const MAX_INPUT_HANDLES: usize = 2;
 pub(crate) const MAX_RESULT_HANDLES: usize = 2;
 pub(crate) const MAX_FIND_HANDLES: usize = 8;
 pub(crate) const MAX_TEMPLATE_ATTRIBUTES: usize = 8;
-/// Six classified metadata fields per source (requested / established).
-pub(crate) const METADATA_FIELDS: usize = 6;
+/// Seven classified metadata fields per source (requested / established).
+/// F16 (7.05 PQC) appends the parameter set at index 6; indices 0..5 keep
+/// their kinds.
+pub(crate) const METADATA_FIELDS: usize = 7;
 
 // ---------------------------------------------------------------------------
 // Private words
@@ -950,7 +952,7 @@ pub(crate) enum FieldState {
     Invalidated(Option<FieldValue>),
 }
 
-/// Six fixed metadata slots indexed by [`SafeAttributeKind`] order.
+/// Seven fixed metadata slots indexed by [`SafeAttributeKind`] order.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct MetadataView {
     fields: [FieldState; METADATA_FIELDS],
@@ -970,7 +972,35 @@ pub(crate) fn field_index(kind: SafeAttributeKind) -> usize {
         SafeAttributeKind::ValueLen => 3,
         SafeAttributeKind::ModulusBits => 4,
         SafeAttributeKind::EcParams => 5,
+        SafeAttributeKind::ParameterSet => 6,
     }
+}
+
+/// F16 (7.05 PQC): the closed eighteen-value PQC parameter-set
+/// vocabulary. The `CKP_*` numbers overlap across families, so this
+/// enum — never one raw code alone — is the label identity. Fieldless
+/// (one byte), so `KeyLabel` keeps its four-byte size and the
+/// `OpMachine == 64` layout pin holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PqcCode {
+    MlDsa44,
+    MlDsa65,
+    MlDsa87,
+    MlKem512,
+    MlKem768,
+    MlKem1024,
+    SlhDsaSha2128s,
+    SlhDsaShake128s,
+    SlhDsaSha2128f,
+    SlhDsaShake128f,
+    SlhDsaSha2192s,
+    SlhDsaShake192s,
+    SlhDsaSha2192f,
+    SlhDsaShake192f,
+    SlhDsaSha2256s,
+    SlhDsaShake256s,
+    SlhDsaSha2256f,
+    SlhDsaShake256f,
 }
 
 /// A combined label from established facts of the same view only,
@@ -982,6 +1012,38 @@ pub(crate) enum KeyLabel {
     Aes { value_len: u16 },
     Rsa { modulus_bits: u16 },
     Ec { curve: SafeCurve },
+    Pqc(PqcCode),
+}
+
+impl KeyLabel {
+    /// F16 (7.05 PQC): the only PQC label constructor. Accepts exactly
+    /// the valid family/code pairs from PKCS #11 3.2 sections
+    /// 6.67.1/6.68.1/6.69.1 (ML-DSA and ML-KEM codes 1..=3, SLH-DSA
+    /// codes 1..=12); anything else is not a label.
+    pub(crate) fn pqc(key_type: u16, parameter_set: u16) -> Option<Self> {
+        let code = match (key_type, parameter_set) {
+            (0x4a, 1) => PqcCode::MlDsa44,
+            (0x4a, 2) => PqcCode::MlDsa65,
+            (0x4a, 3) => PqcCode::MlDsa87,
+            (0x49, 1) => PqcCode::MlKem512,
+            (0x49, 2) => PqcCode::MlKem768,
+            (0x49, 3) => PqcCode::MlKem1024,
+            (0x4b, 1) => PqcCode::SlhDsaSha2128s,
+            (0x4b, 2) => PqcCode::SlhDsaShake128s,
+            (0x4b, 3) => PqcCode::SlhDsaSha2128f,
+            (0x4b, 4) => PqcCode::SlhDsaShake128f,
+            (0x4b, 5) => PqcCode::SlhDsaSha2192s,
+            (0x4b, 6) => PqcCode::SlhDsaShake192s,
+            (0x4b, 7) => PqcCode::SlhDsaSha2192f,
+            (0x4b, 8) => PqcCode::SlhDsaShake192f,
+            (0x4b, 9) => PqcCode::SlhDsaSha2256s,
+            (0x4b, 10) => PqcCode::SlhDsaShake256s,
+            (0x4b, 11) => PqcCode::SlhDsaSha2256f,
+            (0x4b, 12) => PqcCode::SlhDsaShake256f,
+            _ => return None,
+        };
+        Some(KeyLabel::Pqc(code))
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

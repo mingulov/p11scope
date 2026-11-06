@@ -2005,7 +2005,9 @@ fn object_producer_attributes_full_width_and_no_read() {
         (
             SEL_KEYTYPE,
             ak::KEY_TYPE,
-            &[0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41],
+            &[
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x10, 0x1f, 0x40, 0x41, 0x49, 0x4a, 0x4b,
+            ],
         ),
         (SEL_TOKEN, ak::TOKEN, &[0, 1]),
         (SEL_VALUELEN, ak::VALUE_LEN, &[16, 24, 32]),
@@ -2013,6 +2015,12 @@ fn object_producer_attributes_full_width_and_no_read() {
             SEL_MODBITS,
             ak::MODULUS_BITS,
             &[1024, 2048, 3072, 4096, 8192],
+        ),
+        // F16 (7.05 PQC) reviewed row: the CKP_* union 1..=12.
+        (
+            SEL_PARAMETER_SET,
+            ak::PARAMETER_SET,
+            &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12],
         ),
     ];
     for (selector, kind, values) in SCALARS {
@@ -4985,7 +4993,8 @@ fn streamed_stable_recheck_preserves_read_order_and_failure_priority() {
 
 #[test]
 fn request_cell_pack_preserves_widths_and_refuses_unknown_bits() {
-    for kind in 0..=6 {
+    // F16 (7.05 PQC): kind 7 packs now; the boundary moves to 8.
+    for kind in 0..=7 {
         for status in 0..=10 {
             for list_flags in [0, alf::HEADER_READ_FAILURE] {
                 for object_flags in [
@@ -5023,7 +5032,7 @@ fn request_cell_pack_preserves_widths_and_refuses_unknown_bits() {
     };
     assert_eq!(pack_request_cell(good), Some(0x1004_abcd_0101));
     for bad in [
-        RequestCellFacts { kind: 7, ..good },
+        RequestCellFacts { kind: 8, ..good },
         RequestCellFacts {
             kind: u8::MAX,
             ..good
@@ -5072,7 +5081,8 @@ fn request_cell_pack_preserves_widths_and_refuses_unknown_bits() {
     for bit in (48..64).chain([32, 33, 35, 36, 37, 38, 39, 40, 41, 43, 45, 46, 47]) {
         assert!(unpack_request_cell(1 << bit).is_none(), "unknown bit {bit}");
     }
-    for bad in [7, 0xff, 11 << 8, 0xff << 8, 1 << 16] {
+    // F16 (7.05 PQC): packed kind 7 unpacks now; the boundary moves to 8.
+    for bad in [8, 0xff, 11 << 8, 0xff << 8, 1 << 16] {
         assert!(unpack_request_cell(bad).is_none(), "bad={bad:#x}");
     }
     assert_eq!(
@@ -5260,6 +5270,8 @@ fn stable_cell_kind_layout_codec_roundtrips() {
         Kind::ValueLen,
         Kind::ModulusBits,
         Kind::EcParams,
+        // F16 (7.05 PQC) reviewed row: kind 7 round-trips.
+        Kind::ParameterSet,
     ] {
         for layout in [LinuxLayout::Lp64, LinuxLayout::Ilp32] {
             let code = encode_stable_kind_layout(kind, layout);
@@ -5267,7 +5279,8 @@ fn stable_cell_kind_layout_codec_roundtrips() {
         }
     }
     // Unused code 0, above-range codes, bad layout tags, high garbage.
-    for bad in [0u64, 7, 0xFF, 0x200, 0x201, 1 << 16, u64::MAX] {
+    // F16 (7.05 PQC): kind 7 decodes now; the boundary moves to 8.
+    for bad in [0u64, 8, 0xFF, 0x200, 0x201, 1 << 16, u64::MAX] {
         assert_eq!(decode_stable_kind_layout(bad), None, "bad={bad:#x}");
     }
 }
@@ -5304,7 +5317,8 @@ fn get_slot_result_codec_roundtrips() {
 
 #[test]
 fn stable_cell_poison_inputs_publish_nothing() {
-    for bad in [0u64, 7, 0xFF, 0x200, u64::MAX] {
+    // F16 (7.05 PQC): kind 7 decodes now; the boundary moves to 8.
+    for bad in [0u64, 8, 0xFF, 0x200, u64::MAX] {
         let reads = core::cell::Cell::new(0u32);
         let packed = stable_cell_packed(
             0x4000,
@@ -5342,6 +5356,9 @@ fn stable_cell_packed_matches_direct() {
             (Kind::ValueLen, SEL_VALUELEN, w),
             (Kind::ModulusBits, SEL_MODBITS, w),
             (Kind::EcParams, SEL_ECPARAMS, 10),
+            // F16 (7.05 PQC): the parameter set rides the same
+            // packed-vs-direct comparison as the scalar kinds.
+            (Kind::ParameterSet, SEL_PARAMETER_SET, w),
         ] {
             for failed in 0u8..8 {
                 for changed in 0u8..8 {
@@ -5368,6 +5385,9 @@ fn stable_cell_packed_matches_direct() {
                                         Kind::KeyType => 0x10,
                                         Kind::ValueLen => 32,
                                         Kind::ModulusBits => 2048,
+                                        // F16 (7.05 PQC): a healthy
+                                        // parameter-set code.
+                                        Kind::ParameterSet => 2,
                                         _ => unreachable!(),
                                     };
                                     target.borrow_mut().set_word(0x8000, scalar);
@@ -5453,6 +5473,9 @@ fn stable_cell_packed_matches_direct() {
                     Kind::KeyType => target.borrow_mut().set_word(0x8000, 0x10),
                     Kind::ValueLen => target.borrow_mut().set_word(0x8000, 32),
                     Kind::ModulusBits => target.borrow_mut().set_word(0x8000, 2048),
+                    // F16 (7.05 PQC): the parameter-set kind classifies
+                    // its word like the other scalar kinds.
+                    Kind::ParameterSet => target.borrow_mut().set_word(0x8000, 2),
                 }
                 let (mut rw, mut rb) = readers(&target);
                 let mut out = crate::object_wire::ObjectAttributeWire::default();
@@ -5732,8 +5755,10 @@ fn slot_kind_codes_stay_consecutive_from_class() {
             attr_kind::VALUE_LEN,
             attr_kind::MODULUS_BITS,
             attr_kind::EC_PARAMS,
+            // F16 (7.05 PQC) reviewed row: kind 7 stays consecutive.
+            attr_kind::PARAMETER_SET,
         ],
-        [1, 2, 3, 4, 5, 6]
+        [1, 2, 3, 4, 5, 6, 7]
     );
     for code in 0u8..=u8::MAX {
         assert_eq!(
@@ -5754,6 +5779,8 @@ fn selector_for_kind_inverts_policy_mapping() {
         SafeAttributeKind::ValueLen,
         SafeAttributeKind::ModulusBits,
         SafeAttributeKind::EcParams,
+        // F16 (7.05 PQC) reviewed row: the parameter-set selector.
+        SafeAttributeKind::ParameterSet,
     ] {
         assert_eq!(
             object_policy::safe_attribute_kind(selector_for_kind(kind)),

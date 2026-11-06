@@ -504,6 +504,9 @@ impl ViewRecord {
             let compatible = match key_type {
                 0x1f | 0x10 => class == 4,
                 0x00 | 0x03 => class == 2 || class == 3,
+                // F16 (7.05 PQC): ML-KEM/ML-DSA/SLH-DSA keys are
+                // public/private-key objects, like RSA/EC.
+                0x49..=0x4b => class == 2 || class == 3,
                 _ => true,
             };
             if !compatible {
@@ -518,6 +521,13 @@ impl ViewRecord {
                 .map(|modulus_bits| KeyLabel::Rsa { modulus_bits }),
             0x03 => match field(SafeAttributeKind::EcParams) {
                 FieldState::Value(FieldValue::Curve(curve)) => Some(KeyLabel::Ec { curve }),
+                _ => None,
+            },
+            // F16 (7.05 PQC): the label joins the established key type
+            // with the established parameter set from this same view;
+            // the constructor refuses out-of-range codes per family.
+            0x49..=0x4b => match field(SafeAttributeKind::ParameterSet) {
+                FieldState::Value(FieldValue::Scalar(set)) => KeyLabel::pqc(key_type, set),
                 _ => None,
             },
             _ => None,
@@ -4771,6 +4781,117 @@ mod tests {
                 (EcParams, curve),
             ]);
             assert_eq!(view.label(), None, "{name}");
+        }
+    }
+
+    // F16 (7.05 PQC) healthy twins: every valid family/code pair
+    // labels under public_key, private_key, or an unknown class.
+    #[test]
+    fn combined_label_pqc_healthy_pairs() {
+        use crate::semantics_objects::PqcCode;
+        use SafeAttributeKind::*;
+        for (key_type, set, code, name) in [
+            (0x4a, 1, PqcCode::MlDsa44, "ml-dsa-44"),
+            (0x4a, 2, PqcCode::MlDsa65, "ml-dsa-65"),
+            (0x4a, 3, PqcCode::MlDsa87, "ml-dsa-87"),
+            (0x49, 1, PqcCode::MlKem512, "ml-kem-512"),
+            (0x49, 2, PqcCode::MlKem768, "ml-kem-768"),
+            (0x49, 3, PqcCode::MlKem1024, "ml-kem-1024"),
+            (0x4b, 1, PqcCode::SlhDsaSha2128s, "slh-dsa-sha2-128s"),
+            (0x4b, 12, PqcCode::SlhDsaShake256f, "slh-dsa-shake-256f"),
+        ] {
+            for class in [None, Some(2), Some(3)] {
+                let mut pairs = vec![(KeyType, scalar(key_type)), (ParameterSet, scalar(set))];
+                if let Some(class) = class {
+                    pairs.push((Class, scalar(class)));
+                }
+                let view = established_with(&pairs);
+                assert_eq!(
+                    view.label(),
+                    Some(KeyLabel::Pqc(code)),
+                    "{name} class {class:?}"
+                );
+            }
+        }
+        // The remaining ten SLH-DSA codes label under private_key.
+        for (set, code) in [
+            (2, PqcCode::SlhDsaShake128s),
+            (3, PqcCode::SlhDsaSha2128f),
+            (4, PqcCode::SlhDsaShake128f),
+            (5, PqcCode::SlhDsaSha2192s),
+            (6, PqcCode::SlhDsaShake192s),
+            (7, PqcCode::SlhDsaSha2192f),
+            (8, PqcCode::SlhDsaShake192f),
+            (9, PqcCode::SlhDsaSha2256s),
+            (10, PqcCode::SlhDsaShake256s),
+            (11, PqcCode::SlhDsaSha2256f),
+        ] {
+            let view = established_with(&[
+                (Class, scalar(3)),
+                (KeyType, scalar(0x4b)),
+                (ParameterSet, scalar(set)),
+            ]);
+            assert_eq!(view.label(), Some(KeyLabel::Pqc(code)), "slh-dsa set {set}");
+        }
+    }
+
+    // F16 (7.05 PQC) failure twins: a missing side, an out-of-range
+    // code for the family, a conflict, or an incompatible class
+    // withholds the PQC label — "unknown parameter set", never a
+    // guessed name.
+    #[test]
+    fn combined_label_pqc_withheld_without_type_and_set() {
+        use SafeAttributeKind::*;
+        // Type without set, set without type.
+        let type_only = established_with(&[(KeyType, scalar(0x4a))]);
+        assert_eq!(type_only.label(), None, "type alone never labels");
+        let set_only = established_with(&[(ParameterSet, scalar(2))]);
+        assert_eq!(set_only.label(), None, "set alone never labels");
+        // Valid code for another family: ML-DSA/ML-KEM stop at 3.
+        for (key_type, set, name) in [
+            (0x4a, 0, "ml-dsa set 0"),
+            (0x4a, 4, "ml-dsa set 4"),
+            (0x4a, 12, "ml-dsa set 12"),
+            (0x49, 0, "ml-kem set 0"),
+            (0x49, 4, "ml-kem set 4"),
+            (0x4b, 0, "slh-dsa set 0"),
+            (0x4b, 13, "slh-dsa set 13"),
+            (0x48, 2, "non-PQC type with a set code"),
+        ] {
+            let view = established_with(&[
+                (Class, scalar(3)),
+                (KeyType, scalar(key_type)),
+                (ParameterSet, scalar(set)),
+            ]);
+            assert_eq!(view.label(), None, "{name}");
+        }
+        // Conflicts withhold.
+        let conflicted_set = established_with(&[
+            (Class, scalar(3)),
+            (KeyType, scalar(0x4a)),
+            (
+                ParameterSet,
+                FieldState::Conflict(Some(FieldValue::Scalar(2))),
+            ),
+        ]);
+        assert_eq!(conflicted_set.label(), None, "conflicted set");
+        let conflicted_type = established_with(&[
+            (Class, scalar(3)),
+            (
+                KeyType,
+                FieldState::Conflict(Some(FieldValue::Scalar(0x4a))),
+            ),
+            (ParameterSet, scalar(2)),
+        ]);
+        assert_eq!(conflicted_type.label(), None, "conflicted type");
+        // PQC keys are public/private-key objects, like RSA/EC.
+        for (class, name) in [(4, "secret_key"), (1, "certificate"), (0, "data")] {
+            let view = established_with(&[
+                (Class, scalar(class)),
+                (KeyType, scalar(0x4a)),
+                (ParameterSet, scalar(2)),
+            ]);
+            assert_eq!(view.label(), None, "ml-dsa under {name}");
         }
     }
 

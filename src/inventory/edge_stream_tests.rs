@@ -1465,6 +1465,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
             value_len: blank,
             modulus_bits: blank,
             ec_params: blank,
+            parameter_set: blank,
         };
         ObjectRow {
             object,
@@ -1485,6 +1486,7 @@ fn finish_counts_the_selected_stale_publication_not_the_current() {
                 value_len: "not_queried",
                 modulus_bits: "not_queried",
                 ec_params: "not_queried",
+                parameter_set: "not_queried",
             },
             label: None,
             successful_references: 1,
@@ -1593,6 +1595,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
             value_len: blank,
             modulus_bits: blank,
             ec_params: blank,
+            parameter_set: blank,
         };
         ObjectRow {
             object,
@@ -1613,6 +1616,7 @@ fn finish_with_fitting_stale_selection_discloses_nothing() {
                 value_len: "not_queried",
                 modulus_bits: "not_queried",
                 ec_params: "not_queried",
+                parameter_set: "not_queried",
             },
             label: None,
             successful_references: 1,

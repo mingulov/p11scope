@@ -102,6 +102,7 @@ fn object_row(object: u64) -> ObjectRow {
         value_len: blank,
         modulus_bits: blank,
         ec_params: blank,
+        parameter_set: blank,
     };
     ObjectRow {
         object,
@@ -122,6 +123,7 @@ fn object_row(object: u64) -> ObjectRow {
             value_len: "not_queried",
             modulus_bits: "not_queried",
             ec_params: "not_queried",
+            parameter_set: "not_queried",
         },
         label: None,
         successful_references: 1,
@@ -258,6 +260,7 @@ fn snapshot_tallies(snapshot: &str) -> Vec<(&str, u64, u64, u64)> {
     for line in key_ops_block(snapshot).iter().skip(1) {
         if line.starts_with("  not attributed:")
             || line.starts_with("  type unknown")
+            || line.starts_with("  pqc keys:")
             || *line == "  no key operations observed"
         {
             continue;
@@ -1988,4 +1991,151 @@ fn gaps_long_subject_truncates_line_to_100_chars() {
         "truncation is marked: {:?}",
         block[1]
     );
+}
+
+// ==================== F16 (7.05 PQC): PQC spotlight ====================
+
+/// F16: the concise block spotlights proved PQC uses per parameter
+/// set on their own line beside the exact per-provider tallies.
+/// Secondary-role rows stand beside (never double-counted), non-PQC
+/// rows contribute no segment, and the spotlight sits before the
+/// `not attributed` / `type unknown` lines. No object identity anywhere.
+#[test]
+fn key_ops_line_spotlights_pqc_uses() {
+    let mut observations = populated(9);
+    let mut sign = key_row("sign", "key", 12, 0, 0, "operations");
+    sign.metadata_at_use = "ml_dsa_65";
+    observations.key_operations.push(sign);
+    let mut verify = key_row("verify", "key", 3, 0, 0, "operations");
+    verify.metadata_at_use = "ml_dsa_65";
+    observations.key_operations.push(verify);
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 5, 0, 0, "operations"));
+    let mut secondary = key_row("sign", SECONDARY_ROLE, 100, 0, 0, "operations");
+    secondary.metadata_at_use = "ml_dsa_65";
+    observations.key_operations.push(secondary);
+    observations.add_unattributed("record_lost", 2);
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let block = key_ops_block(&snapshot);
+    // The tallies stay exact (parsed from the provider lines): 12 + 5
+    // sign, 3 verify; the secondary 100 excluded.
+    assert_eq!(
+        snapshot_tallies(&snapshot),
+        vec![("sign", 17, 0, 0), ("verify", 3, 0, 0)],
+        "tallies intact: {snapshot}"
+    );
+    let spotlight = block
+        .iter()
+        .find(|line| line.starts_with("  pqc keys: "))
+        .expect("the PQC spotlight line");
+    assert_eq!(
+        *spotlight,
+        "  pqc keys: ML-DSA-65 sign: 12, ML-DSA-65 verify: 3",
+        "one segment per (label, category): {snapshot}"
+    );
+    let text = block.join("\n");
+    assert!(
+        !text.contains("100"),
+        "the secondary row never double-counts: {snapshot}"
+    );
+    let pqc = block
+        .iter()
+        .position(|line| line.starts_with("  pqc keys: "))
+        .expect("spotlight");
+    let unattributed = block
+        .iter()
+        .position(|line| line.starts_with("  not attributed:"))
+        .expect("suffix");
+    assert!(
+        pqc < unattributed,
+        "the spotlight precedes the suffixes: {snapshot}"
+    );
+    assert!(
+        !text.contains("object#") && !text.contains("test-instance"),
+        "counts only, never object identity: {snapshot}"
+    );
+}
+
+/// F16 negative control: without PQC-labelled proved rows the block
+/// shows no spotlight at all.
+#[test]
+fn key_ops_line_without_pqc_rows_shows_no_spotlight() {
+    let mut observations = populated(9);
+    observations
+        .key_operations
+        .push(key_row("sign", "key", 4, 0, 0, "operations"));
+    let mut secondary = key_row("sign", SECONDARY_ROLE, 2, 0, 0, "operations");
+    secondary.metadata_at_use = "ml_kem_768";
+    observations.key_operations.push(secondary);
+    let presentation = key_ops_presentation(observations);
+    let snapshot = render_snapshot(&presentation);
+    let block = key_ops_block(&snapshot);
+    assert!(
+        !block.iter().any(|line| line.starts_with("  pqc keys:")),
+        "no spotlight without primary PQC rows: {snapshot}"
+    );
+    assert_eq!(snapshot_tallies(&snapshot), vec![("sign", 4, 0, 0)]);
+}
+
+/// F16: `-v` adds failed/active terminals to the same spotlight
+/// segments, with the tallies' singular/plural nouns.
+#[test]
+fn key_ops_line_pqc_spotlight_verbose_adds_terminals() {
+    let mut observations = populated(9);
+    let mut sign = key_row("sign", "key", 12, 1, 0, "operations");
+    sign.metadata_at_use = "ml_dsa_65";
+    observations.key_operations.push(sign);
+    let mut encap = key_row("encapsulate", "encapsulation_key", 7, 2, 1, "operations");
+    encap.metadata_at_use = "ml_kem_768";
+    observations.key_operations.push(encap);
+    let presentation = key_ops_presentation(observations);
+    let verbose =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    let spotlight = block
+        .iter()
+        .find(|line| line.starts_with("  pqc keys: "))
+        .expect("the verbose spotlight line");
+    assert!(
+        spotlight.contains("ML-DSA-65 sign: 12 completed, 1 returned an error, 0 active"),
+        "singular noun: {verbose}"
+    );
+    assert!(
+        spotlight
+            .contains("ML-KEM-768 encapsulate: 7 completed, 2 returned errors, 1 active"),
+        "plural nouns: {verbose}"
+    );
+    let concise = render_snapshot(&presentation);
+    let short = key_ops_block(&concise);
+    let brief = short
+        .iter()
+        .find(|line| line.starts_with("  pqc keys: "))
+        .expect("the concise spotlight line");
+    assert_eq!(
+        *brief,
+        "  pqc keys: ML-DSA-65 sign: 12, ML-KEM-768 encapsulate: 7",
+        "concise shows completions only: {concise}"
+    );
+}
+
+/// F16: the display map covers exactly the eighteen PQC labels —
+/// every `is_pqc_metadata_label` member renders, nothing else does.
+#[test]
+fn pqc_display_label_covers_all_pqc_labels() {
+    use crate::key_operation_projection::contract::METADATA_LABELS_V5;
+    use crate::key_operation_projection::is_pqc_metadata_label;
+    for label in METADATA_LABELS_V5 {
+        assert_eq!(
+            pqc_display_label(label).is_some(),
+            is_pqc_metadata_label(label),
+            "{label}"
+        );
+    }
+    let displays: Vec<&str> = METADATA_LABELS_V5
+        .iter()
+        .filter_map(|label| pqc_display_label(label))
+        .collect();
+    assert_eq!(displays.len(), 18, "eighteen display names");
 }

@@ -118,7 +118,7 @@ pub mod attr_list_flag {
     pub const UNINSPECTED: u8 = 1 << 4;
 }
 
-/// Finite attribute kinds (brief codes 0..=6).
+/// Finite attribute kinds (brief codes 0..=7).
 pub mod attr_kind {
     pub const ABSENT: u8 = 0;
     pub const CLASS: u8 = 1;
@@ -127,6 +127,9 @@ pub mod attr_kind {
     pub const VALUE_LEN: u8 = 4;
     pub const MODULUS_BITS: u8 = 5;
     pub const EC_PARAMS: u8 = 6;
+    /// F16 (7.05 PQC): `CKA_PARAMETER_SET`; the cell value is the raw
+    /// `CKP_*` code (`1..=12`), qualified by the key type at label time.
+    pub const PARAMETER_SET: u8 = 7;
 }
 
 /// One classified attribute cell: finite kind/status plus a classified value.
@@ -408,6 +411,7 @@ fn safe_kind_code(kind: SafeAttributeKind) -> u8 {
         SafeAttributeKind::ValueLen => attr_kind::VALUE_LEN,
         SafeAttributeKind::ModulusBits => attr_kind::MODULUS_BITS,
         SafeAttributeKind::EcParams => attr_kind::EC_PARAMS,
+        SafeAttributeKind::ParameterSet => attr_kind::PARAMETER_SET,
     }
 }
 
@@ -420,18 +424,19 @@ fn kind_from_code(code: u8) -> Option<SafeAttributeKind> {
         attr_kind::VALUE_LEN => Some(SafeAttributeKind::ValueLen),
         attr_kind::MODULUS_BITS => Some(SafeAttributeKind::ModulusBits),
         attr_kind::EC_PARAMS => Some(SafeAttributeKind::EcParams),
+        attr_kind::PARAMETER_SET => Some(SafeAttributeKind::ParameterSet),
         _ => None,
     }
 }
 
 /// Slot-kind membership for scans that need selectedness only, not the
-/// decoded kind. Codes run consecutive 1..=6 from `attr_kind::CLASS`
+/// decoded kind. Codes run consecutive 1..=7 from `attr_kind::CLASS`
 /// (pinned by `slot_kind_codes_stay_consecutive_from_class`); 0 marks
 /// unused slots and anything above refuses. One subtract-and-compare
-/// instead of a seven-arm match.
+/// instead of an eight-arm match.
 #[inline(always)]
 fn slot_kind_selected(code: u8) -> bool {
-    code.wrapping_sub(attr_kind::CLASS) < 6
+    code.wrapping_sub(attr_kind::CLASS) < 7
 }
 
 /// The single exact wire selector for a decoded kind (inverse of
@@ -448,6 +453,7 @@ fn selector_for_kind(kind: SafeAttributeKind) -> u64 {
         SafeAttributeKind::ValueLen => 0x0161,
         SafeAttributeKind::ModulusBits => 0x0121,
         SafeAttributeKind::EcParams => 0x0180,
+        SafeAttributeKind::ParameterSet => 0x061d,
     }
 }
 

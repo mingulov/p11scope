@@ -1308,6 +1308,82 @@ pub(crate) struct KeyOpTally {
     pub unit: &'static str,
 }
 
+/// F16 (7.05 PQC): the concise display name for a PQC
+/// `metadata_at_use` label, or `None` for every non-PQC label. The
+/// single display authority behind the snapshot's PQC spotlight; the
+/// contract test pins coverage against all eighteen labels.
+pub(crate) fn pqc_display_label(metadata_at_use: &str) -> Option<&'static str> {
+    match metadata_at_use {
+        "ml_dsa_44" => Some("ML-DSA-44"),
+        "ml_dsa_65" => Some("ML-DSA-65"),
+        "ml_dsa_87" => Some("ML-DSA-87"),
+        "ml_kem_512" => Some("ML-KEM-512"),
+        "ml_kem_768" => Some("ML-KEM-768"),
+        "ml_kem_1024" => Some("ML-KEM-1024"),
+        "slh_dsa_sha2_128s" => Some("SLH-DSA-SHA2-128S"),
+        "slh_dsa_shake_128s" => Some("SLH-DSA-SHAKE-128S"),
+        "slh_dsa_sha2_128f" => Some("SLH-DSA-SHA2-128F"),
+        "slh_dsa_shake_128f" => Some("SLH-DSA-SHAKE-128F"),
+        "slh_dsa_sha2_192s" => Some("SLH-DSA-SHA2-192S"),
+        "slh_dsa_shake_192s" => Some("SLH-DSA-SHAKE-192S"),
+        "slh_dsa_sha2_192f" => Some("SLH-DSA-SHA2-192F"),
+        "slh_dsa_shake_192f" => Some("SLH-DSA-SHAKE-192F"),
+        "slh_dsa_sha2_256s" => Some("SLH-DSA-SHA2-256S"),
+        "slh_dsa_shake_256s" => Some("SLH-DSA-SHAKE-256S"),
+        "slh_dsa_sha2_256f" => Some("SLH-DSA-SHA2-256F"),
+        "slh_dsa_shake_256f" => Some("SLH-DSA-SHAKE-256F"),
+        _ => None,
+    }
+}
+
+/// F16 (7.05 PQC): one proved (label, category) aggregate for the
+/// snapshot's PQC spotlight. Counts only — never object identity.
+pub(crate) struct PqcKeySegment {
+    pub display: &'static str,
+    pub category: &'static str,
+    pub completed: u64,
+    pub failed: u64,
+    pub active: u64,
+}
+
+/// F16 (7.05 PQC): proved completions per (PQC label, category)
+/// across primary-role rows only (secondary rows stand beside,
+/// never double-counted — the H9 §82 rule the tallies follow).
+/// Unknown summaries carry no key, so they contribute nothing.
+/// Segments sort by (label, category); empty when no PQC-labelled
+/// proved row exists, in which case the snapshot shows no suffix.
+pub(crate) fn pqc_key_breakdown(
+    observations: &crate::key_operation_projection::ObjectObservations,
+) -> Vec<PqcKeySegment> {
+    use std::collections::BTreeMap;
+    let secondary = crate::key_operation_projection::SECONDARY_ROLE;
+    let mut by_label: BTreeMap<(&str, &str), (u64, u64, u64)> = BTreeMap::new();
+    for row in &observations.key_operations {
+        if row.role == secondary {
+            continue;
+        }
+        let Some(display) = pqc_display_label(row.metadata_at_use) else {
+            continue;
+        };
+        let entry = by_label.entry((display, row.category)).or_insert((0, 0, 0));
+        entry.0 = entry.0.saturating_add(row.completed);
+        entry.1 = entry.1.saturating_add(row.failed);
+        entry.2 = entry.2.saturating_add(row.active);
+    }
+    by_label
+        .into_iter()
+        .map(
+            |((display, category), (completed, failed, active))| PqcKeySegment {
+                display,
+                category,
+                completed,
+                failed,
+                active,
+            },
+        )
+        .collect()
+}
+
 /// Per-category terminals across proved and unknown buckets; the
 /// unit comes from the rows (one unit per category, by contract).
 /// Each operation counts ONCE (H9 §82): the primary association's
@@ -2399,6 +2475,41 @@ fn render_snapshot_inner(
                     "{}",
                     key_detail_line("unknown keys", &key_tally_segment(tally), &suffix, false)
                 );
+            }
+            // F16 (7.05 PQC): the PQC spotlight names proved uses per
+            // parameter set on its own line; concise shows completions,
+            // `-v` adds failed/active. Absent without PQC rows, so
+            // older snapshots (and their pins) never see it. It precedes
+            // the not-attributed and unknown-type lines.
+            let pqc = pqc_key_breakdown(observations);
+            if !pqc.is_empty() {
+                let segments: Vec<String> = pqc
+                    .iter()
+                    .map(|segment| {
+                        if verbose {
+                            let failed_noun = if segment.failed == 1 {
+                                "returned an error"
+                            } else {
+                                "returned errors"
+                            };
+                            format!(
+                                "{} {}: {} completed, {} {}, {} active",
+                                segment.display,
+                                segment.category,
+                                segment.completed,
+                                segment.failed,
+                                failed_noun,
+                                segment.active
+                            )
+                        } else {
+                            format!(
+                                "{} {}: {}",
+                                segment.display, segment.category, segment.completed
+                            )
+                        }
+                    })
+                    .collect();
+                let _ = writeln!(out, "  pqc keys: {}", segments.join(", "));
             }
             // Not-attributed counters sit beside the exact rows, one
             // line per finite reason: counts only, never a guessed key.

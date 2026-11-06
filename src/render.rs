@@ -6606,14 +6606,17 @@ pub(crate) mod tests {
                 value => unreachable!("unexpected fixture RV {value:#x}"),
             };
             // Task 1.3: the scan-only table is unlinked, so the trace never
-            // names the slot — it shows the ordinal that reached it (review
-            // answer (c)); the counts and RVs are retained unchanged, with
-            // no per-line marker (the header says once that unverified
-            // calls are not decoded).
+            // names the slot — it shows the ordinal that reached it as a
+            // numbered unnamed function (review answer (c)); the counts
+            // and RVs are retained unchanged, with no per-line marker
+            // (the header says once that unverified calls are not
+            // decoded).
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(" Unknown executable (PID 100, TID 1) unknown#{ordinal} → {rv} 100ns"),
+                format!(
+                    " Unknown executable (PID 100, TID 1) function #{ordinal} (unnamed) → {rv} 100ns"
+                ),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }

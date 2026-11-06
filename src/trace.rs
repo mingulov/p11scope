@@ -386,7 +386,7 @@ pub(crate) fn count_evidence_line(
 /// lookup, which `semantics::State` owns.
 #[derive(Clone)]
 struct TraceSlot {
-    /// `plan::presented_label`: names, or `unknown#<ordinal>` when unnamed.
+    /// `plan::presented_label`: names, or `function #<ordinal> (unnamed)` when unnamed.
     label: String,
     semantics: p11scope_ebpf_common::SlotSemantics,
 }

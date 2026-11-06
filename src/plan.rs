@@ -247,9 +247,10 @@ pub struct TargetObject {
 }
 
 /// The one display label for a slot: its names, or — for a slot no
-/// authorized source named — `unknown#<ordinal>` per distinct ordinal
-/// reaching it (`unknown@0x<offset>` when none does), so unnamed rows stay
-/// distinguishable without presenting a positional guess as a name.
+/// authorized source named — `function #<ordinal> (unnamed)` per
+/// distinct ordinal reaching it (`function@0x<offset> (unnamed)` when
+/// none does), so unnamed rows stay distinguishable without
+/// presenting a positional guess as a name.
 pub(crate) fn presented_label(
     names: &[String],
     ordinals: &[SlotOrdinal],
@@ -262,11 +263,11 @@ pub(crate) fn presented_label(
     numbers.sort_unstable();
     numbers.dedup();
     if numbers.is_empty() {
-        return format!("{UNKNOWN_FUNCTION_NAME}@0x{file_offset:x}");
+        return format!("function@0x{file_offset:x} (unnamed)");
     }
     numbers
         .iter()
-        .map(|number| format!("{UNKNOWN_FUNCTION_NAME}#{number}"))
+        .map(|number| format!("function #{number} (unnamed)"))
         .collect::<Vec<_>>()
         .join("|")
 }
@@ -7289,6 +7290,33 @@ mod tests {
         assert_eq!(plan.borrowed_ordinals_of(&absent).count(), 0);
         absent.object = PinnedObjectId(u32::MAX);
         assert!(plan.borrowed_target_object_of(&absent).is_none());
+    }
+
+    /// CLI text: an unnamed slot reads as `function #<ordinal>
+    /// (unnamed)` — a positional handle, never `unknown#<ordinal>`
+    /// jargon — and `function@0x<offset> (unnamed)` when no ordinal
+    /// reaches it. Named slots keep their names.
+    #[test]
+    fn presented_label_names_unnamed_slots_as_function_number() {
+        let unnamed = vec![UNKNOWN_FUNCTION_NAME.to_string()];
+        let ordinal = |ordinal| SlotOrdinal {
+            table_file_offset: None,
+            ordinal,
+        };
+        assert_eq!(
+            presented_label(&unnamed, &[ordinal(12)], 0x250),
+            "function #12 (unnamed)"
+        );
+        assert_eq!(
+            presented_label(&unnamed, &[ordinal(5), ordinal(3)], 0x250),
+            "function #3 (unnamed)|function #5 (unnamed)"
+        );
+        assert_eq!(
+            presented_label(&unnamed, &[], 0x250),
+            "function@0x250 (unnamed)"
+        );
+        let named = vec!["C_Sign".to_string()];
+        assert_eq!(presented_label(&named, &[ordinal(12)], 0x250), "C_Sign");
     }
 
     fn manifest_with(functions: Vec<FunctionRecord>) -> Manifest {

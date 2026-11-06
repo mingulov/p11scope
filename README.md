@@ -388,7 +388,7 @@ If you installed the optional helper, also run
   `"PKCS 11"` interface or an accepted manifest establishes the ordinal layout,
   or when the provider's own `.dynsym` agrees exactly with every retained
   non-NULL target (`linkage: "exports"`). Without name evidence, rows read
-  `unknown#<ordinal>`, never a guessed name. `doctor` and
+  `function #<ordinal> (unnamed)`, never a guessed name. `doctor` and
   `inspect` need the same privileges as a capture to assess or read another
   user's process:
 

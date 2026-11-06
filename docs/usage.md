@@ -278,8 +278,9 @@ decoder walk in words — a fully walked table reads "fully walked", a
 known-prefix table reads "known functions (newer functions unknown)" — while
 JSON keeps the raw `walk` (`full`/`known_prefix`) and `version`. Without name
 evidence, rows read
-`unknown#<ordinal>` in the live table and trace (`functions[].ordinals` and
-`functions[].target` in JSON), never a guessed name. Missing mechanism or
+`function #<ordinal> (unnamed)` in the live table and trace
+(`functions[].ordinals` and `functions[].target` in JSON), never a guessed
+name. Missing mechanism or
 session evidence does not mean the application used none. For those
 semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).

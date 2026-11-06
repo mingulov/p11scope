@@ -5954,6 +5954,13 @@ fn scan_view_examined_mode(
             inventory: group.clone(),
             ..ScanDependencies::default()
         });
+        // Per-module completeness for the sole-table gate: snapshot the
+        // truncating signals before this module's tables scan. A module that
+        // never scans (no mem, over the per-object cap, or stopped) keeps
+        // `tables_scan_finished` false.
+        let refusals_before_module = budget.refusal_counts();
+        let stop_before_module = budget.stopped_reason();
+        let skipped_before_module = skipped.len();
         let Some(mem) = &mem else {
             modules.push(module);
             continue;
@@ -6072,6 +6079,18 @@ fn scan_view_examined_mode(
                 reason: no_table_found_reason(&module.path, hinted),
             });
         }
+        // The sole-table gate's "exactly one" needs a finished scan: no
+        // truncating skip, I/O exhaustion, stop or refusal on this module.
+        // The benign no-table skip above never truncates, so an empty module
+        // from a complete scan still finishes (it refuses sole by count).
+        let truncated = skipped[skipped_before_module..]
+            .iter()
+            .any(|skip| scan_skip_truncates(&skip.reason));
+        module.tables_scan_finished = !io_exhausted
+            && !truncated
+            && budget.refusal_counts() == refusals_before_module
+            && stop_before_module.is_none()
+            && budget.stopped_reason().is_none();
         modules.push(module);
     }
 

@@ -6235,6 +6235,13 @@ fn broad_fixed_pool_module(
             module.path,
         ));
     }
+    // Pool augmentation breaks the sweep's finished-ness: added tables mean
+    // the sweep alone did not see the whole surface, and refused pool tables
+    // mean the union is incomplete. Covered-only pools (added and refused
+    // both zero) keep the sweep's verdict.
+    if tallies.added > 0 || refused > 0 {
+        module.tables_scan_finished = false;
+    }
 }
 
 #[derive(Default)]
@@ -9433,6 +9440,13 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     // sees fewer loads is not fresh evidence of fewer loads.
     existing.double_loaded |= incoming.double_loaded;
     existing.same_file_loads = existing.same_file_loads.max(incoming.same_file_loads);
+    // The finished flag ANDs: both scans must have finished, and the union
+    // must add no new table (a new table means neither scan alone saw the
+    // whole surface). Like the load count, only a complete-scan replacement
+    // re-proves finished-ness, never a union.
+    let finished_before = existing.tables_scan_finished;
+    let tables_before = existing.tables.len();
+    let incoming_finished = incoming.tables_scan_finished;
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
@@ -9484,6 +9498,8 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             }
         });
     }
+    existing.tables_scan_finished =
+        finished_before && incoming_finished && existing.tables.len() == tables_before;
     for mut interface in incoming.interfaces.drain(..) {
         interface.table = interface
             .table

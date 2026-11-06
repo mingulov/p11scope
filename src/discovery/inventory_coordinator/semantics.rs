@@ -375,6 +375,24 @@ struct AcceptedRetainedInputs {
     scan_modules: Option<Vec<ReconciledModule>>,
 }
 
+/// Whether two views' table lists disagree for the sole-table gate: same
+/// count but different tables (file offset, version, entries or NULL holes).
+/// Runtime addresses differ across views by ASLR, walks differ by decode
+/// completeness (a partial walk must not poison a full one), and live,
+/// manifest, extension and unpinned marks are monotonic observations — none
+/// of those refute "exactly one table", so none participate here.
+fn scanned_tables_disagree(a: &[ScannedTable], b: &[ScannedTable]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    a.iter().zip(b.iter()).any(|(x, y)| {
+        x.file_offset != y.file_offset
+            || x.version != y.version
+            || x.entries != y.entries
+            || x.null_entries != y.null_entries
+    })
+}
+
 fn accept_retained_inputs(
     engine: &Engine,
     inputs: &RetainedInputs,
@@ -498,8 +516,48 @@ fn accept_retained_inputs(
                         slot.insert(module);
                     }
                     std::collections::btree_map::Entry::Occupied(mut slot) => {
-                        if !entry_complete(slot.get()) && entry_complete(&module) {
-                            slot.insert(module);
+                        let kept_tables = slot.get().scanned.tables.len();
+                        let incoming_tables = module.scanned.tables.len();
+                        if incoming_tables != kept_tables {
+                            // Views disagree on table count: keep the maximum
+                            // (fail closed for the sole-table gate, which
+                            // needs exactly one), and clear the finished
+                            // flag so the sole leg refuses even for 0-vs-1.
+                            if incoming_tables > kept_tables {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = false;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = false;
+                            }
+                        } else if scanned_tables_disagree(
+                            &slot.get().scanned.tables,
+                            &module.scanned.tables,
+                        ) {
+                            // Same count, different tables: keep the
+                            // complete entry as before, but clear finished
+                            // so the sole leg refuses the disagreement.
+                            if !entry_complete(slot.get()) && entry_complete(&module) {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = false;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = false;
+                            }
+                        } else {
+                            // Agreeing views: keep the complete entry as
+                            // before; finished when either view finished (a
+                            // finished view proves exactly-one, and agreeing
+                            // unfinished views do not refute it).
+                            let finished = slot.get().scanned.tables_scan_finished
+                                || module.scanned.tables_scan_finished;
+                            if !entry_complete(slot.get()) && entry_complete(&module) {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = finished;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = finished;
+                            }
                         }
                     }
                 }

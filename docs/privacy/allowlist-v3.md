@@ -80,8 +80,8 @@ Semantic authority comes from exactly one of three sources:
   runs started without a manifest (the explicit key-operations opt-in), and
   only for a scanned function table that meets every condition: its
   publication is proved by standard interface linkage (`C_GetInterfaceList` /
-  `C_GetInterface` naming the table), by a live function-list return, or by
-  manifest corroboration — export-name agreement alone never grants it; and
+  `C_GetInterface` naming the table) or by a live function-list return —
+  export-name agreement alone never grants it; and
   every required key lives in the provider's own object (a provider whose
   table entries point into another object, such as the p11-kit trust shim,
   is refused). A non-full walk or an unpinned affecting entry refuses the
@@ -90,27 +90,29 @@ Semantic authority comes from exactly one of three sources:
   no argument reads there; or
 - a scan-derived sole-complete-table claim, only in the same no-manifest
   `inventory --key-operations` opt-in, and only when every condition holds
-  together: (a) the provider object holds exactly one function-table
-  candidate (no rival, aliased or degraded second candidate, including no
-  exports-only second table, and no vendor or opaque interface claiming
-  this table's layout); (b) that table's published walk is full with a
+  together: (a) a finished tables scan proves the provider object holds
+  exactly one function-table candidate — no truncating skip, I/O ceiling,
+  budget or table-cap stop on that module, no rival, aliased or degraded
+  second candidate (including no exports-only second table), all views of
+  the object agreeing, and no vendor or opaque interface claiming this
+  table's layout; (b) that table's published walk is full with a
   version-consistent 2.x 68-slot layout (a 3.x label with a proven complete
   68-slot legacy prefix counts as full; any other walk, version or slot
   count refuses), with a complete export witness and no 3.x interface
   getter, and the table is file-backed with every retained entry agreeing
   with the object's exports; (c) every slot is either NULL (an
-  unimplemented function, which
-  gets no probe and no argument reads) or resolves to code inside the
-  provider's own executable mapping, with every 2.x key-operation entry
-  the decoder reads non-NULL and in own code (`C_CreateObject`,
-  `C_CopyObject`, `C_DestroyObject`, `C_GetObjectSize`,
-  `C_GetAttributeValue`, `C_SetAttributeValue`, `C_FindObjects`,
-  `C_EncryptInit`, `C_DecryptInit`, `C_DigestKey`, `C_SignInit`,
-  `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
+  unimplemented function, which gets no probe and no argument reads) or
+  resolves to code inside the provider's own executable mapping, with
+  every 2.x function with an object-capture descriptor (the 20 the decoder
+  reads: `C_CreateObject`, `C_CopyObject`, `C_DestroyObject`,
+  `C_GetObjectSize`, `C_GetAttributeValue`, `C_SetAttributeValue`,
+  `C_FindObjects`, `C_EncryptInit`, `C_DecryptInit`, `C_DigestKey`,
+  `C_SignInit`, `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
   `C_GenerateKey`, `C_GenerateKeyPair`, `C_WrapKey`, `C_UnwrapKey`,
-  `C_DeriveKey`, `C_SetOperationState`); (d) the object exports
-  `C_GetFunctionList`; (e) the provider file has a single load in the
-  process, not a proxy's multi-table closure array.
+  `C_DeriveKey`, `C_SetOperationState`) non-NULL and in own code; (d) the
+  object exports `C_GetFunctionList`; (e) the provider file has a single
+  load in the process, not a proxy's multi-table closure array. A rival,
+  aliased or degraded entry stays count-only at that entry, as above.
   Anything else stays refused as today.
 
 Every other scan result, including every ordinary (non-`--key-operations`)

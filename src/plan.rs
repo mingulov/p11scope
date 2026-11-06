@@ -4697,7 +4697,9 @@ const SOLE_COMPLETE_REQUIRED_2X: [&str; 20] = [
 /// Sole-complete-table scan authority (no-manifest key operations):
 /// a single static 2.x table with no rival proves the table a caller
 /// reaches without interface linkage or a live return. All five legs
-/// hold or nothing grants; anything else stays refused.
+/// hold or nothing grants; anything else stays refused. Leg (a) needs a
+/// finished tables scan: a truncated scan that found one table proves
+/// nothing about a second it never reached.
 fn sole_complete_table_authorized(
     module: &ReconciledModule,
     index: usize,
@@ -4705,6 +4707,9 @@ fn sole_complete_table_authorized(
 ) -> bool {
     let scanned = &module.scanned;
     if scanned.tables.len() != 1 || index != 0 {
+        return false;
+    }
+    if !scanned.tables_scan_finished {
         return false;
     }
     if scanned
@@ -4721,6 +4726,10 @@ fn sole_complete_table_authorized(
     if table.decoded_slot_count() != 68 {
         return false;
     }
+    // The 3.x leg is sound: `extension_impossible` proves the full declared
+    // extent was readable with the first structural failure in 68..92,
+    // refuting the 92/104-wide layouts, so the 68-slot legacy prefix is the
+    // complete reachable surface (see `proven_complete_legacy_prefix`).
     if !(table.version.0 == 2 || (table.version.0 == 3 && table.extension_impossible)) {
         return false;
     }
@@ -4820,10 +4829,12 @@ fn lower_scanned_with(module: &ReconciledModule, scan_authorized: bool) -> Disco
         // corroboration, or the sole-complete-table leg. Export-name
         // agreement alone proves names, not the table in use, so it
         // stays count-only here.
-        let sole = sole_complete_table_authorized(module, index, &exports);
         let scan_semantic = scan_authorized
             && authorized
-            && (score.linked || score.live_return || score.manifest || sole);
+            && (score.linked
+                || score.live_return
+                || score.manifest
+                || sole_complete_table_authorized(module, index, &exports));
         tables.push(TableSummary {
             version: table.version,
             entries: table.entries.len(),
@@ -7436,7 +7447,7 @@ mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
-                tables_scan_finished: false,
+                tables_scan_finished: true,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {

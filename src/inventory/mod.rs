@@ -12048,7 +12048,8 @@ mod tests {
         let text = render_text(&coordinator, "pid:7", 90, 130, 2);
         assert!(text.contains("/lib/a.so"), "both modules render:\n{text}");
         assert!(text.contains("/lib/b.so"), "both modules render:\n{text}");
-        let line = "unattributed use: at least 900 entries in 3 witness rows never bound to a caller";
+        let line =
+            "unattributed use: at least 900 entries in 3 witness rows never bound to a caller";
         assert!(text.contains(line), "summary states the totals:\n{text}");
         let lines: Vec<_> = text.lines().collect();
         let coverage = lines

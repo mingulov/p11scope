@@ -1799,45 +1799,60 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     ellipsize_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS)
 }
 
+/// Gaps that count toward PARTIAL: every retained row except deleted
+/// mappings, which read as a notes line instead (inspect treats them
+/// the same way).
+fn loss_gap_count(gaps: &[GapView]) -> usize {
+    gaps.iter()
+        .filter(|gap| gap.reason != "deleted mapping")
+        .count()
+}
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
 /// line per plain subject/reason group, every group listed, most
 /// frequent first. Plain words only (reusing `gap_plain_*`); per-gap
-/// `gap [` lines stay verbose-only. Counts distinct gap rows like the
-/// coverage line, not `repeats` (JSON carries `repeats`). Empty when no
-/// gaps are retained; suppressed-but-unretained gaps stay in the
-/// coverage line.
+/// `gap [` lines stay verbose-only. Counts distinct loss rows like the
+/// coverage line, not `repeats` (JSON carries `repeats`); deleted
+/// mappings read on the notes line instead. Empty when no loss gaps
+/// are retained; suppressed-but-unretained gaps stay in the coverage
+/// line.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
-    if gaps.is_empty() {
-        return Vec::new();
-    }
-    // Deleted mappings are unloaded libraries, not loss: fold them to one
-    // plain trailing group instead of leading per-path groups.
-    let (deleted, rest): (Vec<_>, Vec<_>) =
-        gaps.iter().partition(|gap| gap.reason == "deleted mapping");
     let mut groups: std::collections::BTreeMap<(String, String), usize> =
         std::collections::BTreeMap::new();
-    for gap in rest {
+    for gap in gaps.iter().filter(|gap| gap.reason != "deleted mapping") {
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
         *groups.entry((subject, reason)).or_insert(0) += 1;
     }
+    if groups.is_empty() {
+        return Vec::new();
+    }
     let mut ranked: Vec<((String, String), usize)> = groups.into_iter().collect();
     ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
-    let mut lines = vec![format!("gaps: {}", gaps.len())];
+    let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
     for ((subject, reason), count) in &ranked {
         lines.push(gap_group_line(*count, subject, reason));
     }
-    if !deleted.is_empty() {
-        lines.push(gap_group_line(
-            deleted.len(),
-            &format!(
-                "unloaded librar{}",
-                if deleted.len() == 1 { "y" } else { "ies" },
-            ),
-            "mapped files were deleted (not loss)",
-        ));
-    }
     lines
+}
+
+/// Deleted mappings are unloaded libraries, not loss: one plain
+/// notes line disclosing them, beside the gaps block. `None` when no
+/// deleted mapping is retained.
+fn concise_deleted_notes_line(gaps: &[GapView]) -> Option<String> {
+    let deleted = gaps
+        .iter()
+        .filter(|gap| gap.reason == "deleted mapping")
+        .count();
+    if deleted == 0 {
+        return None;
+    }
+    if deleted == 1 {
+        return Some("notes: 1 unloaded library — mapped file was deleted (not loss)".to_string());
+    }
+    Some(format!(
+        "notes: {deleted} unloaded libraries — mapped files were deleted (not loss)"
+    ))
 }
 
 /// The concise limits line (INV-1): the headline budgets in words.
@@ -2145,13 +2160,13 @@ fn render_snapshot_inner(
     );
     // One coverage format everywhere (profile, inspect, inventory):
     // `coverage: complete`, or `coverage: partial` with the nonzero
-    // segments — gaps, refusals, suppressed-but-unretained. Zero
-    // counts stay out; the gaps block below names the reasons.
-    if presentation.gaps.is_empty() && budgets.refusals() == 0 && presentation.gaps_suppressed == 0
-    {
+    // segments — loss gaps, refusals, suppressed-but-unretained.
+    // Zero counts stay out; deleted mappings read as notes, never
+    // forcing PARTIAL; the gaps block below names the reasons.
+    let gaps = loss_gap_count(&presentation.gaps);
+    if gaps == 0 && budgets.refusals() == 0 && presentation.gaps_suppressed == 0 {
         let _ = writeln!(out, "coverage: complete");
     } else {
-        let gaps = presentation.gaps.len();
         let mut segments = Vec::new();
         if gaps > 0 {
             segments.push(format!("{gaps} gap{}", if gaps == 1 { "" } else { "s" }));
@@ -2401,6 +2416,9 @@ fn render_snapshot_inner(
     if verbosity == crate::cli::TextVerbosity::Concise {
         render_limits_line(&mut out, budgets);
         for line in concise_gap_summary_block(&presentation.gaps) {
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(line) = concise_deleted_notes_line(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);

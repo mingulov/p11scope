@@ -3035,14 +3035,19 @@ fn concise_limits_line_counts_edges_not_links() {
     assert!(!limits.contains("link"), "{limits}");
 }
 
-/// Item 37: deleted-mapping gaps fold to one plain trailing line in
-/// concise text, never leading the gaps; verbose keeps each record.
+/// Item 37: deleted mappings read as a notes line, not gaps —
+/// never in the gaps block, never forcing PARTIAL; verbose keeps
+/// each record.
 #[test]
-fn concise_deleted_gaps_fold_last_in_plain_words() {
+fn concise_deleted_mappings_read_as_notes_not_gaps() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();
     presentation.gaps_suppressed = 0;
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
     presentation.gaps.push(GapView {
         caller: None,
         module: None,
@@ -3071,25 +3076,64 @@ fn concise_deleted_gaps_fold_last_in_plain_words() {
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines().any(|line| line == "coverage: partial — 1 gap"),
+        "deleted mappings count as notes, not gaps: {out}"
+    );
     let lines: Vec<&str> = out.lines().collect();
     let start = lines
         .iter()
-        .position(|line| *line == "gaps: 3")
+        .position(|line| *line == "gaps: 1")
         .expect("gaps header");
-    let block = &lines[start..start + 3];
     assert_eq!(
-        block,
-        &[
-            "gaps: 3",
-            "  1 × fixture scope — fixture reason",
-            "  2 × unloaded libraries — mapped files were deleted (not loss)",
-        ],
-        "deleted mappings fold to one plain trailing group: {out}"
+        &lines[start..start + 2],
+        &["gaps: 1", "  1 × fixture scope — fixture reason",],
+        "the gaps block holds the fixture gap only: {out}"
     );
     assert!(
-        !block.iter().any(|line| line.contains("libpcre2")),
-        "no per-path groups: {block:?}"
+        out.lines().any(
+            |line| line == "notes: 2 unloaded libraries — mapped files were deleted (not loss)"
+        ),
+        "the notes line discloses the deleted mappings: {out}"
     );
+    assert!(!out.contains("libpcre2"), "no per-path groups: {out}");
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(verbose.contains("libpcre2-8.so (deleted)"), "{verbose}");
+}
+
+/// Item 37: deleted mappings alone keep coverage complete — the
+/// notes line discloses them and no gaps block prints.
+#[test]
+fn deleted_only_gaps_keep_coverage_complete_with_notes() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.budgets.callers_refused = 0;
+    presentation.budgets.modules_refused = 0;
+    presentation.budgets.edges_refused = 0;
+    presentation.budgets.endpoints_refused = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: Some(11),
+        subject: "/usr/lib/libpcre2-8.so (deleted)".into(),
+        reason: "deleted mapping".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.lines().any(|line| line == "coverage: complete"),
+        "deleted mappings alone keep coverage complete: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("gaps:")),
+        "no gaps block for notes alone: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line == "notes: 1 unloaded library — mapped file was deleted (not loss)"),
+        "the notes line discloses the deleted mapping: {out}"
+    );
 }

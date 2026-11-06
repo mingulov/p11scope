@@ -585,17 +585,23 @@ fn main() {
                     std::process::exit(2);
                 }
             },
-            "--isolation" => match args.next() {
-                Some(v) if v == "trusted" || v == "isolated" => isolation = Some(v),
-                Some(_) => {
-                    eprintln!("--isolation must be trusted or isolated\n{USAGE}");
+            "--isolation" => {
+                if isolation.is_some() {
+                    eprintln!("--isolation may be given only once\n{USAGE}");
                     std::process::exit(2);
                 }
-                None => {
-                    eprintln!("--isolation requires a value\n{USAGE}");
-                    std::process::exit(2);
+                match args.next() {
+                    Some(v) if v == "trusted" || v == "isolated" => isolation = Some(v),
+                    Some(_) => {
+                        eprintln!("--isolation must be trusted or isolated\n{USAGE}");
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("--isolation requires a value\n{USAGE}");
+                        std::process::exit(2);
+                    }
                 }
-            },
+            }
             "--help" | "-h" => {
                 println!("{USAGE}");
                 std::process::exit(0);

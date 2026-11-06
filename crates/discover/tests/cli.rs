@@ -393,6 +393,44 @@ fn build_isolation_needy(dir: &Path) -> std::path::PathBuf {
     provider
 }
 
+fn build_isolation_select_needy(dir: &Path) -> std::path::PathBuf {
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixture");
+    let provider = dir.join("isolation-select-needy.so");
+    assert!(
+        Command::new("gcc")
+            .arg(format!("-m{}", usize::BITS))
+            .args(["-shared", "-fPIC", "-o"])
+            .arg(&provider)
+            .arg(source.join("isolation_select_needy.c"))
+            .status()
+            .unwrap()
+            .success()
+    );
+    provider
+}
+
+/// A repeated `--isolation` refuses instead of silently taking the last.
+#[test]
+fn isolation_repeated_flag_is_usage_error() {
+    let out = Command::new(BIN)
+        .args([
+            "--isolation",
+            "trusted",
+            "--isolation",
+            "isolated",
+            "--module",
+            "/dev/null",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(2), "{out:?}");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("--isolation may be given only once"),
+        "{stderr}"
+    );
+}
+
 /// R1: only the two named profiles exist.
 #[test]
 fn isolation_unknown_profile_is_usage_error() {
@@ -549,6 +587,71 @@ fn isolation_socket_needy_getter_is_recorded_not_hidden() {
         stderr.contains("isolated profile: C_GetFunctionList failed"),
         "{stderr}"
     );
+}
+
+/// R8 for `C_GetInterface`: a getter that needs a denied socket records
+/// each selection failure per query (the rv, no result) under the fence
+/// and full results when trusted. Exit 0 in both: recorded in the
+/// manifest, never hidden and never a crash.
+#[test]
+fn isolation_select_needy_getter_is_recorded_per_query() {
+    use p11scope_discover::manifest::SelectionAcquisition;
+    let dir = scratch("isolation-select-needy");
+    let provider = build_isolation_select_needy(&dir);
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let tm: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&trusted.stdout).unwrap();
+    assert!(matches!(
+        tm.selection_evidence.acquisition,
+        SelectionAcquisition::Queried
+    ));
+    assert!(
+        !tm.selection_evidence.queries.is_empty(),
+        "trusted must run selection queries"
+    );
+    for query in &tm.selection_evidence.queries {
+        assert_eq!(query.rv, 0, "trusted query {} must succeed", query.selector);
+        assert!(
+            query.result.is_some(),
+            "trusted query {} must record its result",
+            query.selector
+        );
+    }
+
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let m: p11scope_discover::manifest::Manifest =
+        serde_json::from_slice(&isolated.stdout).unwrap();
+    assert!(matches!(
+        m.selection_evidence.acquisition,
+        SelectionAcquisition::Queried
+    ));
+    assert_eq!(
+        m.selection_evidence.queries.len(),
+        tm.selection_evidence.queries.len(),
+        "the fence must not drop queries"
+    );
+    for query in &m.selection_evidence.queries {
+        assert_eq!(
+            query.rv, 0x30,
+            "isolated query {} must record the device error",
+            query.selector
+        );
+        assert!(
+            query.result.is_none(),
+            "isolated query {} must record no result",
+            query.selector
+        );
+    }
 }
 
 /// The `-o` parent directory stays writable under the fence (private

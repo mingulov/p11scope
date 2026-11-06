@@ -79,14 +79,11 @@ const HANDLED_NET: u64 = NET_BIND_TCP | NET_CONNECT_TCP;
 /// helper's own `/proc/self/maps` and object-identity reads keep working.
 const ALLOW_TREE_READ_EXEC: u64 = FS_READ_FILE | FS_READ_DIR | FS_EXECUTE;
 /// Granted on the `-o` parent directory: create, fsync, rename over a
-/// regular file, unlink on failure. Nothing else is writable.
-const ALLOW_OUTPUT_DIR: u64 = FS_READ_FILE
-    | FS_WRITE_FILE
-    | FS_READ_DIR
-    | FS_REMOVE_FILE
-    | FS_MAKE_REG
-    | FS_REFER
-    | FS_TRUNCATE;
+/// regular file, unlink on failure. Nothing else is writable, and no
+/// refer/truncate: the writer creates with `O_EXCL`, never truncates or
+/// links, and renames within the directory.
+const ALLOW_OUTPUT_DIR: u64 =
+    FS_READ_FILE | FS_WRITE_FILE | FS_READ_DIR | FS_REMOVE_FILE | FS_MAKE_REG;
 
 #[repr(C)]
 struct RulesetAttr {
@@ -98,7 +95,8 @@ struct RulesetAttr {
 struct PathBeneathAttr {
     allowed_access: u64,
     parent_fd: i32,
-    // Explicit padding: the kernel reads 16 bytes.
+    // Explicit padding. The kernel's own struct is these leading 12
+    // bytes (`allowed_access` + `parent_fd`); the tail is ignored.
     _padding: u32,
 }
 
@@ -153,6 +151,7 @@ const SYS_INIT_MODULE: u32 = 175;
 const SYS_FINIT_MODULE: u32 = 313;
 const SYS_DELETE_MODULE: u32 = 176;
 const SYS_KEXEC_LOAD: u32 = 246;
+const SYS_KEXEC_FILE_LOAD: u32 = 320;
 const SYS_REBOOT: u32 = 169;
 const SYS_IOPL: u32 = 172;
 const SYS_IOPERM: u32 = 173;
@@ -222,6 +221,7 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_FINIT_MODULE,
     SYS_DELETE_MODULE,
     SYS_KEXEC_LOAD,
+    SYS_KEXEC_FILE_LOAD,
     SYS_REBOOT,
     SYS_IOPL,
     SYS_IOPERM,
@@ -992,6 +992,11 @@ mod tests {
             (SYS_FINIT_MODULE, libc::SYS_finit_module, "finit_module"),
             (SYS_DELETE_MODULE, libc::SYS_delete_module, "delete_module"),
             (SYS_KEXEC_LOAD, libc::SYS_kexec_load, "kexec_load"),
+            (
+                SYS_KEXEC_FILE_LOAD,
+                libc::SYS_kexec_file_load,
+                "kexec_file_load",
+            ),
             (SYS_REBOOT, libc::SYS_reboot, "reboot"),
             (SYS_IOPL, libc::SYS_iopl, "iopl"),
             (SYS_IOPERM, libc::SYS_ioperm, "ioperm"),

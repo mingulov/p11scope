@@ -1867,9 +1867,7 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     if rest == 1 {
         lines.push("  and 1 more group (--json has every item)".to_string());
     } else if rest > 1 {
-        lines.push(format!(
-            "  and {rest} more groups (--json has every item)"
-        ));
+        lines.push(format!("  and {rest} more groups (--json has every item)"));
     }
     lines
 }

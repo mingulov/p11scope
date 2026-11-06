@@ -1823,8 +1823,7 @@ fn gaps_block_folds_beyond_twenty_groups() {
     );
     assert_eq!(one_over[0], "gaps: 21");
     assert_eq!(
-        one_over[21],
-        "  and 1 more group (--json has every item)",
+        one_over[21], "  and 1 more group (--json has every item)",
         "the fold line names the remainder: {one_over:?}"
     );
     let many = block_for(25);
@@ -1837,8 +1836,7 @@ fn gaps_block_folds_beyond_twenty_groups() {
     assert_eq!(many[1], "  1 × scope-00 — reason-x");
     assert_eq!(many[20], "  1 × scope-19 — reason-x");
     assert_eq!(
-        many[21],
-        "  and 5 more groups (--json has every item)",
+        many[21], "  and 5 more groups (--json has every item)",
         "the fold line names the remainder: {many:?}"
     );
     for line in &many {

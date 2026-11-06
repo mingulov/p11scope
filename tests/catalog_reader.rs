@@ -537,6 +537,27 @@ fn validate_closure_admission(
     {
         return Ok(());
     }
+    // An over-bound closure stays published-only in every mode: its
+    // union exceeds the 104-target whole bound, so it attaches only
+    // its published tables, and none is published yet. JSON carries
+    // the full reason; text renders the terse by-design form that
+    // points at --json. The retired capacity-shaped whole refusal
+    // below stays accepted for reads of older captures.
+    let published_full = reason.contains("attaches only its published tables")
+        && fixture.lookalikes.is_some_and(|tables| {
+            reason.contains(&format!(
+                "none of its {tables} lookalike function tables is published yet"
+            ))
+        });
+    let published_terse = reason.contains("proxy closure array not attached by design")
+        && reason.contains("the providers it forwards to attach when they load");
+    if admission.state == "refused"
+        && admission.class == "closure_array"
+        && admission.endpoints.is_none()
+        && (published_full || published_terse)
+    {
+        return Ok(());
+    }
     match validate_whole_admission(admission, fixture, wide, strict) {
         Ok(()) => Ok(()),
         Err(error) if !strict => {
@@ -1000,8 +1021,8 @@ fn catalog_reader_finds_every_fixture_object() {
     .unwrap();
 
     // C: 65 bare heuristic tables, no triples, 532 distinct endpoints.
-    // Closure classification survives the wider budget: default refuses
-    // whole; wide admits whole when cumulative shared capacity permits.
+    // The 532-target union exceeds the 104-target whole bound, so the
+    // layer stays published-only with none of its 65 tables published.
     let c = object_for(doc, &run.pids, "closure.so");
     let c_tables = tables_of(c);
     assert_eq!(c_tables.len(), 65);

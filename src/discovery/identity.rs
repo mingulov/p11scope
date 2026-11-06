@@ -509,7 +509,11 @@ pub(crate) fn inodes_name_one_file(f_type: u64, super_options: Option<&str>) -> 
     // Tmpfs with 64-bit inode numbers is unique; with `inode32` the
     // 32-bit counter wraps and two live files can share a number. An
     // unreadable mount table fails closed. The option is matched as a
-    // whole comma-separated token, never a substring.
+    // whole comma-separated token, never a substring. A tmpfs line
+    // showing neither token (a kernel built without the inode64
+    // option) counts as unique: refusing it would drop every tmpfs
+    // object on such kernels, while the collision it risks needs
+    // billions of allocations plus an exact pin match.
     super_options.is_some_and(|options| !options.split(',').any(|token| token == "inode32"))
 }
 

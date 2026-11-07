@@ -8212,13 +8212,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             UnboundReason::NoLiveCaller | UnboundReason::CallerExited
         );
         for caller in callers {
-            // A live-miss row after this holder's admission is a
-            // post-admission exit, never a use before admission.
+            // A live-miss row inside this holder's lifetime is a
+            // post-admission exit, never a use before admission: the
+            // admission is at or before the row, and a retired holder's
+            // observed exit is strictly after it.
             let post_admission_exit = exit_unbound
-                && self
-                    .adapter
-                    .record(caller)
-                    .is_some_and(|record| record.first_seen_ns <= row_ns);
+                && self.adapter.record(caller).is_some_and(|record| {
+                    record.first_seen_ns <= row_ns
+                        && (!record.retired || row_ns < record.last_seen_ns)
+                });
             for module in &fresh {
                 if post_admission_exit {
                     self.registry

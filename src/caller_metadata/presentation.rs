@@ -310,13 +310,18 @@ fn hint_source_label(source: HintSource) -> &'static str {
 /// Short container/pod scope label for inventory text lines.
 ///
 /// Concise callers show a 12-hex container prefix (8-hex pod prefix);
-/// verbose callers show the full canonical IDs. A lone container keeps
-/// its runtime in parentheses; a pod pair reads `pod <uid> / container
-/// <id>` with no runtime suffix. A sample with no hints — a host
-/// cgroup, an unrecognized runtime, a pending or an unavailable sample —
-/// yields `None`: host callers carry no scope suffix, and unavailable
-/// samples are already named by the gap line. Stale and historical rows
-/// keep their preserved hints, like the detail view.
+/// verbose callers show the full canonical IDs. Every label carries the
+/// `cgroup hint` marker: these are lexical cgroup-path shapes anyone who
+/// can create cgroups can produce, never proof of orchestrator
+/// ownership. A lone container keeps its runtime first in parentheses; a
+/// pod pair reads `pod <uid> / container <id>` with no runtime suffix.
+/// Non-sampled rows append their freshness (`stale` for an aged sample,
+/// `exited` for a retired caller, `pending`/`unknown` defensively), so a
+/// preserved hint never prints as a current observation. A sample with
+/// no hints — a host cgroup, an unrecognized runtime, a pending or an
+/// unavailable sample — yields `None`: host callers carry no scope
+/// suffix, and unavailable samples are counted in the caller-context
+/// summary line, never silent.
 pub(crate) fn concise_scope_label(metadata: &CallerMetadata, verbose: bool) -> Option<String> {
     let pod = metadata.pod.uid.map(|uid| {
         let full = uid.as_str();
@@ -334,15 +339,28 @@ pub(crate) fn concise_scope_label(metadata: &CallerMetadata, verbose: bool) -> O
             full[..12].to_string()
         }
     });
+    let freshness = match metadata.status {
+        MetadataStatus::Sampled => None,
+        MetadataStatus::Stale => Some("stale"),
+        MetadataStatus::Historical => Some("exited"),
+        MetadataStatus::Pending => Some("pending"),
+        MetadataStatus::Unknown => Some("unknown"),
+    };
+    let qualifier = match freshness {
+        None => "cgroup hint".to_string(),
+        Some(mark) => format!("cgroup hint, {mark}"),
+    };
     match (pod, shown_container) {
-        (Some(pod), Some(container)) => Some(format!("pod {pod} / container {container}")),
-        (Some(pod), None) => Some(format!("pod {pod}")),
+        (Some(pod), Some(container)) => {
+            Some(format!("pod {pod} / container {container} ({qualifier})"))
+        }
+        (Some(pod), None) => Some(format!("pod {pod} ({qualifier})")),
         (None, Some(container)) => match metadata.container.runtime {
             Some(runtime) => Some(format!(
-                "container {container} ({})",
+                "container {container} ({}, {qualifier})",
                 runtime_label(runtime)
             )),
-            None => Some(format!("container {container}")),
+            None => Some(format!("container {container} ({qualifier})")),
         },
         (None, None) => None,
     }

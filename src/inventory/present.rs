@@ -2314,20 +2314,37 @@ fn concise_caller_scope_line(
     ))
 }
 
+/// Concise per-caller scope lines shown before the overflow summary.
+const CONCISE_SCOPE_LINES_SHOWN: usize = 8;
+
 /// Concise per-caller scope lines, in caller order, only when the
-/// `--caller-metadata cgroup` opt-in frame is on. Callers without an
-/// edge print nothing; the view degrades to the provider lines alone.
+/// `--caller-metadata cgroup` opt-in frame is on. Totals are logical:
+/// forwarding-layer observations stay in the forwarding split above and
+/// never inflate the caller's own count. At most eight lines print, then
+/// an overflow line; a caller-context count line (nonzero parts only)
+/// names labeled, unknown and pending callers with edges, so missing
+/// observations never vanish silently. Callers without an edge print
+/// nothing; the view degrades to the provider lines alone.
 fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentation) {
     use std::collections::BTreeMap;
     use std::fmt::Write as _;
     if !presentation.caller_metadata.summary.enabled {
         return;
     }
+    let closure = closure_module_ids(presentation);
+    let active = provider_active_callers(presentation, &closure);
+    let refused = refused_backend_callers(presentation, &closure);
     let mut totals: BTreeMap<CallerId, u64> = BTreeMap::new();
     for edge in &presentation.edges {
         let total = totals.entry(edge.caller).or_default();
-        *total = total.saturating_add(edge.entry_count);
+        if !edge_is_forwarding(edge, &closure, &active, &refused) {
+            *total = total.saturating_add(edge.entry_count);
+        }
     }
+    let mut labeled = 0usize;
+    let mut unknown = 0usize;
+    let mut pending = 0usize;
+    let mut lines: Vec<String> = Vec::new();
     for caller in &presentation.callers {
         let Some(total) = totals.get(&caller.id) else {
             continue;
@@ -2339,8 +2356,41 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
             *total,
             metadata,
         ) {
-            let _ = writeln!(out, "{line}");
+            labeled += 1;
+            lines.push(line);
+        } else if let Some(metadata) = metadata {
+            match metadata.status {
+                crate::caller_metadata::presentation::MetadataStatus::Pending => pending += 1,
+                crate::caller_metadata::presentation::MetadataStatus::Sampled => {}
+                crate::caller_metadata::presentation::MetadataStatus::Unknown
+                | crate::caller_metadata::presentation::MetadataStatus::Stale
+                | crate::caller_metadata::presentation::MetadataStatus::Historical => unknown += 1,
+            }
+        } else {
+            unknown += 1;
         }
+    }
+    let shown = lines.len().min(CONCISE_SCOPE_LINES_SHOWN);
+    for line in lines.iter().take(shown) {
+        let _ = writeln!(out, "{line}");
+    }
+    let more = lines.len().saturating_sub(shown);
+    if more > 0 {
+        let noun = if more == 1 { "caller" } else { "callers" };
+        let _ = writeln!(out, "and {more} more labeled {noun} (-v or --json)");
+    }
+    if labeled + unknown + pending > 0 {
+        let mut parts: Vec<String> = Vec::new();
+        if labeled > 0 {
+            parts.push(format!("{labeled} labeled"));
+        }
+        if unknown > 0 {
+            parts.push(format!("{unknown} unknown"));
+        }
+        if pending > 0 {
+            parts.push(format!("{pending} pending"));
+        }
+        let _ = writeln!(out, "caller context: {} (-v for details)", parts.join(", "));
     }
 }
 

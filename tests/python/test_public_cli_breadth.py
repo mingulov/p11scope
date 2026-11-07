@@ -8,6 +8,7 @@ system-scope-measure.py.
 """
 
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -439,6 +440,36 @@ U C_GetFunctionList(void**out){*out=&list;return 0;}
 '''
 
 
+PROVIDER_CONFLOG = r'''
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+typedef unsigned long U;
+U C_Initialize(void *a){(void)a;
+ const char *f=getenv("P11SCOPE_CONFLOG");
+ if(f){FILE *h=fopen(f,"a");if(h){const char *c=getenv("SOFTHSM2_CONF");
+  fprintf(h,"%d %s\n",(int)getpid(),c?c:"(unset)");fclose(h);}}
+ return 0;}
+U C_Finalize(void *a){(void)a;return 0;}
+U C_GetSlotList(unsigned char t,U *s,U *n){(void)t;s[0]=1;*n=1;return 0;}
+U C_OpenSession(U a,U b,void *c,void*d,U*s){(void)a;(void)b;(void)c;(void)d;*s=1;return 0;}
+U C_CloseSession(U s){(void)s;return 0;}
+U C_Login(U s,U u,unsigned char*p,U n){(void)s;(void)u;(void)p;(void)n;return 0;}
+U C_Logout(U s){(void)s;return 0;}
+U C_GenerateRandom(U s,unsigned char*b,U n){(void)s;(void)b;(void)n;return 0;}
+U C_DigestInit(U s,void*m){(void)s;(void)m;return 0;}
+U C_Digest(U s,unsigned char*b,U n,unsigned char*o,U*l){(void)s;(void)b;(void)n;(void)o;*l=32;return 0;}
+U C_FindObjectsInit(U s,void*t,U n){(void)s;(void)t;(void)n;return 0;}
+U C_FindObjects(U s,U*o,U n,U*c){(void)s;(void)o;(void)n;*c=0;return 0;}
+U C_FindObjectsFinal(U s){(void)s;return 0;}
+struct { unsigned char version[8]; void *p[68]; } list={.version={2,40},.p={
+ [0]=C_Initialize,[1]=C_Finalize,[4]=C_GetSlotList,[12]=C_OpenSession,
+ [13]=C_CloseSession,[18]=C_Login,[19]=C_Logout,[26]=C_FindObjectsInit,
+ [27]=C_FindObjects,[28]=C_FindObjectsFinal,[37]=C_DigestInit,[38]=C_Digest,[64]=C_GenerateRandom}};
+U C_GetFunctionList(void**out){*out=&list;return 0;}
+'''
+
+
 class ForkFixtureTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -478,6 +509,69 @@ class ForkFixtureTests(unittest.TestCase):
         for row in ledgers[0]["functions"]:
             self.assertEqual(row["attempts"], 6)
             self.assertEqual(row["successful"], 6)
+
+    def test_fork_child_uses_own_token_conf(self):
+        # Concurrent C_OpenSession/C_Login on one shared SoftHSM token
+        # fails intermittently under the cgroup thundering herd, which
+        # exits the workload nonzero and preempts the cell oracle. The
+        # fork child therefore switches to its own pre-inited token conf
+        # (the harness passes one per workload); the parent keeps the
+        # inherited conf. Unset child conf keeps the old shared behavior.
+        source = self.tmp / "provider-conflog.c"
+        source.write_text(PROVIDER_CONFLOG)
+        module = self.tmp / "provider-conflog.so"
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O0", "-o", str(module), str(source)],
+                       check=True)
+        gate = self.tmp / "gate-child-conf"
+        gate.touch()
+        conflog = self.tmp / "conflog"
+        env = dict(os.environ, SOFTHSM2_CONF="conf-parent",
+                   P11SCOPE_CGROUP_FORK_CHILD_CONF="conf-child",
+                   P11SCOPE_CONFLOG=str(conflog))
+        proc = subprocess.Popen([str(self.tmp / "cgroup-fork"), str(module), "3", "0", str(gate)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        try:
+            stdout, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            stdout, _ = proc.communicate(timeout=5)
+        parent = [line for line in stdout.splitlines() if line.startswith("READY pid=")][0]
+        child = [line for line in stdout.splitlines() if line.startswith("CHILD pid=")][0]
+        seen = {}
+        for line in conflog.read_text().splitlines():
+            pid, _, conf = line.partition(" ")
+            seen[pid] = conf
+        self.assertEqual(seen[parent.split("=")[1]], "conf-parent")
+        self.assertEqual(seen[child.split("=")[1]], "conf-child")
+
+    def test_fork_child_inherits_conf_when_unset(self):
+        source = self.tmp / "provider-conflog.c"
+        if not source.exists():
+            source.write_text(PROVIDER_CONFLOG)
+            subprocess.run(["gcc", "-shared", "-fPIC", "-O0", "-o",
+                            str(self.tmp / "provider-conflog.so"), str(source)], check=True)
+        module = self.tmp / "provider-conflog.so"
+        gate = self.tmp / "gate-inherit-conf"
+        gate.touch()
+        conflog = self.tmp / "conflog-inherit"
+        env = dict(os.environ, SOFTHSM2_CONF="conf-shared",
+                   P11SCOPE_CONFLOG=str(conflog))
+        env.pop("P11SCOPE_CGROUP_FORK_CHILD_CONF", None)
+        proc = subprocess.Popen([str(self.tmp / "cgroup-fork"), str(module), "3", "0", str(gate)],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        try:
+            stdout, _ = proc.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            proc.terminate()
+            stdout, _ = proc.communicate(timeout=5)
+        child = [line for line in stdout.splitlines() if line.startswith("CHILD pid=")][0]
+        seen = {}
+        for line in conflog.read_text().splitlines():
+            pid, _, conf = line.partition(" ")
+            seen[pid] = conf
+        self.assertEqual(seen[child.split("=")[1]], "conf-shared")
 
 
 PROVIDER32 = r'''

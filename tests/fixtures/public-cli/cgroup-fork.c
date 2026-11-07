@@ -82,6 +82,11 @@ int main(int argc, char **argv) {
   pid_t child = fork();
   if (child < 0) return 1;
   if (child == 0) {
+    /* Own token: concurrent C_OpenSession/C_Login on one shared SoftHSM
+     * token fails intermittently under the cgroup thundering herd. The
+     * harness pre-inits one token per workload; unset keeps sharing. */
+    const char *child_conf = getenv("P11SCOPE_CGROUP_FORK_CHILD_CONF");
+    if (child_conf && *child_conf) setenv("SOFTHSM2_CONF", child_conf, 1);
     close(pipefd[0]);
     unsigned long successful[6] = {0}; unsigned long done = 0;
     int rc = run_loop(n, us, successful, &done);

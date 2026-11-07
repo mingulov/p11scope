@@ -192,9 +192,14 @@ REASON_TRACE_CGROUP="cgroup trace lossy observation; product fix lane for cgroup
 REASON_INVENTORY_7X="inventory cgroup owned-module gaps on 7.x (native endpoint attach failed, 68 deferred); product fix lane for inventory 7.x"
 REASON_INVENTORY_OVERLAY="inventory cgroup overlay unproven (K1 collection witness unavailable, owned file unproven with 0 modules); product fix lane for inventory overlay witness"
 REASON_IA32="ia32 prereq missing (libsofthsm2:i386 cannot coexist with amd64); ia32-only job"
+asuser_conf() {
+  local conf=$1; shift
+  if [ "$CONTROL" = 1 ]; then SOFTHSM2_CONF="$conf" exec "$@"; fi
+  exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$conf" P11SCOPE_CGROUP_FORK_CHILD_CONF="${P11SCOPE_CGROUP_FORK_CHILD_CONF:-}" "$@"
+}
 asuser() {
   if [ "$CONTROL" = 1 ]; then exec "$@"; fi
-  exec setpriv --reuid="$RUNUID" --regid="$RUNGID" --clear-groups env SOFTHSM2_CONF="$SOFTHSM2_CONF" "$@"
+  asuser_conf "$SOFTHSM2_CONF" "$@"
 }
 pin() {
   python3 -I "$HERE/mapped-provider-pin.py" "$MODULE"
@@ -450,8 +455,20 @@ cgroup_capture() {
   fi
   mkdir -p "$CG" || { result "$cell" 0 "cgroup mkdir failed $CG" failed; return 1; }
   CGROUPS+=("$CG")
-  asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
-  asuser "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
+  # One token per workload: concurrent C_OpenSession/C_Login on a shared
+  # SoftHSM token fails intermittently under the cgroup thundering herd.
+  # The inside parent keeps the campaign token; the fork child and the
+  # outside workload get their own pre-inited tokens.
+  local tokdir=$OUT/$cell-tokens
+  mkdir -p "$tokdir/child/tokens" "$tokdir/outside/tokens" || { result "$cell" 0 'cgroup token dir failed' failed; return 1; }
+  printf 'directories.tokendir = %s/child/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$tokdir" > "$tokdir/child/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
+  printf 'directories.tokendir = %s/outside/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$tokdir" > "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
+  SOFTHSM2_CONF=$tokdir/child/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
+  SOFTHSM2_CONF=$tokdir/outside/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
+  chown -R "$RUNUID:$RUNGID" "$tokdir/child/tokens" "$tokdir/outside/tokens" 2>/dev/null || true
+  chmod 644 "$tokdir/child/softhsm2.conf" "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
+  P11SCOPE_CGROUP_FORK_CHILD_CONF=$tokdir/child/softhsm2.conf asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
+  asuser_conf "$tokdir/outside/softhsm2.conf" "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true
   local inside_ready=0 outside_ready=0 in_cgroup=0
   if waitfor "$cell-inside.wl" "^READY pid=$inside$" "$inside" "$READY_TICKS"; then
     inside_ready=1; readygen=$(generation "$inside")

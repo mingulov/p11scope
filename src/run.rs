@@ -9472,6 +9472,21 @@ impl SchedulingAccumulator {
         self.loop_end_mono_ns = at_mono_ns;
         self.loop_end_reason = reason;
         self.loop_ended = true;
+        // TEMP F9 DIAGNOSTIC (revert before freeze): whole-run drain summary.
+        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() {
+            eprintln!(
+                "drain-summary drain_ms={} discovery_ms={} maps_ms={} render_ms={} repolls={} exhausted={} max_gap_ms={} gap_p50={} gap_p99={}",
+                self.phase_drain_ms,
+                self.phase_discovery_ms,
+                self.phase_maps_ms,
+                self.phase_render_ms,
+                self.drain_repolls,
+                self.drain_budget_exhaustions,
+                self.max_inter_drain_gap_ms,
+                self.gaps.p50_ms(),
+                self.gaps.p99_ms(),
+            );
+        }
     }
 
     /// Records the terminal-snapshot loss readings as the post-loop-end

@@ -315,6 +315,9 @@ pub struct InventoryArgs {
     /// `--event-max-files`: live file plus retained rotations;
     /// None ⇒ 5 default.
     pub event_max_files: Option<usize>,
+    /// `--event-interval`: cadence of periodic `totals` events on the
+    /// stream; None ⇒ off.
+    pub event_interval: Option<Duration>,
     /// `--diagnostics`: write bounded native count decisions as JSONL after stop.
     pub diagnostics: Option<PathBuf>,
     /// `--diagnostics-pid`: select one PID's diagnostics without narrowing capture.
@@ -2143,6 +2146,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         event_log,
         event_rotate_bytes,
         event_max_files,
+        event_interval: None,
         diagnostics,
         diagnostics_pid,
         quiet,
@@ -4130,6 +4134,133 @@ mod tests {
                 "--event-log", "b",
             ])),
             Err(CliError::Usage { message: m, .. }) if m.contains("--event-log given twice")
+        ));
+    }
+
+    #[test]
+    fn inventory_event_stdout_accepts_dash_and_refuses_stdout_rivals() {
+        // `--event-log -` streams events to stdout: accepted on its
+        // own and beside `-o` (an independent file sink).
+        for extra in [
+            vec!["inventory", "--pid", "7", "--event-log", "-"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                "-",
+                "-o",
+                "report.json",
+            ],
+        ] {
+            let Command::Inventory(i) = parse(args(&extra)).unwrap() else {
+                panic!("expected inventory for {extra:?}");
+            };
+            assert_eq!(i.event_log, Some(PathBuf::from("-")), "{extra:?}");
+        }
+        // `--json` and `--dashboard` also own stdout: refused beside `-`.
+        for argv in [
+            vec!["inventory", "--pid", "7", "--event-log", "-", "--json"],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                "-",
+                "--dashboard",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
+                    if m.contains("--event-log -")),
+                "{argv:?}"
+            );
+        }
+        // Rotation/retention describe files: refused with `-`, which is
+        // never rotated.
+        for argv in [
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                "-",
+                "--event-rotate-bytes",
+                "1M",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                "-",
+                "--event-max-files",
+                "3",
+            ],
+        ] {
+            assert!(
+                matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
+                    if m.contains("--event-log -")),
+                "{argv:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn inventory_event_interval_parses_and_requires_a_stream() {
+        // Off by default; a duration value parses beside either sink.
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap()
+        else {
+            panic!("expected inventory")
+        };
+        assert_eq!(plain.event_interval, None);
+        for sink in ["events.jsonl", "-"] {
+            let Command::Inventory(i) = parse(args(&[
+                "inventory",
+                "--pid",
+                "7",
+                "--event-log",
+                sink,
+                "--event-interval",
+                "10s",
+            ]))
+            .unwrap() else {
+                panic!("expected inventory for sink {sink}")
+            };
+            assert_eq!(i.event_interval, Some(std::time::Duration::from_secs(10)));
+        }
+        // Without a stream the cadence has nowhere to go: refused, never
+        // silently ignored.
+        assert!(matches!(
+            parse(args(&["inventory", "--pid", "7", "--event-interval", "10s"])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("require --event-log")
+        ));
+        // Zero, repeated and malformed values are refused by name.
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "e.jsonl",
+                "--event-interval", "0",
+            ])),
+            Err(CliError::Usage { message: m, .. })
+                if m.contains("--event-interval must be greater than zero")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "e.jsonl",
+                "--event-interval", "10s",
+                "--event-interval", "30s",
+            ])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--event-interval given twice")
+        ));
+        assert!(matches!(
+            parse(args(&[
+                "inventory", "--pid", "7",
+                "--event-log", "e.jsonl",
+                "--event-interval", "soon",
+            ])),
+            Err(CliError::Usage { message: m, .. }) if m.contains("--event-interval: invalid value")
         ));
     }
 

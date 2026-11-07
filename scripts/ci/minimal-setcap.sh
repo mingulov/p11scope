@@ -329,8 +329,8 @@ pass=1
 if python3 -I - "$json" <<'PY'; then
 import json, sys
 doc = json.load(open(sys.argv[1]))
-modules = [m.get("path", "") for m in doc.get("modules", [])]
-assert any("libsofthsm2" in p for p in modules), modules
+paths = [p for m in doc.get("modules", []) for p in m.get("paths", [])]
+assert any("libsofthsm2" in p for p in paths), paths
 assert len(doc.get("edges", [])) > 0, "no caller edges"
 PY
   detail="exit=$rc module+edge present"
@@ -521,10 +521,13 @@ grep -q "counts complete" "$CELLTMP/out/daemonset-profile.out" || pass=0
 row daemonset-profile "$pass" qualified "exit=$rc"
 wlog=$CELLTMP/out/workload-daemonset-inv.log
 wpid=$(start_workload 200 "$wlog") || exit 2
-"$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/plain" inventory --system --duration 30s -o "$CELLTMP/out/daemonset-inventory.json" \
+# The report goes beside out, not inside it: out is nobody-owned for
+# the nobody rows, and the DaemonSet grant holds no DAC_OVERRIDE.
+"$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/plain" inventory --system --duration 30s -o "$CELLTMP/daemonset-inventory.json" \
   >"$CELLTMP/out/daemonset-inventory.out" 2>"$CELLTMP/out/daemonset-inventory.err"
 rc=$?
 stop_workload "$wpid"
+cp -f "$CELLTMP/daemonset-inventory.json" "$CELLTMP/out/" 2>/dev/null || true
 pass=1
 [ "$rc" -eq 0 ] || pass=0
 python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$CELLTMP/out/daemonset-inventory.json" || pass=0

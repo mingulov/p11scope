@@ -360,16 +360,19 @@ result presented as complete). Every publication carries
 `"D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB
 capture-bytes<=64MiB names<=255B verdicts<=1024"`. The four counts are
 saturating u64s summing to the analyzed subpopulation, never to
-`pid_descendant_gaps` itself. Hints are never calls, never verdicts,
+`pid_descendant_gaps` itself. Under `--mode metrics` the
+`pid_descendant_gaps` denominator key itself is absent
+(profile-only); the split still classifies the same subpopulation.
+Hints are never calls, never verdicts,
 never merged into call or attribution shares, and settle no birth,
 admission, absence, or call (R57). `dlopen`-only provider use is
 invisible by design and reads `no_static_link_within_scope`.
 
 `target_exec_hints` is present if and only if the capture armed
-extensive mode over exact-`--pid` scope (profile `--pid` or owned
-`run`, in the trace, profile and metrics lanes); otherwise the key is
-absent, never null. On `--cgroup`/`--system` captures this key stays
-absent (no single target exists there). It classifies the
+extensive mode over exact-`--pid` scope (trace/profile/metrics
+`--pid` or owned `run`); otherwise the key is absent, never null.
+On `--cgroup`/`--system` captures this key stays absent (no single
+target exists there). It classifies the
 validated-target-exec subpopulation — exactly one hint per target
 exec matched to the live retained target — into the same four
 static-linkage classes with the same `STATIC HINT` label, scope

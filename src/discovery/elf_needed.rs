@@ -192,8 +192,9 @@ pub(crate) struct WatchedProvider {
 }
 
 /// A pending exe identity: seeded from an EXEC record, consumed at most
-/// once by a later unmatched exit, in timestamp order. Never bare-PID
-/// addressed: seeding requires the producer ticket, and consumption
+/// once by a later unmatched exit, in timestamp order. PID-keyed with
+/// timestamp-ordered consume-once: Detailed seeding requires the
+/// producer ticket, aggregate seeding (7.10b) does not, and consumption
 /// requires the stash timestamp to precede the exit timestamp.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct StashedExe {

@@ -672,11 +672,12 @@ pub struct DiscoveryEvidence {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_excludes: Vec<String>,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
-    /// mode armed. Serde-skipped carrier: the profile lane hoists it to
-    /// the top-level `gap_exit_mappings` key in `versioned_evidence`;
-    /// metrics embeds `Evidence` directly and never sees it, while
-    /// trace shares the hoist but never arms, so the key is absent in
-    /// both. Stamped from live engine state on every `capture_facts()`.
+    /// mode armed. Serde-skipped carrier: the profile lane and the
+    /// terminal trace `EVIDENCE` hoist it to the top-level
+    /// `gap_exit_mappings` key in `versioned_evidence`; the metrics
+    /// lane hoists the hint splits but this split never arms there
+    /// (no instance hooks), so the key stays absent. Stamped from
+    /// live engine state on every `capture_facts()`.
     #[serde(skip)]
     pub gap_exit_mappings: Option<GapExitMappings>,
 }

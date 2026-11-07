@@ -157,7 +157,7 @@ and clean up only resources created by the experiment. Do not disturb an
 unrelated browser, service, VM, container or another agent's capture.
 
 Hosted CI runs privileged tests: GitHub runners provide passwordless root,
-BTF and KVM. `.github/workflows/privileged-tests.yml` runs on every push:
+BTF and KVM. `.github/workflows/privileged-tests.yml` runs on every branch push (tag pushes trigger nothing: a release tag rides the commit the branch push already ran):
 - the curated privileged library cells (`scripts/run-privileged-lib-tests.sh`,
   sharded, with a coverage check);
 - the system-scale capture cells;

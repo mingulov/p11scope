@@ -303,6 +303,9 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("schedules run only on the default branch", self.yml.lower())
         self.assertNotIn("schedule:", self.yml)
 
+    def test_tag_pushes_trigger_nothing(self):
+        self.assertEqual([], _BPF.check_no_tag_triggers(self.yml))
+
     def test_floor_file_is_consistent_and_pinned_to_the_runner(self):
         campaign = json.loads(CAMPAIGN.read_text(encoding="utf-8"))
         self.assertEqual(campaign.get("schema"), "p11scope/privileged-campaign/v1")

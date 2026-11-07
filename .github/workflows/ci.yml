@@ -1,6 +1,12 @@
 name: ci
 on:
+  # Release tags ride the commit a branch push already ran (RELEASING.md
+  # pushes main and the tag together): tag pushes trigger nothing, so a
+  # release never reruns this matrix on an identical SHA. The dedupe job
+  # below still covers same-SHA branch re-pushes.
   push:
+    tags-ignore:
+      - '**'
   pull_request:
   # Checks remain the default. Delivery routes call the maintained workflows
   # at this commit without repeating the ordinary check matrix.

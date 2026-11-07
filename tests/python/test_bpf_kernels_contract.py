@@ -166,6 +166,28 @@ def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
     return problems
 
 
+def check_no_tag_triggers(text):
+    """Tag pushes trigger nothing; every branch push and PR still does.
+
+    Release tags ride the same commit a branch push already ran
+    (RELEASING.md pushes main and the tag together), so a tag run only
+    duplicates the matrix on an identical SHA. Returns a problem list,
+    like the other check_* helpers.
+    """
+    problems = []
+    push = re.search(r"^  push:\n((?:    .*\n)+)", text, re.M)
+    if not push:
+        return ["no indented push: trigger block"]
+    block = push.group(1)
+    if "tags-ignore:" not in block or "'**'" not in block:
+        problems.append("push: does not ignore tags")
+    if re.search(r"^    (tags|branches):", block, re.M):
+        problems.append("push: restricts branches or allows tags")
+    if "\n  pull_request:\n" not in text:
+        problems.append("pull_request trigger missing")
+    return problems
+
+
 class BpfKernelsContractTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(CI_YML.is_file(), "ci.yml is missing")
@@ -207,6 +229,10 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)
         self.assertIn("if: matrix.refusal_control != true", self.bpf)
         self.assertIn("if: matrix.refusal_control == true", self.bpf)
+
+    def test_tag_pushes_trigger_nothing(self):
+        self.assertEqual([], check_no_tag_triggers(self.bpf))
+        self.assertEqual([], check_no_tag_triggers(self.ci))
 
     def test_lib_cells_run_in_66_and_612_guests(self):
         match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",

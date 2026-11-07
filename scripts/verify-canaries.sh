@@ -351,8 +351,13 @@ run_lane() {
     done
     test -f "$WORK/$lane.ready" || { echo "$lane workload never became ready"; exit 1; }
 
-    set -- "$lane_observer" "$lane_command" \
-        --manifest "$WORK/matrix-manifest.json" --pid "$WPID"
+    set -- "$lane_observer" "$lane_command"
+    # The stopped canary proves the tier from the live frame's ` — privacy=`
+    # marker, which the observer prints only under -v. Trace lanes stay
+    # concise: their CAPTURE marker is unconditional and their terminal
+    # wording is itself verbosity-sensitive.
+    case $kind in profile|metrics) set -- "$@" -v ;; esac
+    set -- "$@" --manifest "$WORK/matrix-manifest.json" --pid "$WPID"
     [ -z "$lane_mode" ] || set -- "$@" --mode "$lane_mode"
     [ -z "$lane_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
     set -- "$@" --duration 6 -o "$WORK/$lane.output"
@@ -455,7 +460,9 @@ run_start_lane() {
         echo "$start_lane workload never published complete READY"
         exit 1
     }
-    set -- "$start_observer" profile --manifest "$WORK/privacy-manifest.json" \
+    # Verbose: the stopped canary proves the tier from the live frame's
+    # ` — privacy=` marker, which the observer prints only under -v.
+    set -- "$start_observer" profile -v --manifest "$WORK/privacy-manifest.json" \
         --pid "$WPID" \
         --mode profile --duration 8 -o "$WORK/$start_lane.output"
     [ -z "$start_unsafe" ] || set -- "$@" --unsafe-unvalidated-metadata
@@ -552,6 +559,8 @@ run_object_cell() {
     done
     test -f "$WORK/$object_lane.ready" || { echo "$object_lane workload never became ready"; exit 1; }
     object_completed_pid=$WPID
+    # Both object observers run -v: the stopped canary proves the tier from
+    # the live frame's ` — privacy=` marker, which is verbose-only.
     sudo python3 -I scripts/capture-stopped-canary.py \
         --object-attributes "$OBJECT_ATTRIBUTES" \
         --lane "$object_lane" --variant default --mode profile --privacy allowlisted \
@@ -562,7 +571,7 @@ run_object_cell() {
         --done "$WORK/$object_lane.done" --finish "$WORK/$object_lane.finish" \
         --observer-log "$WORK/$object_lane.observer.log" --workload-log "$WORK/$object_lane.workload.log" \
         --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
-        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/matrix-manifest.json" --pid "$WPID" \
+        "$P11SCOPE_DEFAULT" profile -v --manifest "$WORK/matrix-manifest.json" --pid "$WPID" \
         --mode profile --duration 6 -o "$WORK/$object_lane.output"
     reclaim_root_output "$WORK"/mapdump_*_"$object_lane".json "$WORK"/mapdump_*_"$object_lane".bin \
         "$WORK/$object_lane".*.raw "$WORK/$object_lane.observer.log"
@@ -616,7 +625,7 @@ run_object_cell() {
         --done "$WORK/$object_blocked_lane.done" --finish "$WORK/$object_blocked_lane.finish" \
         --observer-log "$WORK/$object_blocked_lane.observer.log" --workload-log "$WORK/$object_blocked_lane.workload.log" \
         --reader "$TASK_STORAGE_READER" --obj "$TASK_STORAGE_OBJECT" -- \
-        "$P11SCOPE_DEFAULT" profile --manifest "$WORK/privacy-manifest.json" --pid "$WPID" \
+        "$P11SCOPE_DEFAULT" profile -v --manifest "$WORK/privacy-manifest.json" --pid "$WPID" \
         --mode profile --duration 8 -o "$WORK/$object_blocked_lane.output"
     reclaim_root_output "$WORK"/mapdump_*_"$object_blocked_lane".json "$WORK"/mapdump_*_"$object_blocked_lane".bin \
         "$WORK/$object_blocked_lane".*.raw "$WORK/$object_blocked_lane.observer.log"
@@ -668,7 +677,9 @@ run_owned_lane() {
     esac
     echo "=== $owned_lane ($owned_build owned metrics) ==="
     refuse_lane_destinations "$owned_lane"
-    set -- "$owned_observer" run --manifest "$WORK/matrix-manifest.json" \
+    # Verbose (before the workload's `--`): the stopped canary proves the
+    # tier from the live frame's ` — privacy=` marker, verbose-only.
+    set -- "$owned_observer" run -v --manifest "$WORK/matrix-manifest.json" \
         --mode metrics --pause never --duration 35 -o "$WORK/$owned_lane.output" -- \
         "$CANARY_WORKLOAD" "$MATRIX_PROVIDER" matrix \
         "$WORK/$owned_lane.ready" "$WORK/$owned_lane.go" "$WORK/$owned_lane.done" "$WORK/$owned_lane.finish"

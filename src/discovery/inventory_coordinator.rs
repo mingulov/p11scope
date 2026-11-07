@@ -29061,6 +29061,7 @@ int main(void) {
         let foreign = WitnessRow::scripted(other, 41, 1, endpoint.object, endpoint.id, 9, 210);
         native.stage(native.stamps.read(other, vec![foreign]));
         native.stage(native.stamps.drain(other));
+        native.stage(native.stamps.read(other, Vec::new()));
         native.scene.coordinator.commit_batch(false).unwrap();
         let exes = scene_unbound_exe(&native);
         assert_eq!(exes.len(), 2);
@@ -29189,8 +29190,15 @@ int main(void) {
     #[test]
     fn scan_learned_exe_map_names_admitted_callers() {
         let (mut native, _) = NativeScene::new();
-        assert!(native.scene.coordinator.scan_learned_exe_map().is_empty());
+        // The fresh scene holds its default caller (pid 7).
+        let map = native.scene.coordinator.scan_learned_exe_map();
+        assert_eq!(
+            map.get(&(1, 100)),
+            Some(&"/bin/driver".to_string()),
+            "the default caller's scan-time exe is exposed by identity: {map:?}"
+        );
         native.scene.source.spawn(9, 900);
+        native.scene.source.exec(9, 101, "/bin/other");
         native
             .scene
             .coordinator
@@ -29199,10 +29207,11 @@ int main(void) {
             .unwrap();
         let map = native.scene.coordinator.scan_learned_exe_map();
         assert_eq!(
-            map.get(&(1, 100)),
-            Some(&"/bin/driver".to_string()),
-            "the admitted caller's scan-time exe is exposed by identity: {map:?}"
+            map.get(&(1, 101)),
+            Some(&"/bin/other".to_string()),
+            "a second admission adds its own identity: {map:?}"
         );
+        assert_eq!(map.len(), 2);
     }
 
     fn staged_tool(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, u64, u64) {
@@ -29309,7 +29318,7 @@ int main(void) {
         native.execs(records);
         native.witness(rows);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified executables: tool-0 (6 calls, pids 9, 10, 11, 12, 13 (+1 more)); tool-1 (1 call, pid 15); tool-2 (1 call, pid 16); tool-3 (1 call, pid 17); tool-4 (1 call, pid 18) (+1 more)";
+        let line = "unidentified executables: tool-0 (6 calls, pids 9, 10, 11, 12, 13 (+1 more)); tool-1 (1 call, pid 15); tool-2 (1 call, pid 21); tool-3 (1 call, pid 27); tool-4 (1 call, pid 33) (+1 more)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise truncates groups and pids with counts:\n{text}"
@@ -29401,35 +29410,29 @@ int main(void) {
         );
     }
 
-    /// Resolution source (a) end to end: a live unadmitted process
-    /// whose start predates the EXEC resolves through its
-    /// `/proc/<pid>/exe` link. Host pidns and comparable clocks
-    /// (the scene's standing assumption for exec hooks).
+    /// Resolution source (a) wiring: a live unadmitted process
+    /// whose start predates the EXEC resolves through the process
+    /// source's live reads. The scripted process stands in for
+    /// `/proc` (scenes resolve through the scripted source); start
+    /// 0 predates every EXEC. Host pidns and comparable clocks (the
+    /// scene's standing assumption for exec hooks).
     #[test]
-    fn live_unadmitted_process_resolves_through_its_proc_link() {
-        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
-        let child = OwnedStoppedChild::new();
-        let pid = child.id();
-        let exe = OsProcessSource
-            .exe_identity(pid)
-            .expect("the live child has an exe identity");
-        let path = exe.path.clone().expect("the exe link reads");
+    fn live_unadmitted_process_resolves_through_its_proc_reads() {
         let (mut native, _) = NativeScene::new();
         native.scene.coordinator.set_exe_index_dirs(Vec::new());
         native.scene.coordinator.exit_clocks_comparable = true;
-        // The EXEC lands now (boottime): the child's birth predates
-        // it on every host, so the generation check passes.
+        native.scene.source.spawn(9, 0);
         let hook = crate::discovery::pause::boot_ns().expect("boottime reads");
-        native.execs(vec![exec_record(41, pid, hook, exe.dev, exe.ino)]);
-        native.witness(vec![native.row(41, 1, pid, 210, 0)]);
+        native.execs(vec![exec_record(41, 9, hook, 1, 100)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let pids = native.scene.coordinator.registry.unidentified_pids();
         assert_eq!(pids.len(), 1);
         assert_eq!(
             pids[0].exe,
             UnboundExe {
-                dev: exe.dev,
-                ino: exe.ino,
-                path: Some(path),
+                dev: 1,
+                ino: 100,
+                path: Some("/bin/driver".to_string()),
                 resolution: ExeResolution::ProcAlive,
             }
         );

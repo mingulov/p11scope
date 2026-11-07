@@ -140,6 +140,53 @@ impl MetadataFrame {
         }
     }
 
+    /// Test-only enabled frame with caller rows, sorted for the binary
+    /// search in [`MetadataFrame::metadata`], with the status census the
+    /// production snapshot computes. Neighbor touch for the T5-6
+    /// unblocking patch: consumed by the `inventory::present_tests`
+    /// render twins, which pin the opt-in concise lines and the verbose
+    /// full-ID suffix without a live sampler. No production path uses it.
+    #[cfg(test)]
+    pub(crate) fn for_test(rows: &[(CallerId, CallerMetadata)]) -> Self {
+        let mut rows: Vec<FrameRow> = rows
+            .iter()
+            .map(|(caller, metadata)| FrameRow {
+                caller: *caller,
+                metadata: *metadata,
+            })
+            .collect();
+        rows.sort_by_key(|row| row.caller);
+        let budget = MetadataRuntime::fresh_budget();
+        let bytes = rows.len() * size_of::<FrameRow>()
+            + ALLOCATION_PADDING
+            + arc_bytes::<FrameRows>()
+            + size_of::<MetadataFrame>();
+        let storage =
+            MemoryCharge::reserve(&budget, bytes).expect("test frame rows fit the ceiling");
+        let rows: Box<[FrameRow]> = rows.into_boxed_slice();
+        let mut summary = MetadataSummary {
+            enabled: true,
+            ..MetadataSummary::default()
+        };
+        for row in rows.iter() {
+            match row.metadata.status {
+                MetadataStatus::Pending => summary.pending += 1,
+                MetadataStatus::Sampled => summary.sampled += 1,
+                MetadataStatus::Unknown => summary.unknown += 1,
+                MetadataStatus::Stale => summary.stale += 1,
+                MetadataStatus::Historical => summary.historical += 1,
+            }
+        }
+        Self {
+            rows: Some(Arc::new(FrameRows {
+                rows,
+                _storage: storage,
+            })),
+            refusal: None,
+            summary,
+        }
+    }
+
     pub(crate) fn contains(&self, caller: CallerId) -> bool {
         self.rows.as_ref().is_some_and(|rows| {
             rows.rows

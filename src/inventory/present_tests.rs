@@ -3226,3 +3226,132 @@ fn concise_unavailable_metadata_prints_no_scope_lines() {
     );
     assert!(out.contains("inventory "), "{out}");
 }
+
+/// F10: an enabled frame with labeled rows prints one exact concise
+/// scope line per caller with edges, and the verbose Details caller
+/// line carries the full-ID suffix.
+#[test]
+fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
+    use std::collections::BTreeMap;
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let pod = scope_metadata_for(&format!(
+        "kubepods/burstable/pod{SCOPE_POD_UID}/{SCOPE_DOCKER_ID}"
+    ));
+    let mut totals: BTreeMap<CallerId, u64> = BTreeMap::new();
+    for edge in &presentation.edges {
+        let total = totals.entry(edge.caller).or_default();
+        *total = total.saturating_add(edge.entry_count);
+    }
+    let mut labeled: Vec<(CallerId, &str)> = Vec::new();
+    for caller in &presentation.callers {
+        if !totals.contains_key(&caller.id) {
+            continue;
+        }
+        let short = if labeled.is_empty() {
+            "container 0123456789ab (docker)"
+        } else {
+            "pod 12345678 / container 0123456789ab"
+        };
+        labeled.push((caller.id, short));
+        if labeled.len() == 2 {
+            break;
+        }
+    }
+    assert_eq!(labeled.len(), 2, "fixture must give two callers with edges");
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = labeled
+        .iter()
+        .enumerate()
+        .map(|(index, (id, _))| (*id, if index == 0 { docker } else { pod }))
+        .collect();
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert!(presentation.caller_metadata.summary.enabled);
+    let expected: Vec<String> = labeled
+        .iter()
+        .map(|(id, short)| {
+            let caller = presentation
+                .callers
+                .iter()
+                .find(|caller| caller.id == *id)
+                .unwrap();
+            let total = totals[&caller.id];
+            let noun = if total == 1 { "entry" } else { "entries" };
+            format!(
+                "caller {} pid {}: {total} {noun} observed, {short}",
+                application_label(&presentation, caller.id),
+                caller.pid,
+            )
+        })
+        .collect();
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("caller "))
+        .collect();
+    assert_eq!(scope_lines, expected, "{out}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    for caller in &presentation.callers {
+        let exe = caller
+            .exe
+            .as_ref()
+            .and_then(|exe| exe.path.as_deref())
+            .unwrap_or("?");
+        let mut expected_line = format!(
+            "caller {} pid {} incarnation {} {} ({})",
+            caller.id.label(),
+            caller.pid,
+            caller.incarnation,
+            caller.lifecycle.label(),
+            escape_controls(exe),
+        );
+        if labeled.iter().any(|(id, _)| *id == caller.id) {
+            let suffix = if caller.id == labeled[0].0 {
+                format!("container {SCOPE_DOCKER_ID} (docker)")
+            } else {
+                format!("pod {SCOPE_POD_UID} / container {SCOPE_DOCKER_ID}")
+            };
+            expected_line.push_str(", ");
+            expected_line.push_str(&suffix);
+        }
+        assert!(
+            verbose.lines().any(|line| line == expected_line),
+            "missing Details line {expected_line:?}\n{verbose}"
+        );
+    }
+}
+
+/// F10: the same labeled frame flipped to disabled prints no concise
+/// scope lines and no verbose suffix: the opt-in gate guards real rows.
+#[test]
+fn concise_disabled_frame_with_rows_prints_no_scope_lines() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let pod = scope_metadata_for(&format!(
+        "kubepods/burstable/pod{SCOPE_POD_UID}/{SCOPE_DOCKER_ID}"
+    ));
+    let ids: Vec<CallerId> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .collect();
+    assert!(ids.len() >= 2, "fixture must give two callers to label");
+    let mut frame = crate::caller_metadata::runtime::MetadataFrame::for_test(&[
+        (ids[0], docker),
+        (ids[1], pod),
+    ]);
+    frame.summary.enabled = false;
+    presentation.caller_metadata = frame;
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller ")),
+        "{out}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(!verbose.contains(", container "), "{verbose}");
+    assert!(!verbose.contains(", pod "), "{verbose}");
+}

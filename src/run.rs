@@ -3470,8 +3470,13 @@ fn capture_with_host(
     // 7.10b: arm extensive mode before the session publishes its
     // CONFIG bit; inventory never reaches this flow. Counter policies
     // never arm (the CLI combination already refused). The engine
-    // splits the gap and PID consumers by scope itself.
-    engine.arm_extensive(extensive_effective(a.track_short_lived, policy), policy);
+    // splits the gap and PID consumers by scope itself; profile/trace
+    // captures have no owned target.
+    engine.arm_extensive(
+        extensive_effective(a.track_short_lived, policy),
+        policy,
+        None,
+    );
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
     // A named pid that died after scope resolution fails below with the one
@@ -4573,9 +4578,15 @@ fn run_owned_inner_with_host(
 
     // 7.10b: arm extensive mode before the session publishes its
     // CONFIG bit. Counter policies never arm (the CLI combination
-    // already refused). An owned `run` is an exact-PID scope, which
-    // arms the PID target-exec consumer for the child.
-    engine.arm_extensive(extensive_effective(args.track_short_lived, policy), policy);
+    // already refused). An owned `run` passes its direct child as the
+    // explicit owned target, which arms the PID target-exec consumer
+    // for the child even under the run-tree cgroup scope; it never
+    // arms the gap consumer.
+    engine.arm_extensive(
+        extensive_effective(args.track_short_lived, policy),
+        policy,
+        Some(pid),
+    );
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.

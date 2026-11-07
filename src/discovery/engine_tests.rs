@@ -4990,7 +4990,7 @@ fn armed_cgroup_engine() -> Engine {
         path: PathBuf::from("/sys/fs/cgroup/test"),
         dir: Arc::new(File::open("/dev/null").unwrap()),
     };
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine
 }
 
@@ -5393,7 +5393,7 @@ fn exit_mappings_routed_record_is_gap_not_live_loss() {
     child.kill().unwrap();
     child.wait().unwrap();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     let mut exit = exit_mappings_record(pid, 1);
     exit.pointers[0] = 3;
     let mut session = ScriptedSession::with_records([], 0);
@@ -5493,7 +5493,7 @@ fn exit_mappings_overflow_sentinel_carries_no_split() {
 fn exit_mappings_coalesced_exit_carries_no_split() {
     let pid = std::process::id();
     let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     let mut exit = exit_mappings_record(pid, 0);
     exit.pointers[0] = 3;
     let mut session = ScriptedSession::with_records([], 0);
@@ -6431,7 +6431,7 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
             .unwrap_or_else(|error| panic!("{what}: cgroup scope failed: {error:#}"));
         let mut engine = Engine::discover(&args, &scope, None).expect("live discovery");
         if armed {
-            engine.arm_extensive(true, CapturePolicy::Allowlisted);
+            engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
         }
         let mut session = engine
             .start_session(
@@ -64461,7 +64461,7 @@ fn gap_exe_identity_shares_unchanged_twin() {
 #[test]
 fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
     let mut pid_engine = Engine::empty();
-    pid_engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    pid_engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     assert!(
         pid_engine.target_exec_hints().is_some(),
         "exact-PID scope arms the target-exec consumer"
@@ -64477,7 +64477,7 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
     assert_eq!(pid_engine.target_exec_hints().unwrap().total(), 0);
     let pid = std::process::id();
     let (mut cgroup_engine, _scope) = engine_over_cgroup_naming(&[pid]);
-    cgroup_engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    cgroup_engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     assert!(
         cgroup_engine.gap_exe_hints().is_some(),
         "cgroup scope arms the gap consumer"
@@ -64490,12 +64490,64 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
         cgroup_engine.gap_exit_mappings().is_some(),
         "cgroup scope arms the exit-mapping split"
     );
-    cgroup_engine.arm_extensive(false, CapturePolicy::Allowlisted);
+    cgroup_engine.arm_extensive(false, CapturePolicy::Allowlisted, None);
     assert!(cgroup_engine.gap_exe_hints().is_none());
     assert!(cgroup_engine.gap_exit_mappings().is_none());
-    pid_engine.arm_extensive(false, CapturePolicy::Allowlisted);
+    pid_engine.arm_extensive(false, CapturePolicy::Allowlisted, None);
     assert!(pid_engine.target_exec_hints().is_none());
     assert!(pid_engine.gap_exit_mappings().is_none());
+}
+
+// 7.10b run-tree: an owned run under the run-cgroup scope still arms
+// the PID target-exec consumer for its direct child via the explicit
+// owned target — never the gap consumer. The target exec publishes
+// `target_exec_hints`; a novel descendant exit still counts its gap
+// but classifies no hint.
+#[test]
+fn owned_run_under_cgroup_scope_arms_pid_consumer_for_direct_child() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, Some(pid));
+    assert!(
+        engine.target_exec_hints().is_some(),
+        "owned run arms the PID consumer under cgroup scope"
+    );
+    assert!(
+        engine.gap_exe_hints().is_none(),
+        "owned run never arms the gap consumer"
+    );
+    assert!(
+        engine.gap_exit_mappings().is_none(),
+        "owned run publishes no exit-mapping split"
+    );
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, dev, ino, 0),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
+    // A novel descendant exit counts its gap but classifies nothing:
+    // the gap consumer stays disarmed for the owned run.
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(424242, 100),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.gap_exe_hints().is_none());
+    assert_eq!(engine.target_exec_hints().unwrap().total(), 1);
 }
 
 // 7.10b: a validated target EXEC under exact-PID scope classifies
@@ -64506,7 +64558,7 @@ fn extensive_arm_splits_gap_and_pid_consumers_by_scope() {
 fn pid_target_exec_validates_a_live_matched_exec_and_counts_one_hint() {
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64534,7 +64586,7 @@ fn pid_target_exec_validates_a_live_matched_exec_and_counts_one_hint() {
 fn pid_target_exec_without_a_learned_path_counts_unknown() {
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64557,7 +64609,7 @@ fn pid_target_exec_without_a_learned_path_counts_unknown() {
 #[test]
 fn pid_target_exec_ignores_execs_that_match_no_retained_view() {
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     // Past every admission bracket, deterministically.
     let ts = u64::MAX;
     let mut pending = PendingViewRetirements::new();
@@ -64589,7 +64641,7 @@ fn pid_target_exec_ignores_execs_against_a_dead_view() {
     child.wait().expect("reap sleeper");
     assert!(!view.still_the_same());
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine.views.push(view);
     // Past every admission bracket, deterministically.
     let ts = u64::MAX;
@@ -64614,7 +64666,7 @@ fn pid_target_exec_ignores_execs_against_a_dead_view() {
 fn pid_target_exec_with_absent_pair_counts_unknown_without_analysis() {
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64643,7 +64695,7 @@ fn pid_target_exec_reexec_between_record_and_learn_counts_unknown() {
     use crate::discovery::elf_needed::fixture as exf;
     let pid = std::process::id();
     let mut engine = Engine::empty();
-    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
     engine
         .views
         .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
@@ -64710,7 +64762,7 @@ fn aggregate_arm_exit_mapping_split_is_all_unknown_under_metrics() {
         path: PathBuf::from("/sys/fs/cgroup/test"),
         dir: Arc::new(File::open("/dev/null").unwrap()),
     };
-    engine.arm_extensive(true, CapturePolicy::AggregateOnly);
+    engine.arm_extensive(true, CapturePolicy::AggregateOnly, None);
     let mut session = ScriptedSession::default();
     assert!(
         session.instance_hooks_refused(),
@@ -64742,7 +64794,7 @@ fn aggregate_arm_exit_mapping_split_is_all_unknown_under_metrics() {
 fn aggregate_arm_classifies_ticketless_gap_hints_end_to_end() {
     let pid = std::process::id();
     let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
-    engine.arm_extensive(true, CapturePolicy::AggregateOnly);
+    engine.arm_extensive(true, CapturePolicy::AggregateOnly, None);
     let dir = tempfile::tempdir().unwrap();
     let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
     dispatch_gap_exe(

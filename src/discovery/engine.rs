@@ -727,6 +727,11 @@ pub struct Engine {
     /// mapped/unknown counts over the novel unmatched-exit
     /// subpopulation. Read only while extensive mode is armed.
     exit_map: ExitMappingState,
+    /// 7.10b (run-tree): the owned direct-child pid for `run`, when
+    /// this engine drives an owned capture. `Some` forces the PID
+    /// target-exec consumer even under a generation-admitting scope
+    /// (the run cgroup); `None` for profile/trace captures.
+    extensive_owned: Option<u32>,
     task_uprobe_link_losses: u64,
     next_selection_binding_id: Option<u64>,
     selection_bindings: BTreeMap<u64, SelectionBindingFact>,
@@ -10848,6 +10853,7 @@ impl Engine {
             cgroup_ingress_overflow: false,
             extensive: elf_needed::ExtensiveState::new(),
             exit_map: ExitMappingState::default(),
+            extensive_owned: None,
             task_uprobe_link_losses: 0,
             next_selection_binding_id: Some(1),
             selection_bindings: BTreeMap::new(),
@@ -11941,11 +11947,17 @@ impl Engine {
     /// the session starts (run flow only; inventory never calls this,
     /// so its surface is unchanged). Arming splits by scope: the gap
     /// consumer on generation-admitting scopes, the PID target-exec
-    /// consumer on exact-PID scope (profile `--pid`, owned `run`).
-    /// A counter policy arms neither consumer, even if asked.
-    /// Arming snapshots the pinned watched providers; the kernel bit
-    /// publishes with the session.
-    pub(crate) fn arm_extensive(&mut self, track_short_lived: bool, policy: CapturePolicy) {
+    /// consumer on exact-PID scope (profile `--pid`) or for the owned
+    /// direct child (`run`, via `owned`). A counter policy arms
+    /// neither consumer, even if asked. Arming snapshots the pinned
+    /// watched providers; the kernel bit publishes with the session.
+    pub(crate) fn arm_extensive(
+        &mut self,
+        track_short_lived: bool,
+        policy: CapturePolicy,
+        owned: Option<u32>,
+    ) {
+        self.extensive_owned = owned;
         let detailed = track_short_lived && policy.allows_track_short_lived();
         let gap = detailed && self.admits_generations();
         let pid = detailed && matches!(self.scope, Scope::Pid(_));

@@ -212,6 +212,17 @@ class ContainerImageCellTests(unittest.TestCase):
                                env={"P11SCOPE_CONTAINER_IMAGE_MODULE": str(self.base / "absent")})
         self.assertEqual(result.returncode, 77)
 
+    def test_container_leg_classifies_before_its_exact_oracle(self):
+        # clean-metrics stays 2.6-calibrated: the container leg must prove
+        # its victim is 2.6-shaped before running it, and both exact legs
+        # must surface the classified table in their result rows.
+        text = ENTRY.read_text()
+        for marker in ('classify_provider_tables "$OUT/container.json"',
+                       "TABLE_CLASS_CONTAINER",
+                       "TABLE_CLASS_HOST"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text)
+
     def test_lane_keeps_its_oracle_and_refusal_markers(self):
         text = ENTRY.read_text()
         for marker in ("--network=none", "--network none", "host-exact", "container-exact",

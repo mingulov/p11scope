@@ -544,7 +544,9 @@ rule grants the whole subtree, so anything already there would be
 writable); without `-o` nothing is writable. IP networking, socket
 connect/bind, and exec/mount/ptrace/BPF/io_uring/file-metadata syscalls
 fail with `EACCES`, as do the terminal-input-injection ioctls
-`TIOCSTI`/`TIOCLINUX`. The fence needs Landlock ABI 5 or newer and an
+`TIOCSTI`/`TIOCLINUX` and the inode-attribute ioctls (`FS_IOC_SETFLAGS`,
+`FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, `FS_IOC_SET_ENCRYPTION_POLICY`,
+`FS_IOC_ENABLE_VERITY`). The fence needs Landlock ABI 5 or newer and an
 x86-64 helper; when either is unavailable the helper refuses before
 loading rather than running weaker. A provider that needs a denied access
 at discovery time fails plainly (a loader or getter error, or an

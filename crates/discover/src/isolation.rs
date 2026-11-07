@@ -6,7 +6,8 @@
 //! filesystem plus denied TCP bind/connect) followed by a seccomp denylist
 //! (no IP networking or socket connect/bind; no exec, mount, ptrace, BPF,
 //! io_uring, keyring or file-metadata syscalls; no terminal-input-injection
-//! ioctls). Every denial fails with `EACCES`, never kill/trap, so a fenced
+//! or inode-attribute ioctls). Every denial fails with `EACCES`, never
+//! kill/trap, so a fenced
 //! provider call reads as an ordinary error. Applied after the shared
 //! privilege drop and before any provider code runs; any failure refuses
 //! before `dlopen`.
@@ -115,10 +116,19 @@ const ARG0_LO_OFFSET: u32 = 16;
 const ARG1_LO_OFFSET: u32 = 24;
 const AF_UNIX: u32 = 1;
 const AF_NETLINK: u32 = 16;
-// Terminal-input-injection commands denied below; every other ioctl
-// stays allowed (device control is Landlock's job).
+// Ioctl commands denied below: terminal-input-injection plus the inode
+// mutators reachable from an O_RDONLY fd (Landlock's IOCTL_DEV does not
+// mediate regular files). Every other ioctl stays allowed.
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541C;
+// linux/fs.h, linux/fsverity.h, linux/fscrypt.h. The 32-bit SETFLAGS is
+// _IOW('f', 2, int) for compat callers.
+const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+const FS_IOC_SETFLAGS32: u32 = 0x4004_6602;
+const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+const FS_IOC_ENABLE_VERITY: u32 = 0x4080_6685;
+const FS_IOC_SET_ENCRYPTION_POLICY: u32 = 0x800c_6613;
+const FS_IOC_SETVERSION: u32 = 0x4008_7602;
 
 // x86-64 syscall numbers in the denylist (contract §5).
 const SYS_IOCTL: u32 = 16;
@@ -166,7 +176,9 @@ const SYS_ACCT: u32 = 163;
 const SYS_IO_URING_SETUP: u32 = 425;
 const SYS_IO_URING_ENTER: u32 = 426;
 const SYS_IO_URING_REGISTER: u32 = 427;
-// File metadata Landlock cannot restrict (mode, owner, xattr, times).
+// File metadata Landlock cannot restrict (mode, owner, xattr, times,
+// inode flags via file_setattr).
+const SYS_FILE_SETATTR: u32 = 469;
 const SYS_CHMOD: u32 = 90;
 const SYS_FCHMOD: u32 = 91;
 const SYS_FCHMODAT: u32 = 268;
@@ -190,8 +202,8 @@ const SYS_UTIMENSAT: u32 = 280;
 
 /// Unconditional denials. `socket` and `ioctl` are handled separately:
 /// `AF_UNIX` and `AF_NETLINK` socket domains stay allowed while every
-/// other domain is denied, and only the `TIOCSTI`/`TIOCLINUX` ioctl
-/// commands are denied.
+/// other domain is denied, and only the listed terminal-injection and
+/// inode-attribute ioctl commands are denied.
 const DENY_ALWAYS: &[u32] = &[
     SYS_CONNECT,
     SYS_BIND,
@@ -253,6 +265,7 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_UTIMES,
     SYS_FUTIMESAT,
     SYS_UTIMENSAT,
+    SYS_FILE_SETATTR,
 ];
 
 #[repr(C)]
@@ -353,11 +366,24 @@ impl FilterBuilder {
         let is_netlink = self.jeq(AF_NETLINK);
         let deny_socket = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_unix = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
-        // ioctl(fd, cmd, ...): TIOCSTI and TIOCLINUX inject input into
-        // the operator's terminal, so only those two are denied.
+        // ioctl(fd, cmd, ...): TIOCSTI/TIOCLINUX inject input into the
+        // operator's terminal, and the inode ioctls mutate flags, xattr,
+        // version, encryption policy or verity from an O_RDONLY fd, so
+        // those commands are denied and every other ioctl stays allowed.
         let ioctl_check = self.emit(stmt(BPF_LD_W_ABS, ARG1_LO_OFFSET));
-        let is_tiocsti = self.jeq(TIOCSTI);
-        let is_tioclinux = self.jeq(TIOCLINUX);
+        let mut ioctl_jumps = Vec::with_capacity(8);
+        for cmd in [
+            TIOCSTI,
+            TIOCLINUX,
+            FS_IOC_SETFLAGS,
+            FS_IOC_SETFLAGS32,
+            FS_IOC_FSSETXATTR,
+            FS_IOC_ENABLE_VERITY,
+            FS_IOC_SET_ENCRYPTION_POLICY,
+            FS_IOC_SETVERSION,
+        ] {
+            ioctl_jumps.push(self.jeq(cmd));
+        }
         let deny_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         // Every target is known now; patch the whole chain explicitly.
@@ -373,8 +399,13 @@ impl FilterBuilder {
         self.patch(ioctl_jump, ioctl_check, allow)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
         self.patch(is_netlink, allow_unix, deny_socket)?;
-        self.patch(is_tiocsti, deny_ioctl, is_tioclinux)?;
-        self.patch(is_tioclinux, deny_ioctl, allow_ioctl)?;
+        // Each denied ioctl: equal falls into `deny_ioctl`, else the next
+        // command check, walked back to front; the last falls to allow.
+        let mut next_ioctl = allow_ioctl;
+        for at in ioctl_jumps.iter().rev() {
+            self.patch(*at, deny_ioctl, next_ioctl)?;
+            next_ioctl = *at;
+        }
         validate_filter(&self.insns)?;
         Ok(self.insns)
     }
@@ -1133,6 +1164,9 @@ mod tests {
             (SYS_UTIMES, libc::SYS_utimes, "utimes"),
             (SYS_FUTIMESAT, libc::SYS_futimesat, "futimesat"),
             (SYS_UTIMENSAT, libc::SYS_utimensat, "utimensat"),
+            // file_setattr postdates libc 0.2.189; its number is from
+            // asm/unistd_64.h: 469.
+            (SYS_FILE_SETATTR, 469, "file_setattr"),
         ];
         assert_eq!(
             keyed.len(),
@@ -1257,8 +1291,8 @@ mod tests {
         assert_eq!(TIOCSTI, libc::TIOCSTI as u32, "wrong TIOCSTI");
         assert_eq!(TIOCLINUX, libc::TIOCLINUX as u32, "wrong TIOCLINUX");
         // TIOCSTI/TIOCLINUX inject input into the operator's terminal;
-        // only those two commands are denied, other ioctls stay allowed
-        // (device control is Landlock's job).
+        // they are denied alongside the inode-attribute commands below,
+        // while ordinary ioctls stay allowed.
         for cmd in [TIOCSTI, TIOCLINUX] {
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, cmd),
@@ -1287,19 +1321,28 @@ mod tests {
         // IOCTL_DEV does not mediate regular files): each must deny.
         // Numbers from linux/fs.h, linux/fsverity.h and linux/fscrypt.h;
         // the 32-bit SETFLAGS is _IOW('f', 2, int).
-        let cmds: &[(u32, &str)] = &[
-            (0x4008_6602, "FS_IOC_SETFLAGS"),
-            (0x4004_6602, "FS_IOC_SETFLAGS32"),
-            (0x401c_5820, "FS_IOC_FSSETXATTR"),
-            (0x4080_6685, "FS_IOC_ENABLE_VERITY"),
-            (0x800c_6613, "FS_IOC_SET_ENCRYPTION_POLICY"),
-            (0x4008_7602, "FS_IOC_SETVERSION"),
+        let cmds: &[(u32, u32, &str)] = &[
+            (FS_IOC_SETFLAGS, 0x4008_6602, "FS_IOC_SETFLAGS"),
+            (FS_IOC_SETFLAGS32, 0x4004_6602, "FS_IOC_SETFLAGS32"),
+            (FS_IOC_FSSETXATTR, 0x401c_5820, "FS_IOC_FSSETXATTR"),
+            (
+                FS_IOC_ENABLE_VERITY,
+                0x4080_6685,
+                "FS_IOC_ENABLE_VERITY",
+            ),
+            (
+                FS_IOC_SET_ENCRYPTION_POLICY,
+                0x800c_6613,
+                "FS_IOC_SET_ENCRYPTION_POLICY",
+            ),
+            (FS_IOC_SETVERSION, 0x4008_7602, "FS_IOC_SETVERSION"),
         ];
-        for (cmd, name) in cmds {
+        for (ours, want, name) in cmds {
+            assert_eq!(*ours, *want, "wrong number for {name}");
             assert_eq!(
-                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, *cmd),
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, *ours),
                 denied,
-                "{name} ({cmd:#x}) escapes the fence"
+                "{name} ({ours:#x}) escapes the fence"
             );
         }
         assert_eq!(
@@ -1319,11 +1362,12 @@ mod tests {
     fn file_setattr_evaluates_to_eacces() {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
-        // file_setattr(469) postdates libc 0.2.189; the number is from
-        // asm/unistd_64.h. It mutates inode flags Landlock cannot
+        // file_setattr postdates libc 0.2.189; the number is from
+        // asm/unistd_64.h: 469. It mutates inode flags Landlock cannot
         // restrict, like the SETFLAGS ioctl above.
+        assert_eq!(SYS_FILE_SETATTR, 469, "wrong number for file_setattr");
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, 469, 0, 0),
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_FILE_SETATTR, 0, 0),
             denied,
             "file_setattr escapes the fence"
         );

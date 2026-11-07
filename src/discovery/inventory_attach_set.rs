@@ -2726,6 +2726,141 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn copyup_pair_key_records_at_most_two_members() {
+        // The content-routed view under a pair key still resolves
+        // Known (see copyup_pair_key_routes_same_file_by_content) —
+        // but the set records at most two members per key, never a
+        // third alias view.
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let other_path = provider(&dir, "other.so", "provider-other");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let mut pins1 = PinnedObjects::empty();
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&upper_path, None, 1, "sha-u"))
+                .is_empty()
+        );
+        let key = pins1.pinned().next().unwrap().key;
+        let mut lower_replay = real_scan_pin(&lower_path, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lower_replay);
+        repath_single_pin(&mut lower_replay, upper_path.to_str().unwrap());
+        assert!(pins1.absorb(lower_replay).is_empty());
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&other_path, None, 1, "sha-o"))
+                .is_empty()
+        );
+        assert_eq!(pins1.pinned().count(), 3);
+        let upper_module = copyup_module(&pins1, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pins1, &upper_path, "sha-l", &offsets(3), Some(0));
+        let other_module = copyup_module(&pins1, &other_path, "sha-o", &offsets(3), None);
+        let pass1 = set.absorb(
+            &lower(&[upper_module, lower_module, other_module], &pins1, policy),
+            &pins1,
+        );
+        assert!(pass1.gaps.is_empty());
+        assert_eq!(set.by_raw.get(&key).map_or(0, Vec::len), 2);
+        // Pass 2: the other file observed under the pair key routes
+        // Known — without growing the member list.
+        let mut pins2 = PinnedObjects::empty();
+        assert!(
+            pins2
+                .absorb(real_scan_pin(&other_path, Some(key), 1, "sha-o"))
+                .is_empty()
+        );
+        repath_single_pin(&mut pins2, upper_path.to_str().unwrap());
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(&pins2, &upper_path, "sha-o", &offsets(3), None)],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        match pass2.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-o".to_string(),
+        }) {
+            Some(AttachVerdict::Admitted { .. }) => {}
+            other => panic!("the same file must route by content: {other:?}"),
+        }
+        assert_eq!(
+            set.by_raw.get(&key).map_or(0, Vec::len),
+            2,
+            "no third member recorded"
+        );
+    }
+
+    #[test]
+    fn copyup_pair_key_refuses_a_rewritten_upper_third_member() {
+        // A rewritten upper re-pinned with the proven lower still in
+        // the pass proves a third member for the pair key; the set
+        // refuses it instead of growing the key, leaving the pair
+        // undisturbed (no changed gap: the proven side is never
+        // poisoned by the unproven rewrite).
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let upper2_path = provider(&dir, "upper2.so", "provider-upper-v2");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        let upper_module = copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0));
+        let pass1 = set.absorb(
+            &lower(&[upper_module, lower_module], &pair_pins, policy),
+            &pair_pins,
+        );
+        assert!(pass1.gaps.is_empty());
+        // Pass 2 re-pins the rewritten upper with the proven lower.
+        let merge = upper_path.to_str().unwrap();
+        let mut pins2 = PinnedObjects::empty();
+        let mut rewritten = real_scan_pin(&upper2_path, Some(key), 1, "sha-u2");
+        repath_single_pin(&mut rewritten, merge);
+        assert!(pins2.absorb(rewritten).is_empty());
+        let mut lower2 = real_scan_pin(&lower_path, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lower2);
+        repath_single_pin(&mut lower2, merge);
+        assert!(pins2.absorb(lower2).is_empty());
+        assert_eq!(pins2.pinned().count(), 2);
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(&pins2, &upper_path, "sha-u2", &offsets(3), None)],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        match pass2.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-u2".to_string(),
+        }) {
+            Some(AttachVerdict::Refused { reason }) => assert!(
+                reason.contains("already names a witness-proven copy-up pair"),
+                "the third member keeps the pair reason: {reason}"
+            ),
+            other => panic!("the rewritten upper must be refused: {other:?}"),
+        }
+        assert_eq!(
+            set.by_raw.get(&key).map_or(0, Vec::len),
+            2,
+            "the pair keeps two members"
+        );
+        assert_eq!(set.len(), 6, "the pair keeps its endpoints");
+        assert_eq!(pass2.gaps.len(), 1, "the refusal is disclosed: {:?}", pass2.gaps);
+        assert_eq!(pass2.gaps[0].subject, REFUSED_SUBJECT);
+    }
+
+    #[test]
     fn module_members_name_each_admitted_modules_endpoints_and_stay_bounded() {
         // Budget 8: membership bound 32. P holds 8 endpoints; seven
         // forwarders each target all eight (8 memberships each).

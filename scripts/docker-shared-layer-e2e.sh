@@ -757,8 +757,10 @@ wait_ready() {
 }
 
 start_inventory() {
+    # -v: per-pass stderr lines are verbose-only (pass 0's headline excepted);
+    # pass_count/wait_passes need every pass's line. The JSON (-o) is unchanged.
     obs inventory --system --identity-backend "$2" --duration "$3" --caller-metadata none \
-        -o "$4" >"$WORK/$1.out" 2>"$WORK/$1.err" &
+        -v -o "$4" >"$WORK/$1.out" 2>"$WORK/$1.err" &
     CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
     STARTED_PID=$!
 }
@@ -1116,9 +1118,9 @@ wait_passes span-userspace "$PID_SPAN_U" "$((R2M_U0 + 2))" \
     || fail_cell "spanning userspace capture ran fewer than two passes after the round-2 twin mapped"
 
 say "=== cgroup profile of B spanning the copy-up ==="
-start_profile d1-span-b "$CG_B" "$SPAN"
+start_profile d1-span-b "$CG_B" "$SPAN" "$WORK/d1-span-b.json"
 PID_SPAN_P=$!
-wait_ready span-profile-b "$PID_SPAN_P" || fail_cell "span profile of B never became ready"
+wait_ready d1-span-b "$PID_SPAN_P" || fail_cell "span profile of B never became ready"
 
 say "=== same-bytes copy-up in B only (OQ5) ==="
 STAT_B_COPY_PRE=$(prov_stat "$PID_B_PRE") || fail_cell "cannot re-stat B provider"

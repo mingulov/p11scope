@@ -3435,11 +3435,6 @@ fn joint_pregrant_close_reasons_counted() {
     assert_eq!(counts.no_hold, 0, "no idle close");
 }
 
-/// F4: a pre-grant admission whose caller has a pending exit stages
-/// no D1 gap — the custody conversion wins and the peek skips the
-/// disclosure, so the input stages exactly the custody refusal and
-/// reduces no S1. Same taint setup as the timeout twin.
-#[test]
 /// One running hook drains a saturated count-only cursor past its
 /// H0 close: with the production running-hook budget the 1,100-row
 /// backlog leaves Collecting in a single service call instead of
@@ -3468,6 +3463,10 @@ fn running_hook_budget_drains_saturated_quantum_in_one_hook() {
     );
 }
 
+/// F4: a pre-grant admission whose caller has a pending exit stages
+/// no D1 gap — the custody conversion wins and the peek skips the
+/// disclosure, so the input stages exactly the custody refusal and
+/// reduces no S1. Same taint setup as the timeout twin.
 #[test]
 fn joint_pregrant_custody_refused_input_stages_no_d1_gap() {
     let mut scene = pregrant_scene();

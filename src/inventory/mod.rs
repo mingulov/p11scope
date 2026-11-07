@@ -220,12 +220,12 @@ fn gate_poll_interval_unset_is_production_default() {
 /// engineering floor: it may be raised, never lowered.
 #[test]
 fn running_hook_budget_sustains_paced_rates() {
-    assert!(
+    const _: () = assert!(
         RUNNING_HOOK_ACTIONS >= 8192,
         "one hook carries a saturated quantum plus its seal"
     );
-    assert!(
-        RUNNING_HOOK_DEADLINE >= Duration::from_millis(120),
+    const _: () = assert!(
+        RUNNING_HOOK_DEADLINE.as_millis() >= 120,
         "one hook has wall room for the seal"
     );
 }

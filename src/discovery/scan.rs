@@ -15064,6 +15064,47 @@ mod tests {
     }
 
     #[test]
+    fn copyup_fallback_refusal_publishes_no_candidate_index() {
+        // The terminal gap publishes only the refused count and the
+        // finite stage words — no candidate index reaches output
+        // (allowlist-v3 lower row), in text or JSON alike.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::write(&good, b"good").unwrap();
+        let bad = PathBuf::from("/lower/missing.so");
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile, WitnessVerdict::OtherFile],
+            vec![bad.clone(), good.clone()],
+        );
+        io.serve(&good, std::fs::File::open(&good).unwrap());
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("all-refused candidates refuse: {other:?}"),
+        };
+        assert!(
+            reason.contains("lower candidates refused: 2"),
+            "both skips counted: {reason}"
+        );
+        for stage in [
+            "could not be opened",
+            "the kernel witness proved another file",
+        ] {
+            assert!(
+                reason.contains(stage),
+                "finite stage words published: {reason}"
+            );
+        }
+        assert!(
+            !reason.contains("index "),
+            "no candidate index reaches output: {reason}"
+        );
+        assert!(
+            !reason.contains("missing.so"),
+            "candidate paths never published: {reason}"
+        );
+    }
+
+    #[test]
     fn copyup_fallback_all_unopenable_names_each_refusal() {
         // The nested-container shape: every candidate unopenable, each
         // refusal named (design step 5: named, per-candidate, not silent).

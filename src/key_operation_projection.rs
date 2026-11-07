@@ -1173,7 +1173,7 @@ pub(crate) mod producer {
         // semantic loss that disposed staged history while the feed
         // stays Joint is lost authority too: a current-segment
         // `record_lost` never sits under `populated`. A clean resume
-        // clears the loss latch and baselines disposed history: the
+        // clears the latches and baselines disposed history: the
         // closed segment stays counted beside a populated section.
         let lost = stagings.iter().any(|staging| {
             staging.degraded_loss()

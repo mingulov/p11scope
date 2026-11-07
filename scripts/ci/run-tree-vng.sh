@@ -92,7 +92,7 @@ esac
 {
     printf '#!/bin/sh\nset -u\n'
     printf 'OUT=%s\nTESTBIN=%s\nRUNNER=%s\n' "$(q "$OUT")" "$(q "$TESTBIN")" "$(q "$RUNNER")"
-    printf '# The guest has no sudo session: the harness-baked drop target.\n'
+    printf '# The guest has no invoker login session: the harness-baked drop target.\n'
     printf 'export SUDO_UID=%s SUDO_GID=%s\n' "$(q "$RUNUID")" "$(q "$RUNGID")"
     cat <<'INNER_EOF'
 uname -r > "$OUT/uname.txt"

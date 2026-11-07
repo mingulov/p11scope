@@ -10876,6 +10876,44 @@ mod maps_skip_tests {
     }
 
     #[test]
+    fn admission_record_feeds_watch_pins_all_four_verdicts() {
+        use super::AdmissionRecord;
+        assert!(
+            AdmissionRecord::Admitted {
+                class: "exact",
+                endpoints: 3
+            }
+            .feeds_watch(),
+            "admitted modules carry watches"
+        );
+        assert!(
+            AdmissionRecord::Partial {
+                class: "exact",
+                endpoints: 1,
+                reason: "test".into()
+            }
+            .feeds_watch(),
+            "partial modules keep attached endpoints"
+        );
+        assert!(
+            !AdmissionRecord::Refused {
+                class: "heuristic",
+                reason: "test".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            }
+            .feeds_watch(),
+            "refused modules attach nothing"
+        );
+        assert!(
+            !AdmissionRecord::Unresolved {
+                reasons: vec!["test".into()]
+            }
+            .feeds_watch(),
+            "unresolved modules reach no verdict"
+        );
+    }
+
+    #[test]
     fn members_mapping_pinned_providers_are_never_skipped() {
         let digest = digest_maps_snapshot(&snapshot());
         let sweep = vec![(4242, snapshot()), (4243, snapshot())];

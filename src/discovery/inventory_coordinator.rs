@@ -27910,6 +27910,73 @@ mod maps_skip_memory_tests {
             "the backstop sheds mapper memory with the digests"
         );
     }
+
+    /// Only mappers of watch-feeding objects never skip: a member
+    /// mapping solely refused objects skips like any examined member
+    /// (nothing to flap: refused modules carry no watch and render
+    /// refused whatever the mapping state). RED: the memory is
+    /// admission-blind and records both mappers.
+    #[test]
+    fn only_admitted_object_mappers_join_the_never_skip_set() {
+        use crate::inspect_system::{AdmissionRecord, CatalogObject, MemberStatus, ProcessRecord};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let mut coordinator = skip_coordinator();
+        let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        let key = |inode| ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+        };
+        let object = |path: &str, inode: u64, admission: AdmissionRecord| CatalogObject {
+            path: path.into(),
+            key: key(inode),
+            sha256: None,
+            build_id: None,
+            identity_source: None,
+            note: None,
+            mappings: Vec::new(),
+            observations: Vec::new(),
+            admission,
+        };
+        catalog.objects = vec![
+            object(
+                "/admitted.so",
+                1,
+                AdmissionRecord::Admitted {
+                    class: "exact",
+                    endpoints: 3,
+                },
+            ),
+            object(
+                "/refused.so",
+                2,
+                AdmissionRecord::Refused {
+                    class: "heuristic",
+                    reason: "test".into(),
+                    kind: crate::plan::RefusalKind::CapacityWhole,
+                },
+            ),
+        ];
+        let record = |pid, objects| ProcessRecord {
+            pid,
+            status: MemberStatus::Scanned,
+            objects,
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: true,
+        };
+        catalog.processes.push(record(12, vec![0]));
+        catalog.processes.push(record(13, vec![1]));
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.passes = 0;
+        assert_eq!(
+            coordinator.priors_for_collection().mappers,
+            BTreeSet::from([12]),
+            "the refused-only mapper must skip (its modules carry no watch)"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -51,7 +51,7 @@ privileged_run_tree_many_children_land_exact
 
 # One results.jsonl row: exactly cell/pass/qualification/detail.
 result() {
-    python3 - "$1" "$2" "$3" "$4" <<'PY' | tee -a "$OUT/results.jsonl"
+    python3 -I - "$1" "$2" "$3" "$4" <<'PY' | tee -a "$OUT/results.jsonl"
 import json,sys
 print(json.dumps({'cell':sys.argv[1],'pass':sys.argv[2]=='1','detail':sys.argv[3],'qualification':sys.argv[4]}))
 PY
@@ -85,7 +85,7 @@ judge_cell() {
 write_summary() {
     local results=$1 summary=$2
     shift 2
-    python3 - "$results" "$@" <<'PY' | tee "$summary"
+    python3 -I - "$results" "$@" <<'PY' | tee "$summary"
 import json,sys
 rows=[json.loads(line) for line in open(sys.argv[1]) if line.strip()]
 expected=sys.argv[2:]; ids=[row['cell'] for row in rows]
@@ -121,9 +121,9 @@ run_self_test() {
         if judge_cell "$name" "$log" "$rc" 42; then got_rc=0; else got_rc=1; fi
         [ "$got_rc" -eq "$want_rc" ] || fail "$name rc=$rc: judge returned $got_rc, want $want_rc"
         row=$(tail -1 "$OUT/results.jsonl")
-        got=$(printf '%s' "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin)["pass"])')
+        got=$(printf '%s' "$row" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["pass"])')
         [ "$got" = "$want_pass" ] || fail "$name rc=$rc: pass=$got, want $want_pass ($row)"
-        got=$(printf '%s' "$row" | python3 -c 'import json,sys; print(json.load(sys.stdin)["qualification"])')
+        got=$(printf '%s' "$row" | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["qualification"])')
         [ "$got" = "$want_qual" ] || fail "$name rc=$rc: qualification=$got, want $want_qual ($row)"
         case "$row" in
             *"$want_detail"*) ;;
@@ -157,7 +157,7 @@ test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
     # Rows carry exactly the four contract keys.
     while IFS= read -r row; do
         [ -n "$row" ] || continue
-        keys=$(printf '%s' "$row" | python3 -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin).keys())))')
+        keys=$(printf '%s' "$row" | python3 -I -c 'import json,sys; print(" ".join(sorted(json.load(sys.stdin).keys())))')
         [ "$keys" = "cell detail pass qualification" ] || fail "row keys drifted: $keys ($row)"
     done <"$OUT/results.jsonl"
     # The summary gate accepts exactly the full pass set.
@@ -228,6 +228,9 @@ command -v timeout >/dev/null 2>&1 || {
 
 PRIVTMP=$(mktemp -d) || exit 2
 chmod 700 "$PRIVTMP" || exit 2
+if [ -n "${SUDO_UID:-}" ]; then
+    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$PRIVTMP" || exit 2
+fi
 cleanup() {
     if command -v pkill >/dev/null 2>&1; then
         # Best effort: only our own strays can name the fresh private

@@ -3004,15 +3004,6 @@ impl LiveJointMachine {
                                     }
                                 };
                                 self.note_pregrant_close(reason);
-                                // TEMP F9 DIAGNOSTIC (revert before merge): pregrant close reason.
-                                if std::env::var_os("P11SCOPE_STAGE_TIMINGS")
-                                    .is_some_and(|v| v == "1")
-                                {
-                                    eprintln!(
-                                        "joint-timing: pregrant_close reason={reason:?} attempted={}",
-                                        original.attempted
-                                    );
-                                }
                             }
                             budget.spend(1);
                             return (Phase::Binding(original), Ok(Step::Continue));

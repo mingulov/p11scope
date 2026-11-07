@@ -32,7 +32,9 @@ __asm__(".text\n"
         ".type _start, @function\n"
         "_start:\n"
         " mov %rsp, %rdi\n"
-        " call sleeper_main\n");
+        " call sleeper_main\n"
+        /* sleeper_main exits and never returns; trap if it ever does. */
+        " ud2\n");
 
 void sleeper_main(u64 *sp)
 {

@@ -9758,6 +9758,107 @@ fn discover_wires_metrics_without_counter_mode_to_the_remedy_hint() {
     }
 }
 
+/// A zombie (exited but unreaped) member of the initial scan is silent like
+/// a reaped exit: it can map nothing new and make no new calls, so there
+/// is no unknown to publish. Before the fix, reaped-only detection missed
+/// zombies and the scan published an unreadable-member skip that failed
+/// strict system cells under short-lived-process churn.
+#[test]
+fn initial_scan_zombie_member_is_silent_like_a_reaped_exit() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..2)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let live = children.0[0].id();
+    let zombie = children.0[1].id();
+    let self_exe = std::env::current_exe().unwrap();
+    for pid in [live, zombie] {
+        let exe = format!("/proc/{pid}/exe");
+        let mut execed = false;
+        for _ in 0..500 {
+            if std::fs::read_link(&exe).is_ok_and(|target| target != self_exe) {
+                execed = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(execed, "sleep child {pid} never execed");
+    }
+    children.0[1].kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !process::process_is_zombie(zombie) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGKILLed child did not become an unreaped zombie"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    assert!(
+        !process::generation_gone(zombie),
+        "the unreaped zombie still has /proc stat"
+    );
+    let dir = tempfile::tempdir().expect("a scope directory");
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{live}\n{zombie}\n"),
+    )
+    .expect("a cgroup.procs");
+    let args = CaptureArgs {
+        track_short_lived: false,
+        verbose: false,
+        quiet: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    let engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert!(
+        engine.views.iter().any(|view| view.pid() == live),
+        "the live member is retained"
+    );
+    assert!(
+        !engine.base_counters.object_skips.iter().any(|skip| {
+            skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+        }),
+        "a zombie member earns silence, not an unreadable-member skip: {:?}",
+        engine.base_counters.object_skips
+    );
+}
+
 /// Task 2 (cgroup-256 B1): the multi-process scan cap is a CLI-settable Engine
 /// field, not a hardcoded constant. Five live members with the cap at two: the
 /// initial pass scans at most two and publishes a skip naming the effective
@@ -11129,6 +11230,90 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
         child.kill().unwrap();
         child.wait().unwrap();
     }
+}
+
+/// A zombie (exited but unreaped) newcomer refresh is silent like a reaped
+/// exit: the view open fails, but the dead generation earns no
+/// unreadable-member skip. Before the fix, reaped-only detection missed
+/// zombies on the refresh path too.
+#[test]
+fn refresh_newcomer_zombie_is_silent_like_a_reaped_exit() {
+    struct ChildrenGuard(Vec<std::process::Child>);
+    impl Drop for ChildrenGuard {
+        fn drop(&mut self) {
+            for child in &mut self.0 {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+    }
+
+    let mut children = ChildrenGuard(
+        (0..3)
+            .map(|_| {
+                std::process::Command::new("sleep")
+                    .arg("30")
+                    .die_with_parent()
+                    .spawn()
+                    .unwrap()
+            })
+            .collect(),
+    );
+    let pids: Vec<_> = children.0.iter().map(|child| child.id()).collect();
+    let dir = tempfile::tempdir().expect("a scope directory");
+    let listing: String = pids[..2].iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    let args = CaptureArgs {
+        track_short_lived: false,
+        verbose: false,
+        quiet: false,
+        kind: crate::cli::Kind::Profile,
+        modules: vec![],
+        exclude_modules: vec![],
+        manifests: vec![],
+        prearm_modules: vec![],
+        hooks: HookRegistry::builtin(),
+        scope: crate::cli::ScopeArg::Cgroup(dir.path().to_path_buf()),
+        metrics: false,
+        counter_mode: None,
+        select_endpoint: None,
+        duration: None,
+        out: None,
+        max_events: None,
+        ring_bytes: None,
+        drain_interval: None,
+        max_scan_pids: None,
+        unsafe_requested: false,
+        allow_confined_uretprobe: false,
+        attach_backend: BackendSelection::default(),
+    };
+    let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+    let mut engine = Engine::discover(&args, &scope, None).expect("an uncapped cgroup captures");
+    assert_eq!(engine.views.len(), 2, "two members are retained");
+    // The third member arrives already dead but unreaped: a zombie newcomer.
+    children.0[2].kill().unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !process::process_is_zombie(pids[2]) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "SIGKILLed child did not become an unreaped zombie"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
+    assert!(
+        engine.request_refresh(pids[2], None),
+        "the zombie newcomer queues"
+    );
+    refresh_inventory_once(&mut engine);
+    assert!(
+        !engine.counters.object_skips.iter().any(|skip| {
+            skip.subject == UNREADABLE_MEMBER_SUBJECT && skip.reason == UNREADABLE_MEMBER_REASON
+        }),
+        "a zombie newcomer earns silence, not an unreadable-member skip: {:?}",
+        engine.counters.object_skips
+    );
 }
 
 /// Task 3.1b: event-driven refresh requests survive allocation exhaustion.

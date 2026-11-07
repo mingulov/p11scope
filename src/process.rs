@@ -1661,6 +1661,36 @@ pub(crate) fn process_is_zombie(pid: u32) -> bool {
         .is_some_and(|state| state == "Z")
 }
 
+/// True when `pid` is provably dead: reaped (`/proc/<pid>/stat` is gone)
+/// or zombie (state `Z`). A single stat read classifies both, so a reap
+/// or exit between two reads cannot strand a dead generation as unknown;
+/// any other read or parse failure answers false (fail-closed: the caller
+/// keeps its unknown). Discovery skip sites use this so an unreaped exit
+/// stays silent like a reaped one.
+pub(crate) fn generation_dead(pid: u32) -> bool {
+    let stat = match read_proc_stat(pid) {
+        Ok(stat) => stat,
+        Err(error) => return error.kind() == io::ErrorKind::NotFound,
+    };
+    let Some(end) = stat.rfind(')') else {
+        return false;
+    };
+    stat[end + 1..]
+        .split_whitespace()
+        .next()
+        .is_some_and(|state| state == "Z")
+}
+
+/// Whether a member whose scan failed is gone for skip purposes. The pin's
+/// `original_exited` verdict stands, but a fallback pin (pidfd refused:
+/// FD pressure, seccomp) still matches an unreaped zombie's start time,
+/// so a fresh `generation_dead` read covers the zombie the pin cannot see.
+/// Reuse-safe like `generation_dead`: either verdict only fires when the
+/// original generation is provably dead.
+pub(crate) fn scan_failure_gone(original_exited: bool, pid: u32) -> bool {
+    original_exited || generation_dead(pid)
+}
+
 fn gone_from(start_time: io::Result<u64>) -> bool {
     start_time.is_err_and(|error| error.kind() == io::ErrorKind::NotFound)
 }
@@ -2571,6 +2601,69 @@ int main(int argc, char **argv) {
 
         child.wait().unwrap();
         assert!(generation_gone(pid));
+    }
+
+    #[test]
+    fn generation_dead_covers_reaped_and_zombie_but_not_live() {
+        assert!(!generation_dead(std::process::id()));
+        assert!(generation_dead(u32::MAX));
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        assert!(!generation_dead(pid), "a live child reads dead");
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_zombie(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_is_zombie(pid), "the killed child is unreaped");
+        assert!(generation_dead(pid), "a zombie reads live");
+        child.wait().unwrap();
+        assert!(generation_dead(pid), "a reaped child reads live");
+    }
+
+    #[test]
+    fn scan_failure_gone_covers_fallback_pinned_zombie() {
+        assert!(
+            !scan_failure_gone(false, std::process::id()),
+            "a live pid reads gone at a scan-failure skip site"
+        );
+        assert!(
+            scan_failure_gone(false, u32::MAX),
+            "a reaped pid reads live at a scan-failure skip site"
+        );
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !process_is_zombie(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(process_is_zombie(pid), "the killed child is unreaped");
+        // A faithful FD-pressure fallback pin: no pidfd, real start time.
+        let pin = PidPin {
+            pid,
+            pidfd: None,
+            start_time: process_start_time(pid).ok(),
+            shared_charge: None,
+        };
+        let original_exited = pin.original_exited() == Ok(true);
+        assert!(
+            !original_exited,
+            "the fallback pin must see the zombie as its generation (test setup)"
+        );
+        assert!(
+            scan_failure_gone(original_exited, pid),
+            "a zombie reads live at a scan-failure skip site without pidfd"
+        );
+        child.wait().unwrap();
     }
 
     #[test]

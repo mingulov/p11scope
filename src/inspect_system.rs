@@ -56,7 +56,7 @@ use crate::inspect_identity::{
     begin_application, finish_application,
 };
 use crate::plan::{self, AdmissionPolicy, AdmissionScope};
-use crate::process::{ProcessView, ProcessViewId, generation_gone};
+use crate::process::{ProcessView, ProcessViewId, generation_dead};
 use crate::timing::{StageKind, StageTimings};
 use anyhow::{Context as _, Result, ensure};
 use p11scope_manifest::manifest::Manifest;
@@ -1049,7 +1049,10 @@ fn member_not_scanned(
     noise: &mut DiscoveryNoiseAggregator,
     mut gaps: Vec<PidGap>,
 ) -> MemberResult {
-    let status = match unreadable_member_skip(pid, generation_gone(pid), detail, noise) {
+    // A zombie is an exited generation: silent like a reaped exit
+    // instead of an unreadable-member gap.
+    let gone = generation_dead(pid);
+    let status = match unreadable_member_skip(pid, gone, detail, noise) {
         Some(skip) => {
             gaps.push(PidGap::generic_member(pid, skip));
             MemberStatus::Unreadable {
@@ -11196,5 +11199,53 @@ mod take_anchors_wiring_tests {
                 "take_anchors={take_anchors} must build capacity {expected}"
             );
         }
+    }
+
+    #[test]
+    fn zombie_member_not_scanned_reports_exited_not_unreadable() {
+        use crate::discovery::noise::DiscoveryNoiseAggregator;
+        use crate::fixture_guard::DieWithParent as _;
+        use crate::process::{ProcessViewId, generation_gone, process_is_zombie};
+
+        struct ChildGuard(std::process::Child);
+        impl Drop for ChildGuard {
+            fn drop(&mut self) {
+                let _ = self.0.kill();
+                let _ = self.0.wait();
+            }
+        }
+        let mut child = ChildGuard(
+            std::process::Command::new("sleep")
+                .arg("30")
+                .die_with_parent()
+                .spawn()
+                .unwrap(),
+        );
+        let pid = child.0.id();
+        child.0.kill().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !process_is_zombie(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "SIGKILLed child did not become an unreaped zombie"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(
+            !generation_gone(pid),
+            "the unreaped zombie still has /proc stat"
+        );
+        let mut noise = DiscoveryNoiseAggregator::default();
+        let result = super::member_not_scanned(
+            pid,
+            ProcessViewId(0),
+            "zombie fixture",
+            &mut noise,
+            Vec::new(),
+        );
+        assert!(
+            matches!(result.status, super::MemberStatus::Exited),
+            "a zombie member reports Exited, not an unreadable gap"
+        );
     }
 }

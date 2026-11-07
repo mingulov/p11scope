@@ -7019,9 +7019,12 @@ fn discover_plan(
                 return Err(anyhow!(error));
             }
             Err(error) => {
+                // A zombie is an exited generation: silent like a reaped
+                // exit instead of an unreadable-member skip.
+                let gone = process::generation_dead(*pid);
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
-                    process::generation_gone(*pid),
+                    gone,
                     &format!("the process generation could not be pinned: {error}"),
                     &mut discovered.base_counters.noise,
                 ) {
@@ -7090,9 +7093,13 @@ fn discover_plan(
                     .object_skips
                     .extend(counters.object_skips);
                 discovered.base_counters.noise.merge(&counters.noise);
+                // A zombie is an exited generation even when the pin fell
+                // back to /proc identity: silent like a reaped exit
+                // instead of an unreadable-member skip.
+                let gone = process::scan_failure_gone(view.original_exited() == Ok(true), *pid);
                 if let Some(skipped) = unreadable_member_skip(
                     *pid,
-                    view.original_exited() == Ok(true),
+                    gone,
                     &format!("the process could not be scanned: {error:#}"),
                     &mut discovered.base_counters.noise,
                 ) {
@@ -22771,7 +22778,13 @@ impl Engine {
                 }
                 Err(error) => {
                     let pid = self.views[position].pid();
-                    let gone = self.views[position].original_exited() == Ok(true);
+                    // A zombie is an exited generation even when the pin fell
+                    // back to /proc identity: silent like a reaped exit
+                    // instead of an unreadable-member skip.
+                    let gone = process::scan_failure_gone(
+                        self.views[position].original_exited() == Ok(true),
+                        pid,
+                    );
                     failed_pids.insert(pid);
                     let detail = format!("{failure}: {error:#}");
                     skipped.extend(unreadable_member_skip(
@@ -23890,9 +23903,12 @@ impl Engine {
                     // the pool instead of burning for the capture lifetime.
                     self.release_view_id(id);
                     failed_refresh_pids.insert(pid);
+                    // A zombie is an exited generation: silent like a reaped
+                    // exit instead of an unreadable-member skip.
+                    let gone = process::generation_dead(pid);
                     skipped.extend(unreadable_member_skip(
                         pid,
-                        process::generation_gone(pid),
+                        gone,
                         &format!("the process generation could not be retained: {error}"),
                         &mut self.counters.noise,
                     ));
@@ -23926,9 +23942,13 @@ impl Engine {
                     // this view, so its ID returns to the pool.
                     self.release_view_id(view.id());
                     failed_refresh_pids.insert(pid);
+                    // A zombie is an exited generation even when the pin fell
+                    // back to /proc identity: silent like a reaped exit
+                    // instead of an unreadable-member skip.
+                    let gone = process::scan_failure_gone(view.original_exited() == Ok(true), pid);
                     skipped.extend(unreadable_member_skip(
                         pid,
-                        view.original_exited() == Ok(true),
+                        gone,
                         &format!("the process generation could not be scanned: {error:#}"),
                         &mut self.counters.noise,
                     ));

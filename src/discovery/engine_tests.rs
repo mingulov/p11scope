@@ -64592,7 +64592,10 @@ fn owned_run_under_cgroup_scope_ignores_descendant_exec() {
         &mut pending,
     );
     assert_eq!(
-        engine.target_exec_hints().expect("armed target split").total(),
+        engine
+            .target_exec_hints()
+            .expect("armed target split")
+            .total(),
         1
     );
     assert_eq!(engine.extensive.stash_len_for_test(), 0);

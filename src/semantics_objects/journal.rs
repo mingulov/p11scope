@@ -5274,6 +5274,13 @@ impl JournalAdapter {
         fault: &impl FaultEpoch,
     ) -> Result<SealSuccess, SealFailure> {
         let requested = self.retained_failure_domain(bootstrap);
+        // TEMP F9 DIAGNOSTIC (revert before merge): seal oldest-entry.
+        let diag_seal =
+            std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1");
+        let diag_oldest = diag_seal
+            .then(|| self.open.values().map(|e| e.begin.entry_ns()).min())
+            .flatten();
+        let diag_count = self.open.len();
         self.seal_inner(model, audit, bootstrap, frontier, births, fault)
             .map_err(|mut failure| {
                 if matches!(failure.scope, SealFailureScope::Unqualified)
@@ -5283,6 +5290,17 @@ impl JournalAdapter {
                     failure.scope = SealFailureScope::Domain(domain);
                 }
                 failure
+            })
+            .map(|ok| {
+                if diag_seal {
+                    eprintln!(
+                        "joint-timing: seal_done oldest={} count={} seal_end_ns={}",
+                        diag_oldest.unwrap_or(0),
+                        diag_count,
+                        crate::discovery::caller_registry::now_ns()
+                    );
+                }
+                ok
             })
     }
 

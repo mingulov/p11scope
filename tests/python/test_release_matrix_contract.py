@@ -2837,7 +2837,8 @@ int main(int argc, char **argv) {
                     + [([f"C_Uncalled_{index}"], 0) for index in range(79)])
                 for row in report["functions"]:
                     get, count = row["names"] == ["C_GetAttributeValue"], row["calls"]
-                    row.update(errors=5 if get else 0, pending_returns=0, in_flight=0,
+                    row.update(forwarding_layer=False,
+                               errors=5 if get else 0, pending_returns=0, in_flight=0,
                         latency_ns={"approximate": True, "p50": 1 if count else None, "p95": 1 if count else None,
                                     "p99": 1 if count else None, "total": count, "max": int(count > 0)},
                         rv_counts=({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)} if get

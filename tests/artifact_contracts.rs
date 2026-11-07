@@ -9229,7 +9229,7 @@ aggregate-only-metrics default metrics"
     );
     assert!(
         owned_lane.contains("--workload-origin owned")
-            && owned_lane.contains("run --manifest \"$WORK/matrix-manifest.json\"")
+            && owned_lane.contains("run -v --manifest \"$WORK/matrix-manifest.json\"")
             && owned_lane.contains("--mode metrics --pause never --duration 35")
             && !owned_lane.contains("--kill-on-timeout")
             && owned_lane.contains(

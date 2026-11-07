@@ -16328,6 +16328,50 @@ mod tests {
         driver.publication_pending()
     }
 
+    #[test]
+    fn cgroup_fence_holds_while_a_coordinator_publication_pends() {
+        // A tick-begun Joint preparation pends at the coordinator with no
+        // driver flag; the cgroup fence must still hold so the loop defers
+        // the next collection past it (its apply refuses while the previous
+        // publication retains the cgroup continuation).
+        let mut coordinator = coordinator();
+        coordinator.pose_pending_joint_publication_for_test();
+        assert!(
+            coordinator.publication_pending(),
+            "the posed publication pends"
+        );
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        driver.cgroup = Some(
+            crate::inventory::CgroupDriverState::new(None, None).expect("cgroup state builds"),
+        );
+        assert!(
+            driver.publication_pending(),
+            "a cgroup run defers collection while a coordinator publication pends"
+        );
+    }
+
+    #[test]
+    fn legacy_fence_ignores_coordinator_only_pending() {
+        // Scope twin: without a cgroup run the loop keeps its
+        // proceed-and-resume shape past coordinator-only pending (the
+        // joint-commit path resumes the unfinished publication).
+        let mut coordinator = coordinator();
+        coordinator.pose_pending_joint_publication_for_test();
+        assert!(
+            coordinator.publication_pending(),
+            "the posed publication pends"
+        );
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.semantic = Some(joint_lane(WindDownIo::completing(), false));
+        assert!(
+            !driver.publication_pending(),
+            "the legacy path still proceeds past coordinator-only pending"
+        );
+    }
+
     fn empty_pass_report() -> PassReport {
         PassReport {
             pass: 0,

@@ -419,18 +419,37 @@ impl DiscoveryScheduler {
         let backlog_order = self.backlog_order(&backlog);
         self.tick_backlog_waited = !backlog_order.is_empty();
         // Newcomers take up to their share, plus any batch slots the
-        // backlog cannot fill; the backlog fills the rest. Callers keep
-        // the share below the batch, so a non-empty backlog keeps at
-        // least the difference in the selected window every tick.
-        let newcomer_share = newcomer_share.min(max_new_views);
-        let fresh_take = fresh_order
-            .len()
-            .min(newcomer_share.max(max_new_views.saturating_sub(backlog_order.len())));
-        let backlog_take = backlog_order
-            .len()
-            .min(max_new_views.saturating_sub(fresh_take));
-        let (fresh_take, backlog_take) =
-            (&fresh_order[..fresh_take], &backlog_order[..backlog_take]);
+        // backlog cannot fill; the backlog fills the rest. While backlog
+        // waits the share leaves at least one batch slot for it: at a
+        // batch at or below the share a flood would otherwise take the
+        // whole window and the owed lead would have no backlog slot to
+        // lead with.
+        let newcomer_share = if backlog_order.is_empty() {
+            newcomer_share.min(max_new_views)
+        } else {
+            newcomer_share.min(max_new_views.saturating_sub(1))
+        };
+        // One slot with both classes waiting: the owed flag chooses the
+        // class, so newcomer and backlog ticks alternate instead of the
+        // flood taking every tick.
+        let (fresh_take, backlog_take) = if max_new_views == 1
+            && !fresh_order.is_empty()
+            && !backlog_order.is_empty()
+        {
+            if self.backlog_owed {
+                (&fresh_order[..0], &backlog_order[..1])
+            } else {
+                (&fresh_order[..1], &backlog_order[..0])
+            }
+        } else {
+            let fresh_take = fresh_order.len().min(
+                newcomer_share.max(max_new_views.saturating_sub(backlog_order.len())),
+            );
+            let backlog_take = backlog_order
+                .len()
+                .min(max_new_views.saturating_sub(fresh_take));
+            (&fresh_order[..fresh_take], &backlog_order[..backlog_take])
+        };
         let mut admitted = Vec::with_capacity(fresh_take.len() + backlog_take.len());
         if fresh_take.is_empty() || backlog_take.is_empty() {
             // A missing class keeps today's single-class order verbatim.

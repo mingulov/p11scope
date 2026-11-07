@@ -303,7 +303,7 @@ fn b7_run_refuses_without_capture_lane() {
         let host_refusal = multi_host::refusal();
         let denied = host_refusal
             .as_ref()
-            .is_some_and(|reason| reason.starts_with("live capture needs root"));
+            .is_some_and(|reason| reason.starts_with("live capture needs CAP_"));
         for args in [
             &["run", "--", "/bin/true"][..],
             &[
@@ -411,7 +411,7 @@ fn j2_unprivileged_profile_names_inspect_and_next_step() {
             refused.stderr
         );
         let denied = multi_host::refusal()
-            .is_some_and(|reason| reason.starts_with("live capture needs root"));
+            .is_some_and(|reason| reason.starts_with("live capture needs CAP_"));
         if denied {
             assert!(refused.stderr.contains("sudo"), "{}", refused.stderr);
             assert!(
@@ -682,7 +682,7 @@ fn t3_f7_attach_refusal_points_at_doctor() {
                 "{}",
                 refused.stderr
             );
-            if reason.starts_with("live capture needs root") {
+            if reason.starts_with("live capture needs CAP_") {
                 assert!(refused.stderr.contains("sudo"), "{}", refused.stderr);
                 assert!(
                     !refused.stderr.contains("p11scope doctor"),
@@ -880,7 +880,8 @@ fn high1_missing_privilege_is_named_and_never_offers_the_override() {
             refused.stderr
         );
         assert!(
-            refused.stderr.contains("needs root") && refused.stderr.contains("sudo"),
+            refused.stderr.contains("live capture needs CAP_")
+                && refused.stderr.contains("Grant the minimal set: sudo setcap "),
             "{args:?}: {}",
             refused.stderr
         );

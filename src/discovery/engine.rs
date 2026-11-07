@@ -10684,6 +10684,17 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
     }
 }
 
+/// Which admission window selected one tick's pids, with the backlog
+/// class it classified for the owed ledger: free slots split fresh from
+/// backlog under two cursors, scarce slots split pending fresh from the
+/// backlog class (pending backlog plus rotation candidates) under one.
+/// Attempts on a backlog member repay the shared owed debt; attempts on
+/// any other admitted pid record as the window's fresh class.
+enum AdmissionLedger {
+    Free { backlog: BTreeSet<u32> },
+    Scarce { backlog: BTreeSet<u32> },
+}
+
 impl Engine {
     fn empty() -> Self {
         Self {
@@ -23603,24 +23614,24 @@ impl Engine {
     /// Admits one tick's newcomer window: opens, scans, and stages each
     /// admitted pid as an inventory new view. The tick quantum stops
     /// admissions before another scan — the current pid and the rest defer
-    /// with their requests retained, never dropped. The admitted window
-    /// interleaves newcomers and backlog (free slots only; scarce ticks
-    /// keep the pending-first order), so a truncated attempt round defers
-    /// both classes proportionally and the backlog keeps progressing under
-    /// a steady flood. `backlog` carries the free-slots classification for
-    /// the owed ledger (`None` on the scarce path, which never classifies).
-    /// At view capacity a pressure-selected pid evicts one guarded
-    /// exploratory view and retries (Lane-A P1); as the last resort, a
-    /// still-unhoused pending newcomer with no evictable view anywhere
-    /// completes without a view when a complete probationary scan proves
-    /// provider-freedom (Lane-A P3). Returns the staged new views, the pids
-    /// to keep queued (failures and deferrals alike), and the tick's skips.
-    /// Extracted verbatim from the inventory tick so an injected clock can
-    /// expire mid-path; production behavior is unchanged.
+    /// with their requests retained, never dropped. Both windows interleave
+    /// newcomers and backlog — free slots split fresh from backlog under
+    /// two cursors, scarce slots split pending fresh from the backlog class
+    /// (pending backlog plus rotation) under one — so a truncated attempt
+    /// round defers both proportionally and the backlog keeps progressing
+    /// under a steady flood. `ledger` carries the window's classification
+    /// for the owed ledger. At view capacity a pressure-selected pid evicts
+    /// one guarded exploratory view and retries (Lane-A P1); as the last
+    /// resort, a still-unhoused pending newcomer with no evictable view
+    /// anywhere completes without a view when a complete probationary scan
+    /// proves provider-freedom (Lane-A P3). Returns the staged new views,
+    /// the pids to keep queued (failures and deferrals alike), and the
+    /// tick's skips. Extracted verbatim from the inventory tick so an
+    /// injected clock can expire mid-path; production behavior is unchanged.
     fn admit_inventory_new_views(
         &mut self,
         admitted: Vec<u32>,
-        backlog: Option<&BTreeSet<u32>>,
+        ledger: &AdmissionLedger,
         max_scan_pids: usize,
         tick_now: &mut TickClock<'_>,
     ) -> (Vec<InventoryNewView>, BTreeSet<u32>, Vec<Skipped>) {
@@ -23656,12 +23667,18 @@ impl Engine {
                     {
                         let (provider_free, probe_skips) = self.probe_newcomer_provider_free(pid);
                         skipped.extend(probe_skips);
-                        match backlog {
-                            Some(set) if set.contains(&pid) => {
+                        match ledger {
+                            AdmissionLedger::Free { backlog }
+                                if backlog.contains(&pid) =>
+                            {
                                 self.scheduler.note_backlog_attempt(pid);
                             }
-                            Some(_) => self.scheduler.note_newcomer_attempt(pid),
-                            None => self.scheduler.note_new_view_attempt(pid),
+                            AdmissionLedger::Scarce { backlog }
+                                if backlog.contains(&pid) =>
+                            {
+                                self.scheduler.note_scarce_backlog_attempt(pid);
+                            }
+                            _ => self.scheduler.note_newcomer_attempt(pid),
                         }
                         if provider_free {
                             self.newcomer_first_seen.remove(&pid);
@@ -23684,10 +23701,14 @@ impl Engine {
                     break;
                 }
             };
-            match backlog {
-                Some(set) if set.contains(&pid) => self.scheduler.note_backlog_attempt(pid),
-                Some(_) => self.scheduler.note_newcomer_attempt(pid),
-                None => self.scheduler.note_new_view_attempt(pid),
+            match ledger {
+                AdmissionLedger::Free { backlog } if backlog.contains(&pid) => {
+                    self.scheduler.note_backlog_attempt(pid);
+                }
+                AdmissionLedger::Scarce { backlog } if backlog.contains(&pid) => {
+                    self.scheduler.note_scarce_backlog_attempt(pid);
+                }
+                _ => self.scheduler.note_newcomer_attempt(pid),
             }
             let open_start = crate::attach::monotonic_ns();
             let opened = ProcessView::open_with_budget(id, pid, &mut self.budget);
@@ -24120,26 +24141,60 @@ impl Engine {
         // before selecting this tick's window. Failed opens/scans must not
         // consume the same first window forever and starve later processes.
         // Deferred requests and their explicit evidence are retained.
-        // Newcomers first with free slots: candidates absent from the
-        // previous enumeration sort ahead of backlog up to a bounded share,
-        // and the admitted window interleaves both classes (leading backlog
-        // when the previous tick owed it one), so a quantum-truncated round
-        // defers both proportionally. While view slots are scarce — a
-        // reconcile pass that just evicted still counts as scarce — the
-        // Lane-A P2a pending-first order stands verbatim, so eviction-freed
-        // slots reach pending waiters first instead of refilling with
-        // never-touched long runners ahead of them.
+        // Newcomers first: with free slots, candidates absent from the
+        // previous enumeration sort ahead of backlog up to a bounded share;
+        // while view slots are scarce — a reconcile pass that just evicted
+        // still counts as scarce — pending pids requested after the
+        // previous tick started sort ahead of pending backlog (then
+        // rotation) up to the same share. Both windows interleave the
+        // admitted classes (leading backlog when the previous tick owed it
+        // one), so a quantum-truncated round defers both proportionally;
+        // eviction-freed slots still reach pending waiters first instead of
+        // refilling with never-touched long runners ahead of them.
         let max_new_views = self.scheduler.max_new_views_per_tick();
         let scarce = self.views.len() >= self.max_scan_pids || reconcile_evicted;
-        let (admitted, deferred, backlog) = if scarce {
+        let (admitted, deferred, ledger) = if scarce {
             let pending: BTreeSet<u32> = serviced_requests.keys().copied().collect();
-            let mut ordered = self
+            // Scarce newcomer classification reads the refresh request's
+            // first-seen mark against the previous tick's start: a pid
+            // first requested after the previous admission window opened
+            // could not have been served then, so it is a newcomer now.
+            // Unmarked requests — or none newer than a known previous
+            // tick — stay backlog, exactly today's pending order.
+            let prev_tick = self.scheduler.prev_tick_start_ns();
+            let mut fresh = Vec::new();
+            let mut backlog_pids = Vec::new();
+            let mut rotation = Vec::new();
+            for pid in new_pids.iter().copied() {
+                if !pending.contains(&pid) {
+                    rotation.push(pid);
+                } else if self
+                    .refresh_requested
+                    .get(&pid)
+                    .and_then(|request| request.first_seen_ns)
+                    .is_some_and(|seen| prev_tick.is_some_and(|prev| seen > prev))
+                {
+                    fresh.push(pid);
+                } else {
+                    backlog_pids.push(pid);
+                }
+            }
+            let (admitted, deferred) = self
                 .scheduler
-                .new_view_order_pending_first(&new_pids, &pending)
-                .into_iter();
-            let admitted: Vec<u32> = ordered.by_ref().take(max_new_views).collect();
-            let deferred: Vec<u32> = ordered.collect();
-            (admitted, deferred, None)
+                .scarce_window_pending_newcomers_first(
+                    &fresh,
+                    &backlog_pids,
+                    &rotation,
+                    max_new_views,
+                    MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+                );
+            let backlog: BTreeSet<u32> =
+                backlog_pids.into_iter().chain(rotation).collect();
+            (
+                admitted,
+                deferred,
+                AdmissionLedger::Scarce { backlog },
+            )
         } else {
             let backlog: BTreeSet<u32> = new_pids
                 .iter()
@@ -24152,7 +24207,11 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
-            (admitted, deferred, Some(backlog))
+            (
+                admitted,
+                deferred,
+                AdmissionLedger::Free { backlog },
+            )
         };
         // Arrival marks in processing order (first diff wins; the admitted
         // window marks first so cap pressure lands on the deferred tail).
@@ -24185,7 +24244,7 @@ impl Engine {
         let (refresh_outcome, admission_outcome) = if newcomers_first {
             let admission = self.admit_inventory_new_views(
                 admitted,
-                backlog.as_ref(),
+                &ledger,
                 max_scan_pids,
                 &mut *tick_now,
             );
@@ -24203,7 +24262,7 @@ impl Engine {
             );
             let admission = self.admit_inventory_new_views(
                 admitted,
-                backlog.as_ref(),
+                &ledger,
                 max_scan_pids,
                 &mut *tick_now,
             );

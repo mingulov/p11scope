@@ -42181,7 +42181,9 @@ fn tick_quantum_expires_mid_path_in_newcomer_admission() {
     let max_scan_pids = engine.max_scan_pids;
     let (new_views, failed, skipped) = engine.admit_inventory_new_views(
         vec![live_pid, dead_pid, deferred_pid],
-        None,
+        &AdmissionLedger::Free {
+            backlog: BTreeSet::new(),
+        },
         max_scan_pids,
         &mut tick_now,
     );

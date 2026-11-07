@@ -768,7 +768,8 @@ behind until the session ends. Descendants that retire between admission
 passes count `pid_descendant_gaps` like cgroup scope (same bounded
 ledger, same lossy-by-design rule, one gap per process generation), and
 an end-of-run sweep counts one more for each descendant still waiting
-for admission when the capture ends, so a forking workload with prearmed
+for admission whose exit has not drained when the capture ends (each
+pending generation once), so a forking workload with prearmed
 or already-attached providers reports exact counts with `PARTIAL`
 observation; unprearmed cold grandchildren may show missing calls; see
 the [known limitations](known-limitations.md). Without permission to
@@ -776,7 +777,9 @@ create the cgroup, `run` observes only the started command itself and
 names the gap; `capture.scope` reads `cgroup` for the tree scope, `pid`
 when degraded. The run-cgroup leaf name (random `p11scope-run-*`, never
 a PID) is published in `cgroups[].label`; the full path is printed on
-stderr only under `-v`, in the retention notice.
+stderr only under `-v`, in the retention notice. A workload sub-cgroup
+below the run publishes from the `p11scope-run-*` component on (never the
+UID/session slices above it).
 
 sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
   --prearm-module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -o tree.json -- \

@@ -3214,19 +3214,32 @@ fn concise_opt_off_prints_no_scope_lines() {
 }
 
 /// F10: an enabled-but-unavailable metadata frame degrades to no scope
-/// lines; the view continues.
+/// lines; the view continues, and the count line names every caller
+/// with edges as unknown instead of vanishing silently.
 #[test]
 fn concise_unavailable_metadata_prints_no_scope_lines() {
+    use std::collections::BTreeSet;
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::unavailable(
         crate::caller_metadata::presentation::MetadataReason::LookupLimit,
     );
     assert!(presentation.caller_metadata.summary.enabled);
+    let with_edges: BTreeSet<CallerId> =
+        presentation.edges.iter().map(|edge| edge.caller).collect();
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        !out.lines().any(|line| line.starts_with("caller ")),
+        !out.lines()
+            .any(|line| line.starts_with("caller ") && line.contains(" pid ")),
         "{out}"
+    );
+    let expected = format!(
+        "caller context: {} unknown (-v for details)",
+        with_edges.len()
+    );
+    assert!(
+        out.lines().any(|line| line == expected),
+        "missing unknown count line {expected:?}\n{out}"
     );
     assert!(out.contains("inventory "), "{out}");
 }
@@ -3306,7 +3319,7 @@ fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let scope_lines: Vec<&str> = out
         .lines()
-        .filter(|line| line.starts_with("caller "))
+        .filter(|line| line.starts_with("caller ") && line.contains(" pid "))
         .collect();
     assert_eq!(scope_lines, expected, "{out}");
     // The concise count line names the labeled rows and the unlabeled
@@ -3490,7 +3503,7 @@ fn concise_count_line_names_unknown_and_pending() {
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let scope_lines: Vec<&str> = out
         .lines()
-        .filter(|line| line.starts_with("caller "))
+        .filter(|line| line.starts_with("caller ") && line.contains(" pid "))
         .collect();
     assert_eq!(
         scope_lines.len(),
@@ -3530,7 +3543,7 @@ fn concise_stale_and_historical_scope_lines_mark_status() {
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let scope_lines: Vec<&str> = out
         .lines()
-        .filter(|line| line.starts_with("caller "))
+        .filter(|line| line.starts_with("caller ") && line.contains(" pid "))
         .collect();
     assert_eq!(scope_lines.len(), 2, "{out}");
     assert!(
@@ -3575,7 +3588,7 @@ fn concise_scope_lines_cap_at_eight() {
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let scope_lines: Vec<&str> = out
         .lines()
-        .filter(|line| line.starts_with("caller "))
+        .filter(|line| line.starts_with("caller ") && line.contains(" pid "))
         .collect();
     assert_eq!(scope_lines.len(), 8, "eight printed scope lines: {out}");
     assert!(

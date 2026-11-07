@@ -5114,3 +5114,234 @@ fn lower_candidates_refuses_escapes_and_missing_lowerdir() {
     );
     assert!(lower_candidates_from_mountinfo("", std::path::Path::new("/mnt/r/a.so")).is_empty());
 }
+
+/// What the copy-up join mirror concluded over live inputs: the guard
+/// refused before any witness work (the legacy shape), the join proved
+/// (held or proven lower), or the join refused with the gap reason.
+enum CopyUpProductionOutcome {
+    LegacyRefused(String),
+    Joined(crate::discovery::scan::CopyUpJoin),
+    Refused(String),
+}
+
+/// Mirror the production provider branch over live inputs: open the
+/// held file, group the target's live maps like production, and run the
+/// real guard plus the copy-up join step. Returns the outcome and the
+/// global witness-query delta across the call.
+fn copyup_production_join(
+    pid: u32,
+    merged: &std::path::Path,
+    key: ObjectKey,
+    maps: &[MapEntry],
+    budget: &mut crate::discovery::scan::CaptureWorkBudget,
+    io: &mut crate::discovery::scan::ProcScanIo,
+) -> Result<(CopyUpProductionOutcome, u64), String> {
+    use crate::discovery::overlay_witness::witness_stats_for_test;
+    use crate::discovery::scan::{
+        GuardOutcome, ScanIo, candidate_groups, mapped_file_guard, witness_join_with_copyup,
+    };
+    use crate::process::{ProcessView, ProcessViewId};
+    let view = ProcessView::open(ProcessViewId(pid), pid)
+        .map_err(|error| format!("copyup join production view {pid}: {error}"))?;
+    let file = std::fs::File::open(merged).map_err(|error| {
+        format!(
+            "copyup join production held open {}: {error}",
+            merged.display()
+        )
+    })?;
+    let held = budget
+        .retained_mapped_identity(&file)
+        .or_else(|| io.held_identity(&file));
+    let groups = candidate_groups(maps);
+    let group = groups
+        .get(&key)
+        .ok_or_else(|| format!("copyup join production: key {key:?} has no candidate group"))?;
+    let (before, _) = witness_stats_for_test();
+    let guarded = mapped_file_guard(io, &view, held, key, group, budget);
+    let outcome = match guarded {
+        Err(reason) => CopyUpProductionOutcome::LegacyRefused(reason),
+        Ok(GuardOutcome::Proven) => {
+            return Err(
+                "copyup join production: the stale shape proved without the witness".into(),
+            );
+        }
+        Ok(GuardOutcome::UnprovenOverlay { range }) => match held {
+            Some(held) => {
+                match witness_join_with_copyup(io, &view, &file, &held, key, range, merged, budget)
+                {
+                    Ok(join) => CopyUpProductionOutcome::Joined(join),
+                    Err(reason) => CopyUpProductionOutcome::Refused(reason),
+                }
+            }
+            None => return Err("copyup join production: unproven join without a held file".into()),
+        },
+    };
+    let (after, _) = witness_stats_for_test();
+    Ok((outcome, after.saturating_sub(before)))
+}
+
+/// Retry the copy-up join mirror across transient
+/// witness-infrastructure loss, mirroring the K1 guard retry: each
+/// attempt carries a fresh scan budget and re-reads the child's maps;
+/// only the unavailable gap retries, at most three attempts. Returns
+/// the settled outcome, the spend of the settling attempt, and the
+/// attempts used.
+fn copyup_production_join_retry(
+    label: &str,
+    pid: u32,
+    merged: &std::path::Path,
+    key: ObjectKey,
+    maps: &dyn Fn() -> Vec<MapEntry>,
+) -> Result<(CopyUpProductionOutcome, u64, u32), String> {
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
+    for attempt in 1..=3u32 {
+        let live = maps();
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut io = crate::discovery::scan::ProcScanIo::new();
+        let (outcome, queries) =
+            copyup_production_join(pid, merged, key, &live, &mut budget, &mut io)?;
+        if io.witness_used() as u64 != queries || queries > 2 {
+            return Err(format!(
+                "{label}: attempt {attempt} spent {} queries and ran {queries}, not one held plus one lower",
+                io.witness_used()
+            ));
+        }
+        let retry = matches!(&outcome, CopyUpProductionOutcome::Refused(reason) if witness_unavailable_refusal(reason))
+            && attempt < 3;
+        if retry {
+            eprintln!("COPYUP_JOIN {label} attempt {attempt}: transient unavailable, retrying");
+            continue;
+        }
+        return Ok((outcome, queries, attempt));
+    }
+    unreachable!("copyup join {label}: retry loop returns on attempt 3");
+}
+
+/// Copy-up join acceptance (privileged): the stale mapper's ranges
+/// attribute after the copy-up through the production provider branch.
+/// On the witness-requiring shape the join proves the pre-copy-up lower
+/// file (exactly two queries: held plus lower); where the stale mapping
+/// already separates, the legacy refusal stands with no witness spent;
+/// where the kernel proof cannot run at all, the row asserts the exact
+/// unavailable gap instead — still a refusal, never silence.
+#[test]
+#[ignore = "root: loop overlay mounts drive the production copy-up join"]
+fn privileged_copyup_stale_mapper_joins_proven_lower_file() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        copyup_join_row(work.path(), mode, lane)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "COPYUP_JOIN direction=stale-lower lane={lane:?} modes=on,off,same-fs verdict=join-lower"
+    );
+}
+
+/// One copy-up join row over a fresh fixture.
+fn copyup_join_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+) -> Result<(), String> {
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
+    use crate::discovery::scan::CopyUpJoin;
+    eprintln!("COPYUP_JOIN start mode={mode:?} row=stale-lower lane={lane:?}");
+    let setup = copyup_old_file_setup(work, mode, lane)?;
+    let stale_maps = setup.stale.maps();
+    let key = ObjectKey::of(&find_line(
+        &stale_maps,
+        target_range(&setup.stale),
+        *b"r-xp",
+    )?);
+    let pid = setup.stale.pid as u32;
+    if !k1_witness_capable() {
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let mut io = crate::discovery::scan::ProcScanIo::new();
+        let (outcome, queries) =
+            copyup_production_join(pid, &setup.merged, key, &stale_maps, &mut budget, &mut io)?;
+        match outcome {
+            CopyUpProductionOutcome::LegacyRefused(reason)
+                if reason.contains("names more than one file") =>
+            {
+                eprintln!(
+                    "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=legacy queries={queries}"
+                );
+                return Ok(());
+            }
+            CopyUpProductionOutcome::Refused(reason) if witness_unavailable_refusal(&reason) => {
+                eprintln!(
+                    "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=unavailable queries={queries}"
+                );
+                return Ok(());
+            }
+            other => {
+                return Err(format!(
+                    "copyup join: expected the legacy or unavailable refusal without kernel proof, got {}",
+                    match other {
+                        CopyUpProductionOutcome::LegacyRefused(reason)
+                        | CopyUpProductionOutcome::Refused(reason) => reason,
+                        CopyUpProductionOutcome::Joined(_) => "a join".to_string(),
+                    }
+                ));
+            }
+        }
+    }
+    let (outcome, queries, attempts) =
+        copyup_production_join_retry("copyup join", pid, &setup.merged, key, &|| {
+            setup.stale.maps()
+        })?;
+    match outcome {
+        CopyUpProductionOutcome::LegacyRefused(reason)
+            if reason.contains("names more than one file") =>
+        {
+            if queries != 0 {
+                return Err(format!(
+                    "copyup join legacy shape spent witness work: {queries} queries"
+                ));
+            }
+            eprintln!(
+                "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=legacy queries={queries} attempts={attempts}"
+            );
+            Ok(())
+        }
+        CopyUpProductionOutcome::Joined(CopyUpJoin::LowerProven(proof)) => {
+            if queries != 2 {
+                return Err(format!(
+                    "copyup join proved the lower file with {queries} queries, not one held plus one lower"
+                ));
+            }
+            {
+                use std::os::unix::fs::MetadataExt as _;
+                let got = std::fs::metadata(&proof.path).map_err(|error| {
+                    format!("copyup join proof open {}: {error}", proof.path.display())
+                })?;
+                let want = std::fs::metadata(setup.fixture.lower_path("lib.so"))
+                    .map_err(|error| format!("copyup join lower fstat: {error}"))?;
+                if (got.dev(), got.ino()) != (want.dev(), want.ino()) {
+                    return Err(format!(
+                        "copyup join proof names the wrong file: {} (candidate {:?} vs lower {:?})",
+                        proof.path.display(),
+                        (got.dev(), got.ino()),
+                        (want.dev(), want.ino())
+                    ));
+                }
+            }
+            eprintln!(
+                "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=join-lower queries={queries} attempts={attempts}"
+            );
+            Ok(())
+        }
+        CopyUpProductionOutcome::Joined(CopyUpJoin::Held) => Err(
+            "copyup join: the stale mapper joined the held upper file instead of the proven lower file"
+                .into(),
+        ),
+        CopyUpProductionOutcome::Refused(reason) => Err(format!(
+            "copyup join: the stale mapper is unattributed after copy-up (queries={queries}): {reason}"
+        )),
+        CopyUpProductionOutcome::LegacyRefused(reason) => Err(format!(
+            "copyup join legacy shape refused without the legacy reason: {reason}"
+        )),
+    }
+}

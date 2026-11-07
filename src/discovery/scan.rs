@@ -4323,6 +4323,47 @@ pub(crate) fn witness_join(
     }
 }
 
+/// What the provider-branch join proved: the group joins the held
+/// (current) file, or a witness-proven pre-copy-up lower file.
+#[allow(dead_code)] // The copy-up fallback constructs `LowerProven`.
+pub(crate) enum CopyUpJoin {
+    Held,
+    LowerProven(LowerProof),
+}
+
+/// A lower file the kernel witness proved for the trigger range: the
+/// target-rooted path to pin (a pin-time open only, never published),
+/// and the proof-time identity the pin must still match.
+#[allow(dead_code)] // The copy-up fallback constructs this.
+pub(crate) struct LowerProof {
+    pub path: PathBuf,
+    pub identity: crate::discovery::identity::FileIdentity,
+    pub pin: Pin,
+}
+
+/// Prove one witness-requiring provider file, falling back to the
+/// pre-copy-up lower file on an other-file verdict: `Ok` joins (held
+/// or proven lower), `Err` refuses with the gap reason. The fallback
+/// spends from the same per-scan witness budget as the held query.
+#[allow(dead_code)] // The provider branch calls this once the fallback lands.
+#[allow(clippy::too_many_arguments)] // The join's inputs are already separate bindings at both call sites.
+pub(crate) fn witness_join_with_copyup(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    file: &File,
+    held: &MappedFile,
+    key: ObjectKey,
+    range: (u64, u64),
+    _merged: &Path,
+    budget: &mut CaptureWorkBudget,
+) -> Result<CopyUpJoin, String> {
+    // Stub: the copy-up fallback lands next; today this is `witness_join`.
+    match witness_join(io, view, file, held, key, range, budget) {
+        None => Ok(CopyUpJoin::Held),
+        Some(reason) => Err(reason),
+    }
+}
+
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
     match error.raw_os_error() {
         Some(libc::EACCES | libc::EPERM) => ("ptrace", true),

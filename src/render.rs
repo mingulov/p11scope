@@ -8363,6 +8363,270 @@ pub(crate) mod tests {
         assert!(!out.contains("potential provider"), "{out}");
     }
 
+    /// v070-ckr-reasons: concise profile text names each function's
+    /// failure reasons (`CKR_*` with counts), not just error counts.
+    /// Successes are never listed as reasons.
+    #[test]
+    fn concise_text_names_per_function_ckr_reasons() {
+        let mut row = report("C_Login", 5, 0, false);
+        row.errors = 4;
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 1);
+        row.rv_counts.insert(pkcs11_types::CkRv::PIN_INCORRECT.0, 3);
+        row.rv_counts
+            .insert(pkcs11_types::CkRv::USER_NOT_LOGGED_IN.0, 1);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("ERROR REASONS:"), "{out}");
+        assert!(
+            out.contains("C_Login: CKR_PIN_INCORRECT x3, CKR_USER_NOT_LOGGED_IN x1"),
+            "{out}"
+        );
+        assert!(!out.contains("CKR_OK"), "{out}");
+    }
+
+    /// v070-ckr-reasons: concise text bounds each function to its top
+    /// three reasons plus an `and N more` tail.
+    #[test]
+    fn concise_text_bounds_reasons_to_top_three_with_and_more() {
+        let mut row = report("C_Sign", 15, 0, false);
+        row.errors = 15;
+        for (rv, count) in [
+            (pkcs11_types::CkRv::GENERAL_ERROR.0, 5),
+            (pkcs11_types::CkRv::DEVICE_ERROR.0, 4),
+            (pkcs11_types::CkRv::KEY_HANDLE_INVALID.0, 3),
+            (pkcs11_types::CkRv::SESSION_HANDLE_INVALID.0, 2),
+            (pkcs11_types::CkRv::OPERATION_NOT_INITIALIZED.0, 1),
+        ] {
+            row.rv_counts.insert(rv, count);
+        }
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains(
+                "C_Sign: CKR_GENERAL_ERROR x5, CKR_DEVICE_ERROR x4, \
+                 CKR_KEY_HANDLE_INVALID x3, and 2 more"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("CKR_SESSION_HANDLE_INVALID"), "{out}");
+        assert!(!out.contains("CKR_OPERATION_NOT_INITIALIZED"), "{out}");
+    }
+
+    /// v070-ckr-reasons: verbose text lists every distinct failure
+    /// reason per function, with no truncation tail.
+    #[test]
+    fn verbose_text_lists_every_distinct_ckr_reason() {
+        let mut row = report("C_Sign", 15, 0, false);
+        row.errors = 15;
+        for (rv, count) in [
+            (pkcs11_types::CkRv::GENERAL_ERROR.0, 5),
+            (pkcs11_types::CkRv::DEVICE_ERROR.0, 4),
+            (pkcs11_types::CkRv::KEY_HANDLE_INVALID.0, 3),
+            (pkcs11_types::CkRv::SESSION_HANDLE_INVALID.0, 2),
+            (pkcs11_types::CkRv::OPERATION_NOT_INITIALIZED.0, 1),
+        ] {
+            row.rv_counts.insert(rv, count);
+        }
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        for name in [
+            "CKR_GENERAL_ERROR x5",
+            "CKR_DEVICE_ERROR x4",
+            "CKR_KEY_HANDLE_INVALID x3",
+            "CKR_SESSION_HANDLE_INVALID x2",
+            "CKR_OPERATION_NOT_INITIALIZED x1",
+        ] {
+            assert!(out.contains(name), "{out}");
+        }
+        assert!(!out.contains("and 2 more"), "{out}");
+    }
+
+    /// v070-ckr-reasons: unregistered (vendor) return codes render as
+    /// verbatim hex, never as a guessed name.
+    #[test]
+    fn text_reasons_render_vendor_codes_as_hex() {
+        let mut row = report("C_Login", 3, 0, false);
+        row.errors = 3;
+        row.rv_counts.insert(0x8000_0001, 2);
+        row.rv_counts.insert(pkcs11_types::CkRv::PIN_INCORRECT.0, 1);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("0x80000001 x2"), "{out}");
+        assert!(!out.contains("CKR_UNKNOWN"), "{out}");
+    }
+
+    /// v070-ckr-reasons: a function with errors but no error breakdown
+    /// in `rv_counts` (the return-value table read failed) degrades to
+    /// a named gap instead of stopping the view.
+    #[test]
+    fn text_reasons_degrade_when_the_breakdown_is_unavailable() {
+        let mut row = report("C_Sign", 3, 0, false);
+        row.errors = 3;
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("FUNCTION"), "{out}");
+        assert!(
+            out.contains("C_Sign: 3 errors (return-code breakdown unavailable)"),
+            "{out}"
+        );
+    }
+
+    /// v070-ckr-reasons: a clean capture renders no reasons section at
+    /// all — the addition is invisible without failures.
+    #[test]
+    fn clean_capture_text_has_no_error_reasons_section() {
+        let mut row = report("C_Sign", 3, 0, false);
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 3);
+        let mut ev = evidence();
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = live_scoped_with_verbosity(
+                &[row.clone()],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &BTreeMap::new(),
+                verbosity,
+            );
+            assert!(!out.contains("ERROR REASONS"), "{verbosity:?}: {out}");
+        }
+    }
+
+    /// v070-ckr-reasons: profile JSON carries `rv_names` beside the
+    /// existing hex-keyed `rv_counts`: every registered code maps to
+    /// its `CKR_*` name, unregistered codes stay hex-only.
+    #[test]
+    fn profile_json_carries_rv_names_next_to_rv_counts() {
+        let mut row = report("C_Login", 6, 0, false);
+        row.errors = 5;
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 1);
+        row.rv_counts.insert(pkcs11_types::CkRv::PIN_INCORRECT.0, 3);
+        row.rv_counts.insert(0x8000_0001, 2);
+        let ev = evidence();
+        let state = state_fixture();
+        let capture = CaptureMeta {
+            started: "t0",
+            ended: "t1",
+            kernel: "6.8.0",
+            policy: CapturePolicy::Allowlisted,
+            scope: "pid",
+            ring_bytes: p11scope_ebpf_common::RING_BYTES,
+            drain_interval_ms: 1000,
+        };
+        let profile = profile_json(&[row], VersionedEvidence::wrap(&ev), &state, &capture);
+        let function = &profile["functions"][0];
+        assert_eq!(
+            function["rv_counts"],
+            serde_json::json!({
+                "0x0000000000000000": 1,
+                "0x00000000000000a0": 3,
+                "0x0000000080000001": 2,
+            }),
+            "{profile}"
+        );
+        assert_eq!(
+            function["rv_names"],
+            serde_json::json!({
+                "0x0000000000000000": "CKR_OK",
+                "0x00000000000000a0": "CKR_PIN_INCORRECT",
+            }),
+            "{profile}"
+        );
+    }
+
+    /// v070-ckr-reasons: the metrics lane shares the same renderer, so
+    /// its rows carry `rv_names` too.
+    #[test]
+    fn metrics_json_carries_rv_names_next_to_rv_counts() {
+        let mut row = report("C_Login", 4, 0, false);
+        row.errors = 3;
+        row.rv_counts.insert(pkcs11_types::CkRv::OK.0, 1);
+        row.rv_counts.insert(pkcs11_types::CkRv::PIN_INCORRECT.0, 3);
+        let ev = evidence();
+        let document = json(
+            &[row],
+            &ev,
+            &CaptureMeta {
+                started: "t0",
+                ended: "t1",
+                kernel: "6.8.0",
+                policy: CapturePolicy::AggregateOnly,
+                scope: "pid",
+                ring_bytes: p11scope_ebpf_common::RING_BYTES,
+                drain_interval_ms: 1000,
+            },
+        );
+        assert_eq!(
+            document["functions"][0]["rv_names"],
+            serde_json::json!({
+                "0x0000000000000000": "CKR_OK",
+                "0x00000000000000a0": "CKR_PIN_INCORRECT",
+            }),
+            "{document}"
+        );
+    }
+
     /// F2: with lost events, concise and verbose show coverage once —
     /// the `call records lost` fragment — without the duplicate
     /// `Coverage partial: event detail was lost` sentence.

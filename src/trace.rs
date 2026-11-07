@@ -926,6 +926,16 @@ mod tests {
         assert!(!line.contains("CKR_OK"));
     }
 
+    /// v070-ckr-reasons: a vendor return code keeps its current trace
+    /// rendering while the name lookup moves to the shared helper.
+    #[test]
+    fn vendor_call_keeps_its_current_trace_rendering() {
+        let mut ev = base_event();
+        ev.rv = 0x8000_0001; // CKR_VENDOR_DEFINED + 1, unregistered
+        let line = format_line(&ev, 0, "C_Sign", Some(3));
+        assert!(line.contains("CKR_UNKNOWN"), "line: {line}");
+    }
+
     #[test]
     fn target_controlled_function_name_controls_are_escaped_like_inspect() {
         // Slot labels come from the target's own tables: a hostile name

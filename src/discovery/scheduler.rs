@@ -193,9 +193,11 @@ pub(crate) struct DiscoveryScheduler {
     /// lead.
     backlog_owed: bool,
     /// Per-tick attempt ledger behind `backlog_owed`: whether this tick's
-    /// window saw backlog, attempted anything, and attempted backlog.
-    /// Every window — free or scarce — settles the previous tick's debt
-    /// and opens a fresh ledger first.
+    /// window saw backlog, attempted a classified pid, and attempted
+    /// backlog. Bare scarce rotation attempts never record here, so a
+    /// rotation-only tick still reads as attempting nothing. Every
+    /// window — free or scarce — settles the previous tick's debt and
+    /// opens a fresh ledger first.
     tick_backlog_waited: bool,
     tick_attempted_any: bool,
     tick_attempted_backlog: bool,
@@ -379,9 +381,10 @@ impl DiscoveryScheduler {
     /// cursor, so the previous tick's newcomer attempts sink to the end,
     /// stable inside each part, instead of retrying ahead of untried
     /// backlog. Free-slots windows use this for the backlog class; scarce
-    /// windows rotate the backlog class after the newcomer cursor instead
-    /// (see `scarce_window_pending_newcomers_first`). `pids` must be sorted
-    /// ascending.
+    /// windows rotate pending backlog after the newcomer cursor instead
+    /// and append rotation candidates after both pending classes, outside
+    /// the share/owed ledger (see `scarce_window_pending_newcomers_first`).
+    /// `pids` must be sorted ascending.
     pub(crate) fn backlog_order(&self, pids: &[u32]) -> Vec<u32> {
         let order = Self::rotated_after(pids, self.backlog_cursor);
         let (mut head, tail): (Vec<u32>, Vec<u32>) = order
@@ -394,13 +397,15 @@ impl DiscoveryScheduler {
     /// Opens one admission window: settles the previous tick's backlog
     /// debt, resets this tick's attempt ledger, and rotates the
     /// newcomer-attempt sets so the backlog rotation sinks exactly the
-    /// previous tick's newcomer attempts — unless that tick attempted
-    /// nothing, in which case the sets are kept for the retry. Every
-    /// admission window calls this first. A backlog attempt paid the debt;
-    /// a round that attempted work but no backlog while backlog waited
-    /// owes the next lead to backlog; no backlog waiting clears it; a
-    /// round that attempted nothing (an expired quantum before the first
-    /// scan) leaves it for the retry.
+    /// previous tick's newcomer attempts — unless that tick attempted no
+    /// classified pid, in which case the sets are kept for the retry.
+    /// Every admission window calls this first. A backlog attempt paid the
+    /// debt; a round that attempted a classified pid but no backlog while
+    /// backlog waited owes the next lead to backlog; no backlog waiting
+    /// clears it; a round that attempted no classified pid while backlog
+    /// waited (an expired quantum before the first scan) leaves it for
+    /// the retry. Bare scarce rotation attempts do not count: a
+    /// rotation-only round carries no backlog wait, so it clears.
     fn open_attempt_window(&mut self) {
         if self.tick_attempted_backlog {
             self.backlog_owed = false;
@@ -1823,9 +1828,10 @@ mod tests {
     }
 
     /// Scarce pending newcomers take the window first up to the share;
-    /// the backlog class (pending backlog, then rotation candidates)
-    /// fills the rest, and the admitted window interleaves both
-    /// newcomer-first.
+    /// pending backlog fills the rest up to the batch, and rotation
+    /// candidates append after both pending classes, outside the
+    /// share/owed ledger; the admitted window interleaves the two pending
+    /// classes newcomer-first.
     #[test]
     fn scarce_window_serves_pending_newcomers_first_within_share() {
         let batch = MAX_NEW_VIEWS_PER_TICK;
@@ -1891,8 +1897,9 @@ mod tests {
 
     /// At a 1-pid scarce batch with fresh and backlog waiting, the owed
     /// flag chooses the single slot, exactly like the free window.
-    /// Rotation candidates count as backlog class: they wait behind fresh
-    /// on the repaid tick.
+    /// Rotation candidates append after both pending classes outside the
+    /// share/owed ledger, so with no pending backlog they still wait
+    /// behind fresh on the repaid tick.
     #[test]
     fn scarce_window_batch_1_owed_flag_chooses_the_class() {
         let mut scheduler = DiscoveryScheduler::new();

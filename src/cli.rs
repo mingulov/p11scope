@@ -583,8 +583,8 @@ reason, a leader exit that is the last lifecycle record ends the window cleanly,
 --cgroup/--system refuse by name.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
---track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
-executable identity and unmatched exits are grouped by linkage.
+--track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
+executable identity for grouping by linkage.
 Refused beside --counter-mode: it arms Detailed captures only.
 On --cgroup/--system captures it groups unmatched exits by linkage; on --pid it groups the target's own execs.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
@@ -615,8 +615,8 @@ Provider identity is pinned by SHA-256 at attach and checked for in-place change
 Trace reports completed call events; PID/TID are diagnostic identifiers.
 Executable names require verified event-image evidence; missing identity stays unknown.
 Exactly one of --pid, --cgroup, or --system is required; --cgroup includes descendants.
---track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
-executable identity and unmatched exits are grouped by linkage.
+--track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
+executable identity for grouping by linkage.
 On --cgroup/--system captures it groups unmatched exits by linkage; on --pid it groups the target's own execs.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
@@ -673,8 +673,9 @@ while a leader exit that is the last lifecycle record ends the window cleanly.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
 --pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
---track-short-lived also records short-lived processes (extra detail; default off): the kernel records exec-time
+--track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
 executable identity and the child's own execs are grouped by linkage.
+Refused beside --counter-mode: it arms Detailed captures only.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture needs root and usable uprobe_multi host capability (normally Linux 6.6+).
 Ctrl-C or SIGTERM ends the capture cleanly.

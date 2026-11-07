@@ -1855,8 +1855,9 @@ five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `CAP_SYS_ADMIN`): `profile --pid` observed 120/123 completed calls with
 `attach_mechanisms: ["uprobe-multi"]` and no attach failures, and
 `inventory --system` and `run` completed the same way
-(`scripts/ci/minimal-setcap.sh`, 18/18 rows; the same cell runs on the
-v6.6 and 7.x guest kernels in CI). Stated plainly: at
+(`scripts/ci/minimal-setcap.sh`, 18/18 rows on that host; the same cell
+also runs on the CI host and the v6.6 and 7.x guest kernels). Stated
+plainly: at
 `perf_event_paranoid >= 3`, capturing on the default lane needs the
 minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
 keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,

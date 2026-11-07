@@ -261,6 +261,66 @@ fn async_global_cgroup_departure_defers_conservative_replay_until_actual_close()
 }
 
 #[test]
+fn async_global_owned_only_retire_detaches_synchronously_without_ticket() {
+    // An owned-run ExecRefresh retires only the owned child's own stale
+    // entry slots: they detach synchronously (exactly as an exact-PID
+    // capture always did) instead of parking an async global ticket, so
+    // the refresh tick completes inside the pause deadline.
+    let mut case = Case::new();
+    case.engine.owned_run_pid = Some(case.child.id());
+    let candidate = case.candidate();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "owned-only retirement must not park an async global ticket"
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0,
+        "owned-only retirement never begins the async worker"
+    );
+    assert!(
+        case.session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| !slots.is_empty()),
+        "owned-only retirement detaches synchronously like an exact-PID capture"
+    );
+}
+
+#[test]
+fn async_global_unowned_retire_keeps_async_ticket() {
+    // Guard twin: without an owned run child, the same candidate keeps
+    // the ordinary async global path.
+    let mut case = Case::new();
+    let candidate = case.candidate();
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Deferred);
+    assert!(case.engine.pending_global_retirement.is_some());
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        1
+    );
+}
+
+#[test]
 fn async_global_candidate_handoff_keeps_only_actual_historical_retired_prefix() {
     let mut case = Case::new();
     let prior_pins = case.engine.pinned.pinned().count();

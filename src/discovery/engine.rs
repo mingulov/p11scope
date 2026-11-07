@@ -3172,6 +3172,12 @@ pub(crate) trait EngineSession {
     ) -> Result<Option<RetirementTicket>> {
         Ok(None)
     }
+    /// Whether a global native retirement is already pending or
+    /// uncertain. Fail-closed default: sessions without a retirement
+    /// worker keep the ordinary async global path.
+    fn global_retirement_blocking(&self) -> bool {
+        true
+    }
     fn poll_global_retirement(&mut self, _: &RetirementTicket) -> RetirementPoll {
         RetirementPoll::Refused
     }
@@ -3469,6 +3475,9 @@ impl EngineSession for Session {
         slots: &[plan::Slot],
     ) -> Result<Option<RetirementTicket>> {
         Session::begin_global_static_retirement(self, slots)
+    }
+    fn global_retirement_blocking(&self) -> bool {
+        Session::global_retirement_blocking(self)
     }
     fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
         Session::poll_global_retirement(self, ticket)
@@ -14510,6 +14519,15 @@ impl Engine {
             .chain(&candidate.delta.replace)
             .cloned()
             .collect();
+        // An owned-run ExecRefresh retires only the owned child's own
+        // stale entry slots: detaching them synchronously (exactly as an
+        // exact-PID capture always did) lets the refresh tick complete
+        // inside the pause deadline, so the loader re-arm corroborates
+        // the new generation before release. The async worker round-trip
+        // would park the tick incomplete and release the pause first,
+        // losing the new generation's startup records.
+        let owned_only =
+            !selected.is_empty() && selected.iter().all(|slot| self.slot_owned_by_run(slot));
         let detach_slots_start = crate::attach::monotonic_ns();
         #[cfg(feature = "h6-reexec-diagnostic")]
         let detach_span = session.reexec_diagnostic().filter(|d| d.active()).map(|d| {
@@ -14528,6 +14546,9 @@ impl Engine {
             // removal-only conservative candidate closes additions without
             // changing eligibility to retire its actually owned global links.
             // Session still rejects PID, stopped or ineligible ownership.
+            None if ended.is_none() && owned_only && !session.global_retirement_blocking() => {
+                session.detach_slots(&selected)
+            }
             None if ended.is_none() => match session.begin_global_static_retirement(&selected) {
                 Ok(Some(ticket)) => Ok(crate::attach::DetachOutcome {
                     pending: Some(ticket),
@@ -19598,6 +19619,33 @@ impl Engine {
         bail!(errors.join("; "))
     }
 
+    /// Whether this view is the owned run child's current view: the one
+    /// named generation keeps PID-scope fidelity (loader arming, sync
+    /// exec-refresh detach) even under the run-tree cgroup scope, so the
+    /// pause and the static links follow its exec chain as they did when
+    /// runs were exact-PID captures.
+    fn owned_run_view(&self, view_id: ProcessViewId) -> bool {
+        self.owned_run_pid.is_some_and(|owned| {
+            self.views
+                .iter()
+                .any(|view| view.id() == view_id && view.pid() == owned)
+        })
+    }
+
+    /// Whether this retiring slot's entry pin belongs to a module of the
+    /// owned run child's current view. Slots no claimed module maps fail
+    /// closed to the ordinary async global path.
+    fn slot_owned_by_run(&self, slot: &plan::Slot) -> bool {
+        self.modules.iter().any(|module| {
+            self.owned_run_view(module.scanned.view)
+                && module
+                    .entry_objects
+                    .iter()
+                    .flatten()
+                    .any(|id| *id == slot.object)
+        })
+    }
+
     /// Whether the ownership gate in `arm_loader_or_partial` keeps this view
     /// unarmed: in a multi-process scope, a view that owns no provider module
     /// and no pin claim stays exploratory.
@@ -19607,11 +19655,7 @@ impl Engine {
         // the pause follows its exec chain as it did when runs were
         // exact-PID captures. Every other provider-free member view
         // stays exploratory.
-        if self.owned_run_pid.is_some_and(|owned| {
-            self.views
-                .iter()
-                .any(|view| view.id() == view_id && view.pid() == owned)
-        }) {
+        if self.owned_run_view(view_id) {
             return false;
         }
         self.admits_generations()
@@ -31807,6 +31851,11 @@ pub(crate) mod session_fixture {
             self.global_retirement
                 .as_ref()
                 .map_or(Ok(None), |state| state.borrow_mut().begin(slots))
+        }
+        fn global_retirement_blocking(&self) -> bool {
+            self.global_retirement
+                .as_ref()
+                .is_some_and(|state| state.borrow().blocking())
         }
         fn poll_global_retirement(&mut self, ticket: &RetirementTicket) -> RetirementPoll {
             self.global_retirement

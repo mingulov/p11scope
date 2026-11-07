@@ -9189,6 +9189,13 @@ impl Session {
         self.detach_slots_with_ended(slots, None, false)
     }
 
+    /// Whether a global native retirement is already pending or
+    /// uncertain: while blocking, detached-link ownership sits with the
+    /// worker and no other detach path may run.
+    pub(crate) fn global_retirement_blocking(&self) -> bool {
+        self.native_retirement.blocking()
+    }
+
     /// Opt-in ownership handoff for the ordinary whole-candidate consumer.
     /// Generic selective detach remains synchronous.
     pub(crate) fn begin_global_static_retirement(

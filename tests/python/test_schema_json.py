@@ -934,7 +934,8 @@ class SchemaOracleAgreement(unittest.TestCase):
 
     def test_profile_branch_requires_versioned_only_fields(self):
         """The lane==profile branch requires exactly the 4 versioned-only
-        fields; the metrics branch forbids them."""
+        fields; the metrics branch forbids them plus the profile-only
+        exit-mapping split (no instance hooks under metrics)."""
         branches = SCHEMA["allOf"]
         profile = next(
             b
@@ -955,7 +956,9 @@ class SchemaOracleAgreement(unittest.TestCase):
             for clause in metrics["then"]["properties"]["evidence"]["not"]["anyOf"]
             for req in clause["required"]
         }
-        self.assertEqual(forbidden, set(CHECKER["PROFILE_V3_FIELDS"]))
+        self.assertEqual(
+            forbidden, set(CHECKER["PROFILE_V3_FIELDS"]) | {"gap_exit_mappings"}
+        )
 
     def test_function_row_identity_matches_oracle(self):
         """`functions[].target` and `.ordinals` keys and bounds match the

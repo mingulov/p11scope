@@ -1,14 +1,29 @@
-# p11scope node-observer image: musl-static binary on Alpine + the
-# in-cluster entry script. Built from the repository root context:
-#   docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
-# Requires the FULL static binary (default features; pure-Rust deps + aya
-# make this work):
+# p11scope observer image: the released static musl binary plus the
+# in-cluster entry script, on Alpine. The image runs the observer by
+# default, so one-host use is plain `docker run` with p11scope arguments:
+#   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+#     --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+#     ghcr.io/mingulov/p11scope:0.7.0 inventory --system
+# (see deploy/README.md for the minimal flags and what each one is for).
+# The in-cluster entry script stays available by explicit name for
+# `kubectl exec` into the DaemonSet pod; the DaemonSet overrides the
+# container command with its idle agent anyway.
+#
+# Build from a staged minimal context holding exactly the released bytes:
+#   OCTX=$(mktemp -d) && mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts"
+#   cp <released-p11scope> "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+#   cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+#   docker build --network=none -f deploy/Dockerfile.observer -t <tag> "$OCTX"
+# Pre-pull the pinned base first; --network=none proves the build takes no
+# network. scripts/kind-e2e.sh stages the same layout from its static
+# binary; package-preview stages the packaged FULL musl binary. A locally
+# built binary also builds (the FULL static recipe below), but publish
+# only images staged from released bytes:
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
 #     cargo +"$(cat .release-rust-version)" build --locked --release \
 #     --target x86_64-unknown-linux-musl --bin p11scope
 # (musl-tools provides the linker; the target-scoped env var keeps the
 # nested bpfel-unknown-none build inside build.rs on its own linker.)
-# scripts/kind-e2e.sh does all of this from a staged minimal context.
 # Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
 # Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
 # No curl/jq: the observer never talks to the Kubernetes API.
@@ -20,5 +35,5 @@ COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
 RUN chmod 0755 /usr/local/bin/k8s-profile-entry \
     && /usr/local/bin/p11scope --help >/dev/null \
     && /usr/local/bin/k8s-profile-entry --self-test
-ENTRYPOINT ["/usr/local/bin/k8s-profile-entry"]
+ENTRYPOINT ["/usr/local/bin/p11scope"]
 CMD ["--help"]

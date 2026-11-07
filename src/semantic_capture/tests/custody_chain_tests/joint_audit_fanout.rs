@@ -9806,14 +9806,16 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
             "the END collect re-syncs the broken unlinked stream"
         );
     }
-    // Disposition pin: the END does not join — the break voided
-    // the retained START, so its call sheds. api_returns stays
-    // flat and the shed call is counted in the unrouted-calls
-    // gap rather than silently dropped.
+    // Disposition pin: the END joins S1 even though the break voided
+    // the retained START joint-side. A bounded S1-side loss no longer
+    // raises the shared fault, so S1 routes the intact END against a
+    // fresh observation at the unchanged era (S1Only history — the
+    // joint still refuses the unmatched END, pinned by the barrier
+    // and void legs below). api_returns advances by exactly the END.
     assert_eq!(
         api_returns(&fixture),
-        before,
-        "the END sheds instead of joining across the void + re-sync"
+        before + 1,
+        "the END joins S1Only across the void + re-sync"
     );
     {
         let gaps: Vec<(String, String)> = fixture
@@ -9827,11 +9829,16 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
             .map(|gap| (gap.subject.clone(), gap.reason.clone()))
             .collect();
         assert!(
+            !gaps
+                .iter()
+                .any(|(subject, _)| subject == "semantic calls unrouted"),
+            "nothing sheds at S1, so no unrouted-calls gap: {gaps:?}"
+        );
+        assert!(
             gaps.iter().any(|(subject, reason)| {
-                subject == "semantic calls unrouted"
-                    && reason.contains("1 calls shed without a route")
+                subject == "semantic receipt refused" && reason == "partition"
             }),
-            "the shed END call is counted, not silent: {gaps:?}"
+            "the joint-side refusal of the unmatched END is counted, not silent: {gaps:?}"
         );
     }
     assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
@@ -9839,23 +9846,23 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
     assert_eq!(fixture.machine.disposition_reason(), None);
     assert!(audit_no_progress_gaps(&fixture).is_empty());
     assert!(no_progress_gaps(&fixture).is_empty());
-    // Void + acknowledgement legs. The shed END left a loss barrier
-    // that no seal acknowledged: the q2 seal refused on a check that
-    // runs before H3, and only an H3 loss void acknowledges. The next
-    // clean frame must still publish, its seal must void that barrier
-    // exactly once (H3Loss, never H3Pending) and acknowledge past it,
-    // and the frame after that must mint clean H3 again. The
-    // follow-up calls join S1Only history across the void: the void
-    // drops staged joint proof, not the S1 API return.
-    let barrier = match fixture
+    // No-barrier legs. The joined END left no loss barrier: H3 is
+    // Clean (nothing shed at S1, so no seal has anything to
+    // acknowledge). The follow-up frames must publish clean with no
+    // void, minting must advance, and H3 must stay Clean. The
+    // follow-up calls join S1 history as usual.
+    let clean_max = match fixture
         .scene
         .real
         .scene
         .coordinator
         .reference_h3_last_disposition()
     {
-        Some(H3DispositionEvidence::StagedLoss { barrier }) => barrier,
-        other => panic!("the shed END leaves a loss barrier, not {other:?}"),
+        Some(H3DispositionEvidence::Clean {
+            staged_max,
+            pending_floor: None,
+        }) => staged_max,
+        other => panic!("the joined END leaves H3 Clean, not {other:?}"),
     };
     assert_eq!(
         fixture
@@ -9865,12 +9872,12 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
             .coordinator
             .reference_h3_acknowledged_below(),
         0,
-        "the q2 publication acknowledges no H3 loss"
+        "the q2 publication has no H3 loss to acknowledge"
     );
-    let before_void = api_returns(&fixture);
+    let before_followup = api_returns(&fixture);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
     fixture.reach_phase("Audited");
-    let void_below = fixture
+    let followup_below = fixture
         .scene
         .real
         .h0
@@ -9880,25 +9887,23 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
         .pending_h3_watermark()
         .expect("the lane still mints at the follow-up audit")
         .0;
-    assert!(void_below > barrier);
+    assert!(
+        followup_below > clean_max,
+        "minting advances past the q2 H3 cover"
+    );
     assert_eq!(
         fixture
             .machine
             .diagnostic_audit_for_test()
             .map(|(gap, h3, bound, floor, _)| (gap, h3, bound, floor)),
-        Some((
-            Some(crate::semantics_objects::journal::JournalGap::H3Loss),
-            "StagedLoss",
-            Some(barrier),
-            None
-        )),
-        "the clean follow-up frame voids the unacknowledged barrier once"
+        Some((None, "Clean", Some(clean_max + 1), None)),
+        "the follow-up audit finds no gap and no barrier to void"
     );
-    fixture.published_labeled("midcall-followup-void", None);
+    fixture.published_labeled("midcall-followup-clean1", None);
     assert_eq!(
         api_returns(&fixture),
-        before_void + 1,
-        "the follow-up call joins S1Only history across the void"
+        before_followup + 1,
+        "the follow-up call joins S1 history"
     );
     assert_eq!(
         fixture
@@ -9907,8 +9912,8 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
             .scene
             .coordinator
             .reference_h3_acknowledged_below(),
-        void_below,
-        "the H3 loss void acknowledges its whole audited interval"
+        0,
+        "with no void, nothing is acknowledged"
     );
     let before_clean = api_returns(&fixture);
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 5);
@@ -9947,7 +9952,7 @@ fn joint_machine_unlinked_midcall_break_end_publishes() {
             .scene
             .coordinator
             .reference_h3_acknowledged_below(),
-        void_below,
+        0,
         "a clean frame voids nothing further"
     );
     assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);

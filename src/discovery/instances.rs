@@ -1222,9 +1222,13 @@ impl InstanceRouter {
     /// The scoped twin of [`Self::fail_image_coverage`] for a collected
     /// quantum whose audit proves a bounded loss with stable eras: fail
     /// this quantum's history (observations cleared, every pending call
-    /// shed as CoverageFault) without latching. The caller advances the
-    /// fault era, so old stamps stay refused while fresh scans re-prove
-    /// and later quanta route normally.
+    /// shed as CoverageFault) without latching and without advancing the
+    /// shared fault era. Clearing forces fresh scans, which mint from the
+    /// still-authoritative live counters (the audit proves the loss is a
+    /// userspace-side read gap, not BPF-side uncertainty); calls rejoin
+    /// only on an exact epoch match, so continuity is re-proven rather
+    /// than assumed. BPF-side faults still advance the era and still
+    /// refuse old stamps globally.
     pub(crate) fn fail_quantum_coverage(&mut self) -> Vec<(u64, Route)> {
         self.observed.clear();
         self.clear_carry();

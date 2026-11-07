@@ -1444,8 +1444,9 @@ impl RawJointQuantum {
     /// unprovable. Every other failure is a bounded loss inside this
     /// quantum (exact malformed/discard deltas or an era move within
     /// the drain bracket), which H0 fails scoped: this quantum's
-    /// content sheds, the fault era advances, and later quanta audit
-    /// normally.
+    /// content sheds and later quanta audit normally, without advancing
+    /// the shared fault era (a bounded S1-side read gap must not
+    /// invalidate every joint domain; BPF-side faults still raise).
     fn collection_failed_permanent(&self) -> bool {
         self.audit.fault_error.is_some() || self.audit.counter_error
     }

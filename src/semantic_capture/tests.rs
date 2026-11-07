@@ -4291,7 +4291,9 @@ fn collected_transient_discard_fails_its_quantum_then_recovers() {
         "the failed quantum discloses its coverage loss"
     );
     // Recovery: the next healthy quantum audits, re-scans, and joins.
-    io.semantic_call("C_Sign", 0, 1);
+    // Its call carries the unchanged era: a bounded loss raises nothing,
+    // so production post-loss records keep era 0 (BPF stamps the live cell).
+    io.semantic_call("C_Sign", 0, 0);
     let (mut healed, _, _) = retained_joint_quantum(&mut io);
     let recovered = capture.tick_collected_with(&mut io, &mut healed).unwrap();
     assert!(
@@ -4489,7 +4491,9 @@ fn collected_bounded_loss_sheds_scoped_without_fault_raise_then_recovers() {
         "a bounded per-quantum loss must not latch coverage"
     );
     // Recovery: the next healthy quantum audits, re-scans, and joins.
-    io.semantic_call("C_Sign", 0, 1);
+    // Its call carries the unchanged era: a bounded loss raises nothing,
+    // so production post-loss records keep era 0 (BPF stamps the live cell).
+    io.semantic_call("C_Sign", 0, 0);
     let (mut healed, _, _) = retained_joint_quantum(&mut io);
     let recovered = capture.tick_collected_with(&mut io, &mut healed).unwrap();
     assert_eq!(recovered.calls().count(), 1);

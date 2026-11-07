@@ -3301,19 +3301,19 @@ impl SemanticCapture {
     }
     /// The scoped twin of [`Self::fail_coverage`] for a collected delivery
     /// whose quantum audit proves a bounded loss with stable eras: this
-    /// tick behaves exactly as under coverage failure (its batch routes
-    /// CoverageFault, history is failed, the fault era advances, the loss
-    /// is disclosed), but nothing latches, so the next tick audits
-    /// normally and fresh scans re-prove. Legacy drain failures keep the
-    /// permanent path: without the quantum audit the scope is unknowable.
-    /// The scoped argument needs the era advance: when the raise itself
-    /// fails, old-era stamps stay routable, so this falls back to
-    /// [`Self::fail_coverage`] instead of recovering.
+    /// tick's batch routes CoverageFault, history is failed, and the loss
+    /// is disclosed, but nothing latches and the shared fault is NOT
+    /// raised, so the next tick audits normally and fresh scans re-prove
+    /// at the unchanged era. A bounded per-quantum loss (short-lived
+    /// churn missed by a read) must not void every joint domain: the
+    /// cleared observations force fresh scans, which mint from the
+    /// still-authoritative live counters, and calls rejoin only on an
+    /// exact epoch match. BPF-side faults still raise independently
+    /// (those still void, as they should). Legacy drain failures keep
+    /// the permanent path: without the quantum audit the scope is
+    /// unknowable.
     fn fail_quantum_coverage(&mut self, io: &mut impl CaptureIo, report: &mut TickReport) {
-        if io.raise_fault().is_err() {
-            self.fail_coverage(io, report);
-            return;
-        }
+        let _ = io;
         self.invalidate(InvalidationScope::CoverageFailed, report);
         let resolved = self.router.fail_quantum_coverage();
         self.resolve(resolved, report);

@@ -21,6 +21,20 @@
 # The observer is the host release binary run through `sudo -n` in the
 # initial PID namespace.
 #
+# With --mid-capture the unmapped-byte patch lands DURING the running
+# cgroup profile instead of before it: the profile starts while B maps
+# the single pre-copy-up file, B-pre's stale ledger completes inside the
+# window, the patch copies the file up mid-window, and the second mapper
+# ledgers fresh on the upper copy before the window ends. The settled
+# inventories are unchanged; only the profile spans the copy-up.
+#
+# With --host fedora-private the cell runs ON fedora as user against a
+# task-owned private dockerd (own data-root/exec-root/pidfile/socket
+# under --task-root, bridge/ip6tables off), which loads the --bundle-dir
+# image tarball built on the dev host (--bundle mode) instead of
+# building. The observer is the delivered host release binary run
+# through `sudo -n`. The private daemon always stops, even with --keep.
+#
 # The CONTROLLER runs every docker/sudo command below. Workers only run
 # `sh $0 --self-test`, which is unprivileged (PATH stubs) and proves the
 # arg refusals, the pins, the cleanup trap and the oracle mutations.
@@ -44,7 +58,8 @@ B2_GATE=/tmp/gate-b2
 
 usage() {
     cat >&2 <<'EOF'
-usage: scripts/docker-copyup-changed-e2e.sh --host dev --observer BIN [options]
+usage: scripts/docker-copyup-changed-e2e.sh --host dev|fedora-private --observer BIN [options]
+       scripts/docker-copyup-changed-e2e.sh --bundle OUTDIR [--image NAME] [--token TOKEN]
        scripts/docker-copyup-changed-e2e.sh --self-test | --help
 
   Cell D1-changed driver (different-bytes copy-up, both mappers ledgered
@@ -56,26 +71,48 @@ usage: scripts/docker-copyup-changed-e2e.sh --host dev --observer BIN [options]
   scripts/container-cells-oracle.py copy-up-changed.
 
   --host dev            use the local docker daemon (dev host only)
+  --host fedora-private run ON fedora as user against a task-owned private
+                        dockerd (own data-root/exec-root/pidfile/socket under
+                        --task-root, bridge/ip6tables off); loads --bundle-dir
+                        instead of building (see CONTROLLER below)
   --observer BIN        host release p11scope binary (run through sudo -n)
   --image NAME          image name (default p11scope-ctr-changed:$TOKEN)
+  --task-root DIR       fedora-private only: existing task root directory
+  --bundle-dir DIR      fedora-private only: bundle from --bundle mode
   --token TOKEN         run token, short [a-z0-9-] (default <time>-<pid>)
   --iters-s N           stale ledger iterations for B-pre (default 250)
   --iters-f N           fresh ledger iterations for B2 (default 100, != S)
   --duration S          profile capture seconds (default 30)
+  --mid-capture         patch DURING the running profile (cell
+                        D1-changed-midcapture); default patches before it
   --work DIR            evidence directory (must not exist; default fresh 0700
                         under $TMPDIR)
   --keep                keep container/image for debugging (prints the delete
-                        commands)
+                        commands); the private daemon always stops
+  --bundle OUTDIR       build the image on the dev host, save it as
+                        OUTDIR/image.tar plus sha256sum.txt and image
+                        name/id files, and exit
   --self-test           unprivileged checks (PATH stubs, no docker)
   --help                this text
 
 Exit codes: 0 PASS, 1 FAIL, 2 usage, 3 UNRUN (cell not run, see SUMMARY reason).
-Every run prints a final SUMMARY line: SUMMARY cell=D1-changed host=... verdict=... reason="...".
+Every run prints a final SUMMARY line: SUMMARY cell=D1-changed host=... verdict=... reason="..."
+(mid-capture runs print cell=D1-changed-midcapture).
 
 CONTROLLER (run order):
   # D1-changed on the dev host (from the repo root; BIN = host release binary).
   # Exact rerun flags: iters 250/100, duration 30.
   sh scripts/docker-copyup-changed-e2e.sh --host dev --observer BIN --token <TOKEN> --iters-s 250 --iters-f 100 --duration 30
+  # D1-changed bundle for fedora (on the dev host):
+  sh scripts/docker-copyup-changed-e2e.sh --bundle /tmp/ctr-changed-bundle-<TOKEN> --image p11scope-ctr-changed:<TOKEN>
+  scp -r /tmp/ctr-changed-bundle-<TOKEN> fedora:/home/user/p11scope-ctr-changed-<TOKEN>/bundle
+  scp BIN fedora:/home/user/p11scope-ctr-changed-<TOKEN>/p11scope
+  ssh fedora mkdir -p /home/user/p11scope-ctr-changed-<TOKEN>/scripts
+  scp scripts/docker-copyup-changed-e2e.sh scripts/container-cells-oracle.py scripts/lib.sh scripts/cleanup-traps.sh fedora:/home/user/p11scope-ctr-changed-<TOKEN>/scripts/
+  # D1-changed on fedora (as user; run `sudo -n true` first in the session):
+  ssh fedora sh /home/user/p11scope-ctr-changed-<TOKEN>/scripts/docker-copyup-changed-e2e.sh --host fedora-private --task-root /home/user/p11scope-ctr-changed-<TOKEN> --bundle-dir /home/user/p11scope-ctr-changed-<TOKEN>/bundle --observer /home/user/p11scope-ctr-changed-<TOKEN>/p11scope --token <TOKEN>
+  # D1-changed-midcapture: the same, with the patch landing mid-profile.
+  sh scripts/docker-copyup-changed-e2e.sh --host dev --observer BIN --token <TOKEN> --iters-s 250 --iters-f 100 --duration 30 --mid-capture
 EOF
     exit 2
 }
@@ -173,6 +210,12 @@ self_test() {
         || { echo "run path lost its lane-B-only gate" >&2; exit 1; }
     grep -q 'PATCHER.*PROVIDER_PAT[H]' "$0" \
         || { echo "run path lost the unmapped-byte patch" >&2; exit 1; }
+    grep -q 'ORACLE_CMD=copy-up-midcaptur[e]' "$0" \
+        || { echo "mid-capture run path lost its oracle subcommand" >&2; exit 1; }
+    grep -q 't-patc[h]=' "$0" \
+        || { echo "mid-capture run path lost its window stamps" >&2; exit 1; }
+    grep -q 't-profile-rea[d]y=' "$0" \
+        || { echo "mid-capture run path lost its window start" >&2; exit 1; }
     d1c_help_self_test
     d1c_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -182,8 +225,10 @@ self_test() {
 
 d1c_help_self_test() {
     help=$(sh "$0" --help 2>&1 || true)
-    for marker in "--host dev --observer BIN" "SUMMARY cell=D1-changed" \
-                  "--iters-s 250 --iters-f 100 --duration 30"; do
+    for marker in "--host dev --observer BIN" "--host fedora-private --task-root" \
+                  "SUMMARY cell=D1-changed" "--bundle OUTDIR" "scp -r" "sudo -n true" \
+                  "--iters-s 250 --iters-f 100 --duration 30" \
+                  "cell=D1-changed-midcapture" "--mid-capture"; do
         case $help in
             *"$marker"*) ;;
             *) echo "help lost its controller line: $marker" >&2; exit 1 ;;
@@ -207,6 +252,18 @@ printf ' %s' "$@"
 printf '\n'
 EOF
     chmod +x "$stub/sudo" "$stub/echo-sudo"
+    # The private dockerd command carries its own roots and no network.
+    argv=$(TASK_ROOT=$stub/task dockerd_argv)
+    for pin in "--data-root $stub/task/docker-data" \
+               "--exec-root $stub/task/docker-exec" \
+               "--pidfile $stub/task/dockerd.pid" \
+               "unix://$stub/task/docker.sock" \
+               "--bridge=none" "--iptables=false"; do
+        case $argv in
+            *"$pin"*) ;;
+            *) echo "dockerd argv lost its pin: $pin" >&2; exit 1 ;;
+        esac
+    done
     # Storage-driver gate: overlay2 (classic store) and overlayfs (the
     # containerd image store snapshotter, Docker 29 default) proceed;
     # anything else is UNRUN.
@@ -333,8 +390,19 @@ EOF
 
 # Docker through the local daemon (dev host only; this cell has no
 # fedora-private mode).
+# Docker through the selected daemon: the local one on dev, the task-owned
+# private socket (root-owned, hence sudo) on fedora.
 dcli() {
-    docker "$@"
+    if [ "${PRIVATE:-0}" -eq 1 ]; then
+        sudo -n docker -H "unix://$TASK_ROOT/docker.sock" "$@"
+    else
+        docker "$@"
+    fi
+}
+
+# The exact private-daemon command (single source for start, facts and test).
+dockerd_argv() {
+    printf '%s\n' "dockerd --data-root $TASK_ROOT/docker-data --exec-root $TASK_ROOT/docker-exec --pidfile $TASK_ROOT/dockerd.pid -H unix://$TASK_ROOT/docker.sock --bridge=none --iptables=false"
 }
 
 # The host observer always runs through passwordless sudo, args verbatim.
@@ -406,7 +474,8 @@ fact() {
 }
 
 summarize() {
-    line="SUMMARY cell=D1-changed host=${HOST-none} verdict=$1 reason=\"$2\""
+    if [ "${MID:-0}" -eq 1 ]; then cell=D1-changed-midcapture; else cell=D1-changed; fi
+    line="SUMMARY cell=$cell host=${HOST-none} verdict=$1 reason=\"$2\""
     printf '%s\n' "$line"
     if [ -n "${FACTS-}" ]; then
         printf '%s\n' "$line" >>"$FACTS"
@@ -435,10 +504,13 @@ cleanup() {
     for capture_pid in ${CAPTURE_PIDS-}; do
         kill "$capture_pid" 2>/dev/null
     done
-    if [ "${KEEP:-0}" -eq 1 ]; then
+    if [ "${KEEP:-0}" -eq 1 ] && [ "${PRIVATE:-0}" -eq 0 ]; then
         echo "kept container ${D1C_B-} and image ${D1C_IMAGE-} (--keep): delete with: docker rm -f ${D1C_B-}; docker image rm -f ${D1C_IMAGE-}" >&2
     elif [ -n "${OWNED-}" ]; then
         cleanup_owned
+    fi
+    if [ "${PRIVATE:-0}" -eq 1 ] && [ -n "${DAEMON_STARTED-}" ]; then
+        stop_private_daemon || true
     fi
     if [ -n "${WORK-}" ]; then
         echo "evidence directory: $WORK" >&2
@@ -450,6 +522,40 @@ cleanup() {
 cleanup_owned() {
     dcli rm -f "$D1C_B" >/dev/null 2>&1 || true
     dcli image rm -f "$D1C_IMAGE" >/dev/null 2>&1 || true
+}
+
+# The bundle a --bundle run wrote: tarball gated by its sha256 list plus name.
+verify_bundle() {
+    [ -f "$1/image.tar" ] && [ -f "$1/sha256sum.txt" ] && [ -f "$1/image-name.txt" ] \
+        || { echo "bundle $1 is incomplete" >&2; return 1; }
+    (cd "$1" && sha256sum -c sha256sum.txt) || return 1
+}
+
+# The private daemon always stops (even with --keep: fedora leaves nothing
+# running) and its state is removed.
+stop_private_daemon() {
+    if [ -f "$TASK_ROOT/dockerd.pid" ]; then
+        pid=$(cat "$TASK_ROOT/dockerd.pid")
+        case $pid in
+            ''|*[!0-9]*) echo "bad dockerd pid: $pid" >&2; return 1 ;;
+        esac
+        sudo -n kill "$pid" 2>/dev/null || true
+        i=0
+        while kill -0 "$pid" 2>/dev/null && [ "$i" -lt 30 ]; do
+            sleep 1
+            i=$((i + 1))
+        done
+        if kill -0 "$pid" 2>/dev/null; then
+            sudo -n kill -9 "$pid" 2>/dev/null || true
+            sleep 2
+        fi
+        if kill -0 "$pid" 2>/dev/null; then
+            echo "dockerd $pid survived SIGKILL" >&2
+            return 1
+        fi
+    fi
+    sudo -n rm -rf "$TASK_ROOT/docker-data" "$TASK_ROOT/docker-exec" \
+        "$TASK_ROOT/docker.sock" "$TASK_ROOT/dockerd.pid"
 }
 
 container_pid() {
@@ -637,15 +743,58 @@ wait_ready() {
     return 1
 }
 
+save_bundle() {
+    printf '%s\n' "$D1C_IMAGE" >"$1/image-name.txt"
+    dcli inspect --format '{{.Id}}' "$D1C_IMAGE" >"$1/image-id.txt" || return 1
+    dcli save -o "$1/image.tar" "$D1C_IMAGE" || return 1
+    (cd "$1" && sha256sum image.tar >sha256sum.txt) || return 1
+    fact "bundle: $1 image=$D1C_IMAGE id=$(cat "$1/image-id.txt") sha256=$(awk '{print $1}' "$1/sha256sum.txt")"
+}
+
+load_bundle() {
+    verify_bundle "$BUNDLE_DIR" || return 1
+    want=$(cat "$BUNDLE_DIR/image-name.txt")
+    [ "$want" = "$D1C_IMAGE" ] \
+        || { echo "bundle image $want is not $D1C_IMAGE" >&2; return 1; }
+    dcli load -i "$BUNDLE_DIR/image.tar" || return 1
+    dcli image inspect "$D1C_IMAGE" >/dev/null || return 1
+}
+
+start_private_daemon() {
+    [ ! -e "$TASK_ROOT/docker.sock" ] \
+        || { echo "socket $TASK_ROOT/docker.sock already exists" >&2; return 1; }
+    [ ! -e "$TASK_ROOT/dockerd.pid" ] \
+        || { echo "pidfile $TASK_ROOT/dockerd.pid already exists" >&2; return 1; }
+    mkdir -p "$TASK_ROOT/docker-data" "$TASK_ROOT/docker-exec"
+    dockerd_argv | tee -a "$FACTS"
+    # shellcheck disable=SC2086
+    sudo -n $(dockerd_argv) >"$TASK_ROOT/dockerd.log" 2>&1 &
+    DAEMON_STARTED=1
+    i=0
+    while [ "$i" -lt 120 ]; do
+        if dcli info >/dev/null 2>&1; then
+            return 0
+        fi
+        sleep 1
+        i=$((i + 1))
+    done
+    echo "private dockerd never answered; see $TASK_ROOT/dockerd.log" >&2
+    return 1
+}
+
 HOST=
 OBSERVER=
 IMAGE=
+TASK_ROOT=
+BUNDLE_DIR=
+BUNDLE_OUT=
 TOKEN=
 ITERS_S=$ITERS_S_DEFAULT
 ITERS_F=$ITERS_F_DEFAULT
 DURATION=$DURATION_DEFAULT
 WORK_OPT=
 KEEP=0
+MID=0
 
 while [ "$#" -gt 0 ]; do
     case $1 in
@@ -654,19 +803,49 @@ while [ "$#" -gt 0 ]; do
         --host) [ "$#" -ge 2 ] || usage; [ -z "$HOST" ] || usage; HOST=$2; shift 2 ;;
         --observer) [ "$#" -ge 2 ] || usage; [ -z "$OBSERVER" ] || usage; OBSERVER=$2; shift 2 ;;
         --image) [ "$#" -ge 2 ] || usage; [ -z "$IMAGE" ] || usage; IMAGE=$2; shift 2 ;;
+        --task-root) [ "$#" -ge 2 ] || usage; [ -z "$TASK_ROOT" ] || usage; TASK_ROOT=$2; shift 2 ;;
+        --bundle-dir) [ "$#" -ge 2 ] || usage; [ -z "$BUNDLE_DIR" ] || usage; BUNDLE_DIR=$2; shift 2 ;;
+        --bundle) [ "$#" -ge 2 ] || usage; [ -z "$BUNDLE_OUT" ] || usage; BUNDLE_OUT=$2; shift 2 ;;
         --token) [ "$#" -ge 2 ] || usage; [ -z "$TOKEN" ] || usage; TOKEN=$2; shift 2 ;;
         --iters-s) [ "$#" -ge 2 ] || usage; ITERS_S=$2; shift 2 ;;
         --iters-f) [ "$#" -ge 2 ] || usage; ITERS_F=$2; shift 2 ;;
         --duration) [ "$#" -ge 2 ] || usage; DURATION=$2; shift 2 ;;
+        --mid-capture) MID=1; shift ;;
         --work) [ "$#" -ge 2 ] || usage; [ -z "$WORK_OPT" ] || usage; WORK_OPT=$2; shift 2 ;;
         --keep) KEEP=1; shift ;;
         *) echo "unknown argument: $1" >&2; usage ;;
     esac
 done
 
+[ -z "$BUNDLE_OUT" ] || {
+    [ -z "$HOST$OBSERVER$TASK_ROOT$BUNDLE_DIR$WORK_OPT" ] && [ "$KEEP" -eq 0 ] || usage
+    [ ! -e "$BUNDLE_OUT" ] || { echo "bundle dir $BUNDLE_OUT already exists" >&2; exit 2; }
+    [ -z "$TOKEN" ] || valid_token "$TOKEN" || usage
+    TOKEN=${TOKEN:-$(date +%s)-$$}
+    valid_token "$TOKEN" || usage
+    D1C_IMAGE=${IMAGE:-p11scope-ctr-changed:$TOKEN}
+    PRIVATE=0
+    for command in docker python3 sha256sum; do
+        command -v "$command" >/dev/null || { echo "$command required" >&2; exit 3; }
+    done
+    mkdir -p "$BUNDLE_OUT"
+    WORK=$BUNDLE_OUT
+    FACTS=$BUNDLE_OUT/bundle.log
+    : >"$FACTS"
+    build_image || { echo "image build failed" >&2; exit 1; }
+    save_bundle "$BUNDLE_OUT" || { echo "bundle save failed" >&2; exit 1; }
+    say "BUNDLE dir=$BUNDLE_OUT image=$D1C_IMAGE"
+    exit 0
+}
+
 [ -n "$HOST" ] || usage
+PRIVATE=0
 case $HOST in
-    dev) ;;
+    dev) [ -z "$TASK_ROOT$BUNDLE_DIR" ] || usage ;;
+    fedora-private)
+        PRIVATE=1
+        [ -n "$TASK_ROOT" ] && [ -n "$BUNDLE_DIR" ] || usage
+        ;;
     *) usage ;;
 esac
 [ -n "$OBSERVER" ] || usage
@@ -701,11 +880,16 @@ SUMMARY_JSONL=$WORK/summary.jsonl
 . scripts/cleanup-traps.sh
 
 D1C_B=d1c-b-$TOKEN
-D1C_IMAGE=${IMAGE:-p11scope-ctr-changed:$TOKEN}
+if [ "$PRIVATE" -eq 1 ] && [ -z "$IMAGE" ]; then
+    [ -f "$BUNDLE_DIR/image-name.txt" ] || unrun "bundle $BUNDLE_DIR has no image-name.txt"
+    D1C_IMAGE=$(cat "$BUNDLE_DIR/image-name.txt")
+else
+    D1C_IMAGE=${IMAGE:-p11scope-ctr-changed:$TOKEN}
+fi
 OWNED=1
 CAPTURE_PIDS=
 
-fact "cell=D1-changed host=$HOST token=$TOKEN date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+if [ "$MID" -eq 1 ]; then fact "cell=D1-changed-midcapture host=$HOST token=$TOKEN date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; else fact "cell=D1-changed host=$HOST token=$TOKEN date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"; fi
 fact "observer=$OBSERVER sha256=$(sha256sum "$OBSERVER" | awk '{print $1}')"
 fact "image=$D1C_IMAGE container=$D1C_B iters-s=$ITERS_S iters-f=$ITERS_F duration=$DURATION"
 fact "kernel=$(uname -sr) $(uname -m)"
@@ -716,6 +900,17 @@ case $LANE in
     *) unrun "D1-changed rows are lane B only (lane $LANE unqualified)" ;;
 esac
 fact "kind: not used (docker-only cell); kubectl: not used (docker-only cell)"
+
+if [ "$PRIVATE" -eq 1 ]; then
+    fstype=$(df -T "$TASK_ROOT" 2>/dev/null | awk 'NR==2 {print $2}')
+    fact "task-root=$TASK_ROOT fstype=${fstype-unknown}"
+    [ "$fstype" != "tmpfs" ] || unrun "task root $TASK_ROOT is memory-backed; use a disk filesystem"
+    verify_bundle "$BUNDLE_DIR" || unrun "bundle $BUNDLE_DIR failed verification"
+    fact "bundle=$BUNDLE_DIR sha256=$(awk '{print $1}' "$BUNDLE_DIR/sha256sum.txt")"
+    fact "downloads: none (private daemon loads the verified bundle; no network)"
+    start_private_daemon || unrun "private dockerd failed to start"
+    fact "dockerd-log=$TASK_ROOT/dockerd.log"
+fi
 
 docker_info=$(dcli info --format '{{.Driver}} {{.ServerVersion}}' 2>/dev/null) \
     || unrun "docker info failed"
@@ -730,8 +925,13 @@ require_overlay2 || unrun "storage driver is not overlay2/overlayfs; D1-changed 
 grep -E ' overlay ' /proc/mounts | head -5 >>"$FACTS" || true
 assert_name_free "$D1C_B" || unrun "container $D1C_B already exists"
 
-build_image || fail_cell "image build failed"
-fact "downloads: base $HOLDER_BASE; apt archive packages per $HOLDER_DOCKERFILE (gcc, softhsm2; unpinned, repeatable not bit-reproducible)"
+if [ "$PRIVATE" -eq 1 ]; then
+    load_bundle || unrun "bundle load failed"
+    fact "downloads: none (bundle load only)"
+else
+    build_image || fail_cell "image build failed"
+    fact "downloads: base $HOLDER_BASE; apt archive packages per $HOLDER_DOCKERFILE (gcc, softhsm2; unpinned, repeatable not bit-reproducible)"
+fi
 fact "image-id=$(dcli inspect --format '{{.Id}}' "$D1C_IMAGE")"
 
 say "=== start container B ($ITERS_S stale rounds held) ==="
@@ -753,46 +953,76 @@ if upper_has "$UPPER_B"; then fail_cell "B provider is already in its upper laye
 save_logs "$D1C_B" "$WORK/logs-b-pre.txt" || fail_cell "cannot read $D1C_B logs"
 grep -h '^TARGET ' "$WORK/logs-b-pre.txt" >>"$FACTS" || fail_cell "B-pre printed no TARGET lines"
 
-say "=== different-bytes copy-up in B (unmapped-byte patch) ==="
-PATCH_OUT=$(dcli exec "$D1C_B" "$PATCHER" "$PROVIDER_PATH" 2>&1) \
-    || fail_cell "patch exec failed in $D1C_B: $PATCH_OUT"
-fact "patch=$PATCH_OUT"
-maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the provider after the patch"
-STAT_B_POST=$(prov_stat "$PID_B_PRE") || fail_cell "cannot stat B provider after the patch"
-SHA_B_POST=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider after the patch"
-fact "stat-b-post=$STAT_B_POST sha-b-post=$SHA_B_POST"
-# The overlay merge view keeps the origin inode across copy-up (same as
-# D1: stat-b-post == stat-b-pre); the copy-up proof is the changed
-# bytes plus the new upper file below, not a merge-inode change.
-[ "$SHA_B_POST" != "$SHA_B_PRE" ] || fail_cell "patch changed no bytes (not different-bytes)"
-upper_has "$UPPER_B" || fail_cell "copy-up left no provider in B's upper layer"
-UPPER_STAT_B=$(upper_stat "$UPPER_B") || fail_cell "cannot stat B upper provider"
-UPPER_SHA_B=$(upper_sha "$UPPER_B") || fail_cell "cannot hash B upper provider"
-fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
-[ "$UPPER_SHA_B" = "$SHA_B_POST" ] || fail_cell "upper bytes are not the merge bytes"
-[ "$UPPER_STAT_B" != "$STAT_B_PRE" ] || fail_cell "upper inode is the pre inode"
+# One unmapped-byte patch with the shared copy-up proof: the merge view
+# keeps the origin inode across copy-up (same as D1: stat-b-post ==
+# stat-b-pre); the proof is the changed bytes plus the new upper file,
+# not a merge-inode change.
+patch_copy_up() {
+    say "=== different-bytes copy-up in B (unmapped-byte patch) ==="
+    PATCH_OUT=$(dcli exec "$D1C_B" "$PATCHER" "$PROVIDER_PATH" 2>&1) \
+        || fail_cell "patch exec failed in $D1C_B: $PATCH_OUT"
+    fact "patch=$PATCH_OUT"
+    maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the provider after the patch"
+    STAT_B_POST=$(prov_stat "$PID_B_PRE") || fail_cell "cannot stat B provider after the patch"
+    SHA_B_POST=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider after the patch"
+    fact "stat-b-post=$STAT_B_POST sha-b-post=$SHA_B_POST"
+    [ "$SHA_B_POST" != "$SHA_B_PRE" ] || fail_cell "patch changed no bytes (not different-bytes)"
+    upper_has "$UPPER_B" || fail_cell "copy-up left no provider in B's upper layer"
+    UPPER_STAT_B=$(upper_stat "$UPPER_B") || fail_cell "cannot stat B upper provider"
+    UPPER_SHA_B=$(upper_sha "$UPPER_B") || fail_cell "cannot hash B upper provider"
+    fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
+    [ "$UPPER_SHA_B" = "$SHA_B_POST" ] || fail_cell "upper bytes are not the merge bytes"
+    [ "$UPPER_STAT_B" != "$STAT_B_PRE" ] || fail_cell "upper inode is the pre inode"
+}
 
-say "=== second mapper in B maps the upper copy ==="
-start_second_mapper
-wait_file_line "$WORK/b2.log" '^READY ' 60 || fail_cell "second mapper in $D1C_B never became ready"
-PID_B2=$(pid_in_cgroup_with "$CG_B" "$B2_GATE") || fail_cell "no host pid for the second mapper"
-maps_provider "$PID_B2" || fail_cell "second mapper does not map the provider"
-maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the provider"
-STAT_B2=$(prov_stat "$PID_B2") || fail_cell "cannot stat the second mapper's provider"
-fact "pid-b2=$PID_B2 stat-b2=$STAT_B2"
-grep -h '^TARGET ' "$WORK/b2.log" >>"$FACTS" || fail_cell "second mapper printed no TARGET lines"
+start_b2() {
+    say "=== second mapper in B maps the upper copy ==="
+    start_second_mapper
+    wait_file_line "$WORK/b2.log" '^READY ' 60 || fail_cell "second mapper in $D1C_B never became ready"
+    PID_B2=$(pid_in_cgroup_with "$CG_B" "$B2_GATE") || fail_cell "no host pid for the second mapper"
+    maps_provider "$PID_B2" || fail_cell "second mapper does not map the provider"
+    maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the provider"
+    STAT_B2=$(prov_stat "$PID_B2") || fail_cell "cannot stat the second mapper's provider"
+    fact "pid-b2=$PID_B2 stat-b2=$STAT_B2"
+    grep -h '^TARGET ' "$WORK/b2.log" >>"$FACTS" || fail_cell "second mapper printed no TARGET lines"
+}
 
-say "=== cgroup profile of B across both ledgers ==="
-start_profile changed-b "$CG_B" "$DURATION" "$WORK/changed-profile-b.json"
-PID_PROF=$STARTED_PID
-wait_ready changed-b "$PID_PROF" || fail_cell "profile of B never became ready"
-release_gate "$PID_B_PRE" || fail_cell "gate release failed for B's first process"
-release_gate "$PID_B2" "$B2_GATE" || fail_cell "gate release failed for the second mapper"
-wait_docker_log "$D1C_B" '^LEDGER ' 120 || fail_cell "stale ledger never completed"
-wait_file_line "$WORK/b2.log" '^LEDGER ' 120 || fail_cell "fresh ledger never completed"
-kill -0 "$PID_PROF" 2>/dev/null || fail_cell "a ledger completed outside the capture window"
-wait "$PID_PROF" || fail_cell "profile of B failed"
-reclaim_root_output "$WORK/changed-profile-b.json" || fail_cell "cannot reclaim profile of B"
+if [ "$MID" -eq 1 ]; then
+    say "=== cgroup profile of B starts BEFORE the copy-up ==="
+    start_profile changed-b "$CG_B" "$DURATION" "$WORK/changed-profile-b.json"
+    PID_PROF=$STARTED_PID
+    wait_ready changed-b "$PID_PROF" || fail_cell "profile of B never became ready"
+    fact "t-profile-ready=$(date +%s%N)"
+    release_gate "$PID_B_PRE" || fail_cell "gate release failed for B's first process"
+    wait_docker_log "$D1C_B" '^LEDGER ' 120 || fail_cell "stale ledger never completed"
+    fact "t-bpre-ledger=$(date +%s%N)"
+    kill -0 "$PID_PROF" 2>/dev/null || fail_cell "stale ledger completed outside the capture window"
+    patch_copy_up
+    fact "t-patch=$(date +%s%N)"
+    kill -0 "$PID_PROF" 2>/dev/null || fail_cell "profile died before the copy-up"
+    start_b2
+    release_gate "$PID_B2" "$B2_GATE" || fail_cell "gate release failed for the second mapper"
+    wait_file_line "$WORK/b2.log" '^LEDGER ' 120 || fail_cell "fresh ledger never completed"
+    fact "t-b2-ledger=$(date +%s%N)"
+    kill -0 "$PID_PROF" 2>/dev/null || fail_cell "fresh ledger completed outside the capture window"
+    wait "$PID_PROF" || fail_cell "profile of B failed"
+    fact "t-profile-end=$(date +%s%N)"
+    reclaim_root_output "$WORK/changed-profile-b.json" || fail_cell "cannot reclaim profile of B"
+else
+    patch_copy_up
+    start_b2
+    say "=== cgroup profile of B across both ledgers ==="
+    start_profile changed-b "$CG_B" "$DURATION" "$WORK/changed-profile-b.json"
+    PID_PROF=$STARTED_PID
+    wait_ready changed-b "$PID_PROF" || fail_cell "profile of B never became ready"
+    release_gate "$PID_B_PRE" || fail_cell "gate release failed for B's first process"
+    release_gate "$PID_B2" "$B2_GATE" || fail_cell "gate release failed for the second mapper"
+    wait_docker_log "$D1C_B" '^LEDGER ' 120 || fail_cell "stale ledger never completed"
+    wait_file_line "$WORK/b2.log" '^LEDGER ' 120 || fail_cell "fresh ledger never completed"
+    kill -0 "$PID_PROF" 2>/dev/null || fail_cell "a ledger completed outside the capture window"
+    wait "$PID_PROF" || fail_cell "profile of B failed"
+    reclaim_root_output "$WORK/changed-profile-b.json" || fail_cell "cannot reclaim profile of B"
+fi
 save_logs "$D1C_B" "$WORK/logs-b.txt" || fail_cell "cannot read $D1C_B logs"
 ledger_is "$WORK/logs-b.txt" "$ITERS_S" || fail_cell "stale ledger is not 6x$ITERS_S"
 ledger_is "$WORK/b2.log" "$ITERS_F" || fail_cell "fresh ledger is not 6x$ITERS_F"
@@ -805,11 +1035,19 @@ maps_provider "$PID_B2" || fail_cell "second mapper no longer maps the provider"
 run_inventory kernel "$WORK/changed-kernel.json" || fail_cell "kernel inventory failed"
 run_inventory userspace "$WORK/changed-userspace.json" || fail_cell "userspace inventory failed"
 
-printf '%s\n' "copy-up-stale-caller: after B's different-bytes copy-up (one unmapped provider byte patched: a new upper inode, a new sha256), B's pre-copy-up process keeps the lower file on its key module with layer pre_copy_up (kernel backend: mapped, deep_scan, gap-free, $ITERS_S stale calls counted on the lower profile row). The second mapper joins the upper file on its own module (mapped, deep_scan, gap-free, $ITERS_F fresh calls counted on the upper profile row). Every userspace leg honestly gaps both overlay joins (no kernel witness there). No named identity loss is expected on any leg." >"$WORK/run-note.txt"
+if [ "$MID" -eq 1 ]; then
+    ORACLE_CMD=copy-up-midcapture
+    CELL_NAME=D1-changed-midcapture
+    printf '%s\n' "copy-up-stale-caller: mid-capture — the cgroup profile of B started while B mapped the single pre-copy-up file; B-pre's stale ledger completed inside the window, then one unmapped provider byte was patched mid-window (a new upper inode, a new sha256), and the second mapper ledgered on the upper copy before the window ended. B's pre-copy-up process keeps the lower file on its key module with layer pre_copy_up (kernel backend: mapped, deep_scan, gap-free, $ITERS_S stale calls counted on the lower profile row). The second mapper joins the upper file on its own module (mapped, deep_scan, gap-free, $ITERS_F fresh calls counted on the upper profile row). Every userspace leg honestly gaps both overlay joins (no kernel witness there). No named identity loss is expected on any leg." >"$WORK/run-note.txt"
+else
+    ORACLE_CMD=copy-up-changed
+    CELL_NAME=D1-changed
+    printf '%s\n' "copy-up-stale-caller: after B's different-bytes copy-up (one unmapped provider byte patched: a new upper inode, a new sha256), B's pre-copy-up process keeps the lower file on its key module with layer pre_copy_up (kernel backend: mapped, deep_scan, gap-free, $ITERS_S stale calls counted on the lower profile row). The second mapper joins the upper file on its own module (mapped, deep_scan, gap-free, $ITERS_F fresh calls counted on the upper profile row). Every userspace leg honestly gaps both overlay joins (no kernel witness there). No named identity loss is expected on any leg." >"$WORK/run-note.txt"
+fi
 fact "run-note=$(cat "$WORK/run-note.txt")"
 
 say "=== oracle ==="
-if python3 -I "$ORACLE" copy-up-changed \
+if python3 -I "$ORACLE" "$ORACLE_CMD" \
         --kernel "$WORK/changed-kernel.json" \
         --userspace "$WORK/changed-userspace.json" \
         --profile "$WORK/changed-profile-b.json" \
@@ -821,9 +1059,9 @@ if python3 -I "$ORACLE" copy-up-changed \
     cat "$WORK/oracle.json" >>"$SUMMARY_JSONL"
     cat "$WORK/oracle.json" >>"$FACTS"
     cat "$WORK/oracle.err" >>"$FACTS"
-    pass_cell "D1-changed lane $LANE copy-up verdict recorded"
+    pass_cell "$CELL_NAME lane $LANE copy-up verdict recorded"
 else
     cat "$WORK/oracle.err" >&2 || true
     cat "$WORK/oracle.err" >>"$FACTS" || true
-    fail_cell "oracle refused the D1-changed evidence"
+    fail_cell "oracle refused the $CELL_NAME evidence"
 fi

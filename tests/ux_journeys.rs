@@ -881,7 +881,9 @@ fn high1_missing_privilege_is_named_and_never_offers_the_override() {
         );
         assert!(
             refused.stderr.contains("live capture needs CAP_")
-                && refused.stderr.contains("Grant the minimal set: sudo setcap "),
+                && refused
+                    .stderr
+                    .contains("Grant the minimal set: sudo setcap "),
             "{args:?}: {}",
             refused.stderr
         );

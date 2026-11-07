@@ -872,6 +872,7 @@ fn collect_with(
         sweep_unavailable,
         budget,
         digests: std::collections::BTreeMap::new(),
+        generations: std::collections::BTreeMap::new(),
     };
     let mut bound = if work.charge(
         collection

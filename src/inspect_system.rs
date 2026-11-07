@@ -354,6 +354,10 @@ struct Collection {
     /// Per-swept-pid maps-snapshot digest: the next pass's skip priors.
     /// Empty under the cap (no sweep ran).
     digests: BTreeMap<u32, u64>,
+    /// Per-swept-pid generation start-time, read beside the digest:
+    /// every swept pid pairs a prior, not only read members. Pids
+    /// whose start-time was unreadable are absent and never skip.
+    generations: BTreeMap<u32, u64>,
 }
 
 #[cfg(test)]
@@ -466,6 +470,20 @@ pub(crate) fn unchanged_skip_set(
             generation(*pid).is_some_and(|live| live == *start)
         })
         .map(|(pid, _)| *pid)
+        .collect()
+}
+
+/// Pair one pass's sweep digests with the start-times read beside them:
+/// every swept pid carries a next-pass prior, whether a deep scan,
+/// a maps match, or no read reached it. A pid whose generation was
+/// unreadable pairs with `None` and never skips.
+pub(crate) fn pair_priors(
+    digests: &BTreeMap<u32, u64>,
+    generations: &BTreeMap<u32, u64>,
+) -> BTreeMap<u32, (Option<u64>, u64)> {
+    digests
+        .iter()
+        .map(|(pid, digest)| (*pid, (generations.get(pid).copied(), *digest)))
         .collect()
 }
 
@@ -628,6 +646,18 @@ fn collect_members_identity(
         .iter()
         .map(|(pid, entries)| (*pid, digest_maps_snapshot(entries)))
         .collect();
+    // Generation for every swept pid, read beside the digest: priors
+    // cover members no deep scan or maps match reached, not only read
+    // members. One stat read per pid; unreadable pids pair with `None`
+    // and never skip.
+    let generations: BTreeMap<u32, u64> = sweep
+        .iter()
+        .filter_map(|(pid, _)| {
+            crate::process::process_start_time(*pid)
+                .ok()
+                .map(|start| (*pid, start))
+        })
+        .collect();
     let mut selected_set: BTreeSet<_> = selected.iter().copied().collect();
     if !priors.digests.is_empty() && !sweep.is_empty() {
         let candidates: Vec<(u32, Vec<MapEntry>)> = sweep
@@ -704,6 +734,7 @@ fn collect_members_identity(
             sweep_unavailable,
             budget,
             digests,
+            generations,
         },
         custody,
     )
@@ -1649,6 +1680,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         sweep_unavailable: BTreeSet::new(),
         budget,
         digests: BTreeMap::new(),
+        generations: BTreeMap::new(),
     };
     let mut bound = bind_collection(&mut collection);
     prepare_count_manifests(
@@ -2702,45 +2734,9 @@ fn assemble(
     } else {
         None
     };
-    // Next pass's skip priors: this pass's sweep digests keyed with the
-    // generation each read proved (deep scans and maps matches pin it;
-    // pids no read reached carry no generation and never skip).
-    let member_generation: BTreeMap<u32, Option<u64>> = collection
-        .members
-        .iter()
-        .map(|member| {
-            (
-                member.pid,
-                member
-                    .generation
-                    .as_ref()
-                    .and_then(|generation| generation.start_time),
-            )
-        })
-        .collect();
-    let attributed_generation: BTreeMap<u32, u64> = attributed
-        .as_ref()
-        .map(|attributed| {
-            attributed
-                .attribution
-                .members
-                .iter()
-                .map(|member| (member.pid, member.start_time))
-                .collect()
-        })
-        .unwrap_or_default();
-    let sweep_digests: BTreeMap<u32, (Option<u64>, u64)> = collection
-        .digests
-        .iter()
-        .map(|(pid, digest)| {
-            let generation = member_generation
-                .get(pid)
-                .copied()
-                .flatten()
-                .or_else(|| attributed_generation.get(pid).copied());
-            (*pid, (generation, *digest))
-        })
-        .collect();
+    // Next pass's skip priors: this pass's sweep digests paired with
+    // the start-times read beside them, covering every swept pid.
+    let sweep_digests = pair_priors(&collection.digests, &collection.generations);
     Catalog {
         lowering: Some(CatalogLowering {
             plan,
@@ -5636,6 +5632,7 @@ mod tests {
                 },
             ),
             digests: std::collections::BTreeMap::new(),
+            generations: std::collections::BTreeMap::new(),
         }
     }
 
@@ -7575,6 +7572,7 @@ mod tests {
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
                 digests: BTreeMap::new(),
+                generations: BTreeMap::new(),
             }
         }
 
@@ -8485,6 +8483,7 @@ mod tests {
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
                 digests: BTreeMap::new(),
+                generations: BTreeMap::new(),
             };
             let catalog = catalog_of(collection, HashMap::new(), false);
             assert!(catalog.objects.is_empty(), "no object was proven");
@@ -8534,6 +8533,7 @@ mod tests {
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
                 digests: BTreeMap::new(),
+                generations: BTreeMap::new(),
             };
             let catalog = catalog_of(collection, HashMap::new(), false);
             assert!(catalog.objects.is_empty(), "no provider was mapped");
@@ -8613,6 +8613,7 @@ mod tests {
             sweep_unavailable: BTreeSet::new(),
             budget: CaptureWorkBudget::default(),
             digests: BTreeMap::new(),
+            generations: BTreeMap::new(),
         };
         let error = format!("{:#}", proc_list_system_error(&collection));
         assert!(error.contains("cannot inspect system"), "{error}");
@@ -10862,6 +10863,24 @@ mod maps_skip_tests {
         assert!(
             unchanged_skip_set(&sweep, &prior, &live).is_empty(),
             "a prior pass that never read the generation proves nothing"
+        );
+    }
+
+    #[test]
+    fn recorded_priors_pair_every_swept_pid_with_its_generation() {
+        use super::pair_priors;
+        let digests: BTreeMap<u32, u64> = [(11, 0xA), (12, 0xB)].into_iter().collect();
+        let generations: BTreeMap<u32, u64> = [(11, 110)].into_iter().collect();
+        assert_eq!(
+            pair_priors(&digests, &generations),
+            [(11, (Some(110), 0xA)), (12, (None, 0xB))]
+                .into_iter()
+                .collect(),
+            "every swept pid carries a prior; an unread generation skips nothing"
+        );
+        assert!(
+            pair_priors(&BTreeMap::new(), &generations).is_empty(),
+            "no sweep means no priors"
         );
     }
 

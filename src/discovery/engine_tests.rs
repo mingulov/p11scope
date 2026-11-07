@@ -65827,9 +65827,7 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     engine.scheduler.set_tick_quantum_ns_for_test(1_000);
     engine.scheduler.set_max_evictions_for_test(1);
     assert!(
-        engine
-            .find_evictable_victim_for_selected(fresh1)
-            .is_some(),
+        engine.find_evictable_victim_for_selected(fresh1).is_some(),
         "the parked sleeper view is the evictable victim"
     );
     // Pass 1 (ordinary): only the two backlogs wait, so the single-class
@@ -65860,7 +65858,10 @@ fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
     // pid first through the freed slot.
     opus_probe_refresh_with_permits(&mut engine, 1);
     let viewed = opus_probe_view_pids(&engine);
-    assert!(!viewed.contains(&parked_pid), "pass 2 evicted the parked view");
+    assert!(
+        !viewed.contains(&parked_pid),
+        "pass 2 evicted the parked view"
+    );
     assert!(
         !engine.refresh_requested.contains_key(&fresh1) && viewed.contains(&fresh1),
         "pass 2 serves the fresh pid first through the freed slot"

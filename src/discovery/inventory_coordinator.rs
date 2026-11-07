@@ -19013,8 +19013,8 @@ exit 0
     fn short_lived_gap_reason(confirmed: u64) -> String {
         format!(
             "{confirmed} short-lived process(es) started and exited before any scan could \
-             examine them; their provider mappings are unknown, and no caller use is counted \
-             for them"
+             examine them; their provider mappings are unknown; any calls to an \
+             already-watched provider are counted only as module-level unidentified use"
         )
     }
 
@@ -28776,6 +28776,335 @@ int main(void) {
                 .any(|gap| gap.subject == "native capture scope custody unproven"
                     && gap.reason.contains("superseded")),
             "the supersede revocation is disclosed"
+        );
+    }
+
+    /// Slice-1 views: the concise snapshot and the JSON document.
+    fn slice_one_views(native: &NativeScene) -> (String, serde_json::Value) {
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2_000,
+            1,
+        );
+        let text = crate::inventory_present::render_snapshot_with_verbosity(
+            &presentation,
+            crate::cli::TextVerbosity::Concise,
+        );
+        let document =
+            crate::inventory::render_json(&native.scene.coordinator, "native", 0, 2_000, 1);
+        (text, document)
+    }
+
+    /// Slice 1: a scan-less one-shot (never admitted, no scan pass)
+    /// counts one unidentified caller with its lower-bound calls, in
+    /// concise text and JSON.
+    #[test]
+    fn a_scan_less_one_shot_counts_one_unidentified_caller() {
+        let (mut native, _) = NativeScene::new();
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 1);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["images_saturated"],
+            false
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            1
+        );
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise names the caller:\n{text}"
+        );
+    }
+
+    /// Slice 1: one tgid, two task cookies — two caller processes.
+    #[test]
+    fn one_tgid_two_cookies_counts_two_unidentified_callers() {
+        let (mut native, _) = NativeScene::new();
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 9, 220, 0);
+        native.witness(vec![first, second]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 2);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            2
+        );
+        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise names both callers:\n{text}"
+        );
+    }
+
+    /// Slice 1 twin: a scanned caller binds its row to an edge and
+    /// counts no unidentified caller.
+    #[test]
+    fn a_scanned_caller_binds_and_counts_no_unidentified_caller() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 900);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        native.scene.project(9, 110);
+        native.answer(9, 900, 41);
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        let (text, document) = slice_one_views(&native);
+        assert!(document["modules"][0]["unbound_use"].is_null());
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            0
+        );
+        assert!(
+            !text.contains("unidentified callers:"),
+            "no unidentified caller reads nothing:\n{text}"
+        );
+    }
+
+    /// Slice 1: one task cookie across an exec chain (two exec ids)
+    /// is one caller process.
+    #[test]
+    fn one_cookie_two_exec_ids_counts_one_unidentified_caller() {
+        let (mut native, _) = NativeScene::new();
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(41, 2, 9, 220, 0);
+        native.witness(vec![first, second]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 1);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            1
+        );
+        let line = "unidentified callers: at least 2 calls from 1 caller process never identified (exited or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "one cookie is one caller:\n{text}"
+        );
+    }
+
+    /// Slice 1: an F4 retained-bound row attributes its caller and
+    /// counts no unidentified caller.
+    #[test]
+    fn a_retained_bound_row_counts_no_unidentified_caller() {
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ));
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::PidHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row]) else {
+            unreachable!("the scripted read constructs a witness batch");
+        };
+        batch.custody = ScopeCustody::PidExited {
+            at_ns: 500,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                native.domain,
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ),
+        };
+        native.stage(NativeBatch::Witness(batch));
+        native.drain();
+        native.stage(native.stamps.read(native.domain, Vec::new()));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            0
+        );
+        assert!(
+            !text.contains("unidentified callers:"),
+            "a bound row is attributed, never unidentified:\n{text}"
+        );
+    }
+
+    /// Slice 1: unidentified callers publish even when the gap table
+    /// is full (no gap carries them).
+    #[test]
+    fn unidentified_callers_survive_a_full_gap_table() {
+        let (mut native, _) = NativeScene::new();
+        for i in 0..1100u32 {
+            native
+                .scene
+                .coordinator
+                .registry_mut()
+                .record_gap(RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject: format!("filler gap {i}"),
+                    reason: format!("filler reason {i}"),
+                    budget: None,
+                });
+        }
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            native.scene.coordinator.registry.gaps_suppressed() > 0,
+            "the table is full"
+        );
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 1);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            1
+        );
+        assert!(
+            text.contains("unidentified callers: at least 1 call"),
+            "the caller survives the full table:\n{text}"
+        );
+    }
+
+    /// Slice 1: past the per-module image bound the module count
+    /// stays a disclosed lower bound while the run-wide count stays
+    /// exact.
+    #[test]
+    fn unidentified_images_saturate_with_a_lower_bound() {
+        let (mut native, _) = NativeScene::new();
+        let rows: Vec<_> = (0..4097u64)
+            .map(|ticket| native.row(1000 + ticket, 1, 9, 210, 0))
+            .collect();
+        native.witness(rows);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 4096);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["images_saturated"],
+            true
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            4097
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images_saturated"],
+            false
+        );
+        let line = "unidentified callers: at least 4097 calls from 4097 caller processes never identified (exited or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "the run-wide count stays exact:\n{text}"
+        );
+    }
+
+    /// Slice 1: past the run-wide image bound the concise count stays
+    /// a disclosed lower bound.
+    #[test]
+    fn unidentified_images_saturate_run_wide_with_a_lower_bound() {
+        let (mut native, _) = NativeScene::new();
+        let rows: Vec<_> = (0..16385u64)
+            .map(|ticket| native.row(1000 + ticket, 1, 9, 210, 0))
+            .collect();
+        native.witness(rows);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images"],
+            16384
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"]["unbound_images_saturated"],
+            true
+        );
+        assert!(
+            text.contains("from 16384 caller processes never identified (exited or never scanned); image bound reached, more callers possible"),
+            "saturation is disclosed:\n{text}"
+        );
+    }
+
+    /// Slice 1: a batch whose caller control shows identity refusals
+    /// discloses IdentityUnavailable next to the caller count.
+    #[test]
+    fn ticket_budget_strain_discloses_identity_unavailable() {
+        let (mut native, _) = NativeScene::new();
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, Vec::new()) else {
+            unreachable!("the scripted read constructs a witness batch");
+        };
+        batch.health.caller_control = Some(p11scope_ebpf_common::ImageIdentityControl {
+            limit: 16_384,
+            next_ticket: 16_384,
+            unavailable: 3,
+            create_failures: 0,
+            retry_exhausted: 0,
+        });
+        native.stage(NativeBatch::Witness(batch));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(
+            document["observation"]["native_witnesses"]["identity_unavailable"],
+            3
+        );
+        assert_eq!(
+            document["observation"]["native_witnesses"]["identity_budget_exhausted"],
+            true
+        );
+        assert!(
+            text.contains("identity unavailable: no caller identity for 3 process images (ticket budget spent)"),
+            "the strain is disclosed:\n{text}"
+        );
+        assert!(
+            text.contains("unidentified callers: at least 1 call"),
+            "the caller still counts:\n{text}"
+        );
+    }
+
+    /// Slice 1: the caller count and its lower bound count only
+    /// module-level unidentified use — a bound edge's entries never
+    /// sum into them.
+    #[test]
+    fn bound_edge_entries_never_sum_into_unidentified_calls() {
+        let (mut native, _) = NativeScene::new();
+        native.answer(7, 500, 41);
+        let mut bound = native.row(41, 1, 7, 100, 0);
+        bound.entry_count = 9;
+        let unbound = native.row(42, 1, 9, 210, 0);
+        native.witness(vec![bound, unbound]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(document["edges"][0]["entries"]["count"], 9);
+        assert_eq!(document["modules"][0]["unbound_use"]["entries"], 1);
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "only unidentified use counts:\n{text}"
         );
     }
 

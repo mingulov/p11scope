@@ -545,18 +545,32 @@ mod tests {
         assert_eq!(line.lines().count(), 1);
     }
 
-    /// Post-setup least privilege: multi sheds the transient
-    /// `CAP_SYS_ADMIN`, singles keeps it, and a setcap process without
-    /// it is untouched either way.
+    /// Post-setup least privilege: multi with linked dynamics sheds the
+    /// transient `CAP_SYS_ADMIN`, singles keeps it, multi with perf
+    /// dynamics (an unproven pid filter) keeps it for re-attach, and a
+    /// setcap process without it is untouched either way.
     #[test]
     fn post_setup_keep_sheds_only_the_transient_sys_admin() {
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let live = minimal_live_mask();
-        assert_eq!(post_setup_keep(true, live | sys_admin), live);
-        assert_eq!(post_setup_keep(true, live), live);
-        assert_eq!(post_setup_keep(true, u64::MAX), u64::MAX & !sys_admin);
-        assert_eq!(post_setup_keep(false, live | sys_admin), live | sys_admin);
-        assert_eq!(post_setup_keep(false, live), live);
+        assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
+        assert_eq!(post_setup_keep(true, true, live), live);
+        assert_eq!(
+            post_setup_keep(true, true, u64::MAX),
+            u64::MAX & !sys_admin
+        );
+        assert_eq!(
+            post_setup_keep(false, false, live | sys_admin),
+            live | sys_admin
+        );
+        assert_eq!(post_setup_keep(false, false, live), live);
+        // Multi backend with perf dynamics: the pid-filter probe failed,
+        // so dynamic re-attach still needs SYS_ADMIN.
+        assert_eq!(
+            post_setup_keep(true, false, live | sys_admin),
+            live | sys_admin
+        );
+        assert_eq!(post_setup_keep(true, false, u64::MAX), u64::MAX);
     }
 
     fn parse(argv: &[&str]) -> crate::cli::Command {
@@ -882,14 +896,21 @@ mod tests {
         // Post-setup: multi sheds only when CHECKPOINT_RESTORE survives
         // it; the DaemonSet lacks it, so the shed keeps SYS_ADMIN.
         assert_eq!(
-            post_setup_keep(true, daemonset),
+            post_setup_keep(true, true, daemonset),
             daemonset,
             "post-setup under the DaemonSet set must keep SYS_ADMIN for map_files"
         );
         assert_eq!(
-            post_setup_keep(true, live | sys_admin),
+            post_setup_keep(true, true, live | sys_admin),
             live,
             "post-setup with CHECKPOINT_RESTORE sheds SYS_ADMIN"
+        );
+        // The capget read agrees with `/proc` (no silent divergence
+        // between the shed's input and the observable set).
+        assert_eq!(
+            read_effective_via_capget().ok(),
+            read_effective(),
+            "capget and /proc must report the same effective set"
         );
     }
 }

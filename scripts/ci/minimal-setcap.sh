@@ -114,6 +114,14 @@ int main(int argc, char **argv) {
     C_GetFunctionList get_list = (C_GetFunctionList)dlsym(h, "C_GetFunctionList");
     printf("ready pid=%d\n", (int)getpid());
     fflush(stdout);
+    /* argv[2], when given, gates the first call: no call runs until that
+       file exists (polled every 20 ms, up to 120 s). */
+    if (argc > 2) {
+        for (int t = 0; t < 6000 && access(argv[2], F_OK) != 0; t++)
+            usleep(20000);
+        if (access(argv[2], F_OK) != 0)
+            return 0;
+    }
     for (int i = 0; i < iters; i++) {
         while (quiet)
             pause();
@@ -308,8 +316,9 @@ if ! as_nobody "$CELLTMP/bin/capcheck" /proc/self/status 2>/dev/null | grep -qE 
   echo "minimal-setcap: harness error: file capabilities ignored on $CELLTMP (nosuid?)" >&2
   exit 2
 fi
-start_workload() { # ITERS LOG — prints the workload pid
-  "$CELLTMP/workload" "$1" >"$2" 2>&1 &
+start_workload() { # ITERS LOG [GATE] — prints the workload pid; with GATE
+  # the workload makes no call until that file exists
+  "$CELLTMP/workload" "$1" ${3:+"$3"} >"$2" 2>&1 &
   local pid=$!
   for _ in $(seq 1 50); do
     grep -q "^ready pid=" "$2" 2>/dev/null && break
@@ -329,15 +338,17 @@ start_late_workload() { # ITERS DELAY|TRIGGER LOG — late-dlopen variant, print
   echo "$pid"
 }
 stop_workload() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
-quiesce_after_capture() { # OPID ERRFILE WPID SECS — once OPID reports
-  # capturing, wait SECS (inside its duration) and quiesce WPID. Returns
-  # early when OPID exits first (a refused capture never captures).
+quiesce_after_capture() { # OPID ERRFILE WPID SECS [GATE] — once OPID
+  # reports capturing, create GATE (releasing a gated workload's calls),
+  # wait SECS (inside its duration) and quiesce WPID. Returns early when
+  # OPID exits first (a refused capture never captures).
   for _ in $(seq 1 240); do
     grep -q "capturing:" "$2" 2>/dev/null && break
     _state=$(sed 's/.*) \([A-Z]\).*/\1/' /proc/"$1"/stat 2>/dev/null) || _state=""
     { [ -z "$_state" ] || [ "$_state" = "Z" ]; } && return 0
     sleep 0.25
   done
+  [ -n "${5:-}" ] && : >"$5"
   sleep "$4"
   kill -USR1 "$3" 2>/dev/null || true
 }
@@ -405,13 +416,20 @@ run_profile() { # PARANOID — profile-pid cell as nobody with the full set
   paranoid=$1
   sysctl -w kernel.perf_event_paranoid="$paranoid" >/dev/null || return 1
   wlog=$CELLTMP/out/workload-p$paranoid.log
-  wpid=$(start_workload 120 "$wlog") \
+  # Gated: the workload calls only once the capture reports capturing,
+  # so no call straddles the export hooks' attach (a call entering
+  # between the return and entry links is an honest discovery-update
+  # partial, seen twice in about 40 CI captures; a race of this harness, not a
+  # capability result).
+  gate=$CELLTMP/gate-profile-p$paranoid
+  rm -f "$gate"
+  wpid=$(start_workload 120 "$wlog" "$gate") \
     || { row "profile-pid-p$paranoid" 0 qualified "workload never became ready"; return 0; }
   json=$NOBODYOUT/profile-p$paranoid.json
   as_nobody timeout 120 "$CELLTMP/bin/full" profile --pid "$wpid" --duration 8s -o "$json" \
     >"$CELLTMP/out/profile-p$paranoid.out" 2>"$CELLTMP/out/profile-p$paranoid.err" &
   opid=$!
-  quiesce_after_capture "$opid" "$CELLTMP/out/profile-p$paranoid.err" "$wpid" 5
+  quiesce_after_capture "$opid" "$CELLTMP/out/profile-p$paranoid.err" "$wpid" 5 "$gate"
   wait "$opid"; rc=$?
   stop_workload "$wpid"
   mv -f "$json" "$CELLTMP/out/" 2>/dev/null || true
@@ -439,12 +457,14 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
   sysctl -w kernel.perf_event_paranoid="$paranoid" >/dev/null || return 1
   lower=$(printf "%s" "$cap" | tr 'A-Z' 'a-z')
   wlog=$CELLTMP/out/workload-miss-$lower-p$paranoid.log
-  wpid=$(start_workload 120 "$wlog") \
+  gate=$CELLTMP/gate-miss-$lower-p$paranoid # gated as in run_profile
+  rm -f "$gate"
+  wpid=$(start_workload 120 "$wlog" "$gate") \
     || { row "missing-cap-$lower-p$paranoid" 0 qualified "workload never became ready"; return 0; }
   as_nobody timeout 120 "$CELLTMP/bin/miss-$lower" profile --pid "$wpid" --duration 6s \
     >"$CELLTMP/out/miss-$lower-p$paranoid.out" 2>"$CELLTMP/out/miss-$lower-p$paranoid.err" &
   opid=$!
-  quiesce_after_capture "$opid" "$CELLTMP/out/miss-$lower-p$paranoid.err" "$wpid" 3
+  quiesce_after_capture "$opid" "$CELLTMP/out/miss-$lower-p$paranoid.err" "$wpid" 3 "$gate"
   wait "$opid"; rc=$?
   stop_workload "$wpid"
   err=$CELLTMP/out/miss-$lower-p$paranoid.err
@@ -458,26 +478,11 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
       [ "$rc" -ne 0 ] || pass=0
       ;;
     CAP_CHECKPOINT_RESTORE)
-      # Degraded proof only: the capture still counts calls, and the
-      # coverage line must say how complete it is (no silent success):
-      # counts complete, or a partial naming only discovery gaps (the
-      # map_files proof is what this capability gates; seen once on a
-      # 6.12 guest at paranoid 2). Any other partial fails the row.
+      # Degraded proof only: the capture still counts calls completely
+      # (mountinfo identity stands in for the map_files proof).
       [ "$rc" -eq 0 ] || pass=0
       grep -qE "^[1-9][0-9]* completed calls" "$out" || pass=0
-      cov=$(grep -m1 "^coverage:" "$out")
-      case $cov in
-        "coverage: counts complete"*) ;;
-        "coverage: partial — calls may be missing ("*)
-          gaps=${cov#*calls may be missing (}
-          gaps=${gaps%%)*}
-          if printf "%s" "$gaps" | tr ',' '\n' | sed 's/^ *//' \
-              | grep -vqE "^[0-9]+ discovery (step|steps) unavailable$|^[0-9]+ discovery (update|updates) failed$"; then
-            pass=0
-          fi
-          ;;
-        *) pass=0 ;;
-      esac
+      grep -q "^coverage: counts complete" "$out" || pass=0
       ;;
     CAP_DAC_READ_SEARCH)
       # No target read: the coverage line must disclose the partial

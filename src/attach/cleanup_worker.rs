@@ -596,6 +596,10 @@ enum Command {
         retention: Arc<CollectedCleanupRetention>,
         batch: Arc<Mutex<BatchState>>,
     },
+    Shed {
+        keep: u64,
+        done: mpsc::SyncSender<std::io::Result<()>>,
+    },
     Shutdown,
 }
 
@@ -996,9 +1000,9 @@ impl CleanupWorker {
                 state.failures.push(message.clone());
                 Err(SubmissionFailure::new(message, links, leases, retention))
             }
-            Err(mpsc::SendError(Command::Shutdown | Command::ReleaseRetained { .. })) => {
-                unreachable!("submitted a link batch")
-            }
+            Err(mpsc::SendError(
+                Command::Shutdown | Command::ReleaseRetained { .. } | Command::Shed { .. },
+            )) => unreachable!("submitted a link batch"),
         }
     }
 
@@ -1023,6 +1027,18 @@ impl CleanupWorker {
             .unwrap()
             .terminal_started_at
             .get_or_insert_with(|| (self.clock)());
+    }
+
+    /// Drop the worker thread's capabilities to `keep` (the post-setup
+    /// shed is per-thread, so the pre-spawned worker needs its own).
+    /// Synchronous: returns the worker's `drop_to_keep` result. A dead
+    /// worker has no capabilities to shed, so a broken channel reads Ok.
+    pub(crate) fn shed_to(&self, keep: u64) -> std::io::Result<()> {
+        let (done_tx, done_rx) = mpsc::sync_channel(1);
+        if self.tx.send(Command::Shed { keep, done: done_tx }).is_err() {
+            return Ok(());
+        }
+        done_rx.recv().unwrap_or(Ok(()))
     }
 
     pub(crate) fn has_submissions(&self) -> bool {
@@ -1237,13 +1253,13 @@ fn run_cleanup(
         }
         Ok(())
     });
-    let mut pool = ClosePool::start(operation);
-    let _ = ready.send(pool.as_ref().map(|_| ()).map_err(Clone::clone));
-    if let Err(error) = &pool {
-        let mut counts = state.lock().unwrap();
-        counts.counts_invalid = true;
-        counts.failures.push(error.clone());
-    }
+    // The closer pool starts lazily on the first submit, not at thread
+    // start: the post-setup shed lands between the two, so helpers
+    // spawned after it inherit the shed set instead of retaining the
+    // startup grant (per-thread `capset`). A shed resets an already
+    // started pool for the same reason.
+    let mut pool: Option<Result<ClosePool<DetailedClose>, String>> = None;
+    let _ = ready.send(Ok(()));
     for command in rx {
         match command {
             Command::Submit {
@@ -1273,7 +1289,15 @@ fn run_cleanup(
                         })
                         .unwrap_or(items.len());
                     for chunk in items[first..end].chunks(4) {
-                        let results = match &mut pool {
+                        if pool.is_none() {
+                            pool = Some(ClosePool::start(Arc::clone(&operation)));
+                            if let Some(Err(error)) = &pool {
+                                let mut counts = state.lock().unwrap();
+                                counts.counts_invalid = true;
+                                counts.failures.push(error.clone());
+                            }
+                        }
+                        let results = match pool.as_mut().expect("pool started above") {
                             Ok(pool) => pool.close_chunk(chunk),
                             Err(error) => chunk
                                 .iter()
@@ -1345,6 +1369,14 @@ fn run_cleanup(
                     }
                 };
                 finish_retained_release(&state, &batch, result);
+            }
+            Command::Shed { keep, done } => {
+                // This thread only (`capset` pid 0); helpers spawned after
+                // this inherit the shed set. An already-started pool is
+                // reset so its helpers restart shed on the next submit.
+                let result = crate::caps::drop_to_keep(keep);
+                pool = None;
+                let _ = done.send(result);
             }
             Command::Shutdown => break,
         }

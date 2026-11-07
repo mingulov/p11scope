@@ -1475,9 +1475,9 @@ pub const RING_BYTES: u32 = 4096;
 /// lane is active, sized at load; every other capture keeps
 /// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END,
 /// so 4 MiB holds about 0.45 s at 10,000 calls/s, less than one large
-/// quantum's seal; 16 MiB holds about 1.9 s. Locked kernel memory: 12 MiB
+/// quantum's seal; 32 MiB holds about 3.8 s. Locked kernel memory: 28 MiB
 /// more than the default, only while that lane is active.
-pub const JOINT_RING_BYTES: u32 = 16 * 1024 * 1024;
+pub const JOINT_RING_BYTES: u32 = 32 * 1024 * 1024;
 const _: () = assert!(JOINT_RING_BYTES.is_power_of_two() && JOINT_RING_BYTES >= RING_BYTES);
 
 /// Maximum template attributes captured per event.
@@ -2653,9 +2653,11 @@ mod tests {
     }
 
     /// Only a journal (Joint) capture loads the larger EVENTS ring.
+    /// Raised 16 to 32 MiB (measured: sustained 10k/s overflowed the
+    /// 1.9 s ring; raises never lower a limit, OD29).
     #[test]
-    fn joint_ring_bytes_is_16mib() {
-        assert_eq!(JOINT_RING_BYTES, 16 * 1024 * 1024);
+    fn joint_ring_bytes_is_32mib() {
+        assert_eq!(JOINT_RING_BYTES, 32 * 1024 * 1024);
         assert_eq!(JOINT_RING_BYTES % 4096, 0);
     }
 

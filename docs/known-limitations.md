@@ -820,9 +820,9 @@ counter counts records, not calls: at system/cgroup scope a refused
 FORK marker counts too, and on a linked (`--key-operations`) capture
 one call writes up to two records (its journal BEGIN and its END, or
 an ABANDON in place of the END), so one lost call can count up to
-twice. A linked capture therefore loads a 16 MiB EVENTS ring (about
-1.9 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
-12 MiB more locked kernel memory while that lane is active. The ring is
+twice. A linked capture therefore loads a 32 MiB EVENTS ring (about
+3.8 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
+28 MiB more locked kernel memory while that lane is active. The ring is
 read only between seals of the key-operation lane, so a seal longer than
 the ring's headroom still loses records, disclosed as above. Prompt saturated-tick commits apply to
 legacy lanes only; joint-machine lanes service the machine instead

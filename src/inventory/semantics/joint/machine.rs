@@ -2167,7 +2167,45 @@ impl LiveJointMachine {
             self.phase = Some(phase);
             match result {
                 Ok(Step::Continue) => {}
-                Ok(Step::Yield) => return Ok(JointServiceProgress::Pending),
+                Ok(Step::Yield) => {
+                    // TEMP F9 DIAGNOSTIC (revert before freeze): yield census.
+                    {
+                        use std::sync::atomic::{AtomicU64, Ordering};
+                        static YN: AtomicU64 = AtomicU64::new(0);
+                        let yn = YN.fetch_add(1, Ordering::Relaxed);
+                        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && yn % 50 == 0
+                        {
+                            let name = match self.phase.as_ref() {
+                                None => "NoPhase",
+                                Some(Phase::Idle) => "Idle",
+                                Some(Phase::Collecting(_)) => "Collecting",
+                                Some(Phase::Binding(_)) => "Binding",
+                                Some(Phase::AwaitH0(_)) => "AwaitH0",
+                                Some(Phase::PendingQ { .. }) => "PendingQ",
+                                Some(Phase::Preparing(_)) => "Preparing",
+                                Some(Phase::PreparationAttempted(_)) => "PreparationAttempted",
+                                Some(Phase::FinishStopReady(_)) => "FinishStopReady",
+                                Some(Phase::FinishStopReport { .. }) => "FinishStopReport",
+                                Some(Phase::PreparingAdmissions(_)) => "PreparingAdmissions",
+                                Some(Phase::BindingKeys { .. }) => "BindingKeys",
+                                Some(Phase::Ingesting(_)) => "Ingesting",
+                                Some(Phase::StagingNegative(_)) => "StagingNegative",
+                                Some(Phase::Claiming { .. }) => "Claiming",
+                                Some(Phase::InstallingClosure { .. }) => "InstallingClosure",
+                                Some(Phase::Births { .. }) => "Births",
+                                Some(Phase::Staging { .. }) => "Staging",
+                                Some(Phase::Auditing { .. }) => "Auditing",
+                                Some(Phase::Negative { .. }) => "Negative",
+                                Some(Phase::Audited { .. }) => "Audited",
+                            };
+                            eprintln!(
+                                "yield-tick yn={yn} phase={name} t_mono={}",
+                                crate::attach::monotonic_ns().unwrap_or(0),
+                            );
+                        }
+                    }
+                    return Ok(JointServiceProgress::Pending);
+                }
                 Ok(Step::Published) => return Ok(JointServiceProgress::Published),
                 Err(reason) => {
                     // This exact produced report remains the retry input.

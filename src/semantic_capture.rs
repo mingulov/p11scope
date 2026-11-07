@@ -1762,6 +1762,14 @@ impl SemanticCapture {
     pub(crate) fn router(&self) -> &InstanceRouter {
         &self.router
     }
+
+    /// Arm one admitted birth mint for (image, file): the key's next
+    /// continued observation reports `AdmittedFirst`. Only the
+    /// coordinator's admission path calls this, after a current
+    /// admission stages.
+    pub(crate) fn mark_admitted_for(&mut self, image: ImageIdentity, file: u32) {
+        self.router.mark_admitted(image, file);
+    }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins
     /// assert the positive disclosure from the report and use this only to
@@ -3527,7 +3535,10 @@ impl SemanticCapture {
         let epochs = proof.epochs();
         let watched = io.retained_attachment(job.slot).ok();
         let (outcome, resolved) = self.router.observe(proof);
-        let accepted = matches!(outcome, ObserveOutcome::New | ObserveOutcome::Continued);
+        let accepted = matches!(
+            outcome,
+            ObserveOutcome::New | ObserveOutcome::Continued | ObserveOutcome::AdmittedFirst
+        );
         // These losses come from the actual eviction, not a counter inference.
         for loss in self.router.take_observation_losses() {
             self.invalidate(
@@ -3627,7 +3638,9 @@ impl SemanticCapture {
                     fence,
                     deadline: job.deadline,
                     ids,
-                    birth: if outcome == ObserveOutcome::New {
+                    birth: if outcome == ObserveOutcome::New
+                        || outcome == ObserveOutcome::AdmittedFirst
+                    {
                         job.birth_cut
                             .clone()
                             .map(|(cut, quantum)| (self.identity, cut, quantum))
@@ -3635,6 +3648,14 @@ impl SemanticCapture {
                         None
                     },
                 });
+                // The admitted mint installed: later admissions for this
+                // key stay plain continuations, so at most one birth per
+                // key ever reaches the seal. A tick without a birth cut
+                // attaches nothing and notes nothing: the next admission
+                // re-marks the key and the mint retries.
+                if outcome == ObserveOutcome::AdmittedFirst && job.birth_cut.is_some() {
+                    self.router.note_minted(job.image, job.endpoint.file_slot);
+                }
             }
         }
         report.observations.push(outcome);

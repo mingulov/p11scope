@@ -496,6 +496,11 @@ pub(crate) enum ObserveOutcome {
     InvalidImage,
     /// First stable observation of these epochs: partitions were minted.
     New,
+    /// First observation after the image's first admitted call: the
+    /// sighting quantum was wasted on an unadmitted slice, so this
+    /// mints the birth quantum instead. Same continuity as
+    /// `Continued` (partitions already exist); no retirement.
+    AdmittedFirst,
     /// Continuity: same epochs with no new range, or a new epoch triple
     /// over the same merged mapping with the local epoch unchanged, no
     /// proven absence since, no latched absence overflow, and the
@@ -675,6 +680,10 @@ pub(crate) struct RouterCounters {
     /// B17 W1: calls that joined through a tainted entry (direct routes
     /// and pending resolutions alike; a subset of `joined`).
     pub(crate) joined_across_global: u64,
+    /// Continued observations that consumed an admitted mark and
+    /// reported `AdmittedFirst` (a subset of `continued`, which keeps
+    /// its existing all-arms total).
+    pub(crate) admitted_first: u64,
     pub(crate) coverage_faults: u64,
     pub(crate) eras: u64,
     /// Era advances latched by a hook-program miss the capture loop had not
@@ -708,6 +717,20 @@ pub(crate) struct InstanceRouter {
     limits: RouterLimits,
     /// (full image, file slot) -> retained observations, oldest first.
     observed: BTreeMap<(ImageKey, u32), VecDeque<Observed>>,
+    /// (image, file) keys with an admitted call whose next observation
+    /// mints the birth quantum. Consumed by that observation; a
+    /// failed mint leaves the key unminted so the next admission
+    /// re-marks it. Sighting mints (`New`) are unaffected.
+    /// Union-capped with `admitted_minted` by the observed-keys cap:
+    /// marks beyond it are refused, which fails closed to the old
+    /// behavior.
+    admitted_pending: BTreeSet<(ImageKey, u32)>,
+    /// (image, file) keys whose admitted mint already installed: a
+    /// second install for the same key refuses (AlreadySelected) and
+    /// a second witness in the same domain would break the
+    /// ready-domain binary search. Marks for these keys are refused;
+    /// only retirement clears them.
+    admitted_minted: BTreeSet<(ImageKey, u32)>,
     /// (image, file) keys whose latest scan proved the module unmapped.
     /// The flag breaks continuity: the next observation for the key
     /// mints instead of continuing, even over an unchanged mapping with
@@ -843,6 +866,8 @@ impl InstanceRouter {
             domain,
             limits,
             observed: BTreeMap::new(),
+            admitted_pending: BTreeSet::new(),
+            admitted_minted: BTreeSet::new(),
             absent: BTreeSet::new(),
             absence_overflowed: false,
             faulted: BTreeSet::new(),
@@ -877,6 +902,47 @@ impl InstanceRouter {
 
     pub(crate) fn domain(&self) -> NativeDomainId {
         self.domain
+    }
+
+    /// Record an admitted call's (image, file): the next observation
+    /// for a continued key reports `AdmittedFirst` once, minting the
+    /// birth quantum the sighting slice wasted. Only the
+    /// coordinator's admission path calls this (a bare join is not
+    /// an admission). Idempotent; refused for already-minted keys
+    /// and past the union cap (both fail closed to the old
+    /// behavior: no quantum, no poison).
+    pub(crate) fn mark_admitted(&mut self, image: ImageIdentity, file: u32) {
+        let key = (ImageKey::from(image), file);
+        if self.admitted_minted.contains(&key) || self.admitted_pending.contains(&key) {
+            return;
+        }
+        let marked = self.admitted_pending.len() + self.admitted_minted.len();
+        if marked >= self.limits.observed_keys {
+            return;
+        }
+        self.admitted_pending.insert(key);
+    }
+
+    /// Record a successful admitted mint: later admissions for the
+    /// key stay plain continuations, so at most one birth per key
+    /// ever reaches the seal. Infallible by construction: the key
+    /// left the pending set at its observation, so the union never
+    /// exceeds the cap by more than the in-flight note.
+    pub(crate) fn note_minted(&mut self, image: ImageIdentity, file: u32) {
+        self.admitted_minted.insert((ImageKey::from(image), file));
+    }
+
+    /// A continued observation for a marked key reports
+    /// `AdmittedFirst` and consumes the mark; the mint site records
+    /// the success with `note_minted`, while a failed mint leaves
+    /// the key unminted so the next admission re-marks it.
+    fn continued_outcome(&mut self, key: (ImageKey, u32)) -> ObserveOutcome {
+        if self.admitted_pending.remove(&key) {
+            self.counters.admitted_first = self.counters.admitted_first.saturating_add(1);
+            ObserveOutcome::AdmittedFirst
+        } else {
+            ObserveOutcome::Continued
+        }
     }
 
     pub(crate) fn ranges_retained(&self) -> usize {
@@ -1290,6 +1356,8 @@ impl InstanceRouter {
             }
         }
         self.absent.retain(|(owner, _)| *owner != key);
+        self.admitted_pending.retain(|(owner, _)| *owner != key);
+        self.admitted_minted.retain(|(owner, _)| *owner != key);
         self.debug_check_absent_subset();
         self.fail_pending(|call| call.facts.image == image, UnknownReason::Retired)
     }
@@ -1322,6 +1390,10 @@ impl InstanceRouter {
             }
         }
         self.absent.retain(|(owner, _)| owner.cookie != cookie);
+        self.admitted_pending
+            .retain(|(owner, _)| owner.cookie != cookie);
+        self.admitted_minted
+            .retain(|(owner, _)| owner.cookie != cookie);
         resolved.extend(self.fail_pending(
             |call| call.facts.image.task_cookie == cookie,
             UnknownReason::Retired,
@@ -1535,7 +1607,7 @@ impl InstanceRouter {
                     found.storage_seen = storage_snapshot;
                 }
                 self.counters.continued += 1;
-                ObserveOutcome::Continued
+                self.continued_outcome(key)
             }
             None => {
                 // The first re-proof of this key in a later hook-miss era
@@ -1625,7 +1697,8 @@ impl InstanceRouter {
                         continued_across_miss: true,
                     });
                     let resolved = self.resolve_pending(image, file);
-                    return (ObserveOutcome::Continued, resolved);
+                    let outcome = self.continued_outcome((image, file));
+                    return (outcome, resolved);
                 }
                 let mut continued = self
                     .observed
@@ -1694,7 +1767,7 @@ impl InstanceRouter {
                             self.ranges -= old.ranges.len();
                         }
                     }
-                    ObserveOutcome::Continued
+                    self.continued_outcome(key)
                 } else {
                     let partitions = observation
                         .ranges

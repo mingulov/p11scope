@@ -1777,6 +1777,17 @@ impl AttestedSemanticLane {
             .and_then(|live| live.capture.retained_registration_ns(image))
     }
 
+    /// Arm one admitted birth mint for (image, file) on the live
+    /// capture's router: the key's next continued observation
+    /// reports `AdmittedFirst`. Only the coordinator's admission
+    /// path calls this, after a current admission stages. A shell
+    /// lane stages without a capture and marks nothing.
+    pub(crate) fn mark_admitted_for(&mut self, image: ImageIdentity, file: u32) {
+        if let Some(live) = self.live.as_mut() {
+            live.capture.mark_admitted_for(image, file);
+        }
+    }
+
     /// Lane-stash pending floor for the finalizer's disposition: the
     /// minimum stashed (undisposed, awaiting merge) outcome position. A
     /// shell lane stashes nothing. Stash overflow sheds ride the merged

@@ -4099,6 +4099,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Joined init taps collected across conversion, applied
         // below: the map borrows the registry it would tap.
         let mut init_taps: Vec<(ModuleId, u64)> = Vec::new();
+        // (image, file) per current admission: armed on the lane's
+        // router after staging, so the key's next continued
+        // observation mints the birth quantum the sighting slice
+        // wasted. Kept beside the staged batch (the closure below
+        // only borrows the lane through `subset`).
+        let mut admitted_marks: Vec<(ImageIdentity, u32)> = Vec::new();
         let staged: Vec<(
             Option<CallerId>,
             u64,
@@ -4139,12 +4145,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                                 Some(coverage) => CallStanding::Current(coverage),
                                 None => CallStanding::Historical(InstanceReason::SemanticLoss),
                             };
-                            (
-                                Some(caller),
-                                admit_call_from_evidence(
-                                    evidence, binding, subset, standing, barrier,
-                                ),
-                            )
+                            let admitted = admit_call_from_evidence(
+                                evidence, binding, subset, standing, barrier,
+                            );
+                            // Current admissions only: historical calls never
+                            // seal, so they arm no mint.
+                            if admitted.is_ok()
+                                && let Some(coverage) = coverage
+                            {
+                                admitted_marks
+                                    .push((coverage.image(), coverage.endpoint().file_slot));
+                            }
+                            (Some(caller), admitted)
                         }
                     }
                 };
@@ -4182,6 +4194,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect();
         for (module, rv) in init_taps {
             self.registry.note_module_init(module, rv);
+        }
+        for (image, file) in admitted_marks {
+            lane.mark_admitted_for(image, file);
         }
         Some(PreparedSemanticBatch::new(
             domain,

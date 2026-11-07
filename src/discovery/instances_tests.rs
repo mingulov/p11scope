@@ -560,6 +560,35 @@ mod full_image {
             Route::Unknown(UnknownReason::AuthorityExhausted)
         );
     }
+
+    /// A known image whose first admitted call lands mints one birth
+    /// quantum on its next observation: the setup slice sights the
+    /// image but its inputs refuse admission, so without this the run
+    /// slices (admitted) observe Known forever and no birth installs.
+    #[test]
+    fn first_admitted_observation_mints_once() {
+        let mut r = router();
+        let identity = image(COOKIE, 10);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::New
+        );
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Continued
+        );
+        r.mark_admitted(identity, FILE);
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::AdmittedFirst,
+            "first observation after admission mints"
+        );
+        assert_eq!(
+            r.observe(seal(domain(), identity, 1, 0, r.fence())).0,
+            ObserveOutcome::Continued,
+            "the admitted mint happens once"
+        );
+    }
 }
 
 #[test]

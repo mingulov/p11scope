@@ -10971,6 +10971,186 @@ mod tests {
         assert!(!first.rejects(key), "the key is not poisoned");
     }
 
+    /// U (plain), U' (plain, different digest) and L (proven pre) for
+    /// one locus, in every arrival order: each order keeps a pair
+    /// (first plain wins) and refuses only the extra plain — the key
+    /// is never poisoned, so pair admission is order-free. The two
+    /// refusal texts differ by path (version skew before the proof,
+    /// pair-full after it) but the pinned set never does.
+    #[test]
+    fn absorbing_copyup_triple_pairs_in_every_arrival_order() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper = backing_file(&dir, "upper.so");
+        let upper2 = backing_file(&dir, "upper2.so");
+        let lower = backing_file(&dir, "lower.so");
+        // (sha, ctime, file, pre): U, U', L.
+        let specs = [
+            ("aaaaaaaa", 1, &upper, false),
+            ("cccccccc", 1, &upper2, false),
+            ("bbbbbbbb", 2, &lower, true),
+        ];
+        let orders: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in orders {
+            let mut acc = PinnedObjects::empty();
+            let mut skipped = Vec::new();
+            for index in order {
+                let (sha, ctime, file, pre) = specs[index];
+                let mut pins = image_pins(&[(key, sha, ctime)]);
+                reback(&mut pins, file);
+                if pre {
+                    mark_pre_copy_up(&mut pins);
+                }
+                skipped.extend(acc.absorb(pins));
+            }
+            let kept: Vec<_> = acc.pinned().collect();
+            assert_eq!(kept.len(), 2, "order {order:?} keeps a pair");
+            assert!(
+                kept.iter()
+                    .any(|pin| pin.pre_copy_up && pin.sha256 == "bbbbbbbb"),
+                "order {order:?} keeps the proven pre"
+            );
+            let first_plain = order
+                .iter()
+                .map(|index| specs[*index].0)
+                .find(|sha| *sha != "bbbbbbbb")
+                .unwrap();
+            assert!(
+                kept.iter()
+                    .any(|pin| !pin.pre_copy_up && pin.sha256 == first_plain),
+                "order {order:?} keeps the first plain"
+            );
+            assert_eq!(skipped.len(), 1, "order {order:?}: {skipped:?}");
+            assert!(
+                skipped[0].reason.contains("was not pinned"),
+                "order {order:?}: the extra plain is refused, not silent: {}",
+                skipped[0].reason
+            );
+            assert!(!acc.rejects(key), "order {order:?} poisons the key");
+        }
+    }
+
+    /// A key rejected in one view (a same-digest collision) still
+    /// files a witness-proven pre observation from another view, in
+    /// both absorb orders: the carried rejection refuses plains but
+    /// never drops the proven pre.
+    #[test]
+    fn absorbing_carried_rejection_spares_the_proven_pre() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let first_file = backing_file(&dir, "first.so");
+        let second_file = backing_file(&dir, "second.so");
+        let lower_file = backing_file(&dir, "lower.so");
+        let rejected_view = || {
+            let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+            reback(&mut first, &first_file);
+            let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+            reback(&mut second, &second_file);
+            second.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
+            let mut view = PinnedObjects::empty();
+            view.absorb(first);
+            view.absorb(second);
+            assert!(view.rejects(key));
+            assert_eq!(view.pinned().count(), 0);
+            view
+        };
+        let proven_view = || {
+            let mut proven = image_pins(&[(key, "bbbbbbbb", 2)]);
+            reback(&mut proven, &lower_file);
+            mark_pre_copy_up(&mut proven);
+            proven
+        };
+        // Proven into rejected: the pre files lone under the rejected key.
+        let mut acc = rejected_view();
+        acc.absorb(proven_view());
+        let kept: Vec<_> = acc.pinned().collect();
+        assert_eq!(kept.len(), 1, "the proven pre files despite the carried rejection");
+        assert!(kept[0].pre_copy_up && kept[0].sha256 == "bbbbbbbb");
+        assert!(acc.rejects(key), "the key stays rejected for plains");
+        // A later plain is still refused under the carried rejection.
+        let mut late = image_pins(&[(key, "cccccccc", 3)]);
+        reback(&mut late, &backing_file(&dir, "late.so"));
+        acc.absorb(late);
+        assert_eq!(acc.pinned().count(), 1, "a later plain never pairs under a rejected key");
+        // Rejected into proven: the carried rejection spares the kept pre.
+        let mut acc = proven_view();
+        acc.absorb(rejected_view());
+        let kept: Vec<_> = acc.pinned().collect();
+        assert_eq!(kept.len(), 1, "the carried rejection spares the kept pre");
+        assert!(kept[0].pre_copy_up && kept[0].sha256 == "bbbbbbbb");
+        assert!(acc.rejects(key), "the carried rejection is still recorded");
+    }
+
+    /// U and U' share a digest but are different files (a forgery) and
+    /// L is the proven pre: every arrival order ends with L lone and
+    /// the key rejected — proof-first keeps the pair only until the
+    /// forgery lands, then fails closed without dropping the proof.
+    #[test]
+    fn absorbing_forged_third_under_pair_rejects_but_spares_the_pre() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper = backing_file(&dir, "upper.so");
+        let upper2 = backing_file(&dir, "upper2.so");
+        let lower = backing_file(&dir, "lower.so");
+        // (sha, ctime, file, pre, remap): U, U' (forged twin), L.
+        let specs = [
+            ("aaaaaaaa", 1, &upper, false, false),
+            ("aaaaaaaa", 1, &upper2, false, true),
+            ("bbbbbbbb", 2, &lower, true, false),
+        ];
+        let orders: [[usize; 3]; 6] = [
+            [0, 1, 2],
+            [0, 2, 1],
+            [1, 0, 2],
+            [1, 2, 0],
+            [2, 0, 1],
+            [2, 1, 0],
+        ];
+        for order in orders {
+            let mut acc = PinnedObjects::empty();
+            for index in order {
+                let (sha, ctime, file, pre, remap) = specs[index];
+                let mut pins = image_pins(&[(key, sha, ctime)]);
+                reback(&mut pins, file);
+                if remap {
+                    pins.by_id
+                        .values_mut()
+                        .next()
+                        .unwrap()
+                        .mapping
+                        .mount_id += 1;
+                }
+                if pre {
+                    mark_pre_copy_up(&mut pins);
+                }
+                acc.absorb(pins);
+            }
+            let kept: Vec<_> = acc.pinned().collect();
+            assert_eq!(kept.len(), 1, "order {order:?} keeps only the proven pre");
+            assert!(
+                kept[0].pre_copy_up && kept[0].sha256 == "bbbbbbbb",
+                "order {order:?} keeps L"
+            );
+            assert!(acc.rejects(key), "order {order:?} rejects the forged key");
+        }
+    }
+
     #[test]
     fn btrfs_snapshot_twins_with_same_mapping_pin_and_digest_do_not_merge() {
         // The Btrfs snapshot shape: one mount, one shared mount-table

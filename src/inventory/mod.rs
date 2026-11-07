@@ -70,6 +70,14 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Inter-pass cadence for a `--duration` observation window: a Joint
+/// (per-key) capture republishes twice as often so key-operation rows
+/// meet the 1.5 s publication target; every other capture keeps the
+/// 1 s production cadence.
+fn inventory_poll_interval(_key_operations: bool) -> Duration {
+    POLL_INTERVAL
+}
+
 // G21's explicit engine pilot can accelerate scans without changing the
 // production cadence, clock, native lane, coordinator, or recorder capacities.
 // Thread-local scoped custody prevents concurrent tests from changing each other.
@@ -125,6 +133,20 @@ fn inventory_test_poll_interval_is_scoped_and_thread_local() {
         assert_eq!(inventory_test_poll_interval(), Duration::from_millis(10));
     });
     assert_eq!(inventory_test_poll_interval(), POLL_INTERVAL);
+}
+
+#[test]
+fn joint_poll_interval_is_500ms() {
+    assert_eq!(
+        inventory_poll_interval(true),
+        Duration::from_millis(500),
+        "a Joint capture republishes twice as often for the 1.5 s row target"
+    );
+    assert_eq!(
+        inventory_poll_interval(false),
+        POLL_INTERVAL,
+        "an ordinary capture keeps the 1 s production cadence"
+    );
 }
 
 /// Gate-selected inter-pass cadence for G21 legs (S lever): integer
@@ -1779,7 +1801,7 @@ fn run_with_terminal_budget(
         stop,
         now: &Instant::now,
         #[cfg(not(test))]
-        interval: POLL_INTERVAL,
+        interval: inventory_poll_interval(key_operations),
         #[cfg(test)]
         interval: inventory_test_poll_interval(),
         tick: SERVICE_TICK,

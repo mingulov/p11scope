@@ -2659,6 +2659,24 @@ mod tests {
         assert_eq!(JOINT_RING_BYTES % 4096, 0);
     }
 
+    /// The Joint EVENTS ring absorbs multi-second drain stalls at
+    /// 10,000 calls/s: a journaled call writes a 224 B START and a
+    /// 632 B END (see `JOINT_RING_BYTES`), so three seconds need
+    /// 25,680,000 B. Sustained 10k/s captures overflowed the 1.9 s
+    /// ring with counted loss; the ring must hold at least 3 s.
+    #[test]
+    fn joint_ring_holds_three_seconds_at_10k_per_s() {
+        const BYTES_PER_CALL: u32 = 224 + 632;
+        const CALLS_PER_S: u32 = 10_000;
+        const SECONDS: u32 = 3;
+        assert!(
+            JOINT_RING_BYTES >= BYTES_PER_CALL * CALLS_PER_S * SECONDS,
+            "joint ring {} B holds less than {SECONDS} s at {CALLS_PER_S}/s ({} B)",
+            JOINT_RING_BYTES,
+            BYTES_PER_CALL * CALLS_PER_S * SECONDS,
+        );
+    }
+
     #[test]
     fn induced_gap_capacities_are_explicit() {
         #[cfg(not(feature = "small-state-maps"))]

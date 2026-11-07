@@ -326,6 +326,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         input: JointCommitInput<'_>,
     ) -> Result<JointCommitProgress> {
+        // TEMP F9 DIAGNOSTIC (revert before freeze): commit total ms.
+        let commit_start = std::time::Instant::now();
+        let commit_outcome = self.commit_joint_publication_inner_timed(input);
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static CN: AtomicU64 = AtomicU64::new(0);
+            let cn = CN.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && cn % 20 == 0 {
+                eprintln!(
+                    "commit-tick cn={cn} ms={} t_mono={}",
+                    commit_start.elapsed().as_millis(),
+                    crate::attach::monotonic_ns().unwrap_or(0),
+                );
+            }
+        }
+        commit_outcome
+    }
+
+    fn commit_joint_publication_inner_timed(
+        &mut self,
+        input: JointCommitInput<'_>,
+    ) -> Result<JointCommitProgress> {
         let JointCommitInput {
             continuation,
             producers,
@@ -537,9 +559,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         } else if completed.is_some() {
             bail!("no original Stop association");
         }
+        // TEMP F9 DIAGNOSTIC (revert before freeze): publish ms.
+        let publish_start = std::time::Instant::now();
         let applied = self
             .registry
             .finish_joint_publication(&mut self.joint_capture, original)?;
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static PUN: AtomicU64 = AtomicU64::new(0);
+            let pun = PUN.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && pun % 20 == 0 {
+                eprintln!(
+                    "publish-tick pun={pun} ms={} applied={applied} t_mono={}",
+                    publish_start.elapsed().as_millis(),
+                    crate::attach::monotonic_ns().unwrap_or(0),
+                );
+            }
+        }
         let pending = self
             .joint_publication
             .take()

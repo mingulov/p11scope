@@ -2841,19 +2841,48 @@ mod tests {
         );
     }
 
-    /// The post-setup shed reaches the worker thread: `shed_to` drops the
-    /// worker's own capabilities (per-thread `capset`) and the worker
-    /// still closes afterwards. Fails while the worker has no shed entry.
+    /// The post-setup shed reaches the worker thread: `shed_to` runs
+    /// the drop on the worker thread with the given keep, restarts its
+    /// helpers shed, and the worker still closes afterwards. The injected
+    /// drop proves the thread and the mask; a stub that never runs it
+    /// fails here.
     #[test]
     fn shed_to_drops_the_worker_thread_without_breaking_closes() {
-        let mut worker = CleanupWorker::pre_start_with(
+        let seen: Arc<Mutex<Vec<(std::thread::ThreadId, u64)>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let drop_fn: super::ShedDropFn = Arc::new(move |keep| {
+            seen_clone
+                .lock()
+                .unwrap()
+                .push((std::thread::current().id(), keep));
+            Ok(())
+        });
+        let pool_starter: super::PoolStarter = Arc::new(|operation| ClosePool::start(operation));
+        let mut worker = CleanupWorker::pre_start_with_hooks(
             Box::new(|link, _| {
                 drop(link.take());
                 Ok(())
             }),
             Arc::new(|| Duration::ZERO),
+            |task| {
+                std::thread::Builder::new()
+                    .name("p11scope-cleanup".to_string())
+                    .spawn(task)
+            },
+            pool_starter,
+            drop_fn,
         );
-        worker.shed_to(0).expect("the worker sheds to zero");
+        let expected = worker
+            .original_thread_id()
+            .expect("prestarted worker has a thread");
+        let keep = 0x1234u64;
+        worker.shed_to(keep).expect("the worker sheds");
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "the drop must run exactly once");
+        assert_eq!(seen[0].0, expected, "the drop must run on the worker thread");
+        assert_eq!(seen[0].1, keep, "the drop must receive the given keep");
+        drop(seen);
         worker.submit(
             vec![(
                 OwnedLink::Multi(vec![tempfile::tempfile().unwrap().into()]),
@@ -2864,6 +2893,78 @@ mod tests {
         );
         let receipt = worker.join();
         assert!(receipt.completed, "the shed worker still closes");
+    }
+
+    /// A failed closer-pool restart after the shed refuses live batches
+    /// with the restart error and quarantines nothing: the session keeps
+    /// its untouched fallback instead of losing links to a broken pool.
+    #[test]
+    fn failed_pool_restart_refuses_live_without_quarantine() {
+        let calls = Arc::new(Mutex::new(0usize));
+        let calls_clone = Arc::clone(&calls);
+        let pool_starter: super::PoolStarter = Arc::new(move |operation| {
+            let mut calls = calls_clone.lock().unwrap();
+            *calls += 1;
+            if *calls == 1 {
+                ClosePool::start(operation)
+            } else {
+                Err("injected pool restart failure".to_string())
+            }
+        });
+        let drop_fn: super::ShedDropFn = Arc::new(|_| Ok(()));
+        let mut worker = CleanupWorker::pre_start_with_hooks(
+            Box::new(|link, _| {
+                drop(link.take());
+                Ok(())
+            }),
+            Arc::new(|| Duration::ZERO),
+            |task| {
+                std::thread::Builder::new()
+                    .name("p11scope-cleanup".to_string())
+                    .spawn(task)
+            },
+            pool_starter,
+            drop_fn,
+        );
+        assert!(worker.live_admission().is_ok());
+        let shed = worker.shed_to(0);
+        assert!(
+            shed.is_err(),
+            "a failed restart must surface through shed_to"
+        );
+        let admission = worker.live_admission().unwrap_err();
+        assert!(
+            admission.contains("injected pool restart failure"),
+            "live must refuse with the restart error, got: {admission}"
+        );
+        {
+            let state = worker.state.lock().unwrap();
+            assert!(
+                state.quarantined.is_empty(),
+                "no link may quarantine on a refused restart"
+            );
+            assert!(
+                !state.counts_invalid,
+                "accounting stays valid when nothing transferred"
+            );
+            assert_eq!(state.uncertain, 0);
+        }
+        let failure = worker
+            .submit_live(
+                vec![(
+                    OwnedLink::Multi(Vec::new()),
+                    ProducerProgram::UProbe("p11_entry"),
+                )],
+                Arc::default(),
+                DetachOrder,
+            )
+            .unwrap_err();
+        assert_eq!(failure.links.len(), 1, "the refused payload stays owned");
+        assert!(
+            worker.state.lock().unwrap().quarantined.is_empty(),
+            "a refused live submit quarantines nothing"
+        );
+        assert!(!worker.join().completed);
     }
 }
 

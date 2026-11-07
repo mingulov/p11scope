@@ -13,7 +13,9 @@
 #   OCTX=$(mktemp -d) && mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts"
 #   cp <released-p11scope> "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
 #   cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+#   cp LICENSE "$OCTX/" && cp -r LICENSES "$OCTX/"
 #   docker build --network=none -f deploy/Dockerfile.observer -t <tag> "$OCTX"
+# (Stage a root COPYRIGHT file the same way once one exists.)
 # Pre-pull the pinned base first; --network=none proves the build takes no
 # network. scripts/kind-e2e.sh stages the same layout from its static
 # binary; package-preview stages the packaged FULL musl binary. A locally
@@ -28,12 +30,19 @@
 # Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
 # No curl/jq: the observer never talks to the Kubernetes API.
 # The base is pinned by digest (multi-arch index of alpine:3.24 as published
-# 2026-10-03); bump tag and digest together.
+# 2026-10-03); bump tag and digest together. Layer timestamps float, so the
+# image is repeatable, not bit-reproducible; the push job re-identifies the
+# exact bytes by image ID instead of trusting the tag.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
 COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
+COPY LICENSE /usr/share/licenses/p11scope/LICENSE
+COPY LICENSES/ /usr/share/licenses/p11scope/LICENSES/
 RUN chmod 0755 /usr/local/bin/k8s-profile-entry \
     && /usr/local/bin/p11scope --help >/dev/null \
-    && /usr/local/bin/k8s-profile-entry --self-test
+    && /usr/local/bin/k8s-profile-entry --self-test \
+    && test -f /usr/share/licenses/p11scope/LICENSE \
+    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt \
+    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt
 ENTRYPOINT ["/usr/local/bin/p11scope"]
 CMD ["--help"]

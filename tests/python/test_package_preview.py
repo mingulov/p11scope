@@ -504,6 +504,10 @@ else:
                        "docker pull",
                        "docker build --network=none"):
             self.assertIn(marker, bodies, f"container-image must {marker}")
+        # The image ships the license texts: the staging step copies them
+        # into the minimal context beside the binary and the entry script.
+        for marker in ('"$GITHUB_WORKSPACE/LICENSE"', '"$GITHUB_WORKSPACE/LICENSES"'):
+            self.assertIn(marker, bodies, f"container-image staging must {marker}")
         # The base image reference stays single-sourced in the Dockerfile;
         # the job parses it out instead of carrying its own copy.
         self.assertIn("FROM", bodies)

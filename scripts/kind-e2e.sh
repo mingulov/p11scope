@@ -450,6 +450,8 @@ else
     cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
 fi
 cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+cp LICENSE "$OCTX/"
+cp -r LICENSES "$OCTX/"
 cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
 cp deploy/holder-entry.sh "$HCTX/deploy/"
 sha256sum "$OBSERVER_BIN" | tee "$WORK/observer.sha256"

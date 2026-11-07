@@ -291,6 +291,8 @@ jobs:
           mkdir -p "$ctx/target/x86_64-unknown-linux-musl/release" "$ctx/scripts"
           cp "$1" "$ctx/target/x86_64-unknown-linux-musl/release/p11scope"
           cp "$GITHUB_WORKSPACE/scripts/k8s-profile-entry.sh" "$ctx/scripts/"
+          cp "$GITHUB_WORKSPACE/LICENSE" "$ctx/"
+          cp -r "$GITHUB_WORKSPACE/LICENSES" "$ctx/"
       - name: Build the observer image with no network
         shell: bash
         run: |

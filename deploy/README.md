@@ -4,9 +4,9 @@
 - [`k8s/`](k8s/README.md) — the Kubernetes node observer: namespace,
   ServiceAccount (no API access), DaemonSet, the required privileges and why
   each one is needed, limits, and troubleshooting. Start there.
-- `Dockerfile.observer` — the observer image: the static musl `p11scope` plus
-  `scripts/k8s-profile-entry.sh` on Alpine. No shell tools beyond busybox, no
-  API client.
+- `Dockerfile.observer` — the observer image: the static musl `p11scope`,
+  `scripts/k8s-profile-entry.sh` and the license texts on Alpine. No shell
+  tools beyond busybox, no API client.
 - `Dockerfile.observer-release` — the same image, but the binary comes from a
   release tarball (`p11scope-<version>-x86_64-linux-musl.tar.gz`) instead of a
   local build. Same base digest, same entrypoint; the tarball's `RELEASE.json`

@@ -212,6 +212,8 @@ if [ -n "$OBSERVER_BIN" ]; then
     mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts"
     cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
     cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+    cp LICENSE "$OCTX/"
+    cp -r LICENSES "$OCTX/"
     BASE=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer)
     test -n "$BASE" || { echo "Dockerfile has no FROM line" >&2; exit 2; }
     test "$(printf '%s\n' "$BASE" | wc -l)" -eq 1 || { echo "Dockerfile has no single base" >&2; exit 2; }

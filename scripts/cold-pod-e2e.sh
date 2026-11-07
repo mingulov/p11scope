@@ -305,6 +305,10 @@ n2"; do
         || { echo "observer context lost the binary" >&2; exit 1; }
     [ -f "$stub/work/context-observer/scripts/k8s-profile-entry.sh" ] \
         || { echo "observer context lost the entry script" >&2; exit 1; }
+    [ -f "$stub/work/context-observer/LICENSE" ] \
+        || { echo "observer context lost LICENSE" >&2; exit 1; }
+    [ -f "$stub/work/context-observer/LICENSES/GPL-2.0-only.txt" ] \
+        || { echo "observer context lost LICENSES" >&2; exit 1; }
     [ -f "$stub/work/context-holder/tests/fixtures/public-cli/gated.c" ] \
         || { echo "holder context lost gated.c" >&2; exit 1; }
     [ -f "$stub/work/context-holder/deploy/holder-entry.sh" ] \
@@ -659,6 +663,8 @@ build_images() {
         "$HCTX/tests/fixtures/public-cli" "$HCTX/deploy"
     cp "$OBSERVER" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
     cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
+    cp LICENSE "$OCTX/"
+    cp -r LICENSES "$OCTX/"
     cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
     cp deploy/holder-entry.sh "$HCTX/deploy/"
     timeout --signal=TERM --kill-after=10s 1200s \

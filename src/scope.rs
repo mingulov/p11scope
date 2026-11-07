@@ -90,7 +90,8 @@ impl RunCgroup {
     /// [`observer_run_cgroup_base`]): the command keeps its ancestor
     /// limits and unit kill semantics, and no resource controllers are
     /// touched. Any failure (unreadable membership, no v2 line,
-    /// permission, delegation) degrades the run to its exact child —
+    /// permission, delegation) degrades the run to its exact child; the
+    /// caller must never fall back to the cgroup root. The group lives
     /// under the observer's own cgroup; that is the root only when the
     /// observer itself runs in the root cgroup.
     pub fn create_under_observer(cgroup_root: &Path) -> Result<Self> {

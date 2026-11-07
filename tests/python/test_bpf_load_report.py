@@ -807,7 +807,8 @@ class ReportTests(unittest.TestCase):
 
     def test_combined_refusal_control_uses_host_eligibility_reason(self):
         text = (ROOT / "scripts/check-multi-host-refusal.py").read_text()
-        for lead in ("live capture needs root: ",
+        for lead in ("live capture needs CAP_",
+                     "live capture refused: ",
                      "live capture unavailable: ",
                      "live capture did not start: "):
             self.assertIn(lead, text)

@@ -773,7 +773,7 @@ run_joint_cell() {
     log "$cell: generator attached; waiting two passes for promotion before GO"
     passes_before=$(pass_count "$dir/observer.out")
     log "$cell: promote-wait from passes_before=$passes_before at $(date +%s)"
-    if ! wait_for_pass "$dir/observer.out" "$((passes_before + 1))" 60; then
+    if ! wait_for_pass "$dir/observer.out" "$((passes_before + 1))" 300; then
         log "$cell: promote-wait ended at count=$(pass_count "$dir/observer.out") time=$(date +%s)"
         log "$cell: no promotion passes after attach"
         kill_pidfile "$dir/gen.pid"

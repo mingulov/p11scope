@@ -221,7 +221,10 @@ fn b3_bare_argv_prints_help_and_unknown_names_problem() {
 fn b4_version_prints_plain_version_exit_0() {
     let version = run(&["--version"]);
     assert_eq!(version.code, Some(0));
-    assert_eq!(version.stdout, "p11scope 0.7.0\n");
+    assert_eq!(
+        version.stdout,
+        "p11scope 0.7.0\nCopyright (C) 2026 Denis Mingulov\nLicense GPL-3.0-or-later <https://gnu.org/licenses/gpl.html>. This is free software: you are free to change and redistribute it. There is NO WARRANTY, to the extent permitted by law.\n"
+    );
     assert!(version.stderr.is_empty());
 }
 

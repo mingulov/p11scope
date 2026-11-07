@@ -385,28 +385,6 @@ def has_identity_loss(gaps):
     return [g for g in gaps if "identity_mismatch" in g.get("reason", "")]
 
 
-def cell_identity_loss(document, pid_of, cell_pids):
-    """identity_mismatch gaps naming a cell process (pid or caller id).
-
-    The span's host-global aggregate (pid-less) is environmental on a
-    --system leg: in heuristic mode the twin's and B2's upper ranges
-    honestly refuse against the retained lower pin once the flip
-    commits, because §3b routes by witness proof only and no proof
-    exists there. A loss that names a cell process is a contract
-    violation; the pid-less aggregate discloses without accusing.
-    """
-    hits = []
-    for gap in document["gaps"]:
-        if "identity_mismatch" not in (gap.get("reason") or ""):
-            continue
-        pid = gap.get("pid")
-        if pid is None and gap.get("caller") is not None:
-            pid = pid_of.get(gap["caller"])
-        if pid in cell_pids:
-            hits.append(gap)
-    return hits
-
-
 def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             fresh_kernel, fresh_userspace, pre_profile_a, pre_profile_b, post_profile_b,
             pid_a, pid_b_pre, pid_b_span, pid_b_post, iters_a, iters_b, lane, dc73_note,
@@ -549,11 +527,8 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
         assert not unproven_gaps_for(span_kernel, span_k_pid, pid,
                                      module_suffix), \
             (label, "joined yet still carries the gap", pid)
-    span_cell_pids = {pid for pid in
-                      (pid_a, pid_b_pre, pid_b_span, b_pre_round2_pid)
-                      if pid is not None}
-    assert not cell_identity_loss(span_kernel, span_k_pid, span_cell_pids), \
-        (label, "identity loss on the cell path")
+    assert not has_identity_loss(span_kernel["gaps"]), \
+        (label, "identity loss in span")
     collapses = collapse_gaps(span_kernel, module_suffix)
     assert any(key_b in pair for pair in collapses), \
         (label, "no collapse names B's key", collapses)
@@ -1126,17 +1101,15 @@ def self_test():
                     st_span_edges(),
                     st_span_gaps() + [("x", "identity_mismatch", 104)],
                     backend="kernel", modules=ST_MODULES_SPAN))
-    aggregate = good_copy_up("B")
-    aggregate["span_kernel"] = good_inventory(
-        st_span_edges(),
-        st_span_gaps() + [("maps attribution",
-                           "processes mapping pinned provider objects were "
-                           "not attributed to them: 2 identity_mismatch "
-                           "(per-process reasons in the process table)",
-                           None)],
-        backend="kernel", modules=ST_MODULES_SPAN)
-    accepts("span host-global mismatch aggregate",
-            lambda: copy_up(**aggregate))
+    mutate_copy("span pid-less mismatch aggregate",
+                span_kernel=good_inventory(
+                    st_span_edges(),
+                    st_span_gaps() + [("maps attribution",
+                                       "processes mapping pinned provider objects were "
+                                       "not attributed to them: 2 identity_mismatch "
+                                       "(per-process reasons in the process table)",
+                                       None)],
+                    backend="kernel", modules=ST_MODULES_SPAN))
     mutate_copy("span B2 claims entries",
                 span_kernel=good_inventory(
                     [item if item["pid"] != 104

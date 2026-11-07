@@ -560,13 +560,12 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=span)
 
-    def test_span_pidless_mismatch_aggregate_passes(self):
-        """The --system span aggregate is host-global, not the cell path.
+    def test_span_pidless_mismatch_aggregate_fails(self):
+        """The span loss gate is global zero: pid-less aggregates refuse.
 
-        In heuristic mode the twin's and B2's upper ranges honestly
-        refuse against the retained lower pin once the flip commits
-        (§3b routes by proof only, and no witness proof exists here);
-        the aggregate discloses that without naming a cell process.
+        The 0-vs-2 flip race is a named known flake (see
+        docs/known-limitations.md); the gate stays exact and any
+        identity_mismatch gap in the span — pid-less or not — fails.
         """
         span = inventory(
             span_edges(),
@@ -577,7 +576,8 @@ class CopyUpTest(unittest.TestCase):
                 "reasons in the process table)",
                 None)],
             backend="kernel", modules=dict(D1_MODULES_SPAN))
-        self.assertTrue(check_copy_up(span_kernel=span)["ok"])
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
 
     def test_span_b2_counted_fails(self):
         """Admitted-unprobed means zero counted entries, never a ledger."""

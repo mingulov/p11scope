@@ -64747,11 +64747,12 @@ fn pid_target_exec_reexec_between_record_and_learn_counts_unknown() {
 }
 
 // 7.10b: under `--mode metrics` (aggregate policy) instance hooks
-// never attach, so the exit-mapping split always reads
-// `{mapped: 0, unknown: N}`; `mapped` is unreachable there. Profile
-// and trace keep the `mapped` outcome (see the `mapped` twins).
+// never attach, so the exit-mapping split never arms there — the key
+// stays absent instead of reading an all-`unknown` split. Profile
+// and trace keep the split (see the `mapped` twins), and the gap-hint
+// consumer still arms under metrics.
 #[test]
-fn aggregate_arm_exit_mapping_split_is_all_unknown_under_metrics() {
+fn aggregate_arm_exit_mapping_split_absent_under_metrics() {
     assert!(
         !CapturePolicy::AggregateOnly.wants_instance_hooks(),
         "aggregate-only sessions never attach instance hooks"
@@ -64775,15 +64776,14 @@ fn aggregate_arm_exit_mapping_split_is_all_unknown_under_metrics() {
     exit.pointers[0] = 3;
     engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
-    assert_eq!(
-        engine
-            .gap_exit_mappings()
-            .map(|split| (split.mapped, split.unknown)),
-        Some((0, 1))
+    assert!(
+        engine.gap_exit_mappings().is_none(),
+        "no exit-mapping split without instance hooks"
     );
-    assert_eq!(
-        engine.exit_mapping_reasons_for_test(),
-        &[ExitMappingReason::UnknownHooksRefused]
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
+    assert!(
+        engine.gap_exe_hints().is_some(),
+        "the gap-hint consumer still arms under metrics"
     );
 }
 

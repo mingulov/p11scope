@@ -5326,8 +5326,8 @@ mod tests {
             );
         }
         assert!(
-            PROFILE_HELP.contains("also records short-lived processes"),
-            "profile documents the flag run refuses"
+            PROFILE_HELP.contains("also records exec-time detail"),
+            "profile documents the flag in scope-neutral words"
         );
         for help in [PROFILE_HELP, RUN_HELP] {
             assert!(help.contains("exactly one watched function"), "{help:.200}");
@@ -5912,13 +5912,19 @@ mod tests {
 
     // 7.10b finding-32 fix: run help documents the flag on its own
     // surface, so help and the parser agree (no "records nothing"
-    // contradiction). The counter-mode refusal stays.
+    // contradiction). The counter-mode refusal stays. Both sentences
+    // are pinned exactly: the flag description must stay true for the
+    // owned child (no "short-lived processes" overclaim), and the
+    // refusal sentence must name the policy.
     #[test]
     fn run_help_documents_track_short_lived() {
         let run = HelpTopic::Run.text();
-        assert!(run.contains("--track-short-lived"), "{run}");
-        assert!(run.contains("child's own execs"), "{run}");
-        assert!(run.contains("--counter-mode"), "{run}");
+        let flag_sentence = "--track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time\nexecutable identity and the child's own execs are grouped by linkage.";
+        assert!(run.contains(flag_sentence), "{run}");
+        assert!(
+            run.contains("Refused beside --counter-mode: it arms Detailed captures only."),
+            "{run}"
+        );
     }
 
     // 7.10b widening: profile help no longer confines the flag to

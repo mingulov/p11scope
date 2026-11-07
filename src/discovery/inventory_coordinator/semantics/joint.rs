@@ -426,8 +426,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let sn = SN.fetch_add(1, Ordering::Relaxed);
             if sn % 20 == 0 {
                 eprintln!(
-                    "seal-loop-tick sn={sn} ms={} t_mono={}",
+                    "seal-loop-tick sn={sn} ms={} rem_after={} t_mono={}",
                     diag_start.elapsed().as_millis(),
+                    *remaining,
                     crate::attach::monotonic_ns().unwrap_or(0),
                 );
             }

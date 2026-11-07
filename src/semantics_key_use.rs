@@ -328,9 +328,9 @@ pub(crate) struct JointStaging {
     /// proof-only refusal): the projection reports `authority_lost`,
     /// never a silent empty success. Cleared on clean resume.
     degraded_loss: bool,
-    /// True while the current segment ended in proof-only refusal
-    /// replayed through ordinary S1: the projection reports
-    /// `proof_refused_fallback`. Cleared on clean resume.
+    /// True once proof-only refusal replayed retained calls through
+    /// ordinary S1 and degraded to S1Only: the projection reports
+    /// `proof_refused_fallback`.
     fell_back: bool,
     /// Whether the segment that just ended permits a clean-point
     /// resume (see [`segment_resumable_after`]); ordered fallbacks
@@ -427,10 +427,12 @@ impl JointStaging {
     /// ended the previous segment. Only a feed that was selected
     /// Joint at registration (retained receipt), actually left it,
     /// and holds no staged remainder may resume. A clean resume
-    /// clears the loss/fallback latches and baselines disposed
-    /// history: current tracking is healthy again, so the reason
+    /// clears the loss latch and baselines disposed history: current
+    /// tracking is healthy again, so the `authority_lost` reason
     /// clears, while the retained counters keep counting the closed
-    /// segment beside it. Returns whether the mode changed.
+    /// segment beside it. The proof-refused fallback latch survives
+    /// (brief issue 3 covers the loss latch alone). Returns whether
+    /// the mode changed.
     pub(crate) fn resume_joint(&mut self) -> bool {
         if self.mode == FeedMode::S1Only
             && !self.watchdog_tripped
@@ -442,7 +444,6 @@ impl JointStaging {
             self.segment_resumable = false;
             self.degraded_window = None;
             self.degraded_loss = false;
-            self.fell_back = false;
             self.history_disposed_baseline = self.history_disposed;
             true
         } else {

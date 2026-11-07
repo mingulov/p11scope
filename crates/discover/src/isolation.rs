@@ -953,7 +953,8 @@ mod tests {
     #[test]
     fn target_name_exception_rejects_a_hard_link() {
         let target = std::ffi::OsStr::new("manifest.json");
-        let dir = std::env::temp_dir().join(format!("isolation-target-nlink-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("isolation-target-nlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -971,7 +972,8 @@ mod tests {
     #[test]
     fn target_name_exception_rejects_a_symlink() {
         let target = std::ffi::OsStr::new("manifest.json");
-        let dir = std::env::temp_dir().join(format!("isolation-target-symlink-{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("isolation-target-symlink-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         let out = dir.join("out");
         std::fs::create_dir_all(&out).unwrap();
@@ -1384,11 +1386,7 @@ mod tests {
             (FS_IOC_SETFLAGS, 0x4008_6602, "FS_IOC_SETFLAGS"),
             (FS_IOC_SETFLAGS32, 0x4004_6602, "FS_IOC_SETFLAGS32"),
             (FS_IOC_FSSETXATTR, 0x401c_5820, "FS_IOC_FSSETXATTR"),
-            (
-                FS_IOC_ENABLE_VERITY,
-                0x4080_6685,
-                "FS_IOC_ENABLE_VERITY",
-            ),
+            (FS_IOC_ENABLE_VERITY, 0x4080_6685, "FS_IOC_ENABLE_VERITY"),
             (
                 FS_IOC_SET_ENCRYPTION_POLICY,
                 0x800c_6613,

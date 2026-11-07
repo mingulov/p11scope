@@ -2841,6 +2841,10 @@ impl LiveJointMachine {
                         );
                     }
                 }
+                // TEMP F9 DIAGNOSTIC (revert before merge): collect timing.
+                let diag_collect =
+                    std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
+                let diag_collect_start = std::time::Instant::now();
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
                         lane,
@@ -2860,6 +2864,13 @@ impl LiveJointMachine {
                 };
                 let (raw, poll) = retain_on_refusal!(Phase::Idle, collected);
                 let poll = poll.expect("positive initial work actually polls the original cursor");
+                if diag_collect {
+                    eprintln!(
+                        "joint-timing: collect attempted={} ms={}",
+                        poll.attempted,
+                        diag_collect_start.elapsed().as_millis()
+                    );
+                }
                 budget.spend(poll.attempted.max(1));
                 let Some(ledger) = raw.ledger_binding() else {
                     return (
@@ -4701,7 +4712,19 @@ impl AttestedSemanticLane {
         mode: JointServiceMode,
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
-        self.service_joint_with_acquisition(coordinator, mode, budget, None)
+        // TEMP F9 DIAGNOSTIC (revert before merge): hook totals.
+        let timing = std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
+        let start = std::time::Instant::now();
+        let actions_before = budget.remaining_actions;
+        let out = self.service_joint_with_acquisition(coordinator, mode, budget, None);
+        if timing {
+            let elapsed_us = start.elapsed().as_micros();
+            if elapsed_us > 1_000 {
+                let spent = actions_before.saturating_sub(budget.remaining_actions);
+                eprintln!("joint-timing: hook actions={spent} elapsed_us={elapsed_us}");
+            }
+        }
+        out
     }
 
     pub(crate) fn service_joint_with_acquisition(

@@ -22123,12 +22123,20 @@ fn key_operation_joint_resumes_at_next_clean_point() {
             .map(|row| row.completed)
             .sum::<u64>();
     assert_eq!(completed, 2, "both exact signs complete once");
-    assert!(
-        observations
-            .unattributed
-            .iter()
-            .any(|row| row.reason == "proof_refused_fallback" && row.count >= 1),
-        "the fallback segment stays counted: {:?}",
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 1,
+            },
+        ],
+        "one replayed call under the segment reason beside its \
+         unsealable trigger: {:?}",
         observations.unattributed
     );
 }

@@ -7011,6 +7011,177 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn per_drain_unrouted_gaps_aggregate_into_one_counted_row() {
+        // Suite flood: 746 per-drain "semantic calls unrouted from
+        // other callers" rows (one per distinct shed count) filled
+        // the 1024 budget. Repeated-subject drains must aggregate
+        // into one counted row with summed calls.
+        let mut registry = registry();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted from other callers".into(),
+            5,
+            vec![("NoFile".into(), 5)],
+            2,
+        );
+        registry.publish();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted from other callers".into(),
+            7,
+            vec![("NoFile".into(), 4), ("foreign".into(), 3)],
+            2,
+        );
+        registry.publish();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted from other callers".into(),
+            3,
+            vec![("foreign".into(), 3)],
+            2,
+        );
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 1, "{:?}", registry.gaps());
+        let gap = &registry.gaps()[0];
+        assert_eq!(gap.subject, "semantic calls unrouted from other callers");
+        assert!(
+            gap.reason.starts_with("15 calls shed without a route ("),
+            "summed total: {}",
+            gap.reason
+        );
+        assert!(gap.reason.contains("NoFile=9"), "summed label: {}", gap.reason);
+        assert!(
+            gap.reason.contains("foreign=6"),
+            "summed label: {}",
+            gap.reason
+        );
+        // The oracle multiplies count by repeats: a summed row keeps
+        // repeats 1, never drains.
+        assert_eq!(registry.gap_repeats(), &[1]);
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
+    fn aggregated_unrouted_gaps_separate_pre_binding_from_bound_drains() {
+        // Pre-binding sheds ("with 0 bindings") forgive against the
+        // pre-binding note; post-binding sheds stay loss. Merging
+        // across the 0/N boundary would erase that distinction, so
+        // each bindings count aggregates separately.
+        let mut registry = registry();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted".into(),
+            4,
+            vec![("NoFile".into(), 4)],
+            0,
+        );
+        registry.publish();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted".into(),
+            6,
+            vec![("NoFile".into(), 6)],
+            3,
+        );
+        registry.publish();
+        registry.record_aggregated_unrouted(
+            "semantic calls unrouted".into(),
+            2,
+            vec![("NoFile".into(), 2)],
+            0,
+        );
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 2, "{:?}", registry.gaps());
+        let zero = registry
+            .gaps()
+            .iter()
+            .find(|gap| gap.reason.ends_with("with 0 bindings"))
+            .expect("the 0-bindings row survives");
+        assert!(
+            zero.reason.starts_with("6 calls shed without a route ("),
+            "0-bindings sum: {}",
+            zero.reason
+        );
+        let bound = registry
+            .gaps()
+            .iter()
+            .find(|gap| gap.reason.ends_with("with 3 bindings"))
+            .expect("the bound row survives");
+        assert!(
+            bound.reason.starts_with("6 calls shed without a route ("),
+            "bound sum: {}",
+            bound.reason
+        );
+    }
+
+    #[test]
+    fn terminal_gaps_survive_a_per_drain_flood() {
+        // Terminal/stop-time gaps stage last and must never be
+        // crowded out by per-drain floods: the last
+        // TERMINAL_GAP_RESERVE slots stay reserved until the
+        // terminal phase begins.
+        let mut registry = registry();
+        for n in 0..1100 {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS - TERMINAL_GAP_RESERVE,
+            "per-drain stops at the reserve"
+        );
+        assert!(
+            registry.gaps_suppressed() > 0,
+            "flood overflow suppresses"
+        );
+        registry.enter_terminal_phase();
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("terminal-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(registry.gaps().len(), DEFAULT_MAX_GAPS);
+        assert!(
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "terminal-0"),
+            "first terminal gap retained"
+        );
+        assert!(
+            registry.gaps().iter().any(|gap| gap.subject
+                == format!("terminal-{}", TERMINAL_GAP_RESERVE - 1)),
+            "last terminal gap retained"
+        );
+    }
+
+    #[test]
+    fn tiny_gap_limits_keep_every_slot_for_per_drain_gaps() {
+        // No reservation when the bound itself fits inside it:
+        // small-limit twins keep their exact per-drain behavior.
+        let mut registry =
+            CallerRegistry::new(RegistryLimits::new(64, 64, 64, 3, 1 << 20, 64).unwrap());
+        for n in 0..3 {
+            registry.record_gap(RegistryGap {
+                pid: Some(100 + n),
+                subject: format!("subject-{n}"),
+                ..collapse_gap()
+            });
+        }
+        registry.publish();
+        assert_eq!(registry.gaps().len(), 3);
+        assert_eq!(registry.gaps_suppressed(), 0);
+    }
+
+    #[test]
     fn complete_absence_unloads_and_reload_recovers_with_history() {
         let mut registry = registry();
         let info = module_info("/lib/a.so", 11, AdmissionState::Admitted);

@@ -64606,6 +64606,135 @@ fn pid_target_exec_ignores_execs_against_a_dead_view() {
     assert_eq!(hints.total(), 0);
 }
 
+// 7.10b: an absent exe pair on a validated target EXEC counts
+// `unknown` without running the shared analysis: the early return
+// fires before `analyze_executable`, so no budget is charged and no
+// verdict is cached.
+#[test]
+fn pid_target_exec_with_absent_pair_counts_unknown_without_analysis() {
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, 0, 0, 0),
+        &mut pending,
+    );
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(engine.extensive.analyses_run_for_test(), 0);
+}
+
+// 7.10b: when the exec-time learn resolves a different image than the
+// recorded pair (a re-exec between the record and the learn), the
+// reopen `fstat` re-verify voids the analysis to `unknown` instead
+// of attributing the wrong image's hint.
+#[test]
+fn pid_target_exec_reexec_between_record_and_learn_counts_unknown() {
+    use crate::discovery::elf_needed::WatchedProvider;
+    use crate::discovery::elf_needed::fixture as exf;
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    let dir = tempfile::tempdir().unwrap();
+    let provider = exf::write_elf(
+        dir.path(),
+        "libgap.so.1",
+        &exf::build_elf(&exf::ElfSpec::lib(b"libgap.so.1", &[])),
+    );
+    let recorded = exf::write_elf(
+        dir.path(),
+        "gexe",
+        &exf::build_elf(&exf::ElfSpec::exe(&[b"libgap.so.1"])),
+    );
+    let relearned = exf::write_elf(
+        dir.path(),
+        "rexec",
+        &exf::build_elf(&exf::ElfSpec::exe(&[])),
+    );
+    let (provider_dev, provider_ino) = exf::record_identity_of(&provider);
+    engine.extensive.set_watched_for_test(vec![WatchedProvider {
+        path: provider.clone(),
+        soname: b"libgap.so.1".to_vec(),
+        dev: provider_dev,
+        ino: provider_ino,
+    }]);
+    // The learn resolves the re-exec'd image under the recorded
+    // pair's key; the reopen re-verify must refuse the mismatch.
+    engine
+        .extensive
+        .learn_scan_path(exf::cache_key_of(&recorded), &relearned);
+    engine
+        .extensive
+        .learn_scan_path(exf::cache_key_of(&provider), &provider);
+    let (dev, ino) = exf::record_identity_of(&recorded);
+    // Past every admission bracket, deterministically.
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, dev, ino, 0),
+        &mut pending,
+    );
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(engine.extensive.analyses_run_for_test(), 1);
+}
+
+// 7.10b: under `--mode metrics` (aggregate policy) instance hooks
+// never attach, so the exit-mapping split always reads
+// `{mapped: 0, unknown: N}`; `mapped` is unreachable there. Profile
+// and trace keep the `mapped` outcome (see the `mapped` twins).
+#[test]
+fn aggregate_arm_exit_mapping_split_is_all_unknown_under_metrics() {
+    assert!(
+        !CapturePolicy::AggregateOnly.wants_instance_hooks(),
+        "aggregate-only sessions never attach instance hooks"
+    );
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.arm_extensive(true, CapturePolicy::AggregateOnly);
+    let mut session = ScriptedSession::default();
+    assert!(
+        session.instance_hooks_refused(),
+        "the scripted metrics session refuses instance hooks"
+    );
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(7201, 5);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let mut exit = exit_mappings_record(7201, 11);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownHooksRefused]
+    );
+}
+
 // 7.10b: arming under aggregate policy (`--mode metrics`) seeds the
 // gap stash ticketless, so a ticketless EXEC plus a novel unmatched
 // exit classifies a real gap hint end to end.

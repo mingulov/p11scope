@@ -11473,6 +11473,39 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     );
 }
 
+/// The published observer image runs the observer by default: `docker run
+/// IMAGE <p11scope args>` must reach p11scope, while the in-cluster entry
+/// script stays available by explicit name for `kubectl exec`. The image
+/// stays minimal (one digest-pinned base, the staged static binary, the
+/// entry script) and keeps its build-time smoke of both.
+#[test]
+fn observer_image_runs_p11scope_by_default() {
+    let dockerfile = read("deploy/Dockerfile.observer");
+    for marker in [
+        "ENTRYPOINT [\"/usr/local/bin/p11scope\"]",
+        "CMD [\"--help\"]",
+        "COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope",
+        "COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry",
+        "/usr/local/bin/p11scope --help >/dev/null",
+        "/usr/local/bin/k8s-profile-entry --self-test",
+    ] {
+        require_contract_marker(&dockerfile, marker, "observer image")
+            .expect("observer image contract");
+    }
+    let from = dockerfile
+        .lines()
+        .find(|line| line.starts_with("FROM "))
+        .expect("the observer image has one base");
+    assert!(
+        from.contains("@sha256:"),
+        "the observer base must stay digest-pinned: {from}"
+    );
+    assert!(
+        !dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/k8s-profile-entry\"]"),
+        "the cluster entry script must not swallow docker run arguments"
+    );
+}
+
 /// A step cannot read its own job's log, and a `tee` wrapper would break every
 /// exact-line pin above, so a second job fetches each finished check job's log
 /// through the Actions API and keeps them as a run artifact. Its token gets

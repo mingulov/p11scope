@@ -2247,8 +2247,7 @@ fn key_ops_line_pqc_spotlight_sorts_by_label() {
         .find(|line| line.starts_with("  pqc keys: "))
         .unwrap_or_else(|| panic!("the spotlight line: {snapshot}"));
     assert_eq!(
-        *spotlight,
-        "  pqc keys: ML-KEM-512 sign: 6, ML-KEM-1024 sign: 4",
+        *spotlight, "  pqc keys: ML-KEM-512 sign: 6, ML-KEM-1024 sign: 4",
         "the line follows label order: {snapshot}"
     );
 }

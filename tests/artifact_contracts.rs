@@ -12307,7 +12307,10 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
             "ev.settle_terminal(profile);",
             "let mut frame = render::live_snapshot_scoped(",
         ),
-        ("let mut frame = render::live_snapshot_scoped(", "write_stdout("),
+        (
+            "let mut frame = render::live_snapshot_scoped(",
+            "write_stdout(",
+        ),
     ] {
         require_before(
             profile_terminal,

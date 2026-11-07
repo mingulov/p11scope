@@ -555,6 +555,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     exec_loss_domains: HashSet<NativeDomainId>,
     /// Userspace executable resolution (system-index cache).
     exe_resolver: ExeResolver,
+    /// Scan-learned exe-probe answers by caller path, pair or
+    /// refusal: each distinct path probes once per capture, so
+    /// backfills and staging batches rebuild the learned map without
+    /// re-probing. Bounded; a full cache stops retaining.
+    exe_probe_cache: HashMap<String, Option<(u64, u64)>>,
     /// Cached observer-timems boottime gate for live-process reads
     /// (the observer's time namespace never changes mid-process).
     timens_boottime_ok: Option<bool>,
@@ -760,13 +765,13 @@ fn exit_clocks_comparable_with(
 /// complete in milliseconds at ~64 B per entry (~1 MiB at the cap).
 /// Never lowered.
 const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
+
 /// Scan-learned exe-probe cache: one entry per distinct caller path
 /// at most, so the retained set cannot outnumber admitted callers
 /// under the default caller bound (4,096). A full cache stops
 /// retaining (the overflow tail probes per build, still correct);
 /// the cap is never lowered.
 const DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES: usize = 4_096;
-
 
 /// One stashed EXEC exe identity: the `(dev, ino)` pair with the
 /// hook instant and pid that resolution (a) verifies against.
@@ -1075,6 +1080,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             exec_exe_shed: 0,
             exec_loss_domains: HashSet::new(),
             exe_resolver: ExeResolver::new(),
+            exe_probe_cache: HashMap::new(),
             timens_boottime_ok: None,
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
@@ -1343,11 +1349,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// Scan-learned exe identities visible to resolution:
     /// maps-domain `(dev, ino)` to path over tracked callers, each
-    /// learned path probed once per call. First path wins per
-    /// identity.
+    /// distinct path probed once per capture through the sticky
+    /// cache. First path wins per identity.
     #[cfg(test)]
-    pub(crate) fn scan_learned_exe_map(&self) -> std::collections::HashMap<(u64, u64), String> {
-        Self::scan_exe_identities(&self.adapter)
+    pub(crate) fn scan_learned_exe_map(
+        &mut self,
+    ) -> std::collections::HashMap<(u64, u64), String> {
+        Self::scan_exe_identities_cached(
+            &self.adapter,
+            &mut self.exe_probe_cache,
+            crate::discovery::unbound_exe::real_maps_identity,
+        )
     }
 
     /// Stash every ticketed EXEC's exe identity, keyed by the exact
@@ -1388,7 +1400,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !self.registry.has_unbound_image(cookie) {
             return;
         }
-        let learned = Self::scan_exe_identities(&self.adapter);
+        let learned = Self::scan_exe_identities_cached(
+            &self.adapter,
+            &mut self.exe_probe_cache,
+            crate::discovery::unbound_exe::real_maps_identity,
+        );
         let exe = self.resolve_unbound_exe(exec, &learned);
         self.registry.attach_unbound_exe(cookie, exe);
     }
@@ -1465,28 +1481,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_loss_domains.contains(&domain) || self.binder.lifecycle_loss_noted(domain)
     }
 
-    /// Scan-learned exe identities over tracked callers, by
-    /// probed maps-domain `(dev, ino)`: each learned path is probed
-    /// once per call, so the keys compare like for like with EXEC
-    /// pairs. Callers without a recorded path, or whose path probes
-    /// nothing, contribute nothing; first path wins per identity.
-    fn scan_exe_identities(adapter: &CallerAdapter<Source>) -> HashMap<(u64, u64), String> {
-        let mut learned = HashMap::new();
-        for record in adapter.records() {
-            let Some(exe) = record.exe.as_ref() else {
-                continue;
-            };
-            let Some(path) = exe.path.as_ref() else {
-                continue;
-            };
-            let Some(pair) = crate::discovery::unbound_exe::real_maps_identity(path) else {
-                continue;
-            };
-            learned.entry(pair).or_insert_with(|| path.clone());
-        }
-        learned
-    }
-
     /// Scan-learned exe identities with the probe cache: each
     /// distinct caller path probes once (deduped by path across
     /// callers sharing one binary) and the answer — pair or refusal —
@@ -1496,7 +1490,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// correct. First path wins per identity.
     fn scan_exe_identities_cached(
         adapter: &CallerAdapter<Source>,
-        _cache: &mut HashMap<String, Option<(u64, u64)>>,
+        cache: &mut HashMap<String, Option<(u64, u64)>>,
         probe: impl Fn(&str) -> Option<(u64, u64)>,
     ) -> HashMap<(u64, u64), String> {
         let mut learned = HashMap::new();
@@ -1507,7 +1501,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(path) = exe.path.as_ref() else {
                 continue;
             };
-            let Some(pair) = probe(path) else {
+            let cached = match cache.get(path) {
+                Some(cached) => *cached,
+                None => {
+                    let probed = probe(path);
+                    // A full cache stops retaining: the overflow tail
+                    // probes per build, still correct.
+                    if cache.len() < DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES {
+                        cache.insert(path.clone(), probed);
+                    }
+                    probed
+                }
+            };
+            let Some(pair) = cached else {
                 continue;
             };
             learned.entry(pair).or_insert_with(|| path.clone());
@@ -8491,8 +8497,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // backfills it, later loss flips it).
                 let exe = match self.exec_exe.get(&cookie).copied() {
                     Some(stashed) => {
-                        let learned =
-                            learned.get_or_insert_with(|| Self::scan_exe_identities(&self.adapter));
+                        let learned = learned.get_or_insert_with(|| {
+                            Self::scan_exe_identities_cached(
+                                &self.adapter,
+                                &mut self.exe_probe_cache,
+                                crate::discovery::unbound_exe::real_maps_identity,
+                            )
+                        });
                         self.resolve_unbound_exe(stashed, learned)
                     }
                     None if self.exec_evidence_lost(cookie.domain()) => UnboundExe {
@@ -29454,9 +29465,10 @@ int main(void) {
 
     /// Resolution source (b): the coordinator exposes the
     /// scan-learned exe identities of admitted callers by their
-    /// maps-domain `(dev, ino)`, probing each learned path once per
-    /// call. A caller whose path probes nothing (a placeholder or a
-    /// deleted binary) contributes nothing.
+    /// maps-domain `(dev, ino)`, probing each distinct path once per
+    /// capture through the sticky cache. A caller whose path probes
+    /// nothing (a placeholder or a deleted binary) contributes
+    /// nothing.
     #[test]
     fn scan_learned_exe_map_names_admitted_callers() {
         let dir = tempfile::tempdir().unwrap();
@@ -29560,6 +29572,64 @@ int main(void) {
             "every staged path probed: {:?}",
             counts.borrow().keys().collect::<Vec<_>>()
         );
+    }
+
+    /// A full probe cache stops retaining: the overflow tail probes
+    /// per build, still correct, while retained entries keep hitting.
+    #[test]
+    fn exe_probe_cache_overflow_probes_per_build() {
+        use std::cell::Cell;
+        let dir = tempfile::tempdir().unwrap();
+        let (path_a, _, _) = staged_tool(&dir, "tool-a");
+        let (mut native, _) = NativeScene::new();
+        native.scene.source.spawn(9, 100);
+        native.scene.source.exec(9, 101, path_a.to_str().unwrap());
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let mut cache = HashMap::new();
+        for index in 0..DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES {
+            cache.insert(format!("/dummy/{index}"), None);
+        }
+        let probes = Cell::new(0usize);
+        let probe = |path: &str| {
+            probes.set(probes.get() + 1);
+            Some((path.len() as u64, 7))
+        };
+        for _ in 0..2 {
+            let map = InventoryCoordinator::scan_exe_identities_cached(
+                &native.scene.coordinator.adapter,
+                &mut cache,
+                &probe,
+            );
+            assert!(
+                map.values()
+                    .any(|path| path == path_a.to_str().unwrap()),
+                "the overflow path still joins the map: {map:?}"
+            );
+        }
+        // Two builds over the admitted callers (the staged tool plus
+        // the scene's own callers), none retained past the cap.
+        let callers = native
+            .scene
+            .coordinator
+            .adapter
+            .records()
+            .filter(|record| record.exe.as_ref().is_some_and(|exe| exe.path.is_some()))
+            .count();
+        assert_eq!(probes.get(), 2 * callers);
+        assert_eq!(cache.len(), DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES);
+    }
+
+    /// LIM-1: the exe-probe cache cap mirrors the default caller
+    /// bound (one entry per admitted caller at most) and is never
+    /// lowered.
+    #[test]
+    fn exe_probe_cache_cap_is_pinned() {
+        assert_eq!(DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES, 4_096);
     }
 
     fn staged_tool(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, u64, u64) {

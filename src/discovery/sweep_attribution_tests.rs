@@ -2213,6 +2213,310 @@ fn privileged_btrfs_equal_pin_twins_use_their_own_inspections() {
     std::fs::remove_dir(path_b.parent().unwrap()).unwrap();
 }
 
+/// A read-write snapshot of subvolume `source` as `dest`, both under
+/// `parent` (`btrfs subvolume snapshot`, writable so cleanup removes the
+/// files and rmdirs the snapshot). The snapshot keeps inode numbers,
+/// sizes, change times and content; only the subvolume device differs.
+fn snapshot_subvolume(parent: &std::path::Path, source: &str, dest: &str) {
+    let status = std::process::Command::new("btrfs")
+        .args(["subvolume", "snapshot"])
+        .arg(parent.join(source))
+        .arg(parent.join(dest))
+        .status()
+        .unwrap_or_else(|error| panic!("btrfs is required: {error}"));
+    assert!(
+        status.success(),
+        "btrfs subvolume snapshot {source} {dest}: {status}"
+    );
+}
+
+/// Pin one real file through the production scan-pinning path, as if a deep
+/// scan had named it: the module carries the file's own maps key, so the
+/// pin exercises the real open/identity/hash path.
+fn pin_file_via_self_view(
+    path: &std::path::Path,
+    budget: &mut crate::discovery::scan::CaptureWorkBudget,
+) -> (
+    crate::discovery::identity::PinnedObjects,
+    Vec<crate::discovery::scan::Skipped>,
+) {
+    use crate::discovery::identity::pin_scanned_view_objects;
+    use crate::discovery::scan::ScannedModule;
+    use crate::process::{ProcessView, ProcessViewId};
+    use p11scope_manifest::identity::mapping_file_key;
+
+    let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let file = std::fs::File::open(path).unwrap();
+    let mapping = mapping_file_key(&file).unwrap();
+    let key = p11scope_manifest::maps::ObjectKey {
+        device: Device {
+            major: mapping.device_major,
+            minor: mapping.device_minor,
+        },
+        inode: mapping.inode,
+    };
+    let module = ScannedModule {
+        module_hint: None,
+        mapped_identity: None,
+        double_loaded: false,
+        same_file_loads: 1,
+        view: view.id(),
+        mount_namespace: view.mount_namespace(),
+        key,
+        path: path.display().to_string(),
+        tables_scan_finished: false,
+        decoder_abi: None,
+        exports: Vec::new(),
+        tables: Vec::new(),
+        interfaces: Vec::new(),
+    };
+    pin_scanned_view_objects(&view, &[module], budget).unwrap()
+}
+
+/// Root on a btrfs TMPDIR, through the production scan-pinning path: a
+/// subvolume snapshot keeps the maps key, pin and digest, so the original
+/// and the snapshot collide on every pre-fix join; they must still not
+/// merge (different subvolume devices), while the same file pinned twice
+/// merges.
+#[test]
+#[ignore = "root on a btrfs TMPDIR: snapshots one subvolume and pins both copies"]
+fn privileged_btrfs_snapshot_twins_do_not_merge() {
+    use crate::discovery::scan::CaptureWorkBudget;
+    use p11scope_manifest::identity::{inspect_file, mapping_file_key};
+    use std::os::unix::fs::MetadataExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+    let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+    // SAFETY: a valid path and buffer, read only on success.
+    assert_eq!(
+        unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+        0
+    );
+    // SAFETY: initialized by the successful statfs.
+    #[allow(clippy::unnecessary_cast)]
+    let magic = (unsafe { stat.assume_init().f_type }) as u64 & 0xffff_ffff;
+    assert_eq!(magic, 0x9123_683e, "TMPDIR must be on btrfs");
+
+    create_subvolume(parent, "snap_a");
+    let path_a = parent.join("snap_a/lib.so");
+    let bytes = std::fs::read("/bin/true").unwrap();
+    std::fs::write(&path_a, &bytes).unwrap();
+    snapshot_subvolume(parent, "snap_a", "snap_s");
+    let path_s = parent.join("snap_s/lib.so");
+
+    let file_a = std::fs::File::open(&path_a).unwrap();
+    let file_s = std::fs::File::open(&path_s).unwrap();
+    // Positive controls: the snapshot really collides on maps key and pin.
+    let map_a = mapping_file_key(&file_a).unwrap();
+    let map_s = mapping_file_key(&file_s).unwrap();
+    assert_eq!(
+        (
+            map_a.mount_id,
+            map_a.device_major,
+            map_a.device_minor,
+            map_a.inode
+        ),
+        (
+            map_s.mount_id,
+            map_s.device_major,
+            map_s.device_minor,
+            map_s.inode
+        ),
+        "twins share the whole mapping key"
+    );
+    let meta_a = file_a.metadata().unwrap();
+    let meta_s = file_s.metadata().unwrap();
+    assert_eq!(
+        (
+            meta_a.ino(),
+            meta_a.len(),
+            (meta_a.ctime(), meta_a.ctime_nsec())
+        ),
+        (
+            meta_s.ino(),
+            meta_s.len(),
+            (meta_s.ctime(), meta_s.ctime_nsec())
+        ),
+        "twins share the whole pin"
+    );
+    assert_ne!(
+        meta_a.dev(),
+        meta_s.dev(),
+        "twins differ only in the subvolume device"
+    );
+    let sha_a = inspect_file(&file_a).unwrap().identity.sha256.unwrap();
+    let sha_s = inspect_file(&file_s).unwrap().identity.sha256.unwrap();
+    assert_eq!(sha_a, sha_s, "twins share the content digest");
+
+    let mut budget = CaptureWorkBudget::default();
+    let (pins_a, skipped_a) = pin_file_via_self_view(&path_a, &mut budget);
+    assert!(skipped_a.is_empty(), "{skipped_a:?}");
+    let (pins_s, skipped_s) = pin_file_via_self_view(&path_s, &mut budget);
+    assert!(skipped_s.is_empty(), "{skipped_s:?}");
+    for (pins, sha, name) in [(&pins_a, &sha_a, "A"), (&pins_s, &sha_s, "S")] {
+        let summaries: Vec<_> = pins.pinned().collect();
+        assert_eq!(summaries.len(), 1, "twin {name} pins once");
+        assert_eq!(
+            summaries[0].sha256, *sha,
+            "twin {name}'s entry names its own file"
+        );
+    }
+    let mut combined = pins_a;
+    let skipped = combined.absorb(pins_s);
+    assert_eq!(combined.pinned().count(), 0, "twins must not merge");
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].reason.contains("physical identity is ambiguous"),
+        "{skipped:?}"
+    );
+
+    // Healthy twin: the same file pinned twice still merges.
+    let mut budget = CaptureWorkBudget::default();
+    let (mut first, skipped) = pin_file_via_self_view(&path_a, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let (second, skipped) = pin_file_via_self_view(&path_a, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let skipped = first.absorb(second);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(first.pinned().count(), 1);
+
+    std::fs::remove_file(&path_a).unwrap();
+    std::fs::remove_file(&path_s).unwrap();
+    std::fs::remove_dir(parent.join("snap_a")).unwrap();
+    std::fs::remove_dir(parent.join("snap_s")).unwrap();
+}
+
+/// A private tmpfs mount with the given options, unmounted on drop.
+struct TmpfsMount {
+    _dir: tempfile::TempDir,
+    mount: std::path::PathBuf,
+}
+
+impl TmpfsMount {
+    fn with_options(options: &str) -> Self {
+        let dir = tempfile::tempdir().unwrap();
+        let mount = dir.path().join("mnt");
+        std::fs::create_dir(&mount).unwrap();
+        let status = std::process::Command::new("mount")
+            .args(["-t", "tmpfs", "-o", options, "tmpfs"])
+            .arg(&mount)
+            .status()
+            .unwrap_or_else(|error| panic!("mount is required: {error}"));
+        assert!(status.success(), "mount -t tmpfs -o {options}: {status}");
+        Self { _dir: dir, mount }
+    }
+}
+
+impl Drop for TmpfsMount {
+    fn drop(&mut self) {
+        let unmounted = std::process::Command::new("umount")
+            .arg(&self.mount)
+            .status()
+            .is_ok_and(|status| status.success());
+        if !unmounted {
+            let _ = std::process::Command::new("umount")
+                .arg("-l")
+                .arg(&self.mount)
+                .status();
+        }
+    }
+}
+
+/// Assert `/proc/self/mountinfo` shows `mount` with super-options containing
+/// the whole comma-separated `token` (proving the test really mounted the
+/// mode it claims, never a silent fallback).
+fn assert_mount_token(mount: &std::path::Path, token: &str) {
+    let table = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+    let mount_str = mount.to_str().unwrap();
+    let line = table
+        .lines()
+        .find(|line| line.split_ascii_whitespace().nth(4) == Some(mount_str))
+        .unwrap_or_else(|| panic!("{mount_str} is not mounted:\n{table}"));
+    let super_options = line.split_ascii_whitespace().next_back().unwrap();
+    assert!(
+        super_options.split(',').any(|t| t == token),
+        "{mount_str} super-options {super_options:?} lack {token:?}"
+    );
+}
+
+/// Root mounting tmpfs with `inode32` and `inode64`: the `inode32` file
+/// labels `tmpfs-inode32`, two pins of it refuse (never merge, never
+/// cache), while the `inode64` control merges. Mount tokens are asserted
+/// (no self-skip).
+#[test]
+#[ignore = "root mounting tmpfs inode32/inode64: labels, refusal, and control merge"]
+fn privileged_tmpfs_inode32_refuses_while_inode64_merges() {
+    use crate::discovery::identity::{file_inodes_are_unique, pin_of};
+    use crate::discovery::scan::{CaptureWorkBudget, InspectedFileKey};
+    use p11scope_manifest::identity::mapping_file_key;
+
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "this cell mounts tmpfs and needs root"
+    );
+    let mnt32 = TmpfsMount::with_options("inode32,size=64M");
+    let mnt64 = TmpfsMount::with_options("inode64,size=64M");
+    assert_mount_token(&mnt32.mount, "inode32");
+    assert_mount_token(&mnt64.mount, "inode64");
+
+    let bytes = std::fs::read("/bin/true").unwrap();
+    let path32 = mnt32.mount.join("lib.so");
+    let path64 = mnt64.mount.join("lib.so");
+    std::fs::write(&path32, &bytes).unwrap();
+    std::fs::write(&path64, &bytes).unwrap();
+
+    // The inode32 file labels tmpfs-inode32 and never counts as unique.
+    let file32 = std::fs::File::open(&path32).unwrap();
+    assert!(!file_inodes_are_unique(&file32));
+    let mut budget = CaptureWorkBudget::default();
+    let (pins32, skipped) = pin_file_via_self_view(&path32, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let id32 = pins32.pinned().next().unwrap().id;
+    assert_eq!(
+        pins32.nonunique_inode_filesystem(id32).unwrap(),
+        Some("tmpfs-inode32")
+    );
+    // Never cached: the inspection is always read, never stored.
+    let mapping = mapping_file_key(&file32).unwrap();
+    let cache_key = InspectedFileKey::for_open_file(
+        &file32,
+        Device {
+            major: mapping.device_major,
+            minor: mapping.device_minor,
+        },
+        mapping.inode,
+        pin_of(&file32).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(budget.inspected_file(&cache_key), None);
+    // Two pins of one inode32 file refuse instead of merging.
+    let (pins32b, skipped) = pin_file_via_self_view(&path32, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut combined = pins32;
+    let skipped = combined.absorb(pins32b);
+    assert_eq!(combined.pinned().count(), 0);
+    assert_eq!(skipped.len(), 1, "{skipped:?}");
+    assert!(
+        skipped[0].reason.contains("physical identity is ambiguous"),
+        "{skipped:?}"
+    );
+
+    // The inode64 control merges.
+    let file64 = std::fs::File::open(&path64).unwrap();
+    assert!(file_inodes_are_unique(&file64));
+    let mut budget = CaptureWorkBudget::default();
+    let (mut first, skipped) = pin_file_via_self_view(&path64, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let (second, skipped) = pin_file_via_self_view(&path64, &mut budget);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let skipped = first.absorb(second);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    assert_eq!(first.pinned().count(), 1);
+}
+
 /// A private ext4 filesystem on a loop device under a temporary directory,
 /// unmounted (lazily if busy) and deleted on drop.
 struct Ext4Loop {

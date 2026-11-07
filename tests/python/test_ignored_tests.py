@@ -100,6 +100,7 @@ BTRFS_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity",
     "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
     "discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections",
+    "discovery::sweep_attribution::tests::privileged_btrfs_snapshot_twins_do_not_merge",
 ]
 
 # The two D3d forced-kernel cells fail their positive gate (observed on
@@ -1573,16 +1574,16 @@ class IgnoredTestsTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0,
                          result.stdout + result.stderr)
         # The fake lists both load-gate alternatives (a real binary has
-        # exactly one), so the default section shows 220 + 2.
-        self.assertIn("default (222)", result.stdout)
-        self.assertIn("btrfs (15, --include-btrfs only)", result.stdout)
+        # exactly one), so the default section shows 221 + 2.
+        self.assertIn("default (223)", result.stdout)
+        self.assertIn("btrfs (16, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (3, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (283 tests)",
+        self.assertIn("verify: curation matches the binary (285 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1777,10 +1778,10 @@ class IgnoredTestsTests(unittest.TestCase):
         result = run_checker(ROOT)
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
         for pin in (
-            "DEFAULT_TESTS=220",
+            "DEFAULT_TESTS=221",
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
-            "BTRFS_TESTS=15",
+            "BTRFS_TESTS=16",
             "OVERLAY_TESTS=3",
             "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",

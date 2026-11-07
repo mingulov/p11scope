@@ -364,6 +364,9 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overl
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
+# Tmpfs inode-number uniqueness: the cell mounts its own inode32/inode64
+# tmpfs pair, so it needs only root (no btrfs TMPDIR provisioning).
+discovery::sweep_attribution::tests::privileged_tmpfs_inode32_refuses_while_inode64_merges
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
 events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map
 events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict
@@ -736,6 +739,7 @@ discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie
 discovery::sweep_attribution::tests::d4_zombie_cells::privileged_d4_btrfs_zombie_cold_admission_backend_parity
 discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors
 discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections
+discovery::sweep_attribution::tests::privileged_btrfs_snapshot_twins_do_not_merge
 )
 
 # Btrfs TMPDIR provisioning also covers these expected-failure cells,

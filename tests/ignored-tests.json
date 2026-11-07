@@ -1971,6 +1971,18 @@
       "path": "discovery::sweep_attribution::tests::privileged_btrfs_equal_pin_twins_use_their_own_inspections",
       "reason": "root on a btrfs TMPDIR: creates subvolume pairs until an equal-pin twin is found",
       "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_btrfs_snapshot_twins_do_not_merge",
+      "reason": "root on a btrfs TMPDIR: snapshots one subvolume and pins both copies",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/sweep_attribution_tests.rs",
+      "path": "discovery::sweep_attribution::tests::privileged_tmpfs_inode32_refuses_while_inode64_merges",
+      "reason": "root mounting tmpfs inode32/inode64: labels, refusal, and control merge",
+      "cell": "privileged"
     }
   ]
 }

@@ -5847,7 +5847,14 @@ impl ClassicDriver<'_> {
                     return (stopped, self.fold_retained_joint_error(error), zero_pass);
                 }
                 Ok(ClassicCompletion::Retained { run, error }) => {
-                    if self.joint_commit_pending && self.semantic.is_some() {
+                    // The stuck bound covers every running-commit shape the
+                    // fence holds, including cgroup coordinator-only pending
+                    // (a tick-begun preparation with no driver flag); a
+                    // polling Joint finish keeps its own settle bound.
+                    let running_commit_owed = self.semantic.is_some()
+                        && (self.joint_commit_pending
+                            || (self.cgroup.is_some() && self.coordinator.publication_pending()));
+                    if running_commit_owed {
                         let now = Instant::now();
                         let since = *pending_since.get_or_insert(now);
                         if now.duration_since(since) >= bound {
@@ -5901,11 +5908,18 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
 
     /// Whether a publication is still owed: a begun-but-unpublished
     /// Joint commit, or a Joint finish mid-poll, beside a live lane.
-    /// A held lane owes nothing further.
+    /// A held lane owes nothing further. A cgroup run also owes while
+    /// the coordinator holds a pending publication: a tick-begun Joint
+    /// preparation pends there with no driver flag, and the next cgroup
+    /// collection must defer past it (its apply refuses while the
+    /// previous publication retains the cgroup continuation). The legacy
+    /// path keeps its proceed-and-resume shape past such
+    /// coordinator-only pending.
     fn publication_pending(&self) -> bool {
         self.semantic.is_some()
             && (self.joint_commit_pending
-                || matches!(self.joint_finish, JointFinishDriver::Polling))
+                || matches!(self.joint_finish, JointFinishDriver::Polling)
+                || (self.cgroup.is_some() && self.coordinator.publication_pending()))
     }
 
     /// The suspension gate (§6.2): latch only, never terminal I/O.

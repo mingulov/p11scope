@@ -64883,6 +64883,88 @@ fn matched_exit_drops_exec_timing_so_reused_pid_reads_late_watch() {
     );
 }
 
+// M-A: the PID consumer learns the target exe at validation time, so a
+// validated exec classifies without any pre-learned scan path. Deleting
+// the exec-time learn strands the analysis with no path (`unknown`).
+#[test]
+fn pid_target_exec_learns_exe_at_validation_without_prelearn() {
+    use crate::discovery::elf_needed::WatchedProvider;
+    use crate::discovery::elf_needed::fixture as exf;
+    let pid = std::process::id();
+    let mut engine = Engine::empty();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), pid).unwrap());
+    // The test process itself: its image links libc, and no scan ever
+    // learned it here — only the validation-time learn may resolve it.
+    let exe = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+    let (dev, ino) = exf::record_identity_of(&exe);
+    engine.extensive.set_watched_for_test(vec![WatchedProvider {
+        path: PathBuf::from("/nonexistent/libc.so.6"),
+        soname: b"libc.so.6".to_vec(),
+        dev: 0,
+        ino: 0,
+    }]);
+    assert_eq!(engine.extensive.path_cache_len_for_test(), 0);
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, ts, dev, ino, 0),
+        &mut pending,
+    );
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+// M-C: target-exec classification runs before the owned-initial-exec
+// acknowledgment returns early, so the owned child's first EXEC still
+// counts its hint. Classifying below the early return strands it at
+// zero.
+#[test]
+fn owned_initial_exec_still_classifies_target_hint_before_ack() {
+    let (_fixture, _child, mut engine, _context, exec, mut session) =
+        owned_prearmed_seed_route(true);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.total(), 1);
+}
+
+// M-4: under Detailed policy a ticketless EXEC seeds no stash entry,
+// so the gap exit counts `unknown` without analysis. Seeding without
+// the ticket would bind the gap to the recorded image instead.
+#[test]
+fn detailed_arm_refuses_ticketless_stash_seed_end_to_end() {
+    let pid = std::process::id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, 100, dev, ino, 0),
+        &mut pending,
+    );
+    assert_eq!(
+        engine.extensive.stash_len_for_test(),
+        0,
+        "Detailed ticketless EXEC must not seed"
+    );
+    engine.dispatch_lifecycle_record(&mut session, &gap_exe_exit_record(pid, 200), &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(engine.extensive.analyses_run_for_test(), 0);
+}
+
 /// Build knobs of the stamped legacy-only fixture
 /// (`crates/discover/tests/fixture/legacy3x_provider.c`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

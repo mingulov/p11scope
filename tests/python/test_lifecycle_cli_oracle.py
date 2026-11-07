@@ -318,6 +318,36 @@ class ShortLivedTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("exe hints", row["detail"])
 
+    def test_pid_nonzero_target_total_fails(self):
+        # The gated workload performs no mid-capture exec, so any
+        # counted target hint fails the --pid cell.
+        target = {"label": "STATIC HINT",
+                  "links_provider": 1, "links_pkcs11_loader": 0,
+                  "no_static_link_within_scope": 0, "unknown": 0}
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=None, target_hints=target),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 1)
+        self.assertIn("target_exec_hints", row["detail"])
+
+    def test_pid_wrong_target_label_fails(self):
+        target = {"label": "STATIC GUESS",
+                  "links_provider": 0, "links_pkcs11_loader": 0,
+                  "no_static_link_within_scope": 0, "unknown": 0}
+        with tempfile.TemporaryDirectory() as raw:
+            rc, row = run_oracle(
+                Path(raw), cell="track-short-lived-pid",
+                report=profile_report(calls={"C_GenerateRandom": 100},
+                                      hints=None, target_hints=target),
+                ledger=cli_ledger({"C_GenerateRandom": 100}),
+                receipt=receipt_for("track-short-lived-pid"))
+        self.assertEqual(rc, 1)
+        self.assertIn("target_exec_hints", row["detail"])
+
 
 LIFECYCLE_CELLS = [
     "profile-pid-reload", "run-exec-chain", "profile-system-exec-churn",

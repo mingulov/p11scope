@@ -956,6 +956,11 @@ impl ExtensiveState {
     }
 
     #[cfg(test)]
+    pub(crate) fn stash_len_for_test(&self) -> usize {
+        self.stash.len()
+    }
+
+    #[cfg(test)]
     pub(crate) fn capture_bytes_charged_for_test(&self) -> u64 {
         self.capture_bytes_charged
     }

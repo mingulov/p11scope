@@ -397,10 +397,11 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
       grep -q "memory scan unavailable" "$out" || pass=0
       ;;
     CAP_SYS_PTRACE)
-      # Cross-UID without ptrace: the host refuses (exit 1), guests
-      # degrade (exit 0); both must name the missing capability.
-      # (Host/guest divergence needs a follow-up: Yama/workload UID.)
-      { [ "$rc" -eq 0 ] || [ "$rc" -eq 1 ]; } || pass=0
+      # Cross-UID without ptrace refuses (exit 1) on the host and in
+      # guests once nobody holds file caps (the old guest exit 0 was
+      # the nosuid CELLTMP running capless, not a Yama divergence).
+      grep -q "Grant the minimal set: sudo setcap" "$err" || pass=0
+      [ "$rc" -eq 1 ] || pass=0
       ;;
     *)
       [ "$rc" -eq 0 ] || pass=0

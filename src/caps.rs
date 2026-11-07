@@ -211,9 +211,12 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 
 /// The keep mask after setup: a multi session sheds the transient
 /// `CAP_SYS_ADMIN` (no `perf_event_open` remains past attach, measured
-/// lane F15); a singles session keeps it for dynamic perf re-attach.
+/// lane F15) unless it is the only map_files grant — the effective set
+/// lacks `CAP_CHECKPOINT_RESTORE` (the DaemonSet), so later identity
+/// proofs still need it; a singles session keeps it for dynamic perf
+/// re-attach.
 pub(crate) fn post_setup_keep(multi: bool, effective: u64) -> u64 {
-    if multi {
+    if multi && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0 {
         effective & !(1u64 << CAP_SYS_ADMIN_BIT)
     } else {
         effective
@@ -356,22 +359,64 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     }
 }
 
+/// The BPF/PERFMON/CHECKPOINT_RESTORE bits `command` needs for its own
+/// operations: where the effective set lacks any of them, `CAP_SYS_ADMIN`
+/// is the only grant the kernel accepts instead (the DaemonSet holds
+/// SYS_ADMIN, not the narrow caps), so the keep must retain it. Live
+/// capture keeps SYS_ADMIN already for the singles fallback; doctor needs
+/// the BPF pair for its self-probe link plus map_files; inspect and scan
+/// need map_files only; diff and version need none of the three.
+fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
+    use crate::cli::Command;
+    let bpf = (1u64 << CAP_BPF_BIT)
+        | (1u64 << CAP_PERFMON_BIT)
+        | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
+    let map_files = 1u64 << CAP_CHECKPOINT_RESTORE_BIT;
+    match command {
+        Command::Profile(_)
+        | Command::Trace(_)
+        | Command::Run(_)
+        | Command::Doctor(_)
+        | Command::Inventory(_) => {
+            // Inventory scan drops the BPF pair it never loads, so it
+            // needs map_files only; every other live lane needs all three.
+            if let Command::Inventory(a) = command
+                && a.capture == crate::cli::CaptureMode::Scan
+            {
+                return map_files;
+            }
+            bpf
+        }
+        Command::Inspect(_) => map_files,
+        Command::InventoryDiff(_) | Command::Version => 0,
+    }
+}
+
 /// The keep mask for `command` given the `effective` set it runs with:
 /// the static keep plus `CAP_SYS_ADMIN` when the effective set lacks any
 /// of the BPF/PERFMON/CHECKPOINT_RESTORE bits the command needs (the
 /// DaemonSet holds SYS_ADMIN, not the narrow caps, and the kernel
-/// accepts SYS_ADMIN for those checks). Stub: returns the static keep;
-/// the fallback lands with the fix.
+/// accepts SYS_ADMIN for those checks).
 pub(crate) fn keep_mask_for_command_in(
-    _effective: u64,
+    effective: u64,
     command: &crate::cli::Command,
 ) -> u64 {
-    keep_mask_for_command(command)
+    let base = keep_mask_for_command(command);
+    let needs = sys_admin_fallback_bits(command);
+    if effective & needs != needs {
+        base | (1u64 << CAP_SYS_ADMIN_BIT)
+    } else {
+        base
+    }
 }
 
 /// Drop what `command` never needs, before it runs. Returns the kept mask.
+/// The fallback reads the effective set from `/proc`; an unreadable
+/// status keeps `CAP_SYS_ADMIN` (fail-safe, never a silent loss of the
+/// only grant), and a refused drop still fails closed below.
 pub fn drop_unneeded_for_command(command: &crate::cli::Command) -> io::Result<u64> {
-    let keep = keep_mask_for_command(command);
+    let effective = read_effective().unwrap_or(0);
+    let keep = keep_mask_for_command_in(effective, command);
     drop_to_keep(keep)?;
     Ok(keep)
 }

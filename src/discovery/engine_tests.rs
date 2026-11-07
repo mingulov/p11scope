@@ -65783,3 +65783,214 @@ fn scarce_backlog_attempt_repays_owed_debt() {
     );
     assert_eq!(engine.probationary_completions, 4);
 }
+
+/// Scarce owed debt repaid through an eviction-freed slot: the same
+/// one-fresh-plus-two-backlog choreography as
+/// `scarce_backlog_attempt_repays_owed_debt`, but every serving pass
+/// reconciles one exploratory view away first, so the attempt records
+/// through the free-slot path instead of the viewless probe path. Odd
+/// passes serve nothing (full cap, and the probe skips past the
+/// evictable view); even passes evict and serve one pid each: fresh,
+/// then backlog (the owed lead), then fresh (the debt repaid), then
+/// the remaining backlog. Recording the freed-slot backlog attempt
+/// bare leaves the debt set, so the third serving pass would lead
+/// backlog instead of fresh; recording the fresh attempt bare never
+/// raises the debt, so the second serving pass would lead fresh.
+/// Zero viewless completions throughout prove the probe path never ran.
+#[test]
+fn scarce_backlog_attempt_repays_owed_debt_with_eviction_freed_slot() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-owed-slot");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    // The evictable sleeper spawns before the choreography pids, so the
+    // discovery cursor parks below them and every window rotation starts
+    // at the lowest choreography pid.
+    let parked = e06_spawn_sleeps(1);
+    let parked_pid = parked[0].pid();
+    let mut sleeps = e06_spawn_sleeps(4);
+    sleeps.sort_by_key(SystemScopeChildGuard::pid);
+    let (backlog1, backlog2, fresh1, fresh2) = (
+        sleeps[0].pid(),
+        sleeps[1].pid(),
+        sleeps[2].pid(),
+        sleeps[3].pid(),
+    );
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid, parked_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(2));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 2);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    engine.scheduler.set_max_evictions_for_test(1);
+    assert!(
+        engine
+            .find_evictable_victim_for_selected(fresh1)
+            .is_some(),
+        "the parked sleeper view is the evictable victim"
+    );
+    // Pass 1 (ordinary): only the two backlogs wait, so the single-class
+    // window leads the lowest — which defers at the full cap instead of
+    // probing, because the parked view is evictable.
+    let mut listing = vec![owner_pid, parked_pid, backlog1, backlog2, fresh1];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(backlog1, Some(100)));
+    assert!(engine.request_refresh(backlog2, Some(110)));
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        engine.refresh_requested.contains_key(&backlog1)
+            && engine.refresh_requested.contains_key(&backlog2),
+        "pass 1 defers both backlogs past the evictable view"
+    );
+    assert_eq!(engine.views.len(), 2);
+    assert_eq!(engine.probationary_completions, 0);
+    // Both fresh pids request after the ordinary pass, newer than any
+    // working tick, so every later pass classifies them as newcomers.
+    listing.push(fresh2);
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(fresh1, Some(2_000_000)));
+    assert!(engine.request_refresh(fresh2, Some(2_000_000)));
+    // Pass 2 (reconcile): evicts the parked view and serves the fresh
+    // pid first through the freed slot.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let viewed = opus_probe_view_pids(&engine);
+    assert!(!viewed.contains(&parked_pid), "pass 2 evicted the parked view");
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh1) && viewed.contains(&fresh1),
+        "pass 2 serves the fresh pid first through the freed slot"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog1)
+            && engine.refresh_requested.contains_key(&backlog2)
+            && engine.refresh_requested.contains_key(&fresh2),
+        "the backlogs and the second fresh wait"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 3 (ordinary): the owed window leads backlog, which defers at
+    // the full cap; the debt survives the zero-attempt pass.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        engine.refresh_requested.contains_key(&backlog1)
+            && engine.refresh_requested.contains_key(&backlog2)
+            && engine.refresh_requested.contains_key(&fresh2),
+        "pass 3 defers everything past the evictable fresh view"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 4 (reconcile): evicts the fresh view and serves the pending
+    // backlog first — the owed lead, recorded through the freed slot.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let viewed = opus_probe_view_pids(&engine);
+    assert!(
+        !engine.refresh_requested.contains_key(&backlog1) && viewed.contains(&backlog1),
+        "pass 4 serves the pending backlog first (the owed lead)"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2)
+            && engine.refresh_requested.contains_key(&fresh2),
+        "the second backlog and the second fresh wait"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 5 (ordinary): the repaid window leads fresh, which defers at
+    // the full cap.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2)
+            && engine.refresh_requested.contains_key(&fresh2),
+        "pass 5 defers the backlog and the fresh past the evictable view"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 6 (reconcile): evicts the backlog view and serves the waiting
+    // fresh pid first — the debt was repaid, so the lead is newcomer.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let viewed = opus_probe_view_pids(&engine);
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh2) && viewed.contains(&fresh2),
+        "pass 6 serves the waiting fresh pid first (the debt was repaid)"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2),
+        "the remaining backlog waits"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 7 (ordinary): the lone backlog defers at the full cap.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2),
+        "pass 7 defers the lone backlog past the evictable view"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 8 (reconcile): the remaining backlog completes last, and no
+    // request survives the choreography.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let viewed = opus_probe_view_pids(&engine);
+    assert!(
+        !engine.refresh_requested.contains_key(&backlog2) && viewed.contains(&backlog2),
+        "the remaining backlog completes last"
+    );
+    assert!(engine.refresh_requested.is_empty());
+    assert_eq!(engine.probationary_completions, 0);
+}
+
+/// A failed scarce rotation attempt through an eviction-freed slot
+/// records bare: the rotation pid never enters the failed-newcomer
+/// list, so the next free-slots window does not sink it behind untried
+/// backlog. Recording the rotation attempt classified would rotate it
+/// into the sink at that window instead.
+#[test]
+fn failed_scarce_rotation_attempt_skips_failed_newcomer_sink() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-rot-sink");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    let parked = e06_spawn_sleeps(1);
+    let parked_pid = parked[0].pid();
+    let mut doomed = e06_spawn_sleeps(1);
+    let rotation_pid = doomed[0].pid();
+    doomed[0].reap().expect("reap the rotation candidate");
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid, parked_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(2));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 2);
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    engine.scheduler.set_max_evictions_for_test(1);
+    // Pass 1 (ordinary): the dead pid holds no request and no free
+    // rotation slot exists, so the pass desires nothing new and opens no
+    // window.
+    let mut listing = vec![owner_pid, parked_pid, rotation_pid];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert_eq!(engine.views.len(), 2);
+    // Pass 2 (reconcile): evicts the parked view, selects the dead pid
+    // as the only rotation candidate, and attempts it through the freed
+    // slot; the open fails and no view is added.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert_eq!(engine.views.len(), 1, "the failed open adds no view");
+    assert_eq!(
+        engine.scheduler.new_view_cursor_for_test(),
+        Some(rotation_pid),
+        "the rotation pid was attempted through the freed slot"
+    );
+    assert_eq!(engine.probationary_completions, 0);
+    // Pass 3 (ordinary): one view under a cap of two with no eviction,
+    // so a free-slots window opens — and the failed rotation pid is not
+    // in the failed-newcomer sink it settles.
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine
+            .scheduler
+            .last_newcomer_attempts_for_test()
+            .contains(&rotation_pid),
+        "the failed rotation attempt never entered the failed-newcomer list"
+    );
+}

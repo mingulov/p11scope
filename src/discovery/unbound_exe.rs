@@ -1161,4 +1161,52 @@ malformed line without fields
         let maps = "00400000-00401000 r--p 00000000 00:14d 99 /bin/x\n";
         assert_eq!(maps_identity_at(maps, 0x0040_0000), Some((0x14d, 99)));
     }
+
+    /// The probe never follows a final-component symlink: a link to a
+    /// regular file is refused, so a link swapped in under a
+    /// user-writable dir can never redirect the probe at another file.
+    #[test]
+    fn maps_probe_refuses_symlinks_without_following() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tool");
+        std::fs::write(&target, b"tool").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert_eq!(real_maps_identity(link.to_str().unwrap()), None);
+    }
+
+    /// The probe never opens the device behind a symlink: a link to
+    /// `/dev/zero` fails closed without touching the device.
+    #[test]
+    fn maps_probe_refuses_a_symlink_to_a_device() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("device");
+        std::os::unix::fs::symlink("/dev/zero", &link).unwrap();
+        assert_eq!(real_maps_identity(link.to_str().unwrap()), None);
+    }
+
+    /// The probe never blocks on a FIFO: a writerless FIFO fails
+    /// closed instead of hanging the root observer forever.
+    #[test]
+    fn maps_probe_never_blocks_on_a_fifo() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let fifo = dir.path().join("fifo");
+        let raw = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+        // SAFETY: a fresh private path, mode 0600.
+        assert_eq!(
+            unsafe { libc::mkfifo(raw.as_ptr(), 0o600) },
+            0,
+            "the fifo stages"
+        );
+        let path = fifo.to_str().unwrap().to_string();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done_tx.send(real_maps_identity(&path));
+        });
+        let answer = done_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .expect("the probe must not block on a fifo");
+        assert_eq!(answer, None);
+    }
 }

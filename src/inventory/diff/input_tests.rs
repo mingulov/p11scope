@@ -350,6 +350,57 @@ fn unbound_use_pids_default_for_old_captures() {
 }
 
 #[test]
+fn unbound_use_executables_are_carried_when_present() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 2,
+        "images": 2, "images_saturated": false,
+        "pids": [{"pid_host": 9, "first_call_ns": 210},
+                 {"pid_host": 11, "first_call_ns": 220}],
+        "pids_dropped": 0,
+        "executables": [
+            {"exe": "/usr/bin/tool", "dev": 8, "ino": 99, "resolution": "system_index",
+             "pid_host": 9, "first_call_ns": 210, "calls_at_least": 2},
+            {"exe": null, "dev": 0, "ino": 0, "resolution": "exec_record_lost",
+             "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
+        ]
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert_eq!(unbound.executables.len(), 2);
+    assert_eq!(
+        unbound.executables[0],
+        UnboundExe {
+            exe: Some("/usr/bin/tool".to_string()),
+            dev: 8,
+            ino: 99,
+            resolution: "system_index".to_string(),
+            pid_host: 9,
+            first_call_ns: 210,
+            calls_at_least: 2,
+        }
+    );
+    assert_eq!(unbound.executables[1].exe, None);
+    assert_eq!(unbound.executables[1].resolution, "exec_record_lost");
+}
+
+#[test]
+fn unbound_use_executables_default_for_old_captures() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 2,
+        "images": 2, "images_saturated": false,
+        "pids": [{"pid_host": 9, "first_call_ns": 210}],
+        "pids_dropped": 0
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert!(unbound.executables.is_empty());
+}
+
+#[test]
 fn native_witness_images_default_for_old_captures() {
     let snapshot = parse_snapshot(FIXTURE).unwrap();
     let witnesses = snapshot.observation.native_witnesses.as_ref().unwrap();

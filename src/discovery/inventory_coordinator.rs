@@ -1263,6 +1263,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.refresh_prearm_object_changes_inner(false)
     }
 
+    /// Test-only system-index root override for executable
+    /// resolution. RED stub.
+    #[cfg(test)]
+    pub(crate) fn set_exe_index_dirs(&mut self, _dirs: Vec<std::path::PathBuf>) {}
+
+    /// Test-only EXEC-stash entry cap. RED stub.
+    #[cfg(test)]
+    pub(crate) fn set_exec_stash_cap(&mut self, _cap: usize) {}
+
+    /// EXEC records shed past the stash cap. RED stub.
+    #[cfg(test)]
+    pub(crate) fn exec_exe_shed(&self) -> u64 {
+        0
+    }
+
+    /// Scan-learned exe identities visible to resolution:
+    /// `(dev, ino)` to path over admitted callers. RED stub.
+    #[cfg(test)]
+    pub(crate) fn scan_learned_exe_map(&self) -> std::collections::HashMap<(u64, u64), String> {
+        std::collections::HashMap::new()
+    }
+
     /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
     /// the detection ran in the blind tail after the stop, so the bracket
     /// stays exact but the coverage end stays unknown.
@@ -8217,6 +8239,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     cookie: row.cookie(),
                     pid_host: row.host_tgid,
                     first_call_ns: row.recorded_at_ns,
+                    calls: folded,
+                    // RED stub: the EXEC stash join lands in GREEN;
+                    // every image reads provisionally unjoined here.
+                    exe: crate::discovery::caller_registry::UnboundExe {
+                        dev: 0,
+                        ino: 0,
+                        path: None,
+                        resolution: crate::discovery::caller_registry::ExeResolution::NoExecRecord,
+                    },
                 };
                 self.registry.note_unbound_witness_with_image(
                     modules,
@@ -11038,6 +11069,7 @@ pub(crate) mod tests {
     use super::super::inventory::{ImageCheck, UnavailableImageGuard};
     use super::*;
     use crate::discovery::caller_registry::OsProcessSource;
+    use crate::discovery::caller_registry::{ExeResolution, UnboundExe};
     use crate::discovery::native_binding::{BoundImage, OwnerImages, ScanOnlyIdentity};
     use crate::fixture_guard::DieWithParent as _;
     use p11scope_ebpf_common::ImageIdentity;
@@ -28938,6 +28970,501 @@ int main(void) {
         assert!(
             text.lines().any(|candidate| candidate == line),
             "one cookie is one caller:\n{text}"
+        );
+    }
+
+    impl NativeScene {
+        pub(super) fn execs(&mut self, records: Vec<p11scope_ebpf_common::DiscoveryRecord>) {
+            let at = self.stamps.tick();
+            let batch = DiscoveryBatch::scripted(self.domain, records, at);
+            self.stage(NativeBatch::Lifecycle(batch));
+        }
+    }
+
+    /// One staged EXEC record carrying `ticket` and `(dev, ino)`.
+    fn exec_record(
+        ticket: u64,
+        tgid: u32,
+        hook: u64,
+        dev: u64,
+        ino: u64,
+    ) -> p11scope_ebpf_common::DiscoveryRecord {
+        // SAFETY: DiscoveryRecord contains only integer fields; this
+        // is the same fixed EXEC wire shape the producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        record.pid_tgid = (u64::from(tgid) << 32) | u64::from(tgid);
+        record.hook_ts_ns = hook;
+        record.binding_id = ticket;
+        record.pointers[0] = dev;
+        record.pointers[1] = ino;
+        record
+    }
+
+    fn scene_unbound_exe(native: &NativeScene) -> Vec<UnboundExe> {
+        native
+            .scene
+            .coordinator
+            .registry
+            .unidentified_pids()
+            .iter()
+            .map(|pid| pid.exe.clone())
+            .collect()
+    }
+
+    /// The EXEC-before-row order: the row's domain-tagged cookie
+    /// meets the EXEC's ticket in the same domain, and the image
+    /// keeps the EXEC's `(dev, ino)`.
+    #[test]
+    fn exec_before_row_joins_exe_pair_to_the_image() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(exes[0].dev, 8);
+        assert_eq!(exes[0].ino, 99);
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+        assert_eq!(exes[0].path, None);
+    }
+
+    /// The row-before-EXEC order (the CALLER_USE map read won the
+    /// race against the EXEC ring drain): the EXEC backfills the
+    /// already-staged image.
+    #[test]
+    fn row_before_exec_backfills_exe_pair_to_the_image() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 99));
+        assert_eq!(exes[0].resolution, ExeResolution::PathUnknown);
+    }
+
+    /// The join is the exact typed pair: another ticket, another
+    /// domain, or a zero (unavailable) ticket never joins — even
+    /// when the pid matches. Never a bare-PID join.
+    #[test]
+    fn exe_join_needs_the_same_domain_and_ticket() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.execs(vec![
+            exec_record(41, 9, 100, 8, 99),
+            exec_record(0, 9, 100, 8, 1000),
+        ]);
+        native.witness(vec![native.row(42, 1, 9, 210, 0)]);
+        let other = NativeDomainId::mint();
+        let endpoint = native.scene.delta.endpoints[0];
+        let foreign = WitnessRow::scripted(other, 41, 1, endpoint.object, endpoint.id, 9, 210);
+        native.stage(native.stamps.read(other, vec![foreign]));
+        native.stage(native.stamps.drain(other));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 2);
+        for exe in &exes {
+            assert_eq!(
+                (exe.dev, exe.ino, exe.path.clone(), exe.resolution),
+                (0, 0, None, ExeResolution::NoExecRecord),
+                "unjoined images stay provisionally unjoined: {exe:?}"
+            );
+        }
+    }
+
+    /// A joined `(0, 0)` pair means the kernel read failed: the
+    /// image reads unavailable, never missing (the EXEC arrived —
+    /// loss accounting must not claim it).
+    #[test]
+    fn zero_exe_pair_reads_unavailable_not_missing() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.execs(vec![exec_record(41, 9, 100, 0, 0)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!(
+            (exes[0].dev, exes[0].ino, exes[0].resolution),
+            (0, 0, ExeResolution::ExeUnavailable)
+        );
+    }
+
+    /// A re-exec keeps its ticket: the latest EXEC wins the pair.
+    #[test]
+    fn reexec_keeps_latest_exe_pair() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.execs(vec![
+            exec_record(41, 9, 100, 8, 99),
+            exec_record(41, 9, 150, 8, 1000),
+        ]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let exes = scene_unbound_exe(&native);
+        assert_eq!(exes.len(), 1);
+        assert_eq!((exes[0].dev, exes[0].ino), (8, 1000));
+    }
+
+    /// Lifecycle loss flips the domain's still-unjoined images to
+    /// `exec_record_lost`; joined pairs are unaffected.
+    #[test]
+    fn lifecycle_loss_flips_unjoined_images_to_exec_lost() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.execs(vec![exec_record(41, 9, 100, 8, 99)]);
+        native.witness(vec![
+            native.row(41, 1, 9, 210, 0),
+            native.row(42, 1, 10, 220, 0),
+        ]);
+        let at = native.stamps.tick();
+        let mut lost = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        lost.failure = Some("scripted lifecycle loss".into());
+        native.stage(NativeBatch::Lifecycle(lost));
+        let pids = native.scene.coordinator.registry.unidentified_pids();
+        assert_eq!(pids.len(), 2);
+        let by_pid: std::collections::HashMap<u32, _> =
+            pids.iter().map(|pid| (pid.pid_host, pid)).collect();
+        assert_eq!(
+            (by_pid[&9].exe.dev, by_pid[&9].exe.ino),
+            (8, 99),
+            "the joined image keeps its pair"
+        );
+        assert_eq!(
+            by_pid[&10].exe,
+            UnboundExe {
+                dev: 0,
+                ino: 0,
+                path: None,
+                resolution: ExeResolution::ExecRecordLost,
+            }
+        );
+    }
+
+    /// Discovery ring loss observed on a witness read flips the
+    /// domain's unjoined images too: a lost ring record may be the
+    /// image's EXEC.
+    #[test]
+    fn discovery_ring_loss_flips_unjoined_images_to_exec_lost() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let at = native.stamps.tick();
+        let mut batch = witness_batch();
+        batch.domain = native.domain;
+        batch.health.discovery_counters = Some([1, 0, 0, 0, 0]);
+        batch.health_read_ns = at;
+        batch.rows_anchor_ns = at + 1;
+        batch.rows_read_ns = at + 1;
+        batch.counts_read_ns = at + 1;
+        native.stage(NativeBatch::Witness(Box::new(batch)));
+        let pids = native.scene.coordinator.registry.unidentified_pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(pids[0].exe.resolution, ExeResolution::ExecRecordLost);
+    }
+
+    /// The EXEC stash is bounded: past the cap, records shed, the
+    /// shed counts, and the domain latches loss (the shed record
+    /// may be the image's EXEC).
+    #[test]
+    fn exec_stash_saturation_sheds_and_counts() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.scene.coordinator.set_exec_stash_cap(2);
+        native.execs(vec![
+            exec_record(41, 9, 100, 8, 99),
+            exec_record(42, 10, 100, 8, 100),
+            exec_record(43, 11, 100, 8, 101),
+        ]);
+        assert_eq!(native.scene.coordinator.exec_exe_shed(), 1);
+        native.witness(vec![native.row(43, 1, 11, 210, 0)]);
+        let pids = native.scene.coordinator.registry.unidentified_pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(pids[0].exe.resolution, ExeResolution::ExecRecordLost);
+    }
+
+    /// Resolution source (b): the coordinator exposes the
+    /// scan-learned exe identities of admitted callers by
+    /// `(dev, ino)` — no new reads, the scan's own records.
+    #[test]
+    fn scan_learned_exe_map_names_admitted_callers() {
+        let (mut native, _) = NativeScene::new();
+        assert!(native.scene.coordinator.scan_learned_exe_map().is_empty());
+        native.scene.source.spawn(9, 900);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let map = native.scene.coordinator.scan_learned_exe_map();
+        assert_eq!(
+            map.get(&(1, 100)),
+            Some(&"/bin/driver".to_string()),
+            "the admitted caller's scan-time exe is exposed by identity: {map:?}"
+        );
+    }
+
+    fn staged_tool(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, u64, u64) {
+        use std::os::unix::fs::MetadataExt as _;
+        let path = dir.path().join(name);
+        std::fs::write(&path, b"tool").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        (path, meta.dev(), meta.ino())
+    }
+
+    /// The concise executable line groups unidentified callers by
+    /// executable with call counts and pids; the count headline
+    /// stays byte-identical beside it.
+    #[test]
+    fn concise_names_unidentified_executables_grouped_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, adev, aino) = staged_tool(&dir, "tool-a");
+        let (_, bdev, bino) = staged_tool(&dir, "tool-b");
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        native.execs(vec![
+            exec_record(41, 9, 100, adev, aino),
+            exec_record(42, 10, 100, bdev, bino),
+            exec_record(43, 11, 100, adev, aino),
+        ]);
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 10, 220, 0);
+        let third = native.row(43, 1, 11, 230, 0);
+        native.witness(vec![first, second, third]);
+        let (text, _) = slice_one_views(&native);
+        let line =
+            "unidentified executables: tool-a (2 calls, pids 9, 11); tool-b (1 call, pid 10)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise groups by executable:\n{text}"
+        );
+        let headline = "unidentified callers: at least 3 calls from 3 caller processes never identified (exited or never scanned); pids 9, 10, 11 (not running now or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == headline),
+            "the count headline stays byte-identical:\n{text}"
+        );
+    }
+
+    /// Concise unknown groups: lost EXEC records read
+    /// `executable unknown (exec record lost)` with their count;
+    /// unjoined images without loss read `no exec record`.
+    #[test]
+    fn concise_counts_executables_unknown_with_reasons() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 10, 220, 0);
+        native.witness(vec![first, second]);
+        let at = native.stamps.tick();
+        let mut lost = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        lost.failure = Some("scripted lifecycle loss".into());
+        native.stage(NativeBatch::Lifecycle(lost));
+        let (text, _) = slice_one_views(&native);
+        let line =
+            "unidentified executables: executable unknown (exec record lost) (2 calls, pids 9, 10)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise counts the lost executables:\n{text}"
+        );
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let (text, _) = slice_one_views(&native);
+        let line = "unidentified executables: executable unknown (no exec record) (1 call, pid 9)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "unjoined images without loss name their reason:\n{text}"
+        );
+    }
+
+    /// Concise truncation: five groups and five pids per group read
+    /// in full; the rest counts.
+    #[test]
+    fn concise_executable_groups_truncate_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = Vec::new();
+        for name in ["tool-0", "tool-1", "tool-2", "tool-3", "tool-4", "tool-5"] {
+            tools.push(staged_tool(&dir, name));
+        }
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        let mut records = Vec::new();
+        let mut rows = Vec::new();
+        for (i, (_, dev, ino)) in tools.iter().enumerate() {
+            let members = if i == 0 { 6 } else { 1 };
+            for j in 0..members {
+                let ticket = 41 + (i * 6 + j) as u64;
+                let pid = (9 + (i * 6 + j)) as u32;
+                records.push(exec_record(ticket, pid, 100, *dev, *ino));
+                rows.push(native.row(ticket, 1, pid, 210 + (i * 6 + j) as u64 * 10, 0));
+            }
+        }
+        native.execs(records);
+        native.witness(rows);
+        let (text, _) = slice_one_views(&native);
+        let line = "unidentified executables: tool-0 (6 calls, pids 9, 10, 11, 12, 13 (+1 more)); tool-1 (1 call, pid 15); tool-2 (1 call, pid 16); tool-3 (1 call, pid 17); tool-4 (1 call, pid 18) (+1 more)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise truncates groups and pids with counts:\n{text}"
+        );
+    }
+
+    /// Two executables sharing a basename read by full path.
+    #[test]
+    fn concise_disambiguates_shared_executable_names() {
+        let root = tempfile::tempdir().unwrap();
+        let da = root.path().join("dir-a");
+        let db = root.path().join("dir-b");
+        std::fs::create_dir(&da).unwrap();
+        std::fs::create_dir(&db).unwrap();
+        let pa = da.join("tool");
+        let pb = db.join("tool");
+        std::fs::write(&pa, b"a").unwrap();
+        std::fs::write(&pb, b"b").unwrap();
+        use std::os::unix::fs::MetadataExt as _;
+        let ma = std::fs::metadata(&pa).unwrap();
+        let mb = std::fs::metadata(&pb).unwrap();
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![da.clone(), db.clone()]);
+        native.execs(vec![
+            exec_record(41, 9, 100, ma.dev(), ma.ino()),
+            exec_record(42, 10, 100, mb.dev(), mb.ino()),
+        ]);
+        native.witness(vec![
+            native.row(41, 1, 9, 210, 0),
+            native.row(42, 1, 10, 220, 0),
+        ]);
+        let (text, _) = slice_one_views(&native);
+        let line = format!(
+            "unidentified executables: {} (1 call, pid 9); {} (1 call, pid 10)",
+            pa.display(),
+            pb.display()
+        );
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "shared basenames read by full path:\n{text}"
+        );
+    }
+
+    /// Verbose module detail names every collected executable with
+    /// its pid, dev:ino, resolution source, and first-call time.
+    #[test]
+    fn verbose_unidentified_use_lists_executable_detail() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, dev, ino) = staged_tool(&dir, "tool-a");
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        native.execs(vec![exec_record(41, 9, 100, dev, ino)]);
+        native.witness(vec![
+            native.row(41, 1, 9, 210, 0),
+            native.row(42, 1, 10, 220, 0),
+        ]);
+        let at = native.stamps.tick();
+        let mut lost = DiscoveryBatch::scripted(native.domain, Vec::new(), at);
+        lost.failure = Some("scripted lifecycle loss".into());
+        native.stage(NativeBatch::Lifecycle(lost));
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2_000,
+            1,
+        );
+        let text = crate::inventory_present::render_snapshot_with_verbosity(
+            &presentation,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let resolved = format!(
+            "{} pid 9 (first call 1.8µs ago; dev {dev} ino {ino}; via system index)",
+            path.display()
+        );
+        assert!(
+            text.contains(&resolved),
+            "verbose names the resolved executable:\n{text}"
+        );
+        assert!(
+            text.contains("executable unknown (exec record lost) pid 10 (first call 1.8µs ago; dev 0 ino 0; lifecycle evidence lost)"),
+            "verbose names the lost executable with its reason:\n{text}"
+        );
+    }
+
+    /// Resolution source (a) end to end: a live unadmitted process
+    /// whose start predates the EXEC resolves through its
+    /// `/proc/<pid>/exe` link. Host pidns and comparable clocks
+    /// (the scene's standing assumption for exec hooks).
+    #[test]
+    fn live_unadmitted_process_resolves_through_its_proc_link() {
+        use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
+        let child = OwnedStoppedChild::new();
+        let pid = child.id();
+        let exe = OsProcessSource
+            .exe_identity(pid)
+            .expect("the live child has an exe identity");
+        let path = exe.path.clone().expect("the exe link reads");
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.scene.coordinator.exit_clocks_comparable = true;
+        // The EXEC lands now (boottime): the child's birth predates
+        // it on every host, so the generation check passes.
+        let hook = crate::discovery::pause::boot_ns().expect("boottime reads");
+        native.execs(vec![exec_record(41, pid, hook, exe.dev, exe.ino)]);
+        native.witness(vec![native.row(41, 1, pid, 210, 0)]);
+        let pids = native.scene.coordinator.registry.unidentified_pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(
+            pids[0].exe,
+            UnboundExe {
+                dev: exe.dev,
+                ino: exe.ino,
+                path: Some(path),
+                resolution: ExeResolution::ProcAlive,
+            }
+        );
+    }
+
+    /// JSON carries the complete per-module executable list; the pid
+    /// entries keep their exact shape beside it.
+    #[test]
+    fn json_unbound_use_carries_complete_executables() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, dev, ino) = staged_tool(&dir, "tool-a");
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        native.execs(vec![exec_record(41, 9, 100, dev, ino)]);
+        native.witness(vec![
+            native.row(41, 1, 9, 210, 0),
+            native.row(42, 1, 11, 220, 0),
+        ]);
+        let (_, document) = slice_one_views(&native);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["executables"],
+            serde_json::json!([
+                {"exe": path.to_string_lossy(), "dev": dev, "ino": ino, "resolution": "system_index", "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
+                {"exe": null, "dev": 0, "ino": 0, "resolution": "no_exec_record", "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
+            ])
+        );
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["pids"],
+            serde_json::json!([
+                {"pid_host": 9, "first_call_ns": 210},
+                {"pid_host": 11, "first_call_ns": 220},
+            ])
         );
     }
 

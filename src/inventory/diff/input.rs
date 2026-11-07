@@ -216,11 +216,22 @@ pub(super) struct UnboundUse {
     pub images_saturated: bool,
     pub pids: Vec<UnboundPid>,
     pub pids_dropped: u64,
+    pub executables: Vec<UnboundExe>,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct UnboundPid {
     pub pid_host: u32,
     pub first_call_ns: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct UnboundExe {
+    pub exe: Option<String>,
+    pub dev: u64,
+    pub ino: u64,
+    pub resolution: String,
+    pub pid_host: u32,
+    pub first_call_ns: u64,
+    pub calls_at_least: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Module {
@@ -997,6 +1008,9 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
             } else {
                 0
             };
+            // RED stub: the `executables` key parses in GREEN;
+            // every capture reads no executables here.
+            let _ = u.fields.contains_key("executables");
             Ok::<_, anyhow::Error>(UnboundUse {
                 first_ns: u.uint("first_ns")?,
                 rows: u.uint("rows")?,
@@ -1006,6 +1020,7 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
                 images_saturated,
                 pids,
                 pids_dropped,
+                executables: Vec::new(),
             })
         })
         .transpose()?;

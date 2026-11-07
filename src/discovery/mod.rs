@@ -40,6 +40,7 @@ pub mod scan;
 pub(crate) mod scheduler;
 pub(crate) mod sweep_attribution;
 pub(crate) mod sweep_shards;
+pub(crate) mod unbound_exe;
 
 #[cfg(test)]
 mod test_subject;

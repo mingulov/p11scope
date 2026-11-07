@@ -25,7 +25,7 @@ use instance_input::{
     AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
 };
 
-use crate::attach::capture::DomainCookie;
+use crate::attach::capture::{DomainCookie, NativeDomainId};
 use crate::discovery::native_binding::{BindingCensus, BoundImage, UnboundReason};
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::CaptureWorkBudget;
@@ -2391,7 +2391,7 @@ impl UnboundUse {
     /// one entry per image, never deduplicated, complete while
     /// [`Self::pids_dropped`] is zero.
     pub(crate) fn pids_sorted(&self) -> Vec<UnboundPid> {
-        let mut pids: Vec<UnboundPid> = self.images.values().copied().collect();
+        let mut pids: Vec<UnboundPid> = self.images.values().cloned().collect();
         pids.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
         pids
     }
@@ -2401,23 +2401,99 @@ impl UnboundUse {
 /// the kernel tgid (host/init-namespace numbering) of the row that
 /// named the image, with the earliest row's first-association
 /// instant. Historical only: never the process now holding that
-/// number, never re-read through `/proc`, never a name or argv/env.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// number. The pid is a label, never a join key and never re-read
+/// through `/proc` for identity — except the executable resolution,
+/// which names the image from its EXEC-joined `(dev, ino)` (see
+/// [`ExeResolution`]).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UnboundPid {
     pub pid_host: u32,
     pub first_call_ns: u64,
+    /// Folded entry-count lower bound over this image's rows on the
+    /// owning scope (per module, or run-wide): each staged row's
+    /// held count at drop, saturating.
+    pub calls_at_least: u64,
+    pub exe: UnboundExe,
+}
+
+/// How one unidentified caller image's executable was named (or why
+/// it stays unknown). The join key is always the row's
+/// domain-tagged task cookie against the EXEC record's ticket —
+/// never a bare PID. JSON vocabulary: [`ExeResolution::json_label`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum ExeResolution {
+    /// A live process at the image's pid whose start time predates
+    /// the EXEC and whose `/proc/<pid>/exe` stats to the joined
+    /// `(dev, ino)`.
+    ProcAlive,
+    /// An exe identity the scan already learned from an admitted
+    /// caller, with the same `(dev, ino)` (re-verified by stat).
+    ScanLearned,
+    /// The lazy system-binary index matched the joined `(dev, ino)`.
+    SystemIndex,
+    /// A `(dev, ino)` joined but no source named a path for it
+    /// (deleted file, container overlay, or a binary outside the
+    /// system index).
+    PathUnknown,
+    /// The EXEC record arrived but its exe pair is `(0, 0)`: the
+    /// kernel read failed.
+    ExeUnavailable,
+    /// No EXEC record joined this image and no lifecycle loss was
+    /// observed: the exec predates the capture, or the ticket was
+    /// unavailable (PID scope stamps none).
+    NoExecRecord,
+    /// No EXEC record joined this image while lifecycle evidence
+    /// was lost in its domain: the record may be among the loss.
+    ExecRecordLost,
+}
+
+impl ExeResolution {
+    /// Finite JSON vocabulary for `unbound_use.executables[]`.
+    pub(crate) const fn json_label(self) -> &'static str {
+        match self {
+            Self::ProcAlive => "proc_alive",
+            Self::ScanLearned => "scan_learned",
+            Self::SystemIndex => "system_index",
+            Self::PathUnknown => "path_unknown",
+            Self::ExeUnavailable => "exe_unavailable",
+            Self::NoExecRecord => "no_exec_record",
+            Self::ExecRecordLost => "exec_record_lost",
+        }
+    }
+
+    /// True once a path names the image.
+    pub(crate) const fn is_resolved(self) -> bool {
+        matches!(
+            self,
+            Self::ProcAlive | Self::ScanLearned | Self::SystemIndex
+        )
+    }
+}
+
+/// One unidentified caller image's executable: the EXEC-joined
+/// `(dev, ino)` pair with its userspace resolution. Invariants: a
+/// resolved image carries `Some` path and a nonzero pair; an
+/// unknown image carries no path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct UnboundExe {
+    pub dev: u64,
+    pub ino: u64,
+    pub path: Option<String>,
+    pub resolution: ExeResolution,
 }
 
 /// The unidentified caller image one unbound row names (slice 1):
-/// the row's domain-tagged task cookie, with the row's host tgid
-/// and first-association instant (Part C). Cookies are
-/// equality-only and never publish; only counts and host pids
-/// reach output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+/// the row's domain-tagged task cookie, with the row's host tgid,
+/// first-association instant, folded entries, and resolved
+/// executable. Cookies are equality-only and never publish; only
+/// counts, host pids, and executables reach output.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UnboundImage {
     pub cookie: DomainCookie,
     pub pid_host: u32,
     pub first_call_ns: u64,
+    pub calls: u64,
+    pub exe: UnboundExe,
 }
 
 /// Slice-1 bounds for unidentified caller-image sets (LIM-1: never
@@ -3978,7 +4054,7 @@ impl CallerRegistry {
     /// (Part C): one entry per image, never deduplicated, complete
     /// while [`Self::unidentified_pids_dropped`] is zero.
     pub(crate) fn unidentified_pids(&self) -> Vec<UnboundPid> {
-        let mut pids: Vec<UnboundPid> = self.unidentified_images.values().copied().collect();
+        let mut pids: Vec<UnboundPid> = self.unidentified_images.values().cloned().collect();
         pids.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
         pids
     }
@@ -5777,7 +5853,7 @@ impl CallerRegistry {
             unbound.entries = unbound.entries.saturating_add(entries);
             let count = unbound.reasons.entry(code).or_default();
             *count = count.saturating_add(1);
-            if let Some(image) = image {
+            if let Some(image) = image.clone() {
                 Self::insert_unbound_image(
                     &mut unbound.images,
                     &mut unbound.images_saturated,
@@ -5813,8 +5889,9 @@ impl CallerRegistry {
     }
 
     /// Insert `image` into a slice-1 image set: a known image keeps
-    /// the earliest call; a new image past the bound saturates and
-    /// counts as dropped instead of growing.
+    /// the earliest call and accumulates its folded calls; a new
+    /// image past the bound saturates and counts as dropped instead
+    /// of growing. RED stub: calls and exe stay unwired.
     fn insert_unbound_image(
         images: &mut HashMap<DomainCookie, UnboundPid>,
         saturated: &mut bool,
@@ -5822,20 +5899,44 @@ impl CallerRegistry {
         limit: usize,
         image: UnboundImage,
     ) {
+        let _ = (&image.calls, &image.exe);
+        let sentinel = UnboundExe {
+            dev: u64::MAX,
+            ino: u64::MAX,
+            path: None,
+            resolution: ExeResolution::NoExecRecord,
+        };
         if let Some(known) = images.get_mut(&image.cookie) {
             known.first_call_ns = known.first_call_ns.min(image.first_call_ns);
+            known.calls_at_least = 0;
+            known.exe = sentinel;
         } else if images.len() < limit {
             images.insert(
                 image.cookie,
                 UnboundPid {
                     pid_host: image.pid_host,
                     first_call_ns: image.first_call_ns,
+                    calls_at_least: 0,
+                    exe: sentinel,
                 },
             );
         } else {
             *saturated = true;
             *dropped = dropped.saturating_add(1);
         }
+    }
+
+    /// Backfill one joined executable into every image set holding
+    /// `cookie` (the EXEC arrived after the row staged). RED stub.
+    pub(crate) fn attach_unbound_exe(&mut self, cookie: DomainCookie, exe: UnboundExe) {
+        let _ = (cookie, exe);
+    }
+
+    /// Lifecycle evidence was lost in `domain`: every image of that
+    /// domain still without a joined EXEC reads `exec_record_lost`.
+    /// Images with a joined pair are unaffected. RED stub.
+    pub(crate) fn flip_unbound_exec_loss(&mut self, domain: NativeDomainId) {
+        let _ = domain;
     }
 
     /// One module-level witness gap, once per (module, subject).
@@ -8879,6 +8980,259 @@ pub(crate) mod tests {
             .filter_map(|module| module.unbound_use.as_ref())
             .map(|unbound| unbound.rows)
             .sum()
+    }
+
+    fn unbound_exe(
+        dev: u64,
+        ino: u64,
+        path: Option<&str>,
+        resolution: ExeResolution,
+    ) -> UnboundExe {
+        UnboundExe {
+            dev,
+            ino,
+            path: path.map(str::to_string),
+            resolution,
+        }
+    }
+
+    fn unbound_image(
+        cookie: DomainCookie,
+        pid: u32,
+        first_ns: u64,
+        calls: u64,
+        exe: UnboundExe,
+    ) -> UnboundImage {
+        UnboundImage {
+            cookie,
+            pid_host: pid,
+            first_call_ns: first_ns,
+            calls,
+            exe,
+        }
+    }
+
+    fn module_pids(registry: &CallerRegistry, key: &ModuleKey) -> Vec<UnboundPid> {
+        registry
+            .modules()
+            .find(|module| &module.key == key)
+            .and_then(|module| module.unbound_use.as_ref())
+            .map(|unbound| unbound.pids_sorted())
+            .unwrap_or_default()
+    }
+
+    /// Each staged row's folded entries accumulate per scope (the
+    /// owning module, and run-wide): the image's call lower bound
+    /// grows with every row, saturating, never reset.
+    #[test]
+    fn unbound_images_accumulate_folded_calls_per_scope() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[
+                ("/lib/a.so", 11, AdmissionState::Admitted),
+                ("/lib/b.so", 12, AdmissionState::Admitted),
+            ],
+        );
+        let domain = NativeDomainId::mint();
+        let cookie = DomainCookie::scripted(domain, 41);
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        for (modules, first_ns, entries) in [
+            (vec![keys[0].clone()], 210, 2),
+            (vec![keys[0].clone()], 220, 3),
+            (vec![keys[1].clone()], 230, 7),
+        ] {
+            registry.note_unbound_witness_with_image(
+                modules,
+                first_ns,
+                UnboundReason::NoLiveCaller,
+                entries,
+                Some(unbound_image(
+                    cookie,
+                    9,
+                    first_ns,
+                    entries,
+                    provisional.clone(),
+                )),
+            );
+            registry.publish();
+        }
+        let a = module_pids(&registry, &keys[0]);
+        assert_eq!(a.len(), 1);
+        assert_eq!((a[0].calls_at_least, a[0].first_call_ns), (5, 210));
+        let b = module_pids(&registry, &keys[1]);
+        assert_eq!(b.len(), 1);
+        assert_eq!((b[0].calls_at_least, b[0].first_call_ns), (7, 230));
+        let wide = registry.unidentified_pids();
+        assert_eq!(wide.len(), 1);
+        assert_eq!((wide[0].calls_at_least, wide[0].first_call_ns), (12, 210));
+    }
+
+    /// A staged image carries its resolved executable into every
+    /// image set that holds it.
+    #[test]
+    fn unbound_images_carry_their_resolved_executable() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let cookie = DomainCookie::scripted(NativeDomainId::mint(), 41);
+        let exe = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::ProcAlive);
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            210,
+            UnboundReason::NoLiveCaller,
+            2,
+            Some(unbound_image(cookie, 9, 210, 2, exe.clone())),
+        );
+        registry.publish();
+        assert_eq!(module_pids(&registry, &keys[0])[0].exe, exe);
+        assert_eq!(registry.unidentified_pids()[0].exe, exe);
+    }
+
+    /// Resolve-once: a refresh row never replaces the stored
+    /// executable (only the EXEC backfill and the loss flip update
+    /// it); calls still accumulate and the first call stays minimal.
+    #[test]
+    fn unbound_image_refresh_keeps_the_first_executable() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let cookie = DomainCookie::scripted(NativeDomainId::mint(), 41);
+        let first = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::ProcAlive);
+        let later = unbound_exe(8, 1000, Some("/bin/y"), ExeResolution::SystemIndex);
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            210,
+            UnboundReason::NoLiveCaller,
+            2,
+            Some(unbound_image(cookie, 9, 210, 2, first.clone())),
+        );
+        registry.note_unbound_witness_with_image(
+            vec![keys[0].clone()],
+            220,
+            UnboundReason::NoLiveCaller,
+            3,
+            Some(unbound_image(cookie, 9, 220, 3, later)),
+        );
+        registry.publish();
+        let pids = module_pids(&registry, &keys[0]);
+        assert_eq!(pids.len(), 1);
+        assert_eq!(pids[0].exe, first);
+        assert_eq!((pids[0].calls_at_least, pids[0].first_call_ns), (5, 210));
+    }
+
+    /// The EXEC backfill updates every image set holding the cookie
+    /// (the EXEC arrived after the row staged); other cookies keep
+    /// their verdict.
+    #[test]
+    fn attach_unbound_exe_backfills_every_image_set_holding_the_cookie() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let domain = NativeDomainId::mint();
+        let joined = DomainCookie::scripted(domain, 41);
+        let other = DomainCookie::scripted(domain, 42);
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        for (cookie, pid) in [(joined, 9), (other, 10)] {
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                210,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(cookie, pid, 210, 2, provisional.clone())),
+            );
+        }
+        registry.publish();
+        let exe = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::SystemIndex);
+        registry.attach_unbound_exe(joined, exe.clone());
+        let module = module_pids(&registry, &keys[0]);
+        assert_eq!(module.len(), 2);
+        assert_eq!(module[0].exe, exe, "pid order: oldest first call first");
+        assert_eq!(module[1].exe, provisional);
+        let wide = registry.unidentified_pids();
+        assert_eq!(wide.len(), 2);
+        assert_eq!(wide[0].exe, exe);
+        assert_eq!(wide[1].exe, provisional);
+        // Unknown cookies attach nowhere and refuse nothing.
+        registry.attach_unbound_exe(DomainCookie::scripted(domain, 43), exe);
+        assert_eq!(registry.unidentified_pids().len(), 2);
+    }
+
+    /// The loss flip marks only the domain's still-unjoined images
+    /// `exec_record_lost`: joined pairs and other domains keep their
+    /// verdicts.
+    #[test]
+    fn exec_loss_flip_marks_only_domain_unknowns_lost() {
+        let mut registry = registry();
+        let keys = mapped(
+            &mut registry,
+            CallerId(0),
+            &[("/lib/a.so", 11, AdmissionState::Admitted)],
+        );
+        let lost = NativeDomainId::mint();
+        let kept = NativeDomainId::mint();
+        let provisional = unbound_exe(0, 0, None, ExeResolution::NoExecRecord);
+        let joined = unbound_exe(8, 99, Some("/bin/x"), ExeResolution::ProcAlive);
+        for (cookie, pid, first_ns, exe) in [
+            (
+                DomainCookie::scripted(lost, 41),
+                9,
+                210,
+                provisional.clone(),
+            ),
+            (DomainCookie::scripted(lost, 42), 10, 220, joined.clone()),
+            (
+                DomainCookie::scripted(kept, 43),
+                11,
+                230,
+                provisional.clone(),
+            ),
+        ] {
+            registry.note_unbound_witness_with_image(
+                vec![keys[0].clone()],
+                first_ns,
+                UnboundReason::NoLiveCaller,
+                2,
+                Some(unbound_image(cookie, pid, first_ns, 2, exe)),
+            );
+        }
+        registry.publish();
+        registry.flip_unbound_exec_loss(lost);
+        let lost_exe = unbound_exe(0, 0, None, ExeResolution::ExecRecordLost);
+        for pids in [
+            module_pids(&registry, &keys[0]),
+            registry.unidentified_pids(),
+        ] {
+            assert_eq!(pids.len(), 3);
+            let by_pid: HashMap<u32, &UnboundPid> =
+                pids.iter().map(|pid| (pid.pid_host, pid)).collect();
+            assert_eq!(
+                by_pid[&9].exe, lost_exe,
+                "the lost domain's unjoined image flips"
+            );
+            assert_eq!(
+                by_pid[&10].exe, joined,
+                "the joined image keeps its executable"
+            );
+            assert_eq!(
+                by_pid[&11].exe, provisional,
+                "other domains keep their verdict"
+            );
+        }
+        // Flipping twice, or an empty domain, changes nothing.
+        registry.flip_unbound_exec_loss(lost);
+        registry.flip_unbound_exec_loss(NativeDomainId::mint());
+        assert_eq!(registry.unidentified_pids().len(), 3);
     }
 
     /// I1/M3 (C4 review): an endpoint two admitted modules share witnesses

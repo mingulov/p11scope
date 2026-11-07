@@ -77,16 +77,26 @@ names the source SHA behind each check the release rounds re-measured.
   window. Affected runs read PARTIAL. Hold the child with `run --pause
   auto` or keep it alive past attach.
 - `run` captures the command with its child processes: the child is
-  placed in a dedicated cgroup before release, so fork/exec children,
-  `sh -c` and `env` wrappers, `sudo -u` hops and double forks are born
-  in scope and their calls are counted. Descendants that retire between
-  admission passes count `pid_descendant_gaps` like cgroup scope (same
-  lossy-by-design rule: exact counts with `PARTIAL` observation), and
-  descendants still alive at run end are handed back alive, disclosed
-  by count (`run_tree_handed_back` with a `run process tree` gap). The
-  run still ends with the direct child's exit. Without permission to
-  create the cgroup, `run` degrades to its exact child with a named
-  gap. `profile --pid` still observes exactly the named process, never
+  placed in a dedicated cgroup under the observer's own cgroup before
+  release, so fork/exec children, `sh -c` and `env` wrappers and
+  double forks are born in the cgroup. Only the direct child is
+  paused; descendants are never paused. A descendant that loads an
+  already-attached provider file is observed from its first call, but
+  a short-lived descendant that cold-loads the provider can retire
+  before admission: its calls are then missing and the run reports
+  `PARTIAL` with `pid_descendant_gaps`. Pass `--prearm-module` for
+  the provider so cold grandchildren are hooked from their first
+  call. (`sudo`/`setuid` inside the command cannot elevate under the
+  child's `no_new_privs` hardening, so privilege hops are not a
+  supported shape.) Descendants that retire between admission passes
+  count `pid_descendant_gaps` like cgroup scope (same lossy-by-design
+  rule: exact counts with `PARTIAL` observation when providers are
+  prearmed or already attached; unprearmed cold grandchildren may show
+  missing calls), and descendants still alive at run end are handed
+  back alive, disclosed by count (`run_tree_handed_back` with a `run
+  process tree` gap). The run still ends with the direct child's exit.
+  Without permission to create the cgroup, `run` degrades to its exact
+  child with a named gap. `profile --pid` still observes exactly the named process, never
   its descendants: a fork/exec child, `subprocess` worker, or
   `multiprocessing` spawn child that loads a provider gets no probes
   and its calls are entirely absent, however long it lives. This is the

@@ -746,22 +746,32 @@ already written and stays intact. Only a second SIGINT does this; a second
 SIGTERM does not escalate.
 
 `run` captures the command with its child processes: before release the
-child is placed in a dedicated cgroup, so every descendant — `fork`/`exec`
-children, `sh -c` and `env` wrappers, `sudo -u` hops, double forks — is
-born in scope and its calls are counted. Only pausing stays with the
-direct child. The run still ends with the direct child's exit: descendants
-still alive are handed back alive, never killed, and disclosed by count
-(`evidence.run_tree_handed_back` with a `run process tree` gap entry;
-`PARTIAL`). A retained nonempty cgroup names itself on stderr so the
-operator can remove it after its members exit. Descendants that retire
-between admission passes count `pid_descendant_gaps` exactly like cgroup
-scope (same bounded ledger, same lossy-by-design rule), so a forking
-workload reports exact counts with `PARTIAL` observation; see the
-[known limitations](known-limitations.md). Without permission to create
-the cgroup, `run` observes only the started command itself and names the
-gap; `capture.scope` reads `cgroup` for the tree scope, `pid` when
-degraded. The run-cgroup leaf name (random `p11scope-run-*`, never a
-PID) is published in `cgroups[].label`; the full path is printed on
+child is placed in a dedicated cgroup under the observer's own cgroup,
+so every descendant — `fork`/`exec` children, `sh -c` and `env`
+wrappers, double forks — is born in the cgroup. Only the direct child
+is paused; descendants are never paused. A descendant that loads an
+already-attached provider file is observed from its first call via the
+shared links, but a short-lived descendant that cold-loads the provider
+can retire before admission: its calls are then missing and the run
+reports `PARTIAL` with `pid_descendant_gaps`. Pass `--prearm-module`
+for the provider so cold grandchildren are hooked from their first
+call. (`sudo`/`setuid` inside the command cannot elevate under the
+child's `no_new_privs` hardening, so privilege hops are not a
+supported shape.) The run still ends with the direct child's exit:
+descendants still alive are handed back alive, never killed, and
+disclosed by count (`evidence.run_tree_handed_back` with a `run
+process tree` gap entry; `PARTIAL`). A retained nonempty cgroup names
+itself on stderr so the operator can remove it after its members exit.
+Descendants that retire between admission passes count
+`pid_descendant_gaps` like cgroup scope (same bounded ledger, same
+lossy-by-design rule), so a forking workload with prearmed or
+already-attached providers reports exact counts with `PARTIAL`
+observation; unprearmed cold grandchildren may show missing calls; see
+the [known limitations](known-limitations.md). Without permission to
+create the cgroup, `run` observes only the started command itself and
+names the gap; `capture.scope` reads `cgroup` for the tree scope, `pid`
+when degraded. The run-cgroup leaf name (random `p11scope-run-*`, never
+a PID) is published in `cgroups[].label`; the full path is printed on
 stderr only, in the retention notice.
 
 sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \

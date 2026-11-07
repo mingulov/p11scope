@@ -147,6 +147,8 @@ const SYS_UMOUNT2: u32 = 166;
 const SYS_PIVOT_ROOT: u32 = 155;
 const SYS_MOVE_MOUNT: u32 = 429;
 const SYS_OPEN_TREE: u32 = 428;
+const SYS_OPEN_TREE_ATTR: u32 = 467;
+const SYS_MOUNT_SETATTR: u32 = 442;
 const SYS_FSOPEN: u32 = 430;
 const SYS_FSMOUNT: u32 = 432;
 const SYS_PTRACE: u32 = 101;
@@ -220,6 +222,8 @@ const DENY_ALWAYS: &[u32] = &[
     SYS_PIVOT_ROOT,
     SYS_MOVE_MOUNT,
     SYS_OPEN_TREE,
+    SYS_OPEN_TREE_ATTR,
+    SYS_MOUNT_SETATTR,
     SYS_FSOPEN,
     SYS_FSMOUNT,
     SYS_PTRACE,
@@ -1095,6 +1099,10 @@ mod tests {
             (SYS_PIVOT_ROOT, libc::SYS_pivot_root, "pivot_root"),
             (SYS_MOVE_MOUNT, libc::SYS_move_mount, "move_mount"),
             (SYS_OPEN_TREE, libc::SYS_open_tree, "open_tree"),
+            // open_tree_attr postdates libc 0.2.189; its number is from
+            // asm/unistd_64.h: 467.
+            (SYS_OPEN_TREE_ATTR, 467, "open_tree_attr"),
+            (SYS_MOUNT_SETATTR, libc::SYS_mount_setattr, "mount_setattr"),
             (SYS_FSOPEN, libc::SYS_fsopen, "fsopen"),
             (SYS_FSMOUNT, libc::SYS_fsmount, "fsmount"),
             (SYS_PTRACE, libc::SYS_ptrace, "ptrace"),
@@ -1454,15 +1462,20 @@ mod tests {
     fn mount_attribute_syscalls_evaluate_to_eacces() {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
-        // mount_setattr(442) retunes a mount; open_tree_attr(467)
-        // postdates libc 0.2.189 (asm/unistd_64.h) and opens a detached
-        // mount with attributes. Both escape mount-namespace containment
-        // like the already-denied open_tree/move_mount.
+        // mount_setattr retunes a mount; open_tree_attr postdates libc
+        // 0.2.189 (asm/unistd_64.h: 467) and opens a detached mount with
+        // attributes. Both escape mount-namespace containment like the
+        // already-denied open_tree/move_mount.
         assert_eq!(
-            442u32, libc::SYS_mount_setattr as u32,
+            SYS_MOUNT_SETATTR,
+            libc::SYS_mount_setattr as u32,
             "wrong number for mount_setattr"
         );
-        for (nr, name) in [(442u32, "mount_setattr"), (467u32, "open_tree_attr")] {
+        assert_eq!(SYS_OPEN_TREE_ATTR, 467, "wrong number for open_tree_attr");
+        for (nr, name) in [
+            (SYS_MOUNT_SETATTR, "mount_setattr"),
+            (SYS_OPEN_TREE_ATTR, "open_tree_attr"),
+        ] {
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),
                 denied,

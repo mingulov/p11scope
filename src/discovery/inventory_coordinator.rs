@@ -28313,6 +28313,81 @@ mod maps_skip_memory_tests {
             "the refused-only mapper must skip (its modules carry no watch)"
         );
     }
+
+    /// A mapper whose object index dangles (out of range of a catalog
+    /// that does hold real objects) files as its own per-pid singleton:
+    /// the dangling fail-safe fails toward never-skip, so the member
+    /// re-decodes alone instead of grouping or skipping. The admitted
+    /// group and the refused exclusion are unaffected.
+    #[test]
+    fn dangling_mapper_in_a_mixed_catalog_files_as_its_own_singleton() {
+        use crate::inspect_system::{AdmissionRecord, CatalogObject, MemberStatus, ProcessRecord};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let mut coordinator = skip_coordinator();
+        let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        let key = |inode| ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode,
+        };
+        let object = |path: &str, inode: u64, admission: AdmissionRecord| CatalogObject {
+            path: path.into(),
+            key: key(inode),
+            sha256: None,
+            build_id: None,
+            identity_source: None,
+            note: None,
+            mappings: Vec::new(),
+            observations: Vec::new(),
+            admission,
+        };
+        catalog.objects = vec![
+            object(
+                "/admitted.so",
+                1,
+                AdmissionRecord::Admitted {
+                    class: "exact",
+                    endpoints: 3,
+                },
+            ),
+            object(
+                "/refused.so",
+                2,
+                AdmissionRecord::Refused {
+                    class: "heuristic",
+                    reason: "test".into(),
+                    kind: crate::plan::RefusalKind::CapacityWhole,
+                },
+            ),
+        ];
+        let record = |pid, objects| ProcessRecord {
+            pid,
+            status: MemberStatus::Scanned,
+            objects,
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: true,
+        };
+        catalog.processes.push(record(12, vec![0]));
+        catalog.processes.push(record(13, vec![1]));
+        // Index 9 dangles: the catalog holds two objects, so no fixture
+        // "fix" can make it valid without rewriting this test.
+        catalog.processes.push(record(14, vec![9]));
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.passes = 0;
+        assert_eq!(
+            coordinator.priors_for_collection().mapper_groups,
+            [
+                (0usize, BTreeSet::from([12])),
+                (16usize, BTreeSet::from([14])),
+            ]
+            .into_iter()
+            .collect(),
+            "the dangling mapper must re-decode alone (singleton key objects.len() + pid)"
+        );
+    }
 }
 
 #[cfg(test)]

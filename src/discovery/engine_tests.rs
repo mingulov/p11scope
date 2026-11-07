@@ -65003,6 +65003,117 @@ fn covered_unmatched_exit_drops_stash_and_exec_timing_for_reused_pid() {
     );
 }
 
+// Admitted-member migration: removing an admitted view drops its
+// PID's exe-identity stash entry and exec timing, exactly like a
+// matched exit. Under --cgroup a member that migrates out produces
+// no exit record at all (the BPF exit hook only emits for tasks in
+// the scope cgroup at exit), so without this drop a fork-only reused
+// PID would consume the dead image with no loss and no PARTIAL.
+#[test]
+fn admitted_member_removal_drops_stash_and_exec_timing_for_reused_pid() {
+    let first = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 10, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    // The member migrates out: a scan/apply removes its view, which
+    // closes its admission. Its later exit outside the scope cgroup
+    // produces no ring record at all, so nothing else drops this PID.
+    engine.close_cgroup_admission_at_removal(ProcessViewId(0));
+    engine.views.retain(|view| view.id() != ProcessViewId(0));
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    let closed = engine.admitted_cgroup_views[&ProcessViewId(0)]
+        .closed_ns
+        .expect("removal closes the admission");
+    // A fork-only reused PID (no EXEC of its own): the gap exit reads
+    // unknown, never the migrated member's image or timing. Kind 7
+    // pins both drops at once — the hint pins the stash drop and the
+    // reason pins the exec-timing drop — before any novel-path drop
+    // could mask a missing removal drop.
+    let reused = exit_mappings_record(pid, closed + 100);
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 0);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
+// The clock-unavailable removal path purges the open admission; the
+// generation is gone from the ledger all the same, so its pending
+// exe identity and exec timing die with it too.
+#[test]
+fn missing_removal_clock_also_drops_short_lived_state() {
+    let first = ProcessView::open(ProcessViewId(36), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 10, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    let removed = [ProcessViewId(36)].into_iter().collect();
+    engine.update_cgroup_admissions_at_removal(&removed, None);
+    engine.views.retain(|view| view.id() != ProcessViewId(36));
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    let reused = exit_mappings_record(pid, admitted + 30);
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    // One gap for the removal loss plus one for the reused-PID exit.
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 0);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
 // M-A: the PID consumer learns the target exe at validation time, so a
 // validated exec classifies without any pre-learned scan path. Deleting
 // the exec-time learn strands the analysis with no path (`unknown`).

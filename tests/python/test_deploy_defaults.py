@@ -10,11 +10,22 @@ container-image cell actually proves.
 """
 
 import re
+import tomllib
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+DAEMONSET = ROOT / "deploy/k8s/20-daemonset.yaml"
 DEPLOY_README = ROOT / "deploy/README.md"
+DEV_IMAGE = "p11scope-observer:1"
+
+
+def daemonset_image_and_policy():
+    text = DAEMONSET.read_text()
+    image = re.search(r"^(\s*)image: (\S+)\s*$", text, re.M)
+    policy = re.search(r"^(\s*)imagePullPolicy: (\S+)\s*$", text, re.M)
+    assert image is not None and policy is not None
+    return image.group(2), policy.group(2)
 
 
 def minimal_recipe_block():
@@ -26,6 +37,15 @@ def minimal_recipe_block():
 
 
 class DeployDefaultsTests(unittest.TestCase):
+    def test_daemonset_default_is_local_or_the_current_release(self):
+        image, policy = daemonset_image_and_policy()
+        with open(ROOT / "Cargo.toml", "rb") as handle:
+            version = tomllib.load(handle)["package"]["version"]
+        self.assertIn(image, {DEV_IMAGE, f"ghcr.io/mingulov/p11scope:{version}"},
+                      "the default must be runnable from this checkout, "
+                      "not a tag from a future release")
+        self.assertEqual(policy, "Never" if image == DEV_IMAGE else "IfNotPresent")
+
     def test_minimal_recipe_mounts_the_node_cgroup_hierarchy(self):
         self.assertIn("-v /sys/fs/cgroup:/sys/fs/cgroup:ro", minimal_recipe_block(),
                       "the proven minimal run mounts cgroupfs read-only")

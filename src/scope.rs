@@ -334,8 +334,9 @@ fn filesystem_magic(dir: &File) -> std::io::Result<u64> {
 /// caller passes `/sys/fs/cgroup`) looking for the one directory whose
 /// inode matches `target`, returning its path relative to `root` (e.g.
 /// `"kubepods.slice/kubepods-pod1234.slice/cri-containerd-abcd.scope"`).
-/// A run-cgroup leaf (`p11scope-run-*`) publishes as its leaf name only:
-/// the full nested path would carry the observer's UID/session slices.
+/// A run cgroup (`p11scope-run-*`) and any sub-cgroup the workload made
+/// below it publish from the `p11scope-run-*` component on: the components
+/// above it would carry the observer's UID/session slices.
 /// `None` when no match is found anywhere under `root` — an absent label
 /// is fine, a wrong one is not: this never guesses, and a cgroup that has
 /// since been removed (the capture ended, the container exited) simply
@@ -349,10 +350,13 @@ pub fn label(root: &Path, target: u64) -> Option<String> {
             if relative.as_os_str().is_empty() {
                 return None;
             }
-            if let Some(leaf) = relative.file_name().and_then(|name| name.to_str())
-                && leaf.starts_with("p11scope-run-")
-            {
-                return Some(leaf.to_string());
+            if let Some(run) = relative.iter().position(|component| {
+                component
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("p11scope-run-"))
+            }) {
+                let published: PathBuf = relative.iter().skip(run).collect();
+                return Some(published.display().to_string());
             }
             return Some(relative.display().to_string());
         }
@@ -954,6 +958,40 @@ mod tests {
         assert!(
             !got.contains('/'),
             "the published label is the leaf only, never the full path: {got:?}"
+        );
+    }
+
+    #[test]
+    fn label_publishes_workload_sub_cgroups_from_the_run_component_on() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let sub = root
+            .path()
+            .join("user.slice")
+            .join("user-1000.slice")
+            .join("session-c2.scope")
+            .join("p11scope-run-0123456789abcdef")
+            .join("workers")
+            .join("a");
+        std::fs::create_dir_all(&sub).unwrap();
+        let target = std::fs::metadata(&sub).unwrap().ino();
+
+        let got = label(root.path(), target).expect("the workload sub-cgroup must be found");
+        assert_eq!(got, "p11scope-run-0123456789abcdef/workers/a");
+        for private in ["user.slice", "user-1000", "session-c2"] {
+            assert!(
+                !got.contains(private),
+                "the label never carries the UID/session part {private}: {got:?}"
+            );
+        }
+
+        // Healthy twin: a cgroup outside any run group keeps its path.
+        let plain = root.path().join("system.slice").join("app.service");
+        std::fs::create_dir_all(&plain).unwrap();
+        let target = std::fs::metadata(&plain).unwrap().ino();
+        assert_eq!(
+            label(root.path(), target).as_deref(),
+            Some("system.slice/app.service")
         );
     }
 

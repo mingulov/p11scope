@@ -423,10 +423,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         if diag {
             let diag_ms = diag_start.elapsed().as_millis();
-            eprintln!(
-                "joint-timing: seal-loop rem_before={diag_rem_before} rem_after={} ms={diag_ms}",
-                *remaining
-            );
+            if diag_ms > 50 {
+                eprintln!(
+                    "joint-timing: seal-loop rem_before={diag_rem_before} rem_after={} ms={diag_ms}",
+                    *remaining
+                );
+            }
         }
         Ok(JointCommitProgress::Pending)
     }

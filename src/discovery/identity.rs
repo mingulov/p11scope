@@ -2393,8 +2393,13 @@ impl PinnedObjects {
         self.bump_copy_version();
         let key = entry.raw.key;
         if self.rejected_keys.contains(&key) {
-            self.ambiguous_keys.insert(key);
-            return None;
+            // A carried rejection refuses plains, but a witness-proven
+            // pre observation stands on its own file: file it. The key
+            // stays rejected, so no plain ever pairs under it.
+            if !entry.pre_copy_up {
+                self.ambiguous_keys.insert(key);
+                return None;
+            }
         }
         let same_key: Vec<PinnedObjectId> = self
             .by_id
@@ -2438,8 +2443,10 @@ impl PinnedObjects {
         // whose raw matches except for the proof marker (same mount
         // namespace, key and merge path — the same observation locus).
         // The proof, not the key, routes the pair: pairing is
-        // order-free, and any third same-locus identity is refused
-        // without disturbing the proven side.
+        // order-free. A divergent third identity is refused without
+        // disturbing the proven side; a third that clones a member's
+        // digest with a different file fails the key closed, and the
+        // proven pre side survives that rejection.
         let paired: Vec<PinnedObjectId> = same_key
             .iter()
             .copied()
@@ -2463,10 +2470,50 @@ impl PinnedObjects {
             self.bump_revision();
             return Some(id);
         }
+        // Order-freedom extends to the meeting order. Two hashed
+        // same-locus plains naming different kernel files with
+        // different digests are version skew (an unproven alias, a
+        // rebound path): the newcomer is refused and the first stays,
+        // so a divergent plain never nukes the key before the proof
+        // arrives. The kept file's own fd and digest stay
+        // self-consistent, so its counts keep meaning its bytes. The
+        // same file re-pinned with a different digest is a rewrite
+        // under a held observation instead — the kept digest no
+        // longer matches the file — and stays a group rejection
+        // below, like same-digest divergence (the btrfs/forgery
+        // shape) and unhashed sides. And a plain third that clones a
+        // pair member's digest with a different file is a forgery,
+        // not skew: the key fails closed (proven pres survive the
+        // rejection) instead of keeping a poisoned pair.
         if !paired.is_empty() {
             let all_plain =
                 !entry.pre_copy_up && paired.iter().all(|id| !self.by_id[id].pre_copy_up);
-            if !all_plain {
+            if all_plain {
+                let newcomer_hashed = !entry.sha256.is_empty();
+                let kept_hashed_skew = paired.iter().any(|id| {
+                    let known = &self.by_id[id];
+                    !known.sha256.is_empty()
+                        && known.sha256 != entry.sha256
+                        && !same_kernel_file(&known.file, &entry.file)
+                });
+                if newcomer_hashed && kept_hashed_skew {
+                    skipped.push(Skipped {
+                        subject: entry.path.clone(),
+                        reason: "this maps key already names a hashed observation with a different digest; the divergent observation was not pinned"
+                            .into(),
+                    });
+                    return None;
+                }
+            } else if paired.len() >= 2
+                && !entry.pre_copy_up
+                && paired.iter().any(|id| {
+                    let known = &self.by_id[id];
+                    !known.sha256.is_empty() && known.sha256 == entry.sha256
+                })
+            {
+                self.reject_key(key);
+                return None;
+            } else {
                 skipped.push(Skipped {
                     subject: entry.path.clone(),
                     reason: if paired.len() >= 2 {
@@ -2531,16 +2578,37 @@ impl PinnedObjects {
     fn reject_key(&mut self, key: ObjectKey) {
         self.bump_revision();
         self.rejected_keys.insert(key);
+        // A witness-proven pre-copy-up observation stands on its own
+        // file: a carried rejection, or a sibling's forgery, never
+        // nukes it. Only unproven entries under the key are removed;
+        // their raws, ownership and claims go with them exactly as
+        // before, while the kept pre's raws stay routable.
         let ids: BTreeSet<PinnedObjectId> = self
             .by_id
             .iter()
-            .filter_map(|(id, entry)| (entry.raw.key == key).then_some(*id))
+            .filter_map(|(id, entry)| {
+                (entry.raw.key == key && !entry.pre_copy_up).then_some(*id)
+            })
+            .collect();
+        let kept_pre: BTreeSet<PinnedObjectId> = self
+            .by_id
+            .iter()
+            .filter_map(|(id, entry)| {
+                (entry.raw.key == key && entry.pre_copy_up).then_some(*id)
+            })
             .collect();
         self.by_id.retain(|id, _| !ids.contains(id));
-        self.raw_to_id
-            .retain(|raw, id| raw.key != key && !ids.contains(id));
+        self.raw_to_id.retain(|raw, id| {
+            !ids.contains(id) && (raw.key != key || kept_pre.contains(id))
+        });
         for raws in self.raw_ownership.values_mut() {
-            raws.retain(|raw| raw.key != key);
+            raws.retain(|raw| {
+                raw.key != key
+                    || self
+                        .raw_to_id
+                        .get(raw)
+                        .is_some_and(|id| kept_pre.contains(id))
+            });
         }
         for claims in self.ownership.values_mut() {
             claims.remove(&ids);

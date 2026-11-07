@@ -334,6 +334,28 @@ LEGACY_UNKNOWN_CELLS = (
     "unregistered_mechanisms", "abi_refusals",
     "owner", "cookie", "root",
 )
+# 7.10b short-lived splits: the additive `gap_exe_hints` /
+# `target_exec_hints` static-hint shape and the `gap_exit_mappings`
+# kernel-observation shape (src/render.rs `static_hint_split_json` /
+# `exit_mappings_split_json` are the producer authority; the label and
+# scope constants live in src/discovery/elf_needed.rs). Present if and
+# only if the capture armed the matching consumer; absent, never null,
+# otherwise. The terminal trace EVIDENCE object carries them through
+# `versioned_evidence` like the profile lane.
+STATIC_HINT_SPLIT_KEYS = {
+    "label", "scope", "links_provider", "links_pkcs11_loader",
+    "no_static_link_within_scope", "unknown",
+}
+STATIC_HINT_LABEL = "STATIC HINT"
+STATIC_HINT_SCOPE = (
+    "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB "
+    "capture-bytes<=64MiB names<=255B verdicts<=1024"
+)
+STATIC_HINT_COUNTS = (
+    "links_provider", "links_pkcs11_loader",
+    "no_static_link_within_scope", "unknown",
+)
+EXIT_MAPPINGS_SPLIT_KEYS = {"mapped", "unknown"}
 # 6.15 endpoint selection: the additive `selected_detail` envelope the
 # metrics composer adds beside --select-endpoint captures
 # (src/metrics/selected_detail_driver.rs is the producer authority).
@@ -1040,6 +1062,18 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "legacy_collection" in evidence:
         wanted.add("legacy_collection")
         exact_legacy_collection(evidence["legacy_collection"])
+    # 7.10b short-lived splits: additive in every lane that renders
+    # them, including the terminal trace EVIDENCE object (which flows
+    # through `versioned_evidence` like the profile lane).
+    if not historical and "gap_exe_hints" in evidence:
+        wanted.add("gap_exe_hints")
+        exact_static_hint_split(evidence["gap_exe_hints"], "gap_exe_hints")
+    if not historical and "target_exec_hints" in evidence:
+        wanted.add("target_exec_hints")
+        exact_static_hint_split(evidence["target_exec_hints"], "target_exec_hints")
+    if not historical and "gap_exit_mappings" in evidence:
+        wanted.add("gap_exit_mappings")
+        exact_exit_mappings_split(evidence["gap_exit_mappings"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -1103,6 +1137,29 @@ def exact_legacy_collection(legacy):
             f"legacy_collection.unknown_evidence must be in bit order: {legacy!r}")
     require(legacy["unread_stats"] > 0 or legacy["rv_failed"] or names,
             f"a clean legacy_collection gap object must be omitted: {legacy!r}")
+
+
+def exact_static_hint_split(split, name):
+    """The additive 7.10b static-hint split (`gap_exe_hints` /
+    `target_exec_hints`): the pinned label and scope plus four
+    saturating-u64 counts. A zero split is valid (an armed capture
+    with an empty subpopulation); only the shape is pinned."""
+    exact_keys(split, STATIC_HINT_SPLIT_KEYS, name)
+    require(split["label"] == STATIC_HINT_LABEL,
+            f"invalid {name}.label: {split!r}")
+    require(split["scope"] == STATIC_HINT_SCOPE,
+            f"invalid {name}.scope: {split!r}")
+    for count in STATIC_HINT_COUNTS:
+        require(u64(split[count]), f"invalid {name}.{count}: {split!r}")
+
+
+def exact_exit_mappings_split(split):
+    """The additive 7.10b exit-mapping split (`gap_exit_mappings`): a
+    kernel observation, so no label or scope rides it — exactly the
+    two saturating-u64 counts."""
+    exact_keys(split, EXIT_MAPPINGS_SPLIT_KEYS, "gap_exit_mappings")
+    require(u64(split["mapped"]), f"invalid gap_exit_mappings.mapped: {split!r}")
+    require(u64(split["unknown"]), f"invalid gap_exit_mappings.unknown: {split!r}")
 
 
 def exact_counter_collection(collection):

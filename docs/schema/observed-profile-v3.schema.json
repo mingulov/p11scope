@@ -181,6 +181,29 @@
         },
         "event_loss": {"type": "integer", "minimum": 0},
         "fork_state_ambiguities": {"type": "integer", "minimum": 0},
+        "gap_exe_hints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "scope", "links_provider", "links_pkcs11_loader",
+                       "no_static_link_within_scope", "unknown"],
+          "properties": {
+            "label": {"const": "STATIC HINT"},
+            "scope": {"const": "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB capture-bytes<=64MiB names<=255B verdicts<=1024"},
+            "links_provider": {"type": "integer", "minimum": 0},
+            "links_pkcs11_loader": {"type": "integer", "minimum": 0},
+            "no_static_link_within_scope": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
+        "gap_exit_mappings": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["mapped", "unknown"],
+          "properties": {
+            "mapped": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
         "handoff_child_pid": {"type": ["integer", "null"], "minimum": 1},
         "in_flight_at_end": {"type": "integer", "minimum": 0},
         "kernel_control": {
@@ -546,6 +569,20 @@
         },
         "table_entries": {"type": "integer", "minimum": 0},
         "task_uprobe_link_losses": {"type": "integer", "minimum": 0},
+        "target_exec_hints": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["label", "scope", "links_provider", "links_pkcs11_loader",
+                       "no_static_link_within_scope", "unknown"],
+          "properties": {
+            "label": {"const": "STATIC HINT"},
+            "scope": {"const": "D-transitive depth=2 objects<=32 edges<=128 exe-bytes<=1MiB capture-bytes<=64MiB names<=255B verdicts<=1024"},
+            "links_provider": {"type": "integer", "minimum": 0},
+            "links_pkcs11_loader": {"type": "integer", "minimum": 0},
+            "no_static_link_within_scope": {"type": "integer", "minimum": 0},
+            "unknown": {"type": "integer", "minimum": 0}
+          }
+        },
         "template_tail_failures": {"type": "integer", "minimum": 0},
         "templates_truncated": {"type": "boolean"},
         "unmatched_closes": {"type": "integer", "minimum": 0},

@@ -570,11 +570,7 @@ fn reader_timens_skews_boottime() -> Result<bool> {
     Ok(timens_boottime_offset(&text).unwrap_or(true))
 }
 
-pub(crate) fn publish_inventory(
-    ebpf: &mut Ebpf,
-    scope: &Scope,
-    callers: bool,
-) -> Result<()> {
+pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope, callers: bool) -> Result<()> {
     publish_inventory_with(
         scope,
         inventory_exe_identity_armed(callers, scope),

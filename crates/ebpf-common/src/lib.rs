@@ -2922,7 +2922,10 @@ mod tests {
             FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
         ));
         assert!(!valid_inventory_config(
-            FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER | FLAG_TRACK_SHORT_LIVED | FLAG_PAUSE_ENABLED
+            FLAG_POLICY_INVENTORY
+                | FLAG_SYSTEM_FILTER
+                | FLAG_TRACK_SHORT_LIVED
+                | FLAG_PAUSE_ENABLED
         ));
     }
 

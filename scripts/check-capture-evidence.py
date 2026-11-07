@@ -1072,8 +1072,19 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
         wanted.add("target_exec_hints")
         exact_static_hint_split(evidence["target_exec_hints"], "target_exec_hints")
     if not historical and "gap_exit_mappings" in evidence:
+        # 7.10b: instance hooks never attach under aggregate policy,
+        # so the exit-mapping split never arms in metrics documents.
+        require(profile, "gap_exit_mappings is profile-only")
         wanted.add("gap_exit_mappings")
         exact_exit_mappings_split(evidence["gap_exit_mappings"])
+    # 7.10b: the engine arms exactly one consumer per capture, so the
+    # gap splits and the target split never publish together.
+    require(
+        "target_exec_hints" not in evidence
+        or ("gap_exe_hints" not in evidence
+            and "gap_exit_mappings" not in evidence),
+        "gap and target splits never publish together",
+    )
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")

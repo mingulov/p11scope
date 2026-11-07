@@ -1483,9 +1483,12 @@ fn key_tally_segment(tally: &KeyOpTally) -> String {
 /// One indented key-operations detail line: `  {name}: {segment}{suffix}`.
 /// A provider file name shrinks first so the tally stays exact; when
 /// the line still overflows, the verbose parenthesized suffix
-/// (instance labels) shrinks next, marked with `…`. Fixed labels
-/// never shrink (they are short — only a pathological tally beside
-/// one may exceed the cap, since counts are never truncated).
+/// (instance labels) shrinks next, marked with `…`. When a long name
+/// meets a long suffix, neither stage fits alone, so the suffix stage
+/// retries with the name shrunk against the minimal suffix (`" (…)"`).
+/// Fixed labels never shrink (they are short — only a pathological
+/// tally beside one may exceed the cap, since counts are never
+/// truncated).
 fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -> String {
     let rest = format!(": {segment}{suffix}");
     let fixed = 2 + rest.chars().count();
@@ -1512,6 +1515,26 @@ fn key_detail_line(name: &str, segment: &str, suffix: &str, shrink_name: bool) -
     else {
         return line;
     };
+    let head = format!("  {shown_name}: {segment}");
+    let suffix_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(head.chars().count());
+    if suffix_budget >= 4 {
+        let shrunk = ellipsize_to(inner, suffix_budget - 3);
+        return format!("{head} ({shrunk})");
+    }
+    // Both stages gave up: the name stage kept a long provider name
+    // because the full suffix already blew the budget, so the head
+    // alone overflows. Shrink the name against the minimal suffix
+    // (`" (…)"`) and retry the suffix stage; fixed labels keep the
+    // over-long line instead (their tally stays exact).
+    if !shrink_name {
+        return line;
+    }
+    // 2 indent + ": " + segment + " (…)".
+    let name_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(2 + 2 + segment.chars().count() + 4);
+    if name_budget < 2 {
+        return line;
+    }
+    let shown_name = ellipsize_to(name, name_budget);
     let head = format!("  {shown_name}: {segment}");
     let suffix_budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(head.chars().count());
     if suffix_budget < 4 {

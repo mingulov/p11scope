@@ -504,7 +504,22 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin ff3707cb1, the run-tree fix-round tip (BPF inputs final since
+      # Pin 2bbc77210, the inventory-gating fix (BPF inputs final since
+      # 2bbc77210; the pin commit itself only advances this baseline),
+      # on top of ff3707cb1:
+      # the inventory gating (2bbc77210): scope_auth's cgroup-arm
+      # PID_FILTER read is compiled only for non-inventory builds, so
+      # both Inventory objects revert to their pre-run-tree bytes while
+      # the default Detailed object keeps the run-tree pause token
+      # (f27901c98). Inventory .text shrinks back (-80 B each) with one
+      # fewer .rel.text entry each; the default object keeps its +88 B
+      # .text / +16 B .rel.text run-tree delta. No map or program is
+      # added or removed (.maps unchanged), symbol sets are unchanged,
+      # and only .BTF.ext line info and .debug_* move with the added
+      # cfg source lines. The journal object, which this gate does not
+      # compare, takes the same gating. No other BPF input changed
+      # since ff3707cb1.
+      # Earlier pin ff3707cb1, the run-tree fix-round tip (BPF inputs final since
       # f27901c98; the pin commit itself only advances this baseline),
       # on top of 3681a1ab7:
       # the run-tree pause token (f27901c98): scope_auth's cgroup arm
@@ -671,7 +686,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=ff3707cb19d17a90706f6f47c50ec6677df7fd43
+          BASELINE=2bbc77210259eead366a1bea5738e03dbfd60f55
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

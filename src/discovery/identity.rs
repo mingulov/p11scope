@@ -130,6 +130,12 @@ struct RawObjectInstance {
     /// never participates in identity merges (`ordinary_identity_equal`
     /// compares mapping, held-fd device, pin and digest only).
     prearm: bool,
+    /// A witness-proven pre-copy-up observation: the kernel witness
+    /// proved this scan's trigger range is the lower file, not the
+    /// opened upper file. Files separately from the plain observation
+    /// for the same key (like `prearm`), so the pair routes by proof;
+    /// never participates in identity compares.
+    pre_copy_up: bool,
 }
 
 impl RawObjectInstance {
@@ -139,6 +145,9 @@ impl RawObjectInstance {
             key,
             path: normalize_target_path(path)?,
             prearm: false,
+            // The proof covers this module's own file only: dependency
+            // entries file plain even on a pre-copy-up module.
+            pre_copy_up: module.pre_copy_up.is_some() && key == module.key,
         })
     }
 
@@ -148,6 +157,7 @@ impl RawObjectInstance {
             key,
             path: normalize_target_path(&path)?,
             prearm: false,
+            pre_copy_up: false,
         })
     }
 
@@ -157,6 +167,7 @@ impl RawObjectInstance {
             key,
             path: normalize_target_path(&path)?,
             prearm: true,
+            pre_copy_up: false,
         })
     }
 }
@@ -234,6 +245,11 @@ struct Entry {
     /// heuristic but does not prove that another overlay instance resolves to the
     /// same underlying kernel inode.
     overlay: bool,
+    /// A witness-proven pre-copy-up observation (copied from the raw it
+    /// filed under): the kernel witness proved the scan's trigger range
+    /// is this lower file. Pairs with the plain observation for the same
+    /// key; never participates in identity compares.
+    pre_copy_up: bool,
     /// Sticky: another mapping was folded onto this entry by the overlayfs
     /// heuristic (same-key alias or cross-key canonicalization). Such an
     /// entry stands for more than one proven kernel file, so its raw key is
@@ -374,6 +390,13 @@ impl RetainedInventoryTarget {
     /// The raw mapping key this object was first retained under.
     pub(crate) fn object_key(&self) -> ObjectKey {
         self.entry.raw.key
+    }
+
+    /// Whether this retained object is the witness-proven pre-copy-up
+    /// side of its key (routing metadata, not identity).
+    #[allow(dead_code)] // The attach-set routing reads this next.
+    pub(crate) fn pre_copy_up(&self) -> bool {
+        self.entry.pre_copy_up
     }
 
     /// The retained pathname, for messages only.
@@ -1048,6 +1071,7 @@ impl Entry {
             .dev();
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
+            pre_copy_up: raw.pre_copy_up,
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -1096,6 +1120,9 @@ pub struct PinnedSummary<'a> {
     pub identity_source: &'static str,
     /// Reserved for bounded diagnostic context; ordinary comparable pins have none.
     pub note: Option<&'a str>,
+    /// A witness-proven pre-copy-up observation: pairs with the plain
+    /// observation for the same key instead of colliding with it.
+    pub pre_copy_up: bool,
 }
 
 /// Claims retained per accepted process view. Vectors deliberately preserve duplicate
@@ -1781,6 +1808,7 @@ impl PinnedObjects {
             note: entry
                 .probed_maps_unproven
                 .then_some(PROBED_MAPS_UNPROVEN_NOTE),
+            pre_copy_up: entry.pre_copy_up,
         })
     }
 
@@ -2022,6 +2050,7 @@ impl PinnedObjects {
                 key: recorded,
                 path: normalized,
                 prearm: false,
+                pre_copy_up: false,
             },
             scan_id,
         );
@@ -2274,6 +2303,7 @@ impl PinnedObjects {
             note: entry
                 .probed_maps_unproven
                 .then_some(PROBED_MAPS_UNPROVEN_NOTE),
+            pre_copy_up: entry.pre_copy_up,
         })
     }
 
@@ -2395,8 +2425,60 @@ impl PinnedObjects {
             {
                 kept.probed_maps_key = entry.probed_maps_key;
             }
+            if entry.pre_copy_up
+                && let Some(kept) = self.by_id.get_mut(&id)
+            {
+                // Same file, proven pre: the proof survives the merge.
+                kept.pre_copy_up = true;
+            }
             self.raw_to_id.insert(entry.raw, id);
             return Some(id);
+        }
+        // A witness-proven copy-up pair files two objects under one maps
+        // key: the plain observation and the pre-copy-up observation
+        // whose raw matches except for the proof marker (same mount
+        // namespace, key and merge path — the same observation locus).
+        // The proof, not the key, routes the pair: pairing is
+        // order-free, and any third same-locus identity is refused
+        // without disturbing the proven side.
+        let paired: Vec<PinnedObjectId> = same_key
+            .iter()
+            .copied()
+            .filter(|id| {
+                let known = &self.by_id[id];
+                known.raw.mount_namespace == entry.raw.mount_namespace
+                    && known.raw.path == entry.raw.path
+                    && known.raw.prearm == entry.raw.prearm
+            })
+            .collect();
+        if paired.len() == 1 && self.by_id[&paired[0]].pre_copy_up != entry.pre_copy_up {
+            let id = PinnedObjectId(self.next_id);
+            self.next_id = self
+                .next_id
+                .checked_add(1)
+                .expect("capture object id overflow");
+            #[cfg(test)]
+            crate::first_use_probe::known(&entry.file, &entry.sha256);
+            self.raw_to_id.insert(entry.raw.clone(), id);
+            self.by_id.insert(id, entry);
+            self.bump_revision();
+            return Some(id);
+        }
+        if !paired.is_empty() {
+            let all_plain =
+                !entry.pre_copy_up && paired.iter().all(|id| !self.by_id[id].pre_copy_up);
+            if !all_plain {
+                skipped.push(Skipped {
+                    subject: entry.path.clone(),
+                    reason: if paired.len() >= 2 {
+                        "this maps key already names a witness-proven copy-up pair; the divergent observation was not pinned"
+                    } else {
+                        "this maps key already names a witness-proven pre-copy-up file; the divergent lower observation was not pinned"
+                    }
+                    .into(),
+                });
+                return None;
+            }
         }
         if incoming_scan_only
             && let Some(id) = same_key.iter().copied().find(|id| {
@@ -2437,6 +2519,14 @@ impl PinnedObjects {
             .next()
             .is_some_and(|raw| raw.mount_namespace.is_some())
             && aliases.all(|raw| raw.mount_namespace.is_some())
+    }
+
+    /// Whether a witness-proven pre-copy-up observation is kept under
+    /// `key`: a proven side is never nuked by a sibling's pin failure.
+    fn has_pre_copy_up_for_key(&self, key: ObjectKey) -> bool {
+        self.by_id
+            .values()
+            .any(|entry| entry.raw.key == key && entry.pre_copy_up)
     }
 
     fn reject_key(&mut self, key: ObjectKey) {
@@ -2721,6 +2811,7 @@ mod conservative_copy {
                         key: next.key,
                         path: String::with_capacity(next.path.len()),
                         prearm: next.prearm,
+                        pre_copy_up: next.pre_copy_up,
                     },
                     storage,
                 });
@@ -2769,6 +2860,7 @@ mod conservative_copy {
                         key: old.raw.key,
                         path: String::with_capacity(old.raw.path.len()),
                         prearm: old.raw.prearm,
+                        pre_copy_up: old.raw.pre_copy_up,
                     },
                     mapping: old.mapping,
                     fd_dev: old.fd_dev,
@@ -2783,6 +2875,7 @@ mod conservative_copy {
                     getter_present: old.getter_present,
                     witness_fault: old.witness_fault,
                     overlay: old.overlay,
+                    pre_copy_up: old.pre_copy_up,
                     collapsed: old.collapsed,
                     probed_maps_unproven: old.probed_maps_unproven,
                     probed_maps_key: old.probed_maps_key,
@@ -4265,6 +4358,7 @@ mod conservative_copy {
                 key: original.key,
                 path: String::with_capacity(original.path.len()),
                 prearm: original.prearm,
+                pre_copy_up: original.pre_copy_up,
             });
             return None;
         }
@@ -5460,6 +5554,7 @@ mod conservative_copy {
                     key,
                     path,
                     prearm: false,
+                    pre_copy_up: false,
                 };
                 Ok(pins.raw_to_id.get(&raw).copied())
             }
@@ -7821,6 +7916,10 @@ fn pin_scanned_view_objects_with(
     // The `vm_file` identity each module's own scan read, where readable:
     // the pin must reopen exactly that file.
     let mut scanned_files: BTreeMap<RawObjectInstance, FileIdentity> = BTreeMap::new();
+    // The proven mount-table candidate index per pre-copy-up raw: the pin
+    // recomputes the same candidate list and reopens this index instead
+    // of the merged path. The candidate path itself is never stored.
+    let mut pre_opens: BTreeMap<RawObjectInstance, u32> = BTreeMap::new();
     let mut skipped = Vec::new();
     for module in modules {
         if module.view != view.id() || module.mount_namespace != view.mount_namespace() {
@@ -7830,6 +7929,9 @@ fn pin_scanned_view_objects_with(
             Some(raw) => {
                 if let Some(identity) = module.mapped_identity {
                     scanned_files.insert(raw.clone(), identity);
+                }
+                if let Some(candidate) = module.pre_copy_up {
+                    pre_opens.insert(raw.clone(), candidate);
                 }
                 wanted.insert(raw);
             }
@@ -7867,10 +7969,12 @@ fn pin_scanned_view_objects_with(
             return Err(exited());
         }
         let scanned = scanned_files.get(&raw).copied();
+        let pre_open = pre_opens.get(&raw).copied();
         let candidate = pin_scanned_object(
             view,
             raw.clone(),
             scanned,
+            pre_open,
             pinned_identity,
             &mut mounts,
             budget,
@@ -7901,7 +8005,12 @@ fn record_scanned_candidate(
             // A missing mapping identity or digest makes every equal raw-key
             // observation incomparable. Remember the failed member so a candidate
             // from another process view cannot become receiver-wins authority.
-            pinned.reject_observation(raw.key);
+            // A pre-copy-up failure refuses only itself: its proof stands on
+            // its own file, so it never nukes the key — and neither does a
+            // plain failure while a proven pre observation is kept.
+            if !raw.pre_copy_up && !pinned.has_pre_copy_up_for_key(raw.key) {
+                pinned.reject_observation(raw.key);
+            }
             skipped.push(Skipped {
                 subject: raw.path,
                 reason,
@@ -8109,13 +8218,47 @@ fn pin_scanned_object(
     view: &ProcessView,
     raw: RawObjectInstance,
     scanned: Option<FileIdentity>,
+    pre_open: Option<u32>,
     pinned_identity: ReadPinnedIdentity<'_>,
     mounts: &mut MountTableCache,
     budget: &mut CaptureWorkBudget,
 ) -> Result<Entry, String> {
+    // A pre-copy-up raw reopens its proven mount-table candidate, not the
+    // merged path: the candidate list is recomputed from the same target
+    // table the scan proved against, and the scanned check below binds
+    // the reopened file to the proof. Any divergence refuses the pin.
+    let pre_path: Option<PathBuf> = if raw.pre_copy_up {
+        let Some(index) = pre_open else {
+            return Err("a pre-copy-up pin without a proven candidate index was refused".into());
+        };
+        let text = match view.open_then_cached_mountinfo(|_| Ok(()), mounts, budget) {
+            Ok(((), text)) => text,
+            Err(_) => {
+                return Err(
+                    "the target mount table is unreadable; the pre-copy-up pin was refused".into(),
+                );
+            }
+        };
+        let candidates =
+            crate::discovery::scan::lower_candidates_from_mountinfo(text, Path::new(&raw.path));
+        match candidates.get(index as usize) {
+            Some(candidate) => Some(candidate.clone()),
+            None => {
+                return Err(
+                    "the proven lower candidate is not in the target's mount table; the pin was refused"
+                        .into(),
+                );
+            }
+        }
+    } else {
+        None
+    };
     // The target's own filesystem view: a container's object is never copied out.
     let (file, mountinfo) = view.open_then_cached_mountinfo(
-        |filesystem| filesystem.open_rooted_object(Path::new(&raw.path)),
+        |filesystem| match &pre_path {
+            Some(candidate) => filesystem.open_rooted_object(candidate),
+            None => filesystem.open_rooted_object(Path::new(&raw.path)),
+        },
         mounts,
         budget,
     )?;
@@ -8123,14 +8266,20 @@ fn pin_scanned_object(
     let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately carry
     // different keys (overlay vs backing device); the self-mapping probe
-    // asks the kernel how it renders this exact fd before refusing.
-    if !opened_file_matches_maps(
-        &file,
-        object_key(found),
-        raw.key,
-        budget,
-        &KernelSelfMappingProbe,
-    ) {
+    // asks the kernel how it renders this exact fd before refusing. A
+    // pre-copy-up file legitimately never matches the maps key (it is the
+    // lower file behind the merged mapping); the kernel witness proved the
+    // range is this file instead, and the scanned check below binds this
+    // reopened file to that proof.
+    if !raw.pre_copy_up
+        && !opened_file_matches_maps(
+            &file,
+            object_key(found),
+            raw.key,
+            budget,
+            &KernelSelfMappingProbe,
+        )
+    {
         return Err(format!(
             "identity_mismatch: the mapping is {:?} but {} now opens as {:?} \
              (compared via mountinfo)",
@@ -8144,8 +8293,13 @@ fn pin_scanned_object(
         .retained_mapped_identity(&file)
         .map(Ok)
         .unwrap_or_else(|| pinned_identity(&file));
+    if raw.pre_copy_up && mapped.is_err() {
+        return Err("the pre-copy-up pin cannot read its vm_file identity; it was refused".into());
+    }
     if let Some(scanned) = scanned {
         check_same_scanned_file(scanned, mapped.clone().map(|mapped| mapped.identity))?;
+    } else if raw.pre_copy_up {
+        return Err("the pre-copy-up pin has no proof-time identity; it was refused".into());
     }
     let mapped = mapped.ok();
     // The per-file rule can be decided from metadata. Aggregate admission happens
@@ -8340,6 +8494,7 @@ pub(crate) mod test_fixture {
             getter_present: false,
             witness_fault: false,
             overlay: false,
+            pre_copy_up: false,
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -8465,6 +8620,7 @@ pub(crate) mod test_fixture {
             getter_present: false,
             witness_fault: false,
             overlay,
+            pre_copy_up: module.pre_copy_up.is_some(),
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -8666,6 +8822,7 @@ pub(crate) mod test_fixture {
             getter_present: false,
             witness_fault: false,
             overlay: true,
+            pre_copy_up: false,
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -8708,6 +8865,7 @@ pub(crate) mod test_fixture {
             getter_present: false,
             witness_fault: false,
             overlay: true,
+            pre_copy_up: false,
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -8751,6 +8909,7 @@ pub(crate) mod test_fixture {
             getter_present: false,
             witness_fault: false,
             overlay: true,
+            pre_copy_up: false,
             collapsed: false,
             probed_maps_unproven: false,
             probed_maps_key: None,
@@ -10606,6 +10765,183 @@ mod tests {
         assert!(replay.rejects(key));
         assert_eq!(replay.pinned().count(), 0);
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
+    }
+
+    /// Marks the single entry of a one-object pin set as a
+    /// witness-proven pre-copy-up observation, re-filing its raw.
+    fn mark_pre_copy_up(pins: &mut PinnedObjects) {
+        let (mut raw, id) = pins.raw_to_id.pop_first().expect("one raw to mark");
+        raw.pre_copy_up = true;
+        let entry = pins.by_id.get_mut(&id).expect("entry for the raw");
+        entry.raw.pre_copy_up = true;
+        entry.pre_copy_up = true;
+        pins.raw_to_id.insert(raw, id);
+    }
+
+    #[test]
+    fn absorbing_same_key_copyup_pair_keeps_both_proven_files() {
+        // The copy-up shape: one maps key names two kernel files — the
+        // plain upper observation and the witness-proven pre-copy-up
+        // lower observation. The proven pair keeps both (routed by
+        // digest through their separate raws), unlike the unproven
+        // btrfs collision above. Either absorb order pairs.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper_file = backing_file(&dir, "upper.so");
+        let lower_file = backing_file(&dir, "lower.so");
+        for upper_first in [true, false] {
+            let mut upper = image_pins(&[(key, "aaaaaaaa", 1)]);
+            reback(&mut upper, &upper_file);
+            let mut lower = image_pins(&[(key, "bbbbbbbb", 2)]);
+            reback(&mut lower, &lower_file);
+            mark_pre_copy_up(&mut lower);
+            let (mut receiver, donor) = if upper_first {
+                (upper, lower)
+            } else {
+                (lower, upper)
+            };
+            let skipped = receiver.absorb(donor);
+            assert!(
+                skipped.is_empty(),
+                "upper_first={upper_first}: the proven pair absorbs silently: {skipped:?}"
+            );
+            assert_eq!(
+                receiver.pinned().count(),
+                2,
+                "upper_first={upper_first}: both proven files stay pinned"
+            );
+            let mut summaries: Vec<_> = receiver.pinned().collect();
+            summaries.sort_by(|left, right| left.sha256.cmp(right.sha256));
+            assert_eq!(summaries[0].sha256, "aaaaaaaa");
+            assert!(!summaries[0].pre_copy_up);
+            assert_eq!(summaries[1].sha256, "bbbbbbbb");
+            assert!(summaries[1].pre_copy_up);
+            // Lookups route by proof: the pre module resolves the lower
+            // pin, the plain module the upper pin.
+            let mut lower_module = module(key);
+            lower_module.pre_copy_up = Some(0);
+            let mut upper_module = module(key);
+            upper_module.pre_copy_up = None;
+            let lower_id = receiver
+                .id_for_scanned(&lower_module, key, &lower_module.path.clone())
+                .expect("the pre module resolves");
+            let upper_id = receiver
+                .id_for_scanned(&upper_module, key, &upper_module.path.clone())
+                .expect("the plain module resolves");
+            assert_ne!(lower_id, upper_id, "upper_first={upper_first}");
+            assert_eq!(receiver.summary(lower_id).unwrap().sha256, "bbbbbbbb");
+            assert_eq!(receiver.summary(upper_id).unwrap().sha256, "aaaaaaaa");
+        }
+    }
+
+    #[test]
+    fn absorbing_third_identity_under_copyup_pair_refuses_only_the_newcomer() {
+        // A proven pair admits exactly two: a third same-locus identity
+        // (an upper rewritten mid-capture, or an unproven alias) is
+        // refused with its own reason while the proven pair stays.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut pair = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut pair, &backing_file(&dir, "upper.so"));
+        let mut lower = image_pins(&[(key, "bbbbbbbb", 2)]);
+        reback(&mut lower, &backing_file(&dir, "lower.so"));
+        mark_pre_copy_up(&mut lower);
+        assert!(pair.absorb(lower).is_empty());
+        assert_eq!(pair.pinned().count(), 2);
+        let mut third = image_pins(&[(key, "cccccccc", 3)]);
+        reback(&mut third, &backing_file(&dir, "third.so"));
+        let skipped = pair.absorb(third);
+        assert_eq!(pair.pinned().count(), 2, "the proven pair stays");
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("already names a witness-proven copy-up pair"),
+            "the newcomer keeps its own reason: {}",
+            skipped[0].reason
+        );
+        assert!(!pair.rejects(key), "the key is not poisoned");
+    }
+
+    #[test]
+    fn pre_copyup_pin_without_a_current_candidate_refuses_without_nuking() {
+        // The pin recomputes the scan's candidate list from the target's
+        // mount table and reopens the proven index. Here no overlay row
+        // covers the path, so the proven index is gone: the lower pin is
+        // refused with its own reason while the plain upper pin for the
+        // same key stays — the failure never nukes the key.
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("upper.so");
+        std::fs::copy("/bin/sh", &path).unwrap();
+        let file = open_object(&path).unwrap();
+        let mapping = mapping_file_key(&file).unwrap();
+        let key = object_key(mapping);
+        let view = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+        let mut upper = test_fixture::module(key);
+        upper.view = view.id();
+        upper.mount_namespace = view.mount_namespace();
+        upper.path = path.display().to_string();
+        upper.tables.clear();
+        let mut lower = upper.clone();
+        lower.pre_copy_up = Some(0);
+        lower.mapped_identity = self_mapped_file(&file).ok().map(|mapped| mapped.identity);
+        let (pinned, skipped) =
+            pin_scanned_view_objects(&view, &[upper, lower], &mut CaptureWorkBudget::default())
+                .unwrap();
+        assert_eq!(pinned.pinned().count(), 1, "the upper pin stays");
+        assert!(
+            !pinned.pinned().next().unwrap().sha256.is_empty(),
+            "the kept pin hashed"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("not in the target's mount table"),
+            "the lower pin keeps its own reason: {}",
+            skipped[0].reason
+        );
+        assert!(!pinned.rejects(key), "the key is not poisoned");
+    }
+
+    #[test]
+    fn absorbing_second_pre_copyup_refuses_only_the_newcomer() {
+        // Two pre-copy-up observations for one locus (the lower file
+        // re-pinned) never form a pair: the first-proven lower stays,
+        // the newcomer is refused.
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = image_pins(&[(key, "bbbbbbbb", 2)]);
+        reback(&mut first, &backing_file(&dir, "lower.so"));
+        mark_pre_copy_up(&mut first);
+        let mut second = image_pins(&[(key, "cccccccc", 3)]);
+        reback(&mut second, &backing_file(&dir, "relowered.so"));
+        mark_pre_copy_up(&mut second);
+        let skipped = first.absorb(second);
+        assert_eq!(first.pinned().count(), 1, "the first-proven lower stays");
+        assert_eq!(
+            first.pinned().next().unwrap().sha256,
+            "bbbbbbbb",
+            "first wins, deterministically"
+        );
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(
+            skipped[0]
+                .reason
+                .contains("already names a witness-proven pre-copy-up file"),
+            "the newcomer keeps its own reason: {}",
+            skipped[0].reason
+        );
+        assert!(!first.rejects(key), "the key is not poisoned");
     }
 
     #[test]

@@ -1601,6 +1601,80 @@ fn key_ops_verbose_many_instances_stay_within_100_chars() {
     );
 }
 
+/// A long provider file name together with hundreds of instance
+/// labels still fits the verbose line within 100 chars: the name
+/// and the suffix shrink cooperatively, both marked, while the
+/// tally stays exact and the suffix keeps its closing paren.
+#[test]
+fn key_ops_verbose_long_name_many_instances_stay_within_100_chars() {
+    let labels: Vec<String> = (0..300).map(|i| format!("i{i}")).collect();
+    let mut observations = populated(3);
+    observations.sessions.push(SessionRow {
+        session: 7,
+        origin: "opened",
+        status: "live",
+    });
+    observations.objects.push(object_row(11));
+    for instance in &labels {
+        observations
+            .key_operations
+            .push(key_row_on(instance, 11, "sign", 1, 0, 0));
+    }
+    let mut presentation = key_ops_presentation(observations);
+    let basename = format!("lib{}.so", "p".repeat(194));
+    assert_eq!(basename.chars().count(), 200);
+    presentation.modules[0].paths = vec![format!("/opt/vendor/{basename}")];
+    let module = presentation.modules[0].id;
+    let caller = presentation.callers[0].id;
+    presentation.instances.clear();
+    for (raw, label) in labels.iter().enumerate() {
+        assert_eq!(
+            RegistryInstanceId::from_raw(raw as u32).label(),
+            *label,
+            "fixture rows resolve to the harness module"
+        );
+        presentation.instances.push(InstanceView {
+            id: RegistryInstanceId::from_raw(raw as u32),
+            caller,
+            module,
+            state: InstanceLifecycle::Observed,
+            reason: None,
+            first_seen_ns: 100,
+            last_seen_ns: 200,
+        });
+    }
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let block = key_ops_block(&verbose);
+    assert_eq!(block.len(), 2, "header plus one provider line:\n{verbose}");
+    let tally = "sign 300 completed, 0 returned errors, 0 active operations";
+    assert!(
+        block[1].contains(tally),
+        "the tally stays exact: {:?}",
+        block[1].chars().take(160).collect::<String>()
+    );
+    assert!(
+        block[1].chars().count() <= 100,
+        "over 100 chars ({}): {:?}:\n{verbose}",
+        block[1].chars().count(),
+        block[1].chars().take(160).collect::<String>()
+    );
+    assert!(
+        block[1].contains('…'),
+        "truncation is marked: {:?}",
+        block[1].chars().take(160).collect::<String>()
+    );
+    assert!(
+        block[1].starts_with("  lib"),
+        "the provider name stays first: {:?}",
+        block[1].chars().take(160).collect::<String>()
+    );
+    assert!(
+        block[1].ends_with(')'),
+        "the suffix keeps its closing paren: {:?}",
+        block[1].chars().take(160).collect::<String>()
+    );
+}
+
 /// Capture-wide unknown-key rows (no instance) read on their own
 /// `unknown keys` lines, never merged into a provider's tallies.
 #[test]
@@ -1844,6 +1918,44 @@ fn gaps_block_folds_beyond_twenty_groups() {
             line.chars().count() <= 100,
             "over 100 chars: {line:?}:\n{}",
             many.join("\n")
+        );
+    }
+}
+
+/// The fold header counts loss rows, not groups: 21 groups where
+/// one group holds 3 rows read `gaps: 23` while the fold still
+/// shows 20 groups plus `and 1 more group`.
+#[test]
+fn gaps_block_fold_header_counts_rows_not_groups() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    for _ in 0..3 {
+        presentation.gaps.push(named_gap("scope-hot", "reason-x"));
+    }
+    for i in 0..20 {
+        let subject = format!("scope-{i:02}");
+        presentation.gaps.push(named_gap(&subject, "reason-x"));
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(
+        block.len(),
+        22,
+        "header plus twenty groups plus the fold line: {block:?}"
+    );
+    assert_eq!(block[0], "gaps: 23", "the header counts rows, not groups");
+    assert_eq!(block[1], "  3 × scope-hot — reason-x");
+    assert_eq!(block[20], "  1 × scope-18 — reason-x");
+    assert_eq!(
+        block[21], "  and 1 more group (--json has every item)",
+        "the fold line names the remainder: {block:?}"
+    );
+    for line in &block {
+        assert!(
+            line.chars().count() <= 100,
+            "over 100 chars: {line:?}:\n{}",
+            block.join("\n")
         );
     }
 }

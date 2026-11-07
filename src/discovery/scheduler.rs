@@ -113,13 +113,13 @@ enum InventoryScanClass {
 
 /// The H1 fairness-accounting cursors a pressure service pass must leave
 /// untouched: pass counts, rotation cursors (including the backlog-only
-/// cursor and the backlog-owed flag with its per-tick attempt ledger), the
-/// previous-tick enumeration for newcomer classification, the scan-class
-/// alternation and the tick deadline. Restored verbatim after each selected
-/// transaction, so pressure service never consumes an ordinary tick's
-/// polling round, reconcile turn, alternation share or newcomer/backlog
-/// standing. Cooling entries are real admission facts, not accounting, and
-/// are never restored.
+/// cursor and the backlog-owed flag with its per-tick attempt ledger and
+/// newcomer-attempt sets), the previous-tick enumeration for newcomer
+/// classification, the scan-class alternation and the tick deadline.
+/// Restored verbatim after each selected transaction, so pressure service
+/// never consumes an ordinary tick's polling round, reconcile turn,
+/// alternation share or newcomer/backlog standing. Cooling entries are
+/// real admission facts, not accounting, and are never restored.
 #[derive(Debug, Clone)]
 pub(crate) struct FairnessCheckpoint {
     over_cap_passes: u64,
@@ -138,6 +138,8 @@ pub(crate) struct FairnessCheckpoint {
     tick_attempted_any: bool,
     tick_attempted_backlog: bool,
     prev_enumerated: BTreeSet<u32>,
+    tick_newcomer_attempts: BTreeSet<u32>,
+    last_newcomer_attempts: BTreeSet<u32>,
 }
 
 /// The per-capture discovery schedule. Reconciliation, polling and new-view
@@ -194,6 +196,15 @@ pub(crate) struct DiscoveryScheduler {
     /// tick, so it holds at most the live enumerated pids (the same bound
     /// argument as `cooling`). Timing arrival marks stay timing-only.
     prev_enumerated: BTreeSet<u32>,
+    /// Pids attempted as newcomers on the current tick: rotated into
+    /// `last_newcomer_attempts` at the next window, so a failed newcomer
+    /// — backlog next tick, never seen by the backlog cursor — retries
+    /// behind untried backlog instead of ahead of it. At most the tick's
+    /// admitted batch (production 64); excess records drop past the cap.
+    tick_newcomer_attempts: BTreeSet<u32>,
+    /// The previous tick's newcomer attempts, sunk to the end of the
+    /// backlog rotation by `backlog_order`. Same bound.
+    last_newcomer_attempts: BTreeSet<u32>,
 }
 
 impl DiscoveryScheduler {
@@ -222,6 +233,8 @@ impl DiscoveryScheduler {
             tick_attempted_any: false,
             tick_attempted_backlog: false,
             prev_enumerated: BTreeSet::new(),
+            tick_newcomer_attempts: BTreeSet::new(),
+            last_newcomer_attempts: BTreeSet::new(),
         }
     }
 
@@ -336,11 +349,41 @@ impl DiscoveryScheduler {
 
     /// Backlog order under its own cursor: the same rotation as
     /// `new_view_order`, but parked by backlog attempts only, so newcomer
-    /// attempts never drag it toward recent deferrals. Free-slots windows
-    /// use this for the backlog class; scarce ticks never classify.
-    /// `pids` must be sorted ascending.
+    /// attempts never drag it toward recent deferrals — with one repair:
+    /// a failed newcomer is backlog next tick without ever parking this
+    /// cursor, so the previous tick's newcomer attempts sink to the end,
+    /// stable inside each part, instead of retrying ahead of untried
+    /// backlog. Free-slots windows use this for the backlog class; scarce
+    /// ticks never classify. `pids` must be sorted ascending.
     pub(crate) fn backlog_order(&self, pids: &[u32]) -> Vec<u32> {
-        Self::rotated_after(pids, self.backlog_cursor)
+        let order = Self::rotated_after(pids, self.backlog_cursor);
+        let (mut head, tail): (Vec<u32>, Vec<u32>) = order
+            .into_iter()
+            .partition(|pid| !self.last_newcomer_attempts.contains(pid));
+        head.extend(tail);
+        head
+    }
+
+    /// Opens one admission window: settles the previous tick's backlog
+    /// debt, resets this tick's attempt ledger, and rotates the
+    /// newcomer-attempt sets so the backlog rotation sinks exactly the
+    /// previous tick's newcomer attempts. Every admission window calls
+    /// this first. A backlog attempt paid the debt; a round that
+    /// attempted work but no backlog while backlog waited owes the next
+    /// lead to backlog; no backlog waiting clears it; a round that
+    /// attempted nothing (an expired quantum before the first scan)
+    /// leaves it for the retry.
+    fn open_attempt_window(&mut self) {
+        if self.tick_attempted_backlog {
+            self.backlog_owed = false;
+        } else if self.tick_backlog_waited && self.tick_attempted_any {
+            self.backlog_owed = true;
+        } else if !self.tick_backlog_waited {
+            self.backlog_owed = false;
+        }
+        self.tick_attempted_any = false;
+        self.tick_attempted_backlog = false;
+        self.last_newcomer_attempts = std::mem::take(&mut self.tick_newcomer_attempts);
     }
 
     /// One admission tick's window with newcomers first (free view slots
@@ -367,20 +410,7 @@ impl DiscoveryScheduler {
         max_new_views: usize,
         newcomer_share: usize,
     ) -> (Vec<u32>, Vec<u32>) {
-        // Settle the previous tick's debt before opening this tick's ledger.
-        // A backlog attempt paid it; a round that attempted work but no
-        // backlog while backlog waited owes the next lead to backlog; no
-        // backlog waiting clears it; a round that attempted nothing (an
-        // expired quantum before the first scan) leaves it for the retry.
-        if self.tick_attempted_backlog {
-            self.backlog_owed = false;
-        } else if self.tick_backlog_waited && self.tick_attempted_any {
-            self.backlog_owed = true;
-        } else if !self.tick_backlog_waited {
-            self.backlog_owed = false;
-        }
-        self.tick_attempted_any = false;
-        self.tick_attempted_backlog = false;
+        self.open_attempt_window();
         let (fresh, backlog): (Vec<u32>, Vec<u32>) = pids
             .iter()
             .copied()
@@ -493,11 +523,16 @@ impl DiscoveryScheduler {
         self.note_scan_attempt(InventoryScanClass::Newcomer);
     }
 
-    /// A free-slots newcomer attempt: parks the newcomer cursor and records
-    /// the attempt in the owed ledger. Backlog attempts use
-    /// `note_backlog_attempt`, which additionally parks the backlog cursor.
+    /// A free-slots newcomer attempt: parks the newcomer cursor, records
+    /// the pid in this tick's newcomer-attempt set (so the next window
+    /// sinks it if it is backlog then), and records the attempt in the
+    /// owed ledger. Backlog attempts use `note_backlog_attempt`, which
+    /// additionally parks the backlog cursor.
     pub(crate) fn note_newcomer_attempt(&mut self, pid: u32) {
         self.new_view_cursor = Some(pid);
+        if self.tick_newcomer_attempts.len() < self.max_new_views {
+            self.tick_newcomer_attempts.insert(pid);
+        }
         self.tick_attempted_any = true;
         self.note_scan_attempt(InventoryScanClass::Newcomer);
     }
@@ -637,6 +672,8 @@ impl DiscoveryScheduler {
             tick_attempted_any: self.tick_attempted_any,
             tick_attempted_backlog: self.tick_attempted_backlog,
             prev_enumerated: self.prev_enumerated.clone(),
+            tick_newcomer_attempts: self.tick_newcomer_attempts.clone(),
+            last_newcomer_attempts: self.last_newcomer_attempts.clone(),
         }
     }
 
@@ -660,6 +697,8 @@ impl DiscoveryScheduler {
         self.tick_attempted_any = checkpoint.tick_attempted_any;
         self.tick_attempted_backlog = checkpoint.tick_attempted_backlog;
         self.prev_enumerated = checkpoint.prev_enumerated;
+        self.tick_newcomer_attempts = checkpoint.tick_newcomer_attempts;
+        self.last_newcomer_attempts = checkpoint.last_newcomer_attempts;
     }
 
     pub(crate) fn quantum_ns(&self) -> u64 {

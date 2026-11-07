@@ -27867,33 +27867,195 @@ mod maps_skip_memory_tests {
     }
 
     #[test]
-    fn ordinary_passes_carry_priors_and_backstop_passes_carry_none() {
+    fn rolling_backstop_withholds_one_cohort_each_pass() {
         let mut coordinator = skip_coordinator();
         coordinator.note_applied_scan_tasks(&catalog_with_digests(
-            [(11, (Some(110), 1))].into_iter().collect(),
+            [
+                (10, (Some(100), 1)),
+                (11, (Some(110), 2)),
+                (12, (Some(120), 3)),
+                (13, (Some(130), 4)),
+            ]
+            .into_iter()
+            .collect(),
         ));
-        for pass in [0u64, 1, 2] {
+        for (pass, withheld) in [(0u64, 12), (1, 13), (2, 10), (3, 11), (7, 11)] {
             coordinator.passes = pass;
+            let priors = coordinator.priors_for_collection().digests;
             assert!(
-                !coordinator.priors_for_collection().digests.is_empty(),
-                "pass {pass} must reuse priors"
+                !priors.contains_key(&withheld),
+                "pass {pass} must withhold pid {withheld} (cohort {})",
+                pass % super::SKIP_BACKSTOP_EVERY
+            );
+            assert_eq!(
+                priors.len(),
+                3,
+                "pass {pass} must carry the other three cohorts (uniform cost, no full rescan)"
             );
         }
-        coordinator.passes = 3;
-        assert!(
-            coordinator.priors_for_collection().digests.is_empty(),
-            "every fourth pass must rescan (file-swap backstop)"
-        );
-        coordinator.passes = 7;
-        assert!(
-            coordinator.priors_for_collection().digests.is_empty(),
-            "the backstop must repeat"
-        );
         assert_eq!(
             super::SKIP_BACKSTOP_EVERY,
             4,
             "the backstop cadence is pinned"
         );
+    }
+
+    #[test]
+    fn every_stable_pid_reproves_within_four_passes() {
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [
+                (10, (Some(100), 1)),
+                (11, (Some(110), 2)),
+                (12, (Some(120), 3)),
+                (13, (Some(130), 4)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        for start in [0u64, 1, 5] {
+            for pid in [10u32, 11, 12, 13] {
+                let mut withheld = 0;
+                for pass in start..start + 4 {
+                    coordinator.passes = pass;
+                    if !coordinator
+                        .priors_for_collection()
+                        .digests
+                        .contains_key(&pid)
+                    {
+                        withheld += 1;
+                    }
+                }
+                assert_eq!(
+                    withheld,
+                    1,
+                    "pid {pid} must re-prove exactly once in passes {start}..{}",
+                    start + 4
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn rolling_spreads_reproofs_uniformly_across_passes() {
+        use crate::inspect_system::{digest_maps_snapshot, unchanged_skip_set};
+        use p11scope_manifest::maps::{Device, MapEntry};
+        let entry = MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode: 11,
+            raw_path: Some(b"/usr/bin/sleep".to_vec()),
+        };
+        let digest = digest_maps_snapshot(&[entry.clone()]);
+        let sweep = vec![
+            (10, vec![entry.clone()]),
+            (11, vec![entry.clone()]),
+            (12, vec![entry.clone()]),
+            (13, vec![entry]),
+        ];
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [
+                (10, (Some(100), digest)),
+                (11, (Some(110), digest)),
+                (12, (Some(120), digest)),
+                (13, (Some(130), digest)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let live = |pid: u32| match pid {
+            10 => Some(100),
+            11 => Some(110),
+            12 => Some(120),
+            _ => Some(130),
+        };
+        for pass in 0u64..4 {
+            coordinator.passes = pass;
+            let priors = coordinator.priors_for_collection();
+            let skip = unchanged_skip_set(&sweep, &priors, live);
+            assert_eq!(
+                skip.len(),
+                3,
+                "pass {pass} must skip three and re-prove one (uniform cost, no backstop lottery)"
+            );
+        }
+    }
+
+    #[test]
+    fn swapped_library_surfaces_within_four_rolling_passes() {
+        use crate::inspect_system::{digest_maps_snapshot, unchanged_skip_set};
+        use p11scope_manifest::maps::{Device, MapEntry};
+        let entry = MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode: 11,
+            raw_path: Some(b"/usr/lib/libprovider.so".to_vec()),
+        };
+        let digest = digest_maps_snapshot(&[entry.clone()]);
+        let sweep = vec![(42, vec![entry])];
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [(42, (Some(420), digest))].into_iter().collect(),
+        ));
+        let live = |_: u32| Some(420);
+        let mut reproofs = 0;
+        for pass in 0u64..4 {
+            coordinator.passes = pass;
+            let priors = coordinator.priors_for_collection();
+            if !unchanged_skip_set(&sweep, &priors, live).contains(&42) {
+                reproofs += 1;
+            }
+        }
+        assert_eq!(
+            reproofs, 1,
+            "an in-place file swap (same maps, new bytes) must force a re-decode within 4 passes"
+        );
+    }
+
+    #[test]
+    fn new_library_scans_on_the_next_pass_under_rolling() {
+        use crate::inspect_system::{digest_maps_snapshot, unchanged_skip_set};
+        use p11scope_manifest::maps::{Device, MapEntry};
+        let before = MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode: 11,
+            raw_path: Some(b"/usr/bin/sleep".to_vec()),
+        };
+        let after = MapEntry {
+            start: 0x3000,
+            end: 0x4000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode: 33,
+            raw_path: Some(b"/usr/lib/softhsm/libsofthsm2.so".to_vec()),
+        };
+        let digest = digest_maps_snapshot(&[before.clone()]);
+        let sweep = vec![(42, vec![before, after])];
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [(42, (Some(420), digest))].into_iter().collect(),
+        ));
+        let live = |_: u32| Some(420);
+        for pass in 0u64..4 {
+            coordinator.passes = pass;
+            let priors = coordinator.priors_for_collection();
+            assert!(
+                !unchanged_skip_set(&sweep, &priors, live).contains(&42),
+                "a dlopen must rescan on pass {pass} (new mappings never wait for the backstop)"
+            );
+        }
     }
 
     #[test]
@@ -27906,11 +28068,11 @@ mod maps_skip_memory_tests {
     }
 
     /// An applied pass groups its watch-feeding mappers by object so
-    /// the next collection re-decodes one representative per group; the
-    /// backstop sheds mapper memory with the digests. RED: the memory
-    /// does not exist yet.
+    /// the next collection re-decodes one representative per group;
+    /// rolling keeps the groups every pass (representatives always
+    /// pin, so peers always confirm). RED: rolling does not exist yet.
     #[test]
-    fn applied_pass_records_pinned_mappers_and_backstop_sheds_them() {
+    fn applied_pass_records_pinned_mappers_and_rolling_keeps_them() {
         use crate::inspect_system::{MemberStatus, ProcessRecord};
         let mut coordinator = skip_coordinator();
         let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
@@ -27926,17 +28088,14 @@ mod maps_skip_memory_tests {
             hints_examined: true,
         });
         coordinator.note_applied_scan_tasks(&catalog);
-        coordinator.passes = 0;
-        assert_eq!(
-            coordinator.priors_for_collection().mapper_groups,
-            [(12usize, BTreeSet::from([12]))].into_iter().collect(),
-            "a dangling mapper must re-decode next pass (pid 11 maps nothing)"
-        );
-        coordinator.passes = 3;
-        assert!(
-            coordinator.priors_for_collection().mapper_groups.is_empty(),
-            "the backstop sheds mapper memory with the digests"
-        );
+        for pass in [0u64, 3] {
+            coordinator.passes = pass;
+            assert_eq!(
+                coordinator.priors_for_collection().mapper_groups,
+                [(12usize, BTreeSet::from([12]))].into_iter().collect(),
+                "pass {pass} must keep mapper groups (a dangling mapper re-decodes)"
+            );
+        }
     }
 
     /// Co-mappers of one watch-feeding object share a group: next pass

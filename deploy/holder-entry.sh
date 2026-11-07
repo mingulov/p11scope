@@ -125,15 +125,17 @@ if [ "$1" = copy-up ]; then
         rm -f "$1"
         "$GATED" "$MODULE" "$2" 200 /tmp/gate 2>&1 | tee "$1" &
         side_pid=$!
-        i=0
+        # No timeout: the driver releases this pod's gate just before
+        # the copy-up-neg cell, after the earlier cells and lock waits
+        # (an hour or more on a busy host). Hold like the plain ledger
+        # mode; the liveness check below still fails a dead side fast,
+        # and the driver's ledger checker fails a hung one at the cell.
         while ! grep -q '^LEDGER ' "$1" 2>/dev/null; do
             kill -0 "$side_pid" 2>/dev/null || {
                 echo "gated side died before its ledger" >&2
                 cat "$1" >&2
                 exit 1
             }
-            i=$((i + 1))
-            [ "$i" -lt 1200 ] || { echo "gated side never ledgered" >&2; exit 1; }
             sleep 0.5
         done
     }

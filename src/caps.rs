@@ -212,13 +212,18 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// The keep mask after setup: a multi session whose dynamic probes link
 /// (`dynamic_multi`: multi backend plus a proven kernel pid filter, so
 /// no `perf_event_open` remains past attach, measured lane F15) sheds
-/// the transient `CAP_SYS_ADMIN`, unless it is the only map_files grant
-/// — the effective set lacks `CAP_CHECKPOINT_RESTORE` (the DaemonSet),
-/// so later identity proofs still need it. A singles session, or a multi
-/// session whose dynamics stay on perf (an unproven pid filter on 6.6-6.9
-/// without the backport), keeps it for dynamic perf re-attach.
+/// the transient `CAP_SYS_ADMIN`, unless it is the only BPF/PERFMON/
+/// map_files grant — the effective set lacks any of `CAP_BPF`,
+/// `CAP_PERFMON` or `CAP_CHECKPOINT_RESTORE` (the DaemonSet lacks all
+/// three), so later dynamic links and identity proofs still need it.
+/// A singles session, or a multi session whose dynamics stay on perf
+/// (an unproven pid filter on 6.6-6.9 without the backport), keeps it
+/// for dynamic perf re-attach.
 pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) -> u64 {
-    if multi && dynamic_multi && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0 {
+    let narrow = (1u64 << CAP_BPF_BIT)
+        | (1u64 << CAP_PERFMON_BIT)
+        | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
+    if multi && dynamic_multi && effective & narrow == narrow {
         effective & !(1u64 << CAP_SYS_ADMIN_BIT)
     } else {
         effective

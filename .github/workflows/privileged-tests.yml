@@ -1419,6 +1419,124 @@ jobs:
             ${{ github.workspace }}/witness-cli-out/vng-console.log
           if-no-files-found: warn
           retention-days: 7
+  # v0.7.0 run-tree CLI cells (tests/run_tree.rs): the command's
+  # descendants are followed in a dedicated cgroup, with ledger-exact
+  # counts. One matrix like witness-cli: the host runner kernel plus
+  # the four pinned guests; the guest legs run the same host-built test
+  # binary inside vng.
+  run-tree:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    strategy:
+      fail-fast: false
+      matrix:
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 shellcheck softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+          cc=$(dpkg-query -W -f='${Package}=${Version}\n' clang-18 gcc gcc-multilib libseccomp-dev llvm | sha256sum | cut -c1-16)
+          echo "cc=$cc" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            target/debug/.fingerprint
+            target/debug/build
+            target/debug/deps
+            target/debug/incremental
+          key: target-run-tree-${{ steps.keys.outputs.image }}-cc-${{ steps.keys.outputs.cc }}-${{ hashFiles('.release-rust-version', 'crates/ebpf/rust-toolchain.toml', 'Cargo.lock', 'crates/ebpf/Cargo.lock') }}
+      - name: Enable KVM and install pinned virtme-ng
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -c /dev/kvm
+          sudo chmod 0666 /dev/kvm
+          sudo apt-get install -y --no-install-recommends -o Acquire::Retries=5 busybox-static qemu-system-x86 qemu-utils seabios ipxe-qemu
+          pipx install "virtme-ng==$CI_VNG_VERSION"
+          bindir=$(pipx environment --value PIPX_BIN_DIR)
+          test "$("$bindir/vng" --version)" = "virtme-ng $CI_VNG_VERSION"
+          echo "$bindir" >>"$GITHUB_PATH"
+      - if: matrix.kernel != 'host'
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/virtme-ng/${{ matrix.kernel }}
+          key: vng-kernel-${{ matrix.kernel }}-vng-${{ env.CI_VNG_VERSION }}-${{ steps.keys.outputs.image }}
+      - name: Verify the kernel download
+        if: matrix.kernel != 'host'
+        shell: bash
+        run: |
+          vng --dry-run --run "${{ matrix.kernel }}" >/dev/null
+          VNGD="$HOME/.cache/virtme-ng/${{ matrix.kernel }}/amd64"
+          SUMS="$GITHUB_WORKSPACE/tests/fixtures/vng-kernel-sha256sums/${{ matrix.kernel }}.sums"
+          (cd "$VNGD" && sha256sum --check "$SUMS") || { echo "kernel integrity check failed: ${{ matrix.kernel }}" >&2; exit 1; }
+          test "$(cd "$VNGD" && ls -1q *.deb | wc -l)" -eq "$(wc -l < "$SUMS")" || { echo "kernel deb set changed: ${{ matrix.kernel }}" >&2; exit 1; }
+      - name: Build the run-tree test target
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain=$(cat .release-rust-version)
+          cargo +"$toolchain" build --locked --offline -p p11scope -p p11scope-discover
+          cargo +"$toolchain" test --locked --offline --no-run --test run_tree --message-format=json >"$RUNNER_TEMP/runtree-build.jsonl"
+          exe=$(jq -r 'select(.reason == "compiler-artifact" and .target.name == "run_tree" and (.target.kind | any(. == "test"))) | .executable' "$RUNNER_TEMP/runtree-build.jsonl" | grep -v '^null$' | tail -1)
+          test -x "$exe"
+          echo "RUNTREE_TESTBIN=$exe" >>"$GITHUB_ENV"
+      - name: Run the run-tree cells
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          out="$GITHUB_WORKSPACE/run-tree-out"
+          if [ "${{ matrix.kernel }}" = host ]; then
+            uname -a
+            sudo -n scripts/ci/run-run-tree.sh "$RUNTREE_TESTBIN" "$out/cells"
+            sudo -n chown -R "$(id -un):$(id -gn)" "$out"
+          else
+            scripts/ci/run-tree-vng.sh "$RUNTREE_TESTBIN" "$out" "${{ matrix.kernel }}"
+          fi
+          # The shared closed-set gate: the same 4 cells on every leg,
+          # all exact-positive.
+          python3 -I scripts/ci/check-cell-results.py "$out/cells/results.jsonl" \
+            --require privileged_run_tree_shell_wrapper_shows_grandchild_calls \
+            --require privileged_run_tree_double_fork_shows_reparented_calls \
+            --require privileged_run_tree_outliving_child_is_disclosed \
+            --require privileged_run_tree_many_children_land_exact
+      - name: Upload the run-tree results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: run-tree-${{ matrix.kernel }}
+          path: |
+            ${{ github.workspace }}/run-tree-out/cells/results.jsonl
+            ${{ github.workspace }}/run-tree-out/cells/summary.txt
+            ${{ github.workspace }}/run-tree-out/cells/*.log
+            ${{ github.workspace }}/run-tree-out/uname.txt
+            ${{ github.workspace }}/run-tree-out/run.log
+            ${{ github.workspace }}/run-tree-out/vng-console.log
+          if-no-files-found: warn
+          retention-days: 7
   # Real browsers: Firefox and Chromium started through Playwright with
   # a SoftHSM token, observed by the release binary as root, in strict
   # mode (a missing prerequisite fails instead of skipping).

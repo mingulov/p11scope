@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* C_GetInterface-needy fixture: C_GetInterface needs an AF_INET socket
  * and fails with CKR_DEVICE_ERROR when creation fails. Trusted records
  * every selection query with its result; isolated records each failure

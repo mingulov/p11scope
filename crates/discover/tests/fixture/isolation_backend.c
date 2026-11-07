@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Lazy backend for the isolation probe fixture. Never DT_NEEDED by the
  * probe; the probe's C_GetFunctionList dlopen's it by bare name (resolved
  * through the probe's $ORIGIN rpath).

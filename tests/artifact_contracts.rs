@@ -10259,7 +10259,7 @@ fn script_dirs() -> Vec<String> {
     found.sort();
     assert_eq!(
         found,
-        ["ci", "fixtures", "matrix", "native"],
+        ["ci", "demo", "fixtures", "matrix", "native"],
         "a new directory under scripts/: teach the UNRUN and self-test derivations \
          about it, or a privileged lane there is invisible to both"
     );
@@ -12299,9 +12299,9 @@ fn both_capture_loops_wire_behavioral_helpers_and_terminal_publication() {
         ),
         (
             "ev.settle_terminal(profile);",
-            "let frame = render::live_snapshot_scoped(",
+            "let mut frame = render::live_snapshot_scoped(",
         ),
-        ("let frame = render::live_snapshot_scoped(", "write_stdout("),
+        ("let mut frame = render::live_snapshot_scoped(", "write_stdout("),
     ] {
         require_before(
             profile_terminal,

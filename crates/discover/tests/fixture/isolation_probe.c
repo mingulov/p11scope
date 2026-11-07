@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Isolation probe fixture: the constructor probes accesses the isolated
  * profile fences (AF_INET socket creation, file creation beside the provider,
  * overwrite of a test-owned sibling) and reports each as a stderr marker,

@@ -65186,6 +65186,67 @@ fn truly_new_pid_with_stale_mark_still_admits_first() {
     );
 }
 
+/// Scarce ticks admit pending newcomers first: at a full view cap with
+/// no evictable view, a pid requested after the previous tick started
+/// (fresh pending) completes its probationary probe ahead of an older
+/// pending pid, which still completes on the next tick. The fresh pid
+/// has the HIGHER pid, so pid order alone would serve it last.
+#[test]
+fn scarce_tick_serves_fresh_pending_newcomer_before_older_backlog() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-fresh");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    let mut sleeps = e06_spawn_sleeps(2);
+    sleeps.sort_by_key(SystemScopeChildGuard::pid);
+    let older_pid = sleeps[0].pid();
+    let fresh_pid = sleeps[1].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(1));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    // The retained view owns its provider, so no eviction can free a
+    // slot: pending newcomers complete viewless (Lane-A P3) in window
+    // order, one per truncated tick.
+    assert!(
+        engine
+            .find_evictable_victim_for_selected(fresh_pid)
+            .is_none(),
+        "no victim: the retained view owns its provider"
+    );
+    let mut listing = vec![owner_pid, older_pid, fresh_pid];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(older_pid, Some(100)));
+    assert!(engine.request_refresh(fresh_pid, Some(200)));
+    // Stage the previous tick at 150: the older request (100) reads as
+    // backlog, the fresh one (200) as a newcomer.
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh_pid),
+        "the fresh pending newcomer completes first"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&older_pid),
+        "the older backlog pid waits another tick"
+    );
+    assert_eq!(
+        engine.probationary_completions, 1,
+        "exactly one viewless completion on the truncated tick"
+    );
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&older_pid),
+        "the older backlog pid completes next"
+    );
+    assert_eq!(engine.probationary_completions, 2);
+}
+
 fn opus_probe_view_pids(engine: &Engine) -> std::collections::BTreeSet<u32> {
     engine.views.iter().map(|view| view.pid()).collect()
 }

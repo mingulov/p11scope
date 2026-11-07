@@ -4555,6 +4555,16 @@ fn run_tree_scope_or_exact(
     }
 }
 
+/// Whether a run-tree discovery keeps its cgroup scope: the held
+/// child must have a live member view after discovery, or the run
+/// would capture an empty tree believing it is the command. Only a
+/// cgroup scope with no live view degrades (exact-PID scopes never
+/// consult discovery membership); the caller drops the group,
+/// re-discovers the exact child, and files the finite gap.
+fn run_tree_unretained_gap(_scope: &Scope, _retained: bool) -> Option<&'static str> {
+    None
+}
+
 /// Turns a run-end membership read into the published fact and gap: the
 /// survivor count when measured, a finite handed-back gap above zero,
 /// and a fail-closed gap when the membership itself could not be read.
@@ -4655,7 +4665,7 @@ fn run_owned_inner_with_host(
     // The barrier still holds the child: placement lands before its
     // first userspace instruction, and every failure still precedes
     // discovery, attach and the release.
-    let (scope, run_cgroup) = match pre_tree_group {
+    let (mut scope, mut run_cgroup) = match pre_tree_group {
         Some(group) => match group.place(pid) {
             Ok(()) => {
                 let (scope, group, gap) = run_tree_scope_or_exact(pid, group);
@@ -4711,12 +4721,28 @@ fn run_owned_inner_with_host(
     // On the run-tree scope discovery opens its own member views: the
     // held child must be among them, or the run would capture an empty
     // tree believing it is the command. The barrier still holds the
-    // child, so this fails as cleanly as the open above.
-    if matches!(scope, Scope::Cgroup { .. }) && !engine.retains_pid(pid) {
-        return Err(combine_setup_failure(
-            anyhow!("run: the owned child was not retained in the run cgroup scope"),
-            &mut child,
+    // child, so an unretained child degrades to the exact child with
+    // the finite gap — never a refusal of a runnable command. Dropping
+    // the group keeps the placed child inside it (the retention notice
+    // names the path, as on the scope-build degrade); the re-discovery
+    // below observes only the started command.
+    if run_tree_unretained_gap(&scope, engine.retains_pid(pid)).is_some() {
+        let stale = anyhow!("the owned child has no live member view");
+        emit_capture_diagnostic(&format!(
+            "p11scope: {}",
+            run_tree_gap_reason(
+                "the started command was not retained in the run cgroup scope",
+                &stale
+            )
         ));
+        drop(run_cgroup.take());
+        scope = Scope::Pid(pid);
+        run_tree_gap = Some(crate::render::RUN_TREE_DEGRADED.to_string());
+        let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
+            combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
+        })?;
+        engine = Engine::discover(&capture_args, &scope, Some(view))
+            .map_err(|error| combine_setup_failure(error, &mut child))?;
     }
     if let Some(reason) = run_tree_gap {
         engine.note_run_tree_gap(&reason, None);
@@ -14184,6 +14210,28 @@ mod tests {
             ),
             "the started command could not be placed in the run cgroup; \
              only the started command is observed"
+        );
+    }
+
+    #[test]
+    fn run_tree_unretained_child_degrades_only_cgroup_scope() {
+        let cgroup = crate::attach::Scope::Cgroup {
+            id: 1,
+            path: "/".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+        };
+        assert_eq!(
+            super::run_tree_unretained_gap(&cgroup, false),
+            Some(crate::render::RUN_TREE_DEGRADED)
+        );
+        assert_eq!(super::run_tree_unretained_gap(&cgroup, true), None);
+        assert_eq!(
+            super::run_tree_unretained_gap(&crate::attach::Scope::Pid(4242), false),
+            None
+        );
+        assert_eq!(
+            super::run_tree_unretained_gap(&crate::attach::Scope::System, true),
+            None
         );
     }
 

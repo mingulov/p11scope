@@ -1,0 +1,769 @@
+{
+  "schema": "p11scope/inventory/v1",
+  "scope": "pid:4242",
+  "clock": {
+    "basis": "CLOCK_MONOTONIC",
+    "unit": "ns"
+  },
+  "observation": {
+    "started_ns": 100,
+    "ended_ns": 200,
+    "passes": 1,
+    "usage_feed": true,
+    "lane": "native",
+    "native_witnesses": {
+      "rows": 2,
+      "bound": 2,
+      "unbound": 0,
+      "pending": 0,
+      "integrity": 0,
+      "unbound_reasons": {},
+      "placement": {
+        "edge": 2,
+        "module": 0,
+        "ambiguous": 0,
+        "unresolved": 0
+      }
+    }
+  },
+  "budgets": {
+    "callers": {
+      "limit": 4096,
+      "occupied": 2,
+      "refused": 0
+    },
+    "modules": {
+      "limit": 4096,
+      "occupied": 2,
+      "refused": 0
+    },
+    "edges": {
+      "limit": 32768,
+      "occupied": 2,
+      "refused": 0
+    },
+    "endpoints": {
+      "limit": 1048576,
+      "occupied": 8,
+      "refused": 0
+    },
+    "inventory_endpoints": {
+      "limit": 4096,
+      "occupied": 8,
+      "refused": 0
+    },
+    "inventory_attach_modules": {
+      "limit": 4096,
+      "occupied": 2,
+      "refused": 0
+    },
+    "counters": {
+      "cap": 18446744073709551615,
+      "observed_edges": 2,
+      "saturated_edges": 0
+    },
+    "semantic_state": {
+      "limit": 32768,
+      "occupied": 2,
+      "status": "observed",
+      "unknown_edges": 0,
+      "refused": 0
+    },
+    "retained_history": {
+      "limit": 1024,
+      "retained": 1,
+      "suppressed": 0
+    },
+    "native_preadmission": {
+      "limit": 4096,
+      "occupied": 0,
+      "refused": 0,
+      "pruned": 0
+    }
+  },
+  "callers": [
+    {
+      "id": "c0",
+      "pid": 4242,
+      "start_time": 1000,
+      "start_time_unit": "clock_ticks_since_boot",
+      "incarnation": 0,
+      "image": {
+        "authority": "scan_pinned",
+        "task_cookie": null,
+        "exec_id": null,
+        "exe": {
+          "dev": 1,
+          "ino": 100,
+          "mtime_secs": 10,
+          "mtime_nanos": 0,
+          "path": "/bin/driver"
+        },
+        "exec_observed": true
+      },
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "first_seen_ns": 110,
+      "last_seen_ns": 190,
+      "retired": false
+    },
+    {
+      "id": "c1",
+      "pid": 4243,
+      "start_time": 1005,
+      "start_time_unit": "clock_ticks_since_boot",
+      "incarnation": 0,
+      "image": {
+        "authority": "scan_pinned",
+        "task_cookie": null,
+        "exec_id": null,
+        "exe": {
+          "dev": 1,
+          "ino": 200,
+          "mtime_secs": 12,
+          "mtime_nanos": 0,
+          "path": "/usr/bin/signer"
+        },
+        "exec_observed": true
+      },
+      "lifecycle": "mapped",
+      "lifecycle_reason": null,
+      "first_seen_ns": 120,
+      "last_seen_ns": 195,
+      "retired": false
+    }
+  ],
+  "modules": [
+    {
+      "id": "m0",
+      "paths": [
+        "/opt/vendor/lib/pkcs11.so"
+      ],
+      "identity": {
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 100000,
+        "sha256": "1ff5c9fa5dd56dd556dcc7fa0e44f20a078015298119d76b3ef11833aa3a4a66",
+        "build_id": null,
+        "source": "workload"
+      },
+      "admission": {
+        "state": "admitted",
+        "class": "exact",
+        "endpoints": 4,
+        "reasons": [],
+        "note": "scan-only admission: manifest corroboration was not consulted",
+        "history": []
+      },
+      "lifecycle": "mapped",
+      "unloaded_observed": false,
+      "unbound_use": null
+    },
+    {
+      "id": "m1",
+      "paths": [
+        "/usr/lib/softokn/libsoftokn3.so"
+      ],
+      "identity": {
+        "device": {
+          "major": 8,
+          "minor": 1
+        },
+        "inode": 100001,
+        "sha256": "966c0e1e2ff57dd437d25f5cd7bdf3b96a0beb6ccedfaab063a7a497b80f4800",
+        "build_id": null,
+        "source": "workload"
+      },
+      "admission": {
+        "state": "admitted",
+        "class": "exact",
+        "endpoints": 4,
+        "reasons": [],
+        "note": "scan-only admission: manifest corroboration was not consulted",
+        "history": []
+      },
+      "lifecycle": "mapped",
+      "unloaded_observed": false,
+      "unbound_use": null
+    }
+  ],
+  "edges": [
+    {
+      "caller": "c0",
+      "module": "m0",
+      "mapping": {
+        "state": "mapped",
+        "evidence": "deep_scan",
+        "reason": null,
+        "first_seen_ns": 110,
+        "last_seen_ns": 190,
+        "interruptions": 0
+      },
+      "entries": {
+        "count": 40,
+        "saturated": false,
+        "cap": 18446744073709551615,
+        "first_seen_ns": 111,
+        "last_seen_ns": 189,
+        "in_flight": false,
+        "observation": "observed",
+        "coverage": {
+          "state": "counted",
+          "since_ns": 110,
+          "until_ns": null,
+          "first_ns": null,
+          "lossy": false,
+          "reason": null,
+          "detail": null
+        }
+      },
+      "semantics": "observed",
+      "mechanisms": [
+        {
+          "mechanism": 4231,
+          "mechanism_hex": "0x1087",
+          "name": "CKM_AES_GCM",
+          "operations": [
+            "decrypt",
+            "encrypt"
+          ],
+          "calls": 24,
+          "errors": 1,
+          "last_seen_ns": 189,
+          "evidence": {
+            "functions": [
+              "C_DecryptInit",
+              "C_EncryptInit"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              },
+              {
+                "rv": 48,
+                "rv_hex": "0x30",
+                "name": "CKR_DEVICE_ERROR"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "mechanism": 1,
+          "mechanism_hex": "0x1",
+          "name": "CKM_RSA_PKCS",
+          "operations": [
+            "decrypt"
+          ],
+          "calls": 12,
+          "errors": 0,
+          "last_seen_ns": 180,
+          "evidence": {
+            "functions": [
+              "C_DecryptInit"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "mechanism": 592,
+          "mechanism_hex": "0x250",
+          "name": "CKM_SHA256",
+          "operations": [
+            "digest"
+          ],
+          "calls": 4,
+          "errors": 0,
+          "last_seen_ns": 170,
+          "evidence": {
+            "functions": [
+              "C_DigestInit"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "mechanism": 23,
+          "mechanism_hex": "0x17",
+          "name": "CKM_ML_KEM",
+          "operations": [
+            "decapsulate",
+            "encapsulate"
+          ],
+          "calls": 2,
+          "errors": 0,
+          "last_seen_ns": 160,
+          "evidence": {
+            "functions": [
+              "C_Decapsulate",
+              "C_Encapsulate"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "mechanism": 2147483649,
+          "mechanism_hex": "0x80000001",
+          "name": null,
+          "operations": [
+            "sign"
+          ],
+          "calls": 3,
+          "errors": 3,
+          "last_seen_ns": 150,
+          "evidence": {
+            "functions": [
+              "C_SignInit"
+            ],
+            "returns": [
+              {
+                "rv": 113,
+                "rv_hex": "0x71",
+                "name": "CKR_MECHANISM_INVALID"
+              }
+            ],
+            "truncated": false
+          }
+        }
+      ],
+      "operations": null
+    },
+    {
+      "caller": "c1",
+      "module": "m1",
+      "mapping": {
+        "state": "mapped",
+        "evidence": "deep_scan",
+        "reason": null,
+        "first_seen_ns": 120,
+        "last_seen_ns": 195,
+        "interruptions": 0
+      },
+      "entries": {
+        "count": 10,
+        "saturated": false,
+        "cap": 18446744073709551615,
+        "first_seen_ns": 121,
+        "last_seen_ns": 194,
+        "in_flight": false,
+        "observation": "observed",
+        "coverage": {
+          "state": "counted",
+          "since_ns": 120,
+          "until_ns": null,
+          "first_ns": null,
+          "lossy": false,
+          "reason": null,
+          "detail": null
+        }
+      },
+      "semantics": "observed",
+      "mechanisms": [
+        {
+          "mechanism": 4231,
+          "mechanism_hex": "0x1087",
+          "name": "CKM_AES_GCM",
+          "operations": [
+            "encrypt"
+          ],
+          "calls": 8,
+          "errors": 0,
+          "last_seen_ns": 194,
+          "evidence": {
+            "functions": [
+              "C_EncryptInit"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              }
+            ],
+            "truncated": false
+          }
+        },
+        {
+          "mechanism": 4161,
+          "mechanism_hex": "0x1041",
+          "name": "CKM_ECDSA",
+          "operations": [
+            "sign"
+          ],
+          "calls": 5,
+          "errors": 0,
+          "last_seen_ns": 193,
+          "evidence": {
+            "functions": [
+              "C_SignInit"
+            ],
+            "returns": [
+              {
+                "rv": 0,
+                "rv_hex": "0x0",
+                "name": "CKR_OK"
+              }
+            ],
+            "truncated": false
+          }
+        }
+      ],
+      "operations": null
+    }
+  ],
+  "instances": [
+    {
+      "id": "i0",
+      "caller": "c0",
+      "module": "m0",
+      "state": "observed",
+      "reason": null,
+      "first_seen_ns": 110,
+      "last_seen_ns": 190
+    }
+  ],
+  "semantic_edges": [],
+  "object_observations": {
+    "version": 1,
+    "revision": 3,
+    "status": "populated",
+    "reason": "none",
+    "sessions": [
+      {
+        "session": 0,
+        "origin": "opened",
+        "status": "live"
+      }
+    ],
+    "objects": [
+      {
+        "object": 0,
+        "session": 0,
+        "origin": "created",
+        "creation": "generate_pair",
+        "birth": {
+          "start_ns": 130,
+          "end_ns": 131
+        },
+        "lifetime": "live",
+        "lifetime_reason": null,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "requested": {
+          "class": {
+            "status": "value",
+            "value": 3
+          },
+          "key_type": {
+            "status": "value",
+            "value": 0
+          },
+          "token": {
+            "status": "value",
+            "value": 0
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "established": {
+          "class": {
+            "status": "value",
+            "value": 3
+          },
+          "key_type": {
+            "status": "value",
+            "value": 0
+          },
+          "token": {
+            "status": "value",
+            "value": 0
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "value",
+            "value": 2048
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "queries": {
+          "class": "established",
+          "key_type": "established",
+          "token": "established",
+          "value_len": "not_queried",
+          "modulus_bits": "established",
+          "ec_params": "not_queried"
+        },
+        "label": "rsa_2048",
+        "successful_references": 6,
+        "successful_key_references": 6,
+        "accessing_sessions": 1
+      },
+      {
+        "object": 1,
+        "session": 0,
+        "origin": "created",
+        "creation": "generate",
+        "birth": {
+          "start_ns": 140,
+          "end_ns": 141
+        },
+        "lifetime": "live",
+        "lifetime_reason": null,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "requested": {
+          "class": {
+            "status": "value",
+            "value": 4
+          },
+          "key_type": {
+            "status": "value",
+            "value": 31
+          },
+          "token": {
+            "status": "value",
+            "value": 0
+          },
+          "value_len": {
+            "status": "value",
+            "value": 16
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "established": {
+          "class": {
+            "status": "value",
+            "value": 4
+          },
+          "key_type": {
+            "status": "value",
+            "value": 31
+          },
+          "token": {
+            "status": "value",
+            "value": 0
+          },
+          "value_len": {
+            "status": "value",
+            "value": 16
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "queries": {
+          "class": "established",
+          "key_type": "established",
+          "token": "established",
+          "value_len": "established",
+          "modulus_bits": "not_queried",
+          "ec_params": "not_queried"
+        },
+        "label": "aes_128",
+        "successful_references": 24,
+        "successful_key_references": 24,
+        "accessing_sessions": 1
+      },
+      {
+        "object": 2,
+        "session": 0,
+        "origin": "first_observed",
+        "creation": null,
+        "birth": null,
+        "lifetime": "live",
+        "lifetime_reason": null,
+        "attribution": "valid",
+        "attribution_reason": null,
+        "requested": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "established": {
+          "class": {
+            "status": "unknown",
+            "value": null
+          },
+          "key_type": {
+            "status": "unknown",
+            "value": null
+          },
+          "token": {
+            "status": "unknown",
+            "value": null
+          },
+          "value_len": {
+            "status": "unknown",
+            "value": null
+          },
+          "modulus_bits": {
+            "status": "unknown",
+            "value": null
+          },
+          "ec_params": {
+            "status": "unknown",
+            "value": null
+          }
+        },
+        "queries": {
+          "class": "not_queried",
+          "key_type": "not_queried",
+          "token": "not_queried",
+          "value_len": "not_queried",
+          "modulus_bits": "not_queried",
+          "ec_params": "not_queried"
+        },
+        "label": null,
+        "successful_references": 1,
+        "successful_key_references": 0,
+        "accessing_sessions": 1
+      }
+    ],
+    "key_operations": [
+      {
+        "instance": "i0",
+        "object": 0,
+        "category": "sign",
+        "role": "key",
+        "metadata_at_use": "rsa_2048",
+        "unit": "operations",
+        "started": 6,
+        "completed": 5,
+        "failed": 1,
+        "cancelled": 0,
+        "unknown": 0,
+        "active": 0,
+        "key_join_lost": 0
+      },
+      {
+        "instance": "i0",
+        "object": 1,
+        "category": "encrypt",
+        "role": "key",
+        "metadata_at_use": "aes_128",
+        "unit": "operations",
+        "started": 24,
+        "completed": 23,
+        "failed": 1,
+        "cancelled": 0,
+        "unknown": 0,
+        "active": 0,
+        "key_join_lost": 0
+      }
+    ],
+    "unknown_key_operations": [],
+    "gaps": {
+      "rows": [],
+      "suppressed": 0
+    },
+    "budgets": {
+      "key_rows": {
+        "limit": 65536,
+        "occupied": 2,
+        "refused": 0
+      },
+      "object_rows": {
+        "limit": 65536,
+        "occupied": 3,
+        "refused": 0
+      },
+      "unknown_rows": {
+        "occupied": 0
+      },
+      "encoded_bytes": 2048,
+      "allocation_refused": false,
+      "refusal_reason": "none"
+    }
+  },
+  "gaps": [
+    {
+      "caller": "c0",
+      "module": "m0",
+      "pid": 4242,
+      "subject": "fixture coverage unknown",
+      "reason": "crypto fixture carries synthetic semantic claims",
+      "budget": null,
+      "repeats": 1
+    }
+  ],
+  "gaps_suppressed": 0,
+  "pid_namespace": {
+    "observer": "initial",
+    "kernel_pids": "initial",
+    "proc_pids": "observer"
+  }
+}

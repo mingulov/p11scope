@@ -4943,4 +4943,17 @@ mod tests {
             "grant the minimal capability set (see 'minimal setcap') and retry"
         );
     }
+
+    /// `doctor` reports the invoking snapshot `main` recorded before the
+    /// startup drop, not the dropped live set: with a snapshot set the
+    /// capability read returns it, and clearing restores live reads.
+    #[test]
+    fn doctor_cap_read_prefers_invoking_snapshot() {
+        let _guard = crate::caps::snapshot_test_guard();
+        crate::caps::clear_invoking_effective_for_test();
+        crate::caps::set_invoking_effective(0xdeadbeef);
+        assert_eq!(read_cap_eff(), Ok(0xdeadbeef));
+        crate::caps::clear_invoking_effective_for_test();
+        assert_ne!(read_cap_eff().ok(), Some(0xdeadbeef));
+    }
 }

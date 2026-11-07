@@ -1560,38 +1560,17 @@ impl JointStaging {
         reducer.invalidate_with_effects(&mut tee);
     }
 
-    /// Dispose every retained payload once as history-only: counted,
-    /// frontier-advanced, never reduced, never re-staged. Every
-    /// ticket and byte releases to the shared ledger when present,
-    /// else pends for the next ledger contact (C4).
-    fn drain_staged(
-        &mut self,
-        mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
-    ) -> usize {
-        // `release_or_pend` borrows `self`, so pop heads one at a
-        // time instead of draining under the ledger borrow.
-        let mut disposed = 0;
-        while let Some(call) = self.staged.pop_front() {
-            let bytes = call.charged_bytes();
-            let position = call.position;
-            let native = call.resource_native;
-            drop(call);
-            self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
-            self.frontier = self.frontier.max(position);
-            self.history_disposed = self.history_disposed.saturating_add(1);
-            disposed += 1;
-        }
-        disposed
-    }
-
     /// Replay every retained payload once in original H3 order
     /// through ordinary S1 (S1Only: no receipts — fallback rows are
     /// unknown-key, never invented object facts), reserving H3
     /// resources per replay (N14). Effects feed the key-use reducer
     /// too. Releases to the ledger when present, else pends for the
     /// next ledger contact (C4). On mid-fallback resource refusal,
-    /// live S1 invalidates with terminals teed (no leaked opens) and
-    /// this head plus every remaining payload disposes as history.
+    /// live S1 invalidates with terminals teed (no leaked opens),
+    /// the failed head disposes as history, and every remaining
+    /// payload disposes with its observed S1 completion preserved as
+    /// an unknown-key row beside the counted `record_lost` (throwaway
+    /// S1 — live stays invalidated, exactly like the seal-loss arms).
     /// Returns the replay count plus per-edge bound refusals.
     fn replay_staged<S: OperationSink>(
         &mut self,
@@ -1656,7 +1635,20 @@ impl JointStaging {
                 self.release_or_pend(ledger.as_deref_mut(), position, bytes, native);
             }
             if failed {
-                self.drain_staged(ledger);
+                // Live S1 is already invalidated above, so the
+                // throwaway preservation applies unchanged: the
+                // remainder rows unknown-key beside its counted
+                // loss. Without any association ledger (direct
+                // unit-test delivery only) this stays pure
+                // counts-only, like the seal-loss arms.
+                self.preserve_and_dispose_below_barrier(
+                    None,
+                    ledger,
+                    instance,
+                    &mut *keyuse,
+                    None,
+                    assoc_fallback,
+                );
                 break;
             }
         }

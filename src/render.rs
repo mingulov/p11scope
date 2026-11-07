@@ -6077,7 +6077,7 @@ pub(crate) mod tests {
             },
             Skipped {
                 subject: "discovery subject".into(),
-                reason: "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached".into(),
+                reason: crate::discovery::identity::AMBIGUOUS_REASON.into(),
             },
         ];
         let mut ev = evidence();

@@ -522,7 +522,7 @@ pub(crate) fn tmpfs_nonunique_kind(super_options: Option<&str>) -> Option<&'stat
     // collision it risks needs billions of allocations plus an exact
     // pin match.
     match super_options {
-        None => Some("tmpfs-unresolved"),
+        None => Some(TMPFS_UNRESOLVED_KIND),
         Some(options) if options.split(',').any(|token| token == "inode32") => {
             Some("tmpfs-inode32")
         }
@@ -6363,7 +6363,9 @@ mod conservative_copy {
 }
 
 const AMBIGUOUS_SUBJECT: &str = "discovery subject";
-const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal, unavailable, or unproven (inode numbers not unique) full opened-file identities; the collision group was not attached";
+/// The internal ambiguity skip reason, shared with renderers and fixtures
+/// so a rewording cannot silently drift from the production text.
+pub(crate) const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal, unavailable, or unproven (inode numbers not unique) full opened-file identities; the collision group was not attached";
 
 fn ambiguous_identity_skip() -> Skipped {
     Skipped {

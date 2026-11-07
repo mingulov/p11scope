@@ -469,6 +469,10 @@ inode, size and change time) and snapshot twins (which keep inode number,
 size, change time and content) no longer share inspections or merge; each
 case is covered by an automated privileged cell. What remains:
 
+- Two Btrfs snapshot copies of one provider mapped at the same time
+  (for example two containers from one image on the btrfs storage driver)
+  are not attached; /proc maps shows one device and inode for both, so
+  the group is refused with an ambiguity gap.
 - A provider on a filesystem without unique inode numbers is not attached
   once two processes map it or it is rescanned: the second observation
   refuses the whole collision group (drops it, with an ambiguity gap)
@@ -476,7 +480,7 @@ case is covered by an automated privileged cell. What remains:
   sshfs, fuse-overlayfs), NFS, SMB/CIFS/SMB2, 9p, Ceph, AFS, Coda, tmpfs
   mounted `inode32`, and tmpfs whose mount cannot be resolved (including a
   container tmpfs seen through the observer's mount table, which is
-  classified at pin time from the observer's table).
+  classified from the observer's table).
 - On kernels built without CONFIG_TMPFS_INODE64, tmpfs uses 32-bit inode
   numbers that can repeat after about 4 billion files on one mount;
   p11scope treats them as unique there.
@@ -488,8 +492,9 @@ case is covered by an automated privileged cell. What remains:
 - Four checks still compare `(st_dev, st_ino)` without refusing on
   non-unique filesystems: the deep-scan mapped-file guard, the
   same-object mapping short-circuit, retained-kernel-file comparison,
-  and `--exclude-path` matching. A detail toggle on such a filesystem
-  reports `Foreign` instead of `Changed` when the pin changed.
+  and `--exclude-module` path matching. A detail toggle on such a
+  filesystem reports the provider as another file instead of a changed one
+  when the pin changed.
 - The inspection cache is never cleared within a capture: a device number
   reused after a Btrfs subvolume delete plus snapshot, or a squashfs image
   re-attached on a reused loop device, can hand one file's cached digest

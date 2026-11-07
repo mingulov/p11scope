@@ -2025,14 +2025,20 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
     )
 }
 
-/// The sweep-refusal gap reason for an object on a filesystem without
-/// unique inode numbers: names the filesystem kind and why sweep
-/// matching cannot use it. Pure so the per-kind wording is unit-testable.
+/// The sweep-refusal gap reason for an object sweep matching cannot use:
+/// names where the object lives and why. A tmpfs mount whose options
+/// could not be read is unproven, not non-unique, so it gets its own
+/// wording instead of the filesystem-kind sentence. Pure so the per-kind
+/// wording is unit-testable.
 fn refused_sweep_gap_reason(filesystem: &str) -> String {
+    let place = if filesystem == crate::discovery::identity::TMPFS_UNRESOLVED_KIND {
+        "a tmpfs mount whose options could not be read, so inode uniqueness is unproven".to_owned()
+    } else {
+        format!("a {filesystem} filesystem, whose inode numbers are not unique")
+    };
     format!(
-        "on a {filesystem} filesystem, whose inode numbers are not unique: processes past the \
-         deep-scan cap are never matched to it by device and inode, so only deep \
-         scans attribute it"
+        "on {place}: processes past the deep-scan cap are never matched to it by device and \
+         inode, so only deep scans attribute it"
     )
 }
 

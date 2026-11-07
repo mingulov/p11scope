@@ -24,7 +24,8 @@ import sys
 import tempfile
 
 REFUSAL_LEADS = (
-    "live capture needs root: ",
+    "live capture needs CAP_",
+    "live capture refused: ",
     "live capture unavailable: ",
     "live capture did not start: ",
 )

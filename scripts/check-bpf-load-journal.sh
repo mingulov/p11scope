@@ -496,7 +496,7 @@ PY
         # Refusal control: the finite pre-Multi refusal, no loaded
         # journal row, no crash. A load or a crash is FAIL.
         REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs root\|unavailable\|did not start\):' "$J_TXT"; then
+        if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs CAP_\|refused:\|unavailable:\|did not start:\)' "$J_TXT"; then
             add_reason "finite live-capture refusal missing"
         fi
         if [ "$J_RC" = 0 ]; then

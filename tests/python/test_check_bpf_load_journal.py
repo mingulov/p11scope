@@ -796,7 +796,7 @@ class ScriptContractTests(unittest.TestCase):
 
     def test_names_the_finite_refusal_reasons(self):
         self.assertIn("journal-pair-unavailable-in-build", self.text)
-        self.assertIn("live capture \\(needs root\\|unavailable\\|did not start\\):", self.text)
+        self.assertIn("live capture \\(needs CAP_\\|refused:\\|unavailable:\\|did not start:\\)", self.text)
 
     def test_runs_one_bounded_guest_per_kernel(self):
         self.assertIn("vng --run", self.text)

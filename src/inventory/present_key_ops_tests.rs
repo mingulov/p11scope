@@ -1315,6 +1315,51 @@ fn joint_birth_gap_renders_plain_words_with_machine_reason() {
     );
 }
 
+/// A refused image stays S1 with a truthful plain reason: its calls
+/// shed (or its records proved unusable) before tracking could cover
+/// them, so per-key tracking cannot start from its first call. The
+/// old "image changed" wording blamed an exec that never happened.
+#[test]
+fn joint_refused_image_gap_names_untracked_prefix_not_an_image_change() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(3, "bootstrap_unavailable"));
+    for reason in ["joint_image_refused", "joint_birth_claim_ImageTainted"] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+            reason: reason.into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("process was not tracked from its first call"),
+        "{concise}"
+    );
+    assert!(
+        !concise.contains("process image changed before tracking could start"),
+        "stale exec-blaming text leaked: {concise}"
+    );
+    assert!(
+        !concise.contains("joint_image_refused")
+            && !concise.contains("joint_birth_claim_ImageTainted"),
+        "machine reasons leaked to concise: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("process was not tracked from its first call"),
+        "{verbose}"
+    );
+    assert!(verbose.contains("(joint_image_refused)"), "{verbose}");
+    assert!(
+        verbose.contains("(joint_birth_claim_ImageTainted)"),
+        "{verbose}"
+    );
+}
+
 /// Item 14: when --key-operations was requested but per-key tracking did
 /// not start, the line names the request and the cause; without the
 /// request gap it stays "not reported (per-key tracking is off)".

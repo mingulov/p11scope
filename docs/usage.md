@@ -1182,6 +1182,19 @@ Limits that matter in pods:
   in the observed window rows with type `unknown` until an observed
   attribute call establishes it),
   and anything that cannot be attributed is counted beside the rows.
+  Callers that exit before the observer admits them semantically —
+  typical for test suites that spawn one short-lived process per test —
+  cannot contribute rows: calls collected before admission shed instead
+  of joining, and count under `not attributed`
+  (`foreign_or_unproven_caller`) plus `semantic calls unrouted` gaps.
+  The terminal `callers never admitted` gap counts how many callers
+  with provider edges exited without admission, and the companion
+  `admitted callers with no joined calls` gap counts admitted callers
+  that exited before any of their calls joined. `--track-short-lived`
+  widens discovery matching only; it never admits callers
+  semantically, so it does not recover these rows either. Prefer
+  longer-lived callers when per-key rows matter; see the known
+  limitations for the design boundary.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited

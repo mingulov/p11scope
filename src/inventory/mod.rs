@@ -6384,6 +6384,15 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
         // The counted short-lived gap stages beside the named disclosure.
         self.coordinator.note_short_lived_never_scanned();
+        // The counted never-admitted gap stages from stop-time
+        // records: retired subset-edged callers no subset instance
+        // ever covered. Its without-joins companion counts retired
+        // subset-instanced callers with zero joined calls. Only when
+        // a semantic lane exists (no lane, no admission to miss).
+        if let Some(lane) = self.semantic.as_ref() {
+            self.coordinator.note_callers_never_admitted(lane);
+            self.coordinator.note_admitted_callers_without_joins(lane);
+        }
         // Terminal pre-arm close, staged before the loop's final commit so
         // the staged changed-identity gap publishes with it (no extra plain
         // commit). Uses the frozen probe result and stop boundary from

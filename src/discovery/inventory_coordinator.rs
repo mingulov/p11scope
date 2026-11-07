@@ -182,6 +182,21 @@ pub(crate) const MAX_PENDING_EXEC_NEWCOMERS: usize = 4096;
 /// enumerated. Pinned verbatim by the coordinator tests below.
 pub(crate) const SHORT_LIVED_NEVER_SCANNED_SUBJECT: &str = "short-lived processes never scanned";
 
+/// Terminal gap subject for callers that exited without semantic
+/// admission: discovery mapped a provider for them, but no semantic
+/// instance was ever registered, so none of their pre-admission calls
+/// could join. Pinned verbatim by the semantics tests.
+pub(crate) const CALLERS_NEVER_ADMITTED_SUBJECT: &str = "callers never admitted";
+
+/// Terminal gap subject for callers that were admitted but exited
+/// with zero joined calls: an instance was registered, yet none of
+/// their calls ever joined, so no row can name them. The companion
+/// to [`CALLERS_NEVER_ADMITTED_SUBJECT`]: together the two terminal
+/// counts cover every retired subset caller that contributed no
+/// row. Pinned verbatim by the semantics tests.
+pub(crate) const ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT: &str =
+    "admitted callers with no joined calls";
+
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
 /// programs were never enumerated twice in a row or were listed only as
 /// exited before their scan, so no scan ever examined them; `untracked`
@@ -199,6 +214,33 @@ pub(crate) fn short_lived_never_scanned_reason(confirmed: u64, untracked: u64) -
         ));
     }
     reason
+}
+
+/// Terminal wording for the never-admitted caller count: `missed`
+/// retired callers held a provider edge but no semantic instance was
+/// ever registered for them, so their pre-admission calls shed instead
+/// of joining. The shed calls themselves are counted beside the rows
+/// (unrouted gaps and not-attributed tallies), never guessed per key.
+/// Pinned verbatim by the semantics tests.
+pub(crate) fn callers_never_admitted_reason(missed: u64) -> String {
+    format!(
+        "{missed} caller(s) with provider edges exited before semantic admission; \
+         their pre-admission calls shed instead of joining (counted under \
+         semantic-calls-unrouted and not-attributed)"
+    )
+}
+
+/// Terminal wording for the admitted-without-joins count: `missed`
+/// retired callers held a subset instance yet exited with zero
+/// joined calls, so no row can name them. The unjoined calls stay
+/// counted beside the rows, never guessed per key. Pinned verbatim
+/// by the semantics tests.
+pub(crate) fn admitted_without_joins_reason(missed: u64) -> String {
+    format!(
+        "{missed} admitted caller(s) exited with zero joined calls; \
+         none of their calls joined (counted under \
+         semantic-calls-unrouted and not-attributed)"
+    )
 }
 
 /// Per-pid authority resolution with a native open attempt: the open is
@@ -578,6 +620,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// EXEC arrivals dropped while the pending map was full:
     /// unreconciled, disclosed beside the confirmed count, then drained.
     short_lived_untracked: u64,
+    /// The terminal never-admitted disclosure already ran: the count is
+    /// computed from stop-time records, so a repeated terminal call must
+    /// stay silent instead of staging the aggregate gap twice.
+    reported_callers_never_admitted: bool,
+    /// The terminal admitted-without-joins disclosure already ran:
+    /// same stop-time rule as its never-admitted companion.
+    reported_admitted_without_joins: bool,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -946,6 +995,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             pending_exec_newcomers: BTreeMap::new(),
             short_lived_never_scanned: 0,
             short_lived_untracked: 0,
+            reported_callers_never_admitted: false,
+            reported_admitted_without_joins: false,
             completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -8973,6 +9024,134 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.note_scope_gap(
             SHORT_LIVED_NEVER_SCANNED_SUBJECT.into(),
             short_lived_never_scanned_reason(confirmed, untracked),
+        );
+        true
+    }
+
+    /// Terminal aggregate for callers the semantic lane never
+    /// admitted: retired records holding an edge to a subset module
+    /// with no registered instance on any subset module. An instance
+    /// on another module does not exclude: the caller was never
+    /// admitted to the observed provider set. Their pre-admission
+    /// calls shed instead of joining, so this counts the missed
+    /// callers the per-key view cannot name; the shed calls
+    /// themselves stay counted beside the rows. Computed from
+    /// stop-time records (a repeated terminal call stays silent). No
+    /// completed-scan guard: a zero-pass run holds no records, so the
+    /// missed count is structurally zero and the call stays silent.
+    /// True when anything staged, so the tail can publish it.
+    pub(crate) fn note_callers_never_admitted(&mut self, lane: &AttestedSemanticLane) -> bool {
+        if self.reported_callers_never_admitted {
+            return false;
+        }
+        self.reported_callers_never_admitted = true;
+        let required = lane.subset().required();
+        if required.is_empty() {
+            return false;
+        }
+        let subset_modules: BTreeSet<ModuleId> = self
+            .registry
+            .modules()
+            .filter(|module| {
+                required
+                    .keys()
+                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
+            })
+            .map(|module| module.id)
+            .collect();
+        if subset_modules.is_empty() {
+            return false;
+        }
+        let subset_instanced: BTreeSet<CallerId> = self
+            .registry
+            .instances()
+            .filter(|record| subset_modules.contains(&record.module))
+            .map(|record| record.caller)
+            .collect();
+        let mut missed = 0u64;
+        for record in self.adapter.records().filter(|record| record.retired) {
+            if subset_instanced.contains(&record.id) {
+                continue;
+            }
+            if self
+                .registry
+                .edges_of(record.id)
+                .any(|edge| subset_modules.contains(&edge.module))
+            {
+                missed = missed.saturating_add(1);
+            }
+        }
+        if missed == 0 {
+            return false;
+        }
+        self.note_scope_gap(
+            CALLERS_NEVER_ADMITTED_SUBJECT.into(),
+            callers_never_admitted_reason(missed),
+        );
+        true
+    }
+
+    /// Terminal aggregate for callers the semantic lane admitted but
+    /// whose calls never joined: retired records holding a subset
+    /// instance with zero joined calls on every instance anywhere
+    /// (`api_returns` counts every applied call, so None or zero
+    /// means nothing joined). The subset instance proves subset
+    /// contact, so no edge check applies; the join check stays
+    /// global so the published "zero joined calls" holds
+    /// literally. Together with
+    /// [`Self::note_callers_never_admitted`] this covers every
+    /// retired subset caller that contributed no row anywhere.
+    /// Computed from stop-time records (a repeated terminal call
+    /// stays silent), with the same structural zero-pass silence.
+    /// True when anything staged, so the tail can publish it.
+    pub(crate) fn note_admitted_callers_without_joins(
+        &mut self,
+        lane: &AttestedSemanticLane,
+    ) -> bool {
+        if self.reported_admitted_without_joins {
+            return false;
+        }
+        self.reported_admitted_without_joins = true;
+        let required = lane.subset().required();
+        if required.is_empty() {
+            return false;
+        }
+        let subset_modules: BTreeSet<ModuleId> = self
+            .registry
+            .modules()
+            .filter(|module| {
+                required
+                    .keys()
+                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
+            })
+            .map(|module| module.id)
+            .collect();
+        if subset_modules.is_empty() {
+            return false;
+        }
+        let mut subset_instanced: BTreeSet<CallerId> = BTreeSet::new();
+        let mut joined: BTreeSet<CallerId> = BTreeSet::new();
+        for row in self.registry.instance_semantic_edges() {
+            if row.api_returns.unwrap_or(0) > 0 {
+                joined.insert(row.caller);
+            }
+            if subset_modules.contains(&row.module) {
+                subset_instanced.insert(row.caller);
+            }
+        }
+        let mut missed = 0u64;
+        for record in self.adapter.records().filter(|record| record.retired) {
+            if !subset_instanced.contains(&record.id) || joined.contains(&record.id) {
+                continue;
+            }
+            missed = missed.saturating_add(1);
+        }
+        if missed == 0 {
+            return false;
+        }
+        self.note_scope_gap(
+            ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT.into(),
+            admitted_without_joins_reason(missed),
         );
         true
     }

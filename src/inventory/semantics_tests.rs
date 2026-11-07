@@ -7075,6 +7075,519 @@ fn native_semantic_failed_refresh_attempts_remain_bounded_and_fair() {
     );
 }
 
+/// Terminal never-admitted disclosure: a retired caller with a
+/// subset edge and no registered instance counts exactly once; a
+/// repeated terminal call stays silent.
+#[test]
+fn retired_subset_edged_callers_without_instances_count_as_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(scene.coordinator.note_callers_never_admitted(&lane));
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::CALLERS_NEVER_ADMITTED_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("1 caller(s)"),
+        "the gap counts the missed caller: {}",
+        found.reason
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "a repeated terminal call stays silent"
+    );
+}
+
+/// A retired subset-edged caller with a registered instance was
+/// admitted: the never-admitted disclosure stays silent.
+#[test]
+fn instanced_retired_callers_stay_silent_for_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428351,
+        exec_id: 824619,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745021),
+        module,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(key, caller),
+    );
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "an instanced caller was admitted"
+    );
+}
+
+/// A live subset-edged caller without an instance is not missed yet:
+/// the run ended before admission, not the caller.
+#[test]
+fn live_uninstanced_callers_stay_silent_for_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        !scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the child stays live"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "a live caller is not a miss"
+    );
+}
+
+/// A retired caller edged only to a non-subset module never fell in
+/// the lane's scope: the never-admitted disclosure stays silent.
+#[test]
+fn retired_non_subset_edged_callers_stay_silent_for_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let other = ModuleKey::physical(9, 9, 999, Some("ab".repeat(32)), "/other-provider.so");
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &other, "/other-provider.so", 200);
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "a non-subset edge is out of scope"
+    );
+}
+
+/// A retired caller with no provider edge is a discovery-level miss,
+/// not a semantic one: the never-admitted disclosure stays silent.
+#[test]
+fn retired_edgeless_callers_stay_silent_for_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "an edgeless caller is not a semantic miss"
+    );
+}
+
+/// Terminal admitted-without-joins disclosure: a retired caller with
+/// a subset instance and zero joined calls counts exactly once; a
+/// repeated terminal call stays silent. The instance excludes it
+/// from the never-admitted disclosure.
+#[test]
+fn retired_subset_instanced_callers_without_joins_count_as_admitted_without_joins() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428351,
+        exec_id: 824619,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745021),
+        module,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(key, caller),
+    );
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "an instanced caller is not never-admitted"
+    );
+    assert!(scene.coordinator.note_admitted_callers_without_joins(&lane));
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("1 admitted caller(s)"),
+        "the gap counts the missed caller: {}",
+        found.reason
+    );
+    assert!(
+        !scene.coordinator.note_admitted_callers_without_joins(&lane),
+        "a repeated terminal call stays silent"
+    );
+}
+
+/// A retired subset-instanced caller with a joined call contributed
+/// a row: both terminal disclosures stay silent.
+#[test]
+fn instanced_callers_with_joins_stay_silent_for_admitted_without_joins() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428352,
+        exec_id: 824620,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745022),
+        module,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+            key.clone(),
+            caller,
+        ),
+    );
+    scene.coordinator.registry_mut().observe_instance_semantic(
+        crate::discovery::caller_registry::instance_input::AdmittedInstanceCall::scripted(
+            key,
+            caller,
+            1,
+            crate::semantics_edge::SemanticCall {
+                function: "C_Sign".into(),
+                rv: 0,
+                session: 7,
+                mechanism: 1,
+                capture: p11scope_ebpf_common::capture::MECHANISM_VALUE
+                    | p11scope_ebpf_common::capture::OUTPUT_NON_NULL,
+                ..crate::semantics_edge::SemanticCall::default()
+            },
+        ),
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert_eq!(
+        scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .find(|row| row.caller == caller)
+            .expect("the observed call retains an edge")
+            .api_returns,
+        Some(1),
+        "the scripted call joins"
+    );
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "an instanced caller is not never-admitted"
+    );
+    assert!(
+        !scene.coordinator.note_admitted_callers_without_joins(&lane),
+        "a caller with a joined call contributed"
+    );
+}
+
+/// A live subset-instanced caller without joins is not missed yet:
+/// the run ended before its calls, not the caller.
+#[test]
+fn live_instanced_callers_without_joins_stay_silent_for_admitted_without_joins() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428353,
+        exec_id: 824621,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745023),
+        module,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(key, caller),
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        !scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the child stays live"
+    );
+    assert!(
+        !scene.coordinator.note_admitted_callers_without_joins(&lane),
+        "a live caller is not a miss"
+    );
+}
+
+/// A retired caller instanced only on a non-subset module never fell
+/// in the lane's scope: both terminal disclosures stay silent.
+#[test]
+fn retired_foreign_instanced_callers_stay_silent_for_admitted_without_joins() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let other = ModuleKey::physical(9, 9, 999, Some("ab".repeat(32)), "/other-provider.so");
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &other, "/other-provider.so", 200);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428354,
+        exec_id: 824622,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745024),
+        other,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(key, caller),
+    );
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "a non-subset edge is out of scope"
+    );
+    assert!(
+        !scene.coordinator.note_admitted_callers_without_joins(&lane),
+        "a foreign instance is out of scope"
+    );
+}
+
+/// A retired subset-edged caller instanced only elsewhere was never
+/// admitted to the observed provider set: the never-admitted
+/// disclosure counts it, the without-joins disclosure stays silent.
+#[test]
+fn retired_subset_edged_callers_with_only_foreign_instances_count_as_never_admitted() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let other = ModuleKey::physical(9, 9, 999, Some("ab".repeat(32)), "/other-provider.so");
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    scene.map_module(caller, child.id(), &other, "/other-provider.so", 210);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428355,
+        exec_id: 824623,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745025),
+        other,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(key, caller),
+    );
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(
+        !scene.coordinator.note_admitted_callers_without_joins(&lane),
+        "a foreign instance is out of scope"
+    );
+    assert!(scene.coordinator.note_callers_never_admitted(&lane));
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::CALLERS_NEVER_ADMITTED_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("1 caller(s)"),
+        "the gap counts the missed caller: {}",
+        found.reason
+    );
+}
+
 #[test]
 fn native_semantic_refresh_picks_share_one_registry_scan() {
     // Two attested providers, six callers alternating between them. Every

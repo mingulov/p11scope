@@ -407,6 +407,31 @@ new untracked caller keeps the plain per-call view with the same
 tracked callers are unaffected. At one new foreign client every 3 seconds
 that is about 14 hours of capture.
 
+When callers with provider edges exit before semantic admission
+completes — the common shape for suites that spawn one short-lived
+process per test — the terminal `callers never admitted` gap counts
+them. Callers admitted after their calls were already collected shed
+those calls the same way; the terminal `admitted callers with no
+joined calls` gap counts them. Their unjoined calls shed instead of
+joining (counted under `semantic calls unrouted` and the
+key-operations `not attributed` tallies), so no per-key rows can name
+them even though discovery saw their provider mappings. This is a
+design boundary, not a missed observation: a collected capture fixes
+each batch's binding set when the batch is collected, so calls from a
+caller the observer has not admitted yet cannot wait for a later
+pass. Longer-lived callers row normally once admitted. What
+matters is when the calls happen, not just how long the process
+lives: a process whose only call runs milliseconds after exec sheds
+it even if it then sleeps for seconds, while sustained calling after
+admission rows.
+
+Processes that exit before any scan examines them (tens to hundreds
+of milliseconds on a loaded host) never gain caller records at all:
+they count only in the aggregate `short-lived processes never
+scanned` gap together with ambient churn, not in the per-caller
+gaps above. Per-caller attribution below the discovery floor needs
+exit-time identity the observer does not retain by default.
+
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
 missed, with no marker in the output; restarting such processes is the

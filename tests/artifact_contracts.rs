@@ -11480,7 +11480,8 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
 /// IMAGE <p11scope args>` must reach p11scope, while the in-cluster entry
 /// script stays available by explicit name for `kubectl exec`. The image
 /// stays minimal (one digest-pinned base, the staged static binary, the
-/// entry script) and keeps its build-time smoke of both.
+/// entry script, the license texts) and keeps its build-time smoke of the
+/// binaries and the licenses.
 #[test]
 fn observer_image_runs_p11scope_by_default() {
     let dockerfile = read("deploy/Dockerfile.observer");
@@ -11489,8 +11490,11 @@ fn observer_image_runs_p11scope_by_default() {
         "CMD [\"--help\"]",
         "COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope",
         "COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry",
+        "COPY LICENSE /usr/share/licenses/p11scope/LICENSE",
+        "COPY LICENSES/ /usr/share/licenses/p11scope/LICENSES/",
         "/usr/local/bin/p11scope --help >/dev/null",
         "/usr/local/bin/k8s-profile-entry --self-test",
+        "test -f /usr/share/licenses/p11scope/LICENSE",
     ] {
         require_contract_marker(&dockerfile, marker, "observer image")
             .expect("observer image contract");

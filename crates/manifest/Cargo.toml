@@ -1,6 +1,7 @@
 [package]
 name = "p11scope-manifest"
 version = "0.0.0"
+authors = ["Denis Mingulov <denis@mingulov.com>"]
 edition = "2024"
 rust-version = "1.99"
 license = "GPL-3.0-or-later"

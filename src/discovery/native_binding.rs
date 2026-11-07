@@ -52,8 +52,9 @@
 //! retired); and no exec, recorded PID reuse, lost lifecycle evidence,
 //! or competing image is recorded at or after its admission. The
 //! fallback runs under PID scope only: the kernel binds PID-scope entry
-//! probes to the original task, so a row read before admission is still
-//! its use even if the pid is reused later. The holder count is
+//! probes to the original task, so a row recorded while the original
+//! task lived is still its use even if the pid is reused later. The
+//! holder count is
 //! evaluated once, when the row is read: a second holder admitted fresh
 //! after the noticed exit (no reuse recorded) does not void the
 //! binding, while a reuse recorded at or after the admission voids it
@@ -721,10 +722,11 @@ impl NativeBinder {
     }
 
     /// Sync whether BPF hook stamps and admission stamps share a clock
-    /// (the coordinator calls this on every staged batch, before any
-    /// absorption or decision, so a decision always sees the current
-    /// value — including a row read while comparable and decided after
-    /// the clocks went incomparable).
+    /// (the coordinator calls this on every staged batch and immediately
+    /// when the clocks go incomparable, before any absorption or decision,
+    /// so a decision always sees the current value — including a row read
+    /// while comparable and decided after the clocks went incomparable,
+    /// and a revalidation that runs before the next batch).
     pub(crate) fn set_exit_clocks_comparable(&mut self, comparable: bool) {
         self.exit_clocks_comparable = comparable;
     }

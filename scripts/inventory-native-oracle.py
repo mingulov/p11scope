@@ -933,7 +933,9 @@ def coverage_ok(edge):
     state (O5, grounded in inventory/mod.rs coverage_json: until_ns only on
     a watched interval — never on counted — since_ns on counted and
     watched, first_ns on witnessed, lossy on counted; anything else is
-    an invented boundary)."""
+    an invented boundary). A counted feed whose sole loss cause is a clean
+    PID-target exit carries that detail with lossy True; any other counted
+    detail is malformed."""
     cov = edge.get("entries", {}).get("coverage")
     if not (isinstance(cov, dict) and set(cov) == COVERAGE_KEYS and cov.get("state") in COVERAGE_STATES):
         return False
@@ -942,8 +944,12 @@ def coverage_ok(edge):
     first, lossy = cov.get("first_ns"), cov.get("lossy")
     reason, detail = cov.get("reason"), cov.get("detail")
     if state == "counted":
-        return (isinstance(since, int) and until is None and first is None
-                and isinstance(lossy, bool) and reason is None and detail is None)
+        if not (isinstance(since, int) and until is None and first is None
+                and isinstance(lossy, bool) and reason is None):
+            return False
+        if detail is None:
+            return True
+        return lossy is True and detail == "the PID target exited"
     if state == "witnessed":
         return (since is None and until is None and isinstance(first, int)
                 and lossy is None and reason is None and detail is None)

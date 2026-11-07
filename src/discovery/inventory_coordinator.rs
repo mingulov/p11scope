@@ -3153,6 +3153,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         // Revocation precedes every sticky-loss early return. A later generic
         // loss cannot leave the earlier historical exit allowance behind.
+        // When an honoured exit claim is withdrawn by a later generic loss
+        // while running, the registry's exit-only claim is revoked too (a
+        // generic loss clears it); after stop nothing stages (frozen facts).
+        let had_exit = capture.original_pid_exit.is_some();
+        let is_generic = matches!(
+            custody,
+            ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. }
+        );
         let exit = match custody {
             ScopeCustody::PidExited { proof, .. } => Some(*proof),
             ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. } => {
@@ -3168,6 +3176,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if capture.unproven.is_some() {
             if capture.original_pid_exit != exit {
                 capture.original_pid_exit = None;
+            }
+            if had_exit && is_generic {
+                self.registry.note_counted_loss();
             }
             return;
         }
@@ -3422,8 +3433,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
+        let had_exit = capture.original_pid_exit.is_some();
         capture.original_pid_exit = None;
         if capture.stopped || capture.unproven.is_some() {
+            // A later lifecycle loss revokes an honoured exit-only claim
+            // while running; after stop nothing stages (frozen facts).
+            if had_exit && !capture.stopped {
+                self.registry.note_counted_loss();
+            }
             return;
         }
         capture.unproven = Some(loss.reason.clone());
@@ -4102,7 +4119,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             &mut crate::attach::monotonic_ns,
         );
         if self.adapter.take_detection_clock_failed() {
-            self.exit_clocks_comparable = false;
+            Self::note_exit_clocks_incomparable(&mut self.exit_clocks_comparable, &mut self.binder);
         }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
@@ -4268,7 +4285,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             )
         };
         if self.adapter.take_detection_clock_failed() {
-            self.exit_clocks_comparable = false;
+            Self::note_exit_clocks_incomparable(&mut self.exit_clocks_comparable, &mut self.binder);
         }
         let (native_failures, scan_pinned) = resolver.finish();
         self.apply_reconcile_events(&events, now_ns);
@@ -4319,9 +4336,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     pub(crate) fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
         // Forward recorded PID reuses first: every reconcile (scan,
         // scoped, or empty pass) funnels through here, so the binder
-        // learns each turnover whether or not a successor admitted.
-        for (pid, at_ns) in self.adapter.take_pid_reuses() {
-            self.binder.note_pid_reuse(pid, at_ns);
+        // learns each turnover whether or not a successor admitted. PID
+        // scope only: the retained fallback (the sole consumer) runs
+        // there, so other scopes never grow the reuse table.
+        let reuses = self.adapter.take_pid_reuses();
+        if matches!(self.engine.scope, Scope::Pid(_)) {
+            for (pid, at_ns) in reuses {
+                self.binder.note_pid_reuse(pid, at_ns);
+            }
         }
         let mut failed: Vec<(u32, &str, Option<BudgetRefusal>)> = Vec::new();
         for event in events {
@@ -5815,18 +5837,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// The exit clocks went incomparable (a detection clock failed): BPF
+    /// hook stamps and admission stamps may not share a clock. Updates
+    /// both the coordinator's guard and the binder's retained-identity
+    /// gate immediately, so a revalidation or exec-coverage decision that
+    /// runs before the next staged batch still sees the current value.
+    /// Takes the two fields (not `&mut self`) because the call sites hold
+    /// disjoint borrows of the engine or attach set.
+    fn note_exit_clocks_incomparable(flag: &mut bool, binder: &mut NativeBinder) {
+        *flag = false;
+        binder.set_exit_clocks_comparable(false);
+    }
+
     /// The one native staging call (plan §3.6): witness reads, lifecycle
     /// quanta and the final flush all enter here, before `commit_batch`.
     /// Whether this witness batch may feed the retained-identity
     /// fallback (v0.7.0: PID scope only). The kernel binds PID-scope
-    /// entry probes to the original task, so a row read before admission
-    /// still names it even if the pid is reused later; in cgroup/system
-    /// scope probes attach to all processes and the same row is
-    /// ambiguous. The fallback also needs held custody (or a clean
-    /// exit proof: a link acquired after the original exited may name a
-    /// reused pid) and comparable exit clocks. The batch's own custody
-    /// is read here because it folds into capture coverage only after
-    /// absorption; a previously folded clean exit proof also qualifies.
+    /// entry probes to the original task, so a row recorded while the
+    /// original task lived still names it even if the pid is reused
+    /// later; in cgroup/system scope probes attach to all processes and
+    /// the same row is ambiguous. The fallback also needs held custody
+    /// (or a clean exit proof: a link acquired after the original exited
+    /// may name a reused pid) and comparable exit clocks. The batch's own
+    /// custody is read here because it folds into capture coverage only
+    /// after absorption; a previously folded clean exit proof also
+    /// qualifies.
     fn retained_fallback_allowed(&self, batch: &WitnessBatch) -> bool {
         if !matches!(self.engine.scope, Scope::Pid(_)) {
             return false;
@@ -8606,7 +8641,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // unfiltered with their gap, never against a silent
                 // pass-start stamp.
                 if self.adapter.take_detection_clock_failed() {
-                    self.exit_clocks_comparable = false;
+                    Self::note_exit_clocks_incomparable(
+                        &mut self.exit_clocks_comparable,
+                        &mut self.binder,
+                    );
                 }
                 events
             }
@@ -9843,7 +9881,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
             if self.adapter.take_detection_clock_failed() {
-                self.exit_clocks_comparable = false;
+                Self::note_exit_clocks_incomparable(
+                    &mut self.exit_clocks_comparable,
+                    &mut self.binder,
+                );
             }
             scoped_scan_callers = allowed.len();
             collection.observe_allowed(&allowed);

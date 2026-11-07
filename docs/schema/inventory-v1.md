@@ -370,7 +370,9 @@ non-null values needs a new allowlist row.
     were lost (a zero then reads `unknown (usage observation lossy)`),
     but when `detail` is `the PID target exited` the sole cause is a
     clean PID-target exit (no records dropped) — the count ran until
-    the exit. Any later generic loss clears the exit claim.
+    the exit. A zero with the exit detail still reads `unknown (usage
+    observation lossy)`: the lower bound 0 proves no use. Any later
+    generic loss clears the exit claim.
   - `witnessed`: use was witnessed (first at `first_ns`) but nothing
     counts it — `count` stays 0 for old consumers, `observation` reads
     `unknown (count unavailable; use witnessed)`, and the dashboard
@@ -462,19 +464,23 @@ non-null values needs a new allowlist row.
     one retained incarnation held the tgid when the row was read, with a
     proven start time and exe identity, an observed exec detector, and a
     mapped or exited lifecycle; the row falls inside its monotonic
-    lifetime; and no exec, recorded PID reuse, lost lifecycle evidence,
-    or competing image is recorded at or after its admission) binds
-    instead and counts on the edge. The fallback is PID-scope-only
+    lifetime; the witness batch holds PID custody or a clean exit proof
+    for the original incarnation; BPF hook and admission stamps share a
+    comparable clock; and no exec, recorded PID reuse, lost lifecycle
+    evidence, or competing image is recorded at or after its admission)
+    binds instead and counts on the edge. The fallback is PID-scope-only
     because the kernel binds PID-scope entry probes to the original
-    task; in cgroup and system scope the same row is ambiguous and stays
-    unbound. The holder count is evaluated once, at the read: a second
-    holder admitted fresh after the noticed exit (no reuse recorded)
-    does not void the binding, while a reuse recorded at or after the
-    admission voids it. A retained row that an exec record voids still
-    reads `use_before_admission` even when its admission provably
-    predates the row: only exit-miss rows carry the post-admission
-    wording, and `use_before_admission` is the general fail-safe label
-    for every other unbound row (exec-voids are never relabeled as
+    task, so a row recorded while the original task lived still names it
+    even if the pid is reused later; in cgroup and system scope the same
+    row is ambiguous and stays unbound. The holder count is evaluated
+    once, at the read: a second holder admitted fresh after the noticed
+    exit (no reuse recorded) does not void the binding, while a reuse
+    recorded at or after the admission voids it. A retained row that an
+    exec record voids still reads `use_before_admission` even when its
+    admission provably predates the row: only exit-miss rows carry the
+    post-admission wording, and `use_before_admission` is the general
+    fail-safe label for every other unbound row except lifecycle-loss
+    rows (which read `loss` above; exec-voids are never relabeled as
     exits).
   - `pending_first_use` (native lane, transient): a `CALLER_USE` row of
     this caller's pid on this module is read but undecided — its

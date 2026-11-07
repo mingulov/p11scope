@@ -74,8 +74,14 @@ const POLL_INTERVAL: Duration = Duration::from_secs(1);
 /// (per-key) capture republishes twice as often so key-operation rows
 /// meet the 1.5 s publication target; every other capture keeps the
 /// 1 s production cadence.
-fn inventory_poll_interval(_key_operations: bool) -> Duration {
-    POLL_INTERVAL
+const JOINT_POLL_INTERVAL: Duration = Duration::from_millis(500);
+
+fn inventory_poll_interval(key_operations: bool) -> Duration {
+    if key_operations {
+        JOINT_POLL_INTERVAL
+    } else {
+        POLL_INTERVAL
+    }
 }
 
 // G21's explicit engine pilot can accelerate scans without changing the

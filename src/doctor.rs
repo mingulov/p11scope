@@ -704,6 +704,9 @@ fn decode_caps(mask: u64) -> Vec<&'static str> {
 }
 
 fn read_cap_eff() -> Result<u64, String> {
+    if let Some(mask) = crate::caps::invoking_effective() {
+        return Ok(mask);
+    }
     let content = std::fs::read_to_string("/proc/self/status")
         .map_err(|e| format!("/proc/self/status: {e}"))?;
     let hex = content

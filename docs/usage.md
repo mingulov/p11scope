@@ -1567,7 +1567,9 @@ Limits that matter in pods:
   `src/uretprobe_hazard.rs`. When the override is taken, the flag plus the
   hazard reason is recorded in report evidence (`evidence.uretprobe_override`),
   not just on stderr.
-- `--version` — print the observer version (`p11scope <semver>`) and exit 0.
+- `--version` — print the observer version line (`p11scope <semver>`),
+  a copyright line and a license line, and exit 0. The first line stays
+  exactly `p11scope <semver>` so scripts parsing it are unaffected.
   Takes no scope or subcommand; anything after it is a usage error.
   `p11scope-discover --version` prints the helper's version
   (`p11scope-discover <semver>`, the same release version) the same way.

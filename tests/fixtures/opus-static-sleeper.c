@@ -1,10 +1,10 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* Opus B4 static-sleeper fallback: raw-syscall sleeper, no libc.
  *
- * Built with `gcc -static -nostdlib` for hosts without busybox (CI
- * runners): argv[1] seconds (default 60), `_start` entry, `nanosleep`
- * resumed across EINTR, then `exit`. Maps no shared objects, so the
- * process is trivially ungrouped.
+ * Built with `gcc -static -nostdlib -fno-stack-protector` for hosts
+ * without busybox (CI runners): argv[1] seconds (default 60), `_start`
+ * entry, `nanosleep` resumed across EINTR, then `exit`. Maps no shared
+ * objects, so the process is trivially ungrouped.
  */
 typedef unsigned long u64;
 
@@ -23,10 +23,19 @@ struct sleep_ts {
     long tv_nsec;
 };
 
-void _start(void)
+/* The entry stub passes the original stack pointer (argc at [rsp]) as
+ * the first argument before any C prologue can move it; reading %rsp
+ * inside a C `_start` sees the frame-adjusted value under -O0.
+ */
+__asm__(".text\n"
+        ".globl _start\n"
+        ".type _start, @function\n"
+        "_start:\n"
+        " mov %rsp, %rdi\n"
+        " call sleeper_main\n");
+
+void sleeper_main(u64 *sp)
 {
-    u64 *sp;
-    __asm__ volatile("mov %%rsp, %0" : "=r"(sp));
     long secs = 60;
     if (sp[0] >= 2) {
         const char *p = (const char *)sp[2];

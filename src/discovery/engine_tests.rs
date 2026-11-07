@@ -65326,8 +65326,9 @@ fn opus_first_existing(candidates: &[&Path]) -> Option<PathBuf> {
 }
 
 /// Builds the static-sleeper fallback: the raw-syscall fixture compiled
-/// `gcc -static -nostdlib` (no libc to link), for hosts without busybox.
-/// Panics with a named reason when the build fails.
+/// `gcc -static -nostdlib -fno-stack-protector` (no libc to link, no
+/// stack guard to provide), for hosts without busybox. Panics with a
+/// named reason when the build fails.
 fn opus_build_static_sleeper(dir: &Path) -> PathBuf {
     let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opus-static-sleeper.c");
     let out = dir.join("opus-static-sleeper");
@@ -65338,6 +65339,7 @@ fn opus_build_static_sleeper(dir: &Path) -> PathBuf {
             "-Wall",
             "-Wextra",
             "-Werror",
+            "-fno-stack-protector",
             "-static",
             "-nostdlib",
             "-o",

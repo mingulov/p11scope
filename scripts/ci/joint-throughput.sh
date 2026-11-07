@@ -414,7 +414,7 @@ wait_for_line() {
         if [ "$(date +%s)" -ge "$deadline" ]; then
             return 1
         fi
-        sleep 2
+        sleep 0.5
     done
     return 0
 }
@@ -433,67 +433,9 @@ wait_for_pass() {
         if [ "$(date +%s)" -ge "$deadline" ]; then
             return 1
         fi
-        sleep 2
+        sleep 0.5
     done
     return 0
-}
-
-# Wait until the pid's caller edge for the provider module is attached
-# (entries coverage carries since_ns), resolving the caller id from the
-# event log. $1 dir, $2 pid, $3 timeout seconds. A pass only proves
-# timing; GO needs the generator's mapping inside the collected scope,
-# else admission defers with no_receipt and the run stays S1-only.
-caller_attached_once() {
-    python3 -I - "$1/events.jsonl" "$1/report.json" "$2" <<'EOF'
-import json, sys
-events_path, report_path, pid = sys.argv[1], sys.argv[2], int(sys.argv[3])
-caller = None
-try:
-    with open(events_path) as f:
-        for line in f:
-            try:
-                d = json.loads(line)
-            except ValueError:
-                continue
-            if d.get('kind') != 'caller_event':
-                continue
-            e = d.get('event', {}) or {}
-            ctx = (e.get('identity_context') or {}).get('caller') or {}
-            if ctx.get('pid') == pid and ctx.get('id'):
-                caller = ctx['id']
-except OSError:
-    pass
-if caller is None:
-    sys.exit(1)
-try:
-    with open(report_path) as f:
-        r = json.load(f)
-except (OSError, ValueError):
-    sys.exit(1)
-for e in r.get('edges', []):
-    if e.get('caller') != caller:
-        continue
-    entries = e.get('entries') or {}
-    if (entries.get('coverage') or {}).get('since_ns') is not None:
-        sys.exit(0)
-sys.exit(1)
-EOF
-}
-
-wait_for_caller_attached() {
-    dir=$1
-    pid=$2
-    timeout=${3:-120}
-    deadline=$(($(date +%s) + timeout))
-    while :; do
-        if caller_attached_once "$dir" "$pid"; then
-            return 0
-        fi
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            return 1
-        fi
-        sleep 2
-    done
 }
 
 # Kill the PIDs in $1 (a pidfile) when still alive; ours only.
@@ -746,14 +688,6 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
         return 0
     fi
-    # TEMP F9 probe: attach BEFORE setup calls so setup counts too.
-    log "$cell: PROBE waiting for attach before setup"
-    gen_pid=$(cat "$dir/gen.pid")
-    if ! wait_for_caller_attached "$dir" "$gen_pid" "${ATTACH_TIMEOUT:-45}"; then
-        log "$cell: PROBE generator edge unattached at setup (setup uncounted)"
-    else
-        log "$cell: PROBE generator edge attached at setup"
-    fi
     log "$cell: opening the setup gate"
     touch "$dir/setup_go"
     if ! wait_for_line "READY pid=" "$dir/gen.out" 120; then
@@ -766,27 +700,16 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=ready-timeout" || return 1
         return 0
     fi
-    log "$cell: setup done; waiting for the generator edge to attach before GO"
-    gen_pid=$(cat "$dir/gen.pid")
-    # TEMP F9 probe: GO anyway after a short attach wait (the idle wait
-    # wedges); log bound state for post-hoc analysis.
-    if ! wait_for_caller_attached "$dir" "$gen_pid" "${ATTACH_TIMEOUT:-45}"; then
-        log "$cell: PROBE generator edge unattached at GO (unbound run)"
-    else
-        log "$cell: PROBE generator edge attached at GO"
-    fi
-    log "$cell: generator attached; waiting two passes for promotion before GO"
+    log "$cell: setup done; waiting for a binding pass before GO"
     passes_before=$(pass_count "$dir/observer.out")
-    log "$cell: promote-wait from passes_before=$passes_before at $(date +%s)"
-    if ! wait_for_pass "$dir/observer.out" "$((passes_before + 1))" 300; then
-        log "$cell: promote-wait ended at count=$(pass_count "$dir/observer.out") time=$(date +%s)"
-        log "$cell: no promotion passes after attach"
+    if ! wait_for_pass "$dir/observer.out" "$passes_before" 180; then
+        log "$cell: no binding pass after setup"
         kill_pidfile "$dir/gen.pid"
         kill_observer "$dir/observer.pid"
         wait 2>/dev/null || true
         exec 9>&-
-        fail_flow "$dir" "no promotion passes after attach"
-        finish_cell "$cell" "$dir" "flow=promote-timeout" || return 1
+        fail_flow "$dir" "no binding pass after setup"
+        finish_cell "$cell" "$dir" "flow=bind-timeout" || return 1
         return 0
     fi
     log "$cell: opening GO"

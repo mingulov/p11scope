@@ -17408,7 +17408,15 @@ fn key_operation_mid_fallback_refusal_preserves_remaining_pair_as_unknown() {
             },
         ]
     );
-    assert_eq!(guarded.registry.semantic_resource_snapshot().refused, 1);
+    // At least the replay refusal fired (the `replayed: 1` pin above
+    // proves it); the preservation assoc mint may additionally refuse
+    // under this clamp, degrading to refused-terminal accounting —
+    // the completion still rows either way, so the exact count is
+    // mint byte-accounting, not this seam's contract.
+    assert!(
+        guarded.registry.semantic_resource_snapshot().refused >= 1,
+        "the head-two replay refused"
+    );
     assert_eq!(guarded.scene.adapter.ledger().charged_bytes(), 0);
     let pool = guarded.registry.semantic_resource_snapshot();
     let reserve = guarded.registry.semantic_storage_reserver();

@@ -1353,7 +1353,7 @@ impl JointStaging {
                             instance,
                             keyuse,
                             None,
-                            assoc_fallback.as_deref_mut(),
+                            assoc_fallback,
                         );
                         self.close_segment(true, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::Degraded { disposed }, 0)

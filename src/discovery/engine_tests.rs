@@ -65263,6 +65263,86 @@ fn missing_removal_clock_also_drops_short_lived_state() {
     );
 }
 
+// A matched exit closes its admission and drops its PID's entries;
+// an EXEC from a reused PID before retirement re-seeds both tables
+// with the new generation's valid entries, and the retirement-time
+// removal must keep them: the admission is already closed, so the
+// entries cannot be the dead generation's. Without the closed-gate
+// the removal deletes the new entries and the reused generation's
+// gap exit reads unknown instead of its valid hint.
+#[test]
+fn removal_after_matched_exit_keeps_reseeded_short_lived_state() {
+    let first = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    // The old generation execs and exits; the matched exit closes
+    // its admission and drops its PID's entries.
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 10, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(pid, admitted + 20),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    assert!(
+        engine.admitted_cgroup_views[&ProcessViewId(0)]
+            .closed_ns
+            .is_some(),
+        "matched exit closes the admission"
+    );
+    // The old generation is dead, so its view no longer matches
+    // lifecycle records (in production the still_the_same gate
+    // excludes it; the test view pins the live test process, so it
+    // leaves the ledger directly). The PID is reused and the new
+    // generation execs, re-seeding both tables.
+    engine.views.retain(|view| view.id() != ProcessViewId(0));
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 30, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    // Retirement removes the old admitted view after the re-seed;
+    // the admission is already closed, so the new entries survive.
+    engine.close_cgroup_admission_at_removal(ProcessViewId(0));
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    // The reused generation's gap exit reads the kept entries: the
+    // hint names the new image and the mapping reads timely.
+    let mut reused = exit_mappings_record(pid, admitted + 40);
+    reused.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.unknown, 0);
+    assert_eq!(hints.total(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 0))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+}
+
 // M-A: the PID consumer learns the target exe at validation time, so a
 // validated exec classifies without any pre-learned scan path. Deleting
 // the exec-time learn strands the analysis with no path (`unknown`).

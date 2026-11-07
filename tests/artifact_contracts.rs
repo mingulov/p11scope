@@ -11244,7 +11244,10 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
     // checks job, so they are not UNRUN hosted. Each must still be named
     // there, or the exclusion rots and this fails until the UNRUN line
     // returns or the table is taught about the move.
-    let hosted_elsewhere = ["scripts/system-scope-measure.sh"];
+    let hosted_elsewhere = [
+        "scripts/system-scope-measure.sh",
+        "scripts/matrix/verify-container-image.sh",
+    ];
     let priv_yml = read(".github/workflows/privileged-tests.yml");
     for lane in &hosted_elsewhere {
         assert!(

@@ -1672,3 +1672,84 @@ jobs:
           path: ${{ runner.temp }}/browser.log
           if-no-files-found: warn
           retention-days: 7
+  # Permanent container-image cell: the observer image built from this
+  # commit's musl binary captures a SoftHSM workload on the runner host
+  # and inside a second container (exact counts attributed to the right
+  # provider file) and proves the missing-PID-namespace and missing-cap
+  # refusals. The musl build is self-contained (parallel with
+  # release-build, delaying none of its consumers); the binary never
+  # leaves this runner. No vng leg: containers share the host kernel by
+  # design, so kernel coverage for this observer binary already comes
+  # from the public-cli vng legs, and a private dockerd inside the guest
+  # (which shares the host's /var/lib/docker) is not something the
+  # harness provides.
+  container-image:
+    runs-on: ubuntu-26.04
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
+      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
+      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
+      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 file gcc jq llvm musl-tools python3 softhsm2
+      - name: Cache keys
+        id: keys
+        shell: bash
+        run: |
+          test -n "${ImageOS:-}"
+          test -n "${ImageVersion:-}"
+          echo "image=$ImageOS-$ImageVersion" >>"$GITHUB_OUTPUT"
+      - id: bpf-linker
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cargo/bin/bpf-linker
+          key: bpf-linker-${{ env.CI_TOOL_BPF_LINKER }}-${{ steps.keys.outputs.image }}-rust-${{ hashFiles('.release-rust-version') }}
+      - if: steps.bpf-linker.outputs.cache-hit != 'true'
+        run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
+      - name: Reconstruct pinned dependency sources
+        run: python3 -I scripts/prepare-dependencies.py
+      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
+      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
+      - name: Prove the default build environment
+        shell: bash
+        run: |
+          if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL=|P11SCOPE_JOURNAL_PROOF=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
+            echo "refusing: size-override or flavor environment is set" >&2
+            exit 1
+          fi
+      - name: Build the musl observer for the image
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
+          cargo +"$(cat .release-rust-version)" build --locked --offline --release \
+            --target x86_64-unknown-linux-musl --bin p11scope
+          file target/x86_64-unknown-linux-musl/release/p11scope | grep -q "static-pie linked"
+      - name: Run the container-image cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          bash scripts/matrix/verify-container-image.sh \
+            --observer-bin "$PWD/target/x86_64-unknown-linux-musl/release/p11scope" \
+            --out "$GITHUB_WORKSPACE/container-image-out"
+          test -s "$GITHUB_WORKSPACE/container-image-out/results.jsonl"
+      - name: Judge the cell rows
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/ci/check-cell-results.py "$GITHUB_WORKSPACE/container-image-out/results.jsonl" \
+            --require host-exact --require container-exact \
+            --require refusal-pidns --require refusal-cap
+      - name: Upload the container-image results
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: container-image
+          path: ${{ github.workspace }}/container-image-out/
+          if-no-files-found: warn
+          retention-days: 7

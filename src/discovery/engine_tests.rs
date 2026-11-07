@@ -65043,9 +65043,9 @@ fn pid_target_exec_learns_exe_at_validation_without_prelearn() {
 // zero.
 #[test]
 fn owned_initial_exec_still_classifies_target_hint_before_ack() {
-    let (_fixture, _child, mut engine, _context, exec, mut session) =
+    let (_fixture, child, mut engine, _context, exec, mut session) =
         owned_prearmed_seed_route(true);
-    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, Some(child.pid()));
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
     let hints = engine.target_exec_hints().expect("armed target split");

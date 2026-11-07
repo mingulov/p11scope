@@ -15,7 +15,7 @@
 //!
 //! Documented residuals: the provider still runs in-process as the
 //! helper's uid with its environment, supplementary groups, readable
-//! files, signaling and limit/priority changes (setpriority,
+//! files, signaling and priority changes (setpriority,
 //! sched_setscheduler, ioprio_set); other terminal ioctls pass, as does
 //! `AF_UNIX` datagram `sendto` without `connect`.
 

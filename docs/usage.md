@@ -563,9 +563,10 @@ The isolated profile is a damage-reduction fence, not a full sandbox.
 Residuals: the provider runs in-process as your uid, reads every file you
 can read, inherits your environment (including any tokens) and
 supplementary groups, and may signal your processes or lower their
-limits or priority; terminal stdio ioctls other than
+priority; terminal stdio ioctls other than
 `TIOCSTI`/`TIOCLINUX` still pass, as does `AF_UNIX` datagram `sendto`
-without `connect`.
+without `connect`. Ioctls of filesystems outside the listed types
+still pass until the v0.8 allowlist lands.
 
 Provider entry points are hooked through five built-ins
 (`C_GetFunctionList`, `C_GetInterfaceList`, `C_GetInterface`,

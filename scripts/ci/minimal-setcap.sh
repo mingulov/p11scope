@@ -31,8 +31,11 @@ test -r /sys/kernel/btf/vmlinux || { echo "minimal-setcap: missing prerequisite:
 umask 022
 mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd) || exit 2
-CELLTMP=$OUT/tmp
-rm -rf "$CELLTMP"
+# The cell binaries run as `nobody`, so they must live outside the
+# runner-owned tree: /home/runner is not traversable by nobody (exit
+# 126 there). A 755 mktemp under /var/tmp traverses everywhere.
+CELLTMP=$(mktemp -d /var/tmp/minimal-setcap.XXXXXX) || exit 2
+chmod 755 "$CELLTMP" || exit 2
 mkdir -p "$CELLTMP/bin" "$CELLTMP/nobody" "$CELLTMP/out" || exit 2
 chmod 700 "$CELLTMP/nobody" "$CELLTMP/out"
 chown nobody:nogroup "$CELLTMP/nobody" "$CELLTMP/out" 2>/dev/null \
@@ -53,7 +56,11 @@ row() { # CELL PASS QUALIFICATION DETAIL
 }
 SAVED_PARANOID=$(sysctl -n kernel.perf_event_paranoid)
 restore_paranoid() { sysctl -w kernel.perf_event_paranoid="$SAVED_PARANOID" >/dev/null 2>&1 || true; }
-cleanup() { restore_paranoid; [ -n "${NOBODYOUT:-}" ] && rm -rf "$NOBODYOUT"; }
+cleanup() {
+  restore_paranoid
+  [ -n "${NOBODYOUT:-}" ] && rm -rf "$NOBODYOUT"
+  [ -n "${CELLTMP:-}" ] && rm -rf "$CELLTMP"
+}
 trap cleanup EXIT
 cat >"$CELLTMP/workload.c" <<'EOF'
 #include <dlfcn.h>
@@ -125,6 +132,12 @@ mkobserver miss-cap_perfmon "cap_bpf,cap_checkpoint_restore,cap_dac_read_search,
 mkobserver miss-cap_checkpoint_restore "cap_bpf,cap_dac_read_search,cap_perfmon,cap_sys_ptrace" || exit 2
 mkobserver miss-cap_dac_read_search "cap_bpf,cap_checkpoint_restore,cap_perfmon,cap_sys_ptrace" || exit 2
 mkobserver miss-cap_sys_ptrace "cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon" || exit 2
+# Harness proof before the first nobody row: the staged observer must be
+# traversable and executable by nobody, else every row would fail 126.
+runuser -u nobody -- test -x "$CELLTMP/bin/full" || {
+  echo "minimal-setcap: harness error: nobody cannot execute $CELLTMP/bin/full" >&2
+  exit 2
+}
 as_nobody() { # runs "$@" as nobody with a private TMPDIR; caller redirects
   runuser -u nobody -- env TMPDIR="$CELLTMP/nobody" "$@"
 }

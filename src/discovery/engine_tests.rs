@@ -65693,3 +65693,91 @@ fn opus_r4_b4_owed_lead_never_hands_the_freed_slot_to_rotation() {
         "a fresh waiter lost the only freed slot: {outcomes:?}"
     );
 }
+
+/// Scarce owed debt is repaid by a pending-backlog attempt: at a full
+/// view cap with no evictable view, one fresh and two pending-backlog
+/// pids, one attempt per truncated tick. Tick 1 serves the fresh pid
+/// (higher pid, so pid order alone would serve it last); tick 2, with a
+/// second fresh request, serves the pending backlog first (the owed
+/// lead); tick 3 serves the waiting fresh pid first (the debt was
+/// repaid, so the lead returns to newcomers). Two backlogs keep one
+/// remaining on tick 3 to observe the cleared debt — with one backlog,
+/// tick 3 would have no backlog and the routing would be unobservable.
+/// Recording the tick-2 backlog attempt bare (M24) leaves the debt set,
+/// so tick 3 would serve backlog first instead of fresh.
+#[test]
+fn scarce_backlog_attempt_repays_owed_debt() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider = system_scope_build_fixture(dir.path(), "scarce-owed");
+    let driver = system_scope_build_driver(dir.path());
+    let loaded = system_scope_spawn_loaded(&driver, &provider);
+    let owner_pid = loaded.pid();
+    let mut sleeps = e06_spawn_sleeps(4);
+    sleeps.sort_by_key(SystemScopeChildGuard::pid);
+    let (backlog1, backlog2, fresh1, fresh2) = (
+        sleeps[0].pid(),
+        sleeps[1].pid(),
+        sleeps[2].pid(),
+        sleeps[3].pid(),
+    );
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[owner_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![provider], Some(1));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    assert!(
+        engine.find_evictable_victim_for_selected(fresh1).is_none(),
+        "no victim: the retained view owns its provider"
+    );
+    let mut listing = vec![owner_pid, backlog1, backlog2, fresh1];
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(backlog1, Some(100)));
+    assert!(engine.request_refresh(backlog2, Some(110)));
+    assert!(engine.request_refresh(fresh1, Some(200)));
+    engine.scheduler.begin_deep_scan_tick(Some(150));
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh1),
+        "tick 1 serves the fresh pid first"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog1)
+            && engine.refresh_requested.contains_key(&backlog2),
+        "both backlogs wait another tick"
+    );
+    assert_eq!(engine.probationary_completions, 1);
+    listing.push(fresh2);
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    assert!(engine.request_refresh(fresh2, Some(2_000_000)));
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&backlog1),
+        "tick 2 serves the pending backlog first (the owed lead)"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2)
+            && engine.refresh_requested.contains_key(&fresh2),
+        "the second backlog and the second fresh wait"
+    );
+    assert_eq!(engine.probationary_completions, 2);
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&fresh2),
+        "tick 3 serves the waiting fresh pid first (the debt was repaid)"
+    );
+    assert!(
+        engine.refresh_requested.contains_key(&backlog2),
+        "the remaining backlog waits"
+    );
+    assert_eq!(engine.probationary_completions, 3);
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    assert!(
+        !engine.refresh_requested.contains_key(&backlog2),
+        "the remaining backlog completes last"
+    );
+    assert_eq!(engine.probationary_completions, 4);
+}

@@ -143,9 +143,27 @@ require_non_root_caller || exit 2
 for tool in docker gcc python3 file softhsm2-util sudo; do
     command -v "$tool" >/dev/null || { echo "$tool required" >&2; exit 77; }
 done
+matrix_private_work container-image || exit 77
+mkdir -p "$WORK/shared"
 matrix_select_timeout || exit 77
 sudo -n true 2>/dev/null || { echo "passwordless sudo required" >&2; exit 77; }
-docker info >/dev/null 2>&1 || { echo "docker daemon unavailable (docker info failed)" >&2; exit 77; }
+# Every `docker` below (bare or under `timeout`, which cannot see shell
+# functions) resolves through this shim. Hosts whose caller is outside
+# the docker group (the fedora test host) reach the daemon through
+# passwordless sudo instead.
+DOCKER_BIN=$(command -v docker)
+mkdir -p "$WORK/bin"
+if "$DOCKER_BIN" info >/dev/null 2>&1; then
+    ln -s "$DOCKER_BIN" "$WORK/bin/docker"
+elif sudo -n "$DOCKER_BIN" info >/dev/null 2>&1; then
+    printf '#!/bin/sh\nexec sudo -n "%s" "$@"\n' "$DOCKER_BIN" >"$WORK/bin/docker"
+    chmod 0755 "$WORK/bin/docker"
+else
+    echo "docker daemon unavailable (docker info failed)" >&2
+    exit 77
+fi
+PATH="$WORK/bin:$PATH"
+export PATH
 BTF_PATH=${P11SCOPE_CONTAINER_IMAGE_BTF:-/sys/kernel/btf/vmlinux}
 CGROUP_PATH=${P11SCOPE_CONTAINER_IMAGE_CGROUP:-/sys/fs/cgroup/cgroup.controllers}
 test -s "$BTF_PATH" || { echo "BTF unavailable ($BTF_PATH)" >&2; exit 77; }
@@ -232,8 +250,6 @@ printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level 
     "$OUT" >"$SOFTHSM2_CONF"
 SOFTHSM2_CONF="$SOFTHSM2_CONF" softhsm2-util --init-token --free --label container-cell \
     --so-pin 5678 --pin 1234 || exit 2
-matrix_private_work container-image
-mkdir -p "$WORK/shared"
 timeout --signal=TERM --kill-after=10s 60s gcc -O0 -o "$WORK/harness" spike/harness.c -ldl || exit 2
 timeout --signal=TERM --kill-after=10s 600s docker build -q -t "$VICTIM_IMAGE" \
     ${P11SCOPE_MATRIX_BUILD_NETWORK:+--network "$P11SCOPE_MATRIX_BUILD_NETWORK"} \

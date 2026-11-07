@@ -54,7 +54,8 @@ class ContainerImageCellTests(unittest.TestCase):
         self.write_stub("softhsm2-util", "#!/bin/sh\nexit 0\n")
         self.write_stub("sudo", '#!/bin/sh\n[ "${1-}" = "-n" ] && shift\nexec "$@"\n')
         self.write_stub("gnutimeout", '#!/bin/sh\necho "timeout (GNU coreutils) 9.0"\nexit 0\n')
-        for name in ("dirname", "mkdir", "head", "id", "true", "rm", "cat", "date"):
+        for name in ("dirname", "mkdir", "head", "id", "true", "rm", "cat", "date",
+                     "ln", "chmod", "mktemp", "grep"):
             target = shutil.which(name)
             self.assertIsNotNone(target, f"host lacks coreutil {name}")
             (self.tools / name).symlink_to(target)
@@ -72,9 +73,12 @@ class ContainerImageCellTests(unittest.TestCase):
         self.outdir = self.base / "out"
         self.bash = shutil.which("bash")
         self.assertIsNotNone(self.bash, "host lacks bash")
+        self.tmp = self.base / "tmp"
+        self.tmp.mkdir()
         self.env = os.environ.copy()
         self.env.update({
             "PATH": str(self.tools),
+            "TMPDIR": str(self.tmp),
             "P11SCOPE_CONTAINER_IMAGE_MODULE": str(self.module),
             "P11SCOPE_CONTAINER_IMAGE_BTF": str(self.btf),
             "P11SCOPE_CONTAINER_IMAGE_CGROUP": str(self.cgroup),
@@ -176,6 +180,18 @@ class ContainerImageCellTests(unittest.TestCase):
         self.write_stub("docker", '#!/bin/sh\n[ "$1" = info ] && exit 1\nexit 0\n')
         result = self.run_cell("--image", "img:tag", "--out", str(self.outdir))
         self.assertEqual(result.returncode, 77)
+
+    def test_sudo_docker_fallback_reaches_setup(self):
+        # Direct `docker info` fails but the sudo path succeeds (the fedora
+        # layout): preflight passes and the run reaches the setup static
+        # gate, which the stub `file` output cannot satisfy.
+        self.write_stub("docker", '#!/bin/sh\n[ "$1" = info ] && exit 1\nexit 0\n')
+        self.write_stub("sudo", '#!/bin/sh\n[ "${1-}" = "-n" ] && shift\n'
+                                '[ "$2" = info ] && exit 0\nexec "$@"\n')
+        result = self.run_cell("--observer-bin", str(self.observer),
+                               "--out", str(self.outdir))
+        self.assertEqual(result.returncode, 2)
+        self.assertIn("not static-pie", result.stderr)
 
     def test_no_gnu_timeout_is_a_setup_failure(self):
         self.write_stub("timeout", '#!/bin/sh\necho "timeout (uutils coreutils) 0.8.0"\nexit 0\n')

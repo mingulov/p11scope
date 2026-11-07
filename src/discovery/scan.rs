@@ -11283,13 +11283,13 @@ mod tests {
         let lines: Vec<&str> = include_str!("scan.rs").lines().map(str::trim).collect();
         assert!(
             lines.contains(
-                &"let lower_facts = match provider_facts_for(&proof.file, lower_key, &wanted, budget) {"
+                &"match provider_facts_for(&proof.file, lower_key, &wanted, budget) {"
             ),
             "lower facts keyed by the lower file's mapping key"
         );
         assert!(
             !lines.contains(
-                &"let lower_facts = match provider_facts_for(&proof.file, key, &wanted, budget) {"
+                &"match provider_facts_for(&proof.file, key, &wanted, budget) {"
             ),
             "lower facts never cached under the upper's maps key"
         );

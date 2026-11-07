@@ -327,6 +327,12 @@ for ctr in "$CTR_A" "$CTR_B"; do
     line=$(grep -F "container $prefix (docker, cgroup hint)" "$OUT/capture.txt" | head -1) || line=
     if [ -z "$line" ]; then
         echo "demo: no caller line for $ctr (container $prefix)" >&2
+        if grep -Fq "$prefix" "$OUT/capture.txt" 2>/dev/null; then
+            echo "demo: bare prefix $prefix is present with other markers; matching lines follow" >&2
+            grep -F "$prefix" "$OUT/capture.txt" >&2 || true
+        else
+            echo "demo: bare prefix $prefix is absent from concise text; the 8-line cap may hide demo callers on busy hosts, check $OUT/capture.json" >&2
+        fi
         fail=1
         continue
     fi

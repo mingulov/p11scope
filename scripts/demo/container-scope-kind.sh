@@ -295,6 +295,13 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 
 LOOP_SECS=$((DURATION + 120))
 echo "demo: creating kind cluster $CLUSTER ..." >&2
+# Re-check right before creating: the image build above takes minutes, and
+# a concurrent run may have taken the name since the first check. Arming
+# cleanup on a foreign cluster would delete work we did not create.
+if kind get clusters 2>/dev/null | grep -Fxq "$CLUSTER"; then
+    echo "demo: kind cluster $CLUSTER already exists; delete it, then rerun this script" >&2
+    exit 2
+fi
 # Arm cleanup before creating: the name was proven free above, so any
 # cluster with this name at cleanup time is ours, even if this create is
 # interrupted after the API accepts it.
@@ -375,6 +382,12 @@ for pod in "$POD_A" "$POD_B"; do
     line=$(grep -F "pod $pod8 / container $ctr12 (cgroup hint)" "$OUT/capture.txt" | head -1) || line=
     if [ -z "$line" ]; then
         echo "demo: no caller line for $pod (pod $pod8 / container $ctr12)" >&2
+        if grep -Fq -e "$pod8" -e "$ctr12" "$OUT/capture.txt" 2>/dev/null; then
+            echo "demo: a bare prefix for $pod is present with other markers; matching lines follow" >&2
+            grep -F -e "$pod8" -e "$ctr12" "$OUT/capture.txt" >&2 || true
+        else
+            echo "demo: bare prefixes $pod8 / $ctr12 are absent from concise text; the 8-line cap may hide demo callers on busy hosts, check $OUT/capture.json" >&2
+        fi
         fail=1
         continue
     fi

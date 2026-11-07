@@ -1102,6 +1102,7 @@ impl Scene {
             excluded: Vec::new(),
             exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
+            sweep_digests: std::collections::BTreeMap::new(),
         }
     }
 

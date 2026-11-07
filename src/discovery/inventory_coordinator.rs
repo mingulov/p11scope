@@ -339,6 +339,12 @@ const EVER_ENUMERATED_CAP: usize = 65_536;
 /// tasks are plentiful past the cap) without stalling a pass.
 const EVER_ENUMERATED_SWEEP: usize = 4_096;
 
+/// RED scaffolding: backstop cadence for the deep-scan skip (every Nth
+/// pass rescans). The stub value is wrong on purpose; the GREEN commit
+/// sets the pinned value.
+#[allow(dead_code)]
+pub(crate) const SKIP_BACKSTOP_EVERY: u64 = 0;
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
@@ -531,6 +537,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// passes. Discarded passes record nothing (their outcomes never
     /// applied); pid reuse drops the stale task by start-time mismatch.
     scan_freshness: BTreeSet<(u32, Option<u64>)>,
+    /// RED scaffolding: per-pid (generation, maps digest) from the last
+    /// applied pass. The GREEN commit records it in
+    /// `note_applied_scan_tasks` and serves it from
+    /// `priors_for_collection`; backstop passes withhold it.
+    maps_prior: BTreeMap<u32, (Option<u64>, u64)>,
     /// Every task identity enumerated by an applied pass, across passes:
     /// the terminal stop diff reports live tasks this never saw, so a
     /// starter that never execs cannot stay invisible. Capped (departed
@@ -917,6 +928,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
             scan_freshness: BTreeSet::new(),
+            maps_prior: BTreeMap::new(),
             ever_enumerated: BTreeSet::new(),
             stop_diff_done: false,
             pending_exec_newcomers: BTreeMap::new(),
@@ -2603,6 +2615,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     #[cfg(test)]
+    pub(crate) fn maps_priors_for_test(&self) -> BTreeMap<u32, (Option<u64>, u64)> {
+        self.maps_prior.clone()
+    }
+
+    #[cfg(test)]
     pub(crate) fn ever_enumerated_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
         self.ever_enumerated.clone()
     }
@@ -3646,6 +3663,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
         let scanned = self.scanned_pids_for_selection();
+        let priors = self.priors_for_collection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3673,6 +3691,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     &manifests,
                     prior_objects,
                     prior_bytes,
+                    &priors,
                 ),
             }
         }
@@ -3700,6 +3719,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             semantic_capture_live,
         );
         let scanned = self.scanned_pids_for_selection();
+        let priors = self.priors_for_collection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3728,6 +3748,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     &manifests,
                     prior_objects,
                     prior_bytes,
+                    &priors,
                 ),
             }
         }
@@ -8593,6 +8614,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             })
             .map(|(pid, _)| *pid)
             .collect()
+    }
+
+    /// RED scaffolding (replaced by the GREEN commit): the deep-scan
+    /// skip priors for the next collection. The stub always withholds,
+    /// so the memory tests fail.
+    pub(crate) fn priors_for_collection(&self) -> crate::inspect_system::ScanPriors {
+        let _ = &self.maps_prior;
+        crate::inspect_system::ScanPriors::empty()
     }
 
     /// A collection the stop discarded before apply: inspect the dropped
@@ -13519,6 +13548,7 @@ pub(crate) mod tests {
             excluded: Vec::new(),
             exclude_inputs: Vec::new(),
             stage_timings: crate::timing::StageTimings::new(),
+            sweep_digests: std::collections::BTreeMap::new(),
         }
     }
 
@@ -27708,6 +27738,115 @@ mod scan_freshness_tests {
             project(&[(u32::MAX, None)]),
             BTreeSet::from([u32::MAX]),
             "an unknown generation stays scanned"
+        );
+    }
+}
+
+/// Cross-pass deep-scan skip memory: the coordinator hands the next
+/// collection the prior pass's per-pid (generation, maps digest), and
+/// withholds priors on every backstop pass so file swaps surface. RED:
+/// the memory, backstop gate and catalog digests do not exist yet.
+#[cfg(test)]
+mod maps_skip_memory_tests {
+    use super::*;
+    use crate::discovery::caller_registry::OsProcessSource;
+
+    fn skip_coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn generation(start_time: Option<u64>) -> Option<crate::inspect_system::MemberGeneration> {
+        Some(crate::inspect_system::MemberGeneration {
+            start_time,
+            exe: None,
+        })
+    }
+
+    fn catalog_with_digests(
+        digests: BTreeMap<u32, (Option<u64>, u64)>,
+    ) -> crate::inspect_system::Catalog {
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        catalog.sweep_digests = digests;
+        catalog
+    }
+
+    #[test]
+    fn applied_pass_records_sweep_digests_for_the_next_pass() {
+        let mut coordinator = skip_coordinator();
+        let digests: BTreeMap<u32, (Option<u64>, u64)> =
+            [(11, (Some(110), 0xA11CE)), (12, (None, 0xB0B))].into_iter().collect();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(digests.clone()));
+        assert_eq!(
+            coordinator.maps_priors_for_test(),
+            digests,
+            "the next collection must see this pass's digests"
+        );
+    }
+
+    #[test]
+    fn departed_pids_leave_prior_memory() {
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [(11, (Some(110), 1)), (12, (Some(120), 2))].into_iter().collect(),
+        ));
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [(11, (Some(110), 3))].into_iter().collect(),
+        ));
+        assert_eq!(
+            coordinator.maps_priors_for_test(),
+            [(11, (Some(110), 3))].into_iter().collect(),
+            "a pid the pass never saw must not linger as proven-unchanged"
+        );
+    }
+
+    #[test]
+    fn ordinary_passes_carry_priors_and_backstop_passes_carry_none() {
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [(11, (Some(110), 1))].into_iter().collect(),
+        ));
+        for pass in [0u64, 1, 2] {
+            coordinator.passes = pass;
+            assert!(
+                !coordinator.priors_for_collection().digests.is_empty(),
+                "pass {pass} must reuse priors"
+            );
+        }
+        coordinator.passes = 3;
+        assert!(
+            coordinator.priors_for_collection().digests.is_empty(),
+            "every fourth pass must rescan (file-swap backstop)"
+        );
+        coordinator.passes = 7;
+        assert!(
+            coordinator.priors_for_collection().digests.is_empty(),
+            "the backstop must repeat"
+        );
+        assert_eq!(
+            super::SKIP_BACKSTOP_EVERY, 4,
+            "the backstop cadence is pinned"
+        );
+    }
+
+    #[test]
+    fn fresh_coordinator_carries_no_priors() {
+        let coordinator = skip_coordinator();
+        assert!(
+            coordinator.priors_for_collection().digests.is_empty(),
+            "the first pass scans everything"
         );
     }
 }

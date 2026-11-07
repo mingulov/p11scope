@@ -871,6 +871,7 @@ fn collect_with(
         sweep,
         sweep_unavailable,
         budget,
+        digests: std::collections::BTreeMap::new(),
     };
     let mut bound = if work.charge(
         collection

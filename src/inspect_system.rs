@@ -351,6 +351,25 @@ struct Collection {
     /// The pass's work budget, carried from the sweep and the deep scans
     /// into the confirmation reads.
     budget: CaptureWorkBudget,
+    /// Per-swept-pid maps-snapshot digest: the next pass's skip priors.
+    /// Empty under the cap (no sweep ran) and in RED scaffolding.
+    #[allow(dead_code)]
+    digests: BTreeMap<u32, u64>,
+}
+
+#[cfg(test)]
+impl Collection {
+    pub(crate) fn digests_for_test(&self) -> &BTreeMap<u32, u64> {
+        &self.digests
+    }
+
+    pub(crate) fn sweep_for_test(&self) -> &[(u32, Vec<MapEntry>)] {
+        &self.sweep
+    }
+
+    pub(crate) fn sweep_unavailable_for_test(&self) -> &BTreeSet<u32> {
+        &self.sweep_unavailable
+    }
 }
 
 impl Collection {
@@ -369,9 +388,54 @@ impl Collection {
     }
 }
 
+/// RED scaffolding (replaced by the GREEN commit): prior-pass memory for
+/// the cross-pass deep-scan skip. `digests` maps pid -> (generation
+/// start-time, sweep-snapshot digest) from the last applied pass.
+#[allow(dead_code)]
+pub(crate) struct ScanPriors {
+    pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
+}
+
+#[allow(dead_code)]
+impl ScanPriors {
+    pub(crate) fn empty() -> Self {
+        Self {
+            digests: BTreeMap::new(),
+        }
+    }
+}
+
+/// RED stub: always 0, so every digest-change test fails.
+#[allow(dead_code)]
+pub(crate) fn digest_maps_snapshot(_entries: &[MapEntry]) -> u64 {
+    0
+}
+
+/// RED stub: skips everything, so every skip-set test fails.
+#[allow(dead_code)]
+pub(crate) fn unchanged_skip_set(
+    sweep: &[(u32, Vec<MapEntry>)],
+    _priors: &ScanPriors,
+    _generation: impl Fn(u32) -> Option<u64>,
+) -> BTreeSet<u32> {
+    sweep.iter().map(|(pid, _)| *pid).collect()
+}
+
+/// RED stub: empty selection, so the wiring test fails.
+#[allow(dead_code)]
+pub(crate) fn select_for_test(
+    _sweep: &[(u32, Vec<MapEntry>)],
+    _unavailable: &BTreeSet<u32>,
+    _cap: usize,
+    _scanned: &BTreeSet<u32>,
+) -> Vec<u32> {
+    Vec::new()
+}
+
 /// Enumerate the machine, sweep over the cap, deep-scan every selected
 /// member fail-open, pin every view. Progress goes to stderr; stdout stays
 /// empty until the final render, so `--json` stays parseable.
+#[allow(clippy::too_many_arguments)]
 fn collect_members(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -379,6 +443,7 @@ fn collect_members(
     timings: &mut StageTimings,
     budget: CaptureWorkBudget,
     scanned: &BTreeSet<u32>,
+    priors: &ScanPriors,
 ) -> Collection {
     collect_members_identity(
         hints,
@@ -389,6 +454,7 @@ fn collect_members(
         budget,
         false,
         scanned,
+        priors,
     )
     .0
 }
@@ -435,7 +501,10 @@ fn collect_members_identity(
     mut budget: CaptureWorkBudget,
     take_anchors: bool,
     scanned: &BTreeSet<u32>,
+    priors: &ScanPriors,
 ) -> (Collection, Option<ExaminedCustody>) {
+    // RED scaffolding: priors are ignored until the GREEN commit.
+    let _ = priors;
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
@@ -551,6 +620,7 @@ fn collect_members_identity(
             sweep,
             sweep_unavailable,
             budget,
+            digests: BTreeMap::new(),
         },
         custody,
     )
@@ -1128,6 +1198,10 @@ pub(crate) struct Catalog {
     /// rendered in the catalog document; `P11SCOPE_STAGE_TIMINGS=1` prints
     /// it to stderr.
     pub stage_timings: StageTimings,
+    /// Per-swept-pid (generation start-time, maps digest): the next pass's
+    /// deep-scan skip priors. Internal capture memory, never rendered.
+    #[allow(dead_code)]
+    pub sweep_digests: BTreeMap<u32, (Option<u64>, u64)>,
 }
 
 /// The one scan-only lowering behind a catalog's admission verdicts: the
@@ -1178,6 +1252,7 @@ pub(crate) fn collect_with_budget(
         &[],
         0,
         0,
+        &ScanPriors::empty(),
     )
 }
 
@@ -1199,6 +1274,7 @@ pub(crate) fn collect_with_count_manifests(
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
+    priors: &ScanPriors,
 ) -> Result<Catalog> {
     collect_identity(
         hints,
@@ -1211,6 +1287,7 @@ pub(crate) fn collect_with_count_manifests(
         manifests,
         prior_objects,
         prior_bytes,
+        priors,
     )
     .map(|(catalog, _)| catalog)
 }
@@ -1240,6 +1317,7 @@ pub(crate) fn collect_inventory_identity(
         &[],
         0,
         0,
+        &ScanPriors::empty(),
     )?;
     Ok((catalog, custody.expect("opt-in collection owns custody")))
 }
@@ -1256,6 +1334,7 @@ fn collect_identity(
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
+    priors: &ScanPriors,
 ) -> Result<(Catalog, Option<ExaminedCustody>)> {
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = if identity {
@@ -1268,10 +1347,19 @@ fn collect_identity(
             budget,
             true,
             scanned,
+            priors,
         )
     } else {
         (
-            collect_members(hints, hooks, max_scan_pids, &mut timings, budget, scanned),
+            collect_members(
+                hints,
+                hooks,
+                max_scan_pids,
+                &mut timings,
+                budget,
+                scanned,
+                priors,
+            ),
             None,
         )
     };
@@ -1478,6 +1566,7 @@ pub(crate) fn collect_pid_with_count_manifests(
         sweep: Vec::new(),
         sweep_unavailable: BTreeSet::new(),
         budget,
+        digests: BTreeMap::new(),
     };
     let mut bound = bind_collection(&mut collection);
     prepare_count_manifests(
@@ -2559,6 +2648,8 @@ fn assemble(
         excluded,
         exclude_inputs,
         stage_timings: StageTimings::new(),
+        // RED scaffolding: empty until the GREEN commit records digests.
+        sweep_digests: BTreeMap::new(),
     }
 }
 
@@ -4621,6 +4712,7 @@ pub(crate) fn collect_system_with_identity(
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
+    priors: &ScanPriors,
 ) -> Result<Catalog> {
     if !matches!(policy, AdmissionPolicy::Inventory(_)) {
         return Err(anyhow::anyhow!(
@@ -4648,6 +4740,7 @@ pub(crate) fn collect_system_with_identity(
         budget,
         identity_takes_anchors(selection),
         scanned,
+        priors,
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
@@ -5422,6 +5515,7 @@ mod tests {
                     total_bytes: 64 << 20,
                 },
             ),
+            digests: std::collections::BTreeMap::new(),
         }
     }
 
@@ -7117,6 +7211,7 @@ mod tests {
             exclude_inputs: Vec::new(),
             explanation: None,
             stage_timings: StageTimings::new(),
+            sweep_digests: BTreeMap::new(),
         }
     }
 
@@ -7359,6 +7454,7 @@ mod tests {
                 sweep,
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
+                digests: BTreeMap::new(),
             }
         }
 
@@ -8268,6 +8364,7 @@ mod tests {
                 sweep: Vec::new(),
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
+                digests: BTreeMap::new(),
             };
             let catalog = catalog_of(collection, HashMap::new(), false);
             assert!(catalog.objects.is_empty(), "no object was proven");
@@ -8316,6 +8413,7 @@ mod tests {
                 sweep: Vec::new(),
                 sweep_unavailable: BTreeSet::new(),
                 budget: CaptureWorkBudget::default(),
+                digests: BTreeMap::new(),
             };
             let catalog = catalog_of(collection, HashMap::new(), false);
             assert!(catalog.objects.is_empty(), "no provider was mapped");
@@ -8394,6 +8492,7 @@ mod tests {
             sweep: Vec::new(),
             sweep_unavailable: BTreeSet::new(),
             budget: CaptureWorkBudget::default(),
+            digests: BTreeMap::new(),
         };
         let error = format!("{:#}", proc_list_system_error(&collection));
         assert!(error.contains("cannot inspect system"), "{error}");
@@ -10471,6 +10570,245 @@ mod refused_filter_tests {
     }
 }
 
+/// Cross-pass deep-scan skip (maps-digest): a member whose sweep snapshot
+/// digest and live generation both match the prior pass is confirmed, not
+/// deep-scanned. RED: the digest, skip set, priors plumbing and wiring do
+/// not exist yet; these tests fail to compile until the GREEN commit adds
+/// them, then fail at runtime on the stub behavior.
+#[cfg(test)]
+mod maps_skip_tests {
+    use super::{ScanPriors, digest_maps_snapshot, unchanged_skip_set};
+    use p11scope_manifest::maps::{Device, MapEntry};
+    use std::collections::{BTreeMap, BTreeSet};
+
+    fn entry(start: u64, inode: u64, path: &str) -> MapEntry {
+        MapEntry {
+            start,
+            end: start + 0x1000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+
+    fn snapshot() -> Vec<MapEntry> {
+        vec![
+            entry(0x1000, 11, "/usr/bin/sleep"),
+            entry(0x2000, 22, "/usr/lib/libc.so.6"),
+        ]
+    }
+
+    #[test]
+    fn identical_snapshots_digest_equal() {
+        assert_eq!(digest_maps_snapshot(&snapshot()), digest_maps_snapshot(&snapshot()));
+        assert_eq!(digest_maps_snapshot(&[]), digest_maps_snapshot(&[]));
+    }
+
+    #[test]
+    fn added_mapping_changes_the_digest() {
+        let before = digest_maps_snapshot(&snapshot());
+        let mut after = snapshot();
+        after.push(entry(0x3000, 33, "/usr/lib/softhsm/libsofthsm2.so"));
+        assert_ne!(before, digest_maps_snapshot(&after), "a dlopen must rescan");
+    }
+
+    #[test]
+    fn removed_mapping_changes_the_digest() {
+        let before = digest_maps_snapshot(&snapshot());
+        let after = vec![snapshot()[0].clone()];
+        assert_ne!(before, digest_maps_snapshot(&after), "a dlclose must rescan");
+    }
+
+    #[test]
+    fn changed_entry_fields_change_the_digest() {
+        let before = digest_maps_snapshot(&snapshot());
+        let mut moved = snapshot();
+        moved[1].start += 0x1000;
+        moved[1].end += 0x1000;
+        assert_ne!(before, digest_maps_snapshot(&moved), "a remap must rescan");
+        let mut swapped = snapshot();
+        swapped[1].inode += 1;
+        assert_ne!(
+            before,
+            digest_maps_snapshot(&swapped),
+            "an inode change must rescan"
+        );
+        let mut relabeled = snapshot();
+        relabeled[1].raw_path = Some(b"/usr/lib/libc.so.7".to_vec());
+        assert_ne!(
+            before,
+            digest_maps_snapshot(&relabeled),
+            "a path change must rescan"
+        );
+        let mut repathed = snapshot();
+        repathed[1].permissions = *b"rw-p";
+        assert_ne!(
+            before,
+            digest_maps_snapshot(&repathed),
+            "a permission change must rescan"
+        );
+    }
+
+    fn priors(entries: &[(u32, Option<u64>, u64)]) -> ScanPriors {
+        ScanPriors {
+            digests: entries
+                .iter()
+                .map(|(pid, generation, digest)| (*pid, (*generation, *digest)))
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn matching_maps_and_generation_skip_the_deep_scan() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot()), (9999, snapshot())];
+        let prior = priors(&[(4242, Some(77), digest)]);
+        let live = |pid: u32| if pid == 4242 { Some(77) } else { None };
+        assert_eq!(
+            unchanged_skip_set(&sweep, &prior, &live),
+            BTreeSet::from([4242]),
+            "only the proven-unchanged member skips"
+        );
+    }
+
+    #[test]
+    fn changed_maps_are_never_skipped() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let mut changed = snapshot();
+        changed.push(entry(0x3000, 33, "/usr/lib/softhsm/libsofthsm2.so"));
+        let sweep = vec![(4242, changed)];
+        let prior = priors(&[(4242, Some(77), digest)]);
+        let live = |_: u32| Some(77);
+        assert!(
+            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            "a dlopen must rescan even with matching generation"
+        );
+    }
+
+    #[test]
+    fn recycled_pids_are_never_skipped() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot())];
+        let prior = priors(&[(4242, Some(77), digest)]);
+        let live = |_: u32| Some(78);
+        assert!(
+            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            "pid reuse must rescan even with identical maps"
+        );
+    }
+
+    #[test]
+    fn unreadable_generations_are_never_skipped() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot())];
+        let prior = priors(&[(4242, Some(77), digest)]);
+        let live = |_: u32| None;
+        assert!(
+            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            "an unverifiable generation must rescan"
+        );
+    }
+
+    #[test]
+    fn members_without_priors_are_never_skipped() {
+        let sweep = vec![(4242, snapshot())];
+        let live = |_: u32| Some(77);
+        assert!(
+            unchanged_skip_set(&sweep, &ScanPriors::empty(), &live).is_empty(),
+            "first passes scan everything"
+        );
+        let prior = priors(&[(1111, Some(77), digest_maps_snapshot(&snapshot()))]);
+        assert!(
+            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            "a newcomer pid must scan"
+        );
+    }
+
+    #[test]
+    fn unrecorded_prior_generations_are_never_skipped() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot())];
+        let prior = priors(&[(4242, None, digest)]);
+        let live = |_: u32| Some(77);
+        assert!(
+            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            "a prior pass that never read the generation proves nothing"
+        );
+    }
+
+    /// Wiring at the real seam: two consecutive member collections over
+    /// live `/proc`; the second reuses the first pass's digests as priors.
+    /// Every recomputed-unchanged pid must leave the deep-scan selection
+    /// (soundness), and at least one pid must skip (non-vacuous: init and
+    /// daemons do not remap between two back-to-back sweeps).
+    #[test]
+    fn consecutive_collections_skip_proven_unchanged_members() {
+        use super::{
+            CaptureWorkBudget, HookRegistry, StageTimings, collect_members_identity,
+            select_for_test,
+        };
+        use std::collections::BTreeSet;
+
+        let scanned = BTreeSet::new();
+        // Cap 1 forces the sweep on any multi-process host (the skip needs
+        // sweep snapshots) and keeps the test to one deep scan per run.
+        let run = |priors: &ScanPriors| {
+            let mut timings = StageTimings::new();
+            collect_members_identity(
+                &[],
+                &HookRegistry::builtin(),
+                Some(1),
+                &mut timings,
+                false,
+                CaptureWorkBudget::default(),
+                false,
+                &scanned,
+                priors,
+            )
+            .0
+        };
+        let first = run(&ScanPriors::empty());
+        assert!(!first.selected.is_empty(), "first pass must select members");
+        let priors = ScanPriors {
+            digests: first
+                .digests_for_test()
+                .iter()
+                .map(|(pid, digest)| {
+                    let generation = crate::process::process_start_time(*pid).ok();
+                    (*pid, (generation, *digest))
+                })
+                .collect::<BTreeMap<_, _>>(),
+        };
+        let second = run(&priors);
+        let live = |pid: u32| crate::process::process_start_time(pid).ok();
+        let skip = unchanged_skip_set(&second.sweep_for_test(), &priors, &live);
+        assert!(
+            !skip.is_empty(),
+            "stable system pids must skip; sweep sizes {} -> {}",
+            first.sweep_for_test().len(),
+            second.sweep_for_test().len()
+        );
+        let selected: BTreeSet<u32> = second.selected.iter().copied().collect();
+        assert!(
+            selected.intersection(&skip).next().is_none(),
+            "no proven-unchanged member may consume a deep-scan slot"
+        );
+        let full = select_for_test(
+            &second.sweep_for_test(),
+            &second.sweep_unavailable_for_test(),
+            1,
+            &scanned,
+        );
+        let expected: Vec<u32> = full.into_iter().filter(|pid| !skip.contains(pid)).collect();
+        assert_eq!(
+            second.selected, expected,
+            "selection is rarity order minus proven-unchanged members"
+        );
+    }
+}
+
 /// Pins the `take_anchors` flag -> builder wiring at the nearest testable
 /// seam: `collect_members_identity` must forward its flag to
 /// `build_identity_custody`, so explicit userspace (`false`) gets
@@ -10501,6 +10839,7 @@ mod take_anchors_wiring_tests {
                 take_anchors,
                 // Cap 0 selects nothing; freshness is moot.
                 &std::collections::BTreeSet::new(),
+                &super::ScanPriors::empty(),
             );
             assert!(
                 collection.selected.is_empty(),

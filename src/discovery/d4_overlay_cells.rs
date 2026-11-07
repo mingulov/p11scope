@@ -3659,6 +3659,7 @@ fn k1_no_route_collect_row(
             &[],
             0,
             0,
+            &crate::inspect_system::ScanPriors::empty(),
         )
         .map_err(|error| format!("k1 no-route collect_system pass {pass}: {error:#}"))?;
         let (queries_after, _) = witness_stats_for_test();

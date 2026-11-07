@@ -1100,7 +1100,8 @@ and a read-only hostPath of `/sys/fs/cgroup`. No bpffs, tracefs, debugfs or
 BTF mount, no `privileged: true`, no hostNetwork; read-only root, seccomp
 `RuntimeDefault`. The five-capability minimal set is expected to replace
 `CAP_SYS_ADMIN` at any paranoid on the default lane — measured at host
-level, but the kind removal is not measured here, so the shipped manifest
+level on both Ubuntu-style hardened sysctls and Fedora defaults, but
+the kind removal is not measured here, so the shipped manifest
 keeps its grant; check with `--command doctor`.
 Do not drop `CAP_SYS_ADMIN` without adding `CAP_CHECKPOINT_RESTORE`:
 `inventory` attributes callers past the scan cap through
@@ -2203,10 +2204,19 @@ five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `run` counted completed calls (`scripts/ci/minimal-setcap.sh`; it has
 26 rows when the saved paranoid value is 3 or 4 and 33 otherwise, and
 runs on the CI host and the v6.6, v6.12, v6.18, 7.3 and 7.4-rc1 guest
-kernels; all 33 rows passed in a local v6.6 guest on 2026-11-07).
-Stated plainly: at
-`perf_event_paranoid >= 3`, capturing on the default lane needs the
-minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
+kernels; all 33 rows passed in a local v6.6 guest on 2026-11-07). Measured the
+same day on Fedora defaults (`perf_event_paranoid=2`,
+`kernel.yama.ptrace_scope=0`, `kernel.kptr_restrict=0`, kernels 7.2.9
+and 7.2.15): the same five-capability set passes all 33
+`minimal-setcap.sh` rows — the paranoid-parametric rows at 2, 3 and 4,
+including the strict `CAP_CHECKPOINT_RESTORE` row and every
+missing-capability refusal row. So one minimal set serves both host
+kinds: Ubuntu-style hardened sysctls (`perf_event_paranoid=4`,
+`kernel.yama.ptrace_scope=1`, `kernel.kptr_restrict=1`) and Fedora
+defaults; both keep `kernel.unprivileged_bpf_disabled=2` and lockdown
+`integrity`. Stated plainly: at `perf_event_paranoid >= 3`, capturing
+on the default lane needs the minimal set, never `CAP_SYS_ADMIN`.
+Only `--attach-backend singles`
 keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,
 every failure `perf_event_open`).
 On every kernel, manifest-free scanning of this same-UID non-descendant
@@ -2223,7 +2233,9 @@ requirement.
 ### Run without sudo
 
 On a 6.6+ kernel the observer captures as an ordinary user with exactly
-five file capabilities, no sudo and no `CAP_SYS_ADMIN`. `p11scope doctor`
+five file capabilities, no sudo and no `CAP_SYS_ADMIN` — the same set
+on Ubuntu-style hardened sysctls and on Fedora defaults (measured rows
+for both are quoted above). `p11scope doctor`
 prints the exact one-line command for its own binary in the `minimal
 setcap` row; for a binary at `/usr/local/bin/p11scope` it is:
 
@@ -2260,8 +2272,9 @@ AmbientCapabilities=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFM
 CapabilityBoundingSet=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFMON CAP_SYS_PTRACE
 ```
 
-A root run under that bounding set lacks `CAP_SETUID`, `CAP_SETGID` and
-`CAP_KILL`: `run` then fails its child identity drop with `EPERM`
+That unit suits Ubuntu-style hardened hosts and Fedora-default hosts
+alike. A root run under that bounding set lacks `CAP_SETUID`, `CAP_SETGID`
+and `CAP_KILL`: `run` then fails its child identity drop with `EPERM`
 instead of a needs-line (the unit above runs as `User=p11scope`, so it
 needs no identity change). Treat the minimal set as root-equivalent for reading: anyone who can
 execute a capability-carrying observer can observe other users'

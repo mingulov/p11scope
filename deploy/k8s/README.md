@@ -187,7 +187,8 @@ Why each grant:
 **Gated variant**: the five-capability minimal set (`BPF` + `PERFMON` +
 `CHECKPOINT_RESTORE` + `SYS_PTRACE` + `DAC_READ_SEARCH`, no `SYS_ADMIN`)
 is expected to suffice at any paranoid on the default lane — measured at
-host level, but this repository has **not** measured the kind removal, so
+host level on both Ubuntu-style hardened sysctls and Fedora defaults,
+but this repository has **not** measured the kind removal, so
 the shipped manifest keeps its grant. **Do not simply drop `SYS_ADMIN`**:
 it also covers `/proc/<pid>/map_files`, which `inventory`'s caller
 attribution past the scan cap reads and which needs `CAP_SYS_ADMIN` or

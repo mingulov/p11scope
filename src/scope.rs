@@ -50,23 +50,40 @@ const CGROUP2_SUPER_MAGIC: u64 = 0x6367_7270;
 #[derive(Debug)]
 pub struct RunCgroup {
     path: PathBuf,
+    cgroup_root: PathBuf,
+    verbose: bool,
 }
 
 impl RunCgroup {
     /// Creates the run subgroup directly under `base`. Tests pass a
     /// tmpfs dir; production must use [`RunCgroup::create_under_observer`]
-    /// instead, never the filesystem root. No controllers are enabled,
-    /// so the subgroup itself carries no resource state; the cgroup2
-    /// proof stays with scope construction (`capture_cgroup`), which
-    /// must build on this path before use.
+    /// instead, under the observer's own cgroup; that is the root only
+    /// when the observer itself runs in the root cgroup. No controllers
+    /// are enabled, so the subgroup itself carries no resource state;
+    /// the cgroup2 proof stays with scope construction (`capture_cgroup`),
+    /// which must build on this path before use.
     pub fn create(base: &Path) -> Result<Self> {
+        let production_root = Path::new("/sys/fs/cgroup");
+        let cgroup_root = if base.starts_with(production_root) {
+            production_root.to_path_buf()
+        } else {
+            base.to_path_buf()
+        };
+        Self::create_with_root(base, &cgroup_root)
+    }
+
+    fn create_with_root(base: &Path, cgroup_root: &Path) -> Result<Self> {
         let path = base.join(
             run_cgroup_name()
                 .with_context(|| format!("naming a run cgroup under {}", base.display()))?,
         );
         std::fs::create_dir(&path)
             .with_context(|| format!("creating run cgroup {}", path.display()))?;
-        Ok(Self { path })
+        Ok(Self {
+            path,
+            cgroup_root: cgroup_root.to_path_buf(),
+            verbose: false,
+        })
     }
 
     /// Creates the run subgroup under the observer's own cgroup (see
@@ -74,22 +91,30 @@ impl RunCgroup {
     /// limits and unit kill semantics, and no resource controllers are
     /// touched. Any failure (unreadable membership, no v2 line,
     /// permission, delegation) degrades the run to its exact child —
-    /// the caller must never fall back to the filesystem root.
+    /// under the observer's own cgroup; that is the root only when the
+    /// observer itself runs in the root cgroup.
     pub fn create_under_observer(cgroup_root: &Path) -> Result<Self> {
         let base = observer_run_cgroup_base(cgroup_root)?;
-        Self::create(&base)
+        Self::create_with_root(&base, cgroup_root)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
     }
 
+    /// Whether the retention notice may name the full cgroup path: only
+    /// under `-v`. By default it names the leaf only, since the full
+    /// path carries the observer's UID/session slices.
+    pub fn set_verbose(&mut self, verbose: bool) {
+        self.verbose = verbose;
+    }
+
     /// Moves the whole process `pid` into the run cgroup and proves the
     /// landing via `/proc/<pid>/cgroup`: a misplaced child would flip
     /// every later scope assertion, so a silent miss fails here instead.
     /// The readback is relative to the v2 mount root, so it joins with
-    /// `/sys/fs/cgroup` — never with the run cgroup's own parent, which
-    /// is the observer's nested base, not the root.
+    /// the stored cgroup root — never with the run cgroup's own parent,
+    /// which is the observer's nested base, not the root.
     pub fn place(&self, pid: u32) -> Result<()> {
         std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
             .with_context(|| format!("moving {pid} to run cgroup {}", self.path.display()))?;
@@ -97,7 +122,7 @@ impl RunCgroup {
             .with_context(|| format!("reading the cgroup of {pid}"))?;
         let relative = parse_cgroup_v2_relative(&text)
             .with_context(|| format!("no cgroup v2 entry for process {pid}: {text:?}"))?;
-        let placed = Path::new("/sys/fs/cgroup").join(relative);
+        let placed = self.cgroup_root.join(relative);
         anyhow::ensure!(
             placed == self.path,
             "process {pid} did not land in {} (in {})",
@@ -133,7 +158,9 @@ impl RunCgroup {
     /// Who keeps the directory alive, by count from the membership
     /// file (never PIDs): the operator removes the named path once
     /// its members exit. An unreadable file reads as empty rather
-    /// than refusing the notice.
+    /// than refusing the notice. By default the notice names the leaf
+    /// only; the full path (which carries UID/session slices) appears
+    /// only when verbose was armed.
     fn retention_notice(&self) -> String {
         let members = std::fs::read_to_string(self.path.join("cgroup.procs"))
             .map(|text| {
@@ -147,9 +174,17 @@ impl RunCgroup {
         } else {
             format!("{members} members are")
         };
+        let shown = if self.verbose {
+            self.path.display().to_string()
+        } else {
+            self.path
+                .file_name()
+                .and_then(|leaf| leaf.to_str())
+                .unwrap_or("p11scope-run-unknown")
+                .to_string()
+        };
         format!(
-            "p11scope: the run cgroup {} is retained: {held} still present; remove it after they exit",
-            self.path.display()
+            "p11scope: the run cgroup {shown} is retained: {held} still present; remove it after they exit"
         )
     }
 }
@@ -298,6 +333,8 @@ fn filesystem_magic(dir: &File) -> std::io::Result<u64> {
 /// caller passes `/sys/fs/cgroup`) looking for the one directory whose
 /// inode matches `target`, returning its path relative to `root` (e.g.
 /// `"kubepods.slice/kubepods-pod1234.slice/cri-containerd-abcd.scope"`).
+/// A run-cgroup leaf (`p11scope-run-*`) publishes as its leaf name only:
+/// the full nested path would carry the observer's UID/session slices.
 /// `None` when no match is found anywhere under `root` — an absent label
 /// is fine, a wrong one is not: this never guesses, and a cgroup that has
 /// since been removed (the capture ended, the container exited) simply
@@ -307,11 +344,16 @@ pub fn label(root: &Path, target: u64) -> Option<String> {
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
         if std::fs::metadata(&dir).is_ok_and(|md| md.ino() == target) {
-            return dir
-                .strip_prefix(root)
-                .ok()
-                .map(|p| p.display().to_string())
-                .filter(|s| !s.is_empty());
+            let relative = dir.strip_prefix(root).ok()?;
+            if relative.as_os_str().is_empty() {
+                return None;
+            }
+            if let Some(leaf) = relative.file_name().and_then(|name| name.to_str())
+                && leaf.starts_with("p11scope-run-")
+            {
+                return Some(leaf.to_string());
+            }
+            return Some(relative.display().to_string());
         }
         if let Ok(entries) = std::fs::read_dir(&dir) {
             for entry in entries.flatten() {
@@ -894,6 +936,66 @@ mod tests {
         assert_eq!(label(root.path(), 0xdead_beef), None);
     }
 
+    #[test]
+    fn label_returns_only_the_run_cgroup_leaf_for_nested_run_groups() {
+        use std::os::unix::fs::MetadataExt as _;
+        let root = tempfile::tempdir().unwrap();
+        let nested = root
+            .path()
+            .join("user.slice")
+            .join("user-1000.slice")
+            .join("p11scope-run-0123456789abcdef");
+        std::fs::create_dir_all(&nested).unwrap();
+        let target = std::fs::metadata(&nested).unwrap().ino();
+
+        let got = label(root.path(), target).expect("nested run group must be found");
+        assert_eq!(got, "p11scope-run-0123456789abcdef");
+        assert!(
+            !got.contains('/'),
+            "the published label is the leaf only, never the full path: {got:?}"
+        );
+    }
+
+    #[test]
+    fn run_cgroup_place_uses_the_stored_cgroup_root() {
+        let root = tempfile::tempdir().unwrap();
+        let group = RunCgroup::create(root.path()).expect("create the run group under tmpfs");
+        let error = format!("{:#}", group.place(1).unwrap_err());
+        assert!(
+            error.contains(&root.path().display().to_string()),
+            "place must join the readback with the stored root, not /sys/fs/cgroup: {error}"
+        );
+        assert!(
+            !error.contains("/sys/fs/cgroup"),
+            "place must not hardcode the production root for a tmpfs group: {error}"
+        );
+    }
+
+    #[test]
+    fn run_cgroup_retention_notice_names_the_leaf_unless_verbose() {
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("user.slice").join("user-1000.slice");
+        std::fs::create_dir_all(&nested).unwrap();
+        let mut group = RunCgroup::create(&nested).expect("create the run group");
+        let leaf = group
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a leaf name")
+            .to_string();
+        let quiet = group.retention_notice();
+        assert!(
+            quiet.contains(&leaf) && !quiet.contains("user.slice"),
+            "the default notice names the leaf only: {quiet:?}"
+        );
+        group.set_verbose(true);
+        let loud = group.retention_notice();
+        assert!(
+            loud.contains(&group.path().display().to_string()),
+            "the verbose notice may name the full path: {loud:?}"
+        );
+    }
+
     /// I4 witness publication fake: models a marker object when
     /// `witness_map` is set, a marker-less object otherwise.
     #[derive(Default)]
@@ -1353,9 +1455,9 @@ mod tests {
 
     #[test]
     fn run_cgroup_drop_notices_a_retained_dir() {
-        // The retention notice names the path and counts planted
+        // The retention notice names the leaf and counts planted
         // members (never PIDs); an empty or already-gone directory
-        // stays silent.
+        // stays silent. The full path appears only when verbose.
         let base = tempfile::tempdir().unwrap();
         let group = RunCgroup::create(base.path()).expect("create in a writable dir");
         assert_eq!(group.remove_best_effort(), None);
@@ -1372,8 +1474,12 @@ mod tests {
             notice.contains("is retained: 2 members are still present"),
             "{notice}"
         );
-        let path = group.path().display().to_string();
-        assert!(notice.contains(path.as_str()), "{notice}");
+        let leaf = group
+            .path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("a leaf name");
+        assert!(notice.contains(leaf), "{notice}");
         assert!(group.path().is_dir(), "retention still never forces");
     }
 
@@ -1431,10 +1537,10 @@ mod tests {
 
     #[test]
     fn observer_run_cgroup_base_stays_under_the_observer_cgroup() {
-        // The run cgroup must be created under the observer's own
-        // cgroup, never at the filesystem root: that keeps ancestor
-        // limits and unit kill semantics. Pure text-to-path mapping,
-        // so no cgroup rights are needed here.
+        // The run cgroup must be created under the observer's own cgroup;
+        // that is the root only when the observer itself runs in the root
+        // cgroup: that keeps ancestor limits and unit kill semantics. Pure
+        // text-to-path mapping, so no cgroup rights are needed here.
         let root = Path::new("/sys/fs/cgroup");
         for (text, expected) in [
             (
@@ -1518,6 +1624,14 @@ mod tests {
             group.path() != base,
             "the run cgroup is a child, not the base itself"
         );
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let placed = group.place(child.id());
+        child.kill().expect("kill the child");
+        child.wait().expect("reap the child");
+        placed.expect("a real child lands in the nested run cgroup");
         let path = group.path().to_path_buf();
         drop(group);
         assert!(!path.exists(), "the emptied run cgroup is removed");

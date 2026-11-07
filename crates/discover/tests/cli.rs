@@ -245,9 +245,24 @@ fn constructor_sees_no_planted_fd_or_loader_env() {
 
 /// A fresh private directory under the cargo test scratch root.
 fn scratch(name: &str) -> std::path::PathBuf {
+    scratch_in(Path::new(env!("CARGO_TARGET_TMPDIR")), name)
+}
+
+/// Scratch root for the btrfs-gated cell: `$P11SCOPE_DISCOVER_BTRFS_SCRATCH`
+/// when set to a non-empty directory (a provisioned btrfs mount), else
+/// the cargo test scratch root.
+fn btrfs_scratch_root() -> std::path::PathBuf {
+    std::env::var_os("P11SCOPE_DISCOVER_BTRFS_SCRATCH")
+        .filter(|value| !value.is_empty())
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| Path::new(env!("CARGO_TARGET_TMPDIR")).to_path_buf())
+}
+
+/// A fresh private directory under `root` (the btrfs-gated cell passes
+/// its provisioned mount here; every other test uses [`scratch`]).
+fn scratch_in(root: &Path, name: &str) -> std::path::PathBuf {
     use std::os::unix::fs::PermissionsExt as _;
-    let dir = Path::new(env!("CARGO_TARGET_TMPDIR"))
-        .join(format!("discover-{name}-{}", std::process::id()));
+    let dir = root.join(format!("discover-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1435,15 +1450,18 @@ fn btrfs_gate_rejects_non_btrfs_filesystems() {
 /// The btrfs subvolume hole: BTRFS_IOC_SUBVOL_CREATE bypasses the
 /// Landlock path hooks, so only the seccomp type-byte rule stops it.
 /// Trusted creates the subvolume outside -o; isolated fails with EACCES
-/// and creates nothing. Needs scratch on btrfs; elsewhere it reports
-/// NOT_RUN instead of passing.
+/// and creates nothing. Ignored by default: it needs scratch on btrfs
+/// (via `$P11SCOPE_DISCOVER_BTRFS_SCRATCH` or a btrfs cargo scratch),
+/// and elsewhere it reports NOT_RUN instead of passing.
 #[test]
+#[ignore = "needs btrfs scratch; run by exact selector"]
 fn isolation_btrfs_subvolume_outside_the_output_is_denied() {
-    let dir = scratch("isolation-subvol");
+    let dir = scratch_in(&btrfs_scratch_root(), "isolation-subvol");
     assert!(
         dir_is_btrfs(&dir),
         "NOT_RUN: needs scratch on btrfs for the subvolume twin ({} is not btrfs); \
-         run where CARGO_TARGET_TMPDIR is on btrfs or provision a loopback btrfs",
+         set P11SCOPE_DISCOVER_BTRFS_SCRATCH to a btrfs directory or run where \
+         CARGO_TARGET_TMPDIR is on btrfs",
         dir.display()
     );
     let provider = build_isolation_probe(&dir);

@@ -10248,6 +10248,7 @@ mod tests {
             exclude_modules: vec![],
             manifests: Vec::new(),
             prearm_modules: Vec::new(),
+            forwarding_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
             counter_mode: None,

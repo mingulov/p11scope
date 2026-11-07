@@ -92,6 +92,7 @@ fn capture_args(
         exclude_modules: vec![],
         manifests,
         prearm_modules: prearm,
+        forwarding_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,

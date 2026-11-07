@@ -42,6 +42,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         exclude_modules: vec![],
         manifests: Vec::new(),
         prearm_modules: Vec::new(),
+        forwarding_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         metrics: false,
         counter_mode: None,

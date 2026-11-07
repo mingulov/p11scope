@@ -122,6 +122,7 @@ fn cold_group_discovery_keeps_tgid_scope_and_actual_callback_target() {
             exclude_modules: vec![],
             manifests: vec![],
             prearm_modules: vec![],
+            forwarding_modules: Vec::new(),
             hooks: HookRegistry::builtin(),
             scope: crate::cli::ScopeArg::Pid(group.pid()),
             metrics: false,

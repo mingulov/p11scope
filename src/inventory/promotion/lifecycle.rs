@@ -1295,6 +1295,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         gaps_suppressed: 0,
         excluded_modules: Vec::new(),
         unmatched_excludes: Vec::new(),
+        unmatched_forwarding: Vec::new(),
         budgets: BudgetView {
             callers_limit: 0,
             callers_occupied: 0,

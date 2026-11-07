@@ -108,6 +108,7 @@ fn discover_prearm_never_mapped(
         exclude_modules: Vec::new(),
         manifests: Vec::new(),
         prearm_modules: paths.to_vec(),
+        forwarding_modules: Vec::new(),
         hooks: crate::discovery::hooks::HookRegistry::builtin(),
         scope: crate::cli::ScopeArg::Pid(pid),
         metrics,

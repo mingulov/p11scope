@@ -281,6 +281,10 @@ pub(crate) struct ModuleView {
     /// Observed `C_Initialize` returns since the semantic lane
     /// sealed, with the judged verdict.
     pub init: ModuleInitView,
+    /// The operator declared this module a forwarding layer with
+    /// `--forwarding-module`: its edges split out exactly like a closure
+    /// array under the same per-caller gates.
+    pub operator_forwarding: bool,
 }
 
 /// One module's `C_Initialize` evidence (S1-adjacent), owned for
@@ -327,7 +331,6 @@ impl ModuleInitView {
             detail: judged.detail,
         }
     }
-}
 
 /// One mechanism id's published facts (S1), owned for rendering.
 /// The id stays verbatim; the name is `Some` iff registered.
@@ -592,6 +595,10 @@ pub(crate) struct Presentation {
     /// the operator passed `--exclude-module`.
     pub excluded_modules: Vec<crate::render::ExcludedOut>,
     pub unmatched_excludes: Vec<String>,
+    /// `--forwarding-module` inputs that matched no mapped file. Like
+    /// `unmatched_excludes`: a declaration that matched nothing must
+    /// never silently do nothing.
+    pub unmatched_forwarding: Vec<String>,
     pub budgets: BudgetView,
     /// The sanitized Detailed-lane summary (`observation.
     /// semantic_capture`): counts only, set by the run loop from the
@@ -777,6 +784,7 @@ impl Presentation {
                 unloaded_observed: record.unloaded_observed,
                 unbound_use: record.unbound_use.clone(),
                 init: ModuleInitView::capture(registry, *id),
+                operator_forwarding: false,
             });
         }
         let mut edge_keys: Vec<(CallerId, ModuleId)> = registry
@@ -938,6 +946,7 @@ impl Presentation {
             gaps_suppressed: registry.gaps_suppressed(),
             excluded_modules,
             unmatched_excludes,
+            unmatched_forwarding: Vec::new(),
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
             // No Joint evidence reaches the live registry today
             // (live-loop carry): the projection is honestly

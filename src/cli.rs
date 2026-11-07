@@ -107,6 +107,12 @@ pub struct CaptureArgs {
     /// Never a scan filter (that is `--module`) and never function claims
     /// (that is `--manifest`).
     pub prearm_modules: Vec<PathBuf>,
+    /// `--forwarding-module` inputs; empty ⇒ no declared layers.
+    /// Repeatable. A full path (contains `/`) declares exactly that file
+    /// by identity; a bare name declares every file with that basename.
+    /// Declared modules split out of headline totals exactly like a
+    /// closure-array forwarding layer under the same gates.
+    pub forwarding_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     pub scope: ScopeArg,
     /// `--mode metrics` (profile only).
@@ -167,6 +173,8 @@ pub struct RunArgs {
     pub manifests: Vec<PathBuf>,
     /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`.
     pub prearm_modules: Vec<PathBuf>,
+    /// `--forwarding-module` inputs; see `CaptureArgs`.
+    pub forwarding_modules: Vec<PathBuf>,
     pub hooks: HookRegistry,
     /// `--mode metrics` (rejected beside `--trace`).
     pub metrics: bool,
@@ -275,6 +283,8 @@ pub struct InventoryArgs {
     /// `--prearm-module` inputs (packet 6.13); see `CaptureArgs`. Refused
     /// under `--capture scan`, like `--manifest`.
     pub prearm_modules: Vec<PathBuf>,
+    /// `--forwarding-module` inputs; see `CaptureArgs`.
+    pub forwarding_modules: Vec<PathBuf>,
     /// `--key-operations`: opt-in per-key tracking (linked journal lane).
     /// Default off; refused under `--capture scan`, like `--manifest`.
     pub key_operations: bool,
@@ -1092,6 +1102,16 @@ pub fn validate_prearm_excludes(prearm: &[PathBuf], excludes: &[PathBuf]) -> Res
     Ok(())
 }
 
+/// Validate `--forwarding-module` inputs at startup (same exit-2
+/// usage-error shape as [`validate_excludes`]): a full path (contains
+/// `/`) must exist, and a declared layer matching an exclusion is
+/// refused — an excluded file gets no probes, so there is nothing to
+/// split. Bare names need no existence: they match by basename at
+/// evidence assembly.
+pub fn validate_forwarding(_forwarding: &[PathBuf], _excludes: &[PathBuf]) -> Result<(), String> {
+    Ok(())
+}
+
 /// Validate `--manifest` inputs against `--exclude-module` at startup (same
 /// exit-2 usage-error shape as [`validate_excludes`]): a manifest attesting
 /// a provider that matches an exclusion is refused. Attested paths are the
@@ -1254,6 +1274,7 @@ struct Common {
     exclude_modules: Vec<PathBuf>,
     manifests: Vec<PathBuf>,
     prearm_modules: Vec<PathBuf>,
+    forwarding_modules: Vec<PathBuf>,
     hooks: HookRegistry,
     metrics: Option<bool>,
     counter_mode: Option<CounterMode>,
@@ -2072,6 +2093,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         exclude_modules,
         manifests,
         prearm_modules,
+        forwarding_modules: Vec::new(),
         key_operations,
         hooks,
         json,
@@ -2213,6 +2235,7 @@ pub fn parse_capture(
         exclude_modules: common.exclude_modules,
         manifests: common.manifests,
         prearm_modules: common.prearm_modules,
+        forwarding_modules: common.forwarding_modules,
         hooks: common.hooks,
         scope,
         metrics,
@@ -2318,6 +2341,7 @@ fn parse_run(mut args: impl Iterator<Item = OsString>) -> Result<RunArgs, CliErr
         exclude_modules: common.exclude_modules,
         manifests: common.manifests,
         prearm_modules: common.prearm_modules,
+        forwarding_modules: common.forwarding_modules,
         hooks: common.hooks,
         metrics,
         counter_mode: common.counter_mode,
@@ -5909,6 +5933,122 @@ mod tests {
             panic!("expected inventory")
         };
         assert_eq!(v.exclude_modules, vec![PathBuf::from("libp11-kit.so.0")]);
+    }
+
+    #[test]
+    fn forwarding_module_parses_repeatable_on_profile_run_trace_and_inventory() {
+        let Command::Profile(a) = parse(args(&[
+            "profile",
+            "--pid",
+            "42",
+            "--forwarding-module",
+            "/opt/shim.so",
+            "--forwarding-module",
+            "pkcs11-spy.so",
+        ]))
+        .unwrap() else {
+            panic!("expected profile")
+        };
+        assert_eq!(
+            a.forwarding_modules,
+            vec![
+                PathBuf::from("/opt/shim.so"),
+                PathBuf::from("pkcs11-spy.so")
+            ]
+        );
+        let Command::Run(r) = parse(args(&[
+            "run",
+            "--forwarding-module",
+            "pkcs11-spy.so",
+            "--",
+            "/bin/true",
+        ]))
+        .unwrap() else {
+            panic!("expected run")
+        };
+        assert_eq!(
+            r.forwarding_modules,
+            vec![PathBuf::from("pkcs11-spy.so")]
+        );
+        let Command::Trace(t) = parse(args(&["trace", "--pid", "42", "--forwarding-module", "s.so"]))
+            .unwrap()
+        else {
+            panic!("expected trace")
+        };
+        assert_eq!(t.forwarding_modules, vec![PathBuf::from("s.so")]);
+        let Command::Inventory(v) = parse(args(&[
+            "inventory",
+            "--system",
+            "--forwarding-module",
+            "pkcs11-spy.so",
+        ]))
+        .unwrap() else {
+            panic!("expected inventory")
+        };
+        assert_eq!(
+            v.forwarding_modules,
+            vec![PathBuf::from("pkcs11-spy.so")]
+        );
+    }
+
+    /// The declaration only affects counting, and `inspect` never counts:
+    /// the flag is refused there, keeping the scan surface unchanged.
+    #[test]
+    fn forwarding_module_is_refused_on_inspect() {
+        let result = parse(args(&["inspect", "--pid", "42", "--forwarding-module", "s.so"]));
+        assert!(
+            result.is_err(),
+            "inspect takes no --forwarding-module: {result:?}"
+        );
+    }
+
+    #[test]
+    fn forwarding_module_conflicts_with_exclude() {
+        let error = validate_forwarding(
+            &[PathBuf::from("/opt/shim.so")],
+            &[PathBuf::from("/opt/shim.so")],
+        )
+        .expect_err("same input must conflict");
+        assert!(
+            error.contains("--forwarding-module") && error.contains("--exclude-module"),
+            "the conflict names both flags: {error}"
+        );
+        let error = validate_forwarding(
+            &[PathBuf::from("/opt/shim.so")],
+            &[PathBuf::from("shim.so")],
+        )
+        .expect_err("bare-name basename match must conflict");
+        assert!(
+            error.contains("--forwarding-module") && error.contains("--exclude-module"),
+            "the conflict names both flags: {error}"
+        );
+    }
+
+    #[test]
+    fn forwarding_module_path_must_exist() {
+        let error = validate_forwarding(
+            &[PathBuf::from("/opt/definitely-missing-shim-7f3a.so")],
+            &[],
+        )
+        .expect_err("a missing path must fail");
+        assert!(
+            error.contains("--forwarding-module") && error.contains("does not exist"),
+            "a missing path names the flag: {error}"
+        );
+        assert!(
+            validate_forwarding(&[PathBuf::from("bare-name.so")], &[]).is_ok(),
+            "bare names need no existence"
+        );
+    }
+
+    #[test]
+    fn forwarding_module_help_names_flag() {
+        for topic in [HelpTopic::Profile, HelpTopic::Run, HelpTopic::Trace, HelpTopic::Inventory] {
+            assert!(
+                topic.text().contains("--forwarding-module"),
+                "{topic:?} help names the flag"
+            );
+        }
     }
 
     /// Controller ruling (remedies): every remedy a refusal can name is a

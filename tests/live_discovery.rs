@@ -56,6 +56,7 @@ fn engine_initial_discovery_preserves_plan() {
         exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
+        forwarding_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,

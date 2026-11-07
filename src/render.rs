@@ -671,6 +671,17 @@ pub struct DiscoveryEvidence {
     /// empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_excludes: Vec<String>,
+    /// Modules the operator declared as forwarding layers with
+    /// `--forwarding-module`, matched to mapped files at evidence assembly.
+    /// Renderer metadata like `admission_class`: absent from the schema;
+    /// the JSON layer split travels in `functions[]` and `layer_totals`.
+    #[serde(skip)]
+    pub forwarding_declared: Vec<ModuleId>,
+    /// `--forwarding-module` inputs that matched no mapped file. Text-only
+    /// (the serialized twin is `unmatched_excludes`): a declared input
+    /// that matched nothing must never silently do nothing.
+    #[serde(skip)]
+    pub unmatched_forwarding: Vec<String>,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
     /// mode armed. Serde-skipped carrier: the profile lane and the
     /// terminal trace `EVIDENCE` hoist it to the top-level
@@ -747,6 +758,22 @@ pub(crate) fn aggregate_excluded(
     (excluded, unmatched)
 }
 
+/// Match `--forwarding-module` inputs against mapped modules at evidence
+/// assembly. Each module is `(id, path, dev, ino)` with `dev` as
+/// `(major, minor)`. A full path (contains `/`) matches by file identity
+/// while the input still resolves, else by exact path string; a bare
+/// name matches every file with that basename. Returns matched module
+/// ids (deduped, in module order) plus the inputs that matched nothing.
+/// Bare names never match by ELF soname here — the scan-time exclusion
+/// matcher owns that; an unmatched soname is reported, not guessed.
+pub(crate) fn match_forwarding_inputs(
+    declared: &[std::path::PathBuf],
+    modules: &[(ModuleId, String, (u64, u64), u64)],
+) -> (Vec<ModuleId>, Vec<String>) {
+    let _ = (declared, modules);
+    (Vec::new(), Vec::new())
+}
+
 impl Default for DiscoveryEvidence {
     fn default() -> Self {
         Self {
@@ -762,6 +789,8 @@ impl Default for DiscoveryEvidence {
             scan_ms: 0,
             excluded_modules: Vec::new(),
             unmatched_excludes: Vec::new(),
+            forwarding_declared: Vec::new(),
+            unmatched_forwarding: Vec::new(),
             gap_exit_mappings: None,
         }
     }
@@ -9450,6 +9479,311 @@ pub(crate) mod tests {
         );
     }
 
+    /// Declared-forwarding twin: a single-table shim (pkcs11-spy shape —
+    /// corroborated, never a closure array) the operator named with
+    /// `--forwarding-module` splits exactly like a closure layer. Every
+    /// headline total counts the logical call once (provider layer); the
+    /// declared layer is shown separately per layer, never summed in.
+    #[test]
+    fn declared_forwarding_layer_splits_like_closure() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("corroborated");
+        layer.ino = 71;
+        layer.path = "/opt/libshim.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.forwarding_declared = vec![ModuleId(7)];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "declared layer counts logical once: {text}"
+        );
+        assert!(
+            !text.contains("1244 completed calls;"),
+            "headline must not sum both layers: {text}"
+        );
+        assert!(
+            text.contains("/opt/libshim.so")
+                && text.contains("500")
+                && text.contains("forwarding"),
+            "declared layer shown separately: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        let inner_json = functions
+            .iter()
+            .find(|row| row["calls"] == 744)
+            .expect("provider row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+        assert_eq!(inner_json["forwarding_layer"], false);
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// Control twin: the same shim shape WITHOUT the declaration stays
+    /// fully logical (1244) — the observer never guesses a forwarding
+    /// role. The coincidence hint below is the only undeclared signal.
+    #[test]
+    fn undeclared_shim_stays_fully_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("corroborated");
+        layer.ino = 71;
+        layer.path = "/opt/libshim.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.forwarding_declared.is_empty());
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("1244 completed calls;"),
+            "undeclared layers stay logical: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        assert!(
+            functions.iter().all(|row| row["forwarding_layer"] == false),
+            "no row splits without a declaration: {document}"
+        );
+    }
+
+    /// Declared-gate twin: a declared layer beside a refused backend keeps
+    /// its calls logical — a disclosed overcount beats hiding the calls —
+    /// exactly like the closure gate.
+    #[test]
+    fn declared_layer_with_refused_backend_stays_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("corroborated");
+        layer.ino = 71;
+        layer.path = "/opt/libshim.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.forwarding_declared = vec![ModuleId(7)];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libother.so".into(),
+            reason: "module needs 100 more; only 512 attach slots are available; 412 are in use \
+                 (412 active, 0 retired) — refusing to attach a prefix; to capture one provider, \
+                 name it with --module <path>; to free slots, exclude an unneeded module with \
+                 --exclude-module <name>"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("1244 completed calls;"),
+            "a refused backend keeps the declared layer logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line when the backend is refused: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 1244);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// Declared-gate twin: a lone declared layer (no active provider row)
+    /// keeps its calls in the totals — the declaration alone never hides
+    /// the only observation.
+    #[test]
+    fn lone_declared_layer_keeps_calls_in_totals() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("corroborated");
+        layer.ino = 71;
+        layer.path = "/opt/libshim.so".into();
+        let mut named = report("C_Sign", 44, 0, false);
+        named.module = Some(ModuleId(7));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer];
+        ev.discovery.forwarding_declared = vec![ModuleId(7)];
+        ev.verdict();
+        let text = scope_summary("pid", &[named.clone()], &ev);
+        assert!(
+            text.contains("44 completed calls;"),
+            "a lone declared layer stays fully logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let document = json(&[named], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 44);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// Coincidence hint: two attached non-layer modules whose per-function
+    /// vectors coincide exactly (the manifest-run spy shape: every shim
+    /// call re-observed at the backend) get a text hint naming both
+    /// modules and the `--forwarding-module` remedy. Advisory only —
+    /// counts never change here.
+    #[test]
+    fn coincident_vectors_suggest_forwarding_flag() {
+        let mut shim = discovered_fixture();
+        shim.id = ModuleId(7);
+        shim.admission_class = Some("corroborated");
+        shim.ino = 71;
+        shim.path = "/opt/libshim.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut rows = Vec::new();
+        for (name, shim_calls, backend_calls) in [
+            ("C_Initialize", 1, 1),
+            ("C_GetSlotList", 2, 2),
+            ("C_GetTokenInfo", 2, 2),
+        ] {
+            let mut outer = report(name, shim_calls, 0, false);
+            outer.module = Some(ModuleId(7));
+            rows.push(outer);
+            let mut inner = report(name, backend_calls, 0, false);
+            inner.module = Some(ModuleId(8));
+            rows.push(inner);
+        }
+        let mut extra = report("C_GetFunctionList", 1, 0, false);
+        extra.module = Some(ModuleId(8));
+        rows.push(extra);
+        let mut ev = evidence();
+        ev.discovery.modules = vec![shim, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &rows, &ev);
+        assert!(
+            text.contains("--forwarding-module"),
+            "coincident vectors suggest the flag: {text}"
+        );
+        assert!(
+            text.contains("/opt/libshim.so") && text.contains("/opt/libbackend.so"),
+            "the hint names both modules: {text}"
+        );
+        // Advisory only: the headline still sums both layers.
+        assert!(
+            text.contains("11 completed calls;"),
+            "the hint changes no count: {text}"
+        );
+    }
+
+    /// Hint negative control: unrelated vectors (no containment either
+    /// way) suggest nothing.
+    #[test]
+    fn unrelated_vectors_suggest_nothing() {
+        let mut first = discovered_fixture();
+        first.id = ModuleId(7);
+        first.admission_class = Some("corroborated");
+        first.ino = 71;
+        first.path = "/opt/libfirst.so".into();
+        let mut second = discovered_fixture();
+        second.id = ModuleId(8);
+        second.admission_class = Some("corroborated");
+        second.ino = 82;
+        second.path = "/opt/libsecond.so".into();
+        let mut sign = report("C_Sign", 9, 0, false);
+        sign.module = Some(ModuleId(7));
+        let mut verify = report("C_Verify", 9, 0, false);
+        verify.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![first, second];
+        ev.verdict();
+        let text = scope_summary("pid", &[sign, verify], &ev);
+        assert!(
+            !text.contains("--forwarding-module"),
+            "unrelated vectors suggest nothing: {text}"
+        );
+    }
+
+    /// Hint negative control: a declared (already split) layer suggests
+    /// nothing — the operator already answered.
+    #[test]
+    fn declared_layer_suggests_nothing() {
+        let mut shim = discovered_fixture();
+        shim.id = ModuleId(7);
+        shim.admission_class = Some("corroborated");
+        shim.ino = 71;
+        shim.path = "/opt/libshim.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut rows = Vec::new();
+        for name in ["C_Sign", "C_Verify"] {
+            let mut outer = report(name, 5, 0, false);
+            outer.module = Some(ModuleId(7));
+            rows.push(outer);
+            let mut inner = report(name, 5, 0, false);
+            inner.module = Some(ModuleId(8));
+            rows.push(inner);
+        }
+        let mut ev = evidence();
+        ev.discovery.modules = vec![shim, backend];
+        ev.discovery.forwarding_declared = vec![ModuleId(7)];
+        ev.verdict();
+        let text = scope_summary("pid", &rows, &ev);
+        assert!(
+            !text.contains("--forwarding-module"),
+            "a declared layer suggests nothing: {text}"
+        );
+    }
+
+    /// A `--forwarding-module` input that matched no mapped file is named
+    /// in text — a declaration that matched nothing must never silently
+    /// do nothing.
+    #[test]
+    fn unmatched_forwarding_inputs_are_named() {
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut inner = report("C_Sign", 3, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![backend];
+        ev.discovery.unmatched_forwarding = vec!["nope.so".into()];
+        ev.verdict();
+        let text = scope_summary("pid", &[inner], &ev);
+        assert!(
+            text.contains("nope.so") && text.contains("forwarding"),
+            "unmatched forwarding inputs are named: {text}"
+        );
+    }
+
     /// Ownership-gap lines explain headline attribution gaps, so they
     /// count logical rows only: unattributed forwarding rows are already
     /// stated in the forwarding line, never summed here.
@@ -9693,6 +10027,55 @@ pub(crate) mod tests {
         assert_eq!(excluded[1].path, "/snap/liba.so");
         assert_eq!(excluded[1].processes, 1);
         assert_eq!(unmatched, vec!["nope.so".to_string()]);
+    }
+
+    #[test]
+    fn forwarding_match_path_matches_by_identity() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libtarget.so.1");
+        std::fs::write(&target, b"fake-a").unwrap();
+        let meta = std::fs::metadata(&target).unwrap();
+        let modules = vec![(
+            ModuleId(3),
+            target.display().to_string(),
+            (
+                u64::from(libc::major(meta.dev())),
+                u64::from(libc::minor(meta.dev())),
+            ),
+            meta.ino(),
+        )];
+        let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
+        assert_eq!(matched, vec![ModuleId(3)]);
+        assert!(unmatched.is_empty(), "identity match leaves none: {unmatched:?}");
+        // A different file never matches by path.
+        let other = dir.path().join("libother.so.1");
+        std::fs::write(&other, b"fake-b").unwrap();
+        let (matched, unmatched) = match_forwarding_inputs(&[other], &modules);
+        assert!(matched.is_empty());
+        assert_eq!(unmatched.len(), 1);
+    }
+
+    #[test]
+    fn forwarding_match_bare_name_matches_every_basename() {
+        use std::path::PathBuf;
+        let modules = vec![
+            (ModuleId(3), "/opt/liba.so".into(), (8, 1), 100),
+            (ModuleId(4), "/snap/liba.so".into(), (8, 2), 200),
+            (ModuleId(5), "/opt/libb.so".into(), (8, 1), 300),
+        ];
+        let (matched, unmatched) =
+            match_forwarding_inputs(&[PathBuf::from("liba.so"), PathBuf::from("nope.so")], &modules);
+        assert_eq!(matched, vec![ModuleId(3), ModuleId(4)]);
+        assert_eq!(unmatched, vec!["nope.so".to_string()]);
+    }
+
+    #[test]
+    fn forwarding_match_nothing_declared_matches_nothing() {
+        let modules = vec![(ModuleId(3), "/opt/liba.so".into(), (8, 1), 100)];
+        let (matched, unmatched) = match_forwarding_inputs(&[], &modules);
+        assert!(matched.is_empty());
+        assert!(unmatched.is_empty());
     }
 
     /// A refused closure array with nothing captured below it says so: its

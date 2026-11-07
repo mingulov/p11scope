@@ -438,6 +438,7 @@ fn args_for(pid: u32, hint: &Path) -> CaptureArgs {
         exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
+        forwarding_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::Pid(pid),
         metrics: false,

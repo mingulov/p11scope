@@ -2169,6 +2169,215 @@ fn forwarding_layer_entries_count_separately_with_per_layer_split() {
     assert_eq!(plain_json["layer_totals"]["forwarding_entries"], 0);
 }
 
+/// Declared-forwarding inventory twin: a single-table shim (pkcs11-spy
+/// shape — corroborated, never a closure array) the operator named with
+/// `--forwarding-module` splits exactly like a closure layer under the
+/// same per-caller gates.
+#[test]
+fn declared_forwarding_edges_count_separately() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
+    assert!(
+        presentation.modules.len() >= 2,
+        "the twin needs two modules: {}",
+        presentation.modules.len()
+    );
+    presentation.modules[0].paths = vec!["/opt/libshim.so".into()];
+    presentation.modules[0].admission_class = Some("exact".into());
+    presentation.modules[0].operator_forwarding = true;
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id)
+        .expect("a forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id)
+        .expect("a provider edge")
+        .entry_count = 744;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("Forwarding-layer entries counted separately"),
+        "forwarding split stated in plain words: {summary}"
+    );
+    assert!(
+        summary.contains("/opt/libshim.so") && summary.contains("500"),
+        "declared layer shown per layer: {summary}"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(document["layer_totals"]["logical_entries"], 744);
+    assert_eq!(document["layer_totals"]["forwarding_entries"], 500);
+    // Negative control: without the declaration the same entries read
+    // as logical and the forwarding line is gone.
+    presentation.modules[0].operator_forwarding = false;
+    let plain = render_snapshot_summary(&presentation);
+    assert!(
+        !plain.contains("Forwarding-layer entries counted separately"),
+        "no forwarding line without a declaration: {plain}"
+    );
+    let plain_json = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(plain_json["layer_totals"]["logical_entries"], 1244);
+    assert_eq!(plain_json["layer_totals"]["forwarding_entries"], 0);
+}
+
+/// Declared-gate twin: a declared layer beside a refused backend keeps
+/// its edges logical for that caller — a disclosed overcount beats
+/// hiding the caller's entries.
+#[test]
+fn declared_layer_with_refused_backend_stays_logical() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.modules[0].paths = vec!["/opt/libshim.so".into()];
+    presentation.modules[0].admission_class = Some("exact".into());
+    presentation.modules[0].operator_forwarding = true;
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    presentation.modules[1].admission = AdmissionState::Refused;
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id)
+        .expect("a forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id)
+        .expect("a provider edge")
+        .entry_count = 744;
+    let (logical, forwarding) = layer_entry_totals(&presentation);
+    assert_eq!(logical, 1244, "a refused backend keeps the layer logical");
+    assert_eq!(forwarding, 0);
+}
+
+/// Coincidence hint: one caller with exactly equal entries at two
+/// attached non-layer modules gets a text hint naming both modules and
+/// the `--forwarding-module` remedy. Advisory only — totals never move.
+#[test]
+fn coincident_entries_suggest_forwarding_flag() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
+    presentation.modules[0].paths = vec!["/opt/libshim.so".into()];
+    presentation.modules[0].admission_class = Some("exact".into());
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    // One caller with exactly equal entries at both modules.
+    let caller = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == fwd_id)
+        .map(|edge| edge.caller)
+        .find(|caller| {
+            presentation
+                .edges
+                .iter()
+                .any(|edge| edge.module == prov_id && edge.caller == *caller)
+        })
+        .expect("a caller with edges to both modules");
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id && edge.caller == caller)
+        .expect("the caller forwarding edge")
+        .entry_count = 9;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id && edge.caller == caller)
+        .expect("the caller provider edge")
+        .entry_count = 9;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("--forwarding-module"),
+        "coincident entries suggest the flag: {summary}"
+    );
+    assert!(
+        summary.contains("/opt/libshim.so") && summary.contains("/opt/libbackend.so"),
+        "the hint names both modules: {summary}"
+    );
+}
+
+/// Hint negative control: unequal entries suggest nothing.
+#[test]
+fn unequal_entries_suggest_nothing() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
+    presentation.modules[0].paths = vec!["/opt/libfirst.so".into()];
+    presentation.modules[0].admission_class = Some("exact".into());
+    presentation.modules[1].paths = vec!["/opt/libsecond.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let first_id = presentation.modules[0].id;
+    let second_id = presentation.modules[1].id;
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == first_id)
+        .expect("a first edge")
+        .entry_count = 9;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == second_id)
+        .expect("a second edge")
+        .entry_count = 4;
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        !summary.contains("--forwarding-module"),
+        "unequal entries suggest nothing: {summary}"
+    );
+}
+
+/// A `--forwarding-module` input that matched no mapped file is named —
+/// a declaration that matched nothing must never silently do nothing.
+#[test]
+fn unmatched_forwarding_inputs_are_named() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.unmatched_forwarding = vec!["nope.so".into()];
+    let summary = render_snapshot_summary(&presentation);
+    assert!(
+        summary.contains("nope.so") && summary.contains("forwarding"),
+        "unmatched forwarding inputs are named: {summary}"
+    );
+}
+
 /// The inventory forwarding line states the counting rule honestly:
 /// provider edges are the logical totals, self-answered layer entries
 /// stay in the forwarding line, and multi-provider layer entries count

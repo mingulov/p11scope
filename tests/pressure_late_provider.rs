@@ -136,6 +136,7 @@ fn system_args(hints: Vec<PathBuf>) -> CaptureArgs {
         exclude_modules: vec![],
         manifests: vec![],
         prearm_modules: vec![],
+        forwarding_modules: Vec::new(),
         hooks: HookRegistry::builtin(),
         scope: ScopeArg::System,
         metrics: false,

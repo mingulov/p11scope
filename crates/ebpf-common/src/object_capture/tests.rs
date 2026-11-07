@@ -5924,9 +5924,7 @@ fn pqc_parameter_set_seed_canary_alias_request_refuses() {
         const SEED_BUF: u64 = 0x9000;
         // The CKA_SEED canary buffer: seed bytes the capture must
         // never retain or emit.
-        target
-            .borrow_mut()
-            .set_bytes(SEED_BUF, &[0x5E; 32]);
+        target.borrow_mut().set_bytes(SEED_BUF, &[0x5E; 32]);
         target.borrow_mut().set_word(SEED_BUF, CANARY);
         // Slot 0: the hostile alias — a parameter-set value pointer
         // into the canary buffer.
@@ -5991,9 +5989,7 @@ fn pqc_parameter_set_seed_canary_alias_get_refuses() {
         let w = layout.word_bytes() as u64;
         let target = fresh(w);
         const SEED_BUF: u64 = 0x8000;
-        target
-            .borrow_mut()
-            .set_bytes(SEED_BUF, &[0x5E; 32]);
+        target.borrow_mut().set_bytes(SEED_BUF, &[0x5E; 32]);
         target.borrow_mut().set_word(SEED_BUF, CANARY);
         prog_attr(&target, 0x4000, 0, w, SEL_PARAMETER_SET, SEED_BUF, w);
         prog_attr(&target, 0x4000, 1, w, SEL_SEED, SEED_BUF + 0x10, w);

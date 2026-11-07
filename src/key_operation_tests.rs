@@ -869,9 +869,13 @@ fn end_for_call(begin: &[u8; 224], call: &ShapedS1) -> [u8; 632] {
         // requested-only keygen templates reach the model.
         "C_GenerateKey" => {
             let mut end = match call.result {
-                Some(result) => {
-                    end_bytes_result(begin, OBJECT_ACTION_GENERATE, call.rv, ENTRY_NS + 50, result)
-                }
+                Some(result) => end_bytes_result(
+                    begin,
+                    OBJECT_ACTION_GENERATE,
+                    call.rv,
+                    ENTRY_NS + 50,
+                    result,
+                ),
                 None => end_bytes(begin, OBJECT_ACTION_GENERATE, call.rv, ENTRY_NS + 50),
             };
             if call.result.is_none() {
@@ -22826,9 +22830,13 @@ fn key_operation_pqc_version_follows_content() {
         let section = object_observations_json(&bare);
         assert_eq!(section["version"], 5);
         assert_seven_key_blocks(&section);
-        assert_eq!(section["objects"][0]["established"]["key_type"]["value"], key_type);
         assert_eq!(
-            section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+            section["objects"][0]["established"]["key_type"]["value"],
+            key_type
+        );
+        assert_eq!(
+            section["objects"][0]["established"]["parameter_set"]["status"],
+            "unknown"
         );
         assert!(section["objects"][0]["label"].is_null());
         assert!(
@@ -22865,10 +22873,12 @@ fn key_operation_pqc_version_follows_content() {
         "the control row proves the scene is live"
     );
     assert_eq!(
-        section["objects"][0]["queries"]["parameter_set"], "unsupported"
+        section["objects"][0]["queries"]["parameter_set"],
+        "unsupported"
     );
     assert_eq!(
-        section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+        section["objects"][0]["established"]["parameter_set"]["status"],
+        "unknown"
     );
     // A requested-only keygen template versions v5: the PQC scalars
     // sit in the requested block, nothing establishes, nothing labels.
@@ -22914,10 +22924,17 @@ fn key_operation_pqc_version_follows_content() {
     let section = object_observations_json(&requested_only);
     assert_eq!(section["version"], 5);
     assert_seven_key_blocks(&section);
-    assert_eq!(section["objects"][0]["requested"]["key_type"]["value"], 0x49);
-    assert_eq!(section["objects"][0]["requested"]["parameter_set"]["value"], 2);
     assert_eq!(
-        section["objects"][0]["established"]["parameter_set"]["status"], "unknown"
+        section["objects"][0]["requested"]["key_type"]["value"],
+        0x49
+    );
+    assert_eq!(
+        section["objects"][0]["requested"]["parameter_set"]["value"],
+        2
+    );
+    assert_eq!(
+        section["objects"][0]["established"]["parameter_set"]["status"],
+        "unknown"
     );
     assert!(section["objects"][0]["label"].is_null());
     let unknown = section["unknown_key_operations"]
@@ -23104,11 +23121,7 @@ fn key_operation_kem_labelled_input_rows_proved() {
             &mut keyuse,
             &mut sink,
             &ShapedS1 {
-                getattr_cells: vec![
-                    (1u8, 1u8, class),
-                    (2u8, 1u8, 0x49u16),
-                    (7u8, 1u8, 2u16),
-                ],
+                getattr_cells: vec![(1u8, 1u8, class), (2u8, 1u8, 0x49u16), (7u8, 1u8, 2u16)],
                 ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
             },
         );
@@ -23126,11 +23139,7 @@ fn key_operation_kem_labelled_input_rows_proved() {
             OBSERVATIONS_VERSION_V5,
             "{name}: the labelled use versions v5"
         );
-        assert_eq!(
-            committed.key_operations.len(),
-            1,
-            "{name}: one proved row"
-        );
+        assert_eq!(committed.key_operations.len(), 1, "{name}: one proved row");
         let row = &committed.key_operations[0];
         assert_eq!(row.category, category, "{name}: category");
         assert_eq!(row.role, role, "{name}: role");

@@ -422,15 +422,7 @@ impl<N: JointNativeIo, W: ReadyBirthLookup + ?Sized> JointBirthEvidenceSource
             .native
             .try_borrow_mut()
             .map_err(|_| BirthObservationRefusal::CurrentPartition)?;
-        let evidence = native.recheck_birth(witness, self.capture, self.attached, binding)?;
-        // Harnesses gate Joint load on this line: rows need an offered
-        // birth, and a birthless feed stays S1Only for the whole run.
-        eprintln!(
-            "p11scope: joint birth offered: caller={:?} domain={:?}",
-            target.caller(),
-            binding.domain()
-        );
-        Ok(evidence)
+        native.recheck_birth(witness, self.capture, self.attached, binding)
     }
 }
 

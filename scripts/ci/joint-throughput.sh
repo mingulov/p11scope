@@ -746,6 +746,14 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=admit-timeout" || return 1
         return 0
     fi
+    # TEMP F9 probe: attach BEFORE setup calls so setup counts too.
+    log "$cell: PROBE waiting for attach before setup"
+    gen_pid=$(cat "$dir/gen.pid")
+    if ! wait_for_caller_attached "$dir" "$gen_pid" "${ATTACH_TIMEOUT:-45}"; then
+        log "$cell: PROBE generator edge unattached at setup (setup uncounted)"
+    else
+        log "$cell: PROBE generator edge attached at setup"
+    fi
     log "$cell: opening the setup gate"
     touch "$dir/setup_go"
     if ! wait_for_line "READY pid=" "$dir/gen.out" 120; then

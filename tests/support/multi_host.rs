@@ -6,7 +6,11 @@ use p11scope::doctor::{Check, Status};
 pub fn refusal() -> Option<String> {
     refusal_from_checks(&p11scope::doctor::probe(None, None)).map(|reason| {
         let probe = std::env::current_exe().expect("test executable path");
-        as_observer(&reason, &probe.display().to_string(), env!("CARGO_BIN_EXE_p11scope"))
+        as_observer(
+            &reason,
+            &probe.display().to_string(),
+            env!("CARGO_BIN_EXE_p11scope"),
+        )
     })
 }
 

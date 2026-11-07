@@ -543,6 +543,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Replaced wholesale per applied pass (a pid the pass never saw
     /// carries no prior and scans); discarded passes record nothing.
     maps_prior: BTreeMap<u32, (Option<u64>, u64)>,
+    /// Members that mapped a pinned object in the last applied pass:
+    /// they never skip, so a watch's confirmed mapping survives across
+    /// passes without an armed/coverage-lost flap. Replaced wholesale
+    /// with the digests; discarded passes record nothing.
+    mappers_prior: BTreeSet<u32>,
     /// Every task identity enumerated by an applied pass, across passes:
     /// the terminal stop diff reports live tasks this never saw, so a
     /// starter that never execs cannot stay invisible. Capped (departed
@@ -930,6 +935,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             post_pass_exec_newcomers: BTreeSet::new(),
             scan_freshness: BTreeSet::new(),
             maps_prior: BTreeMap::new(),
+            mappers_prior: BTreeSet::new(),
             ever_enumerated: BTreeSet::new(),
             stop_diff_done: false,
             pending_exec_newcomers: BTreeMap::new(),
@@ -8543,9 +8549,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// enumeration memory for the terminal stop diff. Memory-unavailable,
     /// unreadable, exited and not-selected members stay fresh so the
     /// next pass retries them. The pass's sweep digests replace the
-    /// deep-scan skip priors wholesale. Discarded passes record nothing.
+    /// deep-scan skip priors wholesale, and its pinned-object mappers
+    /// join the never-skip set. Discarded passes record nothing.
     fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
         self.maps_prior = catalog.sweep_digests.clone();
+        self.mappers_prior = catalog
+            .processes
+            .iter()
+            .filter(|process| !process.objects.is_empty())
+            .map(|process| process.pid)
+            .collect();
         let current: BTreeMap<u32, Option<u64>> = catalog
             .processes
             .iter()
@@ -8620,14 +8633,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// The deep-scan skip priors for the next collection: the last
-    /// applied pass's per-pid digests, or none on a backstop pass (every
-    /// `SKIP_BACKSTOP_EVERY`th pass rescans) and before the first pass.
+    /// applied pass's per-pid digests plus its pinned-object mappers,
+    /// or none on a backstop pass (every `SKIP_BACKSTOP_EVERY`th pass
+    /// rescans) and before the first pass.
     pub(crate) fn priors_for_collection(&self) -> crate::inspect_system::ScanPriors {
         if self.passes % SKIP_BACKSTOP_EVERY == SKIP_BACKSTOP_EVERY - 1 {
             return crate::inspect_system::ScanPriors::empty();
         }
         crate::inspect_system::ScanPriors {
             digests: self.maps_prior.clone(),
+            mappers: self.mappers_prior.clone(),
         }
     }
 
@@ -27870,8 +27885,7 @@ mod maps_skip_memory_tests {
     fn applied_pass_records_pinned_mappers_and_backstop_sheds_them() {
         use crate::inspect_system::{MemberStatus, ProcessRecord};
         let mut coordinator = skip_coordinator();
-        let mut catalog =
-            catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
         catalog.processes.push(ProcessRecord {
             pid: 12,
             status: MemberStatus::Scanned,

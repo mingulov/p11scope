@@ -396,16 +396,21 @@ impl Collection {
 /// applied pass. A selected member whose snapshot digest and live
 /// generation both match is confirmed, not deep-scanned: its mappings
 /// are byte-identical to a pass that already decoded them, so a rescan
-/// could only repeat the same findings. New mappings, pid reuse, and
+/// could only repeat the same findings. `mappers` names the members
+/// that mapped a pinned object last pass; they never skip, because a
+/// skip emits an uncertain mapping (coverage lost) while a re-decode
+/// keeps the watch's confirmed state. New mappings, pid reuse, and
 /// unreadable generations never skip; backstop passes carry no priors.
 pub(crate) struct ScanPriors {
     pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
+    pub(crate) mappers: BTreeSet<u32>,
 }
 
 impl ScanPriors {
     pub(crate) fn empty() -> Self {
         Self {
             digests: BTreeMap::new(),
+            mappers: BTreeSet::new(),
         }
     }
 }
@@ -461,6 +466,9 @@ pub(crate) fn unchanged_skip_set(
     sweep
         .iter()
         .filter(|(pid, entries)| {
+            if priors.mappers.contains(pid) {
+                return false;
+            }
             let Some((Some(start), digest)) = priors.digests.get(pid) else {
                 return false;
             };
@@ -10941,6 +10949,7 @@ mod maps_skip_tests {
                     (*pid, (generation, *digest))
                 })
                 .collect::<BTreeMap<_, _>>(),
+            mappers: BTreeSet::new(),
         };
         let second = run(&priors);
         let live = |pid: u32| crate::process::process_start_time(pid).ok();

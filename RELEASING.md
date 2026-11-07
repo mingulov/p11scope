@@ -68,6 +68,15 @@ describing an old CI run as an exact-new-commit result.
   ` - UNRELEASED`). Put the actual
   publication date in the GitHub release. Every tracked text change must land
   before final CI and artifact builds.
+- Point the DaemonSet default at the release's published observer image: set
+  `image:` to `ghcr.io/mingulov/p11scope:<version>` with
+  `imagePullPolicy: IfNotPresent` in `deploy/k8s/20-daemonset.yaml` and move
+  the three e2e image anchors (`scripts/kind-e2e.sh`,
+  `scripts/cold-pod-e2e.sh`, `scripts/knative-e2e.sh`, including their
+  `--self-test` pins) to the same tag. The tag itself publishes in step 7;
+  until that push the default is forward-dated by construction. Pre-release
+  checkouts keep the locally built `p11scope-observer:1` default (`Never`),
+  which `tests/python/test_deploy_defaults.py` pins.
 - Resolve release placeholders, then check that none remain:
 
   ```sh
@@ -536,7 +545,8 @@ On the commit that steps 3–6 ran on:
    dispatches build and smoke the image but skip the push. Record the run
    URL and the image digest from the push receipt, then verify with
    `docker pull` and the `docker run` recipe in
-   [deploy/README.md](deploy/README.md).
+   [deploy/README.md](deploy/README.md). That push makes live the DaemonSet
+   default retargeted to this tag in step 1.
 
 ## After the tag
 

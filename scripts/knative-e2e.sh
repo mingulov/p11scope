@@ -208,7 +208,7 @@ download_release() {
 render_daemonset() {
     mkdir -p "$2"
     for manifest in "$1"/*.yaml; do
-        sed "s#image: ghcr.io/mingulov/p11scope:0.7.0\$#image: $3#" "$manifest" > "$2/${manifest##*/}" || return 1
+        sed "s#image: p11scope-observer:1\$#image: $3#" "$manifest" > "$2/${manifest##*/}" || return 1
     done
     [ "$(grep -Fc "image: $3" "$2/20-daemonset.yaml")" -eq 1 ] \
         || { echo "daemonset render lost its image anchor" >&2; return 1; }
@@ -761,7 +761,7 @@ self_test() {
         || { echo "ksvc lost imagePullPolicy: Never" >&2; exit 1; }
     # The DaemonSet render this cell reuses (same anchors scripts/kind-e2e.sh
     # requires): one observer image anchor, namespace first.
-    [ "$(cat deploy/k8s/*.yaml | grep -c 'image: ghcr.io/mingulov/p11scope:0.7.0$')" -eq 1 ] \
+    [ "$(cat deploy/k8s/*.yaml | grep -c 'image: p11scope-observer:1$')" -eq 1 ] \
         || { echo "deploy/k8s lost its single observer image anchor" >&2; exit 1; }
     set -- deploy/k8s/*.yaml
     [ "$1" = deploy/k8s/00-namespace.yaml ] \
@@ -876,7 +876,7 @@ EOF
     fi
     # DaemonSet render (the kind-e2e.sh shape): exactly the anchor moves.
     mkdir -p "$stub/k8s"
-    printf 'image: ghcr.io/mingulov/p11scope:0.7.0\n' > "$stub/k8s/20-daemonset.yaml"
+    printf 'image: p11scope-observer:1\n' > "$stub/k8s/20-daemonset.yaml"
     PATH="$stub:$PATH" render_daemonset "$stub/k8s" "$stub/rendered" img:t \
         || { echo "daemonset render refused" >&2; exit 1; }
     grep -Fq 'image: img:t' "$stub/rendered/20-daemonset.yaml" \

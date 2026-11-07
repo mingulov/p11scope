@@ -4545,6 +4545,50 @@ fn cgroup_ingress_admission_and_delayed_exit_are_generation_bounded() {
 }
 
 #[test]
+fn cgroup_pruned_unadmitted_newcomer_counts_a_descendant_gap() {
+    // Fail-closed births: a diff-discovered newcomer that departs before
+    // admission (and whose exit record never drains, e.g. past the
+    // terminal drain) must still count a gap, or an unprearmed fork
+    // workload reads COMPLETE while missing calls.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.mark_newcomer_arrival(4242, Some(100));
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    // 4242 is gone from the live enumeration without ever being admitted.
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    // A second sweep never double-counts the same birth.
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+}
+
+#[test]
+fn cgroup_pruned_newcomer_skips_an_exit_matched_birth() {
+    // No double count: a birth already matched to a drained unmatched
+    // exit stays a single gap when its mark prunes.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.mark_newcomer_arrival(4242, Some(100));
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(4242u32) << 32;
+    exit.hook_ts_ns = 200;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+}
+
+#[test]
 fn cgroup_boundary_unavailability_latches_one_ingress_sentinel() {
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {

@@ -12,6 +12,7 @@ import importlib.util
 import json
 import os
 from pathlib import Path
+import re
 import signal
 import subprocess
 import sys
@@ -26,6 +27,25 @@ spec = importlib.util.spec_from_file_location("offline_journey", FIXTURES / "cro
 shared = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(shared)
 require, run, success = shared.require, shared.run, shared.success
+
+
+# An unprivileged observer names each capability it lacks, once, where the
+# gated read fails (map_files proof, another task's memory under Yama): one
+# stderr line per note, ending in the setcap recipe for this observer.
+CAPABILITY_NOTE = re.compile(
+    rb"p11scope: needs CAP_[A-Z_]+ \([^()]*\)(?:; needs CAP_[A-Z_]+ \([^()]*\))*\. "
+    rb"Grant the minimal set: sudo setcap '[a-z_,]+=ep' (?P<binary>\S+)")
+
+
+def success_noting_capabilities(result, binary):
+    """success(), allowing only capability-note lines naming this observer."""
+    code, stdout, stderr = result
+    lines = stderr.splitlines(keepends=True)
+    notes = [line for line in lines
+             if (match := CAPABILITY_NOTE.fullmatch(line.rstrip(b"\n")))
+             and line.endswith(b"\n") and match["binary"] == binary.encode()]
+    rest = b"".join(line for line in lines if line not in notes)
+    return success((code, stdout, rest))
 
 
 def cleanup(child):
@@ -73,8 +93,8 @@ def commands(binary, helper, root):
         proc = Path(f"/proc/{pid}/exe")
         # Popen returns after exec; this owned process remains in the same image.
         expected, metadata = str(proc.readlink()), proc.stat()
-        text = success(run([binary, "inspect", "--pid", str(pid)])).decode()
-        raw = success(run([binary, "inspect", "--pid", str(pid), "--json"]))
+        text = success_noting_capabilities(run([binary, "inspect", "--pid", str(pid)]), binary).decode()
+        raw = success_noting_capabilities(run([binary, "inspect", "--pid", str(pid), "--json"]), binary)
         document = json.loads(raw)
         identity(document, text, pid, expected, metadata)
         require(document["modules"] == [] and "0 provider files mapped" in text,
@@ -147,6 +167,21 @@ def dashboards(binary, root):
 
 
 class Controls(unittest.TestCase):
+    NOTE = (b"p11scope: needs CAP_DAC_READ_SEARCH (open provider files and target paths "
+            b"unreadable to the observer); needs CAP_SYS_PTRACE (read a target's memory). "
+            b"Grant the minimal set: sudo setcap 'cap_bpf,cap_sys_ptrace=ep' /o/p11scope\n")
+
+    def test_capability_notes_for_this_observer_are_allowed(self):
+        self.assertEqual(success_noting_capabilities((0, b"out", self.NOTE * 2), "/o/p11scope"), b"out")
+
+    def test_other_stderr_or_another_observer_fails(self):
+        for stderr in (self.NOTE + b"p11scope: warning: something else\n",
+                       self.NOTE.replace(b"/o/p11scope", b"/elsewhere/p11scope"),
+                       self.NOTE.rstrip(b"\n"),
+                       b"p11scope: needs root\n"):
+            with self.subTest(stderr=stderr), self.assertRaisesRegex(AssertionError, "unexpected stderr"):
+                success_noting_capabilities((0, b"out", stderr), "/o/p11scope")
+
     def test_wrong_executable_identity_fails(self):
         # A believable observation with another inode must not pass by name.
         document = {"schema": "p11scope/inspect/v1", "application_status": "observed",

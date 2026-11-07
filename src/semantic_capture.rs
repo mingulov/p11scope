@@ -3606,14 +3606,30 @@ impl SemanticCapture {
                 job.image,
                 job.endpoint.file_slot,
             );
-            if self.router.current_partition_matches(
+            // TEMP F9: receipt-push condition census (sampled).
+            let push_partition = self.router.current_partition_matches(
                 self.router.domain(),
                 job.image,
                 job.endpoint.file_slot,
                 epochs,
                 fence,
                 &ids,
-            ) && let Some(watched) = watched
+            );
+            let push_lease = watched
+                .as_ref()
+                .map(|w| w.check_unchanged() == Ok(true));
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static RP: AtomicU64 = AtomicU64::new(0);
+                if RP.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                    eprintln!(
+                        "receipt-push pid={} partition={push_partition} lease={push_lease:?}",
+                        job.pin.pid(),
+                    );
+                }
+            }
+            if push_partition
+                && let Some(watched) = watched
                 && watched.check_unchanged() == Ok(true)
             {
                 report.current.push(CurrentPartitionReceipt {

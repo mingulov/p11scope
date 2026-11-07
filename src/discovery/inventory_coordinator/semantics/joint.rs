@@ -1294,17 +1294,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             installed += 1;
         }
         drop(registrations);
-        // TEMP F9: birth outcome census (sampled).
+        // TEMP F9: birth outcome census (all, with images).
         {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static BO: AtomicU64 = AtomicU64::new(0);
-            if BO.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
-                let matched = association.iter().filter(|l| l.entry.is_some()).count();
-                let refused = association
-                    .iter()
-                    .filter_map(|l| l.refusal.map(|(_, r)| r.reason().to_string()))
-                    .collect::<Vec<_>>()
-                    .join(",");
+            let matched = association.iter().filter(|l| l.entry.is_some()).count();
+            let refused = association
+                .iter()
+                .filter_map(|l| {
+                    l.refusal
+                        .map(|(caller, r)| format!("{caller:?}:{}", r.reason()))
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            if association.len() > 0 || installed > 0 {
                 eprintln!(
                     "birth-outcome links={} matched={matched} installed={installed} refused=[{refused}]",
                     association.len(),

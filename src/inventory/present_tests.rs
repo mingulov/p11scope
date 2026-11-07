@@ -3248,7 +3248,7 @@ fn concise_unavailable_metadata_prints_no_scope_lines() {
 /// scope line per caller with edges, and the verbose Details caller
 /// line carries the full-ID suffix. Entry totals are fixed fixture
 /// constants (17 and 1), never recomputed with the product's sum, so a
-/// forwarding double-count fails this test; the forwarding shape itself
+/// wrong per-caller sum fails this test; the forwarding shape itself
 /// is pinned by `concise_scope_totals_skip_forwarding_edges`.
 #[test]
 fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
@@ -3719,12 +3719,10 @@ fn concise_sampled_host_rows_stay_silent_when_stale_or_historical() {
             (*id, metadata)
         })
         .collect();
-    presentation.caller_metadata =
-        crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        !out
-            .lines()
+        !out.lines()
             .any(|line| line.starts_with("caller ") && line.contains(" pid ")),
         "host rows print no scope lines: {out}"
     );
@@ -3749,13 +3747,8 @@ fn concise_never_sampled_historical_counts_unknown() {
         first_pid: 81_000,
     });
     harness.commit();
-    let mut presentation = Presentation::capture(
-        harness.coordinator(),
-        "host-historical-unknown",
-        1,
-        2,
-        1,
-    );
+    let mut presentation =
+        Presentation::capture(harness.coordinator(), "host-historical-unknown", 1, 2, 1);
     assert_eq!(presentation.edges.len(), 1, "one edge for one caller");
     let id = presentation.edges[0].caller;
     let never_sampled =
@@ -3769,8 +3762,7 @@ fn concise_never_sampled_historical_counts_unknown() {
         crate::caller_metadata::runtime::MetadataFrame::for_test(&[(id, never_sampled)]);
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        !out
-            .lines()
+        !out.lines()
             .any(|line| line.starts_with("caller ") && line.contains(" pid ")),
         "never-sampled row prints no scope line: {out}"
     );

@@ -676,6 +676,9 @@ mappings established before it. Shared-mm exits, refused hooks,
 and local faults likewise read `unknown`. Admissions and overflow
 sentinels carry no verdict, and there is no "did not map" claim:
 nothing here proves a process did not map a watched provider.
+Under `--mode metrics` the split always reads `{mapped: 0, unknown: N}`
+because instance hooks never attach there (refused-hooks arm); use
+profile/trace for `mapped`.
 The live cell qualifying this split builds its fixtures on guest tmpfs
 inside virtme-ng guests rather than under `TMPDIR`, so a host `TMPDIR`
 naming the shared 9p tree cannot lend the fixtures remapped ownership

@@ -400,7 +400,10 @@ exec and its exit) reads `unknown` for the same reason: mappings
 established before the watch are invisible. The two counts never
 feed calls, callers, shares, verdicts, or births, and an exit never
 settles a call (R57). There is no "did not map" publication: nothing
-here proves a process did not map a watched provider.
+here proves a process did not map a watched provider. Under
+`--mode metrics` the split always reads `{mapped: 0, unknown: N}`
+because instance hooks never attach there (refused-hooks arm); use
+profile/trace for `mapped`.
 
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process

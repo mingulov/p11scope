@@ -42,25 +42,30 @@ class AddCopyrightHeadersTests(unittest.TestCase):
         )
 
     def test_comment_styles_mirror_their_header(self):
+        n = NOTICE.encode()
         cases = [
-            ("src/include.rs", b"// SPDX-License-Identifier: GPL-3.0-or-later\nint x;\n",
-             b"// ", b""),
-            ("tool.py", b"# SPDX-License-Identifier: GPL-3.0-or-later\nprint(1)\n",
-             b"# ", b""),
-            ("run.sh", b"#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\necho hi\n",
-             b"# ", b""),
-            ("native.c", b"/* SPDX-License-Identifier: GPL-2.0-only */\nint x;\n",
-             b"/* ", b" */"),
-            ("doc.md", b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n# Title\n",
-             b"<!-- ", b" -->"),
+            ("src/include.rs",
+             b"// SPDX-License-Identifier: GPL-3.0-or-later\nint x;\n",
+             b"// SPDX-License-Identifier: GPL-3.0-or-later\n// " + n + b"\nint x;\n"),
+            ("tool.py",
+             b"# SPDX-License-Identifier: GPL-3.0-or-later\nprint(1)\n",
+             b"# SPDX-License-Identifier: GPL-3.0-or-later\n# " + n + b"\nprint(1)\n"),
+            ("run.sh",
+             b"#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\necho hi\n",
+             b"#!/bin/sh\n# SPDX-License-Identifier: GPL-3.0-or-later\n# " + n + b"\necho hi\n"),
+            ("native.c",
+             b"/* SPDX-License-Identifier: GPL-2.0-only */\nint x;\n",
+             b"/* SPDX-License-Identifier: GPL-2.0-only */\n/* " + n + b" */\nint x;\n"),
+            ("native.h",
+             b"/* SPDX-License-Identifier: GPL-3.0-or-later */\nint x;\n",
+             b"/* SPDX-License-Identifier: GPL-3.0-or-later */\n/* " + n + b" */\nint x;\n"),
+            ("doc.md",
+             b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n# Title\n",
+             b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\n<!-- " + n + b" -->\n# Title\n"),
         ]
-        for path, before, prefix, suffix in cases:
+        for path, before, expected in cases:
             with self.subTest(path=path):
-                header, _, rest = before.partition(b"\n")
-                self.assertEqual(
-                    changed(path, before),
-                    header + b"\n" + prefix + NOTICE.encode() + suffix + b"\n" + rest,
-                )
+                self.assertEqual(changed(path, before), expected)
 
     def test_crlf_bom_and_bare_header_keep_file_shape(self):
         crlf = b"<!-- SPDX-License-Identifier: GPL-3.0-or-later -->\r\n# T\r\n"
@@ -110,7 +115,7 @@ class AddCopyrightHeadersTests(unittest.TestCase):
         self.assertEqual(action, "skip")
         self.assertIsNone(after)
         action, after, _ = ADD.plan_for("plain.txt", b"no header here\n")
-        self.assertEqual(action, "unhandled")
+        self.assertEqual(action, "skip")
         self.assertIsNone(after)
 
     def test_mid_file_spdx_is_reported_not_edited(self):

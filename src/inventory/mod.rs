@@ -6304,6 +6304,12 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         }
         let first_stop = !self.stop_requested;
         self.stop_requested = true;
+        // Terminal gap phase at the stop: disclosures staged from now on
+        // (including this function's own stop disclosures below) carry the
+        // terminal flag and may use the stop-time headroom, never crowded
+        // out by a staged per-drain flood. Idempotent; `on_lane_stopped`
+        // re-enters for bare lane stops.
+        self.coordinator.enter_terminal_phase();
         if first_stop {
             // Freeze the pre-arm stop boundary and probe result once: the
             // terminal close uses these, never a later re-read past the
@@ -6377,9 +6383,10 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
-        // Terminal gap phase first: disclosures staged from now on
-        // may use the reserved slots, never crowded out by a
-        // per-drain flood.
+        // Terminal gap phase first (a stop request entered it already;
+        // this covers bare lane stops): disclosures staged from now on
+        // carry the terminal flag and may use the stop-time headroom,
+        // never crowded out by a per-drain flood.
         self.coordinator.enter_terminal_phase();
         // Terminal coverage disclosure first: post-last-pass newcomers
         // (exec hooks plus the stop-time diff over starters no

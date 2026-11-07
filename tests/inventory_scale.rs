@@ -212,7 +212,10 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
 /// plus suppression consistency. The exact suppressed COUNT depends on
 /// live machine state (unreadable pids per pass × passes), so the
 /// in-crate retention test pins exactness (476) while command level
-/// pins structure, budget-row agreement, and cap engagement.
+/// pins structure, budget-row agreement, and cap engagement. The in-run
+/// cap is 1024 (`DEFAULT_MAX_GAPS`); stop-time disclosures may add up to
+/// 64 headroom rows (`TERMINAL_GAP_RESERVE`), so an engaged cap reads
+/// 1024..=1088.
 fn assert_settled_consistent(doc: &Value) {
     let suppressed = doc["gaps_suppressed"].as_u64().unwrap();
     assert_settled(doc, suppressed);
@@ -224,10 +227,10 @@ fn assert_settled_consistent(doc: &Value) {
         "budget row agrees with the top-level counter"
     );
     if suppressed > 0 {
-        assert_eq!(
-            doc["gaps"].as_array().unwrap().len(),
-            1024,
-            "suppression means the 1024 retention cap engaged"
+        let len = doc["gaps"].as_array().unwrap().len();
+        assert!(
+            (1024..=1088).contains(&len),
+            "suppression means the 1024 in-run retention cap engaged; stop-time headroom allows up to 1088 rows, got {len}"
         );
     }
 }

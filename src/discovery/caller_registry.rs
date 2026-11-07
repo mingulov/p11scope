@@ -2525,18 +2525,16 @@ pub(crate) const DEFAULT_MAX_CALLERS: usize = 4096;
 pub(crate) const DEFAULT_MAX_MODULES: usize = 4096;
 pub(crate) const DEFAULT_MAX_EDGES: usize = 32768;
 pub(crate) const DEFAULT_MAX_GAPS: usize = 1024;
-/// Terminal/stop-time gap reservation: per-drain gaps stop at
-/// `max_gaps - TERMINAL_GAP_RESERVE`, so terminal disclosures staged
-/// last are never crowded out by a per-drain flood (a full-suite
-/// run retained 746 per-drain unrouted rows and suppressed every
-/// terminal gap). Terminal gaps (recorded after
-/// [`CallerRegistry::enter_terminal_phase`]) may fill the whole
-/// bound. No reservation when the bound itself fits inside it, so
-/// small-limit twins keep their exact behavior. Measured terminal
-/// need is ~15 rows (post-pass newcomers, short-lived count,
-/// pre-arm close, winding, terminal commits, joint finish); 64 is
-/// 4x with headroom for future terminal disclosures. This reserves
-/// slots within the unchanged bound; no limit moves (LIM-1).
+/// Stop-time gap headroom above the bound: in-run gaps keep the full
+/// `max_gaps`, and terminal gaps (staged after
+/// [`CallerRegistry::enter_terminal_phase`]) may use up to `max_gaps +
+/// TERMINAL_GAP_RESERVE` rows, so terminal disclosures staged last are
+/// never crowded out by a per-drain flood (a full-suite run retained
+/// 746 per-drain unrouted rows and suppressed every terminal gap).
+/// Measured terminal need is ~15 rows (post-pass newcomers, short-lived
+/// count, pre-arm close, winding, terminal commits, joint finish); 64 is
+/// 4x with headroom for future terminal disclosures. A bounded raise of
+/// the stop-time retention ceiling (LIM-1 allows raises, never lowerings).
 pub(crate) const TERMINAL_GAP_RESERVE: usize = 64;
 /// Hard ceiling for the `--max-gaps` CLI knob (CLI input guard only;
 /// [`RegistryLimits::new`] still accepts any non-zero bound). This caps
@@ -2769,6 +2767,11 @@ enum Mutation {
     },
     RecordGap {
         gap: RegistryGap,
+        /// `terminal_phase` captured at stage time: a gap staged before
+        /// the stop keeps the plain bound even when its publication lands
+        /// after the phase flips, so a staged per-drain flood can never
+        /// consume the stop-time headroom.
+        terminal: bool,
     },
     RecordKeyedGap {
         /// The module key, resolved to an ID at apply time — after the
@@ -2779,6 +2782,8 @@ enum Mutation {
         subject: String,
         reason: String,
         budget: Option<BudgetRefusal>,
+        /// `terminal_phase` captured at stage time (see `RecordGap`).
+        terminal: bool,
     },
     RecordAggregatedUnrouted {
         /// One drain's shed calls for an aggregated per-drain
@@ -2788,6 +2793,8 @@ enum Mutation {
         total: u64,
         labels: Vec<(String, u64)>,
         bindings: usize,
+        /// `terminal_phase` captured at stage time (see `RecordGap`).
+        terminal: bool,
     },
 }
 
@@ -2981,9 +2988,10 @@ pub(crate) struct CallerRegistry {
     /// Aggregated subjects already counted as suppressed: a
     /// suppressed aggregate counts once, not once per merged drain.
     suppressed_aggregates: HashSet<(String, usize)>,
-    /// Terminal/stop-time phase: set once the lane stops, so
-    /// terminal disclosures may use the reserved slots. Per-drain
-    /// gaps recorded before it stop at the reserve.
+    /// Terminal/stop-time phase: set once the lane stops. Gaps staged
+    /// from now on carry the terminal flag and may use the headroom
+    /// above the bound; gaps staged before it keep the plain bound
+    /// even when their publication lands after the flip.
     terminal_phase: bool,
     staged: Vec<Mutation>,
     /// One retained phase over the existing staging vector, never a second
@@ -3987,7 +3995,8 @@ impl CallerRegistry {
     }
 
     pub(crate) fn record_gap(&mut self, gap: RegistryGap) {
-        self.staged.push(Mutation::RecordGap { gap });
+        let terminal = self.terminal_phase;
+        self.staged.push(Mutation::RecordGap { gap, terminal });
     }
 
     /// Stage one drain's shed calls for an aggregated per-drain
@@ -4006,18 +4015,21 @@ impl CallerRegistry {
         labels: Vec<(String, u64)>,
         bindings: usize,
     ) {
+        let terminal = self.terminal_phase;
         self.staged.push(Mutation::RecordAggregatedUnrouted {
             subject,
             total,
             labels,
             bindings,
+            terminal,
         });
     }
 
-    /// Enter the terminal/stop-time phase: gaps recorded from now
-    /// on may use the [`TERMINAL_GAP_RESERVE`] slots. Idempotent;
-    /// the lane calls it once when stopping, before staging any
-    /// terminal disclosure.
+    /// Enter the terminal/stop-time phase: gaps staged from now on
+    /// carry the terminal flag and may use the [`TERMINAL_GAP_RESERVE`]
+    /// headroom above the bound. Idempotent; the lane enters it when
+    /// stopping, before staging any terminal disclosure (stop request
+    /// first; the lane stop re-enters for bare stops).
     pub(crate) fn enter_terminal_phase(&mut self) {
         self.terminal_phase = true;
     }
@@ -4030,7 +4042,7 @@ impl CallerRegistry {
         self.staged
             .iter()
             .filter_map(|staged| match staged {
-                Mutation::RecordGap { gap } => Some((gap.subject.clone(), gap.reason.clone())),
+                Mutation::RecordGap { gap, .. } => Some((gap.subject.clone(), gap.reason.clone())),
                 _ => None,
             })
             .collect()
@@ -4043,7 +4055,7 @@ impl CallerRegistry {
         self.staged
             .iter()
             .filter_map(|staged| match staged {
-                Mutation::RecordGap { gap } => Some(gap.clone()),
+                Mutation::RecordGap { gap, .. } => Some(gap.clone()),
                 _ => None,
             })
             .collect()
@@ -4066,6 +4078,7 @@ impl CallerRegistry {
         reason: String,
         budget: Option<BudgetRefusal>,
     ) {
+        let terminal = self.terminal_phase;
         self.staged.push(Mutation::RecordKeyedGap {
             key,
             caller,
@@ -4073,6 +4086,7 @@ impl CallerRegistry {
             subject,
             reason,
             budget,
+            terminal,
         });
     }
 
@@ -4432,6 +4446,13 @@ impl CallerRegistry {
         }
     }
 
+    /// Publish one gap generated while applying: it carries the live
+    /// phase (staged gaps carry their flag captured at stage time).
+    fn push_gap(&mut self, gap: RegistryGap) {
+        let terminal = self.terminal_phase;
+        self.push_gap_as(gap, terminal);
+    }
+
     /// Publish one gap once per run. Identity is every published field
     /// (caller, module, pid, subject, reason, budget); gaps carry no
     /// time or pass-specific field, so none is excluded. A repeat of a
@@ -4442,20 +4463,20 @@ impl CallerRegistry {
     /// fingerprints of the identity fields (a collision, odds about
     /// 2^-40 at the bound, would under-count one gap); past that, a
     /// recurrence of an unremembered suppressed gap counts again (the
-    /// counter then over-counts, never under-counts).
-    fn push_gap(&mut self, gap: RegistryGap) {
+    /// counter then over-counts, never under-counts). In-run gaps keep
+    /// the full `max_gaps` bound; terminal gaps (staged after
+    /// `enter_terminal_phase`) may use [`TERMINAL_GAP_RESERVE`] headroom
+    /// rows above it, so a per-drain flood can never crowd out the
+    /// stop-time disclosures.
+    fn push_gap_as(&mut self, gap: RegistryGap, terminal: bool) {
         if let Some(&index) = self.gap_index.get(&gap) {
             self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
             return;
         }
-        // Terminal reservation: per-drain gaps stop at the reserve
-        // so terminal disclosures staged last always fit. Terminal
-        // gaps (recorded after `enter_terminal_phase`) and tiny
-        // bounds (at or below the reserve) use the whole bound.
-        let cap = if self.terminal_phase || self.limits.max_gaps <= TERMINAL_GAP_RESERVE {
-            self.limits.max_gaps
+        let cap = if terminal {
+            self.limits.max_gaps.saturating_add(TERMINAL_GAP_RESERVE)
         } else {
-            self.limits.max_gaps - TERMINAL_GAP_RESERVE
+            self.limits.max_gaps
         };
         if self.gaps.len() >= cap {
             let fingerprint = self.suppressed_hasher.hash_one(&gap);
@@ -4486,6 +4507,7 @@ impl CallerRegistry {
         total: u64,
         labels: Vec<(String, u64)>,
         bindings: usize,
+        terminal: bool,
     ) {
         let key = (subject.clone(), bindings);
         let (reason, retained_index) = {
@@ -4549,7 +4571,7 @@ impl CallerRegistry {
             budget: None,
         };
         let before = self.gaps.len();
-        self.push_gap(gap.clone());
+        self.push_gap_as(gap.clone(), terminal);
         if let Some(&index) = self.gap_index.get(&gap) {
             if let Some(aggregate) = self.unrouted_aggregates.get_mut(&key) {
                 aggregate.gap_index = Some(index);
@@ -4890,13 +4912,14 @@ impl CallerRegistry {
                     self.recompute_module(module);
                 }
             }
-            Mutation::RecordGap { gap } => self.push_gap(gap),
+            Mutation::RecordGap { gap, terminal } => self.push_gap_as(gap, terminal),
             Mutation::RecordAggregatedUnrouted {
                 subject,
                 total,
                 labels,
                 bindings,
-            } => self.push_aggregated_unrouted(subject, total, labels, bindings),
+                terminal,
+            } => self.push_aggregated_unrouted(subject, total, labels, bindings, terminal),
             Mutation::RecordKeyedGap {
                 key,
                 caller,
@@ -4904,16 +4927,20 @@ impl CallerRegistry {
                 subject,
                 reason,
                 budget,
+                terminal,
             } => {
                 let module = self.modules_by_key.get(&key).copied();
-                self.push_gap(RegistryGap {
-                    caller,
-                    module,
-                    pid,
-                    subject,
-                    reason,
-                    budget,
-                });
+                self.push_gap_as(
+                    RegistryGap {
+                        caller,
+                        module,
+                        pid,
+                        subject,
+                        reason,
+                        budget,
+                    },
+                    terminal,
+                );
             }
         }
     }

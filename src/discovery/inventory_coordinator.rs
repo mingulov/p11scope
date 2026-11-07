@@ -2788,9 +2788,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.disclose_joint_journal_unavailable_once();
     }
 
-    /// Enter the terminal/stop-time gap phase: gaps recorded from
-    /// now on may use the reserved slots. The lane calls it once
-    /// when stopping, before staging any terminal disclosure.
+    /// Enter the terminal/stop-time gap phase: gaps staged from now on
+    /// carry the terminal flag and may use the headroom above the bound.
+    /// The lane enters it when stopping (stop request, plus the lane stop
+    /// for bare stops), before staging any terminal disclosure.
     pub(crate) fn enter_terminal_phase(&mut self) {
         self.registry.enter_terminal_phase();
     }

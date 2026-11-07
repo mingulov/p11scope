@@ -12116,10 +12116,22 @@ impl Engine {
             .values()
             .any(|admission| admission.covers(record.hook_ts_ns, pid))
         {
+            // Covered but viewless: a scan/apply retired the view
+            // before this ring exit arrived. The admitted generation
+            // is dead, so its pending exe identity and exec timing
+            // die with it — otherwise a reused PID consumes the dead
+            // image with no loss and no PARTIAL.
+            self.extensive.drop_stash_for_pid(pid);
+            self.exit_map.drop_exec_for_pid(pid);
             return;
         }
         let key = (pid, record.hook_ts_ns);
         if self.unmatched_leader_exit_events.contains(&key) {
+            // A redelivered exit starts no new generation; drop like
+            // the first delivery did, toward `unknown` rather than a
+            // stale image.
+            self.extensive.drop_stash_for_pid(pid);
+            self.exit_map.drop_exec_for_pid(pid);
             return;
         }
         if self.unmatched_leader_exit_events.len() >= MAX_SCAN_PIDS {
@@ -12132,6 +12144,10 @@ impl Engine {
                     "the bounded unmatched-exit ledger overflowed; the gap count is a lower bound",
                 );
             }
+            // Uncounted but still dead: the overflow sentinel must
+            // not leave this PID's entries for a reused generation.
+            self.extensive.drop_stash_for_pid(pid);
+            self.exit_map.drop_exec_for_pid(pid);
             return;
         }
         self.unmatched_leader_exit_events.insert(key);
@@ -12146,6 +12162,11 @@ impl Engine {
         if record.kind == DISCOVERY_KIND_LEADER_EXIT_MAPPINGS {
             self.exit_map.classify(record, hooks_refused);
         }
+        // The novel exit consumed the stash above; the exec timing
+        // behind the late-watch rule dies here, after the kind-7
+        // verdict read it, so a reused PID never reads timely on the
+        // dead EXEC.
+        self.exit_map.drop_exec_for_pid(pid);
     }
 
     fn close_cgroup_admission(&mut self, view: ProcessViewId, closed_ns: u64) {

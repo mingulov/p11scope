@@ -1835,12 +1835,14 @@ are unchanged: concise stays concise and `-v` adds no hint lines.
 The machine-readable trace `EVIDENCE` record carries the new keys
 like the JSON lanes, which carry the complete new keys.
 
-Residuals (same class as the Row A note): a matched exit drops its
-PID's stash entry, so PID reuse after a *lost* exit record can still
-consume a stale entry (PARTIAL via `discovery_ring_loss`),
-attributing one image-correct hint to the wrong generation's count;
-the `still_the_same` gate plus the reopen re-verify bound the
-misattribution to that lost-exit case. Target execs before attach
+Residuals (same class as the Row A note): every processed leader
+exit drops its PID's stash entry and exec timing — a matched exit at
+retirement, an admission-covered unmatched exit (its view retired
+before the ring record arrived) at the covers check — so only a
+*lost* exit record can still leave a stale entry (PARTIAL via
+`discovery_ring_loss`), attributing one image-correct hint to the
+wrong generation's count; the `still_the_same` gate plus the reopen
+re-verify bound the misattribution to that lost-exit case. Target execs before attach
 are invisible; metrics ticketless seeding trusts membership admission
 (the same admission that authorizes every other metrics lifecycle
 record). An owned `run` whose child never execs (spawn failure aside,

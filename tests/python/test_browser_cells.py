@@ -90,8 +90,15 @@ _GAPS_ATTACHED_ABSENT = frozenset({
 #: behind the same cause, so the skipped records must all be structural
 #: (checked separately); run-mode adds spawn-window caveats.
 _GAPS_NEVER_MAPPED = frozenset({"discovery", "slots", "skipped"})
+#: Run-tree (v0.7.0): the owned browser's short-lived descendants
+#: retire between admission passes, so run-mode never-mapped cells
+#: honestly disclose pid_descendant_gaps. Same spawn-window caveat
+#: class as the other run-mode additions: the asserted property (no
+#: module ever mapped — zero rows, zero probes, structural skips)
+#: is unchanged.
 _GAPS_NEVER_MAPPED_RUN = _GAPS_NEVER_MAPPED | frozenset({
     "unprotected_live_windows", "pause_partial", "loader_discovery",
+    "pid_descendant_gaps",
 })
 
 #: Verdict details each cell kind earned: attached cells read

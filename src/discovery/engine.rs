@@ -11959,8 +11959,11 @@ impl Engine {
     ) {
         self.extensive_owned = owned;
         let detailed = track_short_lived && policy.allows_track_short_lived();
-        let gap = detailed && self.admits_generations();
-        let pid = detailed && matches!(self.scope, Scope::Pid(_));
+        // An owned run never arms the gap consumer, even under the
+        // run-tree cgroup scope; it arms the PID consumer for its
+        // direct child instead.
+        let gap = detailed && self.admits_generations() && owned.is_none();
+        let pid = detailed && (matches!(self.scope, Scope::Pid(_)) || owned.is_some());
         self.extensive.set_enabled(gap || pid);
         self.extensive.set_pid_target(pid);
         // 7.10b: aggregate policy stamps no EXEC ticket, so the gap
@@ -11977,16 +11980,25 @@ impl Engine {
     }
 
     /// 7.10b: classify one validated target EXEC under exact-PID
-    /// scope (profile `--pid`, owned `run`). Validation is the
+    /// scope (profile `--pid`) or for the owned direct child (`run`,
+    /// including under the run-tree cgroup scope). Validation is the
     /// existing lifecycle match (record to retained view) plus a
     /// live-generation check, since PID-scope EXEC records carry no
-    /// kernel ticket. At validation the observer learns the target's
-    /// exe path with the same bracketed read the scans use, then
-    /// runs the shared analysis on the recorded pair. Unvalidated
-    /// EXECs carry no hint — not even `unknown`.
+    /// kernel ticket; an owned run classifies only its direct child's
+    /// EXECs, never descendants'. At validation the observer learns
+    /// the target's exe path with the same bracketed read the scans
+    /// use, then runs the shared analysis on the recorded pair.
+    /// Unvalidated EXECs carry no hint — not even `unknown`.
     fn classify_pid_target_exec(&mut self, record: &DiscoveryRecord, view: ProcessViewId) {
-        if !self.extensive.pid_active() || !matches!(self.scope, Scope::Pid(_)) {
+        if !self.extensive.pid_active() {
             return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        match (self.extensive_owned, &self.scope) {
+            (Some(owned), _) if pid != owned => return,
+            (None, Scope::Pid(_)) => {}
+            (Some(_), _) => {}
+            (None, _) => return,
         }
         let Some(retained) = self.views.iter().find(|candidate| candidate.id() == view) else {
             return;

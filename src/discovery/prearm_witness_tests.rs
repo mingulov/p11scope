@@ -101,6 +101,8 @@ fn discover_prearm_never_mapped(
     let pid = fixture.pid();
     let args = crate::cli::CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: Vec::new(),
         exclude_modules: Vec::new(),

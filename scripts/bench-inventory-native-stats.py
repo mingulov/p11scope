@@ -577,7 +577,7 @@ def write_run(root, name, *, capture="native", churn=0, passes=4, spans=None,
                 ops = ", ".join([f"sweep {10 + index}.000ms"] + [f"{span} 1.500ms" for span in spans])
                 lines.append(f"p11scope: pass {index}: stage timings: {ops}")
         elif observer == "profile-metrics":
-            lines.append("p11scope: capturing: 874 probe(s) attached; stop with Ctrl-C")
+            lines.append("p11scope: capturing: 874 probes attached; stop with Ctrl-C")
         (sample / "stderr").write_text("\n".join(lines) + "\n")
         if observer != "none":
             (sample / "resources.tsv").write_text(

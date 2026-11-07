@@ -254,8 +254,8 @@ pub const INVENTORY_ENDPOINT_BYTES: u64 = size_of::<u64>() as u64;
 
 /// Public Inventory policy. The upper bound is a candidate capacity,
 /// separate from the lower-level u32 ID space and measured release limits.
-pub const DEFAULT_INVENTORY_ENDPOINT_LIMIT: u64 = 4096;
-pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 8192;
+pub const DEFAULT_INVENTORY_ENDPOINT_LIMIT: u64 = 32_768;
+pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 131_072;
 
 /// Resolve the capture-lifetime physical endpoint budget before opening sinks
 /// or preparing native maps. Other discovery and caller-pair limits are
@@ -263,8 +263,9 @@ pub const MAX_INVENTORY_ENDPOINT_LIMIT: u64 = 8192;
 pub fn inventory_endpoint_budget(requested: Option<u64>) -> Result<InventoryBudget, String> {
     let endpoints = requested.unwrap_or(DEFAULT_INVENTORY_ENDPOINT_LIMIT);
     if !(1..=MAX_INVENTORY_ENDPOINT_LIMIT).contains(&endpoints) {
+        // The en-dash range matches the help this error points at.
         return Err(format!(
-            "--max-endpoints must be in 1..={MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
+            "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested {endpoints})"
         ));
     }
     let payload = endpoints
@@ -2601,33 +2602,34 @@ mod tests {
 
     #[test]
     fn inventory_plan_refusal_names_the_endpoint_option_below_the_maximum() {
-        let default = inventory_endpoint_budget(None).unwrap();
-        let refusal = default.validate_count(4097).unwrap_err();
+        let small = inventory_endpoint_budget(Some(4096)).unwrap();
+        let refusal = small.validate_count(4097).unwrap_err();
         assert!(refusal.contains("requires 4097 endpoints"), "{refusal}");
         assert!(
-            refusal.contains("raise --max-endpoints (up to 8192)"),
+            refusal.contains("raise --max-endpoints (up to 131072)"),
             "{refusal}"
         );
         let maximum = inventory_endpoint_budget(Some(MAX_INVENTORY_ENDPOINT_LIMIT)).unwrap();
-        let refusal = maximum.validate_count(8193).unwrap_err();
-        assert!(refusal.contains("requires 8193 endpoints"), "{refusal}");
+        let refusal = maximum.validate_count(131_073).unwrap_err();
+        assert!(refusal.contains("requires 131073 endpoints"), "{refusal}");
         assert!(!refusal.contains("--max-endpoints"), "{refusal}");
-        assert!(default.validate_count(4096).is_ok());
+        let default = inventory_endpoint_budget(None).unwrap();
+        assert!(default.validate_count(32_768).is_ok());
     }
 
     #[test]
     fn inventory_endpoint_policy_checks_range_and_exact_payload() {
         let default = inventory_endpoint_budget(None).unwrap();
-        assert_eq!(default.endpoint_limit(), 4096);
-        assert_eq!(default.payload_bytes(), 32_768);
+        assert_eq!(default.endpoint_limit(), 32_768);
+        assert_eq!(default.payload_bytes(), 262_144);
         for n in [1, 4097, 6531, 8192] {
             let selected = inventory_endpoint_budget(Some(n)).unwrap();
             assert_eq!(selected.endpoint_limit(), n);
             assert_eq!(selected.payload_bytes(), n.checked_mul(8).unwrap());
         }
-        for n in [0, 8193, u64::from(u32::MAX) + 1, u64::MAX] {
+        for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
             let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
-            assert!(refusal.contains("--max-endpoints") && refusal.contains("1..=8192"));
+            assert!(refusal.contains("--max-endpoints") && refusal.contains("1–131072"));
         }
         // The public policy does not narrow the general, checked ID API.
         let general = u64::from(u32::MAX);
@@ -2637,6 +2639,57 @@ mod tests {
                 .endpoint_limit(),
             general
         );
+    }
+
+    /// The `--max-endpoints` refusal spells the range the way the help
+    /// does (en-dash plus the live ceiling), since the error points at
+    /// that help.
+    #[test]
+    fn max_endpoints_refusal_uses_help_range_notation() {
+        let refusal = inventory_endpoint_budget(Some(999_999)).unwrap_err();
+        assert_eq!(
+            refusal,
+            format!(
+                "--max-endpoints must be in 1–{MAX_INVENTORY_ENDPOINT_LIMIT} (requested 999999)"
+            )
+        );
+        assert!(!refusal.contains("1..="), "{refusal}");
+    }
+
+    #[test]
+    fn inventory_default_covers_a_twenty_thousand_endpoint_host() {
+        let default = inventory_endpoint_budget(None).unwrap();
+        assert_eq!(default.endpoint_limit(), 32_768);
+        assert_eq!(default.payload_bytes(), 262_144);
+        // The LIM-1 target host: several p11-kit copies, about 20K endpoints.
+        assert!(default.validate_count(20_000).is_ok());
+        assert!(default.validate_count(32_768).is_ok());
+        let refusal = default.validate_count(32_769).unwrap_err();
+        assert!(
+            refusal.contains("raise --max-endpoints (up to 131072)"),
+            "{refusal}"
+        );
+    }
+
+    #[test]
+    fn inventory_ceiling_is_131072_and_8192_stays_exact() {
+        assert_eq!(MAX_INVENTORY_ENDPOINT_LIMIT, 131_072);
+        assert_eq!(DEFAULT_INVENTORY_ENDPOINT_LIMIT, 32_768);
+        // The previous ceiling remains an exact, valid selection.
+        let previous = inventory_endpoint_budget(Some(8192)).unwrap();
+        assert_eq!(previous.endpoint_limit(), 8192);
+        assert_eq!(previous.payload_bytes(), 65_536);
+        assert!(previous.validate_count(8192).is_ok());
+        assert!(previous.validate_count(8193).is_err());
+        let maximum = inventory_endpoint_budget(Some(131_072)).unwrap();
+        assert_eq!(maximum.payload_bytes(), 1_048_576);
+        assert!(maximum.validate_count(131_072).is_ok());
+        let refusal = maximum.validate_count(131_073).unwrap_err();
+        assert!(!refusal.contains("--max-endpoints"), "{refusal}");
+        for n in [0, 131_073, u64::from(u32::MAX) + 1, u64::MAX] {
+            let refusal = inventory_endpoint_budget(Some(n)).unwrap_err();
+            assert!(refusal.contains("1–131072"), "{refusal}");
+        }
     }
 
     #[test]

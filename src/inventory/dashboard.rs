@@ -686,7 +686,7 @@ fn render_compact_edge_window(
             width,
         ));
         lines.push(truncate_cell(
-            &crate::inventory_present::observation_label(edge),
+            &crate::inventory_present::observation_label_at(edge, presentation.ended_ns),
             width,
         ));
         shown += 1;
@@ -712,7 +712,9 @@ fn render_compact_edge_window(
 /// reason unless `none`), row counts, refusals, and per-category
 /// completed/failed/active totals with their units. Important fields
 /// come first: narrow terminals truncate the category tail, never
-/// the revision or status.
+/// the revision or status. Fields are spelled out (sessions, keys,
+/// per-key rows, unattributed rows, revision, refused), not
+/// abbreviated.
 fn object_keys_line(
     observations: &crate::key_operation_projection::ObjectObservations,
 ) -> Option<String> {
@@ -737,16 +739,19 @@ fn object_keys_line(
             )
         })
         .collect();
+    let refused = observations
+        .budgets
+        .key_refused
+        .saturating_add(observations.budgets.object_refused);
     Some(format!(
-        "objects/keys rev {} {} | sess {} obj {} krows {} urows {} refused {}+{} | {}",
+        "keys revision {} {} | {} sessions {} keys {} per-key rows {} unattributed rows {} refused | {}",
         observations.revision,
         status,
         observations.sessions.len(),
         observations.objects.len(),
         observations.key_operations.len(),
         observations.unknown_key_operations.len(),
-        observations.budgets.key_refused,
-        observations.budgets.object_refused,
+        refused,
         tallies.join(", "),
     ))
 }
@@ -1599,7 +1604,7 @@ fn render_evidence_block(
     selected: bool,
 ) -> Vec<String> {
     let mut lines = vec![edge_identity_line(presentation, edge, width, selected)];
-    let mut items = vec![coverage_item(edge)];
+    let mut items = vec![coverage_item(presentation, edge)];
     match edge.semantics.operations.as_ref() {
         Some(operations) => items.extend(evidence_items(operations)),
         None => items.push(format!("semantics {}", edge.semantics.label)),
@@ -1611,10 +1616,16 @@ fn render_evidence_block(
 
 /// The edge's coverage item (`coverage <label>`), control-escaped: a
 /// loss reason may carry producer text.
-pub(crate) fn coverage_item(edge: &crate::inventory_present::EdgeView) -> String {
+pub(crate) fn coverage_item(
+    presentation: &crate::inventory_present::Presentation,
+    edge: &crate::inventory_present::EdgeView,
+) -> String {
     format!(
         "coverage {}",
-        escape_controls(&crate::inventory_present::coverage_label(&edge.coverage))
+        escape_controls(&crate::inventory_present::coverage_label_at(
+            &edge.coverage,
+            presentation.ended_ns
+        ))
     )
 }
 

@@ -10,9 +10,11 @@ use crate::discovery::caller_registry::cold_admit_member;
 use crate::discovery::elf_needed::read_elf_needed;
 use crate::discovery::hooks::HookRegistry;
 use crate::discovery::identity::{ExaminedObject, MappedFile, Pin, pin_of};
+#[cfg(test)]
+use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
 use crate::discovery::overlay_witness::{
-    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessFailure, WitnessVerdict,
-    original_file_witness_required, prove_original_file,
+    OVERLAY_WITNESS_QUERIES_PER_SCAN, WitnessDiagnosis, WitnessFailure, WitnessOutcome,
+    WitnessStage, WitnessVerdict, original_file_witness_required, prove_original_file_diagnosed,
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
@@ -1106,6 +1108,10 @@ pub struct CaptureWorkBudget {
     /// encounter. Accumulated across member scans; the caller aggregates by
     /// file identity for process counts after all scans complete.
     excluded: Vec<ExcludedRecord>,
+    /// Explicit `--identity-backend userspace`: the deep-scan witness
+    /// stays off (no BPF load) and refused overlay ranges keep a named
+    /// reason instead of proving.
+    explicit_userspace: bool,
 }
 
 /// One `--exclude-module` hit: a mapped file the scan skipped by operator
@@ -1162,7 +1168,20 @@ impl CaptureWorkBudget {
             scan_stop_reported: false,
             excludes: Vec::new(),
             excluded: Vec::new(),
+            explicit_userspace: false,
         }
+    }
+
+    /// Mark this budget explicit-userspace: the deep-scan witness stays
+    /// off and loads no BPF. Inventory sets it before collecting when
+    /// `--identity-backend userspace` was selected.
+    pub(crate) fn set_explicit_userspace(&mut self) {
+        self.explicit_userspace = true;
+    }
+
+    /// Whether explicit userspace disables the deep-scan witness.
+    pub(crate) fn explicit_userspace(&self) -> bool {
+        self.explicit_userspace
     }
 
     /// Set the capture's `--exclude-module` inputs before scanning.
@@ -2159,6 +2178,14 @@ pub struct ScannedModule {
     /// and only a complete-scan replacement lowers it.
     pub same_file_loads: u32,
     pub path: String,
+    /// Scan evidence: this module's tables scan ran to completion in a real
+    /// process scan with no truncating skip (`scan_skip_truncates`), I/O
+    /// ceiling, budget/table-cap stop, short read or refusal on this module.
+    /// The sole-complete-table grant requires it: "exactly one table" is only
+    /// proven when the scan that found one finished. Default `false` for every
+    /// synthesized module (heap-lowered records, loader prearm, projections,
+    /// manifests); merges AND it and clear it when the union grows.
+    pub tables_scan_finished: bool,
     /// ABI used by the userspace memory decoder. Present only when this module
     /// came from `scan_process_view`; mapping and kernel-record projections do
     /// not manufacture this provenance.
@@ -4222,7 +4249,10 @@ pub(crate) enum GuardOutcome {
 /// ranges with the fresh ones on a same-file verdict; per-range proving
 /// would exhaust the per-scan budget on honest multi-range joins, so
 /// the mixed-mapping corner stays disclosed, not proved (see the
-/// overlay copy-up section in `docs/known-limitations.md`).
+/// overlay copy-up section in `docs/known-limitations.md`). An
+/// unavailable verdict with a diagnosis refuses with the canonical
+/// prefix plus the plain-words stage; without one the reason stays the
+/// exact canonical string.
 pub(crate) fn witness_join(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4232,9 +4262,14 @@ pub(crate) fn witness_join(
     range: (u64, u64),
     budget: &mut CaptureWorkBudget,
 ) -> Option<String> {
-    io.prove_original_file(view, file, held, key, range, budget)
-        .gap_reason()
-        .map(str::to_string)
+    let outcome = io.prove_original_file_diagnosed(view, file, held, key, range, budget);
+    let canonical = outcome.verdict.gap_reason()?;
+    match (&outcome.verdict, outcome.diagnosis) {
+        (WitnessVerdict::Failed(WitnessFailure::Unavailable), Some(diagnosis)) => {
+            Some(diagnosis.enriched_reason())
+        }
+        _ => Some(canonical.to_string()),
+    }
 }
 
 fn mem_unavailable(error: &std::io::Error) -> (&'static str, bool) {
@@ -4886,6 +4921,24 @@ pub(crate) trait ScanIo {
         let _ = (view, file, held, key, range, budget);
         WitnessVerdict::Failed(WitnessFailure::Unavailable)
     }
+    /// The diagnosed prove step: the verdict plus the failure stage,
+    /// if any. The default pairs this IO's verdict with no diagnosis
+    /// (scripted IOs refuse with the canonical reason); the production
+    /// IO spends the per-scan budget and runs the diagnosed witness.
+    fn prove_original_file_diagnosed(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessOutcome {
+        WitnessOutcome {
+            verdict: self.prove_original_file(view, file, held, key, range, budget),
+            diagnosis: None,
+        }
+    }
 }
 
 pub(crate) struct ProcScanIo {
@@ -5000,15 +5053,41 @@ impl ScanIo for ProcScanIo {
         range: (u64, u64),
         budget: &mut CaptureWorkBudget,
     ) -> WitnessVerdict {
+        self.prove_original_file_diagnosed(view, file, held, key, range, budget)
+            .verdict
+    }
+
+    fn prove_original_file_diagnosed(
+        &mut self,
+        view: &ProcessView,
+        file: &File,
+        held: &MappedFile,
+        key: ObjectKey,
+        range: (u64, u64),
+        budget: &mut CaptureWorkBudget,
+    ) -> WitnessOutcome {
+        // Explicit userspace loads no BPF: the deep-scan witness stays
+        // off with its named reason, spending neither budget nor query.
+        if budget.explicit_userspace() {
+            return WitnessOutcome {
+                verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                diagnosis: Some(WitnessDiagnosis {
+                    stage: WitnessStage::ExplicitUserspace,
+                }),
+            };
+        }
         // The per-scan budget spends before the run: a failed attempt
         // still spends, and exhaustion refuses without running. The
         // deep scan keeps its single trigger range; only the sweep
         // passes every refused range of the key.
         if self.witness_used >= OVERLAY_WITNESS_QUERIES_PER_SCAN {
-            return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            return WitnessOutcome {
+                verdict: WitnessVerdict::Failed(WitnessFailure::BudgetExhausted),
+                diagnosis: None,
+            };
         }
         self.witness_used += 1;
-        prove_original_file(view.pid(), file, held, key, &[range], budget)
+        prove_original_file_diagnosed(view.pid(), file, held, key, &[range], budget)
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
@@ -5865,6 +5944,7 @@ fn scan_view_examined_mode(
             double_loaded: same_file_loads >= 2,
             same_file_loads,
             path,
+            tables_scan_finished: false,
             decoder_abi: Some(abi),
             exports: hook_exports,
             tables: Vec::new(),
@@ -5874,6 +5954,13 @@ fn scan_view_examined_mode(
             inventory: group.clone(),
             ..ScanDependencies::default()
         });
+        // Per-module completeness for the sole-table gate: snapshot the
+        // truncating signals before this module's tables scan. A module that
+        // never scans (no mem, over the per-object cap, or stopped) keeps
+        // `tables_scan_finished` false.
+        let refusals_before_module = budget.refusal_counts();
+        let stop_before_module = budget.stopped_reason();
+        let skipped_before_module = skipped.len();
         let Some(mem) = &mem else {
             modules.push(module);
             continue;
@@ -5992,6 +6079,18 @@ fn scan_view_examined_mode(
                 reason: no_table_found_reason(&module.path, hinted),
             });
         }
+        // The sole-table gate's "exactly one" needs a finished scan: no
+        // truncating skip, I/O exhaustion, stop or refusal on this module.
+        // The benign no-table skip above never truncates, so an empty module
+        // from a complete scan still finishes (it refuses sole by count).
+        let truncated = skipped[skipped_before_module..]
+            .iter()
+            .any(|skip| scan_skip_truncates(&skip.reason));
+        module.tables_scan_finished = !io_exhausted
+            && !truncated
+            && budget.refusal_counts() == refusals_before_module
+            && stop_before_module.is_none()
+            && budget.stopped_reason().is_none();
         modules.push(module);
     }
 
@@ -9087,6 +9186,7 @@ mod tests {
                     double_loaded: false,
                     same_file_loads: 1,
                     path,
+                    tables_scan_finished: false,
                     decoder_abi: Some(ElfAbi::Lp64),
                     exports: Vec::new(),
                     tables,
@@ -13674,6 +13774,7 @@ mod tests {
         prove_calls: usize,
         witness_used: u32,
         witness_max: u32,
+        diagnosed: Option<WitnessOutcome>,
     }
 
     impl K1RedIo {
@@ -13687,6 +13788,7 @@ mod tests {
                 prove_calls: 0,
                 witness_used: 0,
                 witness_max: 8,
+                diagnosed: None,
             }
         }
 
@@ -13700,6 +13802,7 @@ mod tests {
                 prove_calls: 0,
                 witness_used: 0,
                 witness_max: 8,
+                diagnosed: None,
             }
         }
 
@@ -13717,6 +13820,10 @@ mod tests {
 
         fn script_binding_failed(&mut self) {
             self.witness.push_back(K1RedVerdict::BindingFailed);
+        }
+
+        fn script_diagnosed(&mut self, outcome: WitnessOutcome) {
+            self.diagnosed = Some(outcome);
         }
 
         fn exhaust(&mut self) {
@@ -13791,6 +13898,27 @@ mod tests {
                 K1RedVerdict::BindingFailed => {
                     WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed)
                 }
+            }
+        }
+
+        fn prove_original_file_diagnosed(
+            &mut self,
+            view: &ProcessView,
+            file: &std::fs::File,
+            held: &MappedFile,
+            key: ObjectKey,
+            range: (u64, u64),
+            budget: &mut CaptureWorkBudget,
+        ) -> WitnessOutcome {
+            if let Some(outcome) = self.diagnosed.take() {
+                self.prove_calls += 1;
+                self.witness_used += 1;
+                return outcome;
+            }
+            let verdict = self.prove_original_file(view, file, held, key, range, budget);
+            WitnessOutcome {
+                verdict,
+                diagnosis: None,
             }
         }
     }
@@ -13959,6 +14087,51 @@ mod tests {
     }
 
     #[test]
+    fn k1_prove_appends_plain_stage_for_unavailable() {
+        // RED: an unavailable verdict with a diagnosis refuses with the
+        // canonical prefix plus the plain-words stage.
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_diagnosed(WitnessOutcome {
+            verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+            diagnosis: Some(WitnessDiagnosis {
+                stage: WitnessStage::CollectionWork,
+            }),
+        });
+        let reason = run_k1_prove(&mut io, held, outcome).expect("unavailable refuses");
+        assert_eq!(
+            reason,
+            "original_file_unproven: kernel witness unavailable: \
+             scoped collection deactivates the kernel proof"
+        );
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
+    }
+
+    #[test]
+    fn k1_prove_keeps_canonical_reason_without_diagnosis() {
+        // RED: an unavailable verdict without a diagnosis (scripted IOs,
+        // old behavior) refuses with the exact canonical reason.
+        let held = k1_red_identity();
+        let entry = k1_red_entry(0x7f00_0000, b"r-xp");
+        let mut io = K1RedIo::overlay(std::collections::BTreeMap::from([(
+            (entry.start, entry.end),
+            held,
+        )]));
+        let outcome = run_k1_guard(&mut io, held, &[&entry])
+            .expect("the guard marks an equal overlay range unproven");
+        io.script_unavailable();
+        let reason = run_k1_prove(&mut io, held, outcome).expect("unavailable refuses");
+        assert_eq!(reason, GAP_WITNESS_UNAVAILABLE);
+        assert_eq!(io.prove_calls, 1, "the refusal came from the witness");
+    }
+
+    #[test]
     fn k1_prove_spends_one_query_per_file() {
         // Nine witness-requiring ranges in one file: the guard marks the
         // first and the prove step runs exactly one query for all of
@@ -14038,6 +14211,98 @@ mod tests {
         assert_eq!(
             io.prove_calls, 1,
             "the failed attempt still spends the budget"
+        );
+    }
+
+    #[test]
+    fn explicit_userspace_deep_scan_witness_stays_off() {
+        // Explicit `--identity-backend userspace` loads no BPF: the
+        // production deep-scan witness refuses with its named reason,
+        // spending neither budget nor query.
+        use crate::discovery::overlay_witness::witness_stats_for_test;
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: k1_red_identity(),
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        budget.set_explicit_userspace();
+        let mut io = ProcScanIo::new();
+        let (queries_before, _) = witness_stats_for_test();
+        let outcome = io.prove_original_file_diagnosed(
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        );
+        assert_eq!(
+            outcome.verdict,
+            WitnessVerdict::Failed(WitnessFailure::Unavailable)
+        );
+        assert_eq!(
+            outcome.diagnosis.map(|diagnosis| diagnosis.stage),
+            Some(WitnessStage::ExplicitUserspace)
+        );
+        assert_eq!(io.witness_used(), 0, "the refusal spends no budget");
+        let (queries_after, _) = witness_stats_for_test();
+        assert_eq!(
+            queries_before, queries_after,
+            "the refusal runs no witness query"
+        );
+        let mut join_io = ProcScanIo::new();
+        let reason = witness_join(
+            &mut join_io,
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        )
+        .expect("explicit userspace refuses with a gap");
+        assert_eq!(
+            reason,
+            "original_file_unproven: kernel witness unavailable: \
+             explicit userspace disables the kernel witness"
+        );
+    }
+
+    #[test]
+    fn auto_deep_scan_witness_attempts_a_query() {
+        // Twin: without the explicit flag the production witness
+        // spends its budget and runs a query (which fails at load in
+        // an unprivileged unit test, but still counts).
+        use crate::discovery::overlay_witness::witness_stats_for_test;
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: k1_red_identity(),
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        let mut budget = CaptureWorkBudget::default();
+        let mut io = ProcScanIo::new();
+        let (queries_before, _) = witness_stats_for_test();
+        let outcome = io.prove_original_file_diagnosed(
+            &view,
+            &file,
+            &held,
+            k1_red_key(),
+            (0x7f00_0000, 0x7f00_1000),
+            &mut budget,
+        );
+        assert_eq!(io.witness_used(), 1, "the attempt spends its budget");
+        let (queries_after, _) = witness_stats_for_test();
+        assert!(
+            queries_after > queries_before,
+            "the attempt runs a witness query"
+        );
+        // The unprivileged load fails, but never at the explicit stage.
+        assert_ne!(
+            outcome.diagnosis.map(|diagnosis| diagnosis.stage),
+            Some(WitnessStage::ExplicitUserspace)
         );
     }
 

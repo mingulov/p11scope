@@ -23,7 +23,7 @@
 # the object's BTF groups are the same, only the key prefix differs.
 #
 # Per kernel one throwaway guest runs a bounded linked inventory,
-# `inventory --system --capture native --key-operations --manifest
+# `inventory -v --system --capture native --key-operations --manifest
 # MANIFEST --duration 60s`, under the probe. Before the observer starts,
 # the guest initializes a guest-local SoftHSM token and starts one
 # persistent ledger caller (eighty mech iterations a second apart,
@@ -37,19 +37,21 @@
 # A load kernel passes only when the probe rows carry both journal roots
 # loaded with verifier stats, the per-program report passes, and the
 # observer text proves the linked lane sealed and live: the `semantic
-# lane ready` line, no `key operations unavailable` refusal gap (the
-# refused-linked arm records exactly that before its ordinary retry),
-# and joined semantic calls from an admitted binding. Zero journal
+# lane ready` line, no `p11scope: key operations unavailable` refusal
+# diagnostic (the refused-linked arm prints exactly that before its
+# ordinary retry; verbose per-process gap detail also names the
+# condition, so the bare phrase is not matched), and joined semantic
+# calls from an admitted binding. Zero journal
 # rows, a refused journal start, an idle lane, a timeout, a crash or a
 # missing count is FAIL. The finite refusal reasons
 # (`journal-pair-unavailable-in-build` on a build that omits the
-# object, `uprobe-multi-required` on pre-Multi kernels) are named in
+# object, the `live capture ...` refusal on pre-Multi kernels) are named in
 # the row detail, never mistaken for a pass. The key-operations display
 # latch does not complete in production runs at this base, so the
 # display state is recorded in the row, never gated.
 #
 # Pre-Multi kernels (v5.15.*, v6.1.*) are a refusal control, not a
-# load: the finite `uprobe-multi-required` refusal with no loaded
+# load: the finite live-capture refusal with no loaded
 # journal row is a pass for that cell; a load or a crash is FAIL.
 #
 # Writes OUTDIR/results.jsonl, one row per kernel:
@@ -371,7 +373,7 @@ else
 fi
 ulimit -n 65536
 RC=0
-timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
+timeout -k 10 -s INT 150 env LD_PRELOAD="$PROBE" P11SCOPE_VERIFIER_STATS_FD=9 "$OBSERVER" inventory -v --system --capture native --key-operations --manifest "$MANIFEST" --duration 60s 9>"journal-probe-$KERNEL.jsonl" >"journal-$KERNEL.txt" 2>&1 || RC=$?
 echo "guest-stage=observer-rc=$RC"
 if [ -f "$LEDGER_LOG" ]; then
     cp "$LEDGER_LOG" "./workload-$KERNEL.log"
@@ -494,8 +496,8 @@ PY
         # Refusal control: the finite pre-Multi refusal, no loaded
         # journal row, no crash. A load or a crash is FAIL.
         REASONS=""
-        if [ ! -f "$J_TXT" ] || ! grep -q 'uprobe-multi-required' "$J_TXT"; then
-            add_reason "finite uprobe-multi-required refusal missing"
+        if [ ! -f "$J_TXT" ] || ! grep -q 'live capture \(needs root\|unavailable\|did not start\):' "$J_TXT"; then
+            add_reason "finite live-capture refusal missing"
         fi
         if [ "$J_RC" = 0 ]; then
             add_reason "observer exited 0 on a pre-Multi kernel"
@@ -507,9 +509,9 @@ PY
             add_reason "observer crashed or left no log"
         fi
         if [ -z "$REASONS" ]; then
-            echo "# control $KERNEL: PASS (refused uprobe-multi-required)"
+            echo "# control $KERNEL: PASS (refused live-capture)"
             emit_row "journal-load-$KERNEL" 1 qualified \
-                "refused uprobe-multi-required; no journal loads; rc=$J_RC"
+                "refused live-capture; no journal loads; rc=$J_RC"
         else
             echo "# control $KERNEL: FAIL ($REASONS)"
             emit_row "journal-load-$KERNEL" 0 failed "$REASONS"
@@ -530,19 +532,22 @@ PY
     elif grep -Eqi 'panicked at|traceback|SIGSEGV|SIGABRT' "$J_TXT"; then
         add_reason "observer crashed"
     fi
-    # Linked proof: the seal line plus no journal-start refusal gap
-    # means the linked start succeeded (start_semantic_lane records
-    # "key operations unavailable" on exactly the refused-linked arm
-    # before its ordinary retry, and prints the seal line only for a
-    # sealed lane), and joined calls prove the lane is live. The
+    # Linked proof: the seal line plus no journal-start refusal
+    # diagnostic means the linked start succeeded (start_semantic_lane
+    # prints "p11scope: key operations unavailable: ..." on exactly the
+    # refused-linked arm before its ordinary retry, and prints the seal
+    # line only for a sealed lane), and joined calls prove the lane is
+    # live. The diagnostic prefix matters: verbose per-process gap
+    # detail also names the condition ("Joint key operations
+    # unavailable"), so the bare phrase would refuse a live lane. The
     # key-operations display latch (bootstrap_unavailable) does not
     # complete in production runs at this base, so the display state
     # is recorded in the row, never gated.
-    # Both refusal shapes: the gap subject from a runtime journal
+    # Both refusal shapes: the stderr diagnostic from a runtime journal
     # refusal (with an ordinary retry behind it), and the bare finite
     # reason from a build that rejects --key-operations up front.
-    if [ -f "$J_TXT" ] && grep -Eq 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
-        REFUSAL=$(grep -E 'key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
+    if [ -f "$J_TXT" ] && grep -Eq 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT"; then
+        REFUSAL=$(grep -E 'p11scope: key operations unavailable|journal-pair-unavailable-in-build' "$J_TXT" | head -1 | cut -c1-160)
         add_reason "linked lane refused: $REFUSAL"
     elif [ ! -f "$J_TXT" ] || ! grep -q 'p11scope: semantic lane ready' "$J_TXT"; then
         add_reason "semantic lane never sealed"
@@ -551,7 +556,7 @@ PY
     fi
     OBSERVED="unknown"
     if [ -f "$J_TXT" ]; then
-        if grep -q 'key operations: unavailable (bootstrap_unavailable)' "$J_TXT"; then
+        if grep -q 'key operations: not available.*bootstrap_unavailable' "$J_TXT"; then
             OBSERVED="bootstrap_unavailable"
         elif grep -q 'key operations: rev ' "$J_TXT"; then
             OBSERVED="populated"

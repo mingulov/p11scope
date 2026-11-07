@@ -248,8 +248,12 @@ impl DiscoveryNoiseAggregator {
     }
 
     /// Best-effort stderr summaries through the backpressure-aware sink, one
-    /// line per class. Diagnostic delivery must not change recorded losses.
+    /// line per class, verbose-only. Diagnostic delivery must not change
+    /// recorded losses.
     pub fn report(&self) {
+        if !crate::cli::text_is_verbose() {
+            return;
+        }
         for line in self.lines() {
             let _ = crate::sink::try_stderr_line(&line);
         }

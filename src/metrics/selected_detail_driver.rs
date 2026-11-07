@@ -935,6 +935,67 @@ pub(crate) fn run_metrics_selection_stage(
     }
 }
 
+impl SelectionLedger {
+    /// The recorded selection attempt for plain text: the endpoint
+    /// plus its named refusal (`None` while the resolution is live),
+    /// or `None` before any attempt. The JSON composer stays the
+    /// durable record; this is the host's diagnostic handle only.
+    pub(crate) fn selection_outcome(&self) -> Option<(&str, Option<&'static str>)> {
+        self.selection
+            .as_ref()
+            .map(|record| (record.endpoint.as_str(), record.refusal))
+    }
+}
+
+/// One plain-text line for a `--select-endpoint` attempt that never
+/// opened a detail window (unresolved name, or a failed K0 open):
+/// endpoint, named reason, aggregate-only continuation, and the
+/// remedy for the shape. `owned_run` distinguishes the run child
+/// (whose provider usually loads after selection) from profile.
+pub(crate) fn format_selection_refused_line(
+    endpoint: &str,
+    refusal: &str,
+    owned_run: bool,
+) -> String {
+    let (short, remedy) = match refusal {
+        "endpoint_unknown" if owned_run => (
+            "matched no counter slot",
+            " With run, the provider usually loads after start: \
+             add --prearm-module <provider.so> so the name resolves.",
+        ),
+        "endpoint_unknown" => (
+            "matched no counter slot",
+            " The name must match exactly one broad slot; \
+             use --module to narrow providers.",
+        ),
+        "promotion_endpoint_ambiguous" => (
+            "matched more than one counter slot",
+            " Use --module to narrow providers.",
+        ),
+        "promotion_scope_unsupported" => (
+            "needs one process",
+            " Selections detail one --pid process; --cgroup/--system cannot name one.",
+        ),
+        _ => ("detail window failed to open", ""),
+    };
+    format!(
+        "p11scope: --select-endpoint {endpoint} {short} ({refusal}); \
+         continuing aggregate-only.{remedy}"
+    )
+}
+
+/// One plain-text line for a resolved `--select-endpoint` whose K0
+/// detail voided at close: endpoint, the named void, and the
+/// aggregate continuation. No remedy: the void is situational
+/// (truncation, an unclean boundary, a changed caller), never a
+/// flag the operator mis-set.
+pub(crate) fn format_selection_withheld_line(endpoint: &str, refusal: &str) -> String {
+    format!(
+        "p11scope: --select-endpoint {endpoint} detail withheld ({refusal}); \
+         aggregate counters continue."
+    )
+}
+
 /// One exec-witness snapshot for a K0 window bound: the broad tap's
 /// facts, `None` when the session carries no PID witness, `Err` when
 /// the witness failed. Production snapshots come from
@@ -2364,6 +2425,103 @@ mod tests {
         assert!(section.get("lineage").is_none());
         assert!(section.get("aggregate").is_none());
         assert!(section.get("detail").is_none());
+    }
+
+    #[test]
+    fn selection_outcome_reports_the_recorded_attempt_for_text() {
+        // The host's plain-text handle: nothing before any attempt,
+        // the endpoint plus its refusal (or live resolution) after.
+        let pool = test_pool();
+        let scene = stage_single_provider(pool, 4);
+        let scope = Scope::Pid(std::process::id());
+        let mut ledger = SelectionLedger::new();
+        assert_eq!(ledger.selection_outcome(), None, "no attempt yet");
+        let resolved =
+            run_metrics_selection_stage("C_Toggle0002", &scene.plan, &scope, &mut ledger)
+                .expect("live name resolves");
+        assert_eq!(resolved.slot, 2);
+        assert_eq!(
+            ledger.selection_outcome(),
+            Some(("C_Toggle0002", None)),
+            "a live resolution refuses nothing"
+        );
+        let mut refused = SelectionLedger::new();
+        let none = run_metrics_selection_stage("C_Missing", &scene.plan, &scope, &mut refused);
+        assert!(none.is_none(), "unknown names resolve to nothing");
+        assert_eq!(
+            refused.selection_outcome(),
+            Some(("C_Missing", Some("endpoint_unknown"))),
+            "the named refusal is readable for text"
+        );
+    }
+
+    #[test]
+    fn selection_refusal_lines_name_endpoint_reason_and_remedy() {
+        // Every refused selection reaches the operator as one plain
+        // line: endpoint, named reason, aggregate-only continuation,
+        // and the remedy for the shape. Single line each, always.
+        let line = format_selection_refused_line("C_Sign", "endpoint_unknown", true);
+        assert!(
+            line.starts_with("p11scope: --select-endpoint C_Sign"),
+            "names the flag and endpoint: {line}"
+        );
+        assert!(
+            line.contains("endpoint_unknown"),
+            "names the reason: {line}"
+        );
+        assert!(
+            line.contains("aggregate-only"),
+            "says the capture continues: {line}"
+        );
+        assert!(
+            line.contains("--prearm-module"),
+            "a run names its usual remedy: {line}"
+        );
+        assert_eq!(line.lines().count(), 1, "one line: {line}");
+
+        let line = format_selection_refused_line("C_Sign", "endpoint_unknown", false);
+        assert!(
+            line.contains("--module"),
+            "a profile names narrowing, not prearm: {line}"
+        );
+        assert!(
+            !line.contains("--prearm-module"),
+            "no run remedy on profile: {line}"
+        );
+
+        let line = format_selection_refused_line("C_Sign", "promotion_endpoint_ambiguous", true);
+        assert!(
+            line.contains("more than one"),
+            "ambiguity says what matched: {line}"
+        );
+        assert!(line.contains("--module"), "ambiguity narrows: {line}");
+
+        let line = format_selection_refused_line("C_Sign", "promotion_scope_unsupported", false);
+        assert!(
+            line.contains("--pid"),
+            "scope names the one process: {line}"
+        );
+
+        let line = format_selection_refused_line("C_Sign", "broad_stopping", true);
+        assert!(
+            line.contains("broad_stopping") && line.contains("aggregate-only"),
+            "open failures stay named and continuing: {line}"
+        );
+
+        let line = format_selection_withheld_line("C_Sign", "broad_stopping");
+        assert!(
+            line.starts_with("p11scope: --select-endpoint C_Sign"),
+            "withheld names the endpoint: {line}"
+        );
+        assert!(
+            line.contains("withheld") && line.contains("broad_stopping"),
+            "withheld names the void: {line}"
+        );
+        assert!(
+            line.contains("aggregate"),
+            "withheld says counters continue: {line}"
+        );
+        assert_eq!(line.lines().count(), 1, "one line: {line}");
     }
 
     #[test]

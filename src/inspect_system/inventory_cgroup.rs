@@ -831,6 +831,8 @@ fn collect_with(
             Path::new("/proc"),
             cap,
             &mut budget,
+            // Cgroup transactions carry no cross-pass scanned set.
+            &BTreeSet::new(),
         );
     }
     let mut noise = DiscoveryNoiseAggregator::default();

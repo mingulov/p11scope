@@ -588,7 +588,7 @@ class BrowserCells(unittest.TestCase):
                 self.stderr = FakePipe([
                     (0.1, "p11scope: loader readiness: 1 active hook(s)\n"),
                     (marker_delay,
-                     "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n"),
+                     "p11scope: capturing: 136 probes attached; stop with Ctrl-C\n"),
                 ])
                 self.stdout = FakePipe([])
 
@@ -737,10 +737,12 @@ class BrowserCells(unittest.TestCase):
         """Unit: the readiness marker parses to its attached-probe count."""
         self.assertEqual(
             cells._parse_capture_ready(
-                "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"), 136)
+                "p11scope: capturing: 136 probes attached; stop with Ctrl-C"), 136)
         self.assertEqual(
             cells._parse_capture_ready(
-                "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"), 0)
+                "p11scope: capturing: 1 probe attached; stop with Ctrl-C"), 1)
+        self.assertIsNone(cells._parse_capture_ready(
+            "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C"))
         self.assertIsNone(cells._parse_capture_ready(
             "p11scope: loader readiness: 1 active hook(s)"))
         self.assertIsNone(cells._parse_capture_ready("unrelated line"))

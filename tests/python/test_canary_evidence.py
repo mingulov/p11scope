@@ -145,6 +145,10 @@ def owned_metrics_document(bits, calls=30):
         privacy="aggregate-only",
     )
     document["functions"] = subject.function_items([(["C_GetInterfaceList"], calls)])
+    document["layer_totals"] = {
+        "logical": {"calls": calls, "errors": 0, "in_flight": 0},
+        "forwarding": {"calls": 0, "errors": 0, "in_flight": 0},
+    }
     return subject, document
 
 
@@ -3608,10 +3612,23 @@ class OwnedMetricsOracleTests(unittest.TestCase):
                 for calls in (28, 29, 31):
                     bad = copy.deepcopy(owned)
                     bad["functions"][0]["calls"] = calls
+                    bad["layer_totals"]["logical"]["calls"] = calls
                     with self.assertRaises(AssertionError):
                         capture.validate_canary(lane, bad, TARGET_BITS)
                     with self.assertRaises(AssertionError):
                         canary.assert_owned_aggregate_metrics(bad)
+                for label, mutate in (
+                    ("logical calls", lambda d: d["layer_totals"]["logical"].update(calls=29)),
+                    ("logical errors", lambda d: d["layer_totals"]["logical"].update(errors=1)),
+                    ("forwarding calls",
+                     lambda d: d["layer_totals"]["forwarding"].update(calls=1)),
+                    ("missing totals", lambda d: d.pop("layer_totals")),
+                ):
+                    with self.subTest(label=label):
+                        bad = copy.deepcopy(owned)
+                        mutate(bad)
+                        with self.assertRaises(AssertionError):
+                            canary.assert_owned_aggregate_metrics(bad)
                 # A retained scan refusal publishes as the categorical
                 # skip, so an owned lane may carry one.
                 one = copy.deepcopy(owned)
@@ -3671,6 +3688,7 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         # no version skip for the matrix shape.
         external["evidence"]["skipped"] = []
         external["functions"][0]["calls"] = 28
+        external["layer_totals"]["logical"]["calls"] = 28
         # Dropping the skip changes the verdict's inputs: re-derive the
         # published classes the way the producer would.
         capture.settle_fixture_verdict(external)
@@ -3678,6 +3696,7 @@ class OwnedMetricsOracleTests(unittest.TestCase):
         canary.assert_aggregate_metrics(external)
         external_30 = copy.deepcopy(external)
         external_30["functions"][0]["calls"] = 30
+        external_30["layer_totals"]["logical"]["calls"] = 30
         with self.assertRaises(AssertionError):
             capture.validate_canary("aggregate-only-metrics", external_30, TARGET_BITS)
         with self.assertRaises(AssertionError):

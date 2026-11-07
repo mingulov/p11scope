@@ -824,6 +824,8 @@ fn self_cpu_jiffies() -> u64 {
 fn system_args(hints: Vec<PathBuf>) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: hints,
         exclude_modules: vec![],
@@ -2374,6 +2376,8 @@ fn ambient_exec_pids(records: &[DiscoveryRecord], owned: &BTreeSet<u32>) -> Vec<
 fn cgroup_args(hints: Vec<PathBuf>, path: PathBuf) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: hints,
         exclude_modules: vec![],

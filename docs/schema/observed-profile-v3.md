@@ -19,20 +19,22 @@ classes (`gap_classes` and its three published inputs), row identity
 and the `modules_skipped[]` named-prefix delta below.
 
 `modules_skipped[]` extends the inherited v2 row: a module new to a
-shared-scope Detailed capture may attach in part, as a named
-leading-tables prefix, instead of being refused whole. Such a module
-appears in both `discovery[]` and `modules_skipped[]`; its `reason`
+shared-scope Detailed capture may attach in part, as a named partial
+gap, instead of being refused whole. Such a module appears in both
+`discovery[]` and `modules_skipped[]`; its `reason`
 opens with the attached-vs-total counts — `A of N endpoints attached;
 calls through the others are not counted (provider_prefix)` for an
-ordinary provider, or `M of N template tables attached; calls through
+ordinary provider, `M of N template tables attached; calls through
 the others are not counted (closure_prefix)` for a late-start proxy
-closure array — rather than with `module needs`. The whole-refusal
-(`module needs …`) and growth-omission (`admitted module needs …`)
-openings are unchanged, and every kind — whole refusal, growth
-omission, and either named prefix — forces `PARTIAL`. The
-`inspect --system` catalog files a prefix-admitted object under
-`refused` with the same named-gap reason; its attached-vs-needed
-counts are in the reason text.
+closure array, or `K of M template tables attached; calls through the
+others are not counted (closure_published_only)` for an already-loaded
+unnamed layer's published-only spill — rather than with `module needs`.
+The whole-refusal (`module needs …`) and growth-omission
+(`admitted module needs …`) openings are unchanged, and every kind —
+whole refusal, growth omission, and any of the three named partials —
+forces `PARTIAL`. The `inspect --system` catalog files a partially
+admitted object under `refused` with the same named-gap reason; its
+attached-vs-needed counts are in the reason text.
 
 The inherited `functions[].latency_ns` timing-availability shapes also apply
 to v3: counts has null timing, timestamps has measured total/max and null
@@ -43,22 +45,43 @@ or combine aggregate and semantic-detail totals.
 When a capture uses the prepared cumulative-counter reader, its evidence also
 contains optional `counter_collection` metadata. Legacy captures omit this
 object. Its exact keys are `mode`, `generation`, `read_window`, `status`,
-`health`, `discontinuity`, and `failure`. Mode and positive generation identify
+`health`, `discontinuity`, and `failure`, plus an optional additive
+`bank_gaps` object (`failed_slots` count with `health_failed`/`kernel_failed`
+flags) that appears only when one bank's cells or evidence reads failed.
+Exact counter reads omit `bank_gaps`. A gap read publishes the last good
+snapshot as stale with the gap counts; only the first read of a generation
+publishes its current rows, with zeros as unknown for the failed slots.
+This is a v3-additive disclosure
+that introduces no new schema revision. Mode and positive generation identify
 the accepted native read. `read_window` is either the measured monotonic
 `{started_ns, finished_ns}` interval or null when that interval is unavailable;
 it does not assert an atomic snapshot. Cached display ticks keep the original
 read window and do not acquire another native read.
 
 `status: "fresh"` has null failure and accepted health
-`{saturated: false, contended: false}`. A failed attempt retains the previous
-accepted rows, mode, generation, and window with `status: "stale"`, null health,
-and a finite failure cause; observed saturation or contention remains explicit
-as `saturated` or `contended`. A generation change sets sticky `discontinuity`.
-Either failure or discontinuity adds `counter_collection` to the observation
-gap causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
-An unavailable initial read cannot produce zero measurements, and a terminal
-report requires a new successful collection and projection. This metadata
+`{saturated: false, contended: false}`, except a fresh read with a health
+gap reports null health (the health read itself failed). A failed attempt
+retains the previous accepted rows, mode, generation, and window with
+`status: "stale"`, null health, and a finite failure cause; observed
+saturation or contention remains explicit as `saturated` or `contended`.
+A generation change sets sticky `discontinuity`. A failure, discontinuity,
+or `bank_gaps` object adds `counter_collection` to the observation gap
+causes and requires `PARTIAL` with `verdict_detail: "concrete_gap"`.
+An unavailable initial read cannot produce zero measurements. A failed
+terminal read publishes the last good snapshot as stale with `PARTIAL`;
+only a capture that never acquired a snapshot fails. This metadata
 does not select a backend or add capture fields.
+
+When a legacy (non-counter) aggregate read cannot read one slot's counters
+or one kernel-evidence cell, its evidence also contains an optional additive
+`legacy_collection` object. Exact legacy reads omit it. Its keys are
+`unread_stats` (how many slots read zero as unknown), `rv_failed` (whether
+the return-value table read failed), and `unknown_evidence` (finite names of
+the unread evidence cells). Zeros in the rows are unknown, not exact,
+whenever this object is present. Like `counter_collection`, it adds
+`legacy_collection` to the observation gap causes and requires `PARTIAL`
+with `verdict_detail: "concrete_gap"`. This is a v3-additive disclosure
+that introduces no new schema revision.
 
 When a metrics+counter capture carries an endpoint selection (`--select-endpoint`),
 the terminal evidence also contains an optional additive `selected_detail`
@@ -588,12 +611,36 @@ guessed per-name shares. Rows that do not name exactly `C_Initialize`,
 and Initialize rows without positively counted returns, omit the key
 (absent, never null or false): absence means Initialize was not
 observed on that row (unknown, per OD35). The live function table marks
-qualifying rows with the same words (`[init: <outcome>]`, plus
-`, potential provider` when the likelihood holds).
+qualifying rows `[init: <outcome>]`; the PROVIDER column beside it names the
+row's file.
 
 Like `selected_detail` and `instance_reload_not_excluded`, this is a
 v3-additive disclosure that introduces no new schema revision: the
 `functions[]` item shape stays open and the key stays optional.
+
+## Forwarding-layer split on `functions[]` rows
+
+Every `functions[]` row carries `forwarding_layer` (boolean, always
+present): true when the row counts calls at a forwarding layer (a
+closure array admitted beside watched providers), false for provider
+rows. The split needs an active provider in the same capture (a
+non-layer row with a non-null module and a call, an error, or an
+in-flight entry) and no refused backend; otherwise the layer's rows
+read `forwarding_layer: false` and stay in the totals. One logical call
+observed at both layers counts once, in the provider row; the forwarding
+row stays explicit beside it. Consumers that sum `calls` across rows must
+skip `forwarding_layer` rows to count logical calls once.
+Layer-self-answered calls, including their errors, appear only in the
+forwarding split, and one layer call reaching several providers counts
+at each.
+
+Top-level `layer_totals` (always present in both v3 documents, metrics
+and profile) splits the same totals: `logical` (provider calls, errors
+and in-flight, counted once) and `forwarding` (forwarding-layer calls,
+errors and in-flight, never summed into logical). Single-layer captures
+read `forwarding` zeros with both layers' rows labelled. Like
+`selected_detail`, this is a v3-additive disclosure that introduces no
+new schema revision: the `functions[]` item shape stays open.
 
 ## Kernel control evidence
 
@@ -678,6 +725,13 @@ Counts are array lengths; no path, PID, or error chain leaves diagnostics.
 always` degrades that collected unpaused instead of aborting. Each forces
 `PARTIAL` via the `pause_unavailable` gap cause; `evidence.pause` reads
 `partial` when either `pause_partial` or `pause_unavailable` is nonzero.
+
+`evidence.pause_engine_incomplete_retirements` (integer, required, default
+0) counts `--pause auto` chains that retired after four straight
+engine-incomplete cycles. Each retirement is already one counted
+`pause_partial`; the count is a subset annotation (never above
+`pause_partial`), so JSON consumers can tell a retired chain from
+scattered partials.
 
 ## Migration
 

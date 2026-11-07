@@ -178,7 +178,9 @@ class PackageReleaseTests(unittest.TestCase):
             "p11scope-0.1.0-x86_64-linux-musl.tar.gz",
             "p11scope-discover-0.1.0-x86_64-linux-gnu.tar.gz",
             "p11scope-discover-0.1.0-x86_64-linux-musl.tar.gz",
-            "p11scope-0.1.0-source.tar.gz", "RELEASE.json", "SHA256SUMS",
+            "p11scope-0.1.0-source.tar.gz",
+            "p11scope_0.1.0_amd64.deb", "p11scope-0.1.0-1.x86_64.rpm",
+            "RELEASE.json", "SHA256SUMS",
         }
         self.assertEqual({p.name for p in self.output.iterdir()}, expected)
         release_bytes = (self.output / "RELEASE.json").read_bytes()
@@ -188,6 +190,13 @@ class PackageReleaseTests(unittest.TestCase):
         self.assertIn("object-attribute capture enabled", release["scope"])
         self.assertIn("Multi-capable Linux x86-64 host", release["scope"])
         self.assertIn("Offline/helper commands", release["scope"])
+        packages = release["packages"]
+        self.assertEqual(packages["deb"]["file"], "p11scope_0.1.0_amd64.deb")
+        self.assertEqual(packages["rpm"]["file"], "p11scope-0.1.0-1.x86_64.rpm")
+        self.assertEqual(packages["deb"]["sha256"],
+                         digest((self.output / "p11scope_0.1.0_amd64.deb").read_bytes()))
+        self.assertEqual(packages["rpm"]["sha256"],
+                         digest((self.output / "p11scope-0.1.0-1.x86_64.rpm").read_bytes()))
         for path in self.output.iterdir():
             self.assertEqual(path.read_bytes(), (second / path.name).read_bytes())
         checksums = (self.output / "SHA256SUMS").read_text()
@@ -214,6 +223,134 @@ class PackageReleaseTests(unittest.TestCase):
                         self.assertNotIn(b"PRIVATE-CAPTURE-CANARY", data)
                         self.assertNotIn(b"/private/host/path", data)
         self.assertEqual((self.dist / "p11scope").stat().st_mode & 0o777, 0o600)
+
+    def test_system_packages_carry_same_bytes_without_scripts_or_privilege(self):
+        self.package()
+        deb = self.output / "p11scope_0.1.0_amd64.deb"
+        rpm = self.output / "p11scope-0.1.0-1.x86_64.rpm"
+        release = json.loads((self.output / "RELEASE.json").read_bytes())
+        docs = [*PACKAGE.LICENSES, "notices/notices.json",
+                *(f"notices/{name}" for name in self.notice_manifest["files"]),
+                "RELEASE.json"]
+        # DEB data: same observer and glibc helper bytes, docs under
+        # /usr/share/doc/p11scope, no set-id bits, no private bytes.
+        deb_root = self.base / "deb-root"
+        deb_root.mkdir()
+        subprocess.run(["dpkg-deb", "-x", str(deb), str(deb_root)],
+                       check=True, capture_output=True, timeout=30)
+        self.assertEqual((deb_root / "usr/bin/p11scope").read_bytes(),
+                         (self.dist / "p11scope").read_bytes())
+        self.assertEqual((deb_root / "usr/bin/p11scope-discover").read_bytes(),
+                         (self.dist / "p11scope-discover-glibc").read_bytes())
+        self.assertEqual((deb_root / "usr/bin/p11scope").stat().st_mode & 0o7777, 0o755)
+        self.assertEqual((deb_root / "usr/bin/p11scope-discover").stat().st_mode & 0o7777, 0o755)
+        deb_docs = deb_root / "usr/share/doc/p11scope"
+        self.assertTrue((deb_docs / "LICENSE").is_file())
+        self.assertTrue((deb_docs / "notices/NOTICES.md").is_file())
+        embedded = json.loads((deb_docs / "RELEASE.json").read_bytes())
+        self.assertNotIn("packages", embedded)
+        self.assertEqual({k: v for k, v in release.items() if k != "packages"}, embedded)
+        for path in deb_root.rglob("*"):
+            if path.is_symlink():
+                self.fail(f"system package contains a symlink: {path}")
+            if path.is_file():
+                self.assertEqual(path.stat().st_mode & 0o6000, 0,
+                                 f"set-id bit on {path.relative_to(deb_root)}")
+                data = path.read_bytes()
+                self.assertNotIn(b"PRIVATE-CAPTURE-CANARY", data)
+                self.assertNotIn(b"/private/host/path", data)
+        # DEB control: expected identity, no maintainer scripts.
+        deb_control = self.base / "deb-control"
+        deb_control.mkdir()
+        subprocess.run(["dpkg-deb", "-e", str(deb), str(deb_control)],
+                       check=True, capture_output=True, timeout=30)
+        control = (deb_control / "control").read_text()
+        self.assertIn("Package: p11scope\n", control)
+        self.assertIn("Version: 0.1.0\n", control)
+        self.assertIn("Architecture: amd64\n", control)
+        self.assertIn("FULL", control)
+        for script in ("preinst", "postinst", "prerm", "postrm", "config", "triggers"):
+            self.assertFalse((deb_control / script).exists(),
+                             f"maintainer script must be absent: {script}")
+        listing = subprocess.run(["dpkg-deb", "-c", str(deb)], check=True,
+                                 capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("./usr/bin/p11scope\n", listing)
+        self.assertIn("./usr/bin/p11scope-discover\n", listing)
+        # Exact data set: any stray payload (a service unit, cron file,
+        # ...) fails here, not just maintainer scripts.
+        expected_data = {"./usr/bin/p11scope", "./usr/bin/p11scope-discover"}
+        expected_data.update(f"./usr/share/doc/p11scope/{name}" for name in docs)
+        expected_dirs = {"./"}
+        for path in expected_data:
+            parts = path.split("/")
+            for end in range(2, len(parts)):
+                expected_dirs.add("/".join(parts[:end]) + "/")
+        self.assertEqual(sorted(line.split()[-1] for line in listing.splitlines()),
+                         sorted(expected_data | expected_dirs))
+        # No file capabilities: the data tar carries no xattr records and
+        # no non-file members.
+        fsys = subprocess.run(["dpkg-deb", "--fsys-tarfile", str(deb)], check=True,
+                              capture_output=True, timeout=30).stdout
+        with tarfile.open(fileobj=io.BytesIO(fsys)) as archive:
+            members = list(archive)
+        self.assertEqual({member.name for member in members},
+                         expected_data | {"." if name == "./" else name[:-1] for name in expected_dirs})
+        for member in members:
+            self.assertTrue(member.isdir() or member.isfile(),
+                            f"unexpected member type: {member.name}")
+            self.assertEqual([key for key in member.pax_headers
+                              if key.startswith("SCHILY.xattr.")], [],
+                             f"xattr record on {member.name}")
+        # RPM queries (no root needed): same bytes by digest, same docs,
+        # no scriptlets, no set-id modes.
+        entries = {}
+        query = subprocess.run(
+            ["rpm", "-qp", "--qf", "[%{FILENAMES}|%{FILEDIGESTS}|%{FILEMODES:octal}\n]", str(rpm)],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        for line in query.splitlines():
+            name, file_digest, mode = line.split("|")
+            entries[name] = (file_digest, int(mode, 8))
+        self.assertEqual(entries["/usr/bin/p11scope"][0], digest((self.dist / "p11scope").read_bytes()))
+        self.assertEqual(entries["/usr/bin/p11scope-discover"][0],
+                         digest((self.dist / "p11scope-discover-glibc").read_bytes()))
+        self.assertEqual(entries["/usr/bin/p11scope"][1] & 0o7777, 0o755)
+        self.assertEqual(entries["/usr/bin/p11scope-discover"][1] & 0o7777, 0o755)
+        pre_public = (json.dumps({k: v for k, v in release.items() if k != "packages"},
+                                 sort_keys=True, indent=2, ensure_ascii=False) + "\n").encode()
+        self.assertEqual(entries["/usr/share/doc/p11scope/RELEASE.json"][0], digest(pre_public))
+        self.assertEqual(entries["/usr/share/doc/p11scope/LICENSE"][0],
+                         digest((self.root / "LICENSE").read_bytes()))
+        for name, (_, mode) in entries.items():
+            self.assertEqual(mode & 0o6000, 0, f"set-id bit on {name}")
+        scripts = subprocess.run(["rpm", "-qp", "--scripts", str(rpm)], check=True,
+                                 capture_output=True, text=True, timeout=30).stdout
+        self.assertNotIn("preinstall", scripts)
+        self.assertNotIn("postinstall", scripts)
+        self.assertNotIn("preuninstall", scripts)
+        self.assertNotIn("postuninstall", scripts)
+        identity = subprocess.run(
+            ["rpm", "-qp", "--qf", "%{NAME} %{VERSION} %{RELEASE} %{ARCH}\n", str(rpm)],
+            check=True, capture_output=True, text=True, timeout=30).stdout
+        self.assertEqual(identity, "p11scope 0.1.0 1 x86_64\n")
+        file_list = subprocess.run(["rpm", "-qlp", str(rpm)], check=True,
+                                   capture_output=True, text=True, timeout=30).stdout
+        self.assertIn("/usr/bin/p11scope\n", file_list)
+        self.assertIn("/usr/bin/p11scope-discover\n", file_list)
+        self.assertIn("/usr/share/doc/p11scope/LICENSE\n", file_list)
+        # Exact file set, as on the DEB side: a stray service unit or
+        # other payload addition fails here.
+        expected_rpm = {"/usr/bin/p11scope", "/usr/bin/p11scope-discover",
+                        "/usr/share/doc/p11scope"}
+        expected_rpm.update(f"/usr/share/doc/p11scope/{name}" for name in docs)
+        self.assertEqual(sorted(file_list.splitlines()), sorted(expected_rpm))
+        self.assertEqual(set(entries), expected_rpm)
+        # No file capabilities on any packaged path.
+        caps = subprocess.run(["rpm", "-qp", "--filecaps", str(rpm)], check=True,
+                              capture_output=True, text=True, timeout=30).stdout
+        capped = dict(line.partition("\t")[::2] for line in caps.splitlines())
+        self.assertEqual(set(capped), expected_rpm)
+        for name, value in capped.items():
+            self.assertEqual(value, "", f"file capability on {name}")
 
     def test_default_provenance_is_full_capture(self):
         result = self.package()
@@ -388,6 +525,18 @@ class PackageReleaseTests(unittest.TestCase):
         with self.assertRaisesRegex((ValueError, OSError), "exists"):
             self.package()
         self.assertEqual(sentinel.read_text(), "keep")
+
+    def test_system_package_docs_state_tested_distros_and_glibc_floor(self):
+        readme = (ROOT / "README.md").read_text()
+        self.assertIn("### System packages (DEB/RPM)", readme)
+        section = readme.split("### System packages (DEB/RPM)", 1)[1].split("\n### ", 1)[0]
+        usage = (ROOT / "docs/usage.md").read_text()
+        self.assertIn("## Installing system packages", usage)
+        installing = usage.split("## Installing system packages", 1)[1].split("\n## ", 1)[0]
+        for name, text in (("README.md", section), ("docs/usage.md", installing)):
+            with self.subTest(doc=name):
+                for marker in ("Ubuntu 26.04", "Fedora 44", "glibc 2.34"):
+                    self.assertIn(marker, text)
 
 
 if __name__ == "__main__":

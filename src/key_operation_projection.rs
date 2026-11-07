@@ -31,6 +31,35 @@ pub(crate) const OBSERVATIONS_VERSION: u8 = 1;
 /// renderer emits v2 only when KEM content is present; v1 output is
 /// byte-stable.
 pub(crate) const OBSERVATIONS_VERSION_V2: u8 = 2;
+/// Section version 3: v2 vocabulary plus the `unattributed`
+/// counters. The renderer emits v3 only when at least one count is
+/// nonzero; fully attributed output stays byte-stable v1/v2.
+pub(crate) const OBSERVATIONS_VERSION_V3: u8 = 3;
+/// Section version 4: v3 vocabulary plus the `unknown` metadata
+/// label on per-key rows (DEMO-4 late attach: a first-observed key
+/// whose type/size were never established in the observed window).
+/// The renderer emits v4 only when such a row is present; the
+/// `unattributed` key is then always present (possibly empty).
+pub(crate) const OBSERVATIONS_VERSION_V4: u8 = 4;
+/// The metadata label of a first-observed key at use: its identity
+/// and counts are proved, its type/size are not (first seen before
+/// attach). Frozen v4 vocabulary; never a guessed label.
+pub(crate) const METADATA_UNKNOWN: &str = "unknown";
+
+/// Finite not-attributed reasons, in publication order. Each counts
+/// calls that carry no per-key row, with the reason no key could be
+/// proved (`started_before_attach`: direct reductions on a feed
+/// registered without a witnessed birth). Counts and reason names
+/// only — never handles, labels, or payloads.
+pub(crate) const UNATTRIBUTED_REASONS: [&str; 7] = [
+    "started_before_attach",
+    "record_lost",
+    "foreign_or_unproven_caller",
+    "session_state_lost",
+    "watchdog_no_progress",
+    "unmodelled_call_shape",
+    "proof_refused_fallback",
+];
 
 /// Frozen machine reasons. `none` only when populated.
 /// `journal_unavailable` (OD33/R-50) names the v0.5.0 world: no journal
@@ -158,6 +187,25 @@ pub(crate) mod contract {
         "ec_p521",
     ];
 
+    /// H9 section v4 metadata vocabulary: the 12 established labels
+    /// plus `unknown` (a first-observed key whose type/size were
+    /// never established in the observed window).
+    pub(crate) const METADATA_LABELS_V4: [&str; 13] = [
+        "rsa_1024",
+        "rsa_2048",
+        "rsa_3072",
+        "rsa_4096",
+        "rsa_other",
+        "aes_128",
+        "aes_192",
+        "aes_256",
+        "aes_other",
+        "ec_p256",
+        "ec_p384",
+        "ec_p521",
+        "unknown",
+    ];
+
     /// Frozen operation categories: 11 machine operations, 9 direct
     /// operations, and the `operation` / `direct` / `unknown` fallbacks.
     pub(crate) const CATEGORY_LABELS: [&str; 23] = [
@@ -246,6 +294,23 @@ pub(crate) mod contract {
         "unknown",
         "active",
     ];
+
+    /// Section keys for a v3 section: v1 keys plus `unattributed`
+    /// beside the row buckets it counts beside.
+    pub(crate) const SECTION_KEYS_V3: [&str; 11] = [
+        "version",
+        "revision",
+        "status",
+        "reason",
+        "sessions",
+        "objects",
+        "key_operations",
+        "unknown_key_operations",
+        "unattributed",
+        "gaps",
+        "budgets",
+    ];
+    pub(crate) const UNATTRIBUTED_ROW_KEYS: [&str; 2] = ["reason", "count"];
 
     pub(crate) const GAP_KEYS: [&str; 2] = ["rows", "suppressed"];
     pub(crate) const GAP_ROW_KEYS: [&str; 3] = ["subject", "reason", "repeats"];
@@ -455,6 +520,16 @@ pub(crate) struct UnknownAggRow {
     pub active: u64,
 }
 
+/// One not-attributed counter: how many calls (or first-observed
+/// sessions) carry no per-key row, and the finite reason why no key
+/// could be proved for them. Attributed rows are never guessed
+/// into existence to avoid this counter.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnattributedRow {
+    pub reason: &'static str,
+    pub count: u64,
+}
+
 /// One gap row: model loss facts plus key-side scope facts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GapRow {
@@ -491,6 +566,7 @@ pub(crate) struct ObjectObservations {
     pub objects: Vec<ObjectRow>,
     pub key_operations: Vec<KeyAggRow>,
     pub unknown_key_operations: Vec<UnknownAggRow>,
+    pub unattributed: Vec<UnattributedRow>,
     pub gaps: Vec<GapRow>,
     pub gaps_suppressed: u64,
     pub budgets: ObsBudgets,
@@ -515,6 +591,7 @@ impl ObjectObservations {
             objects: Vec::new(),
             key_operations: Vec::new(),
             unknown_key_operations: Vec::new(),
+            unattributed: Vec::new(),
             gaps: Vec::new(),
             gaps_suppressed: 0,
             budgets: ObsBudgets {
@@ -530,6 +607,35 @@ impl ObjectObservations {
         };
         observations.budgets.encoded_bytes = measure(&observations);
         observations
+    }
+
+    /// Add `count` to one finite not-attributed reason, keeping the
+    /// frozen publication order, and re-measure so the published
+    /// byte count stays self-consistent. Zero adds nothing.
+    pub(crate) fn add_unattributed(&mut self, reason: &'static str, count: u64) {
+        debug_assert!(
+            UNATTRIBUTED_REASONS.contains(&reason),
+            "unattributed reasons are frozen"
+        );
+        if count == 0 {
+            return;
+        }
+        if let Some(row) = self
+            .unattributed
+            .iter_mut()
+            .find(|row| row.reason == reason)
+        {
+            row.count = row.count.saturating_add(count);
+        } else {
+            self.unattributed.push(UnattributedRow { reason, count });
+        }
+        self.unattributed.sort_by_key(|row| {
+            UNATTRIBUTED_REASONS
+                .iter()
+                .position(|known| *known == row.reason)
+                .unwrap_or(usize::MAX)
+        });
+        self.budgets.encoded_bytes = measure(self);
     }
 }
 
@@ -697,11 +803,23 @@ pub(crate) fn budgets_json(budgets: &ObsBudgets) -> serde_json::Value {
     })
 }
 
-/// The H9 section version for these observations: v2 iff a KEM
-/// creation or role label is present, otherwise v1. The single
-/// version authority behind the JSON section, the JSONL row
-/// payloads and the pass marker.
+/// The H9 section version for these observations: v4 iff a key row
+/// carries the `unknown` metadata label, else v3 iff a
+/// not-attributed count is present, else v2 iff a KEM creation or
+/// role label is present, otherwise v1. The single version
+/// authority behind the JSON section, the JSONL row payloads and
+/// the pass marker.
 pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
+    if observations
+        .key_operations
+        .iter()
+        .any(|row| row.metadata_at_use == METADATA_UNKNOWN)
+    {
+        return OBSERVATIONS_VERSION_V4;
+    }
+    if !observations.unattributed.is_empty() {
+        return OBSERVATIONS_VERSION_V3;
+    }
     let kem = observations
         .objects
         .iter()
@@ -717,6 +835,14 @@ pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
     }
 }
 
+/// Render one not-attributed counter row: reason name and count only.
+pub(crate) fn unattributed_row_json(row: &UnattributedRow) -> serde_json::Value {
+    serde_json::json!({
+        "reason": row.reason,
+        "count": row.count,
+    })
+}
+
 /// Render the whole section: the exact frozen keys. The single
 /// renderer behind JSON, JSONL row payloads and byte measurement —
 /// every consumer reads these shapes. The version follows the
@@ -724,7 +850,7 @@ pub(crate) fn observations_version(observations: &ObjectObservations) -> u8 {
 /// or role label is present, otherwise byte-stable v1.
 pub(crate) fn object_observations_json(observations: &ObjectObservations) -> serde_json::Value {
     let version = observations_version(observations);
-    serde_json::json!({
+    let mut section = serde_json::json!({
         "version": version,
         "revision": observations.revision,
         "status": observations.status.label(),
@@ -738,7 +864,43 @@ pub(crate) fn object_observations_json(observations: &ObjectObservations) -> ser
             "suppressed": observations.gaps_suppressed,
         },
         "budgets": budgets_json(&observations.budgets),
-    })
+    });
+    if version >= OBSERVATIONS_VERSION_V3
+        && let Some(map) = section.as_object_mut()
+    {
+        map.insert(
+            "unattributed".to_string(),
+            serde_json::Value::Array(
+                observations
+                    .unattributed
+                    .iter()
+                    .map(unattributed_row_json)
+                    .collect(),
+            ),
+        );
+        // Keep the frozen key order: `unattributed` sits beside the
+        // row buckets, before `gaps`/`budgets`.
+        let mut ordered = serde_json::Map::new();
+        for key in [
+            "version",
+            "revision",
+            "status",
+            "reason",
+            "sessions",
+            "objects",
+            "key_operations",
+            "unknown_key_operations",
+            "unattributed",
+            "gaps",
+            "budgets",
+        ] {
+            if let Some(value) = map.remove(key) {
+                ordered.insert(key.to_string(), value);
+            }
+        }
+        *map = ordered;
+    }
+    section
 }
 
 /// The publication gate: admits one candidate revision per call,
@@ -867,12 +1029,42 @@ pub(crate) mod producer {
         let joint = stagings
             .iter()
             .any(|staging| staging.mode() == FeedMode::Joint);
-        let lost = stagings.iter().any(|staging| staging.degraded_loss());
+        // A tripped no-progress watchdog held the lane for exit: its
+        // feeds left Joint for good, so the census is partial under
+        // lost authority, the exact rows kept beside the counts. A
+        // semantic loss that disposed staged history while the feed
+        // stays Joint is lost authority too: a counted `record_lost`
+        // never sits under `populated`.
+        let lost = stagings.iter().any(|staging| {
+            staging.degraded_loss() || staging.watchdog_tripped() || staging.history_disposed() > 0
+        });
         let fallback = stagings.iter().any(|staging| staging.fell_back());
+        let unattributed = collect_unattributed(stagings);
+        // Joint never stops as a whole: a feed that fell back or lost
+        // authority keeps every already-attributed and S1-preserved
+        // row under `partial`, with its unattributed calls counted
+        // beside them. Only a census with no evidence at all (no
+        // rows, no sessions, no counted loss) stays unavailable.
+        let has_evidence = !unattributed.is_empty()
+            || !keyuse.aggregates().is_empty()
+            || keyuse
+                .unknown_counters()
+                .iter()
+                .any(|counters| counters.is_live())
+            || !model.sessions.is_empty()
+            || !model.objects.is_empty();
         let (status, reason) = if joint && evidence.partial {
             (ObsStatus::Partial, "row_budget_exhausted")
+        } else if joint && lost {
+            (ObsStatus::Partial, "authority_lost")
+        } else if joint && fallback {
+            (ObsStatus::Partial, "proof_refused_fallback")
         } else if joint {
             (ObsStatus::Populated, "none")
+        } else if lost && has_evidence {
+            (ObsStatus::Partial, "authority_lost")
+        } else if fallback && has_evidence {
+            (ObsStatus::Partial, "proof_refused_fallback")
         } else if lost {
             (ObsStatus::Unavailable, "authority_lost")
         } else if fallback {
@@ -890,6 +1082,7 @@ pub(crate) mod producer {
             objects: model.objects.iter().map(object_row).collect(),
             key_operations: Vec::new(),
             unknown_key_operations: Vec::new(),
+            unattributed,
             gaps: Vec::new(),
             gaps_suppressed: 0,
             budgets: ObsBudgets {
@@ -910,6 +1103,56 @@ pub(crate) mod producer {
         observations.budgets.unknown_occupied = observations.unknown_key_operations.len();
         observations.budgets.encoded_bytes = super::measure(&observations);
         observations
+    }
+
+    /// Count what no per-key row can claim, per finite reason, from
+    /// the feeds' retained counters. Derived only from counts
+    /// already retained — no new capture. Zero reasons are omitted.
+    pub(crate) fn unattributed(stagings: &[&JointStaging]) -> Vec<UnattributedRow> {
+        collect_unattributed(stagings)
+    }
+
+    fn collect_unattributed(stagings: &[&JointStaging]) -> Vec<UnattributedRow> {
+        let sum = |pick: &dyn Fn(&JointStaging) -> u64| {
+            stagings
+                .iter()
+                .fold(0u64, |total, staging| total.saturating_add(pick(staging)))
+        };
+        let counts: [(&str, u64); 5] = [
+            (
+                "started_before_attach",
+                sum(&|staging| staging.pre_attach_direct()),
+            ),
+            (
+                "record_lost",
+                sum(&|staging| {
+                    staging
+                        .history_disposed()
+                        .saturating_add(staging.degraded_loss_direct())
+                }),
+            ),
+            (
+                "watchdog_no_progress",
+                sum(&|staging| staging.watchdog_unsealed()),
+            ),
+            (
+                "unmodelled_call_shape",
+                sum(&|staging| staging.unsealable_direct()),
+            ),
+            (
+                "proof_refused_fallback",
+                sum(&|staging| {
+                    staging
+                        .fallback_replayed()
+                        .saturating_add(staging.degraded_fallback_direct())
+                }),
+            ),
+        ];
+        counts
+            .into_iter()
+            .filter(|(_, count)| *count > 0)
+            .map(|(reason, count)| UnattributedRow { reason, count })
+            .collect()
     }
 
     /// Render the reducer's retained aggregate buckets and fixed

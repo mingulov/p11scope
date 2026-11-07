@@ -43,6 +43,19 @@ unknown/ambiguous/unresolved rows without requiring exact observation;
 spy's logging layer and timing-dependent, so it is recorded and bounded
 at 1, never compared. ``--require-pause`` asserts run-cell pause
 evidence (sigstop, confirmed >= 1, nothing partial).
+
+``--expect-module-use PINFILE`` (inventory mode, with ``--ledger``,
+``--spy``, and ``--bindings N``) judges module-level folded use: short
+callers the observer never admits still count at the backend. The
+summed ledger is the workload side, the spy log the backend side. The
+folded ``unbound_use.entries`` equals the spy's compared stream plus
+one invisible binding call per binding (exact), and the spy PID set has
+exactly ``--bindings`` members (exact). The compared stream covers the
+ledger minus one self-answered ``C_GetFunctionList`` per binding: a
+shortfall means dropped calls and fails, while a surplus is the
+forwarding layer's own backend calls (enumeration), which are p11-kit
+internals, never pinned -- recorded in the detail, never compared.
+Meta-export counts are recorded, never compared.
 """
 
 import argparse
@@ -129,7 +142,7 @@ def pin_identity(pin, what="pin"):
     return identity(pin, what)
 
 
-def parse_spy_log(text):
+def parse_spy_log(text, *, multiplexed=False):
     """Parse an OpenSC pkcs11-spy log into completed per-function counts.
 
     Only block headers (``N: C_Name``), the ``P:pid`` line, the ``Loaded:``
@@ -138,16 +151,23 @@ def parse_spy_log(text):
     ``(counts, meta, loaded, pids, incomplete)``: completed counts for
     compared functions, completed counts for the meta-exports, the loaded
     module path (or None), the sorted PID set, and ``[(seq, name)]``
-    blocks without a return.
+    blocks without a return. With ``multiplexed``, sequential writers
+    each restart numbering at 0, so order is checked per PID instead of
+    globally; every block must still carry its writer's ``P:`` line.
     """
     counts, meta, pids, incomplete = {}, {}, set(), []
     loaded, seq, name, returned, seqs = None, None, None, False, []
+    cur_pid = None
     require("OpenSC PKCS#11 spy" in text[:4096],
             "not an OpenSC pkcs11-spy log")
 
     def close():
         if name is None:
             return
+        if multiplexed:
+            require(cur_pid is not None,
+                    "spy log block without a writer pid")
+            seqs.append((cur_pid, seq))
         if returned:
             bucket = meta if name in META_EXPORTS else counts
             bucket[name] = bucket.get(name, 0) + 1
@@ -159,7 +179,9 @@ def parse_spy_log(text):
         if header:
             close()
             seq, name, returned = int(header[1]), header[2], False
-            seqs.append(seq)
+            cur_pid = None
+            if not multiplexed:
+                seqs.append(seq)
             continue
         if name is None:
             loaded_match = SPY_LOADED.match(line)
@@ -172,10 +194,20 @@ def parse_spy_log(text):
             pid_match = SPY_PID.match(line)
             if pid_match:
                 pids.add(int(pid_match[1]))
+                cur_pid = int(pid_match[1])
     close()
     require(seqs, "spy log holds no call blocks")
-    require(all(b > a for a, b in zip(seqs, seqs[1:])),
-            "spy log sequence numbers are not strictly increasing")
+    if multiplexed:
+        by_pid = {}
+        for pid, num in seqs:
+            by_pid.setdefault(pid, []).append(num)
+        for pid in sorted(by_pid):
+            require(all(b > a for a, b in zip(by_pid[pid], by_pid[pid][1:])),
+                    "spy log sequence numbers are not strictly increasing "
+                    "for pid %d" % pid)
+    else:
+        require(all(b > a for a, b in zip(seqs, seqs[1:])),
+                "spy log sequence numbers are not strictly increasing")
     return counts, meta, loaded, sorted(pids), incomplete
 
 
@@ -666,6 +698,63 @@ def judge_inventory(inv_text, args):
     return "inventory-admission", "; ".join(notes)
 
 
+def judge_inventory_use(inv_text, ledger_text, spy_text, args):
+    """Judge one backend's folded module use against summed ledger and spy.
+
+    Two exact equations plus drop-detection (module docstring): the
+    folded entries are the spy stream plus one invisible binding call
+    per binding; the spy PID set has exactly ``--bindings`` members;
+    the spy stream covers the ledger minus one self-answered call per
+    binding, with any surplus recorded, never compared.
+    """
+    require(args.expect_module_use and args.ledger and args.spy,
+            "module-use judging needs --expect-module-use with "
+            "--ledger and --spy", harness=True)
+    bindings = args.bindings
+    require(isinstance(bindings, int) and bindings > 0,
+            "module-use judging needs --bindings N", harness=True)
+    inv = parse(inv_text, harness=False)
+    require(inv.get("schema") == INV_SCHEMA, "not an inventory v1 document")
+    modules = inv.get("modules")
+    require(isinstance(modules, list), "missing inventory modules")
+    pin = parse(read(Path(args.expect_module_use)))
+    ident = (pin["dev"][0], pin["dev"][1], pin["ino"], pin["sha256"])
+    found = [entry for entry in modules
+             if isinstance(entry, dict) and inventory_identity(entry) == ident]
+    require(len(found) == 1, "module-use identity absent or ambiguous: %s"
+            % args.expect_module_use)
+    use = found[0].get("unbound_use") or {}
+    entries = use.get("entries")
+    require(integer(entries),
+            "module use: backend has no folded entries: %s"
+            % args.expect_module_use)
+    expected, _, _ = parse_workload(ledger_text)
+    ledger_total = sum(expected.values())
+    spy_counts, spy_meta, _, spy_pids, spy_incomplete = parse_spy_log(
+        spy_text, multiplexed=True)
+    require(not spy_incomplete,
+            "spy log holds calls without a return: %r" % (spy_incomplete,))
+    require(spy_counts, "spy log holds no compared calls")
+    compared = sum(spy_counts.values())
+    require(len(spy_pids) == bindings,
+            "module use: spy saw %d processes, bindings=%d"
+            % (len(spy_pids), bindings))
+    require(compared >= ledger_total - bindings,
+            "module use: spy compared %d < ledger %d - %d bindings "
+            "(calls were dropped)" % (compared, ledger_total, bindings))
+    require(entries == compared + bindings,
+            "module use: folded entries %d != spy %d + %d bindings"
+            % (entries, compared, bindings))
+    surplus = compared - (ledger_total - bindings)
+    meta_note = ("meta {%s}" % ", ".join(
+        "%s=%d" % pair for pair in sorted(spy_meta.items())) if spy_meta
+        else "meta none")
+    return ("module use %s: ledger %d, spy %d + %d bindings = entries %d; "
+            "surplus +%d; %s"
+            % (Path(args.expect_module_use).name, ledger_total, compared,
+               bindings, entries, surplus, meta_note))
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--report", default=None)
@@ -678,6 +767,12 @@ def main(argv=None):
     parser.add_argument("--expect-refused", action="append", default=[], nargs=2,
                         metavar=("PINFILE", "SUBSTRING"),
                         help="PINFILE refused with pinned reason text (inventory mode)")
+    parser.add_argument("--expect-module-use", default=None,
+                        help="PINFILE whose folded unbound_use.entries must "
+                             "equal the spy stream plus bindings (inventory "
+                             "mode; needs --ledger, --spy, --bindings)")
+    parser.add_argument("--bindings", default=None, type=int,
+                        help="short-lived caller count for --expect-module-use")
     parser.add_argument("--ledger", default=None,
                         help="workload stdout with READY/TARGET/LEDGER "
                              "(omit with --no-workload)")
@@ -738,9 +833,15 @@ def main(argv=None):
         if args.inventory:
             require(not args.report and not args.receipt and not args.layer,
                     "inventory mode takes no report layers", harness=True)
-            require(args.expect_admitted or args.expect_refused,
+            require(args.expect_admitted or args.expect_refused
+                    or args.expect_module_use,
                     "inventory mode needs an expectation", harness=True)
             qualification, detail = judge_inventory(read(Path(args.inventory)), args)
+            if args.expect_module_use:
+                use_detail = judge_inventory_use(
+                    read(Path(args.inventory)), read(Path(args.ledger)),
+                    read(Path(args.spy)), args)
+                detail = (detail + "; " + use_detail) if detail else use_detail
         else:
             require(args.report and args.receipt, "missing report or receipt", harness=True)
             require(args.scope and args.mode, "missing scope or mode", harness=True)

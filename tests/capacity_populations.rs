@@ -15,8 +15,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// (`version_matrix.c` with `CAPACITY_UNIQUE=68`).
 pub const FULL_SURFACE: usize = 68;
 
-/// Exact Inventory boundary demands: one past the default budget, one past
-/// the historical 6,530 union, and the 8,192 candidate ceiling.
+/// Exact Inventory boundary demands: the historical past-default boundary
+/// 4,097 (still a valid demand), one past the historical 6,530 union, and
+/// the historical 8,192 ceiling. The oracle demand set intentionally
+/// extends past this file's set (fixture cost).
 pub const BOUNDARY_DEMANDS: [usize; 3] = [4097, 6531, 8192];
 
 /// N/N+1 refusal pairs: (selected budget, independent demand). The demand

@@ -263,6 +263,28 @@ impl SemanticInputs {
         prepare_retained_subset(engine, retained)
     }
 
+    /// The no-manifest scan mint (DEMO-4): seed the accepted set
+    /// from the engine's scan-discovered providers and build the
+    /// subset with scan authorization. Only meaningful when no
+    /// manifest was requested; the driver owns that gate.
+    /// `scan_sources` carries the latest catalog lowering's
+    /// reconciled modules and aggregate pins (the current scanned
+    /// tables in a live capture); without them the mint falls back
+    /// to the engine's own scan snapshot.
+    pub(crate) fn prepare_scan(
+        &mut self,
+        engine: &Engine,
+        scan_sources: Option<(Vec<ReconciledModule>, PinnedObjects)>,
+    ) -> SubsetPreparation {
+        let retained = self.retained_or_load(engine);
+        build_subset_from_accepted(
+            engine,
+            accept_retained_inputs(engine, retained, true, scan_sources),
+            None,
+            true,
+        )
+    }
+
     /// The memoized retained inputs, loaded once from the operator
     /// paths. Shared by the full mint and the selected restriction so
     /// both read the same retained files.
@@ -322,7 +344,19 @@ pub(crate) fn prepare_attested_subset(engine: &Engine, paths: &[PathBuf]) -> Sub
 }
 
 fn prepare_retained_subset(engine: &Engine, inputs: &RetainedInputs) -> SubsetPreparation {
-    build_subset_from_accepted(engine, accept_retained_inputs(engine, inputs), None)
+    build_subset_from_accepted(
+        engine,
+        accept_retained_inputs(engine, inputs, false, None),
+        None,
+        false,
+    )
+}
+
+/// Test seam for the no-manifest scan mint, mirroring
+/// [`prepare_attested_subset`] with no operator inputs.
+#[cfg(test)]
+pub(crate) fn prepare_scan_attested_subset(engine: &Engine) -> SubsetPreparation {
+    SemanticInputs::new(Vec::new()).prepare_scan(engine, None)
 }
 
 /// Manifests accepted against the retained scan, before claims: the
@@ -334,9 +368,37 @@ struct AcceptedRetainedInputs {
     accepted: BTreeSet<PinnedObjectId>,
     refusals: Vec<SemanticRefusal>,
     requested: bool,
+    /// DEMO-4 scan mint only: modules reconciled from the current
+    /// per-view scan inputs, replacing the creation-time
+    /// `engine.modules` snapshot (empty in live `--system`
+    /// captures) as the subset's source set.
+    scan_modules: Option<Vec<ReconciledModule>>,
 }
 
-fn accept_retained_inputs(engine: &Engine, inputs: &RetainedInputs) -> AcceptedRetainedInputs {
+/// Whether two views' table lists disagree for the sole-table gate: same
+/// count but different tables (file offset, version, entries or NULL holes).
+/// Runtime addresses differ across views by ASLR, walks differ by decode
+/// completeness (a partial walk must not poison a full one), and live,
+/// manifest, extension and unpinned marks are monotonic observations — none
+/// of those refute "exactly one table", so none participate here.
+fn scanned_tables_disagree(a: &[ScannedTable], b: &[ScannedTable]) -> bool {
+    if a.len() != b.len() {
+        return true;
+    }
+    a.iter().zip(b.iter()).any(|(x, y)| {
+        x.file_offset != y.file_offset
+            || x.version != y.version
+            || x.entries != y.entries
+            || x.null_entries != y.null_entries
+    })
+}
+
+fn accept_retained_inputs(
+    engine: &Engine,
+    inputs: &RetainedInputs,
+    seed_scan: bool,
+    scan_sources: Option<(Vec<ReconciledModule>, PinnedObjects)>,
+) -> AcceptedRetainedInputs {
     // This Inventory owner does not admit live Detailed selection claims.
     // Enabling that Engine path also requires incorporating its retained
     // claims/table latches here before preparing fresh semantic authority.
@@ -404,12 +466,130 @@ fn accept_retained_inputs(engine: &Engine, inputs: &RetainedInputs) -> AcceptedR
             Err(_) => refusals.push(SemanticRefusal::ManifestInput),
         }
     }
+    // DEMO-4 scan seed: with no manifest requested, every provider
+    // in the *current* scan inputs is a candidate; completeness in
+    // `build_subset_from_accepted` still decides which ones mint.
+    // The creation-time `engine.modules` snapshot is empty in live
+    // `--system` captures, so the modules and their pins come from
+    // the engine's current scan snapshot (falling back to the
+    // snapshot modules already retained when no scan input exists,
+    // as in unit fixtures).
+    let mut scan_modules = None;
+    if seed_scan && !inputs.requested {
+        // Current scanned tables come from the latest catalog
+        // lowering when the coordinator stashed them (live
+        // captures); otherwise fall back to the engine's own scan
+        // snapshot and creation-time modules.
+        let (modules, scan_pins) = match scan_sources {
+            Some(sources) => sources,
+            None => engine.scan_reconciled_snapshot(),
+        };
+        if modules.is_empty() {
+            for module in &engine.modules {
+                if pins.file_for(module.object).is_some() {
+                    accepted.insert(module.object);
+                }
+            }
+        } else {
+            // One entry per provider object: a multi-process
+            // browser maps one provider in several views, and the
+            // completeness claim is per object — a partial walk in
+            // one view must not poison a full walk of the same
+            // tables in another. Keep a complete entry when one
+            // exists (all tables full, no affecting unpinned
+            // entries, matching the claims' completeness rule).
+            let entry_complete = |module: &ReconciledModule| {
+                module.scanned.tables.iter().all(|table| {
+                    table.walk == "full"
+                        && !table.unpinned.iter().any(|entry| {
+                            crate::kinds::descriptor(&entry.subject).is_none_or(|descriptor| {
+                                descriptor != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
+                            })
+                        })
+                })
+            };
+            let mut by_object: std::collections::BTreeMap<_, ReconciledModule> =
+                std::collections::BTreeMap::new();
+            // Sticky per-object disagreement: once two views of an
+            // object disagree (count or content), no later agreeing
+            // view may OR the finished flag back.
+            let mut disagreed: BTreeSet<PinnedObjectId> = BTreeSet::new();
+            for module in modules {
+                match by_object.entry(module.object) {
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        slot.insert(module);
+                    }
+                    std::collections::btree_map::Entry::Occupied(mut slot) => {
+                        let kept_tables = slot.get().scanned.tables.len();
+                        let incoming_tables = module.scanned.tables.len();
+                        if incoming_tables != kept_tables {
+                            // Views disagree on table count: keep the maximum
+                            // (fail closed for the sole-table gate, which
+                            // needs exactly one), and clear the finished
+                            // flag so the sole leg refuses even for 0-vs-1.
+                            disagreed.insert(module.object);
+                            if incoming_tables > kept_tables {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = false;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = false;
+                            }
+                        } else if scanned_tables_disagree(
+                            &slot.get().scanned.tables,
+                            &module.scanned.tables,
+                        ) {
+                            // Same count, different tables: keep the
+                            // complete entry as before, but clear finished
+                            // so the sole leg refuses the disagreement.
+                            disagreed.insert(module.object);
+                            if !entry_complete(slot.get()) && entry_complete(&module) {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = false;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = false;
+                            }
+                        } else {
+                            // Agreeing views: keep the complete entry as
+                            // before; finished when either view finished (a
+                            // finished view proves exactly-one, and agreeing
+                            // unfinished views do not refute it). The
+                            // post-loop clear below keeps disagreement
+                            // sticky against this OR.
+                            let finished = slot.get().scanned.tables_scan_finished
+                                || module.scanned.tables_scan_finished;
+                            if !entry_complete(slot.get()) && entry_complete(&module) {
+                                let mut kept = module;
+                                kept.scanned.tables_scan_finished = finished;
+                                slot.insert(kept);
+                            } else {
+                                slot.get_mut().scanned.tables_scan_finished = finished;
+                            }
+                        }
+                    }
+                }
+            }
+            for (object, module) in by_object.iter_mut() {
+                if disagreed.contains(object) {
+                    module.scanned.tables_scan_finished = false;
+                }
+            }
+            let modules: Vec<_> = by_object.into_values().collect();
+            for module in &modules {
+                accepted.insert(module.object);
+            }
+            pins = scan_pins;
+            scan_modules = Some(modules);
+        }
+    }
     AcceptedRetainedInputs {
         pins,
         manifests,
         accepted,
         refusals,
         requested: inputs.requested,
+        scan_modules,
     }
 }
 
@@ -424,6 +604,7 @@ fn build_subset_from_accepted(
     engine: &Engine,
     accepted: AcceptedRetainedInputs,
     restrict: Option<&BTreeSet<PinnedObjectId>>,
+    scan_authorized: bool,
 ) -> SubsetPreparation {
     let AcceptedRetainedInputs {
         pins,
@@ -431,9 +612,19 @@ fn build_subset_from_accepted(
         accepted,
         mut refusals,
         requested,
+        scan_modules,
     } = accepted;
+    // The scan mint builds over the current scan-input modules
+    // when it seeded them; every other mint keeps the retained
+    // creation-time snapshot.
+    let source_modules: &[ReconciledModule] = match &scan_modules {
+        Some(modules) => modules,
+        None => &engine.modules,
+    };
     if accepted.is_empty() {
-        if !requested {
+        // The scan mint retries per discovery pass: no provider
+        // discovered yet is quiet, never a per-pass refusal.
+        if !requested && !scan_authorized {
             refusals.push(SemanticRefusal::Unattested);
         }
         return SubsetPreparation {
@@ -441,14 +632,49 @@ fn build_subset_from_accepted(
             refusals,
         };
     }
-    let claims = plan::semantic_source_claims(&engine.modules, &manifests, &pins);
-    let plan = plan::build_from_sources_for_policy_scoped(
-        &engine.modules,
-        &manifests,
-        &pins,
-        plan::AdmissionPolicy::detailed(),
-        plan::AdmissionScope::Named,
-    );
+    let (claims, plan) = if scan_authorized {
+        // Claims stay over the full source set: rival and
+        // degraded keys from providers that can never mint still
+        // degrade shared keys below. The subset *plan*, though,
+        // is built only over providers the claims do not mark
+        // incomplete. The Detailed slot space is small (512) and
+        // admission is first-come whole-module, so a huge
+        // never-mintable provider (the system p11-kit proxy:
+        // ~410 capped endpoints, `known_prefix` walk) would
+        // otherwise consume the budget ahead of a complete
+        // provider and refuse it whole (fedora ff-late-2). An
+        // incomplete provider keeps its counted refusal: it has
+        // no plan module, exactly as when the budget refused it.
+        let claims =
+            plan::semantic_source_claims_scan_authorized(source_modules, &manifests, &pins);
+        // A cross-object provider (required keys in another
+        // object, the p11-kit trust shape) can never mint either
+        // (refused below): keep it out of the plan too, so a huge
+        // one cannot starve a complete provider of slots.
+        let mintable: Vec<ReconciledModule> = source_modules
+            .iter()
+            .filter(|module| {
+                !claims.incomplete.contains(&module.object)
+                    && claims.providers.get(&module.object).is_none_or(|required| {
+                        required.iter().all(|key| key.object == module.object)
+                    })
+            })
+            .cloned()
+            .collect();
+        let plan = plan::build_from_sources_scan_authorized(&mintable, &manifests, &pins);
+        (claims, plan)
+    } else {
+        (
+            plan::semantic_source_claims(&engine.modules, &manifests, &pins),
+            plan::build_from_sources_for_policy_scoped(
+                &engine.modules,
+                &manifests,
+                &pins,
+                plan::AdmissionPolicy::detailed(),
+                plan::AdmissionScope::Named,
+            ),
+        )
+    };
     let mut selected = BTreeSet::new();
     for provider in accepted {
         let complete = claims
@@ -457,6 +683,17 @@ fn build_subset_from_accepted(
             .zip(plan.modules.iter().find(|module| module.object == provider))
             .is_some_and(|(required, module)| {
                 !claims.incomplete.contains(&provider)
+                    // Scan mint only: a provider whose required
+                    // keys live in another object (the p11-kit
+                    // trust shim, whose table entries are
+                    // implemented inside libp11-kit) can never
+                    // pass the attested seal's per-provider
+                    // instance check, and seeded here it would
+                    // refuse the whole subset. Count it
+                    // incomplete; manifest mints keep their
+                    // operator-chosen semantics.
+                    && (!scan_authorized
+                        || required.iter().all(|key| key.object == provider))
                     && !required.is_empty()
                     && required.iter().all(|key| {
                         plan.slots.iter().any(|slot| {
@@ -828,6 +1065,15 @@ impl PublishedSemanticSuccessor {
     }
 }
 
+/// The reason a binding names when its image is already refused in the
+/// Joint journal: it stays S1.
+pub(crate) const JOINT_IMAGE_REFUSED: &str = "joint_image_refused";
+
+/// JK-18 note: calls already disclosed under `semantic calls unrouted`
+/// before the first binding, later proven other callers' (no new loss).
+pub(crate) const PRE_BINDING_OTHER_CALLERS: &str =
+    "pre-binding unrouted calls resolved to other callers";
+
 impl SemanticBindingSet {
     pub(crate) fn new() -> Self {
         Self {
@@ -947,6 +1193,66 @@ impl SemanticBindingSet {
         self.bindings
             .iter()
             .find(|binding| binding.domain() == domain && binding.image() == image)
+    }
+
+    /// Whether an unrouted call's record proves a caller other than every
+    /// bound Joint caller of its domain, so its lost position need not
+    /// barrier their history. Fails closed: an unknown image (zero
+    /// cookie), no bindings, any binding or admission history of another
+    /// domain (a different ticket space), or a cookie equal to any bound
+    /// or historically admitted image all keep the barrier. Tickets are
+    /// per thread group and never reused within a domain, so a different
+    /// nonzero cookie of the same domain is a different process; an exec
+    /// keeps its cookie and therefore still matches.
+    pub(crate) fn proves_unbound_caller(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+    ) -> bool {
+        let cookie = image.task_cookie;
+        cookie != 0
+            && !self.bindings.is_empty()
+            && self.bindings.iter().all(|binding| {
+                binding.domain() == domain
+                    && binding.image().task_cookie != 0
+                    && binding.image().task_cookie != cookie
+            })
+            && self
+                .admission_images
+                .values()
+                .all(|history| history.domain == domain && history.image.task_cookie != cookie)
+    }
+
+    /// Whether an unrouted call of a journal-refused image proves a
+    /// caller that can never hold Joint history, so its lost position
+    /// need not barrier the bound Joint callers. A refused image's
+    /// birth and attestation refuse permanently, so it never joins
+    /// Joint; this covers the refused caller that later binds for S1,
+    /// whose own binding and admission history then hold its cookie
+    /// and defeat [`Self::proves_unbound_caller`]. Fails closed: the
+    /// call's exact image must itself be refused, and every binding
+    /// or admission history sharing its cookie must be refused too —
+    /// an unrefused same-cookie image (an exec keeps the cookie)
+    /// could own the call and keeps the barrier.
+    pub(crate) fn proves_refused_other_caller(
+        &self,
+        domain: NativeDomainId,
+        image: ImageIdentity,
+        image_refused: impl Fn(ImageIdentity) -> bool,
+    ) -> bool {
+        let cookie = image.task_cookie;
+        cookie != 0
+            && !self.bindings.is_empty()
+            && image_refused(image)
+            && self.bindings.iter().all(|binding| {
+                binding.domain() == domain
+                    && binding.image().task_cookie != 0
+                    && (binding.image().task_cookie != cookie || image_refused(binding.image()))
+            })
+            && self.admission_images.values().all(|history| {
+                history.domain == domain
+                    && (history.image.task_cookie != cookie || image_refused(history.image))
+            })
     }
 
     /// Whether a bound caller holds this Detailed ticket: proven-image
@@ -1282,12 +1588,37 @@ pub(crate) enum JointRetireRefusal {
     PendingWork,
 }
 
+/// A new binding whose image the Joint journal already refused (for
+/// example a process whose earlier calls were shed as another caller's)
+/// can never enter Joint: its refused history is a hole. It stays S1;
+/// name that once, at the binding, so it never depends on a birth being
+/// offered.
+fn name_refused_image_binding(
+    registry: &mut CallerRegistry,
+    journal: &crate::semantics_objects::journal::JournalAdapter,
+    caller: CallerId,
+    image: ImageIdentity,
+) {
+    if journal.image_refused((image.task_cookie, image.exec_id)) {
+        registry.record_gap(RegistryGap {
+            caller: Some(caller),
+            module: None,
+            pid: None,
+            subject: crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT.into(),
+            reason: JOINT_IMAGE_REFUSED.into(),
+            budget: None,
+        });
+    }
+}
+
 /// One existing promotion/diagnostic consumer for owned refreshes and
 /// borrowed collected Current receipts. Only these disjoint coordinator
 /// fields are borrowed; the original receipt stays with its sole owner.
+#[allow(clippy::too_many_arguments)] // Disjoint coordinator fields plus the original admission inputs.
 fn consume_current_admission<Source: ProcessSource>(
     adapter: &CallerAdapter<Source>,
     registry: &mut CallerRegistry,
+    journal: &crate::semantics_objects::journal::JournalAdapter,
     bindings: &mut SemanticBindingSet,
     candidate: SemanticAdmissionCandidate,
     receipt: &crate::semantic_capture::CurrentPartitionReceipt,
@@ -1300,9 +1631,13 @@ fn consume_current_admission<Source: ProcessSource>(
         .as_ref()
         .ok()
         .and_then(|provider| registry.module_id_for(provider.module()));
+    let fresh = bindings.get(caller).is_none();
     let result = promotion::consume(
         adapter, registry, bindings, candidate, receipt, provider, permit,
     );
+    if result.is_ok() && fresh {
+        name_refused_image_binding(registry, journal, caller, receipt.image());
+    }
     if let Err(reason) = result {
         // A provider-side Unavailable has exactly one source: the
         // provider-subject attachment check found no live owner (every
@@ -1796,11 +2131,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let accepted = accept_retained_inputs(
             &self.engine,
             self.semantic_inputs.retained_or_load(&self.engine),
+            false,
+            None,
         );
         let object = provider_object_for_key(&accepted.pins, &key)
             .ok_or(PromotionRefusal::ManifestUnavailable)?;
         let restrict = BTreeSet::from([object]);
-        build_subset_from_accepted(&self.engine, accepted, Some(&restrict))
+        build_subset_from_accepted(&self.engine, accepted, Some(&restrict), false)
             .subset
             .ok_or(PromotionRefusal::ManifestUnavailable)
     }
@@ -2040,6 +2377,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let result = consume_current_admission(
             &self.adapter,
             &mut self.registry,
+            self.joint_capture.adapter(),
             &mut self.semantic_bindings,
             candidate,
             &receipt,
@@ -2165,7 +2503,14 @@ impl InventoryCoordinator<OsProcessSource> {
             suspension_cut: false,
             providers: SemanticProviderAssociations::new(),
             reference_module: Some(module),
-        })
+        })?;
+        name_refused_image_binding(
+            &mut self.registry,
+            self.joint_capture.adapter(),
+            caller,
+            image,
+        );
+        Ok(())
     }
 
     /// Bind one semantic caller through H0 refresh custody: identical proof
@@ -2184,16 +2529,25 @@ impl InventoryCoordinator<OsProcessSource> {
     ) -> Result<(), SemanticBindingRefusal> {
         match self.checked_binding_pid(caller, &module, domain, image, identity)? {
             None => Ok(()),
-            Some(_) => self.semantic_bindings.insert(SemanticCallerBinding {
-                caller,
-                domain,
-                image,
-                pin,
-                scope_current: true,
-                suspension_cut: false,
-                providers: SemanticProviderAssociations::new(),
-                reference_module: Some(module),
-            }),
+            Some(_) => {
+                self.semantic_bindings.insert(SemanticCallerBinding {
+                    caller,
+                    domain,
+                    image,
+                    pin,
+                    scope_current: true,
+                    suspension_cut: false,
+                    providers: SemanticProviderAssociations::new(),
+                    reference_module: Some(module),
+                })?;
+                name_refused_image_binding(
+                    &mut self.registry,
+                    self.joint_capture.adapter(),
+                    caller,
+                    image,
+                );
+                Ok(())
+            }
         }
     }
 
@@ -3235,6 +3589,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             let _ = consume_current_admission(
                                 &self.adapter,
                                 &mut self.registry,
+                                self.joint_capture.adapter(),
                                 &mut self.semantic_bindings,
                                 candidate,
                                 receipt,
@@ -3326,12 +3681,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Unrouted sheds by finite reason label, for the aggregate gap
         // below. A Vec scan avoids new derives on the reason enums.
         let mut shed_reasons: Vec<(&'static str, u64)> = Vec::new();
+        // Unrouted sheds whose records prove a caller other than every
+        // bound Joint caller: disclosed under their own subject, and
+        // attributed to that caller when exactly one live caller owns
+        // them all.
+        let mut other_shed_reasons: Vec<(&'static str, u64)> = Vec::new();
+        // The one pid owning every such shed, or `Some(None)` once two
+        // differ (no allocation: attribution is a label, never a proof).
+        let mut other_pid: Option<Option<u32>> = None;
+        // JK-18: before the namespace's first binding, unrouted calls with
+        // a known image are held (counted now, disclosed and disposed or
+        // barriered when a binding or the stop resolves them).
+        let holding = self.semantic_bindings.len() == 0
+            && self
+                .semantic_finalizer
+                .as_ref()
+                .is_some_and(|state| state.domain == domain && !state.bound_once);
+        let mut stopped = false;
         // H3 disposition inputs collected across staging: every outcome
         // position this finalization disposes, the minimum shed
         // position, and whether any outcome lacked a position.
         let mut staged_positions: Vec<Option<u64>> = Vec::new();
         let mut shed_min: Option<u64> = None;
         let mut unpositioned = false;
+        // Images whose shed calls proved another caller: the Joint journal
+        // refuses them so their staging never holds a bound key's seal.
+        let mut refuse_images: BTreeSet<(u64, u64)> = BTreeSet::new();
         for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
@@ -3345,6 +3720,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         Route::Unknown(reason) => Some(reason.label()),
                         Route::Pending => Some("pending"),
                     };
+                    // Only consulted for unjoined calls below: a record
+                    // proving another caller than every bound Joint
+                    // caller disposes its position instead of barriering
+                    // their history. It stays shed and disclosed. The
+                    // refused-image proof covers the other caller that
+                    // bound for S1 after its refusal: refused in the
+                    // journal it can never hold Joint history, so its
+                    // later sheds are still not a Joint caller's loss.
+                    let other_caller = (shed_reason.is_some() && call.domain() == domain && {
+                        let adapter = self.joint_capture.adapter();
+                        let refused = |image: ImageIdentity| {
+                            adapter.image_refused((image.task_cookie, image.exec_id))
+                        };
+                        self.semantic_bindings
+                            .proves_unbound_caller(domain, call.image())
+                            || self.semantic_bindings.proves_refused_other_caller(
+                                domain,
+                                call.image(),
+                                refused,
+                            )
+                    })
+                    .then(|| (call.record().event.pid_tgid >> 32) as u32);
+                    let call_image = call.image();
+                    let cookie = call_image.task_cookie;
+                    let call_pid = (call.record().event.pid_tgid >> 32) as u32;
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
                             if calls.len() < MAX_INSTANCES {
@@ -3359,22 +3759,76 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         // Unjoined routes never stage: their positions
                         // are undisposable, so they shed.
                         None => {
-                            if let Some(label) = shed_reason {
-                                match shed_reasons.iter_mut().find(|(known, _)| *known == label) {
-                                    Some((_, count)) => *count += 1,
-                                    None => shed_reasons.push((label, 1u64)),
+                            // JK-18: before the first binding, a positioned
+                            // call with a known image is disclosed and
+                            // counted as today, but only its barrier is
+                            // held until a binding can judge its caller.
+                            let mut held = false;
+                            if holding
+                                && other_caller.is_none()
+                                && cookie != 0
+                                && let (Some(at), Some(label)) = (token, shed_reason)
+                            {
+                                let state = self
+                                    .semantic_finalizer
+                                    .as_mut()
+                                    .expect("holding needs the live namespace");
+                                held = state.pre_binding.hold(
+                                    (cookie, call_image.exec_id),
+                                    at,
+                                    label,
+                                    call_pid,
+                                );
+                                if !held {
+                                    // Overflow: everything held barriers
+                                    // now, and this call with it.
+                                    let flushed = state.pre_binding.take();
+                                    shed_min = Some(
+                                        shed_min
+                                            .map_or(flushed.min, |floor| floor.min(flushed.min)),
+                                    );
                                 }
                             }
-                            match token {
-                                Some(at) => {
+                            let reasons = if other_caller.is_some() {
+                                &mut other_shed_reasons
+                            } else {
+                                &mut shed_reasons
+                            };
+                            if let Some(label) = shed_reason {
+                                match reasons.iter_mut().find(|(known, _)| *known == label) {
+                                    Some((_, count)) => *count += 1,
+                                    None => reasons.push((label, 1u64)),
+                                }
+                            }
+                            match (token, other_caller) {
+                                // Another caller's lost call is disposed
+                                // for the bound callers' history.
+                                (Some(at), Some(pid)) => {
+                                    staged_positions.push(Some(at));
+                                    refuse_images.insert((cookie, call_image.exec_id));
+                                    other_pid = match other_pid {
+                                        None => Some(Some(pid)),
+                                        Some(Some(seen)) if seen == pid => Some(Some(pid)),
+                                        Some(_) => Some(None),
+                                    };
+                                }
+                                // Provisionally disposed: no bound key can
+                                // seal yet, and a pending floor here would
+                                // stall the publication that admits the
+                                // first binding. The first binding's
+                                // finalize barriers it late if it cannot
+                                // prove another caller.
+                                (Some(at), None) if held => staged_positions.push(Some(at)),
+                                (Some(at), None) => {
                                     shed_min = Some(shed_min.map_or(at, |floor| floor.min(at)));
                                 }
-                                None => unpositioned = true,
+                                (None, _) => unpositioned = true,
                             }
                         }
                     }
                 }
                 TickOutcome::Invalidation(invalidation) => {
+                    stopped |= matches!(invalidation.scope(), InvalidationScope::Stopped);
                     staged_positions.push(invalidation.position());
                     let image = match invalidation.scope() {
                         InvalidationScope::ImageRetired(image) => Some(*image),
@@ -3419,6 +3873,83 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 }
             }
         }
+        // Resolve the pre-binding hold at the first finalize that sees a
+        // binding (or as loss at a stop before any binding). Any seal of a
+        // bound key needs that finalize first, so the late barrier reaches
+        // every seal that could certify past a held position.
+        let bound = self.semantic_bindings.len() != 0;
+        let mut resolved_other: Option<finalizer::PreBindingHold> = None;
+        if let Some(state) = self
+            .semantic_finalizer
+            .as_mut()
+            .filter(|state| state.domain == domain)
+        {
+            if bound {
+                state.bound_once = true;
+            }
+            if bound || stopped {
+                let held = state.pre_binding.take();
+                if !held.is_empty() {
+                    // Each held cookie resolves at the first binding:
+                    // the bound caller's own (a binding or admission
+                    // history holds it) dispose without barrier or
+                    // refusal — the journal already disposed those
+                    // records as fenced loss before any key existed;
+                    // a provably other caller's dispose and refuse its
+                    // image; anything else (unknown against this
+                    // binding set) still barriers, fail closed.
+                    let mut resolved = bound;
+                    let mut any_own = false;
+                    let mut other_images: Vec<(u64, u64)> = Vec::new();
+                    if bound {
+                        for (cookie, exec) in &held.images {
+                            let own = self.semantic_bindings.has_ticket(domain, *cookie)
+                                || self.semantic_bindings.admission_images.values().any(
+                                    |history| {
+                                        history.domain == domain
+                                            && history.image.task_cookie == *cookie
+                                    },
+                                );
+                            if own {
+                                any_own = true;
+                            } else if self.semantic_bindings.proves_unbound_caller(
+                                domain,
+                                ImageIdentity {
+                                    task_cookie: *cookie,
+                                    exec_id: 0,
+                                },
+                            ) {
+                                other_images.push((*cookie, *exec));
+                            } else {
+                                resolved = false;
+                            }
+                        }
+                    }
+                    if resolved {
+                        refuse_images.extend(other_images);
+                        // The resolution NOTE keeps its exact
+                        // other-caller meaning (and count) only when
+                        // the whole hold was other callers'.
+                        if !any_own {
+                            resolved_other = Some(held);
+                        }
+                    } else {
+                        shed_min = Some(shed_min.map_or(held.min, |floor| floor.min(held.min)));
+                    }
+                }
+            }
+        }
+        // JK-19: a process S1 proved to be another caller is refused in the
+        // Joint journal: its staged entries drop and it never gains Joint
+        // authority later (a later binding stays S1, named). An image the
+        // journal already keys is left alone; its staging keeps holding
+        // the seal, which the no-progress bound ends by name.
+        if !refuse_images.is_empty() {
+            let adapter = self.joint_capture.adapter_mut();
+            for image in &refuse_images {
+                adapter.refuse_other_caller_image(*image);
+            }
+        }
         if shed_calls != 0 {
             self.registry.record_gap(RegistryGap {
                 caller: None,
@@ -3453,6 +3984,56 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 budget: None,
             });
             lane.note_shed_calls(total);
+        }
+        if !other_shed_reasons.is_empty() {
+            let total: u64 = other_shed_reasons.iter().map(|(_, count)| count).sum();
+            let mut parts: Vec<String> = other_shed_reasons
+                .iter()
+                .map(|(label, count)| format!("{label}={count}"))
+                .collect();
+            parts.sort();
+            // Attribute to the other caller when one live, unbound caller
+            // owns every such call; otherwise the gap stays lane-wide.
+            let caller = other_pid
+                .flatten()
+                .and_then(|pid| self.adapter.live_id(pid))
+                .filter(|caller| self.semantic_bindings.get(*caller).is_none());
+            self.registry.note_foreign_unrouted_calls(total);
+            self.registry.record_gap(RegistryGap {
+                caller,
+                module: None,
+                pid: None,
+                subject: "semantic calls unrouted from other callers".into(),
+                reason: format!(
+                    "{total} calls shed without a route ({}) from callers other than the {} bound callers",
+                    parts.join(" "),
+                    self.semantic_bindings.len()
+                ),
+                budget: None,
+            });
+            lane.note_shed_calls(total);
+        }
+        // Pre-binding sheds were disclosed (and counted) when shed; the
+        // first binding proved them other callers', so their barrier is
+        // released. Say so: a note, never a second count.
+        if let Some(held) = resolved_other {
+            let total: u64 = held.labels.iter().map(|(_, count)| count).sum();
+            let caller = held
+                .pid
+                .flatten()
+                .and_then(|pid| self.adapter.live_id(pid))
+                .filter(|caller| self.semantic_bindings.get(*caller).is_none());
+            self.registry.record_gap(RegistryGap {
+                caller,
+                module: None,
+                pid: None,
+                subject: PRE_BINDING_OTHER_CALLERS.into(),
+                reason: format!(
+                    "{total} calls shed before the first binding came from callers other than the {} bound callers; their history is kept",
+                    self.semantic_bindings.len()
+                ),
+                budget: None,
+            });
         }
         // Validated registrations second: every covered id registers.
         // Conversion borrows end before staging mutates the registry.
@@ -3734,6 +4315,193 @@ mod binding_window_tests {
             window_callers(&mut set, 2),
             vec![CallerId(2), CallerId(3)],
             "rotation continues where it left off: the full window stole no turn"
+        );
+    }
+
+    #[test]
+    fn only_a_different_cookie_of_the_bound_domain_proves_another_caller() {
+        let domain = NativeDomainId::mint();
+        let image = |task_cookie| ImageIdentity {
+            task_cookie,
+            exec_id: 1,
+        };
+        let empty = SemanticBindingSet::new();
+        assert!(
+            !empty.proves_unbound_caller(domain, image(5)),
+            "no bound caller: nothing to prove against, keep the barrier"
+        );
+        let unknown_bound = windowed_set(3);
+        let bound = unknown_bound.bindings[0].domain();
+        assert!(
+            !unknown_bound.proves_unbound_caller(bound, image(99)),
+            "a bound caller without a known image could own any call"
+        );
+        let mut set = SemanticBindingSet::new();
+        for cookie in 1..=3u64 {
+            set.insert(SemanticCallerBinding::scripted(
+                CallerId(cookie as u32),
+                ModuleKey::physical(7, 7, 777, None, "/window/provider.so"),
+                bound,
+                image(cookie),
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+        }
+        assert!(set.proves_unbound_caller(bound, image(99)));
+        assert!(
+            !set.proves_unbound_caller(bound, image(0)),
+            "an unknown image could be the bound caller"
+        );
+        assert!(
+            !set.proves_unbound_caller(bound, image(2)),
+            "the bound caller's own image barriers"
+        );
+        assert!(
+            !set.proves_unbound_caller(
+                bound,
+                ImageIdentity {
+                    task_cookie: 2,
+                    exec_id: 9,
+                }
+            ),
+            "an exec keeps the cookie and still matches"
+        );
+        assert!(
+            !set.proves_unbound_caller(domain, image(99)),
+            "a binding of another domain is another ticket space"
+        );
+        // Admission history is part of the proof: a same-domain history
+        // with another cookie keeps the proof, one holding the call's
+        // cookie or one from another domain barriers.
+        let history = |domain, cookie| SemanticAdmissionHistory {
+            domain,
+            image: image(cookie),
+            incarnation: 1,
+            generation: crate::inspect_system::MemberGeneration {
+                start_time: None,
+                exe: None,
+            },
+            pin: Arc::new(PidPin::test_proc_only(1234)),
+            initial_scope_cut: false,
+            pending_gap: None,
+        };
+        set.admission_images
+            .insert(CallerId(20), history(bound, 55));
+        assert!(
+            set.proves_unbound_caller(bound, image(99)),
+            "a different same-domain history keeps the proof"
+        );
+        set.admission_images
+            .insert(CallerId(21), history(bound, 99));
+        assert!(
+            !set.proves_unbound_caller(bound, image(99)),
+            "a history entry holding the call's cookie could be that caller"
+        );
+        set.admission_images.remove(&CallerId(21));
+        set.admission_images
+            .insert(CallerId(22), history(domain, 56));
+        assert!(
+            !set.proves_unbound_caller(bound, image(99)),
+            "a history entry of another domain is another ticket space"
+        );
+    }
+
+    fn refused_proof_image(task_cookie: u64, exec_id: u64) -> ImageIdentity {
+        ImageIdentity {
+            task_cookie,
+            exec_id,
+        }
+    }
+
+    fn refused_proof_history(
+        domain: NativeDomainId,
+        task_cookie: u64,
+        exec_id: u64,
+    ) -> SemanticAdmissionHistory {
+        SemanticAdmissionHistory {
+            domain,
+            image: refused_proof_image(task_cookie, exec_id),
+            incarnation: 1,
+            generation: crate::inspect_system::MemberGeneration {
+                start_time: None,
+                exe: None,
+            },
+            pin: Arc::new(PidPin::test_proc_only(1234)),
+            initial_scope_cut: false,
+            pending_gap: None,
+        }
+    }
+
+    fn refused_proof_bind(
+        set: &mut SemanticBindingSet,
+        caller: u32,
+        domain: NativeDomainId,
+        task_cookie: u64,
+        exec_id: u64,
+    ) {
+        set.insert(SemanticCallerBinding::scripted(
+            CallerId(caller),
+            ModuleKey::physical(7, 7, 777, None, "/window/provider.so"),
+            domain,
+            refused_proof_image(task_cookie, exec_id),
+            Arc::new(PidPin::test_proc_only(1234)),
+        ))
+        .unwrap();
+    }
+
+    #[test]
+    fn refused_proof_needs_every_same_cookie_history_refused() {
+        // The candidate (77, 3) and its exec successor (77, 9) are
+        // refused; an older same-cookie exec (77, 5) stays unrefused.
+        // One unrefused same-cookie admission-history entry must fail
+        // the proof even when the same-cookie binding is refused.
+        let domain = NativeDomainId::mint();
+        let refused =
+            |candidate: ImageIdentity| candidate.task_cookie == 77 && candidate.exec_id != 5;
+        let mut set = SemanticBindingSet::new();
+        refused_proof_bind(&mut set, 1, domain, 77, 9);
+        set.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 9));
+        assert!(
+            set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "a refused candidate with every same-cookie binding and history refused proves"
+        );
+        set.admission_images
+            .insert(CallerId(21), refused_proof_history(domain, 77, 5));
+        assert!(
+            !set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "one unrefused same-cookie history entry keeps the barrier"
+        );
+        // Same verdict without any same-cookie binding: the history
+        // alone blocks.
+        let mut lone = SemanticBindingSet::new();
+        refused_proof_bind(&mut lone, 2, domain, 41, 1);
+        lone.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 5));
+        assert!(
+            !lone.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "an unrefused same-cookie history blocks with no same-cookie binding"
+        );
+    }
+
+    #[test]
+    fn refused_proof_needs_the_candidate_image_refused() {
+        // Every same-cookie binding and history entry is refused, but
+        // the shed's own image (77, 3) is not: the proof must fail, so
+        // the shed barriers instead of disposing.
+        let domain = NativeDomainId::mint();
+        let refused = |candidate: ImageIdentity| candidate == refused_proof_image(77, 9);
+        let mut set = SemanticBindingSet::new();
+        refused_proof_bind(&mut set, 1, domain, 77, 9);
+        set.admission_images
+            .insert(CallerId(20), refused_proof_history(domain, 77, 9));
+        assert!(
+            !set.proves_refused_other_caller(domain, refused_proof_image(77, 3), refused),
+            "an unrefused candidate never proves, however refused its cookie-mates are"
+        );
+        assert!(
+            set.proves_refused_other_caller(domain, refused_proof_image(77, 9), refused),
+            "the refused image itself still proves against the same set"
         );
     }
 }
@@ -4939,6 +5707,711 @@ mod finalizer_history_tests {
             ),
             "foreign dropped work must not insert numeric loss into A's finalizer namespace: {fresh:?}"
         );
+    }
+
+    /// One unrouted call whose record carries `cookie` as its image.
+    fn unrouted_call(domain: NativeDomainId, cookie: u64, position: u64) -> TickOutcome {
+        use crate::discovery::instances::UnknownReason;
+        let event = Event {
+            pid_tgid: (4242u64 << 32) | 4242,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id: 3,
+            },
+            ..Event::default()
+        };
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0x2200,
+                ),
+                object: None,
+            },
+            Route::Unknown(UnknownReason::Unobserved),
+            None,
+            Some(position),
+        ))
+    }
+
+    /// Calls disclosed by every unrouted gap, whatever its subject.
+    fn unrouted_gap_calls(coordinator: &InventoryCoordinator<OsProcessSource>) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject.starts_with("semantic calls unrouted"))
+            .map(|(gap, repeats)| {
+                let count: u64 = gap
+                    .reason
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+                    .expect("unrouted gaps lead with their call count");
+                count * repeats
+            })
+            .sum()
+    }
+
+    #[test]
+    fn unrouted_calls_of_a_provably_other_caller_keep_the_bound_history() {
+        use crate::semantic_capture::Invalidation;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // A bound Joint caller holds image cookie 41. Unrouted calls whose
+        // record proves another caller (a different nonzero cookie of the
+        // same domain) are still shed and disclosed, but no longer stand
+        // as an H3 loss barrier for the bound caller. An unknown image
+        // (cookie 0) or the bound caller's own image still barriers.
+        const BOUND: u64 = 41;
+        for (cookie, other) in [(77u64, true), (0, false), (BOUND, false)] {
+            let (mut coordinator, mut lane, domain) = drop_test_lanes();
+            coordinator
+                .semantic_bindings
+                .insert(SemanticCallerBinding::scripted(
+                    CallerId(9),
+                    ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                    domain,
+                    ImageIdentity {
+                        task_cookie: BOUND,
+                        exec_id: 1,
+                    },
+                    Arc::new(PidPin::test_proc_only(1234)),
+                ))
+                .unwrap();
+            let report = TickReport::scripted_with_disposition(
+                vec![
+                    TickOutcome::Invalidation(Invalidation::scripted(
+                        domain,
+                        crate::semantic_capture::InvalidationScope::CoverageFailed,
+                        Some(1),
+                    )),
+                    unrouted_call(domain, cookie, 2),
+                    unrouted_call(domain, cookie, 3),
+                ],
+                Vec::new(),
+                None,
+                None,
+                false,
+            );
+            let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 130).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(&mut lane))
+                .unwrap();
+            let evidence = coordinator.take_h3_disposition();
+            if other {
+                assert!(
+                    matches!(
+                        evidence,
+                        H3DispositionEvidence::Clean {
+                            staged_max: 3,
+                            pending_floor: None
+                        }
+                    ),
+                    "another caller's unrouted calls leave the bound history whole: {evidence:?}"
+                );
+            } else {
+                assert!(
+                    matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+                    "an unknown or bound image still barriers (cookie {cookie}): {evidence:?}"
+                );
+            }
+            // The published loss is the same either way: both calls are
+            // shed and disclosed.
+            assert_eq!(lane.shed_calls_disclosed(), 2, "cookie {cookie}");
+            assert_eq!(unrouted_gap_calls(&coordinator), 2, "cookie {cookie}");
+            // Only a provably other caller's sheds count as foreign
+            // for the key-operation unattributed counters.
+            assert_eq!(
+                coordinator.registry().foreign_unrouted_calls(),
+                if other { 2 } else { 0 },
+                "cookie {cookie}"
+            );
+        }
+    }
+
+    /// One unrouted call with an explicit exec id.
+    fn unrouted_call_exec(
+        domain: NativeDomainId,
+        cookie: u64,
+        exec_id: u64,
+        position: u64,
+    ) -> TickOutcome {
+        use crate::discovery::instances::UnknownReason;
+        let event = Event {
+            pid_tgid: (4242u64 << 32) | 4242,
+            image: ImageIdentity {
+                task_cookie: cookie,
+                exec_id,
+            },
+            ..Event::default()
+        };
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    event,
+                    InstanceStamp::default(),
+                    0x2200,
+                ),
+                object: None,
+            },
+            Route::Unknown(UnknownReason::Unobserved),
+            None,
+            Some(position),
+        ))
+    }
+
+    fn bind_image(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        caller: u32,
+        image: ImageIdentity,
+    ) {
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                CallerId(caller),
+                ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                domain,
+                image,
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+    }
+
+    fn admit_history(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        caller: u32,
+        image: ImageIdentity,
+    ) {
+        coordinator.semantic_bindings.admission_images.insert(
+            CallerId(caller),
+            SemanticAdmissionHistory {
+                domain,
+                image,
+                incarnation: 1,
+                generation: crate::inspect_system::MemberGeneration {
+                    start_time: None,
+                    exe: None,
+                },
+                pin: Arc::new(PidPin::test_proc_only(1234)),
+                initial_scope_cut: false,
+                pending_gap: None,
+            },
+        );
+    }
+
+    #[test]
+    fn refused_other_caller_sheds_after_its_own_binding_keep_the_bound_history() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // The live intruder shape: a foreign caller's first unrouted
+        // calls prove it another caller, so its image is refused in the
+        // journal and it can never join Joint. It then binds (S1 only,
+        // named). A later unrouted call of that same image is still
+        // provably not the bound Joint caller's: it must dispose, not
+        // barrier, even though its own binding and admission history
+        // now hold its cookie.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let foreign = ImageIdentity {
+            task_cookie: 77,
+            exec_id: 3,
+        };
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+                unrouted_call(domain, 77, 3),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 3,
+                    pending_floor: None
+                }
+            ),
+            "the unbound foreign sheds dispose as before: {first:?}"
+        );
+        assert!(
+            coordinator
+                .joint_capture
+                .adapter()
+                .image_refused((foreign.task_cookie, foreign.exec_id)),
+            "the foreign image is refused in the journal after its sheds"
+        );
+        bind_image(&mut coordinator, domain, 10, foreign);
+        admit_history(&mut coordinator, domain, 10, foreign);
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    4,
+                ),
+                unrouted_call(domain, 77, 5),
+            ],
+        );
+        assert!(
+            matches!(
+                second,
+                H3DispositionEvidence::Clean {
+                    staged_max: 5,
+                    pending_floor: None
+                }
+            ),
+            "a refused caller's later shed must not barrier the bound history: {second:?}"
+        );
+        // Every shed is still shed and disclosed, under the
+        // other-callers subject; the totals do not move.
+        assert_eq!(lane.shed_calls_disclosed(), 3);
+        assert_eq!(unrouted_gap_calls(&coordinator), 3);
+        assert_eq!(unrouted_subject_calls(&coordinator, OTHER), 3);
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 0);
+    }
+
+    #[test]
+    fn bound_other_caller_without_a_refusal_still_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: a second bound caller that was never refused in the
+        // journal could still hold Joint history, so its unrouted call
+        // is a bound caller's own loss and barriers as today.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 3,
+            },
+        );
+        let evidence = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "an unrefused bound caller's shed still barriers: {evidence:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 1);
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 1);
+    }
+
+    #[test]
+    fn refused_image_sheds_still_barrier_beside_an_unrefused_same_cookie_binding() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: the refused image (77, exec 3) sheds again, but an
+        // unrefused binding now holds the same cookie at a later exec.
+        // An exec keeps the cookie, so that binding could own the
+        // call: fail closed and barrier.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        let first = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert!(
+            matches!(
+                first,
+                H3DispositionEvidence::Clean {
+                    staged_max: 2,
+                    pending_floor: None
+                }
+            ),
+            "the unbound foreign shed disposes and refuses its image: {first:?}"
+        );
+        bind_image(
+            &mut coordinator,
+            domain,
+            10,
+            ImageIdentity {
+                task_cookie: 77,
+                exec_id: 9,
+            },
+        );
+        let second = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![unrouted_call_exec(domain, 77, 3, 5)],
+        );
+        assert!(
+            matches!(second, H3DispositionEvidence::StagedLoss { barrier: 5 }),
+            "a same-cookie unrefused binding could own the shed: {second:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2);
+    }
+
+    #[test]
+    fn refused_other_caller_shed_beside_an_unknown_shed_still_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // Twin: in one batch, a refused caller's shed disposes while
+        // an unknown-image shed (cookie 0) still barriers at its own
+        // position. Forgiving the foreign position never forgives an
+        // unknown one beside it.
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        let foreign = ImageIdentity {
+            task_cookie: 77,
+            exec_id: 3,
+        };
+        bind_image(
+            &mut coordinator,
+            domain,
+            9,
+            ImageIdentity {
+                task_cookie: 41,
+                exec_id: 1,
+            },
+        );
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(
+                    domain,
+                    crate::semantic_capture::InvalidationScope::CoverageFailed,
+                    1,
+                ),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        bind_image(&mut coordinator, domain, 10, foreign);
+        let evidence = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![unrouted_call(domain, 77, 5), unrouted_call(domain, 0, 6)],
+        );
+        assert!(
+            matches!(evidence, H3DispositionEvidence::StagedLoss { barrier: 6 }),
+            "the unknown shed barriers at its own position: {evidence:?}"
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 3);
+        assert_eq!(unrouted_gap_calls(&coordinator), 3);
+    }
+
+    /// Gap reasons by subject for the two unrouted subjects.
+    fn unrouted_subject_calls(
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        subject: &str,
+    ) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == subject)
+            .map(|(gap, repeats)| {
+                let count: u64 = gap
+                    .reason
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+                    .unwrap();
+                count * repeats
+            })
+            .sum()
+    }
+
+    fn bind_cookie(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        domain: NativeDomainId,
+        cookie: u64,
+    ) {
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                CallerId(9),
+                ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                domain,
+                ImageIdentity {
+                    task_cookie: cookie,
+                    exec_id: 1,
+                },
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+    }
+
+    fn commit_outcomes(
+        coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        lane: &mut AttestedSemanticLane,
+        domain: NativeDomainId,
+        outcomes: Vec<TickOutcome>,
+    ) -> crate::semantics_objects::journal::H3DispositionEvidence {
+        let report = TickReport::scripted_with_disposition(outcomes, Vec::new(), None, None, false);
+        let batch = SemanticBatch::from_tick_report(domain, report, Vec::new(), 130).unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(lane))
+            .unwrap();
+        coordinator.take_h3_disposition()
+    }
+
+    fn invalidation_at(
+        domain: NativeDomainId,
+        scope: crate::semantic_capture::InvalidationScope,
+        position: u64,
+    ) -> TickOutcome {
+        TickOutcome::Invalidation(crate::semantic_capture::Invalidation::scripted(
+            domain,
+            scope,
+            Some(position),
+        ))
+    }
+
+    const BLOCKING: &str = "semantic calls unrouted";
+    const OTHER: &str = "semantic calls unrouted from other callers";
+    const NOTE: &str = PRE_BINDING_OTHER_CALLERS;
+
+    /// Pre-binding hold: `cookies` are two unrouted calls at positions 2
+    /// and 3 before any binding exists; then the first binding (cookie
+    /// `bound`) appears and a quiet batch resolves the hold. Returns the
+    /// evidence before and after the binding.
+    fn pre_binding_case(
+        cookies: [u64; 2],
+        bound: u64,
+        limit: Option<usize>,
+    ) -> (
+        InventoryCoordinator<OsProcessSource>,
+        AttestedSemanticLane,
+        crate::semantics_objects::journal::H3DispositionEvidence,
+        crate::semantics_objects::journal::H3DispositionEvidence,
+    ) {
+        use crate::semantic_capture::InvalidationScope;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        if let Some(limit) = limit {
+            coordinator
+                .semantic_finalizer
+                .as_mut()
+                .unwrap()
+                .reference_pre_binding_limit(limit);
+        }
+        let before = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(domain, InvalidationScope::CoverageFailed, 1),
+                unrouted_call(domain, cookies[0], 2),
+                unrouted_call(domain, cookies[1], 3),
+            ],
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2, "held calls count at once");
+        bind_cookie(&mut coordinator, domain, bound);
+        let after = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(
+                domain,
+                InvalidationScope::CoverageFailed,
+                4,
+            )],
+        );
+        assert_eq!(lane.shed_calls_disclosed(), 2, "resolution never recounts");
+        let total = unrouted_subject_calls(&coordinator, BLOCKING)
+            + unrouted_subject_calls(&coordinator, OTHER);
+        assert_eq!(total, 2, "every held call is disclosed exactly once");
+        (coordinator, lane, before, after)
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_of_another_caller_are_forgiven_at_the_first_binding() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, after) = pre_binding_case([77, 78], 41, None);
+        assert!(
+            matches!(
+                before,
+                H3DispositionEvidence::Clean {
+                    staged_max: 3,
+                    pending_floor: None
+                }
+            ),
+            "held positions are provisionally disposed, never barriered before a binding: {before:?}"
+        );
+        assert!(
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "the first binding proves another caller: {after:?}"
+        );
+        // Disclosed at once as shed, then noted as other callers'.
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 2);
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_matching_the_first_binding_dispose_without_barrier() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        // The bound caller's own pre-binding sheds were already
+        // disposed as fenced loss in the journal before any key
+        // existed; at its binding they dispose here too (never a
+        // barrier, never a refusal of its own image). The other
+        // caller's sheds in the same hold still resolve as other
+        // callers'. Shed totals are unchanged: both calls stay
+        // disclosed under the blocking subject from shed time.
+        let (coordinator, _lane, _before, after) = pre_binding_case([77, 41], 41, None);
+        assert!(
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "own pre-binding sheds dispose at the binding: {after:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+        // Pure own-cookie hold: same disposal, and the other-caller
+        // subject never sees the bound caller's own sheds.
+        let (coordinator, _lane, _before, after) = pre_binding_case([41, 41], 41, None);
+        assert!(
+            matches!(
+                after,
+                H3DispositionEvidence::Clean {
+                    staged_max: 4,
+                    pending_floor: None
+                }
+            ),
+            "pure own pre-binding sheds dispose at the binding: {after:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, OTHER), 0);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+    }
+
+    #[test]
+    fn pre_binding_unrouted_calls_without_an_image_barrier_at_once() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, after) = pre_binding_case([0, 77], 41, None);
+        assert!(
+            matches!(before, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "an unknown image is never held: {before:?}"
+        );
+        assert!(
+            matches!(after, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "the unknown call's barrier stands after the binding: {after:?}"
+        );
+        // Only the call with a known, different image is noted.
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 1);
+    }
+
+    #[test]
+    fn pre_binding_hold_overflow_barriers() {
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (coordinator, _lane, before, _after) = pre_binding_case([77, 78], 41, Some(1));
+        assert!(
+            matches!(before, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "past the hold limit everything held barriers: {before:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 2);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+    }
+
+    #[test]
+    fn pre_binding_hold_resolves_as_loss_when_the_lane_stops_unbound() {
+        use crate::semantic_capture::InvalidationScope;
+        use crate::semantics_objects::journal::H3DispositionEvidence;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator.semantic_finalizer = Some(SessionFinalizerState::new(domain));
+        commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![
+                invalidation_at(domain, InvalidationScope::CoverageFailed, 1),
+                unrouted_call(domain, 77, 2),
+            ],
+        );
+        assert_eq!(
+            unrouted_subject_calls(&coordinator, BLOCKING),
+            1,
+            "a held call is disclosed at once"
+        );
+        let stopped = commit_outcomes(
+            &mut coordinator,
+            &mut lane,
+            domain,
+            vec![invalidation_at(domain, InvalidationScope::Stopped, 3)],
+        );
+        assert!(
+            matches!(stopped, H3DispositionEvidence::StagedLoss { barrier: 2 }),
+            "{stopped:?}"
+        );
+        assert_eq!(unrouted_subject_calls(&coordinator, BLOCKING), 1);
+        assert_eq!(unrouted_subject_calls(&coordinator, NOTE), 0);
+        assert_eq!(lane.shed_calls_disclosed(), 1);
     }
 }
 

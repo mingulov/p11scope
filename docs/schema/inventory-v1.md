@@ -207,7 +207,7 @@ non-null values needs a new allowlist row.
   `{from, to, at_ns}` in order (`[]` while the first verdict stands, at
   most two entries), and each rise is also a `module admission changed`
   gap. The verdict is judged against the Inventory
-  endpoint budget (`--max-endpoints`, default 4096, range 1..=8192), not the 512-slot detailed ceiling
+  endpoint budget (`--max-endpoints`, default 32768, range 1..=131072), not the 512-slot detailed ceiling
   `inspect --system` reports, so the two can disagree either way: an
   object `inspect` refuses can read `admitted` here, and one it admits
   can read `refused` here. Each pass lowers under that budget. An
@@ -235,19 +235,24 @@ non-null values needs a new allowlist row.
   `lifecycle` is `mapped`, `unloaded` (a complete rescan proved it
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
-  `unbound_use` is `null`, or `{first_ns, rows, reasons}`: native
-  witness rows of this module that no caller edge carries — positive,
-  monotonic module-level use, never attributed to a caller by pid.
-  Only a row whose witness endpoint belongs to this one admitted module
-  counts here; each row counts on at most one module. `first_ns` is the
-  earliest row's first-association instant, `rows` the row count, and
-  `reasons` counts rows per reason code: a binder reason (see
+  `unbound_use` is `null`, or `{first_ns, rows, reasons, entries}`:
+  native witness rows of this module that no caller edge carries —
+  positive, monotonic module-level use, never attributed to a caller by
+  pid. Only a row whose witness endpoint belongs to this one admitted
+  module counts here; each row counts on at most one module. `first_ns`
+  is the earliest row's first-association instant, `rows` the row count,
+  and `reasons` counts rows per reason code: a binder reason (see
   `observation.native_witnesses`) or `no_mapping_edge` (the row bound to
   an identified caller incarnation that has no mapping edge to this
-  module; a witness never invents a mapping). The first binder-reason
-  row of a module records one `used by an unidentified caller image`
-  gap; a `no_mapping_edge` row records instead a `native witness without
-  mapping evidence` gap naming the caller (once per caller and module).
+  module; a witness never invents a mapping). `entries` is the folded
+  entry-count lower bound over the single-module rows: each staged
+  row's held count at drop, saturating (a refresh read after the drop
+  never merges, so a still-running producer's later entries are not
+  included; a row read after its process exited carries all of them).
+  The first binder-reason row of a module records one `used by an
+  unidentified caller image` gap; a `no_mapping_edge` row records
+  instead a `native witness without mapping evidence` gap naming the
+  caller (once per caller and module).
   Witness gaps never carry a `pid`: an unbound row's tgid is exactly
   what could not be identified.
   Boundary: the key is file identity, not load-instance authority —
@@ -648,7 +653,9 @@ non-null values needs a new allowlist row.
   filesystem) the kernel witness could not prove is the held file:
   reason `original_file_unproven` with one of four fixed causes (the
   witness proved another file, the witness query budget was exhausted,
-  the witness was unavailable, the anchor binding failed). Admission
+  the witness was unavailable, the anchor binding failed). The
+  unavailable cause appends the failed stage in plain words after the
+  fixed `original_file_unproven: kernel witness unavailable` prefix. Admission
   failures record one `caller admission failed` gap per pass and kind:
   a single failure keeps its pid and exact reason; several aggregate
   with a count (`N admissions refused this pass: caller budget
@@ -688,7 +695,7 @@ non-null values needs a new allowlist row.
   endpoint counts), `inventory_endpoints` (additive within v1:
   `{limit, occupied}` — the run's Inventory attach set, whose
   capture-lifetime endpoint budget the admission verdicts are judged
-  against (`--max-endpoints`, default 4096), and the endpoints it holds;
+  against (`--max-endpoints`, default 32768), and the endpoints it holds;
   the limit is separate from the summed per-module endpoint census.
   IDs are never reused, so
   occupancy only grows, and its refusals are the
@@ -860,19 +867,34 @@ rows, object views with requested/established metadata, proved-key
 operation aggregates and unknown-key summaries. The frozen consumer
 contracts are
 [inventory-v1-object-observations.schema.json](inventory-v1-object-observations.schema.json)
-(section version 1) and
+(section version 1),
 [inventory-v1-object-observations-v2.schema.json](inventory-v1-object-observations-v2.schema.json)
-(section version 2); consumers must reject unknown section versions,
+(section version 2) and
+[inventory-v1-object-observations-v3.schema.json](inventory-v1-object-observations-v3.schema.json)
+(section version 3) and
+[inventory-v1-object-observations-v4.schema.json](inventory-v1-object-observations-v4.schema.json)
+(section version 4); consumers must reject unknown section versions,
 never guess. JSON, JSONL and the dashboard render from this one
 immutable projection. While H9 delivery stays gated, production
 captures carry `status: "unavailable"` with a finite `reason` and
 empty rows; unavailable/partial/stale name object authority only and
 never imply S1 loss.
 
-- `version` is 1 or 2, following the content: 2 iff a KEM creation
-  (`encapsulate`, `decapsulate`) or role (`encapsulation_key`,
-  `decapsulation_key`) label is present, otherwise byte-stable 1.
-  Version 1 is frozen and never carries KEM labels. `revision` is the
+- `version` follows the content: 4 iff a key row carries the
+  `unknown` metadata label (a first-observed key — first seen before
+  attach — whose type/size were never established in the observed
+  window; its identity and counts are proved, no label is guessed),
+  else 3 iff an `unattributed` counter is present, else 2 iff a KEM
+  creation (`encapsulate`, `decapsulate`) or role
+  (`encapsulation_key`, `decapsulation_key`) label is present,
+  otherwise byte-stable 1. Versions 1, 2 and 3 are frozen; version 1
+  never carries KEM labels and neither 1 nor 2 carries
+  `unattributed`; version 4 always carries `unattributed` (possibly
+  empty). A feed that fell back or lost
+  authority publishes its retained rows as `partial` with the reason
+  named and its unproved calls counted in `unattributed[]`
+  (`{reason, count}`, finite reasons, frozen order); the section is
+  `unavailable` only when no Joint evidence exists at all. `revision` is the
   publication revision. `status` is
   `populated`, `partial`, `stale` or `unavailable`; `reason` is `none`
   only when populated. A stale publication's rows are historical, not
@@ -1063,6 +1085,24 @@ covers any custody loss, including a proven PID-target exit: the exit
 itself is proven, but coverage past it is not, so the watch truncates
 conservatively instead of riding to the run end.
 
+## Forwarding-layer entry totals (additive within v1)
+
+Top-level `layer_totals` (always present) splits entry counts:
+`logical_entries` (provider edges, plus the layer edges of callers with
+no entries at any non-closure module or with a refused backend, counted
+once) and `forwarding_entries` (closure-array forwarding-layer edges of
+provider-active callers without a refused backend, never summed into
+logical). An edge splits out only for callers that also entered a watched
+provider and have no refused backend; callers with no entries at any
+non-closure module, or with a refused backend, stay logical. One logical
+entry observed at both layers counts once, on its provider edge.
+`modules[].admission.class` names the forwarding layers (`closure_array`);
+consumers that sum entry counts must skip those modules' edges to count
+logical entries once, except for callers with no entries at any non-closure
+module, whose edges never split out. Layer-self-answered entries appear
+only in the forwarding split, and one layer entry reaching several providers
+counts at each.
+
 ## Example (abridged)
 
 ```json
@@ -1080,8 +1120,8 @@ conservatively instead of riding to the run end.
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},
     "edges": {"limit": 32768, "occupied": 1, "refused": 0},
     "endpoints": {"limit": 1048576, "occupied": 68, "refused": 0},
-    "inventory_endpoints": {"limit": 4096, "occupied": 68, "refused": 0},
-    "inventory_attach_modules": {"limit": 4096, "occupied": 1, "refused": 0},
+    "inventory_endpoints": {"limit": 32768, "occupied": 68, "refused": 0},
+    "inventory_attach_modules": {"limit": 32768, "occupied": 1, "refused": 0},
     "counters": {"cap": 18446744073709551615, "observed_edges": 0, "saturated_edges": 0},
     "semantic_state": {"limit": 32768, "occupied": 0, "status": "withheld", "unknown_edges": 1, "refused": 0},
     "retained_history": {"limit": 1024, "retained": 1, "suppressed": 0}

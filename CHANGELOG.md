@@ -25,15 +25,25 @@ User-facing limits live in
 ### Added
 
 - `p11scope inventory --key-operations` opts in to live per-key tracking
-  (default off; needs `--capture auto` or `native`). Ordinary builds now
-  carry the journal and the birth marker, so no special build is needed;
-  `P11SCOPE_JOURNAL=0` or `P11SCOPE_BIRTH_MARKER=0` builds without them.
-  When rows populate, the snapshot carries a summary such as
-  `key operations: rev 1 populated; 1 session, 3 objects; sign 1
-  completed, 0 failed, 2 active operations`, and the JSON report carries
-  the per-session, per-object and per-category rows under
-  `object_observations`. Per-key rows need p11scope to see the process
-  start, or the provider load, after capture begins; see
+  (default off; needs `--capture auto` or `native`). No manifest is
+  needed when the tables qualify by standard interface linkage, an
+  observed live function-list return, or a scan-proved sole complete
+  table; anything else needs a rerun with `--manifest`. Ordinary builds
+  now carry the journal and
+  the birth marker, so no special build is needed; `P11SCOPE_JOURNAL=0`
+  or `P11SCOPE_BIRTH_MARKER=0` builds without them. When rows populate,
+  the snapshot carries a summary such as `key operations: rev 1
+  populated; 1 session, 3 objects; sign 1 completed, 0 returned errors,
+  2 active operations`, and the JSON report carries the per-session,
+  per-object and per-category rows under `object_observations`. Attaching to an
+  already-running process works: rows cover operations that start after
+  the attach, earlier operations are counted in named gaps, and a key
+  first seen before the attach reads `type unknown (not established
+  while observed)`, never dropped. Starting the observer first also
+  works, and
+  no restart is needed either way. Views never stop as a whole:
+  operations the observer cannot attribute with certainty are counted
+  in named `not attributed` reasons instead of ending tracking; see
   [known limitations](docs/known-limitations.md#known-limitations-in-060).
 - `--select-endpoint <FUNCTION>` names one endpoint function (for example
   `C_Sign`) for full detail while a `profile` or `run` metrics capture
@@ -45,11 +55,13 @@ User-facing limits live in
 - Repeatable `--exclude-module <path-or-name>` for `inspect`, `run`,
   `profile`, `trace` and `inventory` in every scope: the opposite of
   `--module`. Discovery stays automatic, except excluded files get no
-  probes and use no slots. A full path excludes exactly that file; a
-  bare name excludes every file with that name. Excluded files are
-  listed as "excluded by you" (never silent), and the rest of the
-  capture can still be `exact`. A `--prearm-module` or `--manifest`
-  input that matches an exclusion is refused at startup (exit 2).
+  probes and use no slots. A full path excludes exactly that file by
+  identity (a different file at the same path elsewhere is not
+  excluded); a bare name excludes every file with that file name or ELF
+  soname. Excluded files are listed as "excluded by you" (never
+  silent), and the rest of the capture can still be `exact`. A
+  `--prearm-module` or `--manifest` input that matches an exclusion is
+  refused at startup (exit 2).
 - Provider tables whose readable prefix is proven complete are reported
   with a full walk instead of PARTIAL. A 68-entry legacy table stamped
   PKCS#11 3.0-3.2 (such as SoftHSM 2.7, which reports 3.2) now reads
@@ -78,20 +90,54 @@ User-facing limits live in
 - A provider that loads while the capture stops is no longer dropped
   silently: the report names the newcomer in a gap, on both the live
   discovery path and `inventory --system`.
-- Short-lived exits now carry exit-time mapping verdicts: at exit the
-  kernel reports the watched-provider slots it had recorded for the
-  process, published as a `gap_exit_mappings` split beside
-  `pid_descendant_gaps`. `mapped` means a slot named a watched provider
-  file with no disqualifying refusal; everything else reads `unknown`.
-  There is no "did not map" claim.
+- With `--track-short-lived`, short-lived exits carry exit-time
+  mapping verdicts: at exit the kernel reports the watched-provider
+  slots it had recorded for the process, published as a
+  `gap_exit_mappings` split beside `pid_descendant_gaps`. `mapped`
+  means a slot named a watched provider file with no disqualifying
+  refusal; everything else reads `unknown`. There is no "did not map"
+  claim.
 - Inventory pre-arm inputs are now pinned and reported: `prearm[]`
   carries one interval row per `--prearm-module` input with its watch
   state. A quiet pre-armed interval is a stated watch interval, not
   proven-exact coverage, except on an owned `run` that meets the proven
   bound.
+- `p11scope run --user <name|uid>` (root only, like `strace -u`) starts
+  the command as that account instead of the sudo invoker, with its
+  supplementary groups from the account database (glibc may return only
+  the primary group) and home environment (`HOME`/`USER`/`LOGNAME`/
+  `SHELL` from its passwd entry, `XDG_RUNTIME_DIR` when
+  `/run/user/<uid>` is provably its own (otherwise unset), `MAIL`
+  dropped). Only `root` or `0` select uid 0; any other name or spelling
+  resolving to uid 0 is refused as an unknown account. Without root,
+  for an unknown account, when its group list cannot be resolved, or for
+  a set-id observer it refuses with a plain message (exit 2) before
+  anything starts; `-v` prints `running <cmd> as <user> (uid <uid>)`.
+  The default is unchanged: under sudo the invoker, otherwise the
+  observer itself.
 
 ### Changed
 
+- An owned `run` child inherits the observer's environment unchanged
+  (replacing the 0.5.x small allowlist), so the workload behaves as
+  without p11scope. Only p11scope's own control inputs are withheld by
+  name — the whole `SUDO_*` namespace and `P11SCOPE_*` — with one
+  stderr line under -v naming them; apart from PATH, used to find CMD,
+  values of inherited variables are never inspected or logged. Note sudo
+  itself resets the environment first (pass application variables with
+  `sudo --preserve-env=NAME` or as `env NAME=value ...` after the `--`),
+  while anything exported in a root shell now reaches the unprivileged child.
+
+- Terminal text is concise by default on every user-facing command
+  (`inspect`, `inventory`, `profile`, `run`): the main results, one
+  coverage status line, and a `run with -v for details` hint.
+  `-v` / `--verbose` shows the full detail (every gap and reason,
+  evidence, per-slot data, timing) plus informational stderr notes, and
+  `--quiet` prints only the summary head. `--json` and `-o` are always
+  complete. Default gap names are plain words; the machine names stay in
+  JSON, and in `-v` beside the plain words. Informational stderr notes
+  are suppressed by default; errors, actionable warnings, and the
+  one-line readiness/outcome signals stay.
 - Births under `--pid` are bound to the target's kernel start time, not
   the PID number, so a later process reusing the same PID gains no
   marker row or charge. Lifecycle records stay admitted by PID number by
@@ -104,14 +150,27 @@ User-facing limits live in
   load a 16 MiB event ring (12 MiB more locked kernel memory than the
   4 MiB default, about 1.9 s of 10,000 calls/s between reads). Costs are
   disclosed in the operator's guide.
-- The p11-kit proxy layer no longer crowds out real providers: a proxy
-  closure prefix is admitted only for closures already mapped when the
-  capture's first plan was built and beside a real provider in that
-  plan, or when operator-named, and it never takes the reserve kept for
-  later providers. A closure first mapped mid-capture admits only its
-  published tables, and shared scope stays whole-or-nothing for
-  closures. A later provider that still does not fit is refused by name
-  with the `--exclude-module` remedy.
+- The forwarding layer (such as the p11-kit proxy) never crowds out
+  real providers: it is admitted by what it publishes — only tables
+  the application actually received attach, taking no heuristic
+  slots. Calls it forwards are counted at the attached backend
+  providers, named with counts on the gap line; calls the layer
+  answered itself, including its errors, appear only on the separate
+  forwarding line, and one layer call that reaches several providers
+  counts at each. When nothing is published yet, a named gap says so
+  and the capture continues; an operator-named layer keeps a
+  reserve-capped prefix for the remote-client case. Under inventory,
+  counter and broad admission a closure array that does not fit whole
+  is refused whole with its demand stated. A real provider that still
+  does not fit is admitted on the leading prefix that fits, with a
+  named partial gap, and refused whole only when not even its
+  strongest table fits.
+- Inventory's endpoint budget rises to a 32768 default and a 131072
+  maximum (`--max-endpoints`, 1–131072), so a host with several
+  p11-kit copies (about 20K endpoints) is covered by
+  `inventory --system` with no flag. The raise is measured on
+  uprobe_multi hosts; Detailed's 512-slot budget and the counter
+  modes' 8192 planner ceiling are unchanged.
 - A discovery pass that cannot yet scan a caller (usually one with no
   observed call yet) now reports a `semantic admission deferred` note
   instead of a refusal: tracking starts at a later pass and waiting
@@ -123,8 +182,8 @@ User-facing limits live in
 - `doctor` no longer spends minutes test-loading capture programs on
   kernels without uprobe_multi (for example Linux 6.1, where it took
   about 4 minutes). Live capture refuses there anyway, so those checks
-  now read `skipped: uprobe-multi-required` and the verdict stays
-  capture unavailable.
+  now read `skipped: this check loads capture programs, which need
+  uprobe-multi` and the verdict stays capture unavailable.
 - DONTUNMAP moves missed on kernels with the 6-argument copy_vma are now
   tracked (this affected 0.5.0 on 6.18.58 and current 6.6/6.12/7.2
   stable heads). The move hook read a fixed argument slot, so an
@@ -138,8 +197,8 @@ User-facing limits live in
 - Aimed captures admit first-come with no shared-scope reserve: `--pid`,
   or `--module` naming the providers to capture, admits in discovery
   order, while unaimed system/cgroup captures keep the reserve for late
-  providers. Previously an aimed 8,192-endpoint capture stalled at the
-  6,144 heuristic ceiling.
+  providers. Previously, under the old 8,192-endpoint ceiling, an aimed
+  capture stalled at the 6,144 heuristic ceiling.
 - `inspect --system --module` mirrors capture admission: an aimed
   inspection admits first-come (an over-budget provider admits its
   strongest prefix with the spill disclosed) instead of refusing whole
@@ -151,20 +210,50 @@ User-facing limits live in
   Fedora); occasional partials under heavy load stay disclosed.
 - On busy hosts, skipped mapping hooks no longer stop counting for good:
   each skip raises a new fault era, calls across the skip are shed with
-  counts and a named cause, and key-operation tracking ends with its own
-  named gap while plain counting continues.
+  counts and a named cause, and key operations the observer cannot
+  attribute with certainty are counted in named `not attributed`
+  reasons while exact rows continue for the rest.
 - An owned `run` child that exits in the window no longer always voids
   the selected-endpoint detail: exits the observer can tie to the ended
   process count as exit-only and the detail renders the calls made
   before the exit. A short child that loads and exits at once can still
   void intermittently (about 1 in 10 runs locally); see known
   limitations.
+- A refused attach slot no longer risks its neighbors: the slot is
+  quarantined with its detach reason while unrelated slots keep
+  admitting.
+- An oversized mechanism approval union publishes its official-first
+  subset and counts the rest, instead of refusing the capture.
+- One bad `--manifest` object or `--prearm-module` path gaps only
+  itself with a named reason; the capture keeps its good inputs and
+  reads `PARTIAL` instead of aborting.
+- A live discovery-ring failure keeps the prefix already pulled and
+  gaps the rest, instead of dropping the tick.
+- A stale rebuild the new scan cannot cover gaps with a named reason
+  instead of aborting.
+- `run --pause always` collects unpaused with a named gap when the arm
+  fails, instead of failing the run.
+- `sudo p11scope run -- tool` starts `tool` as the invoking user with
+  the invoker's supplementary groups and home environment, as if the
+  user had run it directly: groups come from the account database
+  (glibc may return only the primary group; HSM and device-group
+  providers keep working), `HOME`/`USER`/`LOGNAME`/`SHELL` from the
+  invoker's passwd entry, and `XDG_RUNTIME_DIR` from `/run/user/<uid>`
+  when that directory exists and is owned by the invoker (otherwise
+  unset). The child keeps `no_new_privs` with clear capabilities. New
+  `-v`/`--verbose` flag for `run` prints the restored identity as
+  `running <cmd> as <user> (uid <uid>) (groups and home restored)`;
+  without it `run` stays quiet about the identity. An account the
+  observer cannot resolve refuses with a plain message before anything
+  starts (DR-56).
 
 ### Known limitations
 
 The v0.6.0 limits live in
 [docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-060).
-Known issues in this release:
+Known issues in this release. Rate, latency and start-up figures below
+were measured on the integration lane (see Qualification for the source
+SHA behind each check the release rounds re-measured):
 
 - Key operations sustain 6,250 calls/s for 60 s with exact rows; plain
   counts stay exact at 10,000 calls/s. 10,000 calls/s sustained for key
@@ -174,10 +263,11 @@ Known issues in this release:
 - Key-operation tracking may not start in about 1 in 4 runs; plain
   counts are unaffected and a named gap says so.
 - On busy hosts, skipped kernel mapping hooks shed counted calls and
-  end key-operation tracking with named gaps.
-- A foreign call still in flight at the seal ends key-operation
-  tracking after about 6 s with a named gap, never a hang; plain
-  counts are unaffected.
+  count unattributable key operations in named `not attributed`
+  reasons.
+- A foreign call still in flight at the seal is counted in named `not
+  attributed` reasons; exact per-key rows continue for operations the
+  observer can attribute with certainty.
 - Past 16,448 refused processes, new untracked callers keep the plain
   per-call view with a named reason (about 14 hours at one new
   foreign client every 3 s).
@@ -188,26 +278,45 @@ Known issues in this release:
   runs are marked incomplete.
 - Container providers carry named unproven cases (multi-node clusters,
   CRI-O and the cgroupfs driver are not exercised).
-- If the overlay-identity witness lands, callers past its 8-per-pass
-  budget alternate between joined and a named loss across passes.
+- The overlay-identity witness proves up to 8 refused callers per scan
+  and per pass; past the budget, callers take turns across passes
+  while the rest keep the named `original_file_unproven` loss.
 - Strict speed claims apply only on 6.6+ kernels with uprobe_multi;
   older kernels stay correct and finite, not fast.
-- Per-key rows need p11scope to see the process start or provider
-  load: start the observer first, then launch the application (an
-  already-running Firefox gives plain counts only).
+- Per-key rows cover operations that start after the attach; earlier
+  operations are counted in named gaps, and a key first seen before
+  the attach reads `type unknown (not established while observed)`.
+  No restart is needed: attaching to an already-running application
+  and starting the observer first both work.
+- Counts through the p11-kit proxy can include the backend's own
+  internal calls and miss calls made before the attach; direct
+  providers are exact.
+- The key-operations reason can latch `authority_lost` ("per-key
+  tracking stopped") while exact rows continue; read the rows and
+  the `not attributed` counts.
+- `inventory --pid` misses a short-lived caller's use; its calls
+  fold to the module as unattributed use. Use `profile --pid` for
+  one-shot flows.
+- `run` (and `profile --pid`) observe exactly the started command,
+  never its descendants. Capture multi-process workloads with
+  `inventory --system` (or `--cgroup`).
 
 ### Qualification of this release
 
-The following scoped checks qualify the release candidate
-(source SHA: `<fill at candidate>`):
+The following scoped checks qualify the release candidate. Each row
+names the source SHA it was measured on; SHAs differ because each
+round measured on its own tip. The last row is the controller's
+final-candidate gate:
 
-| Environment | Checked behavior |
+| Check | Measured result |
 | --- | --- |
-| Linux 6.6.157, 6.12.111, 6.18.58 and 7.3.1 guests (BPF kernel matrix) | Every capture program loads on each kernel; the 6.1 refusal control holds. Result: `<fill at candidate>` |
-| Fedora Linux 7.2.9, quiet host | Key-operation rate campaign (6,250 calls/s for 60 s, exact rows, p99), plain counts at 10,000 calls/s, system-scale and soak cells. Result: `<fill at candidate>` |
-| Hosted CI `ci.yml` | Complete gate on the exact candidate source (fmt, check, tests, clippy, contracts, coverage, Python suites, packaging). Run `<fill at candidate>`: `<fill at candidate>` |
-| Hosted CI `privileged-tests.yml` | Privileged library shards, system-scale capture cells, public CLI cells, real Firefox and Chromium cells on the exact candidate source. Run `<fill at candidate>`: `<fill at candidate>` |
-| Containers (one kind node, Docker) | Shared layers and copy-up, DaemonSet, attach into a pod, pre-attached provider, Knative warm/cold, node-wide late provider. Result: `<fill at candidate>` |
+| Privileged library campaign and quiet pressure set on Fedora 7.2.9 (source `762b289d7`, RC round 2) | Campaign 211/214: the 3 reds pin text RC2 intentionally changed (concise renderer), capture healthy in all three; pressure 5/5 under quiet exclusive; earlier reds closed except the `inventory --pid` one-shot shape, which stays a known issue (see Known limitations). |
+| Strict browser cells and demo rehearsal on Fedora 7.2.9 (source `762b289d7`) | 48/48 strict browser cells; demo 4/4 in both orders (Firefox and Chromium) at the exact 60 s task command; an earlier rehearsal miss root-caused to the rehearsal script on `40808c51e` (script fix, no product change). |
+| SoftHSM and Kryoptic sign flows on Fedora 7.2.9 (source `762b289d7`) | `run` and `profile --pid` PASS on both providers; the `inventory --pid` one-shot shape is a known issue (see Known limitations). |
+| Guest kernel matrix CLI and inventory on 6.6.157, 6.12.111, 6.18.58, 7.0.14 and 7.3.1 (sources `762b289d7`, `324ac067f`) | CLI 23 pass, 0 fail, 1 nonqualifying, 5 expected-fail on every kernel with byte-identical summaries; inventory overlay+cap FAIL systematic on `762b289d7` (predates the overlay-witness fix), PASS on all 5 kernels on `324ac067f` (RC round 3). |
+| Local release gates (sources `e2fd74b67`, `762b289d7`, `08906062e`, RC rounds 1-3) | fmt, check and clippy green; main library suite 7988/8129/8213 passed with 0 failed; `artifact_contracts` 202/202/202; Python suites 122/122; privileged no-route collect cell PASS. |
+| Hosted CI on the round tips | `ci`, `privileged-tests` and `bpf-kernels` runs queued per round and not awaited there (round 3: 42235605621, 42235605493, 42235605637 on `08906062e`); round-2 CI on `762b289d7` failed all three workflows in areas the rounds never touched, triaged in the CI lane. The binding CI record is the final-candidate gate below. |
+| Final candidate (source SHA filled by the controller) | `ci.yml`, `privileged-tests.yml` and `bpf-kernels.yml` green on the exact candidate source, with the run URLs recorded. Result: `TBD-QUALIFIED`. |
 
 The full privacy matrix and extracted-package recipient checks are separate
 release gates. The limitation disclosures above also apply to successful

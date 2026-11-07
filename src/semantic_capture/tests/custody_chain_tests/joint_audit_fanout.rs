@@ -203,6 +203,10 @@ struct MachineNativeRows {
     )>,
     fail_after_preparation: bool,
     fail_births: bool,
+    // Unmarked births stamp exec_attach_gen 0: the task predates the
+    // lane's closure (a late attach), so the attach-observed fallback
+    // applies deterministically, whatever the global attachment counter.
+    predating_births: bool,
     absence_reads: Vec<(u64, ImageIdentity, u32)>,
     birth_outcomes: Vec<(
         u32,
@@ -718,7 +722,11 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
             } else {
                 &["0", "0"]
             },
-            self.attached.generation(),
+            if unmarked && self.native.predating_births {
+                0
+            } else {
+                self.attached.generation()
+            },
         );
         let mut rows = NativeBirthRows { row, control };
         let mut owned = self.h0.0.borrow_mut();
@@ -991,6 +999,7 @@ impl LiveMachineDiscovery {
 impl MachineScene {
     fn absence_scene(providers: usize) -> Self {
         let mut fixture = Self::with_initial_files(providers, &[0], true);
+        fixture.native.predating_births = true;
         fixture.push_quiet();
         fixture.published_labeled("absence-quiet-prefix", None);
         assert_eq!(
@@ -1001,14 +1010,17 @@ impl MachineScene {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            1
         );
         assert!(
             fixture
                 .native
                 .birth_outcomes
                 .iter()
-                .any(|(file, result)| *file == 0 && result.is_err())
+                .any(|(file, result)| *file == 0
+                    && *result == Ok(crate::semantics_objects::journal::BirthKind::AttachObserved)),
+            "precondition: the quiet prefix is born attach-observed: {:?}",
+            fixture.native.birth_outcomes
         );
         fixture
     }
@@ -1259,6 +1271,7 @@ impl MachineScene {
                 preparations: Vec::new(),
                 fail_after_preparation: false,
                 fail_births: false,
+                predating_births: false,
                 absence_reads: Vec::new(),
                 birth_outcomes: Vec::new(),
                 pending_q_resolutions: 0,
@@ -2949,6 +2962,382 @@ fn joint_machine_running_audit_no_progress_bound_refuses_with_named_gap() {
             );
         }
     }
+}
+
+/// The foreign image of the step-3 shape: a short-lived process that is
+/// never a caller.
+const FOREIGN: ImageIdentity = ImageIdentity {
+    task_cookie: 184,
+    exec_id: 0,
+};
+
+/// Stage a call from a foreign process that never becomes a caller: its
+/// image is known only while the call is encoded. A finished call reaches
+/// S1, which sheds it as unobserved; an in-flight call (BEGIN only) is
+/// journal staging S1 never sees.
+fn push_unbound_foreign_call(
+    fixture: &mut MachineScene,
+    sequence: u64,
+    finished: bool,
+) -> OwnedStoppedChild {
+    let foreign = OwnedStoppedChild::new();
+    let pin = fixture.scene.real.h0.0.borrow().io.targets[&std::process::id()]
+        .0
+        .clone();
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .insert(foreign.id(), (pin, FOREIGN));
+    if finished {
+        fixture
+            .scene
+            .push(foreign.id(), 0, "C_CreateObject", sequence);
+    } else {
+        let (begin, _) = fixture
+            .scene
+            .encoded(foreign.id(), 0, "C_CreateObject", sequence);
+        fixture.scene.drain.source_mut().push_record(begin.to_vec());
+    }
+    fixture
+        .scene
+        .real
+        .h0
+        .0
+        .borrow_mut()
+        .io
+        .targets
+        .remove(&foreign.id());
+    foreign
+}
+
+fn unbound_staging(fixture: &MachineScene) -> std::collections::BTreeSet<(u64, u64)> {
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter()
+        .unbound_staging_images_for_test()
+}
+
+/// A seal that can only be retried, with nothing delivered, is no
+/// progress: the running Audited bound ends it with a named gap instead
+/// of spinning its retry budget until the run deadline.
+#[test]
+fn joint_machine_retry_without_delivery_trips_the_running_bound() {
+    use crate::inventory_semantics::JointServiceProgress;
+    let bound = std::time::Duration::from_secs(6);
+    let margin = std::time::Duration::from_millis(100);
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    // The foreign child starts well after the lane attached.
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    // A foreign call still in flight: no S1 call to shed, so the journal
+    // keeps unbound staging that no bound key can account for.
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2, false);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.reach_phase("Audited");
+    for n in 0..64 {
+        match fixture.service(1024) {
+            Ok(JointServiceProgress::Pending) => {}
+            other => panic!("the blocked seal stays Pending (poll {n}): {other:?}"),
+        }
+    }
+    assert_eq!(
+        unbound_staging(&fixture),
+        std::collections::BTreeSet::from([(184, 0)]),
+        "the foreign call is the only unbound staging"
+    );
+    assert!(audit_no_progress_gaps(&fixture).is_empty());
+    fixture
+        .machine
+        .set_finish_no_progress_since_for_test(Some(std::time::Instant::now() - (bound + margin)));
+    match fixture.service(1024) {
+        Err(SemanticRefusal::Unavailable) => {}
+        other => panic!("a retry-only seal past the bound must refuse: {other:?}"),
+    }
+    let gaps = audit_no_progress_gaps(&fixture);
+    assert_eq!(gaps.len(), 1, "the stall is named once: {gaps:?}");
+    assert!(
+        fixture.machine.audit_no_progress_trip_for_test().is_some(),
+        "the trip is recorded for the hold"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
+}
+
+/// The live step-3 shape: a foreign process's finished call that S1 sheds
+/// as another caller's no longer holds the bound key's seal. The journal
+/// refuses that image, its staging drops, and the transaction publishes
+/// with the bound Joint feed intact.
+#[test]
+fn joint_machine_other_caller_finished_call_does_not_hold_the_bound_seal() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let _foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-finished-call", None);
+    let adapter = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .adapter();
+    assert!(
+        adapter.image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the other caller's image is refused in the journal"
+    );
+    assert!(unbound_staging(&fixture).is_empty(), "its staging dropped");
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(registry.joint_feeds(), 1, "the bound Joint feed continues");
+    assert!(
+        registry
+            .gaps()
+            .iter()
+            .any(|gap| gap.subject == "semantic calls unrouted from other callers"),
+        "the foreign call stays disclosed"
+    );
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// A process refused as another caller that binds later never enters
+/// Joint with the hole its refused history left: it stays S1, named, and
+/// the existing bound feed is untouched.
+#[test]
+fn joint_machine_refused_other_caller_binding_later_stays_s1_named() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-refused", None);
+    let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("late-binding", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.joint_feeds(),
+        1,
+        "the refused process never gains a Joint feed"
+    );
+    assert!(
+        registry.gaps().iter().any(|gap| gap.caller == Some(caller)
+            && gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+            && gap.reason == "joint_image_refused"),
+        "the late binding names why it stays S1: {:?}",
+        registry.gaps()
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the refusal is never lifted"
+    );
+}
+
+/// The same late binding as above, but through the production admission
+/// path (selection, H0 refresh, consume) instead of the test-only bind:
+/// a refused process still never enters Joint. It stays S1, named, and
+/// the existing bound feed is untouched. This test never calls the
+/// test-only bind, so only the production naming can satisfy it.
+#[test]
+fn joint_machine_refused_image_production_binding_stays_s1_named() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("other-caller-refused", None);
+    let caller = super::super::sem1_feed::admit_mapped(&mut fixture.scene.real, foreign.id());
+    super::super::sem1_feed::production_bind(
+        &mut fixture.scene.real,
+        caller,
+        foreign.id(),
+        FOREIGN,
+    );
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 4);
+    fixture.scene.push(foreign.id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("late-binding", None);
+    let registry = fixture.scene.real.scene.coordinator.registry();
+    assert_eq!(
+        registry.joint_feeds(),
+        1,
+        "the refused process never gains a Joint feed"
+    );
+    assert!(
+        registry.gaps().iter().any(|gap| gap.caller == Some(caller)
+            && gap.subject == crate::inventory_present::JOINT_BIRTH_UNAVAILABLE_SUBJECT
+            && gap.reason == "joint_image_refused"),
+        "the late binding names why it stays S1: {:?}",
+        registry.gaps()
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .image_tainted_for_test((FOREIGN.task_cookie, FOREIGN.exec_id)),
+        "the refusal is never lifted"
+    );
+}
+
+/// JK-18 resolution at machine level: an own-cookie unrouted shed
+/// finalized before any binding is provisionally disposed, and the
+/// first finalize that sees the owner's binding disposes the match
+/// (the journal already fenced those records before any key
+/// existed), so the first bound seal certifies above the fence
+/// instead of degrading on a late barrier. No resolution NOTE (that
+/// keeps its other-caller meaning), the owner's own image is never
+/// refused, and the bound call that made the seal attempt still
+/// joins S1.
+#[test]
+fn joint_machine_own_cookie_pre_binding_shed_disposes_at_the_first_bound_seal() {
+    let mut fixture = MachineScene::new(1);
+    let foreign = push_unbound_foreign_call(&mut fixture, 2, true);
+    // Quantum 1 must prepare with zero bindings so the shed populates
+    // the hold — but its Binding phase would bind the mapped main pid.
+    // Fail only that bind with a scripted scan fault, then clear it
+    // before the first H0 tick so collection and finalization run real.
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = Some(0);
+    fixture.reach_phase("AwaitH0");
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        0,
+        "quantum 1 binds nothing: its prepare will populate the hold"
+    );
+    fixture.scene.real.h0.0.borrow_mut().io.script.fail_file = None;
+    fixture.published_labeled("pre-binding-shed", None);
+    {
+        let coordinator = &fixture.scene.real.scene.coordinator;
+        assert_eq!(
+            coordinator.semantic_bindings().len(),
+            0,
+            "nothing binds before the owner does"
+        );
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.subject == "semantic calls unrouted" && gap.reason.contains("with 0 bindings")
+            }),
+            "the own-cookie shed is held pre-binding: {:?}",
+            coordinator.registry().gaps()
+        );
+        assert!(
+            coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .all(|gap| gap.subject != "pre-binding unrouted calls resolved to other callers"),
+            "nothing is forgiven before a binding exists"
+        );
+        assert_eq!(coordinator.registry().joint_feeds(), 0);
+    }
+    // The owner binds between the publications; the main pid binds in
+    // quantum 2's own Binding phase, before its prepare — production
+    // order on both seams. The main pid's quantum-2 call then forces a
+    // real bound seal over the late barrier.
+    let caller = fixture.scene.bind(foreign.id(), FOREIGN, &[0]);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        1,
+        "the owner binds between the publications"
+    );
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    fixture.published_labeled("first-bound-seal", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .semantic_bindings()
+            .len(),
+        2,
+        "quantum 2 binds the mapped main pid before its own prepare: {:?}",
+        fixture.scene.real.scene.coordinator.registry().gaps()
+    );
+    // A third quantum seals again above the disposed position.
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    fixture.published_labeled("seal-above-disposed", None);
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.subject != "pre-binding unrouted calls resolved to other callers"),
+        "an own-cookie match is never noted as another caller's: {:?}",
+        coordinator.registry().gaps()
+    );
+    let main = coordinator.adapter().live_id(std::process::id()).unwrap();
+    assert!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .all(|gap| gap.reason != "joint_seal_h3_loss_history_loss"),
+        "no bound seal degrades on the disposed shed: {:?}",
+        coordinator.registry().gaps()
+    );
+    assert_eq!(
+        coordinator.registry().joint_feeds(),
+        1,
+        "the main caller's Joint feed seals above the fence"
+    );
+    let _ = main;
+    let mut owner_feeds = coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter(|record| record.caller == caller)
+        .map(|record| record.feed.mode());
+    assert_eq!(
+        owner_feeds.next(),
+        Some(crate::semantics_key_use::FeedMode::S1Only),
+        "the owner made no post-binding call, so no birth was offered for it"
+    );
+    assert!(owner_feeds.next().is_none(), "the owner keeps one S1 edge");
+    assert_eq!(
+        coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "semantic calls unrouted")
+            .count(),
+        1,
+        "every bound call still joins S1: {:?}",
+        coordinator.registry().gaps()
+    );
 }
 
 /// The real command installs the machine even when the journal is unlinked.
@@ -4838,7 +5227,7 @@ fn joint_machine_absence_before_appearance_publishes_first_joint() {
             .coordinator
             .registry()
             .joint_feeds(),
-        1
+        2
     );
     assert_eq!(fixture.reduced_for(1), 2);
     assert_eq!(
@@ -4980,7 +5369,7 @@ fn joint_machine_absence_rejects_late_busy_and_affecting_prefix() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            usize::from(boundary == "busy")
+            1 + usize::from(boundary == "busy")
         );
         if boundary == "late" {
             assert!(!before.same_boundary(&fixture.scene.drain.consumption_cut().unwrap()));
@@ -5088,7 +5477,7 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
             .coordinator
             .registry()
             .joint_feeds(),
-        1
+        2
     );
     assert_eq!(fixture.reduced_for(2), 1);
     let table = fixture.machine.retained_births_for_test();
@@ -5104,6 +5493,9 @@ fn joint_machine_absence_selects_exact_subject_with_mixed_ready_and_pending() {
         let witness = table
             .find_ready(&target)
             .expect("the exact actual Ready target must be found across pending B");
+        if witness.candidate.receipt.endpoint().file_slot == 0 {
+            continue;
+        }
         assert_eq!(witness.receipt().domain(), target.bootstrap().domain());
         assert_eq!(witness.candidate.receipt.endpoint().file_slot, 2);
         assert_eq!(witness.receipt(), target.bootstrap());
@@ -5318,7 +5710,7 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
         let coordinator = &fixture.scene.real.scene.coordinator;
         let revision = coordinator.registry().published_revision();
         let h3 = coordinator.reference_h3_audit_state();
-        assert_eq!(coordinator.registry().joint_feeds(), 0);
+        assert_eq!(coordinator.registry().joint_feeds(), 1);
         assert!(
             coordinator
                 .joint_capture()
@@ -5368,7 +5760,7 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
         );
         fixture.published();
         let coordinator = &fixture.scene.real.scene.coordinator;
-        assert_eq!(coordinator.registry().joint_feeds(), 2);
+        assert_eq!(coordinator.registry().joint_feeds(), 3);
         assert_eq!(coordinator.registry().published_revision(), revision + 1);
         assert_eq!(coordinator.reference_h3_audit_state(), (h3.0 + 1, false));
         assert_eq!(
@@ -5395,12 +5787,15 @@ fn joint_machine_absence_two_new_keys_share_first_conversion() {
             2
         );
         let table = fixture.machine.retained_births_for_test();
-        assert_eq!(table.ready_for_test().count(), 2);
+        assert_eq!(table.ready_for_test().count(), 3);
         let mut targets = 0;
         for (target, _) in coordinator.registry().joint_history_targets() {
             let witness = table
                 .find_ready(&target)
                 .expect("each exact original Ready must serve its actual target");
+            if witness.candidate.receipt.endpoint().file_slot == 0 {
+                continue;
+            }
             assert_eq!(witness.receipt(), target.bootstrap());
             assert!(witness.original.in_quantum(original));
             assert!(witness.candidate.quantum == original);
@@ -5472,7 +5867,7 @@ fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            if stale == "epoch" { 1 } else { 0 }
         );
         assert!(
             fixture
@@ -5511,7 +5906,7 @@ fn joint_machine_absence_stale_inputs_end_in_permanent_s1() {
                 .coordinator
                 .registry()
                 .joint_feeds(),
-            0
+            if stale == "epoch" { 1 } else { 0 }
         );
     }
 }
@@ -8485,12 +8880,711 @@ fn joint_machine_linked_break_ends_joint_and_keeps_s1() {
     );
 }
 
-/// A void the pool cannot pay for is all-or-nothing: the lane stays
-/// broken and un-voided (no key refused, no custody dropped), and the
-/// refusal takes the machine's ordinary disposition gate like any other
-/// Idle refusal, so the owner ends Joint by its named S1 fallback.
+/// The ingest-break void abandons every pre-break key: its live sessions
+/// end Uncertain(Loss), its objects retire, its bootstrap voids. Those
+/// effects are the void's own original failure; they ride the next audit
+/// frame as its raw failure (never dropped), so the pre-break key's
+/// consumer sees its session end. S1 still joins the follow-up call.
 #[test]
-fn joint_machine_unpaid_linked_break_void_takes_the_disposition_gate() {
+fn joint_machine_break_void_carries_pre_break_session_ends() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    // A non-contiguous cut breaks the linked stream while ingesting:
+    // no raw disposal, so the pre-break session is still Live when the
+    // Idle tick voids the lane.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    fixture.published_labeled("linked-break-followup", None);
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the published per-key view loses the pre-break key use's join"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the follow-up audit frame took the void's failure as its raw failure"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 1,
+        "S1 joins the follow-up call"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// The void's own slot with the raw slot occupied: after the first break
+/// ends the bound feed, the bound caller's next call is admitted S1-only
+/// and its journal original is refused into the audit frame's raw slot.
+/// A second break's void still rides the next frame in its own slot —
+/// never left pending — and the pre-break key use keeps its lost join.
+/// S1 joins both follow-up calls.
+#[test]
+fn joint_machine_second_break_void_delivers_with_s1only_raw_occupied() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    // First break: the void takes the free raw slot and ends the feed,
+    // so the next call stages S1-only.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    fixture.published_labeled("first-void", None);
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the first void ends the pre-break key use"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the first audit frame took the void"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the pre-break key never resumes Joint"
+    );
+    // Second break: the driver's call re-syncs the stream; the marked
+    // call is pushed only after the re-sync so its journal BEGIN is
+    // ingested (a BEGIN collected while broken is refused) and stages
+    // S1-only into the same frame that takes the second void.
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 4);
+    let mut resynced_second = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the second follow-up collect never refuses");
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced_second = true;
+            break;
+        }
+    }
+    assert!(
+        resynced_second,
+        "the second collect re-syncs the linked stream"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the second void awaits its audit frame"
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 5);
+    fixture.published_labeled("second-void-with-s1only", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "one publication takes the second void"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the audit frame took the second void despite the occupied raw slot"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        1,
+        "the pre-break key use keeps its lost join"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "no new Joint feed is born from the S1-only calls"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 2,
+        "S1 joins both follow-up calls"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// A disposed publish with a void already pending completes sanely: the
+/// counted negative publishes, the feed ends with its named gaps, no
+/// void is left pending, and a follow-up proves S1 continues past the
+/// break. The frame twin below pins the disposed take itself: inside
+/// the machine an ingested frame can also take a still-pending void,
+/// so only a single-acquire frame proves which slot took it.
+#[test]
+fn joint_machine_disposed_publish_with_pending_void_completes() {
+    use crate::semantics_objects::{ObjectEffect, ObjectGap, SessionEnd, SessionState};
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("pre-break-use", None);
+    let join_lost = |fixture: &MachineScene| {
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .keyuse_for_test()
+            .evidence()
+            .join_lost
+    };
+    assert_eq!(join_lost(&fixture), 0, "the pre-break key use is open");
+    let live: Vec<_> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture()
+        .model()
+        .project()
+        .sessions
+        .iter()
+        .filter(|session| session.state == SessionState::Live)
+        .map(|session| session.id)
+        .collect();
+    assert_eq!(live.len(), 1, "the primed key holds one live session");
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    // No driver call: the empty loop still voids and re-syncs, and leaves
+    // no leftover record behind for a pre-disposal ingested audit.
+    let mut carried = None;
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let owner = fixture.scene.real.scene.coordinator.joint_capture();
+        if carried.is_none()
+            && let Some(failure) = owner.pending_void_for_test()
+        {
+            carried = Some(failure.effects.effects.iter().any(|effect| {
+                matches!(
+                    effect,
+                    ObjectEffect::SessionEnded {
+                        session,
+                        end: SessionEnd::Uncertain(ObjectGap::Loss),
+                    } if *session == live[0]
+                )
+            }));
+        }
+        let adapter = owner.adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced = true;
+            break;
+        }
+    }
+    assert!(resynced, "the follow-up collect re-syncs the linked stream");
+    assert_eq!(
+        carried,
+        Some(true),
+        "the void keeps the pre-break session's Uncertain(Loss) end for the next frame"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_some(),
+        "the void awaits the malformed publish"
+    );
+    let revision = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .published_revision();
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("break-with-void-pending", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .published_revision(),
+        revision + 1,
+        "the break quantum publishes its counted negative"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_feeds(),
+        0,
+        "the break ends the Joint feed"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "no void is left pending across the disposed publish"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        0,
+        "nothing is staged to retire: the break publish carries no S1 call"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter()
+            .stream_broken_for_test()
+            || fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .joint_capture()
+                .adapter()
+                .invalidated_for_test(),
+        "the malformed disposal ran"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "semantic receipt refused".to_string(),
+            "partition".to_string()
+        )),
+        "the malformed negative stays disclosed: {gaps:?}"
+    );
+    let before: u64 = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .instance_semantic_edges()
+        .filter_map(|record| record.api_returns)
+        .sum();
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let mut resynced_followup = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the follow-up collect never refuses");
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        if !(adapter.stream_broken_for_test() || adapter.invalidated_for_test()) {
+            resynced_followup = true;
+            break;
+        }
+    }
+    assert!(
+        resynced_followup,
+        "the follow-up collect re-syncs past the break"
+    );
+    fixture.published_labeled("disposed-break-followup", None);
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .instance_semantic_edges()
+            .filter_map(|record| record.api_returns)
+            .sum::<u64>(),
+        before + 1,
+        "S1 joins the follow-up call"
+    );
+    let gaps: Vec<(String, String)> = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+        .collect();
+    assert!(
+        gaps.contains(&(
+            "Joint key operations unavailable; retained S1".to_string(),
+            "joint_seal_malformed_history_loss".to_string()
+        )),
+        "Joint ends with its named gap: {gaps:?}"
+    );
+    assert_eq!(
+        join_lost(&fixture),
+        0,
+        "no delayed retirement: the void's session end had no open association"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// The disposed frame's void slot, precisely: with a pending ingest-break
+/// void and an occupied raw slot, the single disposed audit takes the
+/// void into its own slot ahead of the raw failure. (A disposal on an
+/// invalidated lane reports the invalidation rather than the malformed
+/// content, so the raw marker here is occupancy plus order, not the
+/// Malformed label; only a resync — which the machine twin above
+/// covers — clears the lane first.) Old code never took the void on a
+/// disposed frame, so it stays pending there.
+#[test]
+fn joint_disposed_audit_takes_pending_void_with_raw_occupied() {
+    use crate::semantics_objects::journal::JournalGap;
+    use crate::semantics_objects::journal::joint_driver::RawDisposeReason;
+    let mut fixture = CanonicalFanoutScene::prior_sealed();
+    let fault = DisposedNativeFault(fixture.scene.real.h0.clone());
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    let raw = fixture.scene.prepare(0);
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .joint_capture_mut()
+        .adapter_mut()
+        .break_stream_for_test();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture_mut()
+            .void_ingest_break()
+            .expect("the idle tick voids the broken lane"),
+        "the void pends before the disposed audit"
+    );
+    let disposed = raw
+        .dispose_without_ingest(
+            fixture.scene.real.scene.coordinator.joint_capture_mut(),
+            &fixture.scene.producers,
+            RawDisposeReason::TerminalLoss,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("malformed raw disposal: {reason:?}"));
+    assert!(
+        disposed.failure().is_some(),
+        "the disposed frame's raw slot is occupied"
+    );
+    fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .dispose_prepared_claims_s1();
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .finish_prepared_semantic_batch(&fixture.scene.real.lane)
+    );
+    let frame = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .audit_disposed_quantum(
+            disposed,
+            &fixture.scene.producers,
+            &fixture.attached,
+            &fault,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("disposed audit with pending void: {reason:?}"));
+    let failures: Vec<_> = frame.original_failures_for_test().collect();
+    assert_eq!(
+        failures.len(),
+        3,
+        "void, raw and collected failures all ride the frame"
+    );
+    assert!(
+        !failures[0].effects.effects.is_empty(),
+        "the first slot carries the void's abandonment"
+    );
+    assert!(
+        failures
+            .iter()
+            .all(|failure| failure.gap == JournalGap::AdapterInvalidated),
+        "disposal and collection on the invalidated lane report the invalidation"
+    );
+    assert!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .pending_void_for_test()
+            .is_none(),
+        "the disposed audit took the pending void"
+    );
+}
+
+/// A void the pool cannot pay for is all-or-nothing and retried: the
+/// lane stays broken and un-voided (no key refused, no custody dropped)
+/// while the pool is short, every Idle tick yields instead of refusing,
+/// so the machine never takes the disposition gate (a Joint fault never
+/// stops S1). Once the pool can pay, the next tick voids, re-syncs and
+/// S1 joins the follow-up call.
+#[test]
+fn joint_machine_unpaid_linked_break_void_retries_until_paid() {
     let mut fixture = MachineScene::new(1);
     fixture.prime(1);
     fixture.scene.drain.source_mut().push_record(vec![0; 17]);
@@ -8532,27 +9626,119 @@ fn joint_machine_unpaid_linked_break_void_takes_the_disposition_gate() {
     assert!(room >= bound, "the pool could pay before the hold");
     let hold = reserve.reserve(room - (bound - 1)).unwrap();
     fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
-    let mut refused = None;
-    for _ in 0..64 {
+    for _ in 0..16 {
         let result = fixture.service(1);
+        assert_eq!(result.err(), None, "an unpaid void yields, never refuses");
         assert_eq!(pending(&fixture), (true, false), "no partial void");
-        if let Err(reason) = result {
-            refused = Some(reason);
+    }
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        None,
+        "the unpaid void never takes the disposition gate"
+    );
+    assert_eq!(api_returns(&fixture), before, "nothing joins while unpaid");
+    drop(hold);
+    let mut resynced = false;
+    for _ in 0..64 {
+        fixture
+            .service(1)
+            .expect("the paid void and its re-sync never refuse");
+        if pending(&fixture) == (false, false) {
+            resynced = true;
             break;
         }
     }
-    assert_eq!(refused, Some(SemanticRefusal::Unavailable));
-    assert_eq!(
-        fixture.machine.disposition_reason(),
-        Some(SemanticRefusal::Unavailable),
-        "the unpaid void takes the ordinary disposition gate"
-    );
+    assert!(resynced, "the retried void applies once the pool can pay");
+    fixture.published_labeled("unpaid-void-followup", None);
     assert_eq!(
         api_returns(&fixture),
-        before,
-        "nothing joins before the disposition"
+        before + 1,
+        "S1 joins the follow-up call"
     );
-    drop(hold);
+}
+
+/// The unpaid-void wait is bounded. Here nothing outside the capture
+/// holds the pool: its limit sits just below the void's bound above the
+/// capture's own charges (the staged custody, model and ledger state the
+/// void would release). The void yields for the bounded number of Idle
+/// ticks, never applies partially, then takes the named disposition path
+/// instead of stalling collection indefinitely.
+#[test]
+fn joint_machine_unpaid_void_wait_is_bounded_by_the_lanes_own_custody() {
+    let mut fixture = MachineScene::new(1);
+    fixture.prime(1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.scene.drain.source_mut().push_record(vec![0; 17]);
+    fixture.published_labeled("linked-break", None);
+    let pending = |fixture: &MachineScene| {
+        let adapter = fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .joint_capture()
+            .adapter();
+        (
+            adapter.stream_broken_for_test(),
+            adapter.invalidated_for_test(),
+        )
+    };
+    assert_eq!(pending(&fixture), (true, false), "the void is still due");
+    let coordinator = &fixture.scene.real.scene.coordinator;
+    let bound = coordinator
+        .joint_capture()
+        .void_storage_bound_for_test()
+        .expect("finite void bound");
+    let charged = coordinator
+        .registry()
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    coordinator
+        .registry()
+        .clamp_semantic_resource_room_for_test(bound - 1);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 3);
+    let cap = crate::inventory_semantics::MAX_UNPAID_VOID_YIELDS as usize;
+    let mut yields = 0;
+    let mut refused = None;
+    // A fixed window well past the bound: an unbounded wait never ends.
+    for _ in 0..1024 {
+        let result = fixture.service(1);
+        assert_eq!(pending(&fixture), (true, false), "no partial void");
+        match result {
+            Ok(_) => yields += 1,
+            Err(reason) => {
+                refused = Some(reason);
+                break;
+            }
+        }
+    }
+    assert!(
+        charged
+            <= fixture
+                .scene
+                .real
+                .scene
+                .coordinator
+                .registry()
+                .semantic_resource_snapshot()
+                .charged_bytes,
+        "the capture's own charges still fill the pool"
+    );
+    assert_eq!(
+        refused,
+        Some(SemanticRefusal::Unavailable),
+        "the wait ends on the named disposition path"
+    );
+    // Not every service reaches the Idle void tick, so the services that
+    // returned Ok bound the machine's Idle yields from above only.
+    assert!(
+        yields >= cap,
+        "{yields} services before the disposition (bound {cap} Idle yields)"
+    );
+    assert_eq!(
+        fixture.machine.disposition_reason(),
+        Some(SemanticRefusal::Unavailable)
+    );
 }
 
 /// A mid-call call straddling an unlinked break still completes:
@@ -20310,8 +21496,9 @@ fn exercise_s1only_sibling_raw(sibling_first: bool, loss_moment: SiblingLossMome
             .registry()
             .keyuse_for_test()
             .aggregates()
-            .is_empty(),
-        "neither colliding provider receives object proof after disclosed loss"
+            .values()
+            .all(|counters| counters.completed == 0 && counters.active == 0),
+        "neither colliding provider receives completed object proof after disclosed loss"
     );
     let roles = fixture
         .scene
@@ -23534,4 +24721,251 @@ fn joint_s1only_preexisting_image_ordinary_return_delivery_reproducer() {
     );
     fixture.scene.assert_claims(&[]);
     finish_resource_subject_operation(&mut fixture, child.id(), caller);
+}
+
+/// The live Firefox late-attach shape (fedora, 2026-11-06): a caller
+/// born attach-observed whose only call inside the audited frontier
+/// predates its birth cut, and which then stays idle. Its fresh seal
+/// can only be grounded by its own future calls, so the frame must treat
+/// it as waiting for input: the publication completes, nothing latches,
+/// and the lane-wide no-progress bound never trips even past 6 s. The
+/// caller's next real call then reduces through the lane.
+#[test]
+fn joint_machine_idle_fresh_birth_waits_as_future_input() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    fixture.native.predating_births = true;
+    fixture.push_quiet();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::AttachObserved)),
+        "precondition: the caller is born attach-observed: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the idle fresh birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    // Past the 6 s bound with the caller still idle: no trip, no latch.
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(7),
+    ));
+    for n in 0..64 {
+        if let Err(reason) = fixture.service(1) {
+            panic!("idle poll {n} past the bound must not stop the lane: {reason:?}");
+        }
+    }
+    assert!(audit_no_progress_gaps(&fixture).is_empty(), "no stop gap");
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
+    // The browser signs at last: its own call reduces through the lane.
+    let before = fixture.reduced_for(0);
+    fixture.scene.push(std::process::id(), 0, "C_SignInit", 2);
+    fixture.published_labeled("idle-then-sign", None);
+    assert_eq!(
+        fixture.reduced_for(0),
+        before + 1,
+        "the caller's later call reduces exactly once"
+    );
+    assert_eq!(fixture.machine.disposition_reason(), None);
+}
+
+/// An idle fresh birth that never calls again finishes cleanly: the
+/// waiting Future consumer disposes with the frame, the finish
+/// publishes with no no-progress gap, no trip and no disposition, the
+/// reduced count is unchanged and nothing was ever staged.
+#[test]
+fn joint_machine_idle_fresh_birth_finish_with_waiting_caller_is_clean() {
+    use crate::discovery::engine::inventory_coordinator::JointCommitProgress;
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    fixture.native.predating_births = true;
+    fixture.push_quiet();
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::AttachObserved)),
+        "precondition: the caller is born attach-observed: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the idle fresh birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    let before = fixture.reduced_for(0);
+    let target = {
+        let table = fixture.machine.retained_births_for_test();
+        let mut found = None;
+        for (candidate, _) in fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_history_targets()
+        {
+            if let Some(witness) = table.find_ready(&candidate)
+                && witness.candidate.receipt.endpoint().file_slot == 0
+            {
+                found = Some(candidate);
+                break;
+            }
+        }
+        found.expect("the idle caller has a ready Joint target before finish")
+    };
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_staged_count(&target),
+        Some(0),
+        "the idle caller stages nothing before finish"
+    );
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    let mut finish_published = false;
+    for _ in 0..512 {
+        match fixture.poll_finish(1).unwrap() {
+            JointCommitProgress::Published(_) => {
+                finish_published = true;
+                break;
+            }
+            JointCommitProgress::Pending => {}
+        }
+    }
+    assert!(
+        finish_published,
+        "finish publishes with the idle caller still waiting: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    assert!(
+        no_progress_gaps(&fixture).is_empty(),
+        "no joint finish no-progress gap: {:?}",
+        no_progress_gaps(&fixture)
+    );
+    assert!(
+        audit_no_progress_gaps(&fixture).is_empty(),
+        "no joint audit no-progress gap: {:?}",
+        audit_no_progress_gaps(&fixture)
+    );
+    assert_eq!(fixture.machine.finish_no_progress_trip_for_test(), None);
+    assert!(fixture.scene.real.lane.is_finished());
+    assert_eq!(
+        fixture.reduced_for(0),
+        before,
+        "finish preserves the idle caller reduced count"
+    );
+    assert_eq!(
+        fixture
+            .scene
+            .real
+            .scene
+            .coordinator
+            .registry()
+            .joint_staged_count(&target),
+        Some(0),
+        "the idle caller has nothing staged to count"
+    );
+}
+
+/// Observer-first twin of the idle fresh birth: the caller is born
+/// from its exec marker (not a late attach) but is seen only through
+/// a non-key record and then stays idle. Its fresh seal has no staged
+/// history of its own, so it must wait as future input exactly like
+/// the late-attach case: the frame publishes and the lane-wide bound
+/// never trips.
+#[test]
+fn joint_machine_observer_first_exec_birth_idle_waits_as_future_input() {
+    use crate::inventory_semantics::JointServiceProgress;
+    use crate::semantics_objects::journal::BirthKind;
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    // predating_births stays false: the exec stamp equals the sealed
+    // generation, so a marked birth is ExecMarker.
+    {
+        let mut held = fixture.scene.real.h0.0.borrow_mut();
+        held.io
+            .enqueue(std::process::id(), 0, "C_CreateObject", 0, 0);
+        let mut record = held.io.script.records.pop_back().unwrap();
+        record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+        record.base.event.duration_ns = 1;
+        record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        assert_ne!(record.base.event.pid_tgid as u32, 0);
+        assert_eq!(
+            record.base.event.target_function,
+            p11scope_ebpf_common::FUNCTION_NONE
+        );
+        let bytes = crate::events::record_bytes(&record.base);
+        drop(held);
+        fixture.scene.drain.source_mut().push_record(bytes);
+    }
+    let mut published = false;
+    for _ in 0..512 {
+        match fixture.service(1) {
+            Ok(JointServiceProgress::Published) => {
+                published = true;
+                break;
+            }
+            Ok(_) => {}
+            Err(reason) => panic!("the idle caller must never refuse the lane: {reason:?}"),
+        }
+    }
+    assert!(
+        fixture
+            .native
+            .birth_outcomes
+            .iter()
+            .any(|(file, result)| *file == 0 && *result == Ok(BirthKind::ExecMarker)),
+        "precondition: the caller is born from its exec marker: {:?}",
+        fixture.native.birth_outcomes
+    );
+    assert!(
+        published,
+        "the observer-first idle birth waits as future input; the frame still publishes: {:?}",
+        fixture.machine.diagnostic_snapshot_for_test()
+    );
+    fixture.machine.set_finish_no_progress_since_for_test(Some(
+        std::time::Instant::now() - std::time::Duration::from_secs(7),
+    ));
+    for n in 0..64 {
+        if let Err(reason) = fixture.service(1) {
+            panic!("idle poll {n} past the bound must not stop the lane: {reason:?}");
+        }
+    }
+    assert!(audit_no_progress_gaps(&fixture).is_empty(), "no stop gap");
+    assert_eq!(fixture.machine.audit_no_progress_trip_for_test(), None);
+    assert_eq!(fixture.machine.disposition_reason(), None);
 }

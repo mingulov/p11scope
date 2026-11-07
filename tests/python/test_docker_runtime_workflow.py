@@ -104,7 +104,7 @@ class WorkflowTests(unittest.TestCase):
             observer = work / "p11scope"
             observer.write_text("#!" + sys.executable + "\n" + '''
 import os, sys
-assert sys.argv[1:] == ["doctor"]
+assert sys.argv[1:] == ["doctor", "-v"]
 scenario = os.environ["SCENARIO"]
 rows = [
     "uprobe-multi attach (own libc) ... ok scratch program loaded; self-link attached and detached (delivery unmeasured)",

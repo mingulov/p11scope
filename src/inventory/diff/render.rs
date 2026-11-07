@@ -14,6 +14,160 @@ fn optional_number(value: Option<u64>) -> String {
     value.map_or_else(|| "unknown".to_owned(), |number| number.to_string())
 }
 
+/// Concise summary: the comparison counts, the top changed
+/// applications, and the fixed coverage caveats — without the per-record
+/// flood. Detail stays in [`render_text`] under `-v`; JSON keeps
+/// everything.
+pub(super) fn render_concise(report: &DiffReport, out: &mut dyn Write) -> io::Result<()> {
+    let mut human = Human(out);
+    let summary = &report.summary;
+    human.line(
+        0,
+        &format!(
+            "Inventory comparison: {} application group{} changed",
+            summary.application_groups_changed,
+            plural(summary.application_groups_changed)
+        ),
+    )?;
+    human.line(
+        2,
+        &format!(
+            "{} application group{} compared; {} common module content{}",
+            summary.application_groups_compared,
+            plural(summary.application_groups_compared),
+            summary.content_both,
+            plural(summary.content_both)
+        ),
+    )?;
+    human.line(
+        2,
+        &format!(
+            "{} new module content{} observed; {} content{} not observed after",
+            summary.content_after_only,
+            plural(summary.content_after_only),
+            summary.content_before_only,
+            plural(summary.content_before_only)
+        ),
+    )?;
+    human.line(
+        2,
+        &format!(
+            "{} module path{} changed; {} unresolved observation{}",
+            summary.module_paths_changed,
+            plural(summary.module_paths_changed),
+            summary.unresolved_observations,
+            plural(summary.unresolved_observations)
+        ),
+    )?;
+    if report.application_changes.is_empty()
+        && report.module_path_changes.is_empty()
+        && report
+            .module_contents
+            .iter()
+            .all(|row| row.changes.is_empty())
+    {
+        human.line(0, "No differences in the compared inventory observations")?;
+    } else {
+        const SHOWN: usize = 5;
+        human.blank()?;
+        if !report.application_changes.is_empty() {
+            human.line(0, "Top changed applications:")?;
+            for row in report.application_changes.iter().take(SHOWN) {
+                let path = &report.comparison.application_paths[row.key.exe_path_ref.0];
+                human.line(2, path)?;
+                human.line(
+                    4,
+                    &format!("{}; {}", presence(row.presence), row.changes.join(", ")),
+                )?;
+            }
+            let more = report.application_changes.len().saturating_sub(SHOWN);
+            if more > 0 {
+                human.line(2, &format!("and {more} more (--json has every item)"))?;
+            }
+        }
+        if !report.module_path_changes.is_empty() {
+            human.line(
+                2,
+                &format!(
+                    "{} module path{} changed (--json lists each)",
+                    report.module_path_changes.len(),
+                    plural(report.module_path_changes.len())
+                ),
+            )?;
+        }
+        if report.application_changes.is_empty() {
+            let changed = report
+                .module_contents
+                .iter()
+                .filter(|row| !row.changes.is_empty())
+                .count();
+            if changed > 0 {
+                human.line(
+                    2,
+                    &format!(
+                        "{changed} module content change{} (--json lists each)",
+                        plural(changed)
+                    ),
+                )?;
+            }
+        }
+    }
+    render_caveats(&mut human)?;
+    render_plain_limitations(&mut human, &report.limitations)?;
+    if crate::cli::text_verbosity() != crate::cli::TextVerbosity::Quiet {
+        human.line(0, crate::cli::VERBOSE_HINT)?;
+    }
+    Ok(())
+}
+
+/// Fixed comparison caveats already stated in prose; their machine codes
+/// never reach text (JSON keeps `limitations`).
+const FIXED_LIMITATION_CODES: &[&str] = &[
+    "absence_is_not_removal",
+    "application_groups_use_recorded_paths",
+    "counts_are_independent_windows",
+    "host_boot_continuity_unknown",
+    "physical_continuity_unknown",
+    "process_continuity_unknown",
+    "scope_completeness_unknown",
+    "semantic_details_not_compared",
+];
+
+fn render_caveats(human: &mut Human) -> io::Result<()> {
+    human.blank()?;
+    human.line(
+        0,
+        "Coverage/identity: scope completeness and host/boot continuity are unknown.",
+    )?;
+    human.line(
+        0,
+        "Cross-snapshot process and physical continuity are unknown.",
+    )?;
+    human.line(
+        0,
+        "Counts describe independent observation windows; no count delta is computed.",
+    )?;
+    human.line(0, "Not observed after does not prove removal.")?;
+    human.line(0, "Application groups use recorded paths.")?;
+    human.line(
+        0,
+        "Instance and detailed semantic changes are not compared.",
+    )?;
+    Ok(())
+}
+
+/// Snapshot-specific limitations in plain words: the fixed codes stay out
+/// (the caveats above already state them), anything else prints verbatim.
+fn render_plain_limitations(human: &mut Human, limitations: &[String]) -> io::Result<()> {
+    for limitation in limitations {
+        if FIXED_LIMITATION_CODES.contains(&limitation.as_str()) {
+            continue;
+        }
+        human.line(2, &format!("Note: {limitation}"))?;
+    }
+    Ok(())
+}
+
 /// Rendering only borrows the pooled report. References never reach the human
 /// output: labels, physical descriptions and separate observations do.
 pub(super) fn render_text(report: &DiffReport, out: &mut dyn Write) -> io::Result<()> {
@@ -251,28 +405,8 @@ pub(super) fn render_text(report: &DiffReport, out: &mut dyn Write) -> io::Resul
             human.line(2, &format!("Reasons: {}", row.reasons.join(", ")))?;
         }
     }
-    human.blank()?;
-    human.line(
-        0,
-        "Coverage/identity: scope completeness and host/boot continuity are unknown.",
-    )?;
-    human.line(
-        0,
-        "Cross-snapshot process and physical continuity are unknown.",
-    )?;
-    human.line(
-        0,
-        "Counts describe independent observation windows; no count delta is computed.",
-    )?;
-    human.line(0, "Not observed after does not prove removal.")?;
-    human.line(0, "Application groups use recorded paths.")?;
-    human.line(
-        0,
-        "Instance and detailed semantic changes are not compared.",
-    )?;
-    for limitation in &report.limitations {
-        human.line(2, &format!("Limitation: {limitation}"))?;
-    }
+    render_caveats(&mut human)?;
+    render_plain_limitations(&mut human, &report.limitations)?;
     Ok(())
 }
 
@@ -463,8 +597,8 @@ impl Human<'_> {
             self.line(
                 2,
                 &format!(
-                    "Unbound use: {} rows; first {}",
-                    unbound.rows, unbound.first_ns
+                    "Unbound use: {} rows, {} entries; first {}",
+                    unbound.rows, unbound.entries, unbound.first_ns
                 ),
             )?;
             for (reason, rows) in &unbound.reasons {

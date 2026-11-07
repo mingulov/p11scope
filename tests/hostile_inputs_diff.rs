@@ -41,6 +41,8 @@ fn run(
         after: after.to_path_buf(),
         json,
         out,
+        verbose: false,
+        quiet: false,
     };
     let mut output = Vec::new();
     let result = run_with_writer(&args, &mut output).map_err(|error| format!("{error:#}"));

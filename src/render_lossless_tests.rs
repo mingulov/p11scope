@@ -25,7 +25,7 @@ use crate::inventory_diagnostics::{
 use crate::inventory_diff::run_with_writer;
 use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{EVENT_SCHEMA, EventWriter, edge_payload};
-use crate::inventory_present::{Activity, Presentation, render_snapshot};
+use crate::inventory_present::{Activity, Presentation, render_snapshot_with_verbosity};
 use crate::key_operation_projection::OBSERVATIONS_VERSION;
 use crate::metrics::SlotReport;
 use crate::plan::AttachPlan;
@@ -448,7 +448,7 @@ fn presentation_revision_agrees_across_all_lanes() {
     assert_eq!(document["callers"][0]["pid"], expected_pid);
 
     // Text lane: the same caller, pid and count in words.
-    let snapshot = render_snapshot(&view);
+    let snapshot = render_snapshot_with_verbosity(&view, crate::cli::TextVerbosity::Verbose);
     assert!(
         snapshot.contains(expected_caller.as_str()),
         "text snapshot: {snapshot}"
@@ -550,6 +550,8 @@ fn diff_report_schema() -> String {
         after,
         json: true,
         out: None,
+        verbose: false,
+        quiet: false,
     };
     let mut out = Vec::new();
     let code = run_with_writer(&args, &mut out).unwrap();

@@ -35,6 +35,8 @@ fn work_dir(name: &str) -> PathBuf {
 fn run_args(command: &[&str]) -> RunArgs {
     RunArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         exclude_modules: vec![],
@@ -55,6 +57,7 @@ fn run_args(command: &[&str]) -> RunArgs {
         pause: PausePolicy::Never,
         attach_backend: BackendSelection::default(),
         kill_on_timeout: false,
+        user: None,
         command: command.iter().map(std::ffi::OsString::from).collect(),
     }
 }

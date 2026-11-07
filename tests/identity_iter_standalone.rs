@@ -181,12 +181,12 @@ const IDENTITY_INPUTS: [(&str, &[u8], &str); 3] = [
     (
         "vma_identity.c",
         include_bytes!("../crates/ebpf/native/vma_identity.c"),
-        "68551553674bb8f2aa8e317c5b1085f6c6342fdf4c472cea042f0d992e159373",
+        "bcfc9b5627b4c4612902915149fb5dfa4e883611fcb7d4779bf473b0f73de64c",
     ),
     (
         "vma_identity.h",
         include_bytes!("../crates/ebpf/native/vma_identity.h"),
-        "c006f48b0e45cbe5e9c6251054b05e16e396959f7b49674f980156eb37bce685",
+        "0119f1371e0149202580259e0ebbde98b2f4a434a8d58e5f02ef2f40adc8d318",
     ),
     (
         "uapi_check.c",
@@ -532,8 +532,10 @@ fn path_dirs_and_candidate_modes_close_the_chmod_window() {
 /// fresh generation after CONFLICT → clean OK; (e) straddling VMA →
 /// BAD_SHAPE; (f) misaligned/oversized/past-slots/zero-inode shapes →
 /// BAD_SHAPE (+ anonymous VMAs silently skipped); (g) contained VMA →
-/// OK. Unprivileged and permanent; the strict verifier gate still proves
-/// the BPF object loads (re-run as root, see the report).
+/// OK; (h) a non-100 observed tgid installs under the zero wildcard,
+/// is skipped under a mismatched observer, and the observer itself
+/// still installs. Unprivileged and permanent; the strict verifier gate
+/// still proves the BPF object loads (re-run as root, see the report).
 #[test]
 fn anchor_host_harness_replay_and_arena_behavior() {
     let native = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("crates/ebpf/native");
@@ -646,6 +648,16 @@ fn anchor_host_harness_replay_and_arena_behavior() {
             &[
                 "ASSERT ok_on_contained_install",
                 "ASSERT contained_vma_installed",
+            ][..],
+        ),
+        (
+            "observer-tgid-gate-and-wildcard",
+            &[
+                "ASSERT wildcard_installs_non100_tgid",
+                "ASSERT wildcard_installs_entry",
+                "ASSERT mismatch_emits_nothing",
+                "ASSERT mismatch_installs_nothing",
+                "ASSERT match_installs_observer",
             ][..],
         ),
     ] {

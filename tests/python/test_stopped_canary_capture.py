@@ -924,11 +924,11 @@ root = pathlib.Path(sys.argv[0]).parent
 control = json.loads((root / 'owned-control.json').read_text())
 case = control['case']
 args = sys.argv[1:]
-assert len(args) == 19 and args[:2] == ['run', '--manifest']
-assert args[3:9] == ['--mode', 'metrics', '--pause', 'never', '--duration', '35']
-assert args[9] == '-o' and args[11] == '--'
-assert args[14] == 'matrix'
-ready, done, finish = (pathlib.Path(args[i]) for i in (15, 17, 18))
+assert len(args) == 20 and args[:3] == ['run', '-v', '--manifest']
+assert args[4:10] == ['--mode', 'metrics', '--pause', 'never', '--duration', '35']
+assert args[10] == '-o' and args[12] == '--'
+assert args[15] == 'matrix'
+ready, done, finish = (pathlib.Path(args[i]) for i in (16, 18, 19))
 def marker():
     print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C', flush=True)
     print('fixture — privacy=aggregate-only', flush=True)
@@ -960,7 +960,7 @@ if case == 'wrong_executable':
     ready.write_text(json.dumps(dict(schema='p11scope/canary-roster/v1', mode='matrix', pid=child.pid,
         tasks=[dict(pid=child.pid, tid=child.pid, generation=generation, role='leader', call_index=None)])))
 else:
-    child = subprocess.Popen(args[12:])
+    child = subprocess.Popen(args[13:])
     record(child.pid)
 end = time.monotonic() + 3
 while not ready.exists():
@@ -1002,7 +1002,7 @@ elif case == 'handoff_child_early_exit':
     child.terminate()
     child.wait()
 if case != 'handoff_missing':
-    pathlib.Path(args[10]).write_text(json.dumps({'evidence': facts}))
+    pathlib.Path(args[11]).write_text(json.dumps({'evidence': facts}))
 sys.exit(7 if case == 'observer_bad_exit' else 0)
 '''
 
@@ -1024,7 +1024,7 @@ def owned_config(pid, directory, case, program, provider):
         **{name: Path(f'{prefix}.{suffix}') for name, suffix in (
             ('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
             ('observer_log', 'observer.log'), ('workload_log', 'observer.log'))})
-    config.observer_args = [str(executable), 'run', '--manifest', str(directory / 'matrix-manifest.json'),
+    config.observer_args = [str(executable), 'run', '-v', '--manifest', str(directory / 'matrix-manifest.json'),
         '--mode', 'metrics', '--pause', 'never', '--duration', '35', '-o',
         str(prefix) + '.output', '--', program, provider, 'matrix', str(config.ready),
         str(config.go), str(config.done), str(config.finish)]
@@ -1427,6 +1427,112 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
             _, error = self.read_ring(name, category)
             error.continuity_category = 'coverage-failed'
             self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
+
+
+class IdentityMapPartitionTests(unittest.TestCase):
+    """The owned observer preloads the witness identity session: five
+    lowercase maps beside the 44 capture maps. The partition holds the
+    five exact shapes out of capture acquisition, requires all five on
+    owned lanes (the preload is mandatory there), and requires none on
+    external lanes (a witness load mid-capture is a loud failure, never
+    silently absorbed). Shapes mirror crates/ebpf/native/vma_identity.c;
+    flags are bpftool-observed (the kernel does not echo BPF_F_WRONLY).
+    """
+
+    SHAPES = {
+        'anchors': ('hash', 8, 16, 1024, (0, 16)),
+        'anchor_slots': ('array', 4, 8, 1024, (0, 16)),
+        'anchor_observed': ('array', 4, 8, 1024, (0, 16)),
+        'config': ('array', 4, 40, 1, (0,)),
+        'scope_bitmap': ('array', 4, 8, 65536, (1024,)),
+    }
+
+    def row(self, name, flags=None, **override):
+        kind, key, value, entries, accepted = self.SHAPES[name]
+        row = {'id': 1000 + len(name), 'name': name, 'type': kind,
+               'bytes_key': key, 'bytes_value': value, 'max_entries': entries,
+               'map_flags': accepted[0] if flags is None else flags,
+               'bytes_memlock': 64, 'frozen': 0, 'btf_id': 7}
+        row.update(override)
+        return row
+
+    def test_owned_accepts_exact_five_and_nothing_else(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        rows.append({'id': 2000, 'name': 'EVENTS', 'type': 'ringbuf'})
+        kept, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual({row['name'] for row in identity}, set(self.SHAPES))
+        self.assertEqual([row['name'] for row in kept], ['EVENTS'])
+
+    def test_owned_requires_all_five(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        for missing in self.SHAPES:
+            with self.subTest(missing=missing):
+                with self.assertRaises(capture.CaptureError):
+                    capture.partition_identity_maps(
+                        [row for row in rows if row['name'] != missing], 'owned')
+
+    def test_owned_rejects_near_miss_shapes(self):
+        fields = {'type': 'hash', 'bytes_key': 8, 'bytes_value': 16,
+                  'max_entries': 2048, 'map_flags': 8}
+        for name in self.SHAPES:
+            for field, value in fields.items():
+                if self.row(name)[field] == value:
+                    continue
+                with self.subTest(name=name, field=field):
+                    mutated = [self.row(other) for other in self.SHAPES if other != name]
+                    bad = self.row(name, **{field: value})
+                    mutated.append(bad)
+                    with self.assertRaises(capture.CaptureError):
+                        capture.partition_identity_maps(mutated, 'owned')
+                    kept, _ = capture.partition_identity_maps([bad], 'external')
+                    self.assertEqual(kept, [bad])
+
+    def test_wronly_flag_echo_variants(self):
+        for name in ('anchors', 'anchor_slots', 'anchor_observed'):
+            rows = [self.row(other) for other in self.SHAPES if other != name]
+            rows.append(self.row(name, flags=16))
+            _, identity = capture.partition_identity_maps(rows, 'owned')
+            self.assertEqual(len(identity), 5, name)
+        for name, flags in (('config', 16), ('scope_bitmap', 0)):
+            rows = [self.row(other) for other in self.SHAPES if other != name]
+            rows.append(self.row(name, flags=flags))
+            with self.subTest(name=name, flags=flags):
+                with self.assertRaises(capture.CaptureError):
+                    capture.partition_identity_maps(rows, 'owned')
+
+    def test_flags_alias_matches_normalize(self):
+        rows = [self.row(name) for name in self.SHAPES if name != 'config']
+        aliased = self.row('config')
+        aliased['flags'] = aliased.pop('map_flags')
+        rows.append(aliased)
+        _, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual(len(identity), 5)
+        rows = [self.row(name) for name in self.SHAPES if name != 'anchors']
+        conflicted = self.row('anchors')
+        conflicted['flags'] = 8
+        rows.append(conflicted)
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps(rows, 'owned')
+
+    def test_external_requires_none(self):
+        rows = [{'id': 2000, 'name': 'EVENTS', 'type': 'ringbuf'}]
+        kept, identity = capture.partition_identity_maps(rows, 'external')
+        self.assertEqual((kept, identity), (rows, []))
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps(rows + [self.row('config')], 'external')
+
+    def test_rejects_unknown_origin(self):
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps([], 'matrix')
+
+    def test_duplicate_identity_shape_stays_in_capture(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        duplicate = self.row('config')
+        duplicate['id'] = 4242
+        rows.append(duplicate)
+        kept, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual(len(identity), 5)
+        self.assertEqual(kept, [duplicate])
 
 
 class StoppedCanaryCaptureTests(unittest.TestCase):
@@ -2008,23 +2114,27 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         self.probe('complete_metrics')
 
     def test_owned_argv_rejects_options_overrides_and_mismatched_paths_before_launch(self):
-        changes = {'command': (1, 'profile'), 'manifest': (3, '/tmp/other-manifest.json'),
-            'mode': (5, 'profile'), 'pause': (7, 'always'), 'duration': (9, '6'),
-            'output': (11, '/tmp/other-output'),
-            'separator': (12, '--pid'), 'provider': (14, 'relative-provider.so'),
-            'matrix': (15, 'blocked'), 'ready': (16, '/tmp/other-ready'),
-            'go': (17, '/tmp/other-go'), 'done': (18, '/tmp/other-done'),
-            'finish': (19, '/tmp/other-finish')}
-        for problem in (*changes, 'duplicate_pause', 'kill_timeout', 'missing_tail', 'missing_manifest'):
+        changes = {'command': (1, 'profile'), 'verbose': (2, '--verbose'),
+            'manifest': (4, '/tmp/other-manifest.json'),
+            'mode': (6, 'profile'), 'pause': (8, 'always'), 'duration': (10, '6'),
+            'output': (12, '/tmp/other-output'),
+            'separator': (13, '--pid'), 'provider': (15, 'relative-provider.so'),
+            'matrix': (16, 'blocked'), 'ready': (17, '/tmp/other-ready'),
+            'go': (18, '/tmp/other-go'), 'done': (19, '/tmp/other-done'),
+            'finish': (20, '/tmp/other-finish')}
+        for problem in (*changes, 'duplicate_pause', 'kill_timeout', 'missing_verbose',
+                        'missing_tail', 'missing_manifest'):
             with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
                 config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
                 if problem in changes:
                     index, value = changes[problem]
                     config.observer_args[index] = value
                 elif problem == 'duplicate_pause':
-                    config.observer_args[10:10] = ['--pause', 'never']
+                    config.observer_args[11:11] = ['--pause', 'never']
                 elif problem == 'kill_timeout':
-                    config.observer_args.insert(10, '--kill-on-timeout')
+                    config.observer_args.insert(11, '--kill-on-timeout')
+                elif problem == 'missing_verbose':
+                    config.observer_args.pop(2)
                 elif problem == 'missing_tail':
                     config.observer_args.pop()
                 else:

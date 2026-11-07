@@ -46,6 +46,29 @@ fn print_stdout(text: std::fmt::Arguments<'_>) -> Result<i32> {
     }
 }
 
+/// RAII guard arming the run-scoped text verbosity for one command, so
+/// the deep run wrappers need no new display parameter. Restored on
+/// drop; `--json` and `-o` never consult it.
+struct VerbosityGuard {
+    previous: cli::TextVerbosity,
+}
+
+impl VerbosityGuard {
+    fn arm(verbose: bool, quiet: bool) -> Self {
+        let level = cli::TextVerbosity::resolve(verbose, quiet)
+            .expect("parse refuses --quiet beside --verbose");
+        Self {
+            previous: cli::set_text_verbosity(level),
+        }
+    }
+}
+
+impl Drop for VerbosityGuard {
+    fn drop(&mut self) {
+        cli::set_text_verbosity(self.previous);
+    }
+}
+
 fn run() -> Result<i32> {
     // Before any handler installs: the owned command inherits exactly the
     // dispositions captured here for every signal the observer changes.
@@ -58,6 +81,7 @@ fn run() -> Result<i32> {
         // `kind` travels inside the arguments, so both capture subcommands share
         // one arm as well as one parser.
         Ok(Command::Profile(a) | Command::Trace(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -72,9 +96,11 @@ fn run() -> Result<i32> {
             capture(&a).map(|()| 0)
         }
         // `run` owns its child from fork to reap and reports the status a shell
-        // would. A child deliberately handed back still running is a success
-        // for the observer, so it exits 0.
+        // would. A child deliberately handed back still running, or reaped
+        // by a requested `--kill-on-timeout` kill, is a success for the
+        // observer, so it exits 0.
         Ok(Command::Run(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -85,13 +111,25 @@ fn run() -> Result<i32> {
                 ));
                 return Ok(2);
             }
-            run_owned(&a).map(|outcome| outcome.child_exit_code.unwrap_or(0))
+            // The `--user` selection refuses like a usage error (exit 2)
+            // before anything is resolved, forked, or attached.
+            if let Some(user) = a.user.as_deref()
+                && let Err(message) = p11scope::check_run_user(user)
+            {
+                let _ = p11scope::try_stderr_line(&format!(
+                    "{message}\n{}",
+                    cli::HelpTopic::Run.hint()
+                ));
+                return Ok(2);
+            }
+            run_owned(&a).map(|outcome| outcome.exit_code())
         }
         // Both of `inspect`'s hard failures — a pid that names nothing, and a target
         // that exited while its objects were being pinned — mean "the target could
         // not be read at all": one line here, exit 1, never a panic. A
         // fully-unreadable machine fails the same way under `--system`.
         Ok(Command::Inspect(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules) {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
@@ -111,14 +149,27 @@ fn run() -> Result<i32> {
                 a.json,
                 a.max_scan_pids,
             )
-            .with_context(|| scope)
+            .map_err(|error| {
+                if error.is::<p11scope::process::MissingNamedProcess>() {
+                    error
+                } else {
+                    error.context(scope)
+                }
+            })
         }
-        Ok(Command::Doctor(a)) => doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict),
-        Ok(Command::InventoryDiff(a)) => inventory_diff::run(&a),
+        Ok(Command::Doctor(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            doctor::run(a.pid, a.cgroup.as_deref(), a.extra_strict)
+        }
+        Ok(Command::InventoryDiff(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            inventory_diff::run(&a)
+        }
         // `inventory`'s hard failures — an unreadable target, an
         // unwritable `-o` — mean "nothing could be observed": one line
         // here, exit 1, never a panic and never an empty-success report.
         Ok(Command::Inventory(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
@@ -164,7 +215,9 @@ fn run() -> Result<i32> {
                 a.quiet,
             )
             .map_err(|error| {
-                if error.is::<pidns::NumberingMismatch>() {
+                if error.is::<pidns::NumberingMismatch>()
+                    || error.is::<p11scope::process::MissingNamedProcess>()
+                {
                     error
                 } else {
                     error.context(scope)

@@ -960,12 +960,14 @@ mod tests {
             source: "prearm",
             corroborated: false,
             skipped: Vec::new(),
+            admission_class: None,
         }
     }
 
     fn record(id: u32, sources: Vec<&'static str>) -> crate::render::DiscoveredModule {
         crate::render::DiscoveredModule {
             id: ModuleId(id),
+            admission_class: None,
             dev: (8, 1),
             ino: 42,
             sha256: None,

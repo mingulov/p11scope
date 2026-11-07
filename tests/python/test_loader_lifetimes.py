@@ -1121,5 +1121,35 @@ class FixtureWorkloadTests(unittest.TestCase):
         self.assertNotEqual(provider.stat().st_ino, orig_ino)
 
 
+class TraceNoteAndTailTests(unittest.TestCase):
+    NOTE = "Calls on unverified functions are not decoded (names only)."
+    HEADERS = ("Trace — completed call events in arrival order\n"
+               "Executable labels use verified observed paths; "
+               "event PID/TID remain diagnostic identifiers.\n"
+               "CAPTURE privacy=allowlisted\n")
+    ROW = ("00:00:01.000000 \"fixture\" (PID 4242, TID 4242) "
+           "exe=\"/tmp/fixture\" C_Initialize → CKR_OK 3.0µs\n")
+    RECORDS = ('COUNT_EVIDENCE {"stats_entered": 1}\n'
+               'EVIDENCE {"completeness": "COMPLETE"}\n')
+
+    def test_header_note_and_human_tail_are_accepted(self):
+        for totals in ("2 completed calls; 0 returned errors; 0 entries without an observed return.",
+                       "1 completed call; 1 returned error; 1 entry without an observed return."):
+            with self.subTest(totals=totals):
+                text = (self.HEADERS + self.NOTE + "\n" + self.ROW + self.RECORDS
+                        + totals + "\n"
+                        + "coverage: partial — 1 entry without an observed return\n"
+                        + "run with -v for details\n")
+                _, _, _, errors = ORACLE.parse_trace(text)
+                self.assertEqual(errors, [])
+
+    def test_trailing_garbage_after_evidence_is_still_an_error(self):
+        text = (self.HEADERS + self.ROW + self.RECORDS
+                + "2 completed calls; 0 returned errors; 0 entries without an observed return.\n"
+                + "smuggled line\n")
+        _, _, _, errors = ORACLE.parse_trace(text)
+        self.assertTrue(any("smuggled" in error for error in errors), errors)
+
+
 if __name__ == "__main__":
     unittest.main()

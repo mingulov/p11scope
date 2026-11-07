@@ -142,11 +142,13 @@ int p11_anchor_vma(struct p11_iter_task_vma *ctx)
     if (!cfg)
         return 0;
     /* Observer binding: the anchor run is per-pid on the observer. Any
-     * other task (a wrong-scope walk) is skipped before it can install. */
+     * other task (a wrong-scope walk) is skipped before it can install.
+     * A zero `observer_tgid` skips the match (see the header): the
+     * pidfd-bound iterator already walks exactly one task. */
     {
         int tgid = 0;
         P11_READ(tgid, task->tgid);
-        if (tgid < 0 || (u32)tgid != cfg->observer_tgid)
+        if (tgid < 0 || (cfg->observer_tgid != 0 && (u32)tgid != cfg->observer_tgid))
             return 0;
     }
     base = cfg->arena_base;

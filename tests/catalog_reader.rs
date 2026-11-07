@@ -271,10 +271,12 @@ fn dance(fixtures: &FixtureSet, json_out: bool) -> Dance {
     let _ = std::fs::remove_file(&out);
     let script = fixture_source("catalog-observe.sh");
     let binary = env!("CARGO_BIN_EXE_p11scope");
+    // Full detail: the strict asserts below read the complete text and
+    // the startup progress on stderr, both verbose-only since CLI-1.
     let inspect_args: &[&str] = if json_out {
-        &["--system", "--json", "--max-scan-pids", "4096"]
+        &["--system", "--json", "--max-scan-pids", "4096", "-v"]
     } else {
-        &["--system", "--max-scan-pids", "4096"]
+        &["--system", "--max-scan-pids", "4096", "-v"]
     };
     eprintln!(
         "catalog reader: profile={} binary={binary} inspect {}",
@@ -525,10 +527,42 @@ fn validate_closure_admission(
     wide: bool,
     strict: bool,
 ) -> Result<(), String> {
+    // The producer files a prefix-admitted closure as partial with
+    // its attached count; that shape validates in both modes. The
+    // retired refused-plus-prefix shape stays accepted only when
+    // relaxed, for reads of older captures.
+    let reason = admission.reason.unwrap_or("");
+    if admission.state == "partial"
+        && admission.class == "closure_array"
+        && reason.contains("template tables attached")
+        && reason.contains("(closure_prefix)")
+    {
+        return Ok(());
+    }
+    // An over-bound closure stays published-only in every mode: its
+    // union exceeds the 104-target whole bound, so it attaches only
+    // its published tables, and none is published yet. JSON carries
+    // the full reason; text renders the terse by-design form that
+    // points at --json. The retired capacity-shaped whole refusal
+    // below stays accepted for reads of older captures.
+    let published_full = reason.contains("attaches only its published tables")
+        && fixture.lookalikes.is_some_and(|tables| {
+            reason.contains(&format!(
+                "none of its {tables} lookalike function tables is published yet"
+            ))
+        });
+    let published_terse = reason.contains("proxy closure array not attached by design")
+        && reason.contains("the providers it forwards to attach when they load");
+    if admission.state == "refused"
+        && admission.class == "closure_array"
+        && admission.endpoints.is_none()
+        && (published_full || published_terse)
+    {
+        return Ok(());
+    }
     match validate_whole_admission(admission, fixture, wide, strict) {
         Ok(()) => Ok(()),
         Err(error) if !strict => {
-            let reason = admission.reason.unwrap_or("");
             if admission.state == "refused"
                 && admission.class == "closure_array"
                 && reason.contains("template tables attached")
@@ -584,13 +618,17 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
     if lines.next().is_some() {
         return Err("text object must have exactly one admission".into());
     }
-    if let Some(admitted) = line.strip_prefix("admission  admitted (") {
-        let (class, rest) = admitted
-            .split_once(", ")
-            .ok_or("text admitted class is missing")?;
-        let (endpoints, _) = rest
-            .split_once(" endpoints;")
+    if let Some(admitted) = line.strip_prefix("admission  profile/run would watch ") {
+        // `68 functions (class standard; ...)` or `1 function (class ...; ...)`.
+        let (endpoints, rest) = admitted
+            .split_once(' ')
             .ok_or("text admitted endpoint count is missing")?;
+        let (_, rest) = rest
+            .split_once("(class ")
+            .ok_or("text admitted class is missing")?;
+        let (class, _) = rest
+            .split_once([';', ',', ')'])
+            .ok_or("text admitted class is unterminated")?;
         Ok(WholeAdmission {
             state: "admitted",
             class,
@@ -603,6 +641,16 @@ fn text_whole_admission(block: &str) -> Result<WholeAdmission<'_>, String> {
             .ok_or("text refusal reason is missing")?;
         Ok(WholeAdmission {
             state: "refused",
+            class,
+            endpoints: None,
+            reason: Some(reason),
+        })
+    } else if let Some(partial) = line.strip_prefix("admission  partial (") {
+        let (class, reason) = partial
+            .split_once("): ")
+            .ok_or("text partial reason is missing")?;
+        Ok(WholeAdmission {
+            state: "partial",
             class,
             endpoints: None,
             reason: Some(reason),
@@ -666,7 +714,9 @@ fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
         (CLOSURE, "closure_array", CLOSURE_WIDE_REFUSAL),
     ] {
         let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
-        let text = format!("  admission  refused ({class}): {reason} [scan-only admission]");
+        let text = format!(
+            "  admission  refused ({class}): {reason} [scan-only admission: manifest corroboration was not consulted]"
+        );
         validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, false)
             .unwrap();
         validate_whole_admission(text_whole_admission(&text).unwrap(), fixture, true, false)
@@ -678,8 +728,9 @@ fn catalog_admission_oracle_accepts_relaxed_wide_whole_refusals() {
             let json = serde_json::json!({
                 "state": "refused", "class": class, "reason": invalid_reason,
             });
-            let text =
-                format!("  admission  refused ({class}): {invalid_reason} [scan-only admission]");
+            let text = format!(
+                "  admission  refused ({class}): {invalid_reason} [scan-only admission: manifest corroboration was not consulted]"
+            );
             assert!(
                 validate_whole_admission(
                     json_whole_admission(&json).unwrap(),
@@ -709,7 +760,9 @@ fn catalog_admission_oracle_rejects_strict_wide_refusals() {
         (CLOSURE, "closure_array", CLOSURE_WIDE_REFUSAL),
     ] {
         let json = serde_json::json!({ "state": "refused", "class": class, "reason": reason });
-        let text = format!("  admission  refused ({class}): {reason} [scan-only admission]");
+        let text = format!(
+            "  admission  refused ({class}): {reason} [scan-only admission: manifest corroboration was not consulted]"
+        );
         assert!(
             validate_whole_admission(json_whole_admission(&json).unwrap(), fixture, true, true)
                 .is_err()
@@ -726,8 +779,9 @@ fn catalog_admission_oracle_rejects_admitted_prefixes() {
     for (fixture, class, endpoints) in [(NSS, "corroborated", 68), (CLOSURE, "closure_array", 20)] {
         let json =
             serde_json::json!({ "state": "admitted", "class": class, "endpoints": endpoints });
-        let text =
-            format!("  admission  admitted ({class}, {endpoints} endpoints; scan-only admission)");
+        let text = format!(
+            "  admission  profile/run would watch {endpoints} functions (class {class}; scan only: names below come from the files themselves)"
+        );
         for strict in [false, true] {
             assert!(
                 validate_whole_admission(
@@ -756,7 +810,9 @@ fn catalog_closure_admission_accepts_prefix_gap_only_when_relaxed() {
     let reason = "33 of 65 template tables attached; calls through the others are not counted (closure_prefix)";
     let json =
         serde_json::json!({ "state": "refused", "class": "closure_array", "reason": reason });
-    let text = format!("  admission  refused (closure_array): {reason} [scan-only admission]");
+    let text = format!(
+        "  admission  refused (closure_array): {reason} [scan-only admission: manifest corroboration was not consulted]"
+    );
     for wide in [false, true] {
         validate_closure_admission(json_whole_admission(&json).unwrap(), CLOSURE, wide, false)
             .unwrap();
@@ -771,6 +827,55 @@ fn catalog_closure_admission_accepts_prefix_gap_only_when_relaxed() {
                 .is_err()
         );
     }
+}
+
+#[test]
+fn catalog_partial_admission_accepts_prefix_shapes_with_counts() {
+    // The producer files a prefix-admitted object as partial with its
+    // attached count; the oracle must read that shape in both
+    // renderings, for closure and provider prefixes alike.
+    let closure_reason = "33 of 65 template tables attached; calls through the others are not counted (closure_prefix)";
+    let closure_json = serde_json::json!({
+        "state": "partial", "class": "closure_array",
+        "endpoints": 3399, "reason": closure_reason,
+    });
+    let closure_text =
+        format!("  admission  partial (closure_array): {closure_reason} [scan-only admission]");
+    for wide in [false, true] {
+        for strict in [false, true] {
+            validate_closure_admission(
+                json_whole_admission(&closure_json).unwrap(),
+                CLOSURE,
+                wide,
+                strict,
+            )
+            .unwrap();
+            validate_closure_admission(
+                text_whole_admission(&closure_text).unwrap(),
+                CLOSURE,
+                wide,
+                strict,
+            )
+            .unwrap();
+        }
+    }
+    // A provider prefix reads the same way: partial state plus the
+    // attached count in JSON, partial verb in text. Both renderings
+    // must parse (the text verb is new) and keep their counts.
+    let provider_reason =
+        "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)";
+    let provider_json = serde_json::json!({
+        "state": "partial", "class": "heuristic",
+        "endpoints": 300, "reason": provider_reason,
+    });
+    let provider = json_whole_admission(&provider_json).unwrap();
+    assert_eq!(provider.state, "partial");
+    assert_eq!(provider.endpoints, Some(300));
+    let provider_text =
+        format!("  admission  partial (heuristic): {provider_reason} [scan-only admission]");
+    let parsed = text_whole_admission(&provider_text).unwrap();
+    assert_eq!(parsed.state, "partial");
+    assert_eq!(parsed.class, "heuristic");
 }
 
 #[test]
@@ -797,6 +902,14 @@ fn catalog_reader_keeps_partial_export_tables_useful_but_heuristic() {
     assert_eq!(b["admission"]["scan_only"], true);
     match b["admission"]["state"].as_str() {
         Some("admitted") => assert_eq!(b["admission"]["endpoints"], 92),
+        Some("partial") if !strict_admission() => {
+            assert!(b["admission"]["endpoints"].as_u64().unwrap() > 0);
+            let reason = b["admission"]["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("endpoints attached") && reason.contains("(provider_prefix)"),
+                "relaxed B partial must be a named prefix gap with counts: {reason}"
+            );
+        }
         Some("refused") if !strict_admission() => {
             assert!(b["admission"]["endpoints"].is_null());
             let reason = b["admission"]["reason"].as_str().unwrap();
@@ -922,8 +1035,8 @@ fn catalog_reader_finds_every_fixture_object() {
     .unwrap();
 
     // C: 65 bare heuristic tables, no triples, 532 distinct endpoints.
-    // Closure classification survives the wider budget: default refuses
-    // whole; wide admits whole when cumulative shared capacity permits.
+    // The 532-target union exceeds the 104-target whole bound, so the
+    // layer stays published-only with none of its 65 tables published.
     let c = object_for(doc, &run.pids, "closure.so");
     let c_tables = tables_of(c);
     assert_eq!(c_tables.len(), 65);
@@ -1066,6 +1179,7 @@ fn catalog_reader_finds_every_fixture_object() {
             .count() as u64
     };
     assert_eq!(doc["admission"]["admitted"], in_state("admitted"));
+    assert_eq!(doc["admission"]["partial"], in_state("partial"));
     assert_eq!(doc["admission"]["refused"], in_state("refused"));
     if !wide {
         assert!(doc["admission"]["refused"].as_u64().unwrap() >= 2);
@@ -1123,10 +1237,10 @@ fn catalog_reader_finds_every_fixture_object() {
         "tless.so",
         "h1.so",
         "h2.so",
-        "admitted",
+        "  admission  ",
         "alias object",
         "(deleted)",
-        "scan-only admission",
+        "names below come from the files themselves",
     ] {
         assert!(
             text.contains(fragment),

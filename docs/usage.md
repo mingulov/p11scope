@@ -24,7 +24,7 @@ implementation limits are code contracts, not measurements.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -50,6 +50,7 @@ and detail counts are never summed.
 
 - [What it does](#what-it-does)
 - [What it does NOT intentionally decode](#what-it-does-not-intentionally-decode)
+- [Installing system packages](#installing-system-packages)
 - [Quickstart](#quickstart)
 - [Inventory diagnostics](#inventory-diagnostics)
 - [Offline inventory comparison](#offline-inventory-comparison)
@@ -142,6 +143,35 @@ A profile is evidence of what the application *did* during the capture
 window. It is never proof of what the application *cannot* do — see
 [Honest claims](#honest-claims).
 
+## Installing system packages
+
+The v0.6.0 release provides `p11scope_0.6.0_amd64.deb` (Debian/Ubuntu) and
+`p11scope-0.6.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. Each
+installs the same static observer plus the glibc discovery helper to
+`/usr/bin`, with licenses and provenance under `/usr/share/doc/p11scope`,
+and carries no file capabilities, set-id bits, services or maintainer
+scripts. Installs are tested on Ubuntu 26.04 (DEB) and Fedora 44 (RPM).
+The bundled helper needs glibc 2.34 or newer, so it does not run on older
+distributions. Every release file carries a GitHub build-provenance attestation;
+[Install](../README.md#install) has the full bundle table. Download the
+package and `SHA256SUMS`, verify both, then install the file:
+
+```sh
+download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
+cd "$download_dir"
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope_0.6.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+sha256sum -c --ignore-missing SHA256SUMS
+gh attestation verify p11scope_0.6.0_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.6.0_amd64.deb
+p11scope --version
+sudo p11scope doctor
+```
+
+On Fedora/RHEL, download `p11scope-0.6.0-1.x86_64.rpm` instead, verify it
+with `gh attestation verify p11scope-0.6.0-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.6.0-1.x86_64.rpm`.
+
 ## PKCS #11 versions and interface names
 
 Version values are reported metadata, not proof of a table's allocated extent
@@ -181,30 +211,62 @@ classification consequences, never the name bytes.
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
-the one-shot `inspect` verdict refuses p11-kit's fixed closure array whole —
-it exceeds the 512-slot ceiling — while the later-fitting SoftHSM2 backend
-attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
-layer was captured. A live Detailed capture admits a late-start closure (one
-mapped before the capture's first plan beside a non-closure provider) as a
-reserve-capped leading-templates prefix with a named partial gap when no
-provider was refused or omitted; a closure alone in the first plan, or first
-mapped mid-capture, admits only its published tables, unless its opened file
-matches an operator-named `--module` path, which admits the reserve-capped
-prefix after the named non-closure modules admitted in the same discovery
-pass (a prefix held from an earlier pass can still crowd a later-named
-provider). The terminal report names each refused or partially covered module
-with its reason: `run` and `profile` print a `Module gaps` section with the
-first five and an "and K more" line, and `inventory` prints the admission
-reason under each refused module. A capture whose only mapped provider is
-the proxy layer (a process that has not loaded the providers below it yet)
-starts with the proxy layer named as a `PARTIAL` gap — with no provider beside
-it in the first plan there is no prefix, and nothing of it is published yet —
-and attaches each provider below it whole as the process loads it. Naming the
-proxy layer with `--module` admits its reserve-capped prefix but narrows
-discovery to the named modules, so a provider below it is captured only when
-also named. A prefix leaves at least the reserve (128 of 512 slots) free, so
-one later standard function list (at most 104 entries) always fits; a second
-later provider may be refused by name.
+the one-shot `inspect` verdict leaves p11-kit's closure array unattached by
+design — only its published tables would attach, and none of the lookalike
+tables is published yet — while the later-fitting SoftHSM2 backend attaches;
+the report is explicitly `PARTIAL`, not a claim that the proxy layer was
+captured. A live Detailed capture admits a forwarding layer (such as the
+p11-kit proxy) only through its published tables — publication evidence (a
+live `C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
+a manifest, or export agreement) — in every scope and arrival order.
+Unpublished templates take no slots, so the layer can never crowd out a real
+provider; a layer with nothing published yet stays a named gap while the
+capture continues. Calls it forwards are counted at the attached backend
+providers, named with counts on the gap line; calls the layer answered
+itself, including its errors, appear only on the separate forwarding line,
+and one layer call that reaches several providers counts at each (below).
+Under inventory, counter and broad admission a closure array that does not
+fit whole is refused whole with its demand stated. The terminal report names
+each refused or partially covered module with its reason: with `-v`, `run`
+and `profile`
+print a `Module gaps` section with the first five and an "and K more" line,
+and `inventory` prints the admission reason under each refused module. A
+capture whose only mapped provider is the forwarding layer (a process that
+has not loaded the providers below it yet) starts with the layer named as
+a `PARTIAL` gap — nothing of it is published yet — and attaches each
+provider below it whole as the process loads it. Naming the layer with
+`--module` narrows discovery to the named modules, so a provider below it
+is captured only when also named; an operator-named layer keeps a
+reserve-capped leading-templates prefix instead of published-only
+admission, because a remote client's tables are handed out before any
+export probe can observe the return.
+
+When a forwarding layer attaches beside any active attributed non-layer
+row — one with a non-null module that counted a call, an error, or an
+in-flight entry in the same capture (any caller flips the render gate
+capture-wide; per caller in `inventory`) — and no non-layer provider is
+refused, every call-count headline total counts one logical call once, at
+its provider; the forwarding layer's own calls print on a separate
+`Forwarding layers counted separately` line (per layer) and never sum into
+the totals, and `inventory` prints the same split as `Forwarding-layer
+entries counted separately`. In JSON, every `functions[]` row carries
+`forwarding_layer` (true at the layer, false at providers) with top-level
+`layer_totals` (`logical`/`forwarding`); `inventory` carries `layer_totals`
+(`logical_entries`/`forwarding_entries`). Consumers that sum `calls` must
+skip `forwarding_layer` rows. With no active attributed row — a lone remote
+client, providers attached but quiet, providers observed only through
+unattributed rows, or any refused backend — the layer's calls stay in the
+totals and no forwarding line prints. In live views the headline drops when
+the gate flips (a newly active provider moves the layer's calls to the
+forwarding line). Calls the layer answers itself, including its errors,
+appear only in the forwarding line, and one layer call that reaches several
+providers counts at each; per-mechanism, per-session and per-login sections
+still observe both layers. Known limitation: a whole-admitted layer's own
+named rows plus its unknown stub rows can total ~2x the logical calls in the
+separate forwarding count; that intra-layer fan-out is shown, not
+deduplicated. Residual: render rows carry no caller in any scope, so the
+render gate applies capture-wide, and a misclassified provider beside another
+active provider would still split out.
 
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
@@ -212,8 +274,10 @@ return values and latency. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
 the provider's own `.dynsym` and every retained non-NULL target
 (`discovery[].tables[].linkage: "exports"`). `inspect` reports each table's
-raw decoder walk, so a 3.x-labelled prefix that `run` proves `full` still reads
-`known_prefix` in `inspect` output. Without name evidence, rows read
+decoder walk in words — a fully walked table reads "fully walked", a
+known-prefix table reads "known functions (newer functions unknown)" — while
+JSON keeps the raw `walk` (`full`/`known_prefix`) and `version`. Without name
+evidence, rows read
 `unknown#<ordinal>` in the live table and trace (`functions[].ordinals` and
 `functions[].target` in JSON), never a guessed name. Missing mechanism or
 session evidence does not mean the application used none. For those
@@ -240,40 +304,106 @@ sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
   -o observed-profile.json --pause auto -- /opt/application/bin/workload
 ```
 
+### Text output: concise by default, `-v` for detail
+
+Terminal text is short by default: the main results (providers, callers,
+functions and mechanisms, key-operation rows), one coverage status line
+(`coverage: complete`, `coverage: counts complete` when only names are
+unconfirmed, or `coverage: partial` with plain-word reasons), and a
+`run with -v for details` hint. `-v` / `--verbose` shows the full detail —
+every gap and limitation with reasons, evidence, per-slot or per-table data,
+timing — plus the informational stderr notes. `--quiet` prints only the
+summary head, for scripts. `--json` and `-o` are always complete at every
+verbosity. Gap names in default text are plain words; the machine names stay
+in JSON, and in `-v` beside the plain words. `trace` streams one line per
+event at every level and ends with the same totals and coverage lines;
+`-v` pairs machine names beside the plain reasons and adds its stderr notes.
+
+Default stderr keeps the readiness line (`p11scope: capturing:`, which says
+what the capture waits for while nothing is attached) and real warnings:
+errors, actionable warnings, the owned child's nonzero status
+(`command exited with status N`), and the outcome signals scripts match
+(the first pass headline, `capture ended:`, the semantic-lane seal, the
+stop summaries). Progress,
+statistics and all-clear lines — loader readiness, clean long-run reports,
+the `p11scope: discovery:` completion summary, per-module repeats, cleanup
+progress — print under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
+`run` on a terminal never clears the screen: the final frame prints once
+after the command exits.
+
 Trace rows show an executable label when p11scope can establish which process
-image made that call. Otherwise they say `Unknown executable` and retain the
-PID/TID. The label comes from the observed executable path: an interpreter may
-therefore appear as `python` or `sh`, rather than the script or service name.
-For cgroup traces, naming needs calls on both sides of a validated executable
-sample. Early calls and short-lived or infrequent callers can stay unknown;
-their count and admission rules are unchanged. Previously printed rows are
-not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
+image made that call. For a command the observer owns, rows the identity
+proof cannot resolve are labeled with the spawned command instead; anything
+else still says `Unknown executable` and retains the PID/TID. The label
+comes from the observed executable path: an interpreter may therefore appear
+as `python` or `sh`, rather than the script or service name. Event times are
+UTC. For cgroup traces, naming needs calls on both sides of a validated
+executable sample. Early calls and short-lived or infrequent callers can stay
+unknown; their count and admission rules are unchanged. Calls on functions
+p11scope could not verify show names without decoded parameters; the trace
+header says so once instead of marking every row. Previously printed rows
+are not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
 for the sampling and retention limits. Installed cgroup naming checks for v0.4
 are still in progress.
 
 > **`run` safety boundary:** `sudo p11scope run` requires valid non-root
 > `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and
 > drops the child to that identity before releasing its private barrier. Root
-> without that explicit target and set-id invocations are refused. These
-> environment values select the target account but do not authenticate that
+> without that explicit target (or --user) and set-id invocations are refused.
+> These environment values select the target account but do not authenticate that
 > the launcher was `sudo`. The child has no capabilities, cannot gain
-> privilege across exec, receives only `PATH`, C locale, optional `TERM`/`TZ`,
-> and `SOFTHSM2_CONF`, and does not inherit unrelated file descriptors. The
-> command is an opened ELF executable; invoke scripts explicitly as
-> `/bin/sh /path/to/script`, and use `/usr/bin/env NAME=value command` after
-> `--` for other application variables. Owned launch requires procfs mounted
-> at `/proc`: the opened executable is invoked through `/proc/self/fd` so a
-> later path replacement cannot change the selected inode. If that descriptor
-> path is unavailable, `run` reports the exec failure and refuses to retry the
-> command's original path. The sudo path currently clears
-> supplementary groups; use `profile`/`trace` against an already-running
-> workload when the application needs an HSM/device group. When the observer
+> privilege across exec, inherits the observer's environment unchanged (so
+> the workload behaves as without p11scope), and does not inherit unrelated
+> file descriptors. Note sudo itself resets the environment first: pass
+> application variables with `sudo --preserve-env=NAME` or as
+> `env NAME=value ...` after the `--`. Conversely, anything exported in a
+> root shell (`sudo -i`/`-s`) now reaches the unprivileged child. Only
+> p11scope's own control inputs are withheld from the child by name, with
+> one stderr line under -v naming them: `SUDO_*` (the whole sudo namespace:
+> the target-account selection plus anything else describing the sudo
+> invocation a bare execution has none of) and `P11SCOPE_*` (p11scope's
+> own control namespace). Apart from PATH, used to find CMD, values of
+> inherited variables are never inspected or logged. The
+> command is an opened ELF executable, opened by the observer (root under
+> sudo) before any drop and run by descriptor; invoke scripts explicitly as
+> `/bin/sh /path/to/script`.
+> Owned launch requires procfs mounted at `/proc`: the opened executable is
+> invoked through `/proc/self/fd`, so the target account needs no directory
+> search permission on its path and a later path replacement cannot change the
+> selected inode. If that descriptor path is unavailable, `run` reports the exec
+> failure and refuses to retry the command's original path. The sudo path runs
+> the child as the invoker with the invoker's supplementary groups from the
+> account database (glibc may return only the primary group) and home
+> environment, as if the user had run the command directly:
+> `HOME`/`USER`/`LOGNAME`/`SHELL` come from the invoker's passwd entry,
+> `XDG_RUNTIME_DIR` from `/run/user/<uid>` when that directory exists and is
+> owned by the invoker (otherwise unset), and `MAIL` is dropped (no passwd
+> field names a mailbox).
+> `-v`/`--verbose` prints the restored identity as one stderr line,
+> `running <cmd> as <user> (uid <uid>) (groups and home restored)`; without it
+> `run` stays quiet about the identity. An account the observer cannot resolve
+> refuses with a plain message before anything starts.
+> `--user <name|uid>` (root only, like `strace -u`) starts the command as
+> that account instead of the invoker, with its groups from the account database
+> (glibc may return only the primary group) and home environment from its passwd
+> entry; only `root` or `0` select uid 0; any other name or spelling
+> resolving to uid 0 is refused as an unknown account. Without root, for an
+> unknown account, when its group list cannot be resolved, or for a set-id
+> observer it refuses with a plain message (exit 2), and `-v` prints
+> `running <cmd> as <user> (uid <uid>)`. A sudoers grant of `p11scope run` is a
+> root grant: `--user` lets that user start commands as any account, including
+> `--user root`, where capless uid 0 still owns root files (as owner it can
+> chmod and rewrite root-owned files such as `/etc/shadow` or `/etc/sudoers`)
+> and user namespaces restore privilege; do not delegate it. When the
+> observer
 > binary instead carries file capabilities (`setcap
 > 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep'`),
 > it runs unprivileged with its groups intact: BPF attach succeeds and
 > group-gated providers (e.g. opencryptoki's group-owned shared memory) keep
-> working under observation. Measured 2026-09-15 on Fedora 44 (6.19) and
-> Ubuntu 22.04 (5.15). Use the
+> working under observation. Such an observer starts in the loader's
+> secure mode, which unsets `LD_*`, `TMPDIR` and similar variables before
+> the child inherits the environment. Measured 2026-09-15 on Fedora 44
+> (6.19) and Ubuntu 22.04 (5.15). Use the
 > [privileges guide](#privileges-per-environment) for current capability
 > requirements.
 
@@ -415,7 +545,7 @@ profile, trace, run, and inspect.
 
 `doctor` has no module-specific probe lane. `doctor --module` is rejected as
 unsupported instead of accepting and ignoring operator input; use
-`inspect --pid <pid> --module <provider.so>` for module-specific discovery.
+`p11scope inspect --pid <pid> --module <provider.so>` to list mapped providers.
 
 ### Pre-arming providers with `--prearm-module`
 
@@ -576,7 +706,13 @@ If the run is stopped or times out while the
 command is still being handed to the child, the child is killed at once,
 never resumed, so a command that had not already started never runs. A stop
 still waiting for its pause cycle when the capture ends is reported as
-`pause: partial`. Under `--pause always` the run fails instead: no profile
+`pause: partial`. Under `--pause auto` an engine-incomplete cycle re-arms
+after resuming the child, so a later loader hit is paused like any other;
+each incomplete cycle stays a counted partial attempt while the chain
+continues, and four straight incompletes retire the chain with a counted
+named gap (the retirement count is
+`evidence.pause_engine_incomplete_retirements`). Under `--pause always`
+the run fails instead: no profile
 report is published (a trace `-o` stream keeps only the lines already
 written), and a `--duration` child is terminated rather than handed back. A
 signal that lands inside an active pause cycle (which has a 500 ms deadline)
@@ -670,15 +806,23 @@ C_DigestInit                       50      0     2.0µs     4.1µs    65.5µs   
 Evidence: 136/136 probes attached · 68 slots · 0 aliased · 0 skipped · 0 in-flight → COMPLETE
 ```
 
-A current capture's evidence line names why it is `PARTIAL`, grouped by the
-same classes `evidence.gap_classes` publishes, for example
-`→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)`
-for a clean scan-only capture (`verdict_detail: "attribution_only"`: counts
-are exact, only semantic interpretation is withheld), or
-`→ PARTIAL: observation lossy (12 events lost)` for a lossy one
-(`"concrete_gap"`). `→ PARTIAL: terminal drain unproven` means nothing
-concrete is behind the verdict (`"clean_but_unproven"`): the stop gate did
-not prove the final drain (see `evidence.stop_quiescence`).
+A current capture's coverage line names why it is `PARTIAL`, grouped by the
+same classes `evidence.gap_classes` publishes, in plain words: for example
+`coverage: counts complete; function names follow the standard PKCS#11 table
+and were not confirmed by a manifest (add --manifest to confirm)` for
+a clean scan-only capture (`verdict_detail: "attribution_only"`: counts are
+exact, only the names are unconfirmed), or
+`coverage: partial — calls may be missing (12 call records lost)` for a lossy
+one (`"concrete_gap"`). `coverage: partial — end of capture not fully
+confirmed (last calls may be missing)` means nothing concrete is behind the
+verdict (`"clean_but_unproven"`): the stop gate did not prove the final drain
+(see `evidence.stop_quiescence`). An owned run whose command ran ahead of
+probe attachment without pausing says
+`coverage: partial — the command loaded its provider before probes attached;
+rerun with --pause auto`. With `-v`, each plain reason is paired with its
+machine cause name, and the `Evidence:` line repeats the same verdict
+reasons after the probe and slot counts. A `COMPLETE` verdict reads
+`coverage: complete`.
 
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
@@ -842,7 +986,13 @@ Limits that matter in pods:
   world-writable unless it has the sticky bit (as `/tmp` does); otherwise
   `-o` is refused, naming the directory, its mode and a fix. A home
   directory created under Ubuntu's default umask (0775) needs
-  `chmod g-w,o-w` first.
+  `chmod g-w,o-w` first. Under `sudo`, when `SUDO_UID`/`SUDO_GID` name
+  the invoking account and the output directory belongs to that user,
+  newly created report, trace and event-log files are handed to that
+  user (still private `0600`), so the report stays readable without
+  `sudo cat`; pre-existing files keep their owner, and anywhere else
+  the files stay root-owned as before. A second run reuses and
+  truncates an invoker-owned stream file it previously refused.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
@@ -915,7 +1065,7 @@ Limits that matter in pods:
   report's additive `selected_detail` evidence object; unrelated
   endpoints stay aggregate-only, and aggregate and detail counts are
   never summed.
-- `--track-short-lived` — profile and `run` (default off): extensive
+- `--track-short-lived` — profile (default off): extensive
   mode. The kernel records the exec-time executable identity (device +
   inode, no path, argv, or environment) in EXEC records, and each novel
   unmatched exit gains a bounded static-linkage hint (`gap_exe_hints`
@@ -933,19 +1083,20 @@ Limits that matter in pods:
   conformance input, and never a negative. Multi-threaded exits
   and late watches read `unknown`, and nothing here proves a
   process did not map a watched provider.
-  Beside `--trace`, `--mode metrics`, exact `--pid` scope, or an owned
-  `run` the flag is accepted but arms nothing: no exe identity is
+  Beside `--trace`, `--mode metrics`, or exact `--pid` scope the flag is
+  accepted but arms nothing: no exe identity is
   recorded there, because nothing there classifies gaps (614b P1
   narrow authorization — the read arms only where hints publish).
-  Beside `--counter-mode` the flag is refused:
+  Beside an owned `run` the flag is refused because it would record
+  nothing there; beside `--counter-mode` it is refused because
   extensive mode arms Detailed captures only, never a counter
   object. Privacy row: `docs/privacy/allowlist-v3.md`
   (extensive-mode executable dependency hints).
 - `run --trace` — stream one line per completed call (trace semantics) for an
   owned command instead of aggregating a profile.
 - `run --kill-on-timeout` — when `--duration` expires, terminate and reap the
-  owned child. Without it the default is to hand a still-running child back
-  and exit 0.
+  owned child, and exit 0. Without it the default is to hand a still-running
+  child back and exit 0.
 - `inspect --json` — print the inspection as JSON instead of the human-readable
   text table. A scan that fails soft (the target changed mid-scan) still
   prints JSON: the success schema with `scan.status` failed and the
@@ -974,9 +1125,28 @@ Limits that matter in pods:
   physical counting; this
   preparation gate alone does not activate positive Inventory instance delivery.
   `--key-operations` (default off) opts in to per-key tracking through a linked
-  journal session; it requires `--capture auto` or `native` and a build with
-  the journal object. A refused journal start keeps the S1 capture with a
-  finite reason.
+  journal session; it requires `--capture auto` or `native`. Without a manifest,
+  the semantic lane seals only from scan-discovered tables whose publication is
+  proved by standard interface linkage or by an observed live function-list
+  return; tables with export-name agreement alone never qualify (for example
+  SoftHSM, which publishes no standard interface, when the observer attached
+  after the application fetched the list). Then the subset refuses with
+  `incomplete_provider`, the summary reads `key operations: <file>'s
+  function table cannot be verified without --manifest; rerun with --manifest`
+  (naming the provider by its file name; with zero or several modules
+  the line stays generic, `provider function tables ...`),
+  and per-key rows need a rerun with `--manifest <manifest.json>`. When
+  manifests were supplied but the subset still refuses, the gap and
+  summary instead name checking the manifest inputs. A sealed
+  scan lane carries a `semantic subset scan-derived` gap naming that provenance;
+  a manifest still adds operator attestation when supplied. A build without the
+  journal object, or a refused journal start, keeps the S1 capture with a
+  finite reason instead of refusing the inventory. Attaching to an
+  already-running application needs no restart: operations that start
+  after attach attribute per key (a key whose type was not established
+  in the observed window rows with type `unknown` until an observed
+  attribute call establishes it),
+  and anything that cannot be attributed is counted beside the rows.
   Missing retained names read `Unknown executable` or `Unknown module`;
   an observed ` (deleted)` path marker stays on the executable label.
   Retired images say `Application executed a new image`, and exited
@@ -988,6 +1158,8 @@ Limits that matter in pods:
   application app-first-driver [c0 pid 4242 incarnation 0] -> module app-p1.so [m0]: Module mapped; activity not captured; coverage unknown (scan only)
   ```
 
+  <!-- EXCERPT: p11scope inventory --pid <fixture-pid> --capture scan -->
+
   The header also carries a key-operation summary line. Once key
   operations populate (opt in with `--key-operations`), it counts
   completions per operation category, e.g.
@@ -995,10 +1167,24 @@ Limits that matter in pods:
   In v0.6.0 key-operation rows name only registered mechanisms: the
   journal lane keeps withholding unregistered ids, which appear with
   counts in the profile and trace mechanism tables instead.
-  A linked capture whose key-operation tracking never starts reads
-  `key operations: unavailable (bootstrap_unavailable)`. Without the
-  opt-in, or on a build without the journal object, the line reads
-  `key operations: not reported (per-key tracking is off)`.
+  Operations the observer cannot attribute with certainty are counted
+  in named `not attributed` reasons instead of ending the view. A
+  linked capture whose key-operation tracking never starts reads
+  `key operations: not available — per-key tracking never started, so no
+  key can be named yet` (with `-v`, the machine reason follows in
+  parentheses; `--json` keeps it as `object_observations.reason`).
+  Without the opt-in, or on a build without the journal object, the line
+  reads `key operations: not reported (per-key tracking is off)`. With the
+  opt-in but a refused semantic subset (unverifiable scan tables, see
+  above), it names the rerun instead: `key operations: <file>'s
+  function table cannot be verified without --manifest; rerun with
+  --manifest` (with zero or several modules the line stays generic,
+  `provider function tables ...`); when the refusal happens on the
+  manifest path, it instead reads `key operations: <file>'s function
+  table cannot be verified from the supplied --manifest inputs; check
+  the manifest`. When the journal start itself is refused, the line
+  names the request and the cause: `key operations: requested, but
+  per-key tracking did not start (<cause>)`.
   The line shows counts per operation category from the
   `object_observations` section of the JSON report; `--json` has the
   full rows.
@@ -1016,9 +1202,18 @@ Limits that matter in pods:
   document
   (see `docs/schema/inventory-v1.md`) instead of the text summary; `-o
   <out.json>` writes that document atomically (and refuses `-o -`: the
-  report requires a file). `--quiet` prints only the summary head
-  (totals plus application/module edges) and silences scan progress;
-  `--json`, `-o`, and logs are unchanged. `--dashboard` runs the live dashboard on
+  report requires a file). Text output is concise by default: the main
+  results, one coverage line, a `limits:` line, and the hint
+  `run with -v for details`. `-v`/`--verbose` shows the full detail
+  (every gap and reason, per-caller/module/edge data, budgets, timing)
+  plus informational stderr notes, `--quiet` prints only the summary
+  head (totals plus application/module edges) and silences scan
+  progress, and `--json`, `-o`, and logs are unchanged and always
+  complete.
+
+  <!-- EXCERPT: p11scope inventory --system --duration 30s -->
+
+  `--dashboard` runs the live dashboard on
   stdout when it is a terminal (scrollable edge table with
   presence/capture/activity states, coverage header, bounded log tail;
   `j`/`k` scroll, `tab` cycles summary/evidence/gaps, `q` quits, and
@@ -1205,8 +1400,9 @@ Limits that matter in pods:
   `native`
   without the privileges, kernel support or BTF it needs is an error
   (exit 1) naming why; `auto` (the default) runs `native` when it can
-  start and otherwise falls back to `scan` with the gap `native usage
-  feed unavailable`. Under the interactive `--dashboard` the native lane
+  start and, for `--pid`, otherwise falls back to `scan` with the gap
+  `native usage feed unavailable` (`--system` and `--cgroup` fail the
+  run with the refusal instead). Under the interactive `--dashboard` the native lane
   runs exactly as on the classic path; the dashboard gives the terminal
   back before the native stop, so its stderr notices are readable.
   Ctrl-C, SIGTERM or SIGHUP end a classic or dashboard run cleanly: the
@@ -1216,16 +1412,20 @@ Limits that matter in pods:
   judge reads `unresolved`, never `admitted`. `--max-gaps <n>` sets the retained gap history bound
   (1..=65536; 1024 when absent); gaps past the bound count in
   `gaps_suppressed`, never silently. Inventory-only `--max-endpoints <n>`
-  selects the capture-lifetime physical endpoint budget (1..=8192; 4096
-  when absent), before output files or native maps are opened. The same
+  selects the capture-lifetime physical endpoint budget (1–131072;
+  `inventory --system` on hosts with uprobe_multi defaults to 32,768),
+  before output files or native maps are opened. The same
   limit applies to scan, native and auto fallback, including the dashboard.
   IDs are append-only: unloading a provider does not refund capacity, and
   whole-module growth that does not fit is refused while retained endpoints
   and historical observations remain. The JSON row `budgets.inventory_endpoints`
   reports this physical limit; `budgets.endpoints` is the separate summed
   per-module census limit. Pair and discovery-work limits stay independent.
-  The 8192 upper bound is a candidate policy limit, not a measured native
-  release envelope; see [known limitations](known-limitations.md).
+  The 131,072 ceiling rests on attach/detach and per-endpoint memory
+  measurements on uprobe_multi hosts (the only hosts where live capture
+  runs); the freeze campaign confirms the system-scale cells at the
+  new budget, and never ships below 8,192; see
+  [known limitations](known-limitations.md).
   A target no scan inventoried is a
   hard error (one stderr line, exit 1), never an empty-success report.
 - `--allow-uretprobe-on-confined-target` — accept the uretprobe hazard on a
@@ -1349,7 +1549,10 @@ changing capture behavior, it joins the table above and the `--help` list.
 ### Exit codes
 
 - `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
-  or when a still-running child is handed back (without `--kill-on-timeout`).
+  when a still-running child is handed back (without `--kill-on-timeout`),
+  or when a requested `--kill-on-timeout` kill reaped a live child by the
+  observer's signal at timeout. A voluntary exit keeps its own status,
+  however high its code, as does a death before the observer's signal.
 - `1` — a runtime failure: one line on stderr, never a panic. `run` reports
   the child's nonzero exit code instead. `doctor` exits 1 when any requested
   lane reports failure (`--extra-strict` refuses on any warning or failure
@@ -1451,9 +1654,12 @@ p11scope inventory diff before.json after.json -o comparison.json
 p11scope inventory diff --json -- -before.json -after.json
 ```
 
-Default stdout is readable text, with application names, full recorded paths,
-module content digests, and separate before/after evidence. `--json` emits one
-`p11scope/inventory-diff/v1` document plus newline. `-o` atomically saves that
+Default stdout is the concise comparison summary: counts, the top changed
+applications, and caveats. `-v`/`--verbose` shows the full readable report,
+with application names, full recorded paths, module content digests, and
+separate before/after evidence; `--quiet` omits the detail hint. `--json`
+emits one `p11scope/inventory-diff/v1` document plus newline. `-o` atomically
+saves that
 JSON regardless of stdout mode, before writing stdout. Output aliases of
 either input, including hardlinks and symlinks, are refused; the existing
 trusted-directory/final-name protections apply. The final check and rename
@@ -1464,8 +1670,9 @@ prefix a dash-leading output name with `./`.
 For an illustrative application upgrade, suppose `/opt/service/bin/worker`
 has an edge to `/opt/vendor/lib/pkcs11.so` with digest A before and digest B
 after. A and B here stand for different valid 64-digit SHA-256 values, not
-literal input values. The report names one changed application group, two
-content-presence rows, and different module content observed at that path.
+literal input values. With `-v`, the report names one changed application
+group, two content-presence rows, and different module content observed at
+that path.
 If counts are 128 before and 24 after, they remain separate window
 observations; no -104 delta or throughput change is inferred. Equal digests
 mean equal module bytes, while different inodes remain separate physical
@@ -1566,7 +1773,9 @@ capture refuses before loading any capture program, so doctor skips those
 loads: `BPF map create`, `uprobe attach (self)`,
 `uretprobe vs seccomp`, `host program preflight`, `inventory program preflight`,
 `lifecycle preflight` and a requested `scope preflight` read `n/a` with
-`skipped: uprobe-multi-required`, and the verdict stays `capture unavailable`.
+`skipped: this check loads capture programs, which need uprobe-multi`,
+and the verdict stays `capture unavailable`. The version hint lives in
+the `Next:` step, which only a proven pre-Multi host prints.
 A permission or policy refusal of the probe, a resource error, or an `ENOSYS`
 answer (possibly a seccomp mask) still runs them, so their rows name the cause.
 `CAP_DAC_READ_SEARCH`, `CAP_SYS_PTRACE`, `CAP_SYS_ADMIN`,
@@ -1595,7 +1804,7 @@ If that PID filter is unavailable, `auto` can use safe target-bound Singles;
 a safe scoped startup retry can also select per-probe `perf_event` uprobes
 (`src/attach.rs`: `select_session_backend`). Other required permissions and
 scope features still apply. A host that fails Multi eligibility exits nonzero
-with `uprobe-multi-required`. Both historical matrices below were measured by
+with a one-line refusal naming the cause. Both historical matrices below were measured by
 `scripts/matrix/verify-fork-scope.sh` against a same-UID non-descendant
 with SoftHSM2 already mapped, at `kernel.perf_event_paranoid=4`,
 `kernel.yama.ptrace_scope=1`.
@@ -1742,7 +1951,7 @@ cgroup. `scripts/matrix/verify-pidns.sh` reproduces all of this without kind:
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -1753,7 +1962,7 @@ release commitment is made.
 The following permission measurements are historical diagnostics. Their old
 5.15 floor hints and exit-0 partial-capture behavior predate current host
 admission. A live attempt on a host without usable Multi now exits nonzero with
-`uprobe-multi-required` before capture or workload side effects.
+a one-line refusal naming the cause before capture or workload side effects.
 
 These earlier measurements came from a real host
 (`docs/notes/phase5-unsupported.md`; two real bugs — a swallowed OS error,

@@ -35,6 +35,8 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
 
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         exclude_modules: vec![],
@@ -68,6 +70,8 @@ fn untrusted_output_is_refused_before_the_discovery_scan() {
 fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: Kind::Profile,
         modules: Vec::new(),
         exclude_modules: vec![],

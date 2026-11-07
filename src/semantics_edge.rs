@@ -288,6 +288,9 @@ pub(crate) struct KeyReceipt {
     /// Whether the viewed attribution was valid at use (H9 §72: a
     /// label needs valid attribution plus non-conflicting fields).
     pub attribution_valid: bool,
+    /// The viewed object's origin is first-observed (its creation
+    /// or lookup predates the observed window; late attach).
+    pub first_observed: bool,
     /// Set when retirement ends this association before the S1
     /// terminal (H9 §66 `key_join_lost`); never backfilled.
     pub lost: bool,

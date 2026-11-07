@@ -57,7 +57,8 @@ CELLS = ("counts-system", "detailed-pid", "inventory-system")
 TIMING_LINE = re.compile(r"p11scope: pass (\d+): stage timings: (.+)")
 OP_VALUE = re.compile(r"(\S+)\s+([0-9]+(?:\.[0-9]+)?)(ns|us|ms|s)")
 UNIT_NS = {"ns": 1.0, "us": 1e3, "ms": 1e6, "s": 1e9}
-CAPTURING_LINE = re.compile(r"p11scope: capturing: (\d+) probe\(s\) attached")
+CAPTURING_LINE = re.compile(r"p11scope: capturing: (\d+) probes? attached")
+CAPTURING_WAITING = re.compile(r"p11scope: capturing: waiting for .*; stop with Ctrl-C")
 LANE_ACTIVE_LINE = re.compile(r"p11scope: native usage lane active")
 RSS_LINE = re.compile(r"Maximum resident set size \(kbytes\): (\d+)")
 DURATION_RE = re.compile(r"(\d+)s$")
@@ -134,6 +135,8 @@ def parse_readiness(stderr_lines, cell):
             match = CAPTURING_LINE.search(line)
             if match:
                 return index, int(match.group(1))
+            if CAPTURING_WAITING.search(line):
+                return index, 0
         elif cell == "counts-system":
             if LANE_ACTIVE_LINE.search(line):
                 return index, None

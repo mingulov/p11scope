@@ -562,12 +562,44 @@ class CompareTwins(unittest.TestCase):
             with self.assertRaisesRegex(oracle.LedgerError, "role invalid"):
                 oracle.validate_snapshot(snapshot)
         with self.subTest("unknown versions refused"):
-            for version in (0, 3, 99):
+            for version in (0, 99):
                 snapshot = healthy_snapshot([first, second])
                 snapshot["version"] = version
                 with self.assertRaisesRegex(oracle.LedgerError,
                                             "version mismatch"):
                     oracle.validate_snapshot(snapshot)
+        with self.subTest("v3 unattributed counters validate"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 3
+            snapshot["unattributed"] = [
+                {"reason": "foreign_or_unproven_caller", "count": 2}]
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("v3 without unattributed refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 3
+            with self.assertRaises(oracle.LedgerError):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("unattributed before v3 refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["unattributed"] = [
+                {"reason": "record_lost", "count": 1}]
+            with self.assertRaises(oracle.LedgerError):
+                oracle.validate_snapshot(snapshot)
+        with self.subTest("v4 unknown metadata label validates"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 4
+            snapshot["unattributed"] = []
+            snapshot["key_operations"][0]["metadata_at_use"] = "unknown"
+            oracle.validate_snapshot(snapshot)
+        with self.subTest("unknown metadata label before v4 refused"):
+            snapshot = healthy_snapshot([first, second])
+            snapshot["version"] = 3
+            snapshot["unattributed"] = [
+                {"reason": "record_lost", "count": 1}]
+            snapshot["key_operations"][0]["metadata_at_use"] = "unknown"
+            with self.assertRaisesRegex(oracle.LedgerError,
+                                        "metadata_at_use invalid"):
+                oracle.validate_snapshot(snapshot)
 
     def test_healthy_same_scope_handle_joins_one_row(self):
         oracle = require_oracle(self)
@@ -785,7 +817,7 @@ class StreamTwins(unittest.TestCase):
         with self.subTest("unknown row version refused"):
             snapshot = healthy_snapshot([first, second])
             stream = healthy_stream([first, second], snapshot)
-            stream[0]["event"]["version"] = 3
+            stream[0]["event"]["version"] = 99
             with self.assertRaisesRegex(oracle.LedgerError, "version"):
                 oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("unknown marker version refused"):
@@ -793,7 +825,7 @@ class StreamTwins(unittest.TestCase):
             stream = healthy_stream([first, second], snapshot)
             marker = next(line for line in stream
                           if line["kind"] == "pass_committed")
-            marker["event"]["object_version"] = 3
+            marker["event"]["object_version"] = 99
             with self.assertRaisesRegex(oracle.LedgerError, "version"):
                 oracle.compare_stream(stream, [first, second], snapshot)
         with self.subTest("v2 role on a v1 row refused from stream authority"):

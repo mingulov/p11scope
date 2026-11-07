@@ -98,6 +98,7 @@ impl OwnedFixture {
                 inode: mapping.inode,
             },
             path: path.display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: vec![],
             tables: vec![],
@@ -2183,9 +2184,7 @@ fn task4_file_replay_rejects_swapped_physical_calls_and_changed_rendering() -> R
         );
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        rendered.extend_from_slice(
-            format!("owned_{slot} [semantics unverified] → {rv_label} \n").as_bytes(),
-        );
+        rendered.extend_from_slice(format!("owned_{slot} → {rv_label} \n").as_bytes());
     }
     for slot in 0..2 {
         raw.push(
@@ -2684,7 +2683,7 @@ fn task4_highslot_replay_requires_old_worker_start_and_new_image() -> Result<()>
         raw.push(task4_synthetic_terminal(1));
         let rv_label = pkcs11_types::CkRv(rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-        let rendered = format!("owned_2048 [semantics unverified] → {rv_label} \n");
+        let rendered = format!("owned_2048 → {rv_label} \n");
         ensure!(
             task4_replay_files(case, &ledger, &lines(&raw)?, rendered.as_bytes(), &offsets)?
                 == (1, 1)
@@ -4035,11 +4034,7 @@ fn task4_replay_identity_files(
                     && (position % 2 != 0 || ts.checked_sub(duration) == witness["ts_ns"].as_u64())
             );
             let line = std::str::from_utf8(rendered[position])?;
-            ensure!(
-                line.contains("C_Finalize")
-                    && line.contains("C_Initialize")
-                    && line.contains("[semantics unverified]")
-            );
+            ensure!(line.contains("C_Finalize") && line.contains("C_Initialize"));
         }
         let terminal = &raw[16];
         ensure!(
@@ -5280,9 +5275,7 @@ fn task4_replay_files(
             let rv_label = pkcs11_types::CkRv(rv).to_string();
             let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
             ensure!(
-                rendered_lines[position].contains(&format!(
-                    "owned_{slot} [semantics unverified] → {rv_label} "
-                )),
+                rendered_lines[position].contains(&format!("owned_{slot} → {rv_label} ")),
                 "replay rendered slot/RV differs at {position}"
             );
         }
@@ -6639,6 +6632,231 @@ fn inventory_multi_prefix_case(with_over_budget: bool) -> Result<()> {
     Ok(())
 }
 
+/// Default-budget scale cell: five owned providers of 4,096 endpoints
+/// each (20,480 endpoints, the several-p11-kit-copies host shape) merge
+/// whole under the DEFAULT Inventory budget — no `--max-endpoints`
+/// selection — attach on Multi, every endpoint fires exactly once, and
+/// the stop releases every link. This is the cell that covers the
+/// LIM-1 default of 32,768; on the old 4,096 default the merge refuses
+/// every provider past the first whole.
+#[test]
+#[ignore = "root-owned BPF lane; 20480-endpoint default-budget Multi population admits every endpoint with no refusal"]
+fn privileged_inventory_multi_n20480_default_lp64() -> Result<()> {
+    let total_start = Instant::now();
+    let budget = crate::capacity::inventory_endpoint_budget(None).map_err(anyhow::Error::msg)?;
+    ensure!(
+        budget.endpoint_limit() == 32_768,
+        "the default budget is {}, not 32768",
+        budget.endpoint_limit()
+    );
+    const PROVIDERS: u32 = 5;
+    const PER_PROVIDER: u32 = 4_096;
+    const TOTAL: u32 = PROVIDERS * PER_PROVIDER;
+    let fixture_start = Instant::now();
+    let mut fixtures = Vec::new();
+    for _ in 0..PROVIDERS {
+        let fixture = OwnedFixture::build_n(false, PER_PROVIDER)?;
+        ensure!(
+            fixture.plan.slots.len() == PER_PROVIDER as usize,
+            "provider carries {} endpoints, not {PER_PROVIDER}",
+            fixture.plan.slots.len()
+        );
+        fixtures.push(fixture);
+    }
+    eprintln!(
+        "MULTI_DEFAULT_FIXTURE providers={PROVIDERS} endpoints={TOTAL} ms={}",
+        fixture_start.elapsed().as_millis()
+    );
+    let files: Vec<(&Path, &str)> = fixtures
+        .iter()
+        .map(|fixture| (fixture.path.as_path(), fixture.expected_sha256.as_str()))
+        .collect();
+    let pins = inventory_fx::pass_pins(&files);
+    let mut modules = Vec::new();
+    for fixture in &fixtures {
+        let offsets: Vec<u64> = fixture
+            .plan
+            .slots
+            .iter()
+            .map(|slot| slot.file_offset)
+            .collect();
+        let mut module = inventory_fx::module(&pins, &fixture.path, &offsets);
+        module.scanned.interfaces.push(ScannedInterface {
+            index: 0,
+            name_class: "exact_standard",
+            name_lossy: None,
+            name_private: None,
+            flags: 0,
+            table: Some(0),
+        });
+        modules.push(module);
+    }
+    let plan_start = Instant::now();
+    let plan = crate::plan::build_from_sources_for_policy_scoped(
+        &modules,
+        &[],
+        &pins,
+        AdmissionPolicy::Inventory(budget),
+        AdmissionScope::Shared,
+    );
+    ensure!(
+        plan.slots.len() == TOTAL as usize,
+        "the default-budget merge admitted {} slots, not {TOTAL}",
+        plan.slots.len()
+    );
+    ensure!(
+        plan.modules_skipped.is_empty(),
+        "the default-budget merge refused {:?}",
+        plan.modules_skipped
+    );
+    let mut set = InventoryAttachSet::new(budget);
+    let mut outcome = set.absorb(&plan, &pins);
+    ensure!(
+        outcome.delta.endpoints.len() == TOTAL as usize && set.len() == TOTAL as usize,
+        "the attach set holds {} endpoints, not {TOTAL}",
+        set.len()
+    );
+    ensure!(outcome.gaps.is_empty(), "absorb gaps: {:?}", outcome.gaps);
+    let fds_before = multi_prefix_fd_count();
+    let prepare_start = Instant::now();
+    let mut capture = InventoryCapture::prepare(
+        CaptureScope::System,
+        budget,
+        crate::attach::inventory::capture::caller_budget(budget, MULTI_PREFIX_PAIRS)?,
+        AttachBackend::Multi,
+    )?;
+    ensure!(
+        capture.backend() == AttachBackend::Multi,
+        "the capture did not stay Multi"
+    );
+    let receipt = capture.extend(
+        std::mem::take(&mut outcome.delta),
+        &set,
+        ExtendWindow::new(TOTAL as usize, Instant::now() + Duration::from_secs(600)).unwrap(),
+    );
+    ensure!(receipt.activated_roots, "roots inactive: {receipt:?}");
+    ensure!(
+        receipt.refused.is_none(),
+        "extend refused: {:?}",
+        receipt.refused
+    );
+    ensure!(
+        receipt.failed.is_empty(),
+        "attach failures: {} (first: {:?})",
+        receipt.failed.len(),
+        receipt.failed.iter().take(3).collect::<Vec<_>>()
+    );
+    ensure!(
+        receipt.attached.len() == TOTAL as usize,
+        "attached {} endpoints, not {TOTAL}",
+        receipt.attached.len()
+    );
+    let mut grouped: Vec<u32> = Vec::new();
+    let mut group_links = 0usize;
+    for group in &receipt.groups {
+        ensure!(group.links == 1, "group {} split", group.serial);
+        group_links += group.links;
+        grouped.extend(group.members.iter().map(|id| id.0));
+    }
+    grouped.sort_unstable();
+    ensure!(
+        grouped.len() == TOTAL as usize,
+        "the {} groups carry {} members, not {TOTAL}",
+        receipt.groups.len(),
+        grouped.len()
+    );
+    eprintln!(
+        "MULTI_DEFAULT_ATTACH attached={TOTAL} groups={} links={} ms={} attach_ns_total={} attach_ns_max={}",
+        receipt.groups.len(),
+        2 + group_links,
+        prepare_start.elapsed().as_millis(),
+        receipt.attach_ns_total,
+        receipt.attach_ns_max,
+    );
+    eprintln!("MULTI_DEFAULT_PLAN ms={}", plan_start.elapsed().as_millis());
+    let call_start = Instant::now();
+    let mut callers = Vec::new();
+    for fixture in &fixtures {
+        callers.push(fixture.spawn()?);
+    }
+    for caller in &mut callers {
+        for id in 0..PER_PROVIDER {
+            caller.calls(id, 1)?;
+        }
+    }
+    let call_ms = call_start.elapsed().as_millis();
+    let (rows, batch) = multi_prefix_read_sweep(&mut capture)?;
+    ensure!(
+        rows.len() == PROVIDERS as usize && batch.seen_rows == PROVIDERS as usize,
+        "witnessed {} rows (seen {}), not {PROVIDERS}",
+        rows.len(),
+        batch.seen_rows
+    );
+    let mut tgids: Vec<u32> = rows.iter().map(|row| row.host_tgid).collect();
+    tgids.sort_unstable();
+    let mut caller_pids: Vec<u32> = callers.iter().map(|caller| caller.child.id()).collect();
+    caller_pids.sort_unstable();
+    ensure!(tgids == caller_pids, "witness rows name other processes");
+    for row in &rows {
+        ensure!(
+            row.entry_count == u64::from(PER_PROVIDER),
+            "a witness row counted {}, not {PER_PROVIDER}",
+            row.entry_count
+        );
+    }
+    ensure!(
+        batch
+            .health
+            .caller_evidence
+            .is_none_or(|cells| cells == [0, 0, 0, 0]),
+        "caller evidence is dirty: {:?}",
+        batch.health.caller_evidence
+    );
+    ensure!(
+        batch
+            .health
+            .usage_evidence
+            .is_none_or(|cells| cells == [0, 0, 0]),
+        "usage evidence is dirty: {:?}",
+        batch.health.usage_evidence
+    );
+    eprintln!("MULTI_DEFAULT_WITNESS rows={PROVIDERS} call_ms={call_ms}");
+    for mut caller in callers {
+        caller.finish()?;
+    }
+    let live_before_stop = capture.live_links();
+    let stop_start = Instant::now();
+    let retired = multi_prefix_stop(capture)?;
+    let stop_ms = stop_start.elapsed().as_millis();
+    let cleanup = retired.cleanup();
+    ensure!(
+        cleanup.failures.is_empty() && cleanup.retained_links == 0,
+        "dirty stop: {cleanup:?}"
+    );
+    ensure!(
+        cleanup.closed == live_before_stop,
+        "the stop closed {} links, not {}",
+        cleanup.closed,
+        live_before_stop
+    );
+    let closed = cleanup.closed;
+    drop(retired);
+    let fds_after = multi_prefix_fd_count();
+    ensure!(
+        fds_after == fds_before,
+        "the stop leaked descriptors: {fds_before} -> {fds_after}"
+    );
+    eprintln!(
+        "MULTI_DEFAULT_STOP closed={closed} stop_ms={stop_ms} total_ms={}",
+        total_start.elapsed().as_millis()
+    );
+    ensure!(
+        total_start.elapsed() < MULTI_PREFIX_TOTAL_BUDGET,
+        "the cell overran its finite-time backstop"
+    );
+    Ok(())
+}
+
 #[cfg(not(feature = "wide-detailed-2112"))]
 #[cfg(not(feature = "wide-detailed-2112"))]
 #[test]
@@ -7447,10 +7665,7 @@ fn detailed_sweep_gate(n: u32, cell: Option<&'static str>) -> Result<()> {
         let rv_label = pkcs11_types::CkRv(event.rv).to_string();
         let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
         ensure!(
-            rendered.contains(&format!(
-                "owned_{} [semantics unverified] → {rv_label} ",
-                event.slot
-            )),
+            rendered.contains(&format!("owned_{} → {rv_label} ", event.slot)),
             "Tracer failed to render exact fixture slot and RV without authority: {rendered}"
         );
         rendered_hash.update(rendered.as_bytes());
@@ -8774,13 +8989,7 @@ fn privileged_task4_detailed_physical_identity_controls() -> Result<()> {
             evidence.identity_event(event, fixture, witness, role)?;
             tracer.count_raw_call(event);
             let rendered = tracer.on_event(event, &mut state);
-            let rv_label = pkcs11_types::CkRv(event.rv).to_string();
-            let rv_label = rv_label.split(" (").next().unwrap_or(&rv_label);
-            ensure!(
-                rendered.contains("C_Finalize")
-                    && rendered.contains("C_Initialize")
-                    && rendered.contains(&format!("[semantics unverified] → {rv_label} "))
-            );
+            ensure!(rendered.contains("C_Finalize") && rendered.contains("C_Initialize"));
             evidence.render(&rendered)?;
         }
     }
@@ -9297,7 +9506,7 @@ fn wide_highslot_gate(exec: bool) -> Result<()> {
     evidence.event(&events[0], &fixture, "successor_completed")?;
     evidence.render(&rendered)?;
     ensure!(
-        tracer.raw_calls() == 1 && rendered.contains("owned_2048 [semantics unverified]"),
+        tracer.raw_calls() == 1 && rendered.contains("owned_2048 →"),
         "high-slot successor was not rendered by real Tracer"
     );
     ensure!(

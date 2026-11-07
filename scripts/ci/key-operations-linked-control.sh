@@ -503,8 +503,9 @@ refused_exit() {
 }
 
 # run_no_manifest_cell: the flag without --manifest. No fixture, no seal
-# wait: without a manifest there is no Detailed Session and no semantic
-# lane at all, so the seal line can never come. A startup refusal exits
+# wait: since DEMO-4 the semantic lane seals from scan-discovered tables
+# after an engine-changing pass (or stays unsealed when no provider is
+# discovered); either way the capture is accepted. A startup refusal exits
 # inside REFUSE_WAIT_S; otherwise the capture is accepted and observed
 # until stderr goes quiet for SETTLE_S or NOMANIFEST_CAP_S elapses (a
 # continuous scanner never idles, so the bound stops it), then one

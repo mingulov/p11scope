@@ -65,6 +65,7 @@ impl Fixture {
                 inode: mapping.inode,
             },
             path: path.display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: vec![],
             tables: vec![],

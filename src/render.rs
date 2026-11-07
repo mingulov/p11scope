@@ -914,6 +914,14 @@ pub struct DiscoveredModule {
     /// deliberately absent from the public report schema.
     #[serde(skip)]
     pub id: ModuleId,
+    /// The deciding admission class label, renderer metadata like `id`:
+    /// `closure_array` marks a forwarding-layer candidate even when it was
+    /// admitted whole with no gap (counter/broad policies); the split
+    /// additionally needs an active attributed row and no refused backend.
+    /// Absent from the schema; the JSON layer split travels in `functions[]`
+    /// and `layer_totals` instead.
+    #[serde(skip)]
+    pub admission_class: Option<&'static str>,
     pub dev: (u64, u64),
     pub ino: u64,
     /// `None` when nothing pinned the module object itself.
@@ -1094,6 +1102,11 @@ pub struct Evidence {
     /// `--pause always` degrades that collected unpaused instead of
     /// aborting (never-stop). Each forces `PARTIAL`.
     pub pause_unavailable: u64,
+    /// Engine-incomplete cap retirements: `--pause auto` chains that
+    /// ended after four straight incomplete cycles. Each is already one
+    /// counted `pause_partial`; this count is a subset annotation, not
+    /// a lattice member.
+    pub pause_engine_incomplete_retirements: u64,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2045,6 +2058,40 @@ fn label(r: &SlotReport) -> String {
     }
 }
 
+/// The function table's provider cell: the owning module's file name,
+/// `two providers` when two files claim the row, or `unknown` when no
+/// file is proven. Escaped and truncated to the column width, so long
+/// paths never break the table's alignment.
+fn provider_cell(row: &SlotReport, modules: &[DiscoveredModule]) -> String {
+    const WIDTH: usize = 16;
+    let cell = if row.module_ambiguous {
+        "two providers".to_string()
+    } else if let Some(id) = row.module {
+        modules
+            .iter()
+            .find(|module| module.id == id)
+            .map(|module| {
+                module
+                    .path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(&module.path)
+                    .to_string()
+            })
+            .unwrap_or_else(|| "unknown".to_string())
+    } else {
+        "unknown".to_string()
+    };
+    let escaped = escape_controls(&cell);
+    if escaped.chars().count() <= WIDTH {
+        escaped.into_owned()
+    } else {
+        let mut short: String = escaped.chars().take(WIDTH - 1).collect();
+        short.push('…');
+        short
+    }
+}
+
 pub(crate) fn fmt_ns(ns: Option<u64>) -> String {
     match ns {
         None => "—".into(),
@@ -2071,6 +2118,35 @@ pub(crate) const MODULE_GAPS_SHOWN: usize = 5;
 /// Attached providers named inside one closure-array gap line: the top
 /// three by counted calls plus an "and K more" suffix.
 const GAP_PROVIDERS_SHOWN: usize = 3;
+
+/// Concise module gaps shown in default text: at most this many
+/// `modules_skipped` lines plus an "and K more" line. Verbose shows
+/// up to `MODULE_GAPS_SHOWN`; quiet shows none.
+pub(crate) const CONCISE_MODULE_GAPS_SHOWN: usize = 2;
+
+/// The concise twin of [`module_gap_lines`]: the first one or two
+/// refused or partially covered providers with file, plain status and
+/// the `--module` remedy, so a concise PARTIAL names its target
+/// without requiring `-v`. Empty when nothing was refused.
+fn concise_module_gap_lines(ev: &Evidence, reports: &[SlotReport]) -> String {
+    let total = ev.discovery.modules_skipped.len();
+    if total == 0 {
+        return String::new();
+    }
+    let shown = total.min(CONCISE_MODULE_GAPS_SHOWN);
+    let mut out = format!("Module gaps (showing {shown} of {total}):\n");
+    for skipped in ev.discovery.modules_skipped.iter().take(shown) {
+        out.push_str(&format!(
+            "  {}: {}\n",
+            escape_controls(&skipped.name),
+            gap_line_body(ev, reports, skipped)
+        ));
+    }
+    if total > shown {
+        out.push_str(&format!("  and {} more\n", total - shown));
+    }
+    out
+}
 
 /// The named module gaps behind a PARTIAL verdict: every refused or
 /// partially covered module with its reason in plain words, what is still
@@ -2135,24 +2211,27 @@ fn excluded_lines(ev: &Evidence) -> String {
 }
 
 /// One named gap line's body: the status, the planner's reason, and the
-/// hint. A refused proxy layer points at the attached providers that count
-/// its forwarded calls; a prefix-admitted proxy layer names its covered
-/// templates with no further hint; a refused provider points at `--module`
+/// hint. A forwarding (proxy closure) layer points at the attached providers
+/// that count its forwarded calls and states plainly that calls the layer
+/// answers itself are not counted (through a template that was not attached,
+/// for a prefix); a refused provider points at `--module`
 /// (unless the reason already carries that hint, as shared-scope refusals do).
 fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) -> String {
-    let status = if crate::plan::is_growth_omission(&skipped.reason)
-        || crate::plan::is_closure_array_prefix(&skipped.reason)
-        || crate::plan::is_provider_prefix(&skipped.reason)
-    {
+    let status = if crate::plan::is_partial_coverage(&skipped.reason) {
         "partially covered"
     } else {
         "not attached"
     };
     let mut body = format!("{status} — {}", escape_controls(&skipped.reason));
     if crate::plan::is_closure_array_refusal(&skipped.reason) {
-        body.push_str(&closure_forwarding_hint(ev, reports));
+        body.push_str(&closure_forwarding_hint(ev, reports, &skipped.name));
+        body.push_str(". Calls the forwarding layer answers itself are not counted.");
     } else if crate::plan::is_closure_array_prefix(&skipped.reason) {
-        // The reason already names the covered templates; no hint.
+        body.push_str(&closure_forwarding_hint(ev, reports, &skipped.name));
+        body.push_str(
+            ". Calls the forwarding layer answers itself through a template \
+             that was not attached are not counted.",
+        );
     } else if !skipped.reason.contains("--module") {
         body.push_str(&format!(
             "; capture it alone with --module {}",
@@ -2165,10 +2244,23 @@ fn gap_line_body(ev: &Evidence, reports: &[SlotReport], skipped: &SkippedOut) ->
 /// Where a refused proxy layer's forwarded calls are counted: the attached
 /// providers with their completed calls, top three plus "and K more" — or,
 /// when nothing below it counted, an explicit statement to that effect.
-fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
+/// The skipped layer itself is never listed: a prefix-admitted layer's own
+/// stub slots count under its own module id, and naming it as a provider
+/// below itself would be circular. A refused layer holds no slots, so the
+/// exclusion is a no-op there.
+fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: &str) -> String {
+    let skipped_id = ev
+        .discovery
+        .modules
+        .iter()
+        .find(|module| module.path == skipped_name)
+        .map(|module| module.id);
     let mut calls = std::collections::BTreeMap::<ModuleId, u64>::new();
     for report in reports {
         if let Some(module) = report.module {
+            if Some(module) == skipped_id {
+                continue;
+            }
             let total = calls
                 .get(&module)
                 .copied()
@@ -2193,7 +2285,8 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
         if ev.discovery.modules.is_empty() {
             return "; no provider below it was captured".into();
         }
-        return "; the attached providers counted 0 calls".into();
+        return "; no other attached provider counted calls; the layer's own calls stay in the totals"
+            .into();
     }
     let mut list: Vec<String> = providers
         .iter()
@@ -2211,9 +2304,127 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport]) -> String {
         list.push(format!("and {more} more"));
     }
     format!(
-        "; calls it forwards are counted at the attached providers ({})",
+        "; calls it forwards are counted at the attached provider files ({})",
         list.join(", ")
     )
+}
+
+/// Modules whose attached counts are forwarding-layer observations, never
+/// logical calls: closure-array layers admitted beside watched providers.
+/// Identified structurally — never by path, name or vendor — from the
+/// deciding admission class first (this also catches whole-admitted
+/// closures under counter/broad policies, which carry no gap) and from
+/// the planner's closure gaps beside it. The split additionally needs any
+/// watched, attributed, active non-layer row in the same capture — not
+/// necessarily the provider below the layer, any active non-layer module
+/// flips the gate — and no refused (whole, non-closure) provider gap: a
+/// refused backend keeps the layer logical, since a disclosed overcount
+/// beats hiding the application's calls. Without an active attributed row
+/// (a lone remote client, a quiet provider, or backend rows observed only
+/// through unattributed rows) the layer's calls are the only attributed
+/// observation and stay logical, so the set is empty. Render rows carry no
+/// caller in any scope, so the gate applies capture-wide.
+fn forwarding_module_ids(
+    ev: &Evidence,
+    reports: &[SlotReport],
+) -> std::collections::BTreeSet<ModuleId> {
+    let mut names = std::collections::BTreeSet::new();
+    for skipped in &ev.discovery.modules_skipped {
+        if crate::plan::is_closure_array_prefix(&skipped.reason)
+            || crate::plan::is_closure_array_refusal(&skipped.reason)
+        {
+            names.insert(skipped.name.as_str());
+        }
+    }
+    let candidates: std::collections::BTreeSet<ModuleId> = ev
+        .discovery
+        .modules
+        .iter()
+        .filter(|module| {
+            module.admission_class == Some("closure_array") || names.contains(module.path.as_str())
+        })
+        .map(|module| module.id)
+        .collect();
+    let backend_refused = ev.discovery.modules_skipped.iter().any(|skipped| {
+        !crate::plan::is_partial_coverage(&skipped.reason)
+            && !crate::plan::is_closure_array_refusal(&skipped.reason)
+    });
+    if backend_refused {
+        return std::collections::BTreeSet::new();
+    }
+    let provider_active = reports.iter().any(|row| {
+        row.module.is_some_and(|id| !candidates.contains(&id))
+            && (row.calls > 0 || row.errors > 0 || row.in_flight > 0)
+    });
+    if !provider_active {
+        return std::collections::BTreeSet::new();
+    }
+    candidates
+}
+
+/// True when a slot row counts calls at a forwarding layer. Attributed
+/// rows match by module id; unattributed rows (ambiguous or unresolved
+/// ownership) match by the attach target's file identity, since the
+/// counts are real even when the owner was not proven.
+fn row_is_forwarding(
+    report: &SlotReport,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> bool {
+    if forwarding.is_empty() {
+        return false;
+    }
+    if let Some(id) = report.module {
+        return forwarding.contains(&id);
+    }
+    if let Some(target) = &report.target_object {
+        return modules.iter().any(|module| {
+            forwarding.contains(&module.id) && module.dev == target.dev && module.ino == target.ino
+        });
+    }
+    false
+}
+
+/// Ownership-gap rows behind the headline: logical rows only, since
+/// the gap lines explain headline attribution. Forwarding rows are
+/// stated in the forwarding line, never summed here.
+fn owner_gap_total(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+    gap: fn(&SlotReport) -> bool,
+) -> (bool, u64) {
+    let mut any = false;
+    let mut total = 0u64;
+    for row in reports {
+        if gap(row) && !row_is_forwarding(row, forwarding, modules) {
+            any = true;
+            total = total.saturating_add(row.calls);
+        }
+    }
+    (any, total)
+}
+
+/// Per-layer completed/error/in-flight totals over slot rows: logical
+/// (provider) calls first, forwarding-layer calls second. One logical
+/// call observed at both layers counts once, in the logical total.
+fn layer_call_totals(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> [(u64, u64, u64); 2] {
+    let mut totals = [(0u64, 0u64, 0u64); 2];
+    for report in reports {
+        let slot = if row_is_forwarding(report, forwarding, modules) {
+            &mut totals[1]
+        } else {
+            &mut totals[0]
+        };
+        slot.0 = slot.0.saturating_add(report.calls);
+        slot.1 = slot.1.saturating_add(report.errors);
+        slot.2 = slot.2.saturating_add(report.in_flight);
+    }
+    totals
 }
 
 /// True when at least one mapped provider has no manifest source at all.
@@ -2257,8 +2468,8 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
         shown.join(", ")
     };
     format!(
-        "Attribution: {} of {} mapped provider{} {} no manifest ({}); counts are exact, \
-         names are withheld — rerun with --manifest for each mapped provider.\n",
+        "Attribution: {} of {} mapped provider file{} {} no manifest ({}); counts are exact, \
+         names are unconfirmed — rerun with --manifest for each mapped provider file.\n",
         unattested.len(),
         modules.len(),
         if modules.len() == 1 { "" } else { "s" },
@@ -2267,68 +2478,193 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
     )
 }
 
+/// Plain-words per-layer split for forwarding-layer activity: each
+/// forwarding layer with its own completed calls, stated separately from
+/// — never summed into — the logical headline above it. Empty when no
+/// forwarding layer recorded activity, so single-layer captures read
+/// exactly as before.
+fn forwarding_layer_lines(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    (fwd_calls, fwd_errors, fwd_open): (u64, u64, u64),
+) -> String {
+    if fwd_calls == 0 && fwd_errors == 0 && fwd_open == 0 {
+        return String::new();
+    }
+    let mut per_layer = std::collections::BTreeMap::<ModuleId, (u64, u64, u64)>::new();
+    for report in reports {
+        if !row_is_forwarding(report, forwarding, &ev.discovery.modules) {
+            continue;
+        }
+        // Attributed rows group under their module; unattributed rows
+        // group under the forwarding layer their attach target
+        // identifies (the same file-identity match as
+        // `row_is_forwarding`), so the per-layer line names the
+        // matched layer.
+        let key = report
+            .module
+            .or_else(|| {
+                report.target_object.as_ref().and_then(|target| {
+                    ev.discovery
+                        .modules
+                        .iter()
+                        .filter(|module| {
+                            forwarding.contains(&module.id)
+                                && module.dev == target.dev
+                                && module.ino == target.ino
+                        })
+                        .map(|module| module.id)
+                        .next()
+                })
+            })
+            .unwrap_or(ModuleId(u32::MAX));
+        let slot = per_layer.entry(key).or_insert((0, 0, 0));
+        slot.0 = slot.0.saturating_add(report.calls);
+        slot.1 = slot.1.saturating_add(report.errors);
+        slot.2 = slot.2.saturating_add(report.in_flight);
+    }
+    let mut layers: Vec<String> = per_layer
+        .iter()
+        .filter(|(_, (calls, errors, open))| *calls > 0 || *errors > 0 || *open > 0)
+        .map(|(id, (calls, errors, open))| {
+            let path = ev
+                .discovery
+                .modules
+                .iter()
+                .find(|module| module.id == *id)
+                .map(|module| escape_controls(&module.path).into_owned())
+                .unwrap_or_else(|| "an unattributed forwarding target".into());
+            let mut detail = format!("{path} recorded {calls} completed forwarding-layer calls");
+            if *errors > 0 {
+                detail.push_str(&format!(", {errors} returned errors"));
+            }
+            if *open > 0 {
+                detail.push_str(&format!(", {open} entries without an observed return"));
+            }
+            detail
+        })
+        .collect();
+    layers.sort();
+    if layers.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Forwarding layers counted separately (not in the totals above): {}.\n\
+         The totals above count calls at the attached providers; \
+         calls a layer answered itself or forwarded to a provider that was not attached, \
+         including its errors, appear only here, \
+         and a layer call that reaches several providers counts at each.\n",
+        layers.join("; ")
+    )
+}
+
 /// Human context from aggregate map rows and the existing evidence verdict.
 /// Scope is a kind, never a target PID, path or application identity.
+/// Renders at the run-scoped verbosity; see [`scope_summary_with_verbosity`].
 pub fn scope_summary(scope: &str, reports: &[SlotReport], ev: &Evidence) -> String {
-    let sum = |field: fn(&SlotReport) -> u64| {
-        reports
-            .iter()
-            .fold(0u64, |total, row| total.saturating_add(field(row)))
-    };
-    let calls = sum(|row| row.calls);
-    let errors = sum(|row| row.errors);
-    let open = sum(|row| row.in_flight);
-    let mut text = format!("Scope: {} scope\n", scope_label(scope));
-    if scope != "pid" {
-        text.push_str("Aggregate across the selected scope; counts are not per application.\n");
+    scope_summary_with_verbosity(scope, reports, ev, crate::cli::text_verbosity())
+}
+
+/// [`scope_summary`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps totals, plain coverage reasons, the
+/// attribution hint and the first module gaps; verbose adds every
+/// module gap and owner-gap lines; quiet keeps totals and coverage
+/// only.
+pub fn scope_summary_with_verbosity(
+    scope: &str,
+    reports: &[SlotReport],
+    ev: &Evidence,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    use crate::cli::TextVerbosity;
+    let verbose = verbosity == TextVerbosity::Verbose;
+    // Headline totals count logical calls once: a call observed at both
+    // a forwarding layer and the provider it forwards into counts in the
+    // provider (logical) total only. Forwarding-layer calls are stated
+    // separately below, never summed in.
+    let forwarding = forwarding_module_ids(ev, reports);
+    let [(calls, errors, open), (fwd_calls, fwd_errors, fwd_open)] =
+        layer_call_totals(reports, &forwarding, &ev.discovery.modules);
+    let mut text = String::new();
+    if verbosity != TextVerbosity::Quiet {
+        if scope != "pid" {
+            text.push_str("Aggregate across the selected scope; counts are not per application.\n");
+        }
+        if calls == 0 && fwd_calls == 0 {
+            text.push_str(if ev.completeness == "COMPLETE" {
+                "No completed calls observed during this window.\n"
+            } else {
+                "No completed calls observed; coverage incomplete.\n"
+            });
+            // A quiet window over mapped providers is usually correct —
+            // the target simply made no PKCS#11 calls — but it reads as a
+            // failure. Say when providers are typically called and name
+            // the wider target a narrower scope should try. Only when
+            // coverage is COMPLETE: under PARTIAL the assertion would
+            // overclaim calls explicitly not counted.
+            if ev.completeness == "COMPLETE" && !ev.discovery.modules.is_empty() {
+                text.push_str(
+                    "No PKCS#11 calls were made in this window; providers are often called only at startup. ",
+                );
+                if scope == "system" {
+                    text.push_str("Attach before the targets start.\n");
+                } else {
+                    text.push_str(
+                        "Attach before the target starts, or use --system when a related process may call them.\n",
+                    );
+                }
+            }
+        }
     }
-    if calls == 0 {
-        text.push_str(if ev.completeness == "COMPLETE" {
-            "No completed calls observed during this window.\n"
-        } else {
-            "No completed calls observed; coverage incomplete.\n"
-        });
-    }
-    text.push_str(&format!(
-        "{calls} completed calls; {errors} returned errors; {open} entries without an observed return.\n"
+    text.push_str(&totals_line(calls, errors, open));
+    text.push('\n');
+    text.push_str(&forwarding_layer_lines(
+        reports,
+        ev,
+        &forwarding,
+        (fwd_calls, fwd_errors, fwd_open),
     ));
-    text.push_str(&format!(
-        "Coverage {}{}\n",
-        escape_controls(ev.completeness),
-        escape_controls(&verdict_reasons(ev)),
-    ));
-    text.push_str(&unattributed_provider_line(ev));
-    if ev.event_loss > 0 {
-        text.push_str(
-            "Coverage partial: event detail was lost. Aggregate counts use the counter maps.\n",
-        );
+    text.push_str(&coverage_line(ev, verbose));
+    text.push('\n');
+    if verbosity != TextVerbosity::Quiet {
+        text.push_str(&unattributed_provider_line(ev));
     }
-    text.push_str(&module_gap_lines(ev, reports));
+    if verbose {
+        text.push_str(&module_gap_lines(ev, reports));
+    } else if verbosity == TextVerbosity::Concise {
+        text.push_str(&concise_module_gap_lines(ev, reports));
+    }
     text.push_str(&excluded_lines(ev));
-    for (has_owner_gap, total, description) in [
-        (
-            reports.iter().any(|row| row.module_ambiguous),
-            sum(|row| if row.module_ambiguous { row.calls } else { 0 }),
-            "ambiguous",
-        ),
-        (
-            reports.iter().any(|row| row.module_unresolved),
-            sum(|row| if row.module_unresolved { row.calls } else { 0 }),
-            "unresolved",
-        ),
-    ] {
-        if has_owner_gap {
-            text.push_str(&format!(
-                "{total} completed calls have {description} module ownership.\n"
-            ));
+    if verbose {
+        for ((has_owner_gap, total), description) in [
+            (
+                owner_gap_total(reports, &forwarding, &ev.discovery.modules, |row| {
+                    row.module_ambiguous
+                }),
+                "ambiguous",
+            ),
+            (
+                owner_gap_total(reports, &forwarding, &ev.discovery.modules, |row| {
+                    row.module_unresolved
+                }),
+                "unresolved",
+            ),
+        ] {
+            if has_owner_gap {
+                text.push_str(&format!(
+                    "{total} completed calls have {description} module ownership.\n"
+                ));
+            }
         }
     }
     text
 }
 
 /// One refreshing screen for consumers without a retained scope kind.
-/// Rows with no activity are omitted; the evidence line is always present.
-/// Mechanism rows are never shown here; `live_scoped` renders them.
+/// Rows with no activity are omitted; the evidence line renders under
+/// `-v` only. Mechanism rows are never shown here; `live_scoped`
+/// renders them.
 pub fn live(
     reports: &[SlotReport],
     ev: &Evidence,
@@ -2360,6 +2696,21 @@ pub(crate) fn apply_counter_snapshot(
         let observation = &mut ev.gap_classes.observation;
         if !observation.causes.contains(&"counter_collection") {
             observation.causes.push("counter_collection");
+        }
+        observation.status = "lossy";
+        ev.completeness = "PARTIAL";
+        ev.verdict_detail = VERDICT_CONCRETE_GAP;
+    }
+}
+
+/// Derive the legacy read gap from the protected snapshot, mirroring the
+/// counter gap above. A legacy slot or evidence read failure never blanks
+/// the capture; it reports zeros as unknown with this named gap.
+pub(crate) fn apply_legacy_gaps(ev: &mut Evidence, snapshot: &crate::metrics::CaptureSnapshot) {
+    if snapshot.has_legacy_gap() {
+        let observation = &mut ev.gap_classes.observation;
+        if !observation.causes.contains(&"legacy_collection") {
+            observation.causes.push("legacy_collection");
         }
         observation.status = "lossy";
         ev.completeness = "PARTIAL";
@@ -2411,55 +2762,126 @@ pub fn live_scoped(
     scope: &str,
     mechanisms: &BTreeMap<u64, MechStat>,
 ) -> String {
+    live_scoped_with_verbosity(
+        reports,
+        ev,
+        elapsed,
+        module,
+        mode,
+        policy,
+        scope,
+        mechanisms,
+        crate::cli::text_verbosity(),
+    )
+}
+
+/// [`live_scoped`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the header, totals, plain coverage reasons
+/// and the function/mechanism tables plus the `-v` hint; verbose is
+/// the full frame with Evidence and machine reason names; quiet keeps
+/// the header, totals and coverage only. The function table renders
+/// only when some row has activity; the header carries the privacy
+/// mode under verbose only.
+#[allow(clippy::too_many_arguments)]
+pub fn live_scoped_with_verbosity(
+    reports: &[SlotReport],
+    ev: &Evidence,
+    elapsed: Duration,
+    module: &str,
+    mode: &str,
+    policy: CapturePolicy,
+    scope: &str,
+    mechanisms: &BTreeMap<u64, MechStat>,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
     let mut s = String::new();
+    // Concise states the scope once, in the header; the privacy mode
+    // is verbose detail.
+    let privacy = if verbosity == crate::cli::TextVerbosity::Verbose {
+        format!(" — privacy={}", policy.privacy_mode())
+    } else {
+        String::new()
+    };
     s.push_str(&format!(
-        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {} — privacy={} — {}\n",
+        "p11scope — {} scope — up {:02}:{:02}:{:02} — mode {}{} — {}\n",
         scope_label(scope),
         elapsed.as_secs() / 3600,
         (elapsed.as_secs() % 3600) / 60,
         elapsed.as_secs() % 60,
         escape_controls(mode),
-        policy.privacy_mode(),
+        privacy,
         escape_controls(module),
     ));
-    s.push_str(&scope_summary(scope, reports, ev));
-    s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
-    s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
-    s.push_str(&format!(
-        "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-        "FUNCTION", "CALLS", "ERR", "p50~", "p95~", "p99~", "IN-FLIGHT"
-    ));
+    s.push_str(&scope_summary_with_verbosity(scope, reports, ev, verbosity));
+    if verbosity == crate::cli::TextVerbosity::Quiet {
+        return s;
+    }
     let mut rows: Vec<&SlotReport> = reports
         .iter()
         .filter(|r| r.calls > 0 || r.in_flight > 0)
         .collect();
     rows.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.names.cmp(&b.names)));
-    for r in rows {
-        let percentiles = if r.mode.has_histogram() {
-            [
-                percentile_ns(&r.buckets, 0.50),
-                percentile_ns(&r.buckets, 0.95),
-                percentile_ns(&r.buckets, 0.99),
-            ]
-        } else {
-            [None; 3]
-        };
-        let mut name = label(r);
-        if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
-            name.push_str(init.text_suffix());
+    // No table at all when nothing was called — neither legends nor
+    // header. One latency legend otherwise, above the table.
+    if !rows.is_empty() {
+        s.push_str("CALLS = completed calls; ERR = returned errors; IN-FLIGHT = entries without an observed return.\n");
+        s.push_str("Latency units: ns/us/ms/s (us displayed as µs); ~ = log2-bucket approximation, lower bound.\n");
+        let forwarding = forwarding_module_ids(ev, reports);
+        // The name field fits the longest rendered name in this frame (min 28),
+        // so marked rows keep the columns aligned without fixed padding.
+        let mut rendered: Vec<(String, &SlotReport)> = Vec::with_capacity(rows.len());
+        for r in rows {
+            let mut name = label(r);
+            if let Some(init) = initialization_out(&r.names, &r.rv_counts) {
+                name.push_str(init.text_suffix());
+            }
+            if row_is_forwarding(r, &forwarding, &ev.discovery.modules) {
+                name.push_str(" (forwarding layer)");
+            }
+            rendered.push((escape_controls(&name).into_owned(), r));
         }
+        let width = rendered
+            .iter()
+            .map(|(name, _)| name.len())
+            .max()
+            .unwrap_or(0)
+            .max(28);
         s.push_str(&format!(
-            "{:<28} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
-            escape_controls(&name),
-            r.calls,
-            r.errors,
-            fmt_ns(percentiles[0]),
-            fmt_ns(percentiles[1]),
-            fmt_ns(percentiles[2]),
-            r.in_flight
+            "{:<w$} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+            "FUNCTION",
+            "PROVIDER",
+            "CALLS",
+            "ERR",
+            "p50~",
+            "p95~",
+            "p99~",
+            "IN-FLIGHT",
+            w = width
         ));
+        for (name, r) in rendered {
+            let percentiles = if r.mode.has_histogram() {
+                [
+                    percentile_ns(&r.buckets, 0.50),
+                    percentile_ns(&r.buckets, 0.95),
+                    percentile_ns(&r.buckets, 0.99),
+                ]
+            } else {
+                [None; 3]
+            };
+            s.push_str(&format!(
+                "{:<w$} {:<16} {:>8} {:>6} {:>9} {:>9} {:>9} {:>9}\n",
+                name,
+                provider_cell(r, &ev.discovery.modules),
+                r.calls,
+                r.errors,
+                fmt_ns(percentiles[0]),
+                fmt_ns(percentiles[1]),
+                fmt_ns(percentiles[2]),
+                r.in_flight,
+                w = width
+            ));
+        }
     }
-    s.push_str("(~ = log2-bucket approximation, lower bound)\n");
     if !mechanisms.is_empty() {
         s.push_str(&format!(
             "{:<28} {:>8} {:>6}\n",
@@ -2486,8 +2908,8 @@ pub fn live_scoped(
         // while a mapped provider actually lacks one.
         if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
             s.push_str(&format!(
-                "Mechanisms: none attributed — {} semantics-unverified/count-only slot{}; \
-                 add --manifest for each mapped provider (see Coverage).\n",
+                "Mechanisms: none attributed — {} function{} named from the standard table, \
+                 unconfirmed; add --manifest for each mapped provider file (see Coverage).\n",
                 ev.semantic_unverified_slots,
                 if ev.semantic_unverified_slots == 1 {
                     ""
@@ -2499,55 +2921,72 @@ pub fn live_scoped(
             s.push_str("Mechanisms: none recorded for the observed calls.\n");
         }
     }
-    let mut evidence_line = format!(
-        "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
-        ev.attached_probes,
-        ev.slots * 2,
-        ev.slots,
-        ev.active_slots,
-        ev.aliased.len(),
-        ev.skipped.len(),
-        ev.in_flight_at_end,
-    );
-    if ev.semantic_history_drops > 0 {
-        evidence_line.push_str(&format!(
-            " · semantic_history_drops={}",
-            ev.semantic_history_drops
-        ));
-    }
-    let mut info_fragments: Vec<String> = Vec::new();
-    for (label, count) in [
-        ("orphan ops", ev.orphan_ops),
-        ("unmatched closes", ev.unmatched_closes),
-        ("shape decode gaps", ev.shape_decode_failures),
-        (
-            "process trackers using /proc",
-            ev.process_tracking_fallbacks,
-        ),
-    ] {
-        if count > 0 {
-            info_fragments.push(format!("ℹ {count} {label}"));
+    if verbosity == crate::cli::TextVerbosity::Verbose {
+        let mut evidence_line = format!(
+            "Evidence: {}/{} probes attached · {} slots ({} active) · {} aliased · {} skipped · {} in-flight",
+            ev.attached_probes,
+            ev.slots * 2,
+            ev.slots,
+            ev.active_slots,
+            ev.aliased.len(),
+            ev.skipped.len(),
+            ev.in_flight_at_end,
+        );
+        if ev.semantic_history_drops > 0 {
+            evidence_line.push_str(&format!(
+                " · semantic_history_drops={}",
+                ev.semantic_history_drops
+            ));
         }
+        let mut info_fragments: Vec<String> = Vec::new();
+        for (label, count) in [
+            ("orphan ops", ev.orphan_ops),
+            ("unmatched closes", ev.unmatched_closes),
+            ("shape decode gaps", ev.shape_decode_failures),
+            (
+                "process trackers using /proc",
+                ev.process_tracking_fallbacks,
+            ),
+        ] {
+            if count > 0 {
+                info_fragments.push(format!("ℹ {count} {label}"));
+            }
+        }
+        if !info_fragments.is_empty() {
+            evidence_line.push_str(" · ");
+            evidence_line.push_str(&info_fragments.join(" "));
+        }
+        // F-13: why the verdict is what it is, from the classes the verdict used,
+        // so a gate can never force PARTIAL without being named here.
+        evidence_line.push_str(&format!(
+            " → {}{}\n",
+            ev.completeness,
+            verdict_reasons(ev, true)
+        ));
+        s.push_str(&escape_controls(evidence_line.trim_end()));
+        s.push('\n');
+    } else {
+        s.push_str(crate::cli::VERBOSE_HINT);
+        s.push('\n');
     }
-    if !info_fragments.is_empty() {
-        evidence_line.push_str(" · ");
-        evidence_line.push_str(&info_fragments.join(" "));
-    }
-    // F-13: why the verdict is what it is, from the classes the verdict used,
-    // so a gate can never force PARTIAL without being named here.
-    evidence_line.push_str(&format!(" → {}{}\n", ev.completeness, verdict_reasons(ev)));
-    s.push_str(&escape_controls(evidence_line.trim_end()));
-    s.push('\n');
     s
 }
 
-/// `": observation lossy (12 events lost); attribution withheld (68
-/// semantics-unverified/count-only slots)"` — one group per class with a
-/// cause, from `ev.gap_classes` — or `": terminal drain unproven"` when the
-/// terminal seal is the only reason. Empty when `COMPLETE`.
-fn verdict_reasons(ev: &Evidence) -> String {
+/// `" — calls may be missing (12 call records lost); names unconfirmed
+/// (…)"` — one group per class with a cause, from `ev.gap_classes` —
+/// or the unproven-drain sentence when the terminal seal is the only
+/// reason. Empty when `COMPLETE`. Concise text is plain words only;
+/// verbose pairs each machine name beside its plain words.
+fn verdict_reasons(ev: &Evidence, verbose: bool) -> String {
+    verdict_reason_body(ev, verbose).map_or_else(String::new, |body| format!(" — {body}"))
+}
+
+/// The [`verdict_reasons`] groups without the leading separator, so
+/// the coverage line can reuse or replace them. `None` when `COMPLETE`
+/// or when no reason renders at all.
+fn verdict_reason_body(ev: &Evidence, verbose: bool) -> Option<String> {
     if ev.completeness == "COMPLETE" {
-        return String::new();
+        return None;
     }
     let classes = &ev.gap_classes;
     let mut groups: Vec<String> = [
@@ -2557,18 +2996,46 @@ fn verdict_reasons(ev: &Evidence) -> String {
     ]
     .into_iter()
     .filter_map(|(label, class)| {
-        let fragments = cause_fragments(ev, &class.causes);
-        (!fragments.is_empty())
-            .then(|| format!("{label} {} ({})", class.status, fragments.join(", ")))
+        let fragments = cause_fragments(ev, &class.causes, verbose);
+        (!fragments.is_empty()).then(|| {
+            format!(
+                "{} ({})",
+                verdict_group_label(label, class.status, verbose),
+                fragments.join(", ")
+            )
+        })
     })
     .collect();
     if groups.is_empty() && !ev.drain_proven {
-        groups.push("terminal drain unproven".into());
+        groups.push(if verbose {
+            "end of capture not fully confirmed — last calls may be missing \
+             (terminal drain unproven)"
+                .into()
+        } else {
+            "end of capture not fully confirmed (last calls may be missing)".into()
+        });
     }
     if groups.is_empty() {
-        String::new()
+        None
     } else {
-        format!(": {}", groups.join("; "))
+        Some(groups.join("; "))
+    }
+}
+
+/// One verdict group's plain label: what the class means for the
+/// counts. An unexpected label/status pair renders verbatim so it
+/// always surfaces.
+fn verdict_group_label(label: &str, status: &str, verbose: bool) -> String {
+    let plain = match (label, status) {
+        ("observation", "lossy") => "calls may be missing",
+        ("attribution", "withheld") => "names unconfirmed",
+        ("semantics", "degraded") => "call details degraded",
+        _ => return format!("{label} {status}"),
+    };
+    if verbose {
+        format!("{plain} ({label} {status})")
+    } else {
+        plain.to_string()
     }
 }
 
@@ -2594,23 +3061,38 @@ fn semantic_state_counter(ev: &Evidence, cause: &str) -> Option<u64> {
     })
 }
 
-/// One human fragment per verdict cause, stating the count behind it. A
-/// cause without a phrase renders as its own field name, so a new gate
-/// always surfaces.
-fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
-    let count = |n: u64, label: &str| format!("{n} {label}");
+/// One human fragment per verdict cause, stating the count behind it.
+/// Concise text is plain words only; verbose pairs the machine cause
+/// name beside each plain fragment. A cause without a phrase folds
+/// into "other gaps" in concise text and renders as its own field name
+/// in verbose, so a new gate always surfaces.
+fn cause_fragments(ev: &Evidence, causes: &[&'static str], verbose: bool) -> Vec<String> {
+    let count = |n: u64, one: &str, many: &str| format!("{n} {}", if n == 1 { one } else { many });
     let mut fragments = Vec::new();
     let mut state_gaps = 0u64;
+    let mut state_causes: Vec<&str> = Vec::new();
+    let mut unknown = 0u64;
     for &cause in causes {
         if let Some(value) = semantic_state_counter(ev, cause) {
             state_gaps = state_gaps.saturating_add(value);
+            if value > 0 {
+                state_causes.push(cause);
+            }
             continue;
         }
+        // Pairs the machine cause name beside its plain fragment.
+        let tag = |plain: String| {
+            if verbose {
+                format!("{plain} ({cause})")
+            } else {
+                plain
+            }
+        };
         let fragment = match cause {
-            "discovery" => "no modules discovered".to_string(),
-            "slots" => "no slots planned".to_string(),
+            "discovery" => "no provider files found".to_string(),
+            "slots" => "no functions watched".to_string(),
             "scan_unavailable" => format!(
-                "scan unavailable ({})",
+                "memory scan unavailable ({})",
                 ev.discovery
                     .scan_unavailable
                     .as_deref()
@@ -2624,32 +3106,63 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                     .discovery
                     .modules_skipped
                     .iter()
-                    .filter(|module| {
-                        crate::plan::is_growth_omission(&module.reason)
-                            || crate::plan::is_closure_array_prefix(&module.reason)
-                            || crate::plan::is_provider_prefix(&module.reason)
-                    })
+                    .filter(|module| crate::plan::is_partial_coverage(&module.reason))
                     .count() as u64;
                 let refused = ev.discovery.modules_skipped.len() as u64 - partially_covered;
-                for (n, label) in [
-                    (refused, "modules refused"),
-                    (partially_covered, "modules partially covered"),
+                for (n, one, many) in [
+                    (
+                        refused,
+                        "provider file not watched",
+                        "provider files not watched",
+                    ),
+                    (
+                        partially_covered,
+                        "provider file partially covered",
+                        "provider files partially covered",
+                    ),
                 ] {
                     if n > 0 {
-                        fragments.push(count(n, label));
+                        fragments.push(tag(count(n, one, many)));
                     }
                 }
                 continue;
             }
-            "attach_failures" => count(ev.attach_failures.len() as u64, "attach failures"),
+            "attach_failures" => count(
+                ev.attach_failures.len() as u64,
+                "function could not be watched",
+                "functions could not be watched",
+            ),
             "skipped" => {
-                fragments.push(count(
-                    ev.skipped
-                        .iter()
-                        .filter(|skip| skip.reason != NULL_POINTER_REASON)
-                        .count() as u64,
-                    "entries skipped",
-                ));
+                // Discovery-subject entries are unavailable discovery
+                // steps, not skipped functions; only named function
+                // entries keep the "skipped" wording.
+                let mut subjects = 0u64;
+                let mut functions = 0u64;
+                for skip in ev
+                    .skipped
+                    .iter()
+                    .filter(|skip| skip.reason != NULL_POINTER_REASON)
+                {
+                    if skip.name == DISCOVERY_SUBJECT {
+                        subjects += 1;
+                    } else {
+                        functions += 1;
+                    }
+                }
+                if subjects > 0 {
+                    fragments.push(tag(count(
+                        subjects,
+                        "discovery step unavailable",
+                        "discovery steps unavailable",
+                    )));
+                }
+                if functions > 0 {
+                    fragments.push(tag(count(
+                        functions,
+                        "function skipped",
+                        "functions skipped",
+                    )));
+                }
                 // One histogram line per named limit present, in canonical
                 // order; the labels are the finite public reasons, never
                 // raw skip text, so no target data can reach this line.
@@ -2665,116 +3178,358 @@ fn cause_fragments(ev: &Evidence, causes: &[&'static str]) -> Vec<String> {
                         .filter(|skip| skip.reason == reason)
                         .count() as u64;
                     if hits > 0 {
-                        fragments.push(format!("{reason}: {hits}"));
+                        fragments.push(tag(format!("{reason}: {hits}")));
+                    }
+                }
+                if verbose {
+                    let items = skipped_item_list(ev);
+                    if !items.is_empty() {
+                        fragments.push(format!("skipped: {}", items.join(", ")));
                     }
                 }
                 continue;
             }
-            "in_flight_at_end" => count(ev.in_flight_at_end, "calls in flight"),
+            "in_flight_at_end" => count(
+                ev.in_flight_at_end,
+                "call still running at capture end",
+                "calls still running at capture end",
+            ),
             "surfaces" => count(
                 ev.surfaces
                     .iter()
                     .filter(|s| s.walk != "full" || s.acquisition != "ok")
                     .count() as u64,
-                "surface gaps",
+                "provider table incompletely read",
+                "provider tables incompletely read",
             ),
-            "vendor_interfaces" => count(ev.vendor_interfaces as u64, "vendor interfaces"),
-            "interface_list" => "interface list failed".to_string(),
-            "event_loss" => count(ev.event_loss, "events lost"),
-            "start_insert_failures" => count(ev.start_insert_failures, "start inserts failed"),
-            "unmatched_returns" => count(ev.unmatched_returns, "unmatched returns"),
-            "rv_update_failures" => count(ev.rv_update_failures, "RV updates failed"),
-            "cgroup_scope_failures" => count(ev.cgroup_scope_failures, "cgroup checks failed"),
-            "abi_refusals" => count(ev.abi_refusals, "ABI probe hits refused"),
-            "malformed_records" => count(ev.malformed_records, "malformed records"),
-            "provider_changed" => "provider changed".to_string(),
+            "vendor_interfaces" => count(
+                ev.vendor_interfaces as u64,
+                "vendor-specific interface not decoded",
+                "vendor-specific interfaces not decoded",
+            ),
+            "interface_list" => "could not list interfaces".to_string(),
+            "event_loss" => count(ev.event_loss, "call record lost", "call records lost"),
+            "start_insert_failures" => count(
+                ev.start_insert_failures,
+                "call start not recorded",
+                "call starts not recorded",
+            ),
+            "unmatched_returns" => count(
+                ev.unmatched_returns,
+                "return without a recorded start",
+                "returns without a recorded start",
+            ),
+            "rv_update_failures" => count(
+                ev.rv_update_failures,
+                "return value not recorded",
+                "return values not recorded",
+            ),
+            "cgroup_scope_failures" => count(
+                ev.cgroup_scope_failures,
+                "cgroup membership check failed",
+                "cgroup membership checks failed",
+            ),
+            "abi_refusals" => count(
+                ev.abi_refusals,
+                "unexpected probe hit refused",
+                "unexpected probe hits refused",
+            ),
+            "malformed_records" => count(
+                ev.malformed_records,
+                "unreadable kernel record",
+                "unreadable kernel records",
+            ),
+            "provider_changed" => "provider file changed during capture".to_string(),
             "trace_truncated" => "trace truncated at its event cap".to_string(),
-            "counter_collection" => "counter collection incomplete".to_string(),
+            "counter_collection" => "final counter read incomplete".to_string(),
+            "legacy_collection" => "legacy collection incomplete".to_string(),
             "proc_namespace_mismatch" => {
-                "/proc numbering foreign: kernel PIDs unresolvable".to_string()
+                "process numbering is foreign: kernel PIDs unresolvable".to_string()
             }
             "pid_namespace" => format!(
                 "observer PID namespace {}: kernel PIDs unresolvable",
                 ev.pid_namespace.observer
             ),
-            "unprotected_live_windows" => "unprotected live window".to_string(),
-            "discovery_ring_loss" => count(ev.discovery_ring_loss, "discovery records lost"),
-            "discovery_state_failures" => {
-                count(ev.discovery_state_failures, "discovery state failures")
+            "unprotected_live_windows" => {
+                "calls made while probes were being attached may be missing".to_string()
             }
-            "discovery_read_failures" => {
-                count(ev.discovery_read_failures, "discovery read failures")
-            }
-            "discovery_truncated" => count(ev.discovery_truncated, "discovery records truncated"),
-            "task_uprobe_link_losses" => {
-                count(ev.task_uprobe_link_losses, "task-uprobe links lost")
-            }
-            "pause_partial" => count(ev.pause_partial, "partial pauses"),
+            "discovery_ring_loss" => count(
+                ev.discovery_ring_loss,
+                "discovery record lost",
+                "discovery records lost",
+            ),
+            "discovery_state_failures" => count(
+                ev.discovery_state_failures,
+                "discovery update failed",
+                "discovery updates failed",
+            ),
+            "discovery_read_failures" => count(
+                ev.discovery_read_failures,
+                "discovery read failed",
+                "discovery reads failed",
+            ),
+            "discovery_truncated" => count(
+                ev.discovery_truncated,
+                "discovery record truncated",
+                "discovery records truncated",
+            ),
+            "task_uprobe_link_losses" => count(
+                ev.task_uprobe_link_losses,
+                "probe link lost",
+                "probe links lost",
+            ),
+            "pause_partial" => count(
+                ev.pause_partial,
+                "load only partly paused",
+                "loads only partly paused",
+            ),
             "pause_unavailable" => count(
                 ev.pause_unavailable,
-                "pause unavailable (collected unpaused)",
+                "load could not be paused (collected unpaused)",
+                "loads could not be paused (collected unpaused)",
             ),
             "loader_discovery" => {
                 let loader = &ev.loader_discovery;
                 if loader.hits == 0 && loader.strategies.debug_state_every_hit == 1 {
-                    "loader BPF delivery failure suspected (0 hits, no EXEC acknowledgment)"
+                    "library-load tracking received nothing from the kernel \
+                     (loads may be missing)"
                         .to_string()
                 } else if loader.hits == 0 && loader.strategies.debug_state_every_hit >= 2 {
-                    "loader uprobe never fired despite EXEC processing (uprobe miss suspected)"
-                        .to_string()
+                    "library-load tracking missed loads it should have seen".to_string()
                 } else {
-                    "live loader timing unproven".to_string()
+                    "library-load tracking could not be confirmed".to_string()
                 }
             }
-            "scheduling.terminal_drain_truncated" => "terminal drain truncated".to_string(),
-            "scheduling.sink_dropped_bytes" => {
-                count(ev.scheduling.sink_dropped_bytes, "output bytes dropped")
+            "scheduling.terminal_drain_truncated" => {
+                "final drain cut short (last calls may be missing)".to_string()
             }
-            "interface_selection" => "interface selection incomplete".to_string(),
-            "pid_descendant_gaps" => count(ev.pid_descendant_gaps, "descendant gaps"),
-            "multi_rebuild_gaps" => count(ev.multi_rebuild_gaps, "multi-attach rebuild gaps"),
-            "semantic_unverified_slots" => format!(
-                "{} semantics-unverified/count-only slot{}",
-                ev.semantic_unverified_slots,
-                if ev.semantic_unverified_slots == 1 {
-                    ""
-                } else {
-                    "s"
-                }
+            "scheduling.sink_dropped_bytes" => count(
+                ev.scheduling.sink_dropped_bytes,
+                "output byte dropped",
+                "output bytes dropped",
             ),
-            "aliased" => count(ev.aliased.len() as u64, "aliased slots"),
-            "module_ambiguous" => count(ev.discovery.module_ambiguous, "module-ambiguous slots"),
-            "module_unresolved_slots" => count(ev.module_unresolved_slots as u64, "unowned slots"),
-            "unregistered_mechanisms" => {
-                count(ev.unregistered_mechanisms, "unregistered mechanisms")
+            "interface_selection" => "function list not fully identified".to_string(),
+            "pid_descendant_gaps" => count(
+                ev.pid_descendant_gaps,
+                "short-lived process gap",
+                "short-lived process gaps",
+            ),
+            "multi_rebuild_gaps" => count(
+                ev.multi_rebuild_gaps,
+                "probe re-attach gap",
+                "probe re-attach gaps",
+            ),
+            "semantic_unverified_slots" => {
+                // The names render from the standard table; only a
+                // manifest confirms them. Verbose keeps the slot count
+                // with the machine cause name.
+                const PLAIN: &str = "function names follow the standard PKCS#11 table and were \
+                     not confirmed by a manifest (add --manifest to confirm)";
+                if verbose {
+                    fragments.push(format!(
+                        "{PLAIN} ({} slots; {cause})",
+                        ev.semantic_unverified_slots
+                    ));
+                } else {
+                    fragments.push(PLAIN.to_string());
+                }
+                continue;
             }
-            "unpublished_mechanisms" => count(ev.unpublished_mechanisms, "unpublished mechanisms"),
-            "discovery_conflicts" => count(ev.discovery.conflicts, "discovery conflicts"),
-            "discovery_uncorroborated" => {
-                count(ev.discovery.uncorroborated, "uncorroborated modules")
-            }
+            "aliased" => count(
+                ev.aliased.len() as u64,
+                "function sharing an address",
+                "functions sharing an address",
+            ),
+            "module_ambiguous" => count(
+                ev.discovery.module_ambiguous,
+                "function claimed by two provider files",
+                "functions claimed by two provider files",
+            ),
+            "module_unresolved_slots" => count(
+                ev.module_unresolved_slots as u64,
+                "function with no proven provider file",
+                "functions with no proven provider file",
+            ),
+            "unregistered_mechanisms" => count(
+                ev.unregistered_mechanisms,
+                "unregistered mechanism",
+                "unregistered mechanisms",
+            ),
+            "unpublished_mechanisms" => count(
+                ev.unpublished_mechanisms,
+                "vendor mechanism not listed by name",
+                "vendor mechanisms not listed by name",
+            ),
+            "discovery_conflicts" => format!(
+                "manifest and scan disagree on {} provider file{}",
+                ev.discovery.conflicts,
+                if ev.discovery.conflicts == 1 { "" } else { "s" }
+            ),
+            "discovery_uncorroborated" => count(
+                ev.discovery.uncorroborated,
+                "provider file not confirmed from a second source",
+                "provider files not confirmed from a second source",
+            ),
             "interface_selection.selection_count_only" => {
-                "count-only interface selection".to_string()
+                "function list counted without names".to_string()
             }
-            "semantic_capture_failures" => {
-                count(ev.semantic_capture_failures, "semantic captures failed")
+            "semantic_capture_failures" => count(
+                ev.semantic_capture_failures,
+                "mechanism detail not recorded",
+                "mechanism details not recorded",
+            ),
+            "template_tail_failures" => count(
+                ev.template_tail_failures,
+                "attribute-list read not recorded",
+                "attribute-list reads not recorded",
+            ),
+            "semantic_history_drops" => count(
+                ev.semantic_history_drops,
+                "mechanism history dropped",
+                "mechanism histories dropped",
+            ),
+            "templates_truncated" => "attribute lists cut short".to_string(),
+            "shape_decode_total_failures" => count(
+                ev.shape_decode_total_failures,
+                "mechanism never decoded",
+                "mechanisms never decoded",
+            ),
+            other => {
+                if verbose {
+                    fragments.push(other.to_string());
+                } else {
+                    unknown += 1;
+                }
+                continue;
             }
-            "template_tail_failures" => {
-                count(ev.template_tail_failures, "template tail calls failed")
-            }
-            "semantic_history_drops" => count(ev.semantic_history_drops, "semantic history drops"),
-            "templates_truncated" => "templates truncated".to_string(),
-            "shape_decode_total_failures" => {
-                count(ev.shape_decode_total_failures, "mechanisms never decoded")
-            }
-            other => other.to_string(),
         };
-        fragments.push(fragment);
+        fragments.push(tag(fragment));
     }
     if state_gaps > 0 {
-        fragments.push(count(state_gaps, "semantic state gaps"));
+        let plain = count(state_gaps, "session-tracking gap", "session-tracking gaps");
+        fragments.push(if verbose && !state_causes.is_empty() {
+            format!("{plain} ({})", state_causes.join(", "))
+        } else {
+            plain
+        });
+    }
+    if unknown > 0 {
+        fragments.push(format!(
+            "{} other gap{} (see --json evidence)",
+            unknown,
+            if unknown == 1 { "" } else { "s" }
+        ));
     }
     fragments
+}
+
+/// Verbose `-v` listing of the skipped entries behind the `skipped`
+/// cause: each distinct `{name} ({reason})` in first-seen order with
+/// a repeat count, capped like the module gaps. The coverage line
+/// already escapes the whole reasons string, so categorical names and
+/// reasons render as-is.
+fn skipped_item_list(ev: &Evidence) -> Vec<String> {
+    const SHOWN: usize = 5;
+    let mut distinct: Vec<(&str, &str, u64)> = Vec::new();
+    for skip in ev
+        .skipped
+        .iter()
+        .filter(|skip| skip.reason != NULL_POINTER_REASON)
+    {
+        if let Some(entry) = distinct
+            .iter_mut()
+            .find(|(name, reason, _)| *name == skip.name && *reason == skip.reason)
+        {
+            entry.2 += 1;
+        } else {
+            distinct.push((skip.name.as_str(), skip.reason.as_str(), 1));
+        }
+    }
+    let mut items: Vec<String> = distinct
+        .iter()
+        .take(SHOWN)
+        .map(|(name, reason, n)| {
+            if *n > 1 {
+                format!("{name} ({reason}) ×{n}")
+            } else {
+                format!("{name} ({reason})")
+            }
+        })
+        .collect();
+    if distinct.len() > SHOWN {
+        items.push(format!("and {} more", distinct.len() - SHOWN));
+    }
+    items
+}
+
+/// True for an owned run that never paused while its command ran
+/// ahead of probe attachment: nothing was watched, a live load went
+/// unpaused, and a refused loader context or repeated discovery
+/// misses corroborate the missed provider. A bare command with no
+/// missed load (one subject skip, no refused context) stays generic.
+fn missed_provider_load(ev: &Evidence) -> bool {
+    ev.child_still_running.is_some()
+        && ev.pause == "none"
+        && ev.pause_attempts == 0
+        && ev.unprotected_live_windows > 0
+        && ev.slots == 0
+        && (ev.discovery_truncated > 0
+            || ev
+                .skipped
+                .iter()
+                .filter(|skip| skip.name == DISCOVERY_SUBJECT)
+                .count()
+                > 1)
+}
+
+/// The totals line shared by the profile summary and the trace tail.
+pub(crate) fn totals_line(calls: u64, errors: u64, open: u64) -> String {
+    let call_noun = if calls == 1 { "call" } else { "calls" };
+    let error_noun = if errors == 1 { "error" } else { "errors" };
+    let entry_noun = if open == 1 { "entry" } else { "entries" };
+    format!(
+        "{calls} completed {call_noun}; {errors} returned {error_noun}; {open} {entry_noun} \
+         without an observed return."
+    )
+}
+
+/// The one coverage line shared by the profile summary and the trace
+/// tail: `coverage: complete`; `coverage: counts complete; …` when
+/// names are the only gap; the owned-run missed-load remedy; or
+/// `coverage: partial — <reasons>`. Verbose keeps the full grouped
+/// reasons beside the special cases.
+pub(crate) fn coverage_line(ev: &Evidence, verbose: bool) -> String {
+    if ev.completeness == "COMPLETE" {
+        return "coverage: complete".to_string();
+    }
+    if missed_provider_load(ev) {
+        let mut line = "coverage: partial — the command loaded its provider before probes \
+             attached; rerun with --pause auto"
+            .to_string();
+        if verbose && let Some(reasons) = verdict_reason_body(ev, true) {
+            line.push_str("; ");
+            line.push_str(&escape_controls(&reasons));
+        }
+        return line;
+    }
+    let classes = &ev.gap_classes;
+    if classes.observation.causes.is_empty()
+        && classes.semantics.causes.is_empty()
+        && !classes.attribution.causes.is_empty()
+    {
+        let fragments = cause_fragments(ev, &classes.attribution.causes, verbose);
+        if fragments.is_empty() {
+            return "coverage: counts complete".to_string();
+        }
+        return format!(
+            "coverage: counts complete; {}",
+            escape_controls(&fragments.join("; "))
+        );
+    }
+    match verdict_reason_body(ev, verbose) {
+        Some(body) => format!("coverage: partial — {}", escape_controls(&body)),
+        None => "coverage: partial".to_string(),
+    }
 }
 
 /// The module a slot's counts belong to, as `functions[]` renders it.
@@ -2817,6 +3572,12 @@ struct FunctionOut {
     /// relabelled as two-module ambiguity. The three fields are an exact
     /// exclusive relation: nonnull/false/false, null/true/false, null/false/true.
     module_unresolved: bool,
+    /// True when this row counts calls at a forwarding layer (a closure
+    /// array admitted beside watched providers): the logical call is the
+    /// provider row it contains, counted once in `layer_totals.logical`.
+    /// Additive within v3: consumers that sum `calls` across rows must
+    /// skip `forwarding_layer` rows to count logical calls once.
+    forwarding_layer: bool,
     calls: u64,
     errors: u64,
     pending_returns: u64,
@@ -2901,14 +3662,13 @@ enum InitializationOutcome {
 }
 
 impl InitializationOut {
-    /// The live-table marker uses the same words as the JSON row.
+    /// The live-table marker reports the outcome only; the provider
+    /// column beside it names the file.
     fn text_suffix(&self) -> &'static str {
         match self.outcome {
-            InitializationOutcome::Ok => " [init: ok, potential provider]",
-            InitializationOutcome::AlreadyInitialized => {
-                " [init: already_initialized, potential provider]"
-            }
-            InitializationOutcome::Mixed => " [init: mixed, potential provider]",
+            InitializationOutcome::Ok => " [init: ok]",
+            InitializationOutcome::AlreadyInitialized => " [init: already_initialized]",
+            InitializationOutcome::Mixed => " [init: mixed]",
             InitializationOutcome::Error => " [init: error]",
         }
     }
@@ -2966,7 +3726,11 @@ fn initialization_out(
 /// sourcing in both renderers). `modules` is the current compact
 /// `evidence.discovery[]` snapshot, so stable `ModuleId`s are matched rather
 /// than treated as vector offsets.
-fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<FunctionOut> {
+fn functions_out(
+    reports: &[SlotReport],
+    modules: &[DiscoveredModule],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+) -> Vec<FunctionOut> {
     reports
         .iter()
         .map(|r| FunctionOut {
@@ -2989,6 +3753,7 @@ fn functions_out(reports: &[SlotReport], modules: &[DiscoveredModule]) -> Vec<Fu
             // null module must not have to know why it is null.
             module_ambiguous: r.module_ambiguous,
             module_unresolved: r.module_unresolved,
+            forwarding_layer: row_is_forwarding(r, forwarding, modules),
             calls: r.calls,
             errors: r.errors,
             pending_returns: r
@@ -3027,7 +3792,27 @@ fn capture_modules(ev: &Evidence) -> Vec<serde_json::Value> {
         .collect()
 }
 
+/// Additive v3 `layer_totals`: logical (provider) calls count once no
+/// matter how many layers observed them; forwarding-layer calls stay
+/// explicit beside them. Both layers keep their `functions[]` rows with
+/// `forwarding_layer` labels, so the split is reproducible per row.
+fn layer_totals_json(
+    reports: &[SlotReport],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+    modules: &[DiscoveredModule],
+) -> serde_json::Value {
+    let [
+        (logical_calls, logical_errors, logical_open),
+        (fwd_calls, fwd_errors, fwd_open),
+    ] = layer_call_totals(reports, forwarding, modules);
+    serde_json::json!({
+        "logical": {"calls": logical_calls, "errors": logical_errors, "in_flight": logical_open},
+        "forwarding": {"calls": fwd_calls, "errors": fwd_errors, "in_flight": fwd_open},
+    })
+}
+
 pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) -> serde_json::Value {
+    let forwarding = forwarding_module_ids(ev, reports);
     serde_json::json!({
         "schema": "p11scope/observed-profile/v3-metrics",
         // Machine-readable lane discriminator (SYSPLAN residual F-12): the
@@ -3042,7 +3827,8 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
                      "drain_interval_ms": capture.drain_interval_ms,
                      "modules": capture_modules(ev) },
         "evidence": ev,
-        "functions": functions_out(reports, &ev.discovery.modules),
+        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
+        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
     })
 }
 
@@ -3057,6 +3843,22 @@ pub(crate) fn with_counter_snapshot(
             .as_object_mut()
             .expect("capture renderer emits an evidence object")
             .insert("counter_collection".into(), collection);
+    }
+    document
+}
+
+/// Optional legacy gap object, omitted when the legacy read was exact.
+/// Counts and finite reason names only; zeros in the rows are unknown, not
+/// exact, whenever this object is present.
+pub(crate) fn with_legacy_snapshot(
+    mut document: serde_json::Value,
+    snapshot: &crate::metrics::CaptureSnapshot,
+) -> serde_json::Value {
+    if let Some(collection) = snapshot.legacy_collection() {
+        document["evidence"]
+            .as_object_mut()
+            .expect("capture renderer emits an evidence object")
+            .insert("legacy_collection".into(), collection);
     }
     document
 }
@@ -3437,6 +4239,7 @@ pub fn profile_json(
     capture: &CaptureMeta,
 ) -> serde_json::Value {
     let ev = versioned.evidence();
+    let forwarding = forwarding_module_ids(ev, reports);
     let mechanisms: Vec<MechanismOut> = state
         .mechanisms()
         .iter()
@@ -3539,7 +4342,8 @@ pub fn profile_json(
             "modules": capture_modules(ev),
         },
         "evidence": versioned.value().clone(),
-        "functions": functions_out(reports, &ev.discovery.modules),
+        "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
+        "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
         "mechanisms": mechanisms,
         "sessions": sessions_out,
         "logins": logins,
@@ -3718,7 +4522,9 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(
                 fields,
-                ["C_Sign", "25", "3", expected, expected, expected, "2"],
+                [
+                    "C_Sign", "unknown", "25", "3", expected, expected, expected, "2"
+                ],
                 "{mode:?}"
             );
         }
@@ -3879,7 +4685,7 @@ pub(crate) mod tests {
                 &BTreeMap::new(),
             );
             assert!(frame.contains("last read stale"), "{frame}");
-            assert!(frame.contains("PARTIAL"), "{frame}");
+            assert!(frame.contains("coverage: partial"), "{frame}");
             let document =
                 with_counter_snapshot(json(stale.reports(), &ev, &capture_fixture()), &stale);
             assert!(document["evidence"]["counter_collection"]["health"].is_null());
@@ -3958,6 +4764,7 @@ pub(crate) mod tests {
             pause_confirmed: 0,
             pause_partial: 0,
             pause_unavailable: 0,
+            pause_engine_incomplete_retirements: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
@@ -4827,6 +5634,7 @@ pub(crate) mod tests {
         let sha = "11".repeat(32);
         DiscoveredModule {
             id: ModuleId(0),
+            admission_class: None,
             dev: (8, 1),
             ino: 11,
             sha256: Some(sha.clone()),
@@ -4880,7 +5688,7 @@ pub(crate) mod tests {
         let mut report = report("C_Sign", 1, 0, false);
         report.module = Some(crate::plan::ModuleId(1));
 
-        let out = functions_out(&[report], &[b, c]);
+        let out = functions_out(&[report], &[b, c], &std::collections::BTreeSet::new());
 
         assert_eq!(out[0].module.as_ref().unwrap().ino, 22);
     }
@@ -5141,16 +5949,16 @@ pub(crate) mod tests {
             .filter(|line| line.contains("C_Initialize"))
             .collect();
         assert_eq!(init_lines.len(), 5, "{out}");
-        for marker in [
-            "[init: ok, potential provider]",
-            "[init: already_initialized, potential provider]",
-            "[init: mixed, potential provider]",
-        ] {
+        for marker in ["[init: ok]", "[init: already_initialized]", "[init: mixed]"] {
             assert!(
                 init_lines.iter().any(|line| line.contains(marker)),
                 "missing {marker} in:\n{out}"
             );
         }
+        assert!(
+            !out.contains("potential provider"),
+            "no row claims a provider: {out}"
+        );
         let error_line = init_lines
             .iter()
             .find(|line| line.contains("[init: error]"))
@@ -5406,10 +6214,10 @@ pub(crate) mod tests {
                 serde_json::to_value(&ev).unwrap()["pid_namespace"]["observer"],
                 observer.label()
             );
-            let reasons = verdict_reasons(&ev);
+            let reasons = verdict_reasons(&ev, false);
             assert!(
                 reasons.contains(&format!(
-                    "observation lossy (observer PID namespace {}",
+                    "calls may be missing (observer PID namespace {}",
                     observer.label()
                 )),
                 "{reasons}"
@@ -5443,7 +6251,7 @@ pub(crate) mod tests {
                 serde_json::to_value(&ev).unwrap()["pid_namespace"]["proc_pids"],
                 "foreign"
             );
-            assert!(verdict_reasons(&ev).contains("/proc numbering foreign"));
+            assert!(verdict_reasons(&ev, false).contains("process numbering is foreign"));
         }
     }
 
@@ -5486,7 +6294,9 @@ pub(crate) mod tests {
             CapturePolicy::Allowlisted,
         );
         assert!(
-            output.contains("1 semantics-unverified/count-only slot"),
+            output.contains(
+                "coverage: counts complete; function names follow the standard PKCS#11 table"
+            ),
             "{output}"
         );
     }
@@ -5532,6 +6342,7 @@ pub(crate) mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![
@@ -5644,6 +6455,7 @@ pub(crate) mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
@@ -5795,13 +6607,13 @@ pub(crate) mod tests {
             };
             // Task 1.3: the scan-only table is unlinked, so the trace never
             // names the slot — it shows the ordinal that reached it (review
-            // answer (c)); the counts and RVs are retained unchanged.
+            // answer (c)); the counts and RVs are retained unchanged, with
+            // no per-line marker (the header says once that unverified
+            // calls are not decoded).
             let ordinal = crate::discovery::scan::standard_ordinal("C_OpenSession").unwrap();
             assert_eq!(
                 &line[15..],
-                format!(
-                    " Unknown executable (PID 100, TID 1) unknown#{ordinal} [semantics unverified] → {rv} 100ns"
-                ),
+                format!(" Unknown executable (PID 100, TID 1) unknown#{ordinal} → {rv} 100ns"),
                 "the generated trace must retain every aggregate RV without semantic payload"
             );
         }
@@ -6160,39 +6972,50 @@ pub(crate) mod tests {
             if seal {
                 ev.mark_terminal_drain_unproven();
             }
-            live(
+            live_scoped_with_verbosity(
                 &[],
                 &ev,
                 Duration::ZERO,
                 "/opt/p11.so",
                 "profile",
                 CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
             )
         };
         let out = frame(|ev| ev.event_loss = 12, false);
         assert!(
-            out.contains("→ PARTIAL: observation lossy (12 events lost)"),
+            out.contains(
+                "→ PARTIAL — calls may be missing (observation lossy) \
+                 (12 call records lost (event_loss))"
+            ),
             "{out}"
         );
         let out = frame(|ev| ev.semantic_unverified_slots = 68, true);
         assert!(
             out.contains(
-                "→ PARTIAL: attribution withheld (68 semantics-unverified/count-only slots)"
+                "→ PARTIAL — names unconfirmed (attribution withheld) \
+                 (function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots))"
             ),
             "{out}"
         );
         let out = frame(|ev| ev.unprotected_live_windows = 1, false);
         assert!(
-            out.contains("→ PARTIAL: observation lossy (unprotected live window)"),
+            out.contains(
+                "calls made while probes were being attached may be missing \
+                 (unprotected_live_windows)"
+            ),
             "{out}"
         );
         let out = frame(|ev| ev.pending_at_end = 2, false);
         assert!(
-            out.contains("→ PARTIAL: semantics degraded (2 semantic state gaps)"),
+            out.contains("2 session-tracking gaps (pending_at_end)"),
             "{out}"
         );
         let out = frame(|_| {}, true);
-        assert!(out.contains("→ PARTIAL: terminal drain unproven"), "{out}");
+        assert!(out.contains("end of capture not fully confirmed"), "{out}");
         let out = frame(|_| {}, false);
         assert!(out.trim_end().ends_with("→ COMPLETE"), "{out}");
     }
@@ -6217,12 +7040,978 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("1 discovery conflicts"), "{out}");
-        assert!(out.contains("2 uncorroborated modules"), "{out}");
-        assert!(out.contains("3 module-ambiguous slots"), "{out}");
-        assert!(out.contains("1 modules refused"), "{out}");
-        assert!(out.contains("scan unavailable (ptrace)"), "{out}");
-        assert!(out.contains("PARTIAL"), "{out}");
+        assert!(
+            out.contains("manifest and scan disagree on 1 provider file"),
+            "{out}"
+        );
+        assert!(
+            out.contains("2 provider files not confirmed from a second source"),
+            "{out}"
+        );
+        assert!(
+            out.contains("3 functions claimed by two provider files"),
+            "{out}"
+        );
+        assert!(out.contains("1 provider file not watched"), "{out}");
+        assert!(out.contains("memory scan unavailable (ptrace)"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+    }
+
+    /// CLI-1/F2: the concise profile summary keeps totals with plain
+    /// coverage reasons and no machine names, plus the first module
+    /// gaps (file + remedy) so a refused provider is actionable.
+    #[test]
+    fn concise_profile_summary_keeps_plain_reasons_without_machine_names() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.discovery.conflicts = 1;
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/x.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(out.contains("calls may be missing"), "{out}");
+        assert!(out.contains("12 call records lost"), "{out}");
+        assert!(out.contains("names unconfirmed"), "{out}");
+        assert!(
+            out.contains(
+                "function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm)"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.contains("manifest and scan disagree on 1 provider file"),
+            "{out}"
+        );
+        for machine in [
+            "observation lossy",
+            "attribution withheld",
+            "semantics-unverified",
+            "discovery conflicts",
+            "event_loss",
+        ] {
+            assert!(!out.contains(machine), "{machine} leaked: {out}");
+        }
+        // F2: concise names the refused file with its remedy.
+        assert!(out.contains("Module gaps (showing 1 of 1):"), "{out}");
+        assert!(out.contains("/opt/x.so"), "{out}");
+        assert!(
+            out.contains("capture it alone with --module /opt/x.so"),
+            "{out}"
+        );
+    }
+
+    /// F2: the concise profile summary names a refused provider with
+    /// its file and the `--module` remedy (not just the aggregate
+    /// "1 provider file not watched" fragment).
+    #[test]
+    fn concise_profile_summary_names_refused_provider_with_remedy() {
+        let mut ev = evidence();
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/refused.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 provider file not watched"), "{out}");
+        assert!(out.contains("/opt/refused.so"), "{out}");
+        assert!(
+            out.contains("capture it alone with --module /opt/refused.so"),
+            "{out}"
+        );
+    }
+
+    /// CLI text: one coverage format in capture text — `coverage: partial —
+    /// <reasons>` and `coverage: complete` — in every verbosity.
+    #[test]
+    fn coverage_line_uses_one_lowercase_format() {
+        let mut partial = evidence();
+        partial.event_loss = 12;
+        partial.verdict();
+        assert_eq!(partial.completeness, "PARTIAL");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &partial, verbosity);
+            assert!(out.contains("coverage: partial — "), "{verbosity:?}: {out}");
+            assert!(!out.contains("Coverage PARTIAL"), "{verbosity:?}: {out}");
+            assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
+        }
+        let mut complete = evidence();
+        complete.verdict();
+        assert_eq!(complete.completeness, "COMPLETE");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &complete, verbosity);
+            assert!(out.contains("coverage: complete"), "{verbosity:?}: {out}");
+            assert!(!out.contains("Coverage COMPLETE"), "{verbosity:?}: {out}");
+        }
+    }
+
+    /// CLI text: every counted coverage fragment uses the singular for
+    /// one and the plural otherwise.
+    #[test]
+    fn coverage_counts_use_singular_for_one() {
+        fn summary(mutated: fn(&mut Evidence)) -> String {
+            let mut ev = evidence();
+            // The loader aggregate is complete by default; keep every
+            // other gate clean so each arm below pins only its fragment.
+            mutated(&mut ev);
+            ev.verdict();
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        }
+        fn bad_surface() -> crate::plan::SurfaceSummary {
+            crate::plan::SurfaceSummary {
+                source: "legacy_function_list".into(),
+                walk: "partial".into(),
+                acquisition: "ok".into(),
+                functions: 68,
+            }
+        }
+        fn refused(module: &str, reason: &str) -> SkippedOut {
+            SkippedOut {
+                name: module.into(),
+                reason: reason.into(),
+            }
+        }
+        // (mutation for one, mutation for two, singular, plural)
+        type CountArm = (
+            fn(&mut Evidence),
+            fn(&mut Evidence),
+            &'static str,
+            &'static str,
+        );
+        let arms: Vec<CountArm> = vec![
+            (
+                |ev| ev.attach_failures.push("slot 3: EPERM".into()),
+                |ev| {
+                    ev.attach_failures.push("slot 3: EPERM".into());
+                    ev.attach_failures.push("slot 4: EPERM".into());
+                },
+                "1 function could not be watched",
+                "2 functions could not be watched",
+            ),
+            (
+                |ev| ev.in_flight_at_end = 1,
+                |ev| ev.in_flight_at_end = 2,
+                "1 call still running at capture end",
+                "2 calls still running at capture end",
+            ),
+            (
+                |ev| ev.surfaces = vec![ok_surface(), bad_surface()],
+                |ev| ev.surfaces = vec![bad_surface(), bad_surface()],
+                "1 provider table incompletely read",
+                "2 provider tables incompletely read",
+            ),
+            (
+                |ev| ev.vendor_interfaces = 1,
+                |ev| ev.vendor_interfaces = 2,
+                "1 vendor-specific interface not decoded",
+                "2 vendor-specific interfaces not decoded",
+            ),
+            (
+                |ev| ev.event_loss = 1,
+                |ev| ev.event_loss = 2,
+                "1 call record lost",
+                "2 call records lost",
+            ),
+            (
+                |ev| ev.start_insert_failures = 1,
+                |ev| ev.start_insert_failures = 2,
+                "1 call start not recorded",
+                "2 call starts not recorded",
+            ),
+            (
+                |ev| ev.unmatched_returns = 1,
+                |ev| ev.unmatched_returns = 2,
+                "1 return without a recorded start",
+                "2 returns without a recorded start",
+            ),
+            (
+                |ev| ev.rv_update_failures = 1,
+                |ev| ev.rv_update_failures = 2,
+                "1 return value not recorded",
+                "2 return values not recorded",
+            ),
+            (
+                |ev| ev.cgroup_scope_failures = 1,
+                |ev| ev.cgroup_scope_failures = 2,
+                "1 cgroup membership check failed",
+                "2 cgroup membership checks failed",
+            ),
+            (
+                |ev| ev.abi_refusals = 1,
+                |ev| ev.abi_refusals = 2,
+                "1 unexpected probe hit refused",
+                "2 unexpected probe hits refused",
+            ),
+            (
+                |ev| ev.malformed_records = 1,
+                |ev| ev.malformed_records = 2,
+                "1 unreadable kernel record",
+                "2 unreadable kernel records",
+            ),
+            (
+                |ev| ev.discovery_ring_loss = 1,
+                |ev| ev.discovery_ring_loss = 2,
+                "1 discovery record lost",
+                "2 discovery records lost",
+            ),
+            (
+                |ev| ev.discovery_state_failures = 1,
+                |ev| ev.discovery_state_failures = 2,
+                "1 discovery update failed",
+                "2 discovery updates failed",
+            ),
+            (
+                |ev| ev.discovery_read_failures = 1,
+                |ev| ev.discovery_read_failures = 2,
+                "1 discovery read failed",
+                "2 discovery reads failed",
+            ),
+            (
+                |ev| ev.discovery_truncated = 1,
+                |ev| ev.discovery_truncated = 2,
+                "1 discovery record truncated",
+                "2 discovery records truncated",
+            ),
+            (
+                |ev| ev.task_uprobe_link_losses = 1,
+                |ev| ev.task_uprobe_link_losses = 2,
+                "1 probe link lost",
+                "2 probe links lost",
+            ),
+            (
+                |ev| ev.pause_partial = 1,
+                |ev| ev.pause_partial = 2,
+                "1 load only partly paused",
+                "2 loads only partly paused",
+            ),
+            (
+                |ev| ev.pause_unavailable = 1,
+                |ev| ev.pause_unavailable = 2,
+                "1 load could not be paused (collected unpaused)",
+                "2 loads could not be paused (collected unpaused)",
+            ),
+            (
+                |ev| ev.multi_rebuild_gaps = 1,
+                |ev| ev.multi_rebuild_gaps = 2,
+                "1 probe re-attach gap",
+                "2 probe re-attach gaps",
+            ),
+            (
+                |ev| ev.aliased = vec![vec!["C_Sign".into(), "C_Encrypt".into()]],
+                |ev| {
+                    ev.aliased = vec![
+                        vec!["C_Sign".into(), "C_Encrypt".into()],
+                        vec!["C_Digest".into(), "C_DigestUpdate".into()],
+                    ];
+                },
+                "1 function sharing an address",
+                "2 functions sharing an address",
+            ),
+            (
+                |ev| ev.discovery.module_ambiguous = 1,
+                |ev| ev.discovery.module_ambiguous = 2,
+                "1 function claimed by two provider files",
+                "2 functions claimed by two provider files",
+            ),
+            (
+                |ev| ev.module_unresolved_slots = 1,
+                |ev| ev.module_unresolved_slots = 2,
+                "1 function with no proven provider file",
+                "2 functions with no proven provider file",
+            ),
+            (
+                |ev| ev.unregistered_mechanisms = 1,
+                |ev| ev.unregistered_mechanisms = 2,
+                "1 unregistered mechanism",
+                "2 unregistered mechanisms",
+            ),
+            (
+                |ev| ev.unpublished_mechanisms = 1,
+                |ev| ev.unpublished_mechanisms = 2,
+                "1 vendor mechanism not listed by name",
+                "2 vendor mechanisms not listed by name",
+            ),
+            (
+                |ev| ev.discovery.uncorroborated = 1,
+                |ev| ev.discovery.uncorroborated = 2,
+                "1 provider file not confirmed from a second source",
+                "2 provider files not confirmed from a second source",
+            ),
+            (
+                |ev| ev.semantic_capture_failures = 1,
+                |ev| ev.semantic_capture_failures = 2,
+                "1 mechanism detail not recorded",
+                "2 mechanism details not recorded",
+            ),
+            (
+                |ev| ev.template_tail_failures = 1,
+                |ev| ev.template_tail_failures = 2,
+                "1 attribute-list read not recorded",
+                "2 attribute-list reads not recorded",
+            ),
+            (
+                |ev| ev.semantic_history_drops = 1,
+                |ev| ev.semantic_history_drops = 2,
+                "1 mechanism history dropped",
+                "2 mechanism histories dropped",
+            ),
+            (
+                |ev| ev.shape_decode_total_failures = 1,
+                |ev| ev.shape_decode_total_failures = 2,
+                "1 mechanism never decoded",
+                "2 mechanisms never decoded",
+            ),
+            (
+                |ev| ev.pending_at_end = 1,
+                |ev| ev.pending_at_end = 2,
+                "1 session-tracking gap",
+                "2 session-tracking gaps",
+            ),
+            (
+                |ev| ev.pid_descendant_gaps = 1,
+                |ev| ev.pid_descendant_gaps = 2,
+                "1 short-lived process gap",
+                "2 short-lived process gaps",
+            ),
+            (
+                |ev| {
+                    ev.stdout_data_sink = true;
+                    ev.scheduling.sink_dropped_bytes = 1;
+                },
+                |ev| {
+                    ev.stdout_data_sink = true;
+                    ev.scheduling.sink_dropped_bytes = 2;
+                },
+                "1 output byte dropped",
+                "2 output bytes dropped",
+            ),
+            (
+                |ev| ev.discovery.modules_skipped = vec![refused("/opt/a.so", "capacity")],
+                |ev| {
+                    ev.discovery.modules_skipped = vec![
+                        refused("/opt/a.so", "capacity"),
+                        refused("/opt/b.so", "capacity"),
+                    ];
+                },
+                "1 provider file not watched",
+                "2 provider files not watched",
+            ),
+            (
+                |ev| {
+                    ev.discovery.modules_skipped =
+                        vec![refused("/opt/a.so", "admitted module needs 5 more slots")];
+                },
+                |ev| {
+                    ev.discovery.modules_skipped = vec![
+                        refused("/opt/a.so", "admitted module needs 5 more slots"),
+                        refused("/opt/b.so", "admitted module needs 5 more slots"),
+                    ];
+                },
+                "1 provider file partially covered",
+                "2 provider files partially covered",
+            ),
+        ];
+        for (one, two, singular, plural) in arms {
+            let out = summary(one);
+            assert!(out.contains(singular), "missing {singular:?}: {out}");
+            let out = summary(two);
+            assert!(out.contains(plural), "missing {plural:?}: {out}");
+        }
+    }
+
+    /// CLI text: discovery-subject skips are unavailable discovery
+    /// steps, not skipped functions; verbose lists each item with its
+    /// reason.
+    #[test]
+    fn skipped_discovery_subjects_render_as_unavailable_steps() {
+        let subject = || SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        };
+        let function = || SkippedOut {
+            name: "C_Sign".into(),
+            reason: "function entry unavailable".into(),
+        };
+        // Subjects alone: no "functions skipped" at all.
+        let mut ev = evidence();
+        ev.skipped = vec![subject()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 discovery step unavailable"), "{out}");
+        assert!(!out.contains("functions skipped"), "{out}");
+        assert!(!out.contains("function skipped"), "{out}");
+        // Mixed: both fragments, each counted.
+        let mut ev = evidence();
+        ev.skipped = vec![subject(), subject(), function()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("2 discovery steps unavailable"), "{out}");
+        assert!(out.contains("1 function skipped"), "{out}");
+        // Verbose lists the items with their reasons.
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("C_Sign (function entry unavailable)"), "{out}");
+        assert!(
+            out.contains("discovery subject (discovery unavailable)"),
+            "{out}"
+        );
+    }
+
+    /// CLI text: loader and live-window gaps read as plain words,
+    /// never as internal mechanism names.
+    #[test]
+    fn loader_gaps_use_plain_words() {
+        let summary = |mutated: fn(&mut Evidence)| {
+            let mut ev = evidence();
+            mutated(&mut ev);
+            ev.verdict();
+            scope_summary_with_verbosity(
+                "pid",
+                &reports_fixture(),
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+            )
+        };
+        let out = summary(|ev| ev.unprotected_live_windows = 1);
+        assert!(
+            out.contains("calls made while probes were being attached may be missing"),
+            "{out}"
+        );
+        assert!(!out.contains("unguarded live capture window"), "{out}");
+        let out = summary(|ev| ev.loader_discovery.initial_set_capture.none = 1);
+        assert!(
+            out.contains("library-load tracking could not be confirmed"),
+            "{out}"
+        );
+        assert!(!out.contains("live loader timing unproven"), "{out}");
+        let out = summary(|ev| {
+            ev.loader_discovery.initial_set_capture.none = 1;
+            ev.loader_discovery.strategies.debug_state_every_hit = 2;
+        });
+        assert!(
+            out.contains("library-load tracking missed loads it should have seen"),
+            "{out}"
+        );
+        assert!(!out.contains("uprobe miss suspected"), "{out}");
+        let out = summary(|ev| {
+            ev.loader_discovery.initial_set_capture.none = 1;
+            ev.loader_discovery.strategies.debug_state_every_hit = 1;
+        });
+        assert!(
+            out.contains("library-load tracking received nothing from the kernel"),
+            "{out}"
+        );
+        assert!(!out.contains("delivery failure suspected"), "{out}");
+    }
+
+    /// CLI text: when names are the only gap, counts are complete and
+    /// the names follow the standard table unconfirmed — never
+    /// "withheld" above a table that names them.
+    #[test]
+    fn attribution_only_coverage_names_unconfirmed_standard_names() {
+        let mut ev = evidence();
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains(
+                "coverage: counts complete; function names follow the standard PKCS#11 table \
+                 and were not confirmed by a manifest (add --manifest to confirm)"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("names withheld"), "{out}");
+        assert!(!out.contains("counted but not named"), "{out}");
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("counts complete"), "{out}");
+        assert!(out.contains("semantic_unverified_slots"), "{out}");
+        assert!(out.contains("68"), "{out}");
+        // Beside a concrete gap the group keeps its label, reworded.
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("names unconfirmed"), "{out}");
+        assert!(!out.contains("names withheld"), "{out}");
+    }
+
+    /// CLI text: the frame header states the scope once, and the
+    /// privacy mode only under -v.
+    #[test]
+    fn frame_header_states_scope_once_without_default_privacy() {
+        let mut ev = evidence();
+        ev.verdict();
+        let frame = |verbosity| {
+            live_scoped_with_verbosity(
+                &[],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "pid",
+                &BTreeMap::new(),
+                verbosity,
+            )
+        };
+        let out = frame(crate::cli::TextVerbosity::Concise);
+        assert!(
+            out.contains("p11scope — PID scope — up 00:00:00 — mode profile — /opt/p11.so\n"),
+            "{out}"
+        );
+        assert!(!out.contains("privacy="), "{out}");
+        assert!(!out.contains("Scope: PID scope"), "{out}");
+        let out = frame(crate::cli::TextVerbosity::Verbose);
+        assert!(out.contains("privacy=allowlisted"), "{out}");
+        assert!(!out.contains("Scope: PID scope"), "{out}");
+        let out = frame(crate::cli::TextVerbosity::Quiet);
+        assert!(!out.contains("privacy="), "{out}");
+    }
+
+    /// CLI text: an owned run that never paused while its command ran
+    /// ahead names the missed load and the `--pause auto` remedy; a
+    /// command with no missed load keeps the generic reasons.
+    #[test]
+    fn owned_run_without_pause_names_the_missed_provider_load() {
+        const REMEDY: &str = "the command loaded its provider before probes attached; \
+                              rerun with --pause auto";
+        let subject = || SkippedOut {
+            name: "discovery subject".into(),
+            reason: "discovery unavailable".into(),
+        };
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.skipped = vec![subject(), subject()];
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &[], &ev, verbosity);
+            assert!(
+                out.contains(&format!("coverage: partial — {REMEDY}")),
+                "{verbosity:?}: {out}"
+            );
+            assert!(
+                !out.contains("no provider files found"),
+                "{verbosity:?}: {out}"
+            );
+        }
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
+        assert!(out.contains(REMEDY), "{out}");
+        assert!(out.contains("unprotected_live_windows"), "{out}");
+        // No missed load: a bare command keeps the generic reasons.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.unprotected_live_windows = 1;
+        ev.skipped = vec![subject()];
+        ev.verdict();
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
+        assert!(!out.contains(REMEDY), "{out}");
+        assert!(out.contains("no provider files found"), "{out}");
+        // Pause protection was used: no remedy either.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.child_still_running = Some(false);
+        ev.pause = "sigstop";
+        ev.pause_attempts = 1;
+        ev.pause_confirmed = 1;
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.verdict();
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
+        assert!(!out.contains(REMEDY), "{out}");
+        // Not an owned run: no remedy.
+        let mut ev = evidence();
+        ev.discovery.modules.clear();
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.unprotected_live_windows = 1;
+        ev.discovery_truncated = 1;
+        ev.verdict();
+        let out = scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
+        assert!(!out.contains(REMEDY), "{out}");
+    }
+
+    /// CLI text: one latency legend, and no function table at all
+    /// when nothing was called.
+    #[test]
+    fn empty_capture_omits_table_and_keeps_one_legend() {
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!out.contains("FUNCTION"), "{out}");
+        assert!(!out.contains("CALLS = completed calls"), "{out}");
+        assert!(!out.contains("Latency units"), "{out}");
+        assert!(!out.contains("log2-bucket approximation"), "{out}");
+        let out = live_scoped_with_verbosity(
+            &reports_fixture(),
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("FUNCTION"), "{out}");
+        assert_eq!(
+            out.matches("log2-bucket approximation, lower bound")
+                .count(),
+            1,
+            "{out}"
+        );
+    }
+
+    /// CLI text: the function table names each row's provider file, so
+    /// identical function names from two providers stay distinct;
+    /// shared and unknown rows say so instead of guessing.
+    #[test]
+    fn function_table_names_each_rows_provider() {
+        fn module(id: u32, path: &str) -> DiscoveredModule {
+            let mut module = discovered_fixture();
+            module.id = crate::plan::ModuleId(id);
+            module.path = path.into();
+            module
+        }
+        let mut ev = evidence();
+        ev.discovery.modules = vec![module(0, "/opt/a.so"), module(1, "/opt/b.so")];
+        ev.verdict();
+        let mut first = report("C_Initialize", 188, 0, false);
+        first.module = Some(crate::plan::ModuleId(0));
+        let mut second = report("C_Initialize", 2, 0, false);
+        second.module = Some(crate::plan::ModuleId(1));
+        let mut shared = report("C_Sign", 30, 0, false);
+        shared.module_ambiguous = true;
+        let unknown = report("C_Digest", 4001, 0, false);
+        let out = live_scoped_with_verbosity(
+            &[first, second, shared, unknown],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "system",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("PROVIDER"), "{out}");
+        let line_for = |text: &str| {
+            out.lines()
+                .find(|line| line.contains(text))
+                .unwrap_or_else(|| panic!("missing {text} in:\n{out}"))
+                .to_string()
+        };
+        assert!(line_for("188").contains("a.so"), "{out}");
+        assert!(line_for("C_Sign").contains("two providers"), "{out}");
+        assert!(line_for("C_Digest").contains("unknown"), "{out}");
+        let twins: Vec<String> = out
+            .lines()
+            .filter(|line| line.contains("C_Initialize"))
+            .map(str::to_string)
+            .collect();
+        assert_eq!(twins.len(), 2, "{out}");
+        assert!(twins.iter().any(|line| line.contains("a.so")), "{out}");
+        assert!(twins.iter().any(|line| line.contains("b.so")), "{out}");
+    }
+
+    /// CLI text: the Initialize marker reports the outcome only; the
+    /// provider column beside it names the file.
+    #[test]
+    fn initialization_suffix_never_claims_a_provider() {
+        let mut ok = report("C_Initialize", 2, 0, false);
+        ok.rv_counts.insert(pkcs11_types::CkRv::OK.0, 2);
+        let mut ev = evidence();
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[ok],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("[init: ok]"), "{out}");
+        assert!(!out.contains("potential provider"), "{out}");
+    }
+
+    /// F2: with lost events, concise and verbose show coverage once —
+    /// the `call records lost` fragment — without the duplicate
+    /// `Coverage partial: event detail was lost` sentence.
+    #[test]
+    fn profile_summary_shows_coverage_once_with_event_loss() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
+            assert!(out.contains("12 call records lost"), "{verbosity:?}: {out}");
+            assert!(
+                !out.contains("event detail was lost"),
+                "{verbosity:?} duplicates coverage: {out}"
+            );
+            assert!(
+                !out.contains("Aggregate counts use the counter maps"),
+                "{verbosity:?} duplicates coverage: {out}"
+            );
+            // One coverage verdict, not two worded differently.
+            let coverage_lines = out
+                .lines()
+                .filter(|line| line.to_lowercase().starts_with("coverage:"))
+                .count();
+            assert_eq!(coverage_lines, 1, "{verbosity:?}: {out}");
+        }
+    }
+
+    /// CLI-1: the verbose profile summary pairs every machine name with
+    /// its plain reason and keeps the module-gap section.
+    #[test]
+    fn verbose_profile_summary_pairs_machine_names_with_plain_reasons() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.discovery.conflicts = 1;
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/x.so".into(),
+            reason: "capacity".into(),
+        });
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            out.contains("calls may be missing (observation lossy)"),
+            "{out}"
+        );
+        assert!(out.contains("12 call records lost (event_loss)"), "{out}");
+        assert!(
+            out.contains("names unconfirmed (attribution withheld)"),
+            "{out}"
+        );
+        assert!(
+            out.contains(
+                "function names follow the standard PKCS#11 table and were not confirmed \
+                 by a manifest (add --manifest to confirm) (68 slots; semantic_unverified_slots)"
+            ),
+            "{out}"
+        );
+        assert!(out.contains("(discovery_conflicts)"), "{out}");
+        assert!(out.contains("Module gaps"), "{out}");
+    }
+
+    /// CLI-1: the quiet profile summary is totals and coverage only.
+    #[test]
+    fn quiet_profile_summary_keeps_totals_and_coverage_only() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let out = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("1 completed call;"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("Attribution:"), "{out}");
+        assert!(!out.contains("Module gaps"), "{out}");
+    }
+
+    /// Item 25: the shared totals line singularizes one of each count.
+    #[test]
+    fn totals_line_singularizes_one() {
+        assert_eq!(
+            totals_line(1, 1, 1),
+            "1 completed call; 1 returned error; 1 entry without an observed return."
+        );
+        assert_eq!(
+            totals_line(2, 1, 0),
+            "2 completed calls; 1 returned error; 0 entries without an observed return."
+        );
+        assert_eq!(
+            totals_line(0, 0, 0),
+            "0 completed calls; 0 returned errors; 0 entries without an observed return."
+        );
+    }
+
+    /// CLI-1: a COMPLETE verdict reads `coverage: complete`.
+    #[test]
+    fn complete_coverage_reads_complete() {
+        let mut ev = evidence();
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out = scope_summary_with_verbosity("pid", &reports_fixture(), &ev, verbosity);
+            assert!(out.contains("coverage: complete"), "{verbosity:?}: {out}");
+        }
+    }
+
+    /// CLI-1: the concise live frame keeps the tables and the `-v`
+    /// hint; the Evidence line is verbose-only.
+    #[test]
+    fn concise_live_frame_keeps_tables_and_hint_without_evidence() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> =
+            [(0x250, mech_stat(8, 1))].into_iter().collect();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("FUNCTION"), "{out}");
+        assert!(out.contains("C_Sign"), "{out}");
+        assert!(out.contains("MECHANISM"), "{out}");
+        assert!(out.contains("CKM_SHA256"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("Evidence:"), "{out}");
+        assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: the verbose live frame keeps Evidence and no hint.
+    #[test]
+    fn verbose_live_frame_keeps_evidence_without_hint() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("Evidence:"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: the quiet live frame is header, totals and coverage only.
+    #[test]
+    fn quiet_live_frame_keeps_header_totals_coverage_only() {
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[report("C_Sign", 10, 0, false)],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("p11scope — PID scope"), "{out}");
+        assert!(out.contains("10 completed calls;"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("FUNCTION"), "{out}");
+        assert!(!out.contains("Evidence:"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
     }
 
     /// The omission record the planner writes for an admitted provider whose
@@ -6260,9 +8049,9 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("1 modules refused"), "{out}");
-        assert!(out.contains("1 modules partially covered"), "{out}");
-        assert!(!out.contains("2 modules refused"), "{out}");
+        assert!(out.contains("1 provider file not watched"), "{out}");
+        assert!(out.contains("1 provider file partially covered"), "{out}");
+        assert!(!out.contains("2 provider files not watched"), "{out}");
 
         let value = versioned_evidence(&ev);
         assert_eq!(value["modules_skipped"][1]["name"], "/opt/grown.so");
@@ -6284,8 +8073,13 @@ pub(crate) mod tests {
                 .into(),
         });
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 modules refused"), "{text}");
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file not watched"), "{text}");
         assert!(text.contains("Module gaps (showing 1 of 1):"), "{text}");
         assert!(
             text.contains("/opt/p11-kit-trust.so: not attached — "),
@@ -6318,13 +8112,13 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains(
-                "Attribution: 1 of 2 mapped providers has no manifest (libsoftokn3.so); \
-                 counts are exact, names are withheld"
+                "Attribution: 1 of 2 mapped provider files has no manifest (libsoftokn3.so); \
+                 counts are exact, names are unconfirmed"
             ),
             "{text}"
         );
         assert!(
-            text.contains("rerun with --manifest for each mapped provider"),
+            text.contains("rerun with --manifest for each mapped provider file"),
             "{text}"
         );
     }
@@ -6352,21 +8146,21 @@ pub(crate) mod tests {
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(
             text.contains(
-                "Attribution: 2 of 3 mapped providers have no manifest (a.so, b.so); \
-                 counts are exact, names are withheld"
+                "Attribution: 2 of 3 mapped provider files have no manifest (a.so, b.so); \
+                 counts are exact, names are unconfirmed"
             ),
             "{text}"
         );
     }
 
-    /// PID scope covers one process: the aggregate note stays silent while
-    /// the scope line still names it.
+    /// PID scope covers one process: the aggregate note stays silent,
+    /// and the header already named the scope, so no scope line repeats it.
     #[test]
     fn scope_summary_for_pid_scope_omits_the_aggregate_note() {
         let mut ev = evidence();
         ev.verdict();
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("Scope: PID scope"), "{text}");
+        assert!(!text.contains("Scope:"), "{text}");
         assert!(!text.contains("not per application"), "{text}");
     }
 
@@ -6384,6 +8178,74 @@ pub(crate) mod tests {
                 "{scope}: {text}"
             );
         }
+    }
+
+    /// A quiet window over mapped providers explains itself: no
+    /// PKCS#11 activity happened, providers are often called only at
+    /// startup, and a narrower scope names the wider target to try.
+    #[test]
+    fn scope_summary_with_zero_calls_over_mapped_providers_suggests_startup_attach() {
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.verdict();
+        for scope in ["pid", "cgroup", "selected"] {
+            let text = scope_summary(scope, &[], &ev);
+            assert!(
+                text.contains("No completed calls observed"),
+                "{scope}: {text}"
+            );
+            assert!(
+                text.contains("No PKCS#11 calls were made in this window"),
+                "{scope}: {text}"
+            );
+            assert!(
+                text.contains("Attach before the target starts"),
+                "{scope}: {text}"
+            );
+            assert!(text.contains("--system"), "{scope}: {text}");
+        }
+        let system = scope_summary("system", &[], &ev);
+        assert!(
+            system.contains("No PKCS#11 calls were made in this window"),
+            "{system}"
+        );
+        assert!(
+            system.contains("Attach before the targets start"),
+            "{system}"
+        );
+        assert!(!system.contains("--system"), "{system}");
+        // A window with calls, or with nothing mapped, stays silent.
+        let busy = scope_summary("pid", &reports_fixture(), &ev);
+        assert!(!busy.contains("were made in this window"), "{busy}");
+        let mut bare = evidence();
+        bare.discovery.modules = Vec::new();
+        bare.verdict();
+        let empty = scope_summary("pid", &[], &bare);
+        assert!(!empty.contains("were made in this window"), "{empty}");
+    }
+
+    /// Under PARTIAL coverage the quiet-window startup sentence stays
+    /// silent: asserting that no calls were made would overclaim when
+    /// calls through unattached tables were explicitly not counted.
+    #[test]
+    fn scope_summary_with_zero_calls_under_partial_coverage_withholds_the_startup_hint() {
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/partial.so".into(),
+            reason: "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)".into(),
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let text = scope_summary("pid", &[], &ev);
+        assert!(
+            text.contains("No completed calls observed; coverage incomplete."),
+            "{text}"
+        );
+        assert!(
+            !text.contains("No PKCS#11 calls were made in this window"),
+            "a partial window must not assert no calls happened: {text}"
+        );
     }
 
     /// No unverified slots, or every mapped provider attested (partial
@@ -6414,8 +8276,13 @@ pub(crate) mod tests {
             reason: GROWTH_OMISSION_RECORD.into(),
         });
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 modules partially covered"), "{text}");
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/grown.so: partially covered — "),
             "{text}"
@@ -6441,25 +8308,36 @@ pub(crate) mod tests {
         ev.discovery.modules.push(trust);
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a \
-                 prefix of its 64 lookalike function tables (a proxy closure array is admitted \
-                 whole, as a prefix when mapped before the capture's first plan, or as published \
-                 tables)"
-                .into(),
+                 prefix of its 64 lookalike function tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
-        let text = scope_summary("pid", &[row], &ev);
+        let text =
+            scope_summary_with_verbosity("pid", &[row], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains("/opt/libp11-kit.so: not attached — "),
             "{text}"
         );
         assert!(text.contains("64 lookalike function tables"), "{text}");
+        // Planner/render junction: the gap line carries the planner's own
+        // note verbatim.
+        assert!(
+            text.contains(crate::plan::CLOSURE_ARRAY_NOTE_DETAILED),
+            "{text}"
+        );
         assert!(
             text.contains(
-                "calls it forwards are counted at the attached providers \
+                "calls it forwards are counted at the attached provider files \
                  (/opt/p11-kit-trust.so: 744 calls)"
             ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
             "{text}"
         );
     }
@@ -6472,18 +8350,829 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/p11-kit-client.so".into(),
-            reason: "4 of 64 template tables attached; calls through the others are not counted"
+            reason: "4 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
                 .into(),
         });
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 modules partially covered"), "{text}");
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/p11-kit-client.so: partially covered — "),
             "{text}"
         );
         assert!(text.contains("4 of 64 template tables attached"), "{text}");
         assert!(!text.contains("--module"), "{text}");
+        assert!(
+            text.contains(
+                "Calls the forwarding layer answers itself through a template \
+                 that was not attached are not counted"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("calls it forwards are counted at the attached provider files"),
+            "{text}"
+        );
+    }
+
+    /// A prefix-admitted layer's own stub slots count under its own module
+    /// id; the forwarding hint must not name the layer itself among the
+    /// providers below it.
+    #[test]
+    fn prefix_hint_excludes_the_layer_itself() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libp11-kit.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/p11-kit-trust.so".into();
+        let mut self_row = report("C_GetSlotList", 500, 0, false);
+        self_row.module = Some(ModuleId(7));
+        let mut backend_row = report("C_FindObjects", 744, 0, false);
+        backend_row.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libp11-kit.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[self_row, backend_row], &ev);
+        assert!(text.contains("/opt/p11-kit-trust.so: 744 calls"), "{text}");
+        assert!(
+            !text.contains("/opt/libp11-kit.so: 500 calls"),
+            "the layer must not list itself as a provider below it: {text}"
+        );
+    }
+
+    /// Nested forwarding twin: one logical call observed twice — once at
+    /// the forwarding layer's published stub (outer, same thread, containing
+    /// the inner call) and once at the watched provider it forwards into.
+    /// Every headline total counts the logical call once (provider layer);
+    /// the forwarding layer is shown separately per layer, never summed in.
+    #[test]
+    fn headline_totals_count_nested_forwarding_once_with_per_layer_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        // Same function, nested pair: outer at the layer, inner at the
+        // provider. The 500 outer calls each contain one inner call; the
+        // provider also answered 244 calls directly (not through the layer).
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "headline counts logical calls once (provider layer): {text}"
+        );
+        assert!(
+            !text.contains("1244 completed calls;"),
+            "headline must not sum both layers: {text}"
+        );
+        assert!(
+            text.contains("/opt/libforward.so")
+                && text.contains("500")
+                && text.contains("forwarding"),
+            "forwarding layer shown separately per layer in plain words: {text}"
+        );
+    }
+
+    /// JSON twin of the nested-forwarding headline: both layers stay
+    /// present and explicitly labelled; logical totals count once.
+    #[test]
+    fn json_labels_both_nested_layers_and_counts_logical_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 2, "both layers stay present");
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        let inner_json = functions
+            .iter()
+            .find(|row| row["calls"] == 744)
+            .expect("provider row present");
+        assert_eq!(
+            outer_json["forwarding_layer"], true,
+            "outer row labelled as the forwarding layer"
+        );
+        assert_eq!(
+            inner_json["forwarding_layer"], false,
+            "inner row labelled as the provider layer"
+        );
+        assert_eq!(
+            document["layer_totals"]["logical"]["calls"], 744,
+            "JSON logical totals count once"
+        );
+        assert_eq!(
+            document["layer_totals"]["forwarding"]["calls"], 500,
+            "JSON forwarding totals stay explicit"
+        );
+    }
+
+    /// Unattributed twin: a whole-admitted forwarding layer (counter/broad
+    /// policy: no gap at all) whose row ownership was not proven (null
+    /// module) still leaves the logical total once — the deciding
+    /// admission class marks the layer, and the attach target's file
+    /// identity places the row at it.
+    #[test]
+    fn unresolved_forwarding_rows_leave_logical_totals_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "unattributed forwarding rows leave the logical headline once: {text}"
+        );
+        assert!(
+            text.contains("forwarding-layer calls"),
+            "unattributed forwarding activity stays visible per layer: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+        // Negative control: the same unattributed row aimed at another
+        // file stays logical — the file-identity match decides.
+        let mut elsewhere = report("unknown#3", 500, 0, false);
+        elsewhere.module = None;
+        elsewhere.module_unresolved = true;
+        elsewhere.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 999,
+            sha256: None,
+        });
+        let mut direct = report("C_Sign", 744, 0, false);
+        direct.module = Some(ModuleId(8));
+        let control = json(&[elsewhere, direct], &ev, &capture_fixture());
+        assert_eq!(control["layer_totals"]["logical"]["calls"], 1244);
+        assert_eq!(control["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// Live pause/counter shape: a class-marked whole-admitted forwarding
+    /// layer with attributed rows and no gap. The halves compose through
+    /// `row_is_forwarding`, but the exact live shape deserves one pin.
+    #[test]
+    fn class_marked_attributed_rows_without_gap_count_logical_once() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), inner.clone()], &ev);
+        assert!(
+            text.contains("744 completed calls;"),
+            "class-marked attributed rows count logical once: {text}"
+        );
+        assert!(
+            !text.contains("1244 completed calls;"),
+            "headline must not sum both layers: {text}"
+        );
+        assert!(
+            text.contains("/opt/libforward.so")
+                && text.contains("500")
+                && text.contains("forwarding"),
+            "forwarding layer shown separately: {text}"
+        );
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        let inner_json = functions
+            .iter()
+            .find(|row| row["calls"] == 744)
+            .expect("provider row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+        assert_eq!(inner_json["forwarding_layer"], false);
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// A refused closure array marks forwarding by its refusal reason alone
+    /// (no class, no prefix gap): the `is_closure_array_refusal` arm of
+    /// `forwarding_module_ids`. Refused modules hold no rows in production,
+    /// so this is rebuild-history defense; the pin keeps the arm honest.
+    #[test]
+    fn refused_closure_array_marks_forwarding_by_reason_alone() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = None;
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: format!(
+                "module needs 5966 more; only 512 attach slots are available — refusing to attach a prefix of its 67 lookalike function tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_WHOLE
+            ),
+        });
+        ev.verdict();
+        let document = json(&[outer, inner], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 744);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+        let functions = document["functions"].as_array().unwrap();
+        let outer_json = functions
+            .iter()
+            .find(|row| row["calls"] == 500)
+            .expect("forwarding row present");
+        assert_eq!(outer_json["forwarding_layer"], true);
+    }
+
+    /// The forwarding line states the counting rule honestly: provider
+    /// totals, self-answered layer calls kept in the forwarding line,
+    /// and per-provider counting of multi-provider layer calls — not an
+    /// exactness claim the code does not have.
+    #[test]
+    fn forwarding_line_states_the_counting_rule() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains(
+                "The totals above count calls at the attached providers; \
+                 calls a layer answered itself or forwarded to a provider that was not attached, \
+                 including its errors, appear only here, \
+                 and a layer call that reaches several providers counts at each."
+            ),
+            "honest counting rule stated: {text}"
+        );
+        assert!(
+            !text
+                .contains("Each forwarding-layer call is counted at the provider it forwards into"),
+            "no exactness claim beyond the code: {text}"
+        );
+        assert!(
+            !text.contains("contains one provider call on the same thread"),
+            "no structural nesting claim: {text}"
+        );
+    }
+
+    /// Remote-client shape: a closure-array forwarding layer is the only
+    /// observation point — no watched provider below it. The split needs
+    /// an active provider, so the layer's calls stay in the headline
+    /// totals everywhere (text, live, metrics and profile JSON) and no
+    /// forwarding line prints.
+    #[test]
+    fn lone_forwarding_layer_keeps_its_calls_in_the_totals() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut row = report("C_Sign", 22, 0, false);
+        row.module = Some(ModuleId(7));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[row.clone()], &ev);
+        assert!(
+            text.contains("22 completed calls;"),
+            "a lone layer stays in the headline totals: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[row.clone()],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(
+            !out.contains("(forwarding layer)"),
+            "a lone layer carries no live marker: {out}"
+        );
+        let document = json(&[row.clone()], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 22);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert_eq!(functions.len(), 1);
+        assert_eq!(functions[0]["forwarding_layer"], false);
+        let profile = profile_json(
+            &[row],
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        assert_eq!(profile["layer_totals"]["logical"]["calls"], 22);
+        assert_eq!(profile["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = profile["functions"].as_array().unwrap();
+        assert_eq!(functions[0]["forwarding_layer"], false);
+    }
+
+    /// A provider attached but quiet (no calls, errors or in-flight
+    /// rows) beside an active layer: exclusion needs an *active*
+    /// provider, so the layer's calls stay logical.
+    #[test]
+    fn quiet_provider_beside_active_layer_keeps_layer_calls_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 695, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut quiet = report("C_Sign", 0, 0, false);
+        quiet.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), quiet.clone()], &ev);
+        assert!(
+            text.contains("695 completed calls;"),
+            "a quiet provider keeps the layer logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let document = json(&[outer, quiet], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 695);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// A provider row with errors but no completed calls still proves an
+    /// active provider below the layer: the split stays on and the
+    /// provider errors stay in the logical totals.
+    #[test]
+    fn provider_errors_alone_keep_the_forwarding_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut errored = report("C_Sign", 0, 0, false);
+        errored.module = Some(ModuleId(8));
+        errored.errors = 3;
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), errored.clone()], &ev);
+        assert!(
+            text.contains("0 completed calls; 3 returned errors;"),
+            "provider errors stay logical while the layer splits out: {text}"
+        );
+        assert!(
+            text.contains("Forwarding layers counted separately"),
+            "an erroring provider keeps the split: {text}"
+        );
+        let document = json(&[outer, errored], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 0);
+        assert_eq!(document["layer_totals"]["logical"]["errors"], 3);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// A provider row with in-flight entries but no completed calls or
+    /// errors still proves an active provider below the layer: the split
+    /// stays on (kills M3, which drops the in-flight arm of the gate).
+    #[test]
+    fn provider_in_flight_alone_keeps_the_forwarding_split() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut open = report("C_Sign", 0, 2, false);
+        open.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer.clone(), open.clone()], &ev);
+        assert!(
+            text.contains(
+                "0 completed calls; 0 returned errors; 2 entries without an observed return."
+            ),
+            "provider in-flight stays logical while the layer splits out: {text}"
+        );
+        assert!(
+            text.contains("Forwarding layers counted separately"),
+            "an in-flight-only provider keeps the split: {text}"
+        );
+        let document = json(&[outer, open], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 0);
+        assert_eq!(document["layer_totals"]["logical"]["in_flight"], 2);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 500);
+    }
+
+    /// P1 shape (controller ruling): a forwarding layer beside a refused
+    /// backend and an unrelated active provider. The gate sees the
+    /// unrelated 2 calls, but the refused backend keeps the layer logical:
+    /// a disclosed overcount (697) beats hiding the app's 695 calls.
+    #[test]
+    fn refused_backend_keeps_layer_calls_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut unrelated = discovered_fixture();
+        unrelated.id = ModuleId(9);
+        unrelated.admission_class = Some("corroborated");
+        unrelated.ino = 93;
+        unrelated.path = "/opt/libunrelated.so".into();
+        let mut outer = report("C_Sign", 695, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut other = report("C_Initialize", 2, 0, false);
+        other.module = Some(ModuleId(9));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, unrelated];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libbackend.so".into(),
+            reason: "module needs 100 more; only 512 attach slots are available; 412 are in use \
+                 (412 active, 0 retired) — refusing to attach a prefix; to capture one provider, \
+                 name it with --module <path>; to free slots, exclude an unneeded module with \
+                 --exclude-module <name>"
+                .into(),
+        });
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        let text = scope_summary("pid", &[outer.clone(), other.clone()], &ev);
+        assert!(
+            text.contains("697 completed calls;"),
+            "a refused backend keeps the layer logical (disclosed overcount): {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line when the backend is refused: {text}"
+        );
+        assert!(
+            text.contains("/opt/libbackend.so: not attached — "),
+            "the refused backend is still named as a gap: {text}"
+        );
+        let document = json(&[outer, other], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 697);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert!(
+            functions.iter().all(|row| row["forwarding_layer"] == false),
+            "no row splits when the backend is refused: {document}"
+        );
+    }
+
+    /// P2 shape: an unattributed backend row does not activate the gate —
+    /// the layer stays logical and the total double-counts (1000) with the
+    /// ownership gap naming the 500. Disclosed, not hidden.
+    #[test]
+    fn unattributed_backend_rows_keep_the_layer_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.dev = (8, 1);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut stray = report("unknown#3", 500, 0, false);
+        stray.module = None;
+        stray.module_unresolved = true;
+        stray.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 82,
+            sha256: None,
+        });
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        assert!(ev.discovery.modules_skipped.is_empty());
+        ev.verdict();
+        assert_eq!(ev.completeness, "COMPLETE");
+        let text = scope_summary("pid", &[outer.clone(), stray.clone()], &ev);
+        assert!(
+            text.contains("1000 completed calls;"),
+            "an unattributed backend keeps the layer logical (disclosed double count): {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no split without an attributed provider row: {text}"
+        );
+        // Owner-gap lines are verbose-only; concise keeps the headline above.
+        let verbose_text = scope_summary_with_verbosity(
+            "pid",
+            &[outer.clone(), stray.clone()],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose_text.contains("\n500 completed calls have unresolved module ownership.\n"),
+            "the ownership gap names the unattributed share: {verbose_text}"
+        );
+        let document = json(&[outer, stray], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 1000);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+    }
+
+    /// P3 shape: a lone layer with an attributed row and an unresolved stub
+    /// matched by file identity stays fully logical (44/0) — the file match
+    /// never splits without an active provider.
+    #[test]
+    fn lone_layer_attributed_and_identity_matched_rows_stay_logical() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut named = report("C_Sign", 22, 0, false);
+        named.module = Some(ModuleId(7));
+        let mut stub = report("unknown#3", 22, 0, false);
+        stub.module = None;
+        stub.module_unresolved = true;
+        stub.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer];
+        ev.discovery.modules_skipped.push(SkippedOut {
+            name: "/opt/libforward.so".into(),
+            reason: "3 of 64 template tables attached; calls through the others are not counted (closure_prefix)"
+                .into(),
+        });
+        ev.verdict();
+        let text = scope_summary("pid", &[named.clone(), stub.clone()], &ev);
+        assert!(
+            text.contains("44 completed calls;"),
+            "a lone layer stays fully logical: {text}"
+        );
+        assert!(
+            !text.contains("Forwarding layers counted separately"),
+            "no forwarding line without an active provider: {text}"
+        );
+        let document = json(&[named, stub], &ev, &capture_fixture());
+        assert_eq!(document["layer_totals"]["logical"]["calls"], 44);
+        assert_eq!(document["layer_totals"]["forwarding"]["calls"], 0);
+        let functions = document["functions"].as_array().unwrap();
+        assert!(
+            functions.iter().all(|row| row["forwarding_layer"] == false),
+            "no row splits without an active provider: {document}"
+        );
+    }
+
+    /// Ownership-gap lines explain headline attribution gaps, so they
+    /// count logical rows only: unattributed forwarding rows are already
+    /// stated in the forwarding line, never summed here.
+    #[test]
+    fn ownership_gap_lines_count_logical_rows_only() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.dev = (8, 1);
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut stray = report("unknown#4", 5, 0, false);
+        stray.module = None;
+        stray.module_unresolved = true;
+        stray.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 82,
+            sha256: None,
+        });
+        let mut contested = report("unknown#5", 7, 0, false);
+        contested.module = None;
+        contested.module_ambiguous = true;
+        contested.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary(
+            "pid",
+            &[
+                outer.clone(),
+                stray.clone(),
+                contested.clone(),
+                inner.clone(),
+            ],
+            &ev,
+        );
+        assert!(
+            text.contains("749 completed calls;"),
+            "headline counts logical rows once: {text}"
+        );
+        // Owner-gap lines are verbose-only; concise keeps the headline above.
+        let verbose_text = scope_summary_with_verbosity(
+            "pid",
+            &[outer, stray, contested, inner],
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose_text.contains("\n5 completed calls have unresolved module ownership.\n"),
+            "unresolved line counts the logical stray only: {verbose_text}"
+        );
+        assert!(
+            !verbose_text.contains("505 completed calls"),
+            "forwarding rows are not summed into the unresolved line: {verbose_text}"
+        );
+        assert!(
+            !verbose_text.contains("ambiguous module ownership"),
+            "a forwarding-only ambiguity prints no ownership line: {verbose_text}"
+        );
+    }
+
+    /// An unattributed forwarding row matched to its layer by attach-target
+    /// file identity is named in the per-layer line, not hidden behind
+    /// "an unattributed forwarding target".
+    #[test]
+    fn unattributed_forwarding_line_names_the_identity_matched_layer() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.dev = (8, 1);
+        layer.ino = 71;
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.ino = 82;
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("unknown#3", 500, 0, false);
+        outer.module = None;
+        outer.module_unresolved = true;
+        outer.target_object = Some(crate::plan::TargetObject {
+            dev: (8, 1),
+            ino: 71,
+            sha256: None,
+        });
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let text = scope_summary("pid", &[outer, inner], &ev);
+        assert!(
+            text.contains("/opt/libforward.so recorded 500 completed forwarding-layer calls"),
+            "the identity-matched layer is named: {text}"
+        );
+        assert!(
+            !text.contains("an unattributed forwarding target"),
+            "no unattributed label for a matched layer: {text}"
+        );
     }
 
     /// JK-22a: a prefix-admitted ordinary provider names its attached
@@ -6498,8 +9187,13 @@ pub(crate) mod tests {
                 .into(),
         });
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 modules partially covered"), "{text}");
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file partially covered"), "{text}");
         assert!(
             text.contains("/opt/mixed.so: partially covered — "),
             "{text}"
@@ -6521,9 +9215,14 @@ pub(crate) mod tests {
                 .into(),
         });
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 modules refused"), "{text}");
-        assert!(!text.contains("modules partially covered"), "{text}");
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("1 provider file not watched"), "{text}");
+        assert!(!text.contains("partially covered"), "{text}");
         assert!(text.contains("/opt/crowded.so: not attached — "), "{text}");
         assert!(!text.contains("partially covered"), "{text}");
     }
@@ -6608,19 +9307,25 @@ pub(crate) mod tests {
         ev.discovery.modules.clear();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 0 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 0 are in use \
                  (0 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
-                 the capture's first plan, or as published tables)"
-                .into(),
+                 tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
-        let text = scope_summary("pid", &[], &ev);
+        let text =
+            scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains("/opt/libp11-kit.so: not attached — "),
             "{text}"
         );
         assert!(text.contains("no provider below it was captured"), "{text}");
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
+            "{text}"
+        );
     }
 
     /// A refused closure array above attached-but-quiet providers says the
@@ -6630,17 +9335,25 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.discovery.modules_skipped.push(SkippedOut {
             name: "/opt/libp11-kit.so".into(),
-            reason: "module needs 6530 more; only 512 attach slots are available; 68 are in use \
+            reason: format!(
+                "module needs 6530 more; only 512 attach slots are available; 68 are in use \
                  (68 active, 0 retired) — refusing to attach a prefix of its 64 lookalike function \
-                 tables (a proxy closure array is admitted whole, as a prefix when mapped before \
-                 the capture's first plan, or as published tables)"
-                .into(),
+                 tables {}",
+                crate::plan::CLOSURE_ARRAY_NOTE_DETAILED
+            ),
         });
         ev.verdict();
-        let text = scope_summary("pid", &[], &ev);
+        let text =
+            scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Verbose);
         assert!(!ev.discovery.modules.is_empty());
         assert!(
-            text.contains("the attached providers counted 0 calls"),
+            text.contains(
+                "no other attached provider counted calls; the layer's own calls stay in the totals"
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains("Calls the forwarding layer answers itself are not counted"),
             "{text}"
         );
     }
@@ -6656,7 +9369,12 @@ pub(crate) mod tests {
             });
         }
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(text.contains("Module gaps (showing 5 of 7):"), "{text}");
         assert!(text.contains("/opt/refused0.so: not attached — "), "{text}");
         assert!(text.contains("/opt/refused4.so: not attached — "), "{text}");
@@ -6680,7 +9398,10 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(frame.contains("provider changed"), "{frame}");
+        assert!(
+            frame.contains("provider file changed during capture"),
+            "{frame}"
+        );
         assert_eq!(
             serde_json::to_value(&ev).unwrap()["provider_changed"],
             serde_json::Value::Bool(true)
@@ -6859,13 +9580,16 @@ pub(crate) mod tests {
                 .contains("\"semantic_history_drops\":1")
         );
         assert!(
-            live(
+            live_scoped_with_verbosity(
                 &[],
                 &ev,
                 Duration::ZERO,
                 "/x.so",
                 "profile",
-                CapturePolicy::Allowlisted
+                CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
             )
             .contains("semantic_history_drops=1")
         );
@@ -6994,7 +9718,7 @@ pub(crate) mod tests {
             [(0x250, mech_stat(8, 1)), (0x9999, mech_stat(2, 0))]
                 .into_iter()
                 .collect();
-        let out = live_scoped(
+        let out = live_scoped_with_verbosity(
             &[report("C_Sign", 10, 0, false)],
             &ev,
             Duration::ZERO,
@@ -7003,6 +9727,7 @@ pub(crate) mod tests {
             CapturePolicy::Allowlisted,
             "pid",
             &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("MECHANISM"), "{out}");
         assert!(out.contains("CKM_SHA256"), "{out}");
@@ -7034,6 +9759,171 @@ pub(crate) mod tests {
         assert!(!out.contains("MECHANISM"), "{out}");
     }
 
+    /// Live rows at a forwarding layer carry the `(forwarding layer)`
+    /// marker; provider rows do not. The table holds two `C_Sign` rows,
+    /// exactly one marked.
+    #[test]
+    fn live_table_marks_forwarding_layer_rows() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_Sign", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[outer, inner],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        assert!(out.contains("C_Sign (forwarding layer)"), "{out}");
+        assert_eq!(out.matches("C_Sign").count(), 2, "{out}");
+        assert_eq!(out.matches("(forwarding layer)").count(), 1, "{out}");
+    }
+
+    /// A marked long-name row stays inside the name field: its CALLS
+    /// value aligns with the header's CALLS column instead of pushing
+    /// the row's columns right.
+    #[test]
+    fn live_table_forwarding_marker_keeps_column_alignment() {
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_GetAttributeValue", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![layer, backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[outer, inner],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header = out
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col = header.find("CALLS").expect("CALLS column");
+        let marked = out
+            .lines()
+            .find(|line| line.contains("C_GetAttributeValue (forwarding layer)"))
+            .expect("marked long-name row");
+        assert_eq!(
+            &marked[calls_col..calls_col + 5],
+            "  500",
+            "marked row CALLS aligns with the header: {out}"
+        );
+        let plain = out
+            .lines()
+            .find(|line| line.starts_with("C_Sign "))
+            .expect("unmarked row");
+        assert_eq!(
+            &plain[calls_col..calls_col + 5],
+            "  744",
+            "unmarked row CALLS aligns with the header: {out}"
+        );
+    }
+
+    /// The live name field sizes to the longest rendered name (min 28),
+    /// not a fixed width: short frames stay compact, long marked rows expand.
+    #[test]
+    fn live_table_name_field_sizes_to_longest_rendered_name() {
+        let mut backend = discovered_fixture();
+        backend.id = ModuleId(8);
+        backend.admission_class = Some("corroborated");
+        backend.path = "/opt/libbackend.so".into();
+        let mut row = report("C_Sign", 10, 0, false);
+        row.module = Some(ModuleId(8));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![backend];
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let out = live_scoped(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header = out
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col = header.find("CALLS").expect("CALLS column");
+        // Name width + gap + PROVIDER column + gap + CALLS right-offset.
+        assert_eq!(
+            calls_col,
+            28 + 1 + 16 + 1 + 3,
+            "a short frame uses the min width 28: {out}"
+        );
+        let mut layer = discovered_fixture();
+        layer.id = ModuleId(7);
+        layer.admission_class = Some("closure_array");
+        layer.path = "/opt/libforward.so".into();
+        let mut backend2 = discovered_fixture();
+        backend2.id = ModuleId(8);
+        backend2.admission_class = Some("corroborated");
+        backend2.path = "/opt/libbackend.so".into();
+        let mut outer = report("C_GetAttributeValue", 500, 0, false);
+        outer.module = Some(ModuleId(7));
+        let mut inner = report("C_Sign", 744, 0, false);
+        inner.module = Some(ModuleId(8));
+        let mut ev2 = evidence();
+        ev2.discovery.modules = vec![layer, backend2];
+        ev2.verdict();
+        let out2 = live_scoped(
+            &[outer, inner],
+            &ev2,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+        );
+        let header2 = out2
+            .lines()
+            .find(|line| line.starts_with("FUNCTION"))
+            .expect("function table header");
+        let calls_col2 = header2.find("CALLS").expect("CALLS column");
+        // Name width + gap + PROVIDER column + gap + CALLS right-offset.
+        assert_eq!(
+            calls_col2,
+            38 + 1 + 16 + 1 + 3,
+            "a long marked row expands the field to its rendered name: {out2}"
+        );
+    }
+
     /// Demo journey 2, empty side: with observed calls but no attributed
     /// mechanisms, the human view says so in one plain line naming the
     /// count-only gap and how to get mechanisms, instead of omitting the
@@ -7044,7 +9934,7 @@ pub(crate) mod tests {
         ev.semantic_unverified_slots = 212;
         ev.verdict();
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
-        let out = live_scoped(
+        let out = live_scoped_with_verbosity(
             &[report("C_SignInit", 2, 0, false)],
             &ev,
             Duration::ZERO,
@@ -7053,11 +9943,12 @@ pub(crate) mod tests {
             CapturePolicy::Allowlisted,
             "pid",
             &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(
             out.contains(
-                "Mechanisms: none attributed — 212 semantics-unverified/count-only slots; \
-                 add --manifest for each mapped provider (see Coverage)."
+                "Mechanisms: none attributed — 212 functions named from the standard table, \
+                 unconfirmed; add --manifest for each mapped provider file (see Coverage)."
             ),
             "{out}"
         );
@@ -7098,7 +9989,13 @@ pub(crate) mod tests {
             out.contains("Mechanisms: none recorded for the observed calls."),
             "{out}"
         );
-        assert!(!out.contains("--manifest"), "{out}");
+        // The note itself offers no manifest remedy; the coverage line
+        // above it still names the unconfirmed names.
+        let note = out
+            .lines()
+            .find(|line| line.starts_with("Mechanisms:"))
+            .expect("mechanisms note: {out}");
+        assert!(!note.contains("--manifest"), "{out}");
     }
 
     /// Empty mechanisms with fully attested slots: none of the observed
@@ -7157,13 +10054,16 @@ pub(crate) mod tests {
         ev.active_slots = 4;
         ev.attached_probes = 8;
         ev.verdict();
-        let out = live(
+        let out = live_scoped_with_verbosity(
             &[],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
             "profile",
             CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(
             out.contains("10 slots (4 active)"),
@@ -7185,16 +10085,16 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        // Evidence line shows why a PARTIAL verdict was rendered.
+        // Coverage line shows why a PARTIAL verdict was rendered.
         assert!(
-            out.contains("5 events lost"),
-            "event_loss must appear in evidence line"
+            out.contains("5 call records lost"),
+            "event_loss must appear in the coverage line"
         );
         assert!(
-            out.contains("2 malformed records"),
-            "malformed_records must appear in evidence line"
+            out.contains("2 unreadable kernel records"),
+            "malformed_records must appear in the coverage line"
         );
-        assert!(out.contains("PARTIAL"));
+        assert!(out.contains("coverage: partial"));
     }
 
     #[test]
@@ -7203,13 +10103,16 @@ pub(crate) mod tests {
         ev.orphan_ops = 3;
         ev.unmatched_closes = 1;
         ev.verdict();
-        let out = live(
+        let out = live_scoped_with_verbosity(
             &[report("C_Sign", 10, 0, false)],
             &ev,
             Duration::from_secs(10),
             "/opt/p11.so",
             "profile",
             CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
         );
         // Informational evidence: capture started mid-operation, still marked COMPLETE for its scope.
         assert!(
@@ -7244,12 +10147,13 @@ pub(crate) mod tests {
         // F-13: fragments group by class — observation, then attribution —
         // each in its gate order.
         let positions = [
-            out.find("observation lossy (").unwrap(),
-            out.find("2 events lost").unwrap(),
-            out.find("3 malformed records").unwrap(),
-            out.find("provider changed").unwrap(),
-            out.find("attribution withheld (").unwrap(),
-            out.find("1 discovery conflicts").unwrap(),
+            out.find("calls may be missing (").unwrap(),
+            out.find("2 call records lost").unwrap(),
+            out.find("3 unreadable kernel records").unwrap(),
+            out.find("provider file changed during capture").unwrap(),
+            out.find("names unconfirmed (").unwrap(),
+            out.find("manifest and scan disagree on 1 provider file")
+                .unwrap(),
         ];
         assert!(
             positions.windows(2).all(|w| w[0] < w[1]),
@@ -7265,13 +10169,16 @@ pub(crate) mod tests {
         let mut ev = evidence();
         ev.process_tracking_fallbacks = 1;
         ev.verdict();
-        let out = live(
+        let out = live_scoped_with_verbosity(
             &[],
             &ev,
             Duration::ZERO,
             "/x.so",
             "profile",
             CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(
             out.contains("· ℹ 1 process trackers using /proc"),
@@ -7285,57 +10192,75 @@ pub(crate) mod tests {
         // fragment without a gate term rendered nothing. The table derives
         // the gate from the same fragments; each counter alone must surface.
         let gap_cases: [(&str, EvidenceMutation); 23] = [
-            ("1 discovery conflicts", |e| e.discovery.conflicts = 1),
-            ("1 uncorroborated modules", |e| {
+            ("manifest and scan disagree on 1 provider file", |e| {
+                e.discovery.conflicts = 1
+            }),
+            ("1 provider file not confirmed from a second source", |e| {
                 e.discovery.uncorroborated = 1;
             }),
-            ("1 module-ambiguous slots", |e| {
+            ("1 function claimed by two provider files", |e| {
                 e.discovery.module_ambiguous = 1;
             }),
-            ("1 modules refused", |e| {
+            ("1 provider file not watched", |e| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/x.so".into(),
                     reason: "capacity".into(),
                 });
             }),
-            ("1 modules partially covered", |e| {
+            ("1 provider file partially covered", |e| {
                 e.discovery.modules_skipped.push(SkippedOut {
                     name: "/opt/grown.so".into(),
                     reason: GROWTH_OMISSION_RECORD.into(),
                 });
             }),
-            ("1 surface gaps", |e| {
+            ("1 provider table incompletely read", |e| {
                 e.surfaces[0].walk = "known_prefix".into();
             }),
-            ("1 vendor interfaces", |e| e.vendor_interfaces = 1),
-            ("1 events lost", |e| e.event_loss = 1),
-            ("1 start inserts failed", |e| e.start_insert_failures = 1),
-            ("1 unmatched returns", |e| e.unmatched_returns = 1),
-            ("1 RV updates failed", |e| e.rv_update_failures = 1),
-            ("1 cgroup checks failed", |e| e.cgroup_scope_failures = 1),
-            ("1 semantic captures failed", |e| {
+            ("1 vendor-specific interface not decoded", |e| {
+                e.vendor_interfaces = 1
+            }),
+            ("1 call record lost", |e| e.event_loss = 1),
+            ("1 call start not recorded", |e| e.start_insert_failures = 1),
+            ("1 return without a recorded start", |e| {
+                e.unmatched_returns = 1
+            }),
+            ("1 return value not recorded", |e| e.rv_update_failures = 1),
+            ("1 cgroup membership check failed", |e| {
+                e.cgroup_scope_failures = 1
+            }),
+            ("1 mechanism detail not recorded", |e| {
                 e.semantic_capture_failures = 1;
             }),
-            ("1 unregistered mechanisms", |e| {
+            ("1 unregistered mechanism", |e| {
                 e.unregistered_mechanisms = 1;
             }),
-            ("1 template tail calls failed", |e| {
+            ("1 attribute-list read not recorded", |e| {
                 e.template_tail_failures = 1;
             }),
-            ("1 semantics-unverified/count-only slot", |e| {
-                e.semantic_unverified_slots = 1;
+            (
+                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                |e| {
+                    e.semantic_unverified_slots = 1;
+                },
+            ),
+            (
+                "coverage: counts complete; function names follow the standard PKCS#11 table",
+                |e| {
+                    e.semantic_unverified_slots = 2;
+                },
+            ),
+            ("1 unreadable kernel record", |e| e.malformed_records = 1),
+            ("attribute lists cut short", |e| {
+                e.templates_truncated = true
             }),
-            ("2 semantics-unverified/count-only slots", |e| {
-                e.semantic_unverified_slots = 2;
-            }),
-            ("1 malformed records", |e| e.malformed_records = 1),
-            ("templates truncated", |e| e.templates_truncated = true),
-            ("1 mechanisms never decoded", |e| {
+            ("1 mechanism never decoded", |e| {
                 e.shape_decode_total_failures = 1;
             }),
-            ("provider changed", |e| e.provider_changed = true),
-            ("no modules discovered", |e| e.discovery.modules.clear()),
-            ("scan unavailable (ptrace)", |e| {
+            ("provider file changed during capture", |e| {
+                e.provider_changed = true
+            }),
+            ("no provider files found", |e| e.discovery.modules.clear()),
+            ("memory scan unavailable (ptrace)", |e| {
                 e.discovery.scan_unavailable = Some("ptrace".into());
             }),
         ];
@@ -7391,21 +10316,29 @@ pub(crate) mod tests {
                 CapturePolicy::Allowlisted,
             );
             assert!(
-                out.contains("1 semantic state gaps"),
+                out.contains("1 session-tracking gap"),
                 "state summand lost from the aggregate: {out}"
+            );
+            assert!(
+                !out.contains("1 session-tracking gaps"),
+                "singular count must use the singular: {out}"
             );
         }
         for (fragment, mutate) in info_cases {
             let mut ev = evidence();
             mutate(&mut ev);
             ev.verdict();
-            let out = live(
+            // The ℹ fragments ride the Evidence line: verbose-only.
+            let out = live_scoped_with_verbosity(
                 &[],
                 &ev,
                 Duration::ZERO,
                 "/x.so",
                 "profile",
                 CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
             );
             assert!(out.contains(fragment), "missing {fragment:?}: {out}");
         }
@@ -7444,7 +10377,7 @@ pub(crate) mod tests {
             "profile",
             CapturePolicy::Allowlisted,
         );
-        assert!(out.contains("1 surface gaps"), "{out}");
+        assert!(out.contains("1 provider table incompletely read"), "{out}");
         assert!(!out.contains("unsupported function-table"), "{out}");
     }
 
@@ -7568,6 +10501,7 @@ pub(crate) mod tests {
             double_loaded: false,
             same_file_loads: 1,
             path: "/lib/provider.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: hook_exports,
             tables: vec![table],
@@ -8054,6 +10988,7 @@ pub(crate) mod tests {
             double_loaded: false,
             same_file_loads: 1,
             path: "/lib/provider.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![table],
@@ -8111,13 +11046,16 @@ pub(crate) mod tests {
         ev.verdict();
 
         assert_eq!(ev.completeness, "PARTIAL");
-        let out = live(
+        let out = live_scoped_with_verbosity(
             &[],
             &ev,
             Duration::ZERO,
             "/opt/p11.so",
             "profile",
             crate::attach::CapturePolicy::Allowlisted,
+            "selected",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("privacy=allowlisted"), "{out}");
         assert!(out.contains("2 unregistered mechanisms"), "{out}");
@@ -8133,13 +11071,16 @@ pub(crate) mod tests {
             ),
             (CapturePolicy::AggregateOnly, "aggregate-only"),
         ] {
-            let out = live(
+            let out = live_scoped_with_verbosity(
                 &[],
                 &evidence(),
                 Duration::ZERO,
                 "/opt/p11.so",
                 "test",
                 policy,
+                "selected",
+                &BTreeMap::new(),
+                crate::cli::TextVerbosity::Verbose,
             );
             assert!(out.contains(&format!("privacy={label}")), "{out}");
         }
@@ -9330,7 +12271,7 @@ pub(crate) mod tests {
             );
         }
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("1 entries skipped"), "{text}");
+        assert!(text.contains("1 discovery step unavailable"), "{text}");
         assert!(
             text.contains(
                 "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
@@ -9338,7 +12279,7 @@ pub(crate) mod tests {
             "{text}"
         );
         assert!(
-            verdict_reasons(&ev).contains(
+            verdict_reasons(&ev, false).contains(
                 "capture process-view capacity was exhausted; remaining generations were not scanned: 1"
             ),
             "{text}"
@@ -9417,7 +12358,7 @@ pub(crate) mod tests {
             ])
         );
         let text = scope_summary("pid", &reports_fixture(), &ev);
-        assert!(text.contains("4 entries skipped"), "{text}");
+        assert!(text.contains("4 discovery steps unavailable"), "{text}");
         for fragment in [
             "loader context capacity 256 is exhausted: 2",
             "a deferred loader memory scan exceeded the bounded loader-context ledger: 1",
@@ -9492,7 +12433,7 @@ pub(crate) mod tests {
         }
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
-        assert!(text.contains("5 entries skipped"), "{text}");
+        assert!(text.contains("5 discovery steps unavailable"), "{text}");
     }
 
     /// Twins: reasons that merely start with an allowlisted sentence but
@@ -9578,7 +12519,7 @@ pub(crate) mod tests {
         assert!(!rendered.contains("/private/"), "{rendered}");
         let text = scope_summary("pid", &reports_fixture(), &ev);
         assert!(!text.contains("PRIVATE_"), "{text}");
-        assert!(text.contains("10 entries skipped"), "{text}");
+        assert!(text.contains("10 discovery steps unavailable"), "{text}");
     }
 
     /// With the compiled-in timing catalog empty (D3), debug-state discovery
@@ -9694,11 +12635,11 @@ pub(crate) mod tests {
     }
 
     /// The 0-hit ghost with a single initial-set context never saw its EXEC
-    /// acknowledged (a second live context would exist otherwise), so BPF
-    /// delivered no loader or lifecycle records for the run. The report names
-    /// that delivery failure instead of generic unproven timing.
+    /// acknowledged (a second live context would exist otherwise), so the
+    /// kernel delivered no loader or lifecycle records for the run. The
+    /// report names that empty tracking instead of generic unproven timing.
     #[test]
-    fn a_never_fired_single_context_loader_names_bpf_delivery_failure() {
+    fn a_never_fired_single_context_loader_names_empty_tracking() {
         let mut ghost = evidence();
         ghost.loader_discovery.strategies.debug_state_every_hit = 1;
         ghost.loader_discovery.hits = 0;
@@ -9706,21 +12647,19 @@ pub(crate) mod tests {
         ghost.loader_discovery.initial_set_capture.none = 1;
         ghost.pause_partial = 1;
         ghost.verdict();
-        let reasons = verdict_reasons(&ghost);
+        let reasons = verdict_reasons(&ghost, false);
         assert!(
-            reasons.contains("BPF delivery failure")
-                && reasons.contains("no EXEC acknowledgment")
-                && reasons.contains("suspected"),
-            "ghost names the delivery failure, got: {reasons:?}",
+            reasons.contains("library-load tracking received nothing from the kernel"),
+            "ghost names the empty tracking, got: {reasons:?}",
         );
     }
 
     /// Zero hits with two bound contexts means the EXEC was processed (a
     /// second live context exists via acknowledgment or immediate re-arm)
-    /// but the loader uprobe itself never fired: a loader-specific miss,
+    /// but the loader tracking itself never fired: a loader-specific miss,
     /// not a silent run. The report names that.
     #[test]
-    fn a_never_fired_processed_loader_names_uprobe_miss() {
+    fn a_never_fired_processed_loader_names_missed_loads() {
         let mut miss = evidence();
         miss.loader_discovery.strategies.debug_state_every_hit = 2;
         miss.loader_discovery.hits = 0;
@@ -9737,17 +12676,15 @@ pub(crate) mod tests {
             "{:?}",
             miss.gap_classes(true)
         );
-        let reasons = verdict_reasons(&miss);
+        let reasons = verdict_reasons(&miss, false);
         assert!(
-            reasons.contains("uprobe miss")
-                && reasons.contains("EXEC processing")
-                && reasons.contains("suspected"),
-            "processed 0-hit loader names the uprobe miss, got: {reasons:?}",
+            reasons.contains("library-load tracking missed loads it should have seen"),
+            "processed 0-hit loader names the missed loads, got: {reasons:?}",
         );
     }
 
-    /// A loader that fired keeps the generic unproven-timing text: the
-    /// delivery-failure and uprobe-miss arms are 0-hit only.
+    /// A loader that fired keeps the generic unconfirmed-tracking text:
+    /// the empty-tracking and missed-loads arms are 0-hit only.
     #[test]
     fn a_fired_loader_keeps_generic_unproven_timing_text() {
         let mut fired = evidence();
@@ -9767,13 +12704,13 @@ pub(crate) mod tests {
             "{:?}",
             fired.gap_classes(true)
         );
-        let reasons = verdict_reasons(&fired);
+        let reasons = verdict_reasons(&fired, false);
         assert!(
-            reasons.contains("live loader timing unproven"),
+            reasons.contains("library-load tracking could not be confirmed"),
             "fired loader keeps generic text, got: {reasons:?}",
         );
         assert!(
-            !reasons.contains("BPF delivery failure") && !reasons.contains("uprobe miss"),
+            !reasons.contains("received nothing") && !reasons.contains("missed loads"),
             "fired loader names no 0-hit cause, got: {reasons:?}",
         );
     }
@@ -10375,7 +13312,7 @@ pub(crate) mod tests {
                 "post_q_discovery": false,
             })
         );
-        assert_eq!(verdict_reasons(&ev), "");
+        assert_eq!(verdict_reasons(&ev, false), "");
     }
 
     // Ruling B's conditions: either post-Q flag, an unproven Q, or no

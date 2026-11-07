@@ -323,11 +323,17 @@ collect_receipt() {
 
 # wait_attach <cond_dir> <observer_pid> <observer_birth> <timeout_s> — hold the go file
 # until discovery is done (marker on the timestamped stderr passthrough)
-# AND the attach session is complete: the observer prints
-# "p11scope: capturing: N probe(s) attached; stop with Ctrl-C" on stderr
-# once probes are attached and the capture loop starts (capture_ready_line
-# in src/run.rs — "the one readiness line ... scripts and supervisors
-# wait for this line"), so that line is the in-observer attach-end signal.
+# AND the attach session is complete: the observer prints its readiness
+# line on stderr once probes are attached and the capture loop starts
+# (capture_ready_line in src/run.rs — "the one readiness line ... scripts
+# and supervisors wait for this line"), so that line is the in-observer
+# attach-end signal: "p11scope: capturing: N probes attached; stop with
+# Ctrl-C" ("1 probe attached" for a single probe; a zero-probe session
+# prints "capturing: waiting for ...; stop with Ctrl-C" instead, which
+# also fires this gate). The discovery summary is
+# a verbose diagnostic, so the observer below runs with
+# P11SCOPE_CAPTURE_DIAGNOSTICS=1 (after the argv receipt, so the recorded
+# command stays the real one).
 # The 0801e79c "p11scope: attached N probe(s)" line is dead: merge
 # 79a54f53 dropped it as a duplicate of the capturing line, so gating on
 # it waits forever. The old first-live-frame stdout signal died with M-10
@@ -348,7 +354,7 @@ wait_attach() {
         case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
-            && grep -q -E "p11scope: capturing: [0-9]+ probe\(s\) attached" "$1/stderr.txt" 2>/dev/null; then
+            && grep -q -E "p11scope: capturing: ([0-9]+ probes? attached|waiting for .*; stop with Ctrl-C)" "$1/stderr.txt" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
@@ -516,6 +522,9 @@ run_condition() {
     if [ -n "$RING_BYTES" ]; then set -- "$@" --ring-bytes "$RING_BYTES"; fi
     if [ -n "$DRAIN_MS" ]; then set -- "$@" --drain-interval-ms "$DRAIN_MS"; fi
     OBS_ARGV_JSON=$(python3 -I -c "import json,sys; print(json.dumps(sys.argv[1:]))" "$@")
+    # The attach/discovery markers are concise-mode diagnostics: request
+    # them explicitly (after the receipt, so the recorded argv stays real).
+    set -- env P11SCOPE_CAPTURE_DIAGNOSTICS=1 "$@"
     T_SPAWN=$(mono_ns)
     # Sink routing: the observer's stdout destination. slow-pipe interposes
     # a throttled FIFO reader that still keeps every byte in

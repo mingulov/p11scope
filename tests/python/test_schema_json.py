@@ -55,6 +55,44 @@ class SchemaOracleAgreement(unittest.TestCase):
             observation["causes"].append("counter_collection")
         return document
 
+    def counter_gaps_document(self, *, gaps, health_unknown=False,
+                              failure=None, discontinuity=False):
+        """A counter document carrying the additive `bank_gaps` object.
+        Any gap forces PARTIAL with the `counter_collection` cause, even
+        on a fresh read; only a health gap reports unknown (null) health."""
+        document = self.counter_document(
+            failure=failure, discontinuity=discontinuity)
+        evidence = document["evidence"]
+        evidence["counter_collection"]["bank_gaps"] = dict(gaps)
+        if health_unknown:
+            evidence["counter_collection"]["health"] = None
+        evidence["completeness"] = "PARTIAL"
+        evidence["verdict_detail"] = "concrete_gap"
+        observation = evidence["gap_classes"]["observation"]
+        observation["status"] = "lossy"
+        if "counter_collection" not in observation["causes"]:
+            observation["causes"].append("counter_collection")
+        return document
+
+    def legacy_gaps_document(self, *, unread_stats=1, rv_failed=False,
+                             unknown_evidence=()):
+        """A legacy (non-counter) document carrying the additive
+        `legacy_collection` object. Any gap forces PARTIAL with the
+        `legacy_collection` cause."""
+        document = self.metrics_document()
+        evidence = document["evidence"]
+        evidence["legacy_collection"] = {
+            "unread_stats": unread_stats,
+            "rv_failed": rv_failed,
+            "unknown_evidence": list(unknown_evidence),
+        }
+        evidence["completeness"] = "PARTIAL"
+        evidence["verdict_detail"] = "concrete_gap"
+        observation = evidence["gap_classes"]["observation"]
+        observation["status"] = "lossy"
+        observation["causes"].append("legacy_collection")
+        return document
+
     def selected_document(self, *, selection="resolved", events=(), mode="counts",
                           with_close_products=False):
         """A metrics document carrying the 6.15 selection envelope. The
@@ -252,12 +290,161 @@ class SchemaOracleAgreement(unittest.TestCase):
         collection = evidence_schema()["properties"]["counter_collection"]
         keys = {"mode", "generation", "read_window", "status", "health", "discontinuity", "failure"}
         self.assertEqual(set(collection["required"]), keys)
-        self.assertEqual(set(collection["properties"]), keys)
+        self.assertEqual(set(collection["properties"]), keys | {"bank_gaps"})
         self.assertFalse(collection["additionalProperties"])
         self.assertNotIn("counter_collection", evidence_schema()["required"])
         failure = collection["properties"]["failure"]["enum"]
         self.assertEqual(set(failure) - {None}, set(CHECKER["COUNTER_COLLECTION_FAILURES"]))
         self.assertIn(None, failure)
+        gaps = collection["properties"]["bank_gaps"]
+        self.assertEqual(
+            set(gaps["required"]), set(CHECKER["BANK_GAPS_KEYS"]))
+        self.assertEqual(
+            set(gaps["properties"]), set(CHECKER["BANK_GAPS_KEYS"]))
+        self.assertFalse(gaps["additionalProperties"])
+        self.assertNotIn("bank_gaps", collection["required"])
+
+    def test_counter_bank_gaps_fresh_and_stale_shapes_accepted(self):
+        """Gap captures pass the gate: fresh reads with slot, health or
+        kernel gaps, and stale reads with gaps, all PARTIAL with the
+        `counter_collection` cause. Only a health gap reports null health."""
+        slot_gaps = {"failed_slots": 1, "health_failed": False,
+                     "kernel_failed": False}
+        health_gaps = {"failed_slots": 0, "health_failed": True,
+                       "kernel_failed": False}
+        kernel_gaps = {"failed_slots": 0, "health_failed": False,
+                       "kernel_failed": True}
+        positives = [
+            self.counter_gaps_document(gaps=slot_gaps),
+            self.counter_gaps_document(gaps=health_gaps, health_unknown=True),
+            self.counter_gaps_document(gaps=kernel_gaps),
+            self.counter_gaps_document(gaps=slot_gaps, failure="read_rvs"),
+        ]
+        for document in positives:
+            with self.subTest(document=document["evidence"]["counter_collection"]):
+                CHECKER["exact_metrics_schema"](document)
+        stale = self.counter_gaps_document(gaps=slot_gaps, failure="read_rvs")
+        for field, value in (("completeness", "COMPLETE"),
+                             ("verdict_detail", "clean_proven")):
+            invalid = copy.deepcopy(stale)
+            invalid["evidence"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        fresh = self.counter_gaps_document(gaps=slot_gaps)
+        for field, value in (("completeness", "COMPLETE"),
+                             ("verdict_detail", "clean_proven")):
+            invalid = copy.deepcopy(fresh)
+            invalid["evidence"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        unflagged = copy.deepcopy(fresh)
+        unflagged["evidence"]["gap_classes"]["observation"]["causes"].remove(
+            "counter_collection")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](unflagged)
+
+    def test_counter_bank_gaps_malformed_rejected(self):
+        """Malformed `bank_gaps` objects are refused for their own shape,
+        not for the closed collection keys: each case differs from an
+        accepted positive by one field."""
+        base = {"failed_slots": 1, "health_failed": False,
+                "kernel_failed": False}
+        shape_cases = [
+            {**base, "extra": 0},
+            {**base, "failed_slots": True},
+            {**base, "failed_slots": -1},
+            {**base, "failed_slots": 2**64},
+            {**base, "failed_slots": "1"},
+            {**base, "health_failed": 0},
+            {**base, "kernel_failed": None},
+            {"failed_slots": 1, "health_failed": False},
+            {"failed_slots": 0, "health_failed": False,
+             "kernel_failed": False},
+        ]
+        for gaps in shape_cases:
+            with self.subTest(gaps=gaps):
+                document = self.counter_gaps_document(gaps=gaps)
+                with self.assertRaisesRegex(AssertionError, "counter bank_gaps"):
+                    CHECKER["exact_metrics_schema"](document)
+        healthy = {"failed_slots": 0, "health_failed": True,
+                   "kernel_failed": False}
+        contradiction = self.counter_gaps_document(gaps=healthy)
+        with self.assertRaisesRegex(AssertionError, "counter collection"):
+            CHECKER["exact_metrics_schema"](contradiction)
+        unknown = self.counter_gaps_document(gaps=base, health_unknown=True)
+        with self.assertRaisesRegex(AssertionError, "counter collection"):
+            CHECKER["exact_metrics_schema"](unknown)
+
+    def test_legacy_collection_accepted_and_requires_gap(self):
+        """Legacy gap captures pass the gate with PARTIAL and the
+        `legacy_collection` cause, for slot, RV and evidence-cell gaps."""
+        positives = [
+            self.legacy_gaps_document(unread_stats=2),
+            self.legacy_gaps_document(unread_stats=0, rv_failed=True),
+            self.legacy_gaps_document(
+                unread_stats=0, unknown_evidence=["ring_loss", "owner"]),
+            self.legacy_gaps_document(
+                unread_stats=1, rv_failed=True,
+                unknown_evidence=["cookie", "root"]),
+        ]
+        for document in positives:
+            with self.subTest(document=document["evidence"]["legacy_collection"]):
+                CHECKER["exact_metrics_schema"](document)
+        gap = self.legacy_gaps_document(
+            unread_stats=1, unknown_evidence=["ring_loss"])
+        for field, value in (("completeness", "COMPLETE"),
+                             ("verdict_detail", "clean_proven")):
+            invalid = copy.deepcopy(gap)
+            invalid["evidence"][field] = value
+            with self.subTest(field=field):
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+        unflagged = copy.deepcopy(gap)
+        unflagged["evidence"]["gap_classes"]["observation"]["causes"].remove(
+            "legacy_collection")
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](unflagged)
+
+    def test_legacy_collection_malformed_rejected(self):
+        """Malformed `legacy_collection` objects are refused for their own
+        shape: each case differs from an accepted positive by one field."""
+        cases = [
+            {"unread_stats": 1, "rv_failed": False, "unknown_evidence": [],
+             "extra": 0},
+            {"unread_stats": -1, "rv_failed": False, "unknown_evidence": []},
+            {"unread_stats": True, "rv_failed": False, "unknown_evidence": []},
+            {"unread_stats": 1, "rv_failed": 1, "unknown_evidence": []},
+            {"unread_stats": 1, "rv_failed": False,
+             "unknown_evidence": ["no_such_cell"]},
+            {"unread_stats": 0, "rv_failed": False,
+             "unknown_evidence": ["ring_loss", "ring_loss"]},
+            {"unread_stats": 0, "rv_failed": False,
+             "unknown_evidence": ["owner", "ring_loss"]},
+            {"unread_stats": 0, "rv_failed": False, "unknown_evidence": []},
+            {"unread_stats": 1, "rv_failed": False,
+             "unknown_evidence": "ring_loss"},
+            {"unread_stats": 1, "rv_failed": False},
+        ]
+        for legacy in cases:
+            with self.subTest(legacy=legacy):
+                document = self.legacy_gaps_document()
+                document["evidence"]["legacy_collection"] = legacy
+                with self.assertRaisesRegex(AssertionError, "legacy_collection[ .:]"):
+                    CHECKER["exact_metrics_schema"](document)
+
+    def test_legacy_collection_schema_matches_oracle_shape(self):
+        legacy = evidence_schema()["properties"]["legacy_collection"]
+        self.assertEqual(
+            set(legacy["required"]), set(CHECKER["LEGACY_COLLECTION_KEYS"]))
+        self.assertEqual(
+            set(legacy["properties"]), set(CHECKER["LEGACY_COLLECTION_KEYS"]))
+        self.assertFalse(legacy["additionalProperties"])
+        self.assertNotIn("legacy_collection", evidence_schema()["required"])
+        names = legacy["properties"]["unknown_evidence"]["items"]["enum"]
+        self.assertEqual(names, list(CHECKER["LEGACY_UNKNOWN_CELLS"]))
+        self.assertTrue(legacy["properties"]["unknown_evidence"]["uniqueItems"])
 
     def test_counter_mode_agrees_with_function_timing_in_both_document_lanes(self):
         timestamp = {"approximate": False, "p50": None, "p95": None, "p99": None,
@@ -703,12 +890,12 @@ class SchemaOracleAgreement(unittest.TestCase):
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
-        the optional additive envelopes (counter, selection, excludes)."""
+        the optional additive envelopes (counter, selection, excludes, legacy)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
             | {"child_still_running", "counter_collection", "selected_detail",
-               "excluded_modules", "unmatched_excludes"}
+               "excluded_modules", "unmatched_excludes", "legacy_collection"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 

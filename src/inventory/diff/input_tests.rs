@@ -202,7 +202,7 @@ fn native_additions_are_validated_when_present() {
     v["observation"]["lifecycle"] =
         json!({"records":2,"ring_loss":1,"malformed":0,"failed_quanta":0,"recovery_rescans":1});
     v["modules"][0]["unbound_use"] =
-        json!({"first_ns":123,"rows":1,"reasons":{"no_live_caller":1}});
+        json!({"first_ns":123,"rows":1,"reasons":{"no_live_caller":1},"entries":5});
     v["budgets"]["native_preadmission"] = json!({"limit":4096,"occupied":1,"refused":0,"pruned":0});
     assert!(parse_snapshot(&bytes(&v)).is_ok());
     for path in [
@@ -230,12 +230,37 @@ fn native_additions_are_validated_when_present() {
         "/observation/lifecycle/ring_loss",
         "/observation/native_witnesses/rows",
         "/modules/0/unbound_use/rows",
+        "/modules/0/unbound_use/entries",
         "/budgets/native_preadmission/pruned",
     ] {
         let mut wrong = v.clone();
         *wrong.pointer_mut(path).unwrap() = json!("bad");
         rejected(&wrong, path.rsplit('/').next().unwrap());
     }
+}
+
+#[test]
+fn unbound_use_entries_are_carried_when_present() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 744
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    assert_eq!(
+        snapshot.modules[0].unbound_use.as_ref().unwrap().entries,
+        744
+    );
+}
+
+#[test]
+fn unbound_use_entries_default_to_zero_for_old_captures() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2, "reasons": {"no_live_caller": 2}
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    assert_eq!(snapshot.modules[0].unbound_use.as_ref().unwrap().entries, 0);
 }
 
 #[test]

@@ -7,8 +7,10 @@
 //! the first semantic mutation: [`FeedMode::Joint`] stages H3-admitted
 //! S1 payloads and replays them through the one [`EdgeSemantics`]
 //! reducer as sealed H8 calls settle; [`FeedMode::S1Only`] reduces
-//! directly and never stages. An S1Only incarnation never becomes
-//! Joint, and an already-reduced call is never replayed.
+//! directly and never stages. An incarnation selected S1Only at
+//! registration never becomes Joint; one that left Joint through
+//! fallback or loss resumes at its next clean point
+//! ([`is_clean_point`]). An already-reduced call is never replayed.
 //!
 //! The original seal retains call-qualified settlement steps and frozen
 //! effect spans. Effect emission and the exact admission head advance
@@ -41,15 +43,56 @@ use std::mem::size_of;
 pub(crate) const JOINT_STAGING_CAPACITY: usize =
     crate::semantics_objects::journal::MAX_UNSETTLED_STAGED;
 
-/// Permanent per-instance/era feed selection, chosen at registration
-/// before the first semantic mutation (H9).
+/// Per-instance/era feed selection, chosen at registration before
+/// the first semantic mutation (H9). A feed that leaves Joint
+/// (fallback or loss) stays S1Only until its next clean point —
+/// an operation init, login, or session open — where a feed that
+/// still holds its birth receipt re-enters Joint for the new
+/// segment. Already-reduced calls are never replayed either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum FeedMode {
-    /// Reduce directly; never stage, never replay, never upgrade.
+    /// Reduce directly; never stage, never replay. Selected at
+    /// registration it is permanent; reached by fallback or loss
+    /// with a retained receipt it lasts until the next clean point.
     S1Only,
     /// Stage H3-admitted payloads; replay each through the one
     /// reducer as its sealed call settles.
     Joint,
+}
+
+/// Which ending opened a feed's current degraded window: the
+/// reason direct reductions count under until the next clean
+/// point resumes Joint (see [`JointStaging::note_direct_reduction`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DegradedWindow {
+    /// A proof-only or ordered fallback ended the segment.
+    Fallback,
+    /// Real loss ended the segment.
+    Loss,
+    /// The no-progress watchdog tripped: the lane is held for exit
+    /// and no seal will settle anything again (never resumes).
+    Watchdog,
+}
+
+/// Whether the frozen endpoint table proves `function` irrelevant
+/// to key proof: info and session-state reads that are not key
+/// operations and never count as not attributed.
+fn proved_irrelevant(function: &str) -> bool {
+    crate::kinds::function_id(function).and_then(crate::semantics_objects::journal::endpoint_class)
+        == Some(crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant)
+}
+
+/// Whether `function` starts a clean segment boundary at which a
+/// degraded feed may resume attribution: an operation init (the
+/// frozen descriptor's INITIALIZE transition), a login, or a
+/// session open. Reads only the function name's frozen descriptor.
+pub(crate) fn is_clean_point(function: &str) -> bool {
+    use p11scope_ebpf_common::{lifecycle, transition};
+    crate::kinds::descriptor(function).is_some_and(|descriptor| {
+        descriptor.transition == transition::INITIALIZE
+            || descriptor.lifecycle == lifecycle::LOGIN
+            || descriptor.lifecycle == lifecycle::OPEN_SESSION
+    })
 }
 
 /// Why one call was not staged.
@@ -149,6 +192,29 @@ pub(crate) enum SealFailureDisposition {
     Retry,
 }
 
+/// Whether a feed whose segment ended with this gap may resume
+/// Joint at its next clean point. Record-level and proof-only
+/// endings are segment-local: fresh seals can prove a later
+/// segment. Endings that name the authority itself — a tainted or
+/// ended domain/image, a mismatched or invalidated birth, a
+/// stopped adapter, or a faulted journal — have no clean point on
+/// this feed; only a new birth (a new feed) can attribute again.
+pub(crate) fn segment_resumable_after(gap: JournalGap) -> bool {
+    use JournalGap::*;
+    !matches!(
+        gap,
+        DomainTainted
+            | ImageTainted
+            | DomainEnded
+            | AdapterInvalidated
+            | Stopped
+            | BootstrapMismatch
+            | FaultChanged
+            | FaultUnreadable
+            | FaultSaturated
+    )
+}
+
 /// Map one seal gap to its H9 disposition.
 pub(crate) fn disposition_of(gap: JournalGap) -> SealFailureDisposition {
     use JournalGap::*;
@@ -216,6 +282,42 @@ pub(crate) struct JointStaging {
     redeemed: u64,
     reduced: u64,
     history_disposed: u64,
+    /// Staged calls replayed S1-direct by a fallback (ordered or
+    /// proof-only): they keep their S1 counts but no per-key row can
+    /// be proved for them, so the projection counts them as not
+    /// attributed (`proof_refused_fallback`).
+    fallback_replayed: u64,
+    /// Affecting calls the frozen endpoint table cannot seal
+    /// (negative-only or unclassified), reduced S1-direct: counted
+    /// as not attributed (`unmodelled_call_shape`).
+    /// Proved-irrelevant calls are not key operations and never
+    /// count here.
+    unsealable_direct: u64,
+    /// Direct reductions on a feed registered without a witnessed
+    /// birth (attach after start, or the birth race): counted as
+    /// not attributed (`started_before_attach`). The registry
+    /// notes each one; the feed itself never sees the call.
+    pre_attach_direct: u64,
+    /// Direct reductions in the degraded window after a fallback
+    /// ended a segment, before its next clean point: counted as
+    /// not attributed under that segment's reason
+    /// (`proof_refused_fallback`).
+    degraded_fallback_direct: u64,
+    /// Direct reductions in the degraded window after real loss
+    /// ended a segment, before its next clean point: counted as
+    /// not attributed under that segment's reason (`record_lost`).
+    degraded_loss_direct: u64,
+    /// The ending that opened the current degraded window, if a
+    /// segment has ended and not yet resumed. Cleared on resume.
+    degraded_window: Option<DegradedWindow>,
+    /// Staged calls taken out at the no-progress watchdog trip,
+    /// plus later direct key calls in the watchdog window: each
+    /// counted once as not attributed (`watchdog_no_progress`).
+    /// Taken out history-only — never reduced, never replayed.
+    watchdog_unsealed: u64,
+    /// True once the watchdog trip has been noted for this feed:
+    /// the take-out above runs exactly once.
+    watchdog_tripped: bool,
     correlation_refusals: u64,
     /// True once real loss (not proof-only refusal) ended this
     /// feed's object authority: the projection reports
@@ -225,9 +327,14 @@ pub(crate) struct JointStaging {
     /// ordinary S1 and degraded to S1Only: the projection reports
     /// `proof_refused_fallback`.
     fell_back: bool,
+    /// Whether the segment that just ended permits a clean-point
+    /// resume (see [`segment_resumable_after`]); ordered fallbacks
+    /// always permit it. Cleared on resume.
+    segment_resumable: bool,
     /// Ledger releases pended by a ledger-less ordered fallback
-    /// (C4): flushed on the next ledger contact. At most one
-    /// fallback per feed (feeds never re-enter Joint), so bounded by
+    /// (C4): flushed on the next ledger contact. One fallback drains
+    /// staging, and re-staging after a clean-point resume flushes
+    /// first, so one segment's worth is ever pended: bounded by
     /// [`JOINT_STAGING_CAPACITY`].
     pending_releases: Vec<(Option<crate::attach::capture::NativeDomainId>, u64, u64)>,
 }
@@ -260,9 +367,18 @@ impl JointStaging {
             redeemed: 0,
             reduced: 0,
             history_disposed: 0,
+            fallback_replayed: 0,
+            unsealable_direct: 0,
+            pre_attach_direct: 0,
+            degraded_fallback_direct: 0,
+            degraded_loss_direct: 0,
+            degraded_window: None,
+            watchdog_unsealed: 0,
+            watchdog_tripped: false,
             correlation_refusals: 0,
             degraded_loss: false,
             fell_back: false,
+            segment_resumable: false,
             pending_releases: Vec::new(),
         }
     }
@@ -301,6 +417,28 @@ impl JointStaging {
         self.mode
     }
 
+    /// Re-enter Joint at a clean point after a fallback or loss
+    /// ended the previous segment. Only a feed that was selected
+    /// Joint at registration (retained receipt), actually left it,
+    /// and holds no staged remainder may resume; the loss/fallback
+    /// flags stay set so publication keeps counting the closed
+    /// segment. Returns whether the mode changed.
+    pub(crate) fn resume_joint(&mut self) -> bool {
+        if self.mode == FeedMode::S1Only
+            && !self.watchdog_tripped
+            && self.selected_receipt.is_some()
+            && self.segment_resumable
+            && self.staged.is_empty()
+        {
+            self.mode = FeedMode::Joint;
+            self.segment_resumable = false;
+            self.degraded_window = None;
+            true
+        } else {
+            false
+        }
+    }
+
     /// Calls replayed through the one reducer (seal or fallback).
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn reduced(&self) -> u64 {
@@ -311,6 +449,114 @@ impl JointStaging {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn history_disposed(&self) -> u64 {
         self.history_disposed
+    }
+
+    /// Staged calls a fallback replayed S1-direct without proof.
+    pub(crate) fn fallback_replayed(&self) -> u64 {
+        self.fallback_replayed
+    }
+
+    /// Affecting unsealable calls reduced S1-direct.
+    pub(crate) fn unsealable_direct(&self) -> u64 {
+        self.unsealable_direct
+    }
+
+    /// Direct reductions counted against an unwitnessed birth.
+    pub(crate) fn pre_attach_direct(&self) -> u64 {
+        self.pre_attach_direct
+    }
+
+    /// Direct reductions in the degraded window after a fallback.
+    pub(crate) fn degraded_fallback_direct(&self) -> u64 {
+        self.degraded_fallback_direct
+    }
+
+    /// Direct reductions in the degraded window after real loss.
+    pub(crate) fn degraded_loss_direct(&self) -> u64 {
+        self.degraded_loss_direct
+    }
+
+    /// Staged calls counted under the watchdog reason at the trip.
+    pub(crate) fn watchdog_unsealed(&self) -> u64 {
+        self.watchdog_unsealed
+    }
+
+    /// Note the no-progress watchdog trip for this feed, exactly
+    /// once: take every staged call out (history-only, like loss
+    /// disposal: never reduced, never replayed, releases pended to
+    /// the next ledger contact) and count each once as
+    /// `watchdog_no_progress`. The segment closes for good: no later
+    /// seal, loss or replay can count those calls again, nothing new
+    /// stages, and later direct key calls count under the watchdog
+    /// reason too. Returns whether this call left Joint mode.
+    pub(crate) fn note_watchdog_trip(&mut self) -> bool {
+        if self.watchdog_tripped {
+            return false;
+        }
+        self.watchdog_tripped = true;
+        while let Some(head) = self.staged.pop_front() {
+            let bytes = head.charged_bytes();
+            let (position, native) = (head.position, head.resource_native);
+            drop(head);
+            self.release_or_pend(None, position, bytes, native);
+            self.frontier = self.frontier.max(position);
+            self.watchdog_unsealed = self.watchdog_unsealed.saturating_add(1);
+        }
+        let was_joint = self.mode == FeedMode::Joint;
+        if was_joint || self.selected_receipt.is_some() {
+            self.mode = FeedMode::S1Only;
+            self.segment_resumable = false;
+            self.degraded_window = Some(DegradedWindow::Watchdog);
+        }
+        was_joint
+    }
+
+    /// Whether the no-progress watchdog tripped on this feed.
+    pub(crate) fn watchdog_tripped(&self) -> bool {
+        self.watchdog_tripped
+    }
+
+    /// End the current Joint segment: degrade to S1Only and open
+    /// the degraded window in which direct reductions count under
+    /// this ending's reason until the next clean point resumes.
+    fn close_segment(&mut self, loss: bool, resumable: bool) {
+        self.mode = FeedMode::S1Only;
+        self.segment_resumable = resumable;
+        if loss {
+            self.degraded_loss = true;
+            self.degraded_window = Some(DegradedWindow::Loss);
+        } else {
+            self.fell_back = true;
+            self.degraded_window = Some(DegradedWindow::Fallback);
+        }
+    }
+
+    /// Count one S1-direct reduction on this feed, under the one
+    /// reason that kept it from attribution. Proved-irrelevant
+    /// calls are not key operations and never count. Without a
+    /// selected birth receipt the call started before attach; on
+    /// a receipt-holding feed whose last segment ended and has
+    /// not yet resumed, it counts under that segment's reason.
+    pub(crate) fn note_direct_reduction(&mut self, function: &str) {
+        if proved_irrelevant(function) {
+            return;
+        }
+        if self.selected_receipt.is_none() {
+            self.pre_attach_direct = self.pre_attach_direct.saturating_add(1);
+            return;
+        }
+        match self.degraded_window {
+            Some(DegradedWindow::Fallback) => {
+                self.degraded_fallback_direct = self.degraded_fallback_direct.saturating_add(1);
+            }
+            Some(DegradedWindow::Loss) => {
+                self.degraded_loss_direct = self.degraded_loss_direct.saturating_add(1);
+            }
+            Some(DegradedWindow::Watchdog) => {
+                self.watchdog_unsealed = self.watchdog_unsealed.saturating_add(1);
+            }
+            None => {}
+        }
     }
 
     /// Seal quanta refused for correlation (multi-call seals H9 does
@@ -420,12 +666,17 @@ impl JointStaging {
         if self.mode != FeedMode::Joint {
             return Err(StagingRefusal::NotJoint);
         }
-        let sealable = crate::kinds::function_id(&facts.function)
-            .and_then(crate::semantics_objects::journal::endpoint_class)
-            .is_some_and(|class| {
-                class == crate::semantics_objects::journal::EndpointClass::ModeledAffecting
-            });
+        let class = crate::kinds::function_id(&facts.function)
+            .and_then(crate::semantics_objects::journal::endpoint_class);
+        let sealable =
+            class == Some(crate::semantics_objects::journal::EndpointClass::ModeledAffecting);
         if !sealable {
+            // Affecting shapes we cannot seal count as not
+            // attributed; proved-irrelevant calls are not key
+            // operations and count nothing.
+            if class != Some(crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant) {
+                self.unsealable_direct = self.unsealable_direct.saturating_add(1);
+            }
             return Err(StagingRefusal::Unsealable);
         }
         if position <= self.frontier
@@ -788,6 +1039,7 @@ impl JointStaging {
             return (FailureBatchProgress::Held, 0);
         }
         let disposition = audited.disposition();
+        let gap = audited.failure().gap;
         let covered = matches!(audited.h3(), H3DispositionEvidence::Clean {
             staged_max, pending_floor: None,
         } if self.covered_by(*staged_max));
@@ -840,7 +1092,10 @@ impl JointStaging {
             // still binds later original negatives to this exact history.
             // S1Only never owns a staged suffix; refuse before completing if
             // that invariant is broken rather than discarding any head.
-            self.degraded_loss |= loss;
+            if loss {
+                self.degraded_loss = true;
+                self.degraded_window = Some(DegradedWindow::Loss);
+            }
             return (
                 batch.negative_delivered().map_or(
                     FailureBatchProgress::Held,
@@ -850,12 +1105,7 @@ impl JointStaging {
             );
         }
         if self.staged.is_empty() {
-            self.mode = FeedMode::S1Only;
-            if loss {
-                self.degraded_loss = true;
-            } else {
-                self.fell_back = true;
-            }
+            self.close_segment(loss, segment_resumable_after(gap));
             return (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 0 }
@@ -896,6 +1146,7 @@ impl JointStaging {
                         refused = count;
                         replayed = true;
                         self.reduced = self.reduced.saturating_add(1);
+                        self.fallback_replayed = self.fallback_replayed.saturating_add(1);
                     }
                     Err(_) => {
                         reducer.invalidate_with_effects(&mut tee);
@@ -911,12 +1162,7 @@ impl JointStaging {
             }
         }
         if self.staged.is_empty() {
-            self.mode = FeedMode::S1Only;
-            if loss {
-                self.degraded_loss = true;
-            } else {
-                self.fell_back = true;
-            }
+            self.close_segment(loss, segment_resumable_after(gap));
             (
                 FailureBatchProgress::Complete(if loss {
                     FailureApplyOutcome::Degraded { disposed: 1 }
@@ -1027,8 +1273,7 @@ impl JointStaging {
                     assoc_fallback.as_deref_mut(),
                 );
                 let disposed = self.drain_staged(Some(ledger));
-                self.mode = FeedMode::S1Only;
-                self.degraded_loss = true;
+                self.close_segment(true, segment_resumable_after(failure.gap));
                 (FailureApplyOutcome::Degraded { disposed }, 0)
             }
             SealFailureDisposition::Fallback => {
@@ -1050,8 +1295,7 @@ impl JointStaging {
                             Some(&mut *ledger),
                             assoc_fallback.as_deref_mut(),
                         );
-                        self.mode = FeedMode::S1Only;
-                        self.fell_back = true;
+                        self.close_segment(false, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }
                     H3DispositionEvidence::StagedLoss { .. } | H3DispositionEvidence::Exhausted => {
@@ -1067,8 +1311,7 @@ impl JointStaging {
                             assoc_fallback,
                         );
                         let disposed = self.drain_staged(Some(ledger));
-                        self.mode = FeedMode::S1Only;
-                        self.degraded_loss = true;
+                        self.close_segment(true, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::Degraded { disposed }, 0)
                     }
                     _ => {
@@ -1175,8 +1418,9 @@ impl JointStaging {
         // needed, unlike proof-only fallback across a seal gap.
         let (replayed, refused) =
             self.replay_staged(reducer, keyuse, instance, sink, ledger, assoc_fallback);
-        self.mode = FeedMode::S1Only;
-        self.fell_back = true;
+        // Ordered fallbacks are local capacity/shape endings: the
+        // next clean point may resume Joint for a fresh segment.
+        self.close_segment(false, true);
         (replayed, refused)
     }
 
@@ -1283,6 +1527,7 @@ impl JointStaging {
                     Ok(head_refused) => {
                         refused = refused.saturating_add(head_refused);
                         self.reduced = self.reduced.saturating_add(1);
+                        self.fallback_replayed = self.fallback_replayed.saturating_add(1);
                         replayed += 1;
                         false
                     }
@@ -1436,6 +1681,28 @@ fn usable_label(receipt: &KeyReceipt) -> Option<&'static str> {
         return None;
     }
     Some(metadata_label(label))
+}
+
+/// The metadata label a receipt rows under: its usable established
+/// label, or — for a first-observed object (DEMO-4 late attach: the
+/// key's creation/lookup predates the observed window) with valid
+/// attribution and no established label and no metadata conflict —
+/// the honest `unknown` label. The per-key row is kept with the
+/// object id and its exact counts; no type or size is guessed.
+/// Later learned metadata never rewrites this snapshot: a later use
+/// after an established attribute read buckets under its own label.
+fn row_label(receipt: &KeyReceipt) -> Option<&'static str> {
+    if let Some(label) = usable_label(receipt) {
+        return Some(label);
+    }
+    if receipt.first_observed
+        && receipt.attribution_valid
+        && receipt.label.is_none()
+        && receipt.metadata.conflicted == 0
+    {
+        return Some(crate::key_operation_projection::METADATA_UNKNOWN);
+    }
+    None
 }
 
 /// The unknown reason for an unusable label: any conflict at use
@@ -2203,7 +2470,7 @@ impl KeyUseReducer {
         let mut slots = [ResolvedAssoc::NONE; 2];
         let mut len = 0usize;
         for (index, receipt) in receipts.iter().enumerate().take(slots.len()) {
-            let bucket = match usable_label(receipt) {
+            let bucket = match row_label(receipt) {
                 Some(label) => AssocBucket::Proved(AggKey {
                     instance,
                     object: receipt.key.as_u64(),
@@ -2347,6 +2614,7 @@ impl KeyUseReducer {
                 metadata,
                 label,
                 attribution_valid,
+                first_observed,
                 ..
             } = effect
             else {
@@ -2368,6 +2636,7 @@ impl KeyUseReducer {
                 metadata: *metadata,
                 label: *label,
                 attribution_valid: *attribution_valid,
+                first_observed: *first_observed,
                 lost: false,
             });
         }

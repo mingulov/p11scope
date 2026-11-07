@@ -95,7 +95,7 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked --jobs "$BUILD_JOBS"
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml rpm softhsm2
       - name: Install packaged bpftool
         shell: bash
         run: |
@@ -162,3 +162,85 @@ jobs:
           path: ${{ runner.temp }}/release-evidence/${{ matrix.public }}/
           if-no-files-found: error
           retention-days: 30
+  attest:
+    needs: package
+    runs-on: ubuntu-26.04
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          pattern: release-preview-public-assets*
+          path: ./attested
+          merge-multiple: false
+      - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: './attested/**/*'
+  install-test:
+    needs: package
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.capture_mode != 'p0'
+        with:
+          name: release-preview-public-assets
+          path: ./install-test
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        if: inputs.capture_mode == 'p0'
+        with:
+          name: release-preview-public-assets-p0
+          path: ./install-test
+      - name: Install and smoke-test the DEB package
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd install-test
+          sha256sum --check SHA256SUMS
+          sudo apt-get install -y ./p11scope_*.deb
+          p11scope --version
+          set +e
+          sudo p11scope doctor >doctor.txt 2>&1
+          code=$?
+          set -e
+          cat doctor.txt
+          test "$code" -eq 0 -o "$code" -eq 1
+          grep -q '^Doctor:' doctor.txt
+          p11scope-discover --version
+          sudo apt-get remove -y p11scope
+          test ! -e /usr/bin/p11scope
+          test ! -e /usr/bin/p11scope-discover
+      - name: Install and smoke-test the RPM package in Fedora
+        shell: bash
+        run: |
+          set -euo pipefail
+          docker run --rm -v "$PWD/install-test:/work:ro" fedora:44 bash -c '
+            set -euo pipefail
+            cd /work
+            sha256sum --check SHA256SUMS
+            dnf install -y ./p11scope-*.rpm
+            p11scope --version
+            set +e
+            p11scope doctor >/tmp/doctor.txt 2>&1
+            code=$?
+            set -e
+            cat /tmp/doctor.txt
+            test "$code" -eq 0 -o "$code" -eq 1
+            grep -q "^Doctor:" /tmp/doctor.txt
+            p11scope-discover --version
+            dnf remove -y p11scope
+            test ! -e /usr/bin/p11scope
+            test ! -e /usr/bin/p11scope-discover
+          '

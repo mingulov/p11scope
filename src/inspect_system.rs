@@ -26,7 +26,6 @@
 use crate::attach::Scope;
 use crate::attach::monotonic_ns;
 use crate::discovery::caller_registry::{ExeIdentity, read_exe_identity};
-use crate::discovery::confirm_shards::attribute_unselected_with_policy;
 use crate::discovery::engine::{
     MAX_SCAN_PIDS, capture_manifest_object_key, parse_manifest_text, retarget_to_pins, scope_pids,
     select_excluding_kernel_threads, sweep_process_maps, unreadable_member_skip,
@@ -76,6 +75,9 @@ const DOC_ID: &str = "p11scope/inspect-system/v1";
 /// so plainly instead of reading as a capture promise.
 pub(crate) const SCAN_ONLY_NOTE: &str =
     "scan-only admission: manifest corroboration was not consulted";
+/// The same disclaimer in TEXT words: names below come from the files
+/// themselves. JSON keeps [`SCAN_ONLY_NOTE`] verbatim.
+const TEXT_SCAN_ONLY_NOTE: &str = "scan only: names below come from the files themselves";
 pub(crate) const COUNT_MANIFEST_NOTE: &str =
     "count admission includes explicit manifest targets validated against the mapped provider";
 
@@ -114,6 +116,8 @@ fn run_with_writer(
         hooks,
         max_scan_pids,
         AdmissionPolicy::detailed(),
+        // Single pass: no earlier scans, pure rarity selection.
+        &BTreeSet::new(),
     )?;
     if stage_timings_requested() {
         eprintln!(
@@ -131,10 +135,10 @@ fn run_with_writer(
 }
 
 /// The scan stages' progress lines on stderr ("enumerating…",
-/// "deep-scanning…"): on by default. The interactive inventory dashboard
-/// turns them off while it owns the terminal (C5.3): its own pass lines
-/// say the same, and one line per scanned process would flood its bounded
-/// log tail.
+/// "deep-scanning…"): verbose-only, so default and `--quiet` runs stay
+/// silent. The interactive inventory dashboard turns them off while it
+/// owns the terminal (C5.3): its own pass lines say the same, and one
+/// line per scanned process would flood its bounded log tail.
 static PROGRESS_LINES: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Turns the scan progress lines on or off; returns the previous setting.
@@ -146,7 +150,9 @@ pub(crate) fn set_progress_lines(on: bool) -> bool {
 /// argument evaluation stay inside the enabled branch (see [`set_progress_lines`]).
 macro_rules! progress {
     ($($arg:tt)*) => {
-        if PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst) {
+        if $crate::cli::text_is_verbose()
+            && PROGRESS_LINES.load(std::sync::atomic::Ordering::SeqCst)
+        {
             let line = format!($($arg)*);
             let _ = crate::sink::try_stderr_line(&crate::render::escape_controls(&line));
         }
@@ -368,8 +374,19 @@ fn collect_members(
     max_scan_pids: Option<usize>,
     timings: &mut StageTimings,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Collection {
-    collect_members_identity(hints, hooks, max_scan_pids, timings, false, budget, false).0
+    collect_members_identity(
+        hints,
+        hooks,
+        max_scan_pids,
+        timings,
+        false,
+        budget,
+        false,
+        scanned,
+    )
+    .0
 }
 
 /// Explicit userspace never attempts the kernel pass (`decide_pass_attempt`
@@ -404,6 +421,7 @@ pub(crate) fn build_identity_custody(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_members_identity(
     hints: &[PathBuf],
     hooks: &HookRegistry,
@@ -412,6 +430,7 @@ fn collect_members_identity(
     identity: bool,
     mut budget: CaptureWorkBudget,
     take_anchors: bool,
+    scanned: &BTreeSet<u32>,
 ) -> (Collection, Option<ExaminedCustody>) {
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
@@ -426,9 +445,12 @@ fn collect_members_identity(
 
     // Phase 1+2, exactly like capture discovery: the sweep and the
     // rarity selection run only over the cap; under it selection is the
-    // identity (ascending pids). Past the cap the sweep is kept: C1b
-    // attributes the unselected pids from it after the deep scans, and
-    // the capped-or-complete record is decided then, from its counts.
+    // identity (ascending pids). A non-empty scanned set tiers the
+    // selection (never-scanned groups first) so multi-pass scans cannot
+    // starve a newcomer; single passes pass an empty set. Past the cap
+    // the sweep is kept: C1b attributes the unselected pids from it
+    // after the deep scans, and the capped-or-complete record is decided
+    // then, from its counts.
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
     let selected: Vec<u32> = if pids.len() > cap {
@@ -452,6 +474,7 @@ fn collect_members_identity(
             Path::new("/proc"),
             cap,
             &mut budget,
+            scanned,
         );
         timings.span(StageKind::Scan, "select", select_start, monotonic_ns());
         sweep = swept;
@@ -882,9 +905,20 @@ pub(crate) enum AdmissionRecord {
         class: &'static str,
         endpoints: usize,
     },
+    /// A prefix-admitted (or growth-kept) object: some endpoints
+    /// attached, the rest disclosed in the gap reason with counts.
+    /// Partially covered, never refused.
+    Partial {
+        class: &'static str,
+        endpoints: usize,
+        reason: String,
+    },
     Refused {
         class: &'static str,
         reason: String,
+        /// The merge-time refusal kind. Display branches on this, never on
+        /// the reason wording; JSON still carries only the reason.
+        kind: crate::plan::RefusalKind,
     },
     Unresolved {
         reasons: Vec<String>,
@@ -895,6 +929,7 @@ impl AdmissionRecord {
     pub(crate) const fn state(&self) -> &'static str {
         match self {
             Self::Admitted { .. } => "admitted",
+            Self::Partial { .. } => "partial",
             Self::Refused { .. } => "refused",
             Self::Unresolved { .. } => "unresolved",
         }
@@ -902,7 +937,9 @@ impl AdmissionRecord {
 
     pub(crate) fn class(&self) -> Option<&'static str> {
         match self {
-            Self::Admitted { class, .. } | Self::Refused { class, .. } => Some(class),
+            Self::Admitted { class, .. }
+            | Self::Partial { class, .. }
+            | Self::Refused { class, .. } => Some(class),
             Self::Unresolved { .. } => None,
         }
     }
@@ -910,7 +947,9 @@ impl AdmissionRecord {
     pub(crate) fn reasons(&self) -> Vec<String> {
         match self {
             Self::Admitted { .. } => Vec::new(),
-            Self::Refused { reason, .. } => vec![reason.clone()],
+            Self::Partial { reason, .. } | Self::Refused { reason, .. } => {
+                vec![reason.clone()]
+            }
             Self::Unresolved { reasons } => reasons.clone(),
         }
     }
@@ -1031,6 +1070,7 @@ pub(crate) struct AdmissionSummary {
     pub uncorroborated_candidates: u64,
     pub module_ambiguous: usize,
     pub admitted: usize,
+    pub partial: usize,
     pub refused: usize,
     pub unresolved: usize,
 }
@@ -1084,10 +1124,14 @@ pub(crate) struct Catalog {
 /// The one scan-only lowering behind a catalog's admission verdicts: the
 /// aggregate pins every reconciled module was bound against and the plan
 /// built over them under the caller's policy. Plan object IDs index these
-/// pins and nothing else.
+/// pins and nothing else. `modules` retains the reconciled scan
+/// modules the plan was built from (DEMO-4): the coordinator stashes
+/// them at absorb time so the no-manifest scan seal can mint over
+/// current scanned tables instead of a creation-time snapshot.
 pub(crate) struct CatalogLowering {
     pub plan: plan::AttachPlan,
     pub pins: PinnedObjects,
+    pub modules: Vec<ReconciledModule>,
 }
 
 /// Collect the machine, lower scan-only admission under `policy`, assemble
@@ -1100,10 +1144,11 @@ pub(crate) fn collect(
     hooks: &HookRegistry,
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
+    scanned: &BTreeSet<u32>,
 ) -> Result<Catalog> {
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
-    collect_with_budget(hints, hooks, max_scan_pids, policy, budget)
+    collect_with_budget(hints, hooks, max_scan_pids, policy, budget, scanned)
 }
 
 pub(crate) fn collect_with_budget(
@@ -1112,13 +1157,28 @@ pub(crate) fn collect_with_budget(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Result<Catalog> {
-    collect_with_count_manifests(hints, hooks, max_scan_pids, policy, budget, &[], 0, 0)
+    collect_with_count_manifests(
+        hints,
+        hooks,
+        max_scan_pids,
+        policy,
+        budget,
+        scanned,
+        &[],
+        0,
+        0,
+    )
 }
 
 /// System collection with explicit count manifests. `prior_objects` /
 /// `prior_bytes` are already-retained capture-level pins, charged against
 /// the shared manifest+pre-arm budget (packet 6.13 round-3, finding 3).
+/// `scanned` holds pids deep-scanned by earlier passes; a non-empty set
+/// tiers selection (never-scanned groups first) so multi-pass scans cannot
+/// starve a newcomer, while single passes pass an empty set for pure
+/// rarity selection.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn collect_with_count_manifests(
     hints: &[PathBuf],
@@ -1126,6 +1186,7 @@ pub(crate) fn collect_with_count_manifests(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1137,6 +1198,7 @@ pub(crate) fn collect_with_count_manifests(
         policy,
         false,
         budget,
+        scanned,
         manifests,
         prior_objects,
         prior_bytes,
@@ -1165,6 +1227,7 @@ pub(crate) fn collect_inventory_identity(
         policy,
         true,
         CaptureWorkBudget::default(),
+        &BTreeSet::new(),
         &[],
         0,
         0,
@@ -1180,6 +1243,7 @@ fn collect_identity(
     policy: AdmissionPolicy,
     identity: bool,
     budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -1194,10 +1258,11 @@ fn collect_identity(
             true,
             budget,
             true,
+            scanned,
         )
     } else {
         (
-            collect_members(hints, hooks, max_scan_pids, &mut timings, budget),
+            collect_members(hints, hooks, max_scan_pids, &mut timings, budget, scanned),
             None,
         )
     };
@@ -1245,12 +1310,20 @@ fn collect_identity(
         (policy, ReservationOwner::new(policy))
     };
     let attribute = |pools: ProofPools<'_>| {
+        // Single-shot sweeps run no kernel run at all: refused overlay
+        // keys prove through the private witness session under the
+        // no-route budget (the first-pass window covers them all).
+        // Without overlay keys the hook answers plain userspace and no
+        // query runs, exactly like the policy path before.
+        let mut witness = crate::discovery::overlay_witness::KernelSweepWitness::with_budget(
+            crate::discovery::overlay_witness::OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE,
+        );
         attribute_sweep_with(
             &mut collection,
             &bound,
             &bound.aggregate,
             |sweep, unavailable, selected, index, budget| {
-                attribute_unselected_with_policy(
+                crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
                     sweep,
                     unavailable,
                     selected,
@@ -1260,7 +1333,12 @@ fn collect_identity(
                     &reservations,
                     shards,
                     &|| OsConfirmIo::with_pools(pools),
+                    &bound.aggregate,
+                    &mut witness,
+                    0,
+                    0,
                 )
+                .0
             },
         )
     };
@@ -2023,7 +2101,10 @@ fn assemble(
         policy,
         admission_scope,
     );
-    let refused: BTreeMap<PinnedObjectId, &Skipped> = plan.refused_modules().collect();
+    let refused: BTreeMap<PinnedObjectId, (&Skipped, crate::plan::RefusalKind)> = plan
+        .refused_modules_typed()
+        .map(|(object, skipped, kind)| (object, (skipped, kind)))
+        .collect();
     let admitted: BTreeMap<PinnedObjectId, usize> = plan
         .modules
         .iter()
@@ -2100,10 +2181,25 @@ fn assemble(
             }
             continue;
         };
+        // A prefix-admitted (or growth-kept) object has both slots
+        // in the plan and a gap record: it files as partial with its
+        // attached count, never as refused. A partial-kind gap with no
+        // plan slots is a shape the merge never emits; it stays a
+        // whole refusal rather than inventing coverage.
         let admission = match (refused.get(&object), admitted.get(&object)) {
-            (Some(skip), _) => AdmissionRecord::Refused {
+            (Some((skip, _)), Some(endpoints))
+                if crate::plan::is_partial_coverage(&skip.reason) =>
+            {
+                AdmissionRecord::Partial {
+                    class,
+                    endpoints: *endpoints,
+                    reason: skip.reason.clone(),
+                }
+            }
+            (Some((skip, kind)), _) => AdmissionRecord::Refused {
                 class,
                 reason: skip.reason.clone(),
+                kind: *kind,
             },
             (None, Some(endpoints)) => AdmissionRecord::Admitted {
                 class,
@@ -2386,6 +2482,10 @@ fn assemble(
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Admitted { .. }))
             .count(),
+        partial: objects
+            .iter()
+            .filter(|object| matches!(object.admission, AdmissionRecord::Partial { .. }))
+            .count(),
         refused: objects
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Refused { .. }))
@@ -2414,6 +2514,7 @@ fn assemble(
         lowering: Some(CatalogLowering {
             plan,
             pins: aggregate,
+            modules: inputs,
         }),
         scan_status: if complete { "complete" } else { "partial" },
         enumerated: collection.enumerated.len(),
@@ -2768,6 +2869,7 @@ fn render_json(catalog: &Catalog) -> serde_json::Value {
             "uncorroborated_candidates": catalog.admission.uncorroborated_candidates,
             "module_ambiguous": catalog.admission.module_ambiguous,
             "admitted": catalog.admission.admitted,
+            "partial": catalog.admission.partial,
             "refused": catalog.admission.refused,
             "unresolved": catalog.admission.unresolved,
         },
@@ -2850,7 +2952,18 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
             "scan_only": true,
             "note": SCAN_ONLY_NOTE,
         }),
-        AdmissionRecord::Refused { class, reason } => serde_json::json!({
+        AdmissionRecord::Partial {
+            class,
+            endpoints,
+            reason,
+        } => serde_json::json!({
+            "class": class,
+            "endpoints": endpoints,
+            "reason": reason,
+            "scan_only": true,
+            "note": SCAN_ONLY_NOTE,
+        }),
+        AdmissionRecord::Refused { class, reason, .. } => serde_json::json!({
             "class": class,
             "reason": reason,
             "scan_only": true,
@@ -2887,38 +3000,85 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
 /// Renders the catalog as human-readable text: the same facts as the JSON
 /// (identities, states, totals, gaps) in pid-inspect's layout. Plain
 /// stdout; pager design is not this command's job.
+/// Renders at the run-scoped verbosity; see [`render_text_with_verbosity`].
 fn render_text(catalog: &Catalog) -> String {
+    render_text_with_verbosity(catalog, crate::cli::text_verbosity())
+}
+
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the header, one short block per provider,
+/// folded skips, coverage and the `-v` hint; verbose is the full
+/// per-table listing; quiet keeps the header and coverage only.
+fn render_text_with_verbosity(catalog: &Catalog, verbosity: crate::cli::TextVerbosity) -> String {
+    use crate::cli::TextVerbosity;
+    let verbose = verbosity == TextVerbosity::Verbose;
     let mut out = String::new();
-    let word = if catalog.objects.len() == 1 {
-        "object"
+    let files = if catalog.objects.len() == 1 {
+        "provider file"
     } else {
-        "objects"
+        "provider files"
+    };
+    // The scan split in words, counted from the same process table the
+    // `processes:` line below summarizes — so "checked in detail" is one
+    // count in both places. Memory-unreadable members are named
+    // separately, never folded into the deep-scanned total.
+    let checked = catalog
+        .processes
+        .iter()
+        .filter(|process| matches!(process.status, MemberStatus::Scanned))
+        .count();
+    let matched = catalog
+        .processes
+        .iter()
+        .filter(|process| matches!(process.status, MemberStatus::MapsMatched))
+        .count();
+    let mem_unreadable = catalog
+        .processes
+        .iter()
+        .filter(|process| matches!(process.status, MemberStatus::MemoryUnavailable { .. }))
+        .count();
+    let found = catalog.processes.len();
+    let detail = if matched == 0 && mem_unreadable == 0 && checked == found {
+        format!("all {found} checked in detail")
+    } else if mem_unreadable == 0 {
+        format!("{checked} checked in detail, {matched} matched from maps, of {found} found")
+    } else {
+        format!(
+            "{checked} checked in detail, {matched} matched from maps, {mem_unreadable} memory \
+             unreadable, of {found} found"
+        )
     };
     let _ = writeln!(
         out,
-        "system — {} PKCS#11 {word} in {} processes ({} deep-scanned and {} maps-matched of {} \
-         enumerated, cap {}; scan {}ms, {})",
+        "system — {} {files} mapped in {} processes ({detail}; cap {}; deep scans {} ms; {})",
         catalog.objects.len(),
         catalog.processes.len(),
-        catalog.scanned,
-        catalog.maps_matched,
-        catalog.enumerated,
         catalog.cap,
         catalog.scan_ms,
         catalog.scan_status,
     );
-    out.push_str("Mapped objects are scan evidence; activity was not captured by inspect.\n");
+    out.push_str(
+        "Mapped provider files are scan evidence; activity was not captured by inspect.\n",
+    );
     out.push('\n');
+    if verbosity == TextVerbosity::Quiet {
+        render_excluded(&mut out, catalog);
+        if let Some(explanation) = &catalog.explanation {
+            let _ = writeln!(out, "{explanation}");
+        }
+        render_coverage(&mut out, catalog);
+        return out;
+    }
     let processes: BTreeMap<u32, &ProcessRecord> = catalog
         .processes
         .iter()
         .map(|process| (process.pid, process))
         .collect();
     for (index, object) in catalog.objects.iter().enumerate() {
-        render_object(&mut out, index, object, &processes);
+        render_object(&mut out, index, object, &processes, verbosity);
         out.push('\n');
     }
-    if !catalog.relationships.is_empty() {
+    if verbose && !catalog.relationships.is_empty() {
         out.push_str("relationships:\n");
         for relationship in &catalog.relationships {
             match relationship {
@@ -2967,14 +3127,50 @@ fn render_text(catalog: &Catalog) -> String {
         }
         out.push('\n');
     }
-    render_process_summary(&mut out, catalog);
-    render_skipped(&mut out, &catalog.skipped);
-    render_gaps(&mut out, "notes", &catalog.notes);
+    render_process_summary(&mut out, catalog, verbosity);
+    render_gaps(&mut out, "skipped", &catalog.skipped, verbose);
+    render_gaps(&mut out, "notes", &catalog.notes, verbose);
     render_excluded(&mut out, catalog);
     if let Some(explanation) = &catalog.explanation {
         let _ = writeln!(out, "{explanation}");
     }
+    render_coverage(&mut out, catalog);
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
+    }
     out
+}
+
+/// One coverage status line: complete only when collection finished
+/// and nothing was skipped.
+fn render_coverage(out: &mut String, catalog: &Catalog) {
+    let mut parts: Vec<String> = Vec::new();
+    if !catalog.skipped.is_empty() {
+        parts.push(format!(
+            "{} item{} skipped",
+            catalog.skipped.len(),
+            if catalog.skipped.len() == 1 { "" } else { "s" }
+        ));
+    }
+    if catalog.scan_status != "complete" {
+        parts.push("scan incomplete".to_string());
+    }
+    if parts.is_empty() {
+        let _ = writeln!(out, "coverage: complete");
+    } else {
+        let _ = writeln!(
+            out,
+            "coverage: partial — {} (--json has every item)",
+            parts.join("; ")
+        );
+    }
+}
+
+/// Whether a planner refusal is a probe-budget refusal: the module needs
+/// more attach slots than remain. Concise folds these to one plain line;
+/// verbose and JSON keep the full demand.
+fn is_capacity_refusal(reason: &str) -> bool {
+    reason.contains("attach slots are available")
 }
 
 fn render_object(
@@ -2982,21 +3178,35 @@ fn render_object(
     index: usize,
     object: &CatalogObject,
     processes: &BTreeMap<u32, &ProcessRecord>,
+    verbosity: crate::cli::TextVerbosity,
 ) {
-    let _ = writeln!(
-        out,
-        "object[{index}]  {}",
-        crate::render::escape_controls(&object.path)
-    );
-    let _ = writeln!(
-        out,
-        "  identity   sha256 {}  build-id {}  dev {}:{}  ino {}",
-        object.sha256.as_deref().unwrap_or("-"),
-        object.build_id.as_deref().unwrap_or("-"),
-        object.key.device.major,
-        object.key.device.minor,
-        object.key.inode,
-    );
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
+    // Concise names the provider file like pid-inspect; the `object[N]`
+    // index stays verbose-only for cross-references.
+    if verbose {
+        let _ = writeln!(
+            out,
+            "object[{index}]  {}",
+            crate::render::escape_controls(&object.path)
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "module  {}",
+            crate::render::escape_controls(&object.path)
+        );
+    }
+    if verbose {
+        let _ = writeln!(
+            out,
+            "  identity   sha256 {}  build-id {}  dev {}:{}  ino {}",
+            object.sha256.as_deref().unwrap_or("-"),
+            object.build_id.as_deref().unwrap_or("-"),
+            object.key.device.major,
+            object.key.device.minor,
+            object.key.inode,
+        );
+    }
     let mappings: Vec<String> = object
         .mappings
         .iter()
@@ -3007,24 +3217,89 @@ fn render_object(
                 .map_or(&unknown, |process| &process.application);
             let label = application_label(application, *pid);
             match view {
-                Some(view) => format!("{label} (view {})", view.0),
+                Some(view) if verbose => format!("{label} (view {})", view.0),
+                // Concise names the process; the internal view id stays
+                // verbose-only (JSON keeps every process).
+                Some(_) => label,
                 None => format!("{label} (maps match)"),
             }
         })
         .collect();
-    let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
+    if verbose || mappings.len() <= 3 {
+        let _ = writeln!(out, "  mapped by  {}", mappings.join(", "));
+    } else {
+        let _ = writeln!(
+            out,
+            "  mapped by  {}, and {} more (--json lists every process)",
+            mappings[..3].join(", "),
+            mappings.len() - 3,
+        );
+    }
     match &object.admission {
         AdmissionRecord::Admitted { class, endpoints } => {
-            let _ = writeln!(
-                out,
-                "  admission  admitted ({class}, {endpoints} endpoints; {SCAN_ONLY_NOTE})"
-            );
+            // Inspect watches nothing: say what a capture aimed at this
+            // file would watch. Concise has no per-table listing below,
+            // so the scan-only note stays verbose-only. A zero-endpoint
+            // record qualifies rather than predicts: an unscanned
+            // module deep-scans on capture (admitting its real
+            // functions), while a genuinely empty table admits nothing,
+            // and this renderer cannot tell them apart.
+            if *endpoints == 0 {
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  0 functions admitted from this scan (class {class}; \
+                         {TEXT_SCAN_ONLY_NOTE})"
+                    );
+                } else {
+                    let _ = writeln!(out, "  admission  0 functions admitted from this scan");
+                }
+            } else {
+                let noun = if *endpoints == 1 {
+                    "function"
+                } else {
+                    "functions"
+                };
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  profile/run would watch {endpoints} {noun} (class {class}; \
+                         {TEXT_SCAN_ONLY_NOTE})"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  admission  profile/run would watch {endpoints} {noun}"
+                    );
+                }
+            }
         }
-        AdmissionRecord::Refused { class, reason } => {
-            if crate::plan::is_closure_awaiting_publication(reason) {
+        AdmissionRecord::Partial { class, reason, .. } => {
+            // The reason already carries the attached-vs-needed
+            // counts; the line mirrors the refused shape.
+            if verbose {
+                let _ = writeln!(
+                    out,
+                    "  admission  partial ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "  admission  partial: {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            }
+        }
+        AdmissionRecord::Refused {
+            class,
+            reason,
+            kind,
+        } => {
+            if *kind == crate::plan::RefusalKind::AwaitingPublication {
                 // By-design refusal: the proxy alone admits nothing until
-                // its providers publish. One plain line; JSON keeps the
-                // full planner reason.
+                // its providers publish. One plain line; verbose pairs
+                // the machine class, JSON keeps the full planner reason.
                 let proxy = if std::path::Path::new(&object.path)
                     .file_name()
                     .is_some_and(|name| name.to_string_lossy().contains("p11-kit"))
@@ -3033,15 +3308,37 @@ fn render_object(
                 } else {
                     "proxy closure array"
                 };
+                if verbose {
+                    let _ = writeln!(
+                        out,
+                        "  admission  refused ({class}): {proxy} not attached by design; the providers \
+                         it forwards to attach when they load (--json shows the full reason)"
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "  admission  refused (proxy): {proxy} not attached by design; the providers \
+                         it forwards to attach when they load"
+                    );
+                }
+            } else if verbose {
                 let _ = writeln!(
                     out,
-                    "  admission  refused ({class}): {proxy} not attached by design; the providers \
-                     it forwards to attach when they load (--json shows the full reason)"
+                    "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    crate::render::escape_controls(reason),
+                );
+            } else if is_capacity_refusal(reason) {
+                // A budget refusal names its demand in full under -v and
+                // JSON; concise keeps the plain budget line with the fix.
+                let _ = writeln!(
+                    out,
+                    "  admission  refused: too many functions for the remaining probe \
+                     budget; name it with --module to capture it alone"
                 );
             } else {
                 let _ = writeln!(
                     out,
-                    "  admission  refused ({class}): {} [{SCAN_ONLY_NOTE}]",
+                    "  admission  refused: {} [{SCAN_ONLY_NOTE}]",
                     crate::render::escape_controls(reason),
                 );
             }
@@ -3050,11 +3347,16 @@ fn render_object(
             for reason in reasons {
                 let _ = writeln!(
                     out,
-                    "  admission  unresolved: {}",
+                    "  admission  undecided: {}",
                     crate::render::escape_controls(reason),
                 );
             }
         }
+    }
+    if !verbose {
+        // Concise stops here: identity, per-process observations and
+        // interfaces are verbose-only.
+        return;
     }
     for observation in &object.observations {
         if observation.evidence == ObservationEvidence::MapsMatch {
@@ -3078,7 +3380,6 @@ fn render_object(
         );
         let table_lines = observation.tables.iter().map(|table| {
             let count = table.entries.len();
-            let entry_word = if count == 1 { "entry" } else { "entries" };
             let nulls = if table.null_entries.is_empty() {
                 String::new()
             } else {
@@ -3090,8 +3391,10 @@ fn render_object(
                 format!("  (unpinned: {})", table.unpinned.len())
             };
             format!(
-                "    table      {}.{}  {}  {count} {entry_word}{nulls}{unpinned}",
-                table.version.0, table.version.1, table.walk
+                "    table      {}.{}, {}{nulls}{unpinned}",
+                table.version.0,
+                table.version.1,
+                crate::inspect::table_walk_words(table.walk, count)
             )
         });
         crate::inspect::push_collapsed_lines(out, table_lines);
@@ -3120,14 +3423,40 @@ fn render_object(
     }
 }
 
-fn render_process_summary(out: &mut String, catalog: &Catalog) {
+/// One member status in plain words (text only; JSON keeps the
+/// label). Unknown labels pass through verbatim.
+fn member_status_words(status: &str) -> &str {
+    match status {
+        "scanned" => "checked in detail",
+        "maps_matched" => "matched from maps",
+        "exited" => "exited",
+        "memory_unavailable" => "memory unreadable",
+        "unreadable" => "unreadable",
+        "not_selected" => "past the scan cap",
+        other => other,
+    }
+}
+
+fn render_process_summary(
+    out: &mut String,
+    catalog: &Catalog,
+    verbosity: crate::cli::TextVerbosity,
+) {
+    let verbose = verbosity == crate::cli::TextVerbosity::Verbose;
     let mut counts: BTreeMap<&'static str, usize> = BTreeMap::new();
     for process in &catalog.processes {
         *counts.entry(process.status.label()).or_default() += 1;
     }
     let parts: Vec<String> = counts
         .iter()
-        .map(|(status, count)| format!("{count} {status}"))
+        .map(|(status, count)| {
+            let plain = member_status_words(status);
+            if verbose && plain != *status {
+                format!("{count} {plain} ({status})")
+            } else {
+                format!("{count} {plain}")
+            }
+        })
         .collect();
     let _ = writeln!(out, "processes: {}", parts.join(", "));
     let mut unlisted = 0usize;
@@ -3144,9 +3473,11 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         // Kernel threads and other processes with nothing to report are
         // counted below; listing each would bury the few that matter. A
         // process with an object, a reason or its own gap record
-        // (skipped or note) is always listed, so the folded line may
-        // only claim no object was found or attributed, never that a
-        // folded process maps none.
+        // (skipped or note) is always listed in verbose text, so the
+        // folded line may only claim no object was found or attributed,
+        // never that a folded process maps none. Concise text folds
+        // every process: the `processes:` line above carries the status
+        // split, mapped-by previews name callers, and --json lists each.
         if process.objects.is_empty()
             && process.status.reason().is_none()
             && !with_gaps.contains(&process.pid)
@@ -3162,6 +3493,10 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
                 MemberStatus::Exited => unlisted_exited += 1,
                 _ => {}
             }
+            continue;
+        }
+        if !verbose {
+            unlisted += 1;
             continue;
         }
         let objects = process
@@ -3189,60 +3524,171 @@ fn render_process_summary(out: &mut String, catalog: &Catalog) {
         }
     }
     if unlisted > 0 {
-        let _ = writeln!(
-            out,
-            "  {unlisted} other {} not listed: no PKCS#11 object found or attributed \
-             ({unlisted_scanned} deep-scanned, {unlisted_past_cap} past the deep-scan cap, \
-             {unlisted_exited} exited); --json lists every process",
-            if unlisted == 1 {
-                "process is"
-            } else {
-                "processes are"
-            },
-        );
+        if verbose {
+            let _ = writeln!(
+                out,
+                "  {unlisted} other {} not listed: no PKCS#11 object found or attributed \
+                 ({unlisted_scanned} checked in detail, {unlisted_past_cap} past the scan cap, \
+                 {unlisted_exited} exited); --json lists every process",
+                if unlisted == 1 {
+                    "process is"
+                } else {
+                    "processes are"
+                },
+            );
+        } else {
+            let _ = writeln!(
+                out,
+                "  {unlisted} {} not listed individually; --json lists every process",
+                if unlisted == 1 {
+                    "process is"
+                } else {
+                    "processes are"
+                },
+            );
+        }
     }
+    render_admission_summary(out, catalog, verbose);
+}
+
+/// The admission totals in the JSON-aligned verdict terms
+/// (admitted/partial/refused/unresolved), the
+/// unconfirmed-function count with its ordinary-scan gloss, and the
+/// scan-only disclaimer. Verbose pairs the machine counters.
+fn render_admission_summary(out: &mut String, catalog: &Catalog, verbose: bool) {
+    let uncorroborated = catalog.admission.uncorroborated_candidates;
+    let ambiguous = catalog.admission.module_ambiguous;
+    let mut parts: Vec<String> = Vec::new();
+    if uncorroborated > 0 || verbose {
+        let mut part =
+            format!("{uncorroborated} possible functions not yet confirmed from a second source");
+        if verbose {
+            part.push_str(" (uncorroborated_candidates)");
+        } else {
+            part.push_str("; this is normal for a scan");
+        }
+        parts.push(part);
+    }
+    if ambiguous > 0 || verbose {
+        let mut part = format!("{ambiguous} functions claimed by two providers");
+        if verbose {
+            part.push_str(" (module_ambiguous)");
+        }
+        parts.push(part);
+    }
+    parts.push(TEXT_SCAN_ONLY_NOTE.to_string());
     let _ = writeln!(
         out,
-        "admission: {} admitted, {} refused, {} unresolved ({} uncorroborated candidates, {} \
-         module-ambiguous; {SCAN_ONLY_NOTE})",
+        "admission: {} admitted, {} partial, {} refused, {} unresolved ({})",
         catalog.admission.admitted,
+        catalog.admission.partial,
         catalog.admission.refused,
         catalog.admission.unresolved,
-        catalog.admission.uncorroborated_candidates,
-        catalog.admission.module_ambiguous,
+        parts.join("; "),
     );
 }
 
-fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap]) {
-    for gap in gaps {
-        match gap.pid {
-            Some(pid) => {
-                let _ = writeln!(
-                    out,
-                    "{title}: pid {pid} {} — {}",
-                    crate::render::escape_controls(&gap.subject),
-                    crate::render::escape_controls(&gap.reason)
-                );
-            }
-            None => {
-                let _ = writeln!(
-                    out,
-                    "{title}: {} — {}",
-                    crate::render::escape_controls(&gap.subject),
-                    crate::render::escape_controls(&gap.reason)
-                );
-            }
-        }
-    }
+/// Whether a skip reason is an unexamined-maps gap (`unexamined_maps_gap`):
+/// per-pid shared-object counts that would split concise groups by number.
+fn is_unexamined_maps_reason(reason: &str) -> bool {
+    reason.starts_with("maps ")
+        && reason.contains("shared object")
+        && reason.contains("no deep scan examined")
 }
 
-/// Skipped records in text: member gaps group by reason — a lone gap keeps
-/// its pid and subject, a repeated reason folds to one counted line — then
-/// scope-level gaps print verbatim (the split already deduped them). JSON
-/// keeps every record; see `render_json`.
-fn render_skipped(out: &mut String, gaps: &[PidGap]) {
-    let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
+/// The per-object cap behind an over-capacity skip, for folding sizes
+/// that would otherwise split concise groups. Handles both producer
+/// formats (`too_large (SIZE bytes; per-object cap is CAP)` from the
+/// scan budget and `object is SIZE bytes; limit is LIMIT` from the view
+/// filesystem). `None` for any other reason or an unparsable cap.
+fn too_large_cap(reason: &str) -> Option<u64> {
+    if let Some(rest) = reason.strip_prefix("too_large (") {
+        let (_, rest) = rest.split_once("per-object cap is ")?;
+        return parse_leading_u64(rest);
+    }
+    if let Some(rest) = reason.strip_prefix("object is ") {
+        let (_, rest) = rest.split_once("; limit is ")?;
+        return parse_leading_u64(rest);
+    }
+    None
+}
+
+/// Leading ASCII digits as u64, for cap parsing with a graceful fallback.
+fn parse_leading_u64(text: &str) -> Option<u64> {
+    let digits: String = text.chars().take_while(|c| c.is_ascii_digit()).collect();
+    if digits.is_empty() {
+        return None;
+    }
+    digits.parse().ok()
+}
+
+/// Skipped records and notes in text. Verbose lists every record —
+/// the full per-gap detail `-v` promises. Concise folds member records
+/// by reason — a lone record keeps its pid and subject, a repeated
+/// reason folds to one counted line — then scope-level records print
+/// verbatim (the split already deduped them). JSON keeps every record;
+/// see `render_json`.
+fn render_gaps(out: &mut String, title: &str, gaps: &[PidGap], verbose: bool) {
+    if verbose {
+        for gap in gaps {
+            match gap.pid {
+                Some(pid) => {
+                    let _ = writeln!(
+                        out,
+                        "{title}: pid {pid} {} — {}",
+                        crate::render::escape_controls(&gap.subject),
+                        crate::render::escape_controls(&gap.reason)
+                    );
+                }
+                None => {
+                    let _ = writeln!(
+                        out,
+                        "{title}: {} — {}",
+                        crate::render::escape_controls(&gap.subject),
+                        crate::render::escape_controls(&gap.reason)
+                    );
+                }
+            }
+        }
+        return;
+    }
+    // Plain folds first: reasons with per-record numbers (unexamined-maps
+    // counts, over-cap sizes) fold by kind with a process/file count,
+    // instead of splitting one group per number.
+    let mut plain_maps: Vec<&PidGap> = Vec::new();
+    let mut plain_large: BTreeMap<u64, Vec<&PidGap>> = BTreeMap::new();
+    let mut rest: Vec<&PidGap> = Vec::new();
     for gap in gaps.iter().filter(|gap| gap.pid.is_some()) {
+        if is_unexamined_maps_reason(&gap.reason) {
+            plain_maps.push(gap);
+        } else if let Some(cap) = too_large_cap(&gap.reason) {
+            plain_large.entry(cap).or_default().push(gap);
+        } else {
+            rest.push(gap);
+        }
+    }
+    if !plain_maps.is_empty() {
+        let processes: BTreeSet<u32> = plain_maps.iter().filter_map(|gap| gap.pid).collect();
+        let count = processes.len();
+        let noun = if count == 1 { "process" } else { "processes" };
+        let verb = if count == 1 { "maps" } else { "map" };
+        let _ = writeln!(
+            out,
+            "{title}: {count} {noun} {verb} libraries that were not deep-scanned (may hide \
+             providers) (--json lists each)",
+        );
+    }
+    for (cap, group) in &plain_large {
+        let mib = cap / (1024 * 1024);
+        let count = group.len();
+        let noun = if count == 1 { "file" } else { "files" };
+        let _ = writeln!(
+            out,
+            "{title}: {count} {noun} over {mib} MiB not read (--json lists each)",
+        );
+    }
+    let mut by_reason: BTreeMap<&str, Vec<&PidGap>> = BTreeMap::new();
+    for gap in rest {
         by_reason.entry(gap.reason.as_str()).or_default().push(gap);
     }
     for (reason, group) in &by_reason {
@@ -3250,7 +3696,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
             let gap = group[0];
             let _ = writeln!(
                 out,
-                "skipped: pid {} {} — {}",
+                "{title}: pid {} {} — {}",
                 gap.pid.expect("member gap carries its pid"),
                 crate::render::escape_controls(&gap.subject),
                 crate::render::escape_controls(&gap.reason),
@@ -3260,7 +3706,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
         let processes: BTreeSet<u32> = group.iter().filter_map(|gap| gap.pid).collect();
         let _ = writeln!(
             out,
-            "skipped ({} gap{} in {} process{}): {} (--json lists each)",
+            "{title} ({} gap{} in {} process{}): {} (--json lists each)",
             group.len(),
             if group.len() == 1 { "" } else { "s" },
             processes.len(),
@@ -3271,7 +3717,7 @@ fn render_skipped(out: &mut String, gaps: &[PidGap]) {
     for gap in gaps.iter().filter(|gap| gap.pid.is_none()) {
         let _ = writeln!(
             out,
-            "skipped: {} — {}",
+            "{title}: {} — {}",
             crate::render::escape_controls(&gap.subject),
             crate::render::escape_controls(&gap.reason)
         );
@@ -3478,7 +3924,7 @@ impl IdentityChecks for LiveIdentityChecks {
 /// refusal (EPERM/EACCES on the BPF syscalls) rather than a verifier or
 /// object failure. Any non-empty verifier log means verifier rejection
 /// (`load_failed`), even when its errno is EACCES.
-fn load_error_is_permission(error: &crate::attach::identity_iter::LoadError) -> bool {
+pub(crate) fn load_error_is_permission(error: &crate::attach::identity_iter::LoadError) -> bool {
     use std::error::Error as _;
     if crate::attach::identity_iter::verifier_log_of(error).is_some_and(|log| !log.is_empty()) {
         return false;
@@ -3523,30 +3969,107 @@ pub(crate) struct ProbeDir {
 }
 
 impl ProbeDir {
-    /// A fresh unpredictable 0700 probe dir under the temp dir, named
-    /// `{prefix}-…`. The prefix is one plain segment: anything that could
-    /// escape the temp dir fails closed instead of joining.
+    /// A fresh unpredictable 0700 probe dir, named `{prefix}-…`, under
+    /// the first exec-capable root: the temp dir, else `/var/tmp`. The
+    /// probe child maps its fixtures `PROT_EXEC`, so a noexec root (a
+    /// kind node mounts /tmp noexec) is unusable; a root that fails to
+    /// create or to exec-map is dropped and the next is tried. The
+    /// prefix is one plain segment: anything that could escape the
+    /// root fails closed instead of joining.
     pub(crate) fn create(prefix: &str) -> Result<Self, IdentityUnavailable> {
         if prefix.is_empty() || prefix.contains('/') || prefix.contains('\0') {
             return Err(IdentityUnavailable::ProbeFailed);
         }
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        // Unpredictable as well as unique: a local squatter cannot
-        // precreate the probe path of a privileged run.
-        let seed = std::collections::hash_map::RandomState::new();
-        let random = {
-            use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
-            let mut hasher = seed.build_hasher();
-            std::process::id().hash(&mut hasher);
-            id.hash(&mut hasher);
-            hasher.finish()
+        let temp = std::env::temp_dir();
+        let fallback = std::path::PathBuf::from("/var/tmp");
+        let mut roots = vec![temp];
+        if roots[0] != fallback {
+            roots.push(fallback);
+        }
+        for root in roots.iter() {
+            let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            // Unpredictable as well as unique: a local squatter cannot
+            // precreate the probe path of a privileged run.
+            let seed = std::collections::hash_map::RandomState::new();
+            let random = {
+                use std::hash::{BuildHasher as _, Hash as _, Hasher as _};
+                let mut hasher = seed.build_hasher();
+                std::process::id().hash(&mut hasher);
+                id.hash(&mut hasher);
+                hasher.finish()
+            };
+            let path = root.join(format!(
+                "{prefix}-{pid}-{id}-{random:016x}",
+                pid = std::process::id()
+            ));
+            let dir = match Self::create_at(&path) {
+                Ok(dir) => dir,
+                Err(_) => continue,
+            };
+            if dir.supports_exec_map() {
+                // CLI-1: informational notes stay silent by default; the
+                // `-v` lane resurfaces this fallback ("probe dir fell back
+                // to {root} ({temp} is not exec-capable)") in verbose
+                // output. A failed fallback still errors below.
+                return Ok(dir);
+            }
+            // Not exec-capable: dropping removes the empty just-created
+            // dir (the check unlinked its test file first), then the
+            // next root is tried.
+        }
+        Err(IdentityUnavailable::ProbeFailed)
+    }
+
+    /// Whether a fresh file in this dir maps `PROT_EXEC` (the probe
+    /// child's fixture shape). False on any failure; the test file is
+    /// unlinked on every path so the dir stays empty for `Drop`.
+    fn supports_exec_map(&self) -> bool {
+        use std::os::fd::{AsRawFd as _, FromRawFd as _};
+        let name = c"probe-exec-check";
+        // SAFETY: `openat` under the held verified directory fd;
+        // `O_EXCL` fails on any pre-existing name instead of opening it.
+        let raw = unsafe {
+            libc::openat(
+                self.dirfd.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                0o600,
+            )
         };
-        let path = std::env::temp_dir().join(format!(
-            "{prefix}-{}-{id}-{random:016x}",
-            std::process::id()
-        ));
-        Self::create_at(&path)
+        if raw < 0 {
+            return false;
+        }
+        // SAFETY: the successful `openat` returned a new owned fd.
+        let file = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        // SAFETY: `ftruncate` on a live fd with a plain length.
+        let mut ok = unsafe { libc::ftruncate(file.as_raw_fd(), 4096) } == 0;
+        if ok {
+            // SAFETY: private executable mapping of the 4096-byte file
+            // just created; unmapped below.
+            let addr = unsafe {
+                libc::mmap(
+                    std::ptr::null_mut(),
+                    4096,
+                    libc::PROT_READ | libc::PROT_EXEC,
+                    libc::MAP_PRIVATE,
+                    file.as_raw_fd(),
+                    0,
+                )
+            };
+            ok = addr != libc::MAP_FAILED;
+            if ok {
+                // SAFETY: the successful `mmap` above returned this range.
+                ok = unsafe { libc::munmap(addr, 4096) } == 0;
+            }
+        }
+        drop(file);
+        // SAFETY: `unlinkat` of the static name on the live held dirfd;
+        // flags 0 never unlinks directories.
+        unsafe {
+            libc::unlinkat(self.dirfd.as_raw_fd(), name.as_ptr(), 0);
+        }
+        ok
     }
 
     pub(crate) fn path(&self) -> &std::path::Path {
@@ -3821,6 +4344,12 @@ impl IdentityRunShared {
         (self.sweep_witness_rotation, self.sweep_witness_denominator)
     }
 
+    /// The witness window for tests (privileged cells assert rotation).
+    #[cfg(test)]
+    pub(crate) fn witness_window_for_test(&self) -> (u64, usize) {
+        self.witness_window()
+    }
+
     /// Advance the witness window by this pass's spent queries, and
     /// record this pass's refused count as the next denominator
     /// (`None` when no witness scan ran, or a zero refused count, keeps
@@ -4043,7 +4572,8 @@ impl<P: crate::discovery::confirm_shards::SegmentProof>
 /// Collect `--system` for inventory with D3d identity selection: custody
 /// plus userspace or kernel sweep proof per the capture-owned shared
 /// state, assembled under the Inventory policy. `inspect --system`
-/// keeps using [`collect`] (userspace-only, frozen output).
+/// keeps using [`collect`] (single-shot sweep overlays prove through
+/// the private witness; frozen output otherwise).
 /// `prior_objects` / `prior_bytes` are already-retained capture-level
 /// pins, charged against the shared manifest+pre-arm budget (packet 6.13
 /// round-3, finding 3).
@@ -4054,7 +4584,8 @@ pub(crate) fn collect_system_with_identity(
     max_scan_pids: Option<usize>,
     policy: AdmissionPolicy,
     shared: IdentityShared,
-    budget: CaptureWorkBudget,
+    mut budget: CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
     manifests: &[PathBuf],
     prior_objects: usize,
     prior_bytes: u64,
@@ -4070,6 +4601,11 @@ pub(crate) fn collect_system_with_identity(
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .selection;
+    // Explicit userspace loads no BPF: the deep-scan witness stays off
+    // for every member scan below.
+    if matches!(selection, crate::cli::IdentityBackendSelection::Userspace) {
+        budget.set_explicit_userspace();
+    }
     let mut timings = StageTimings::new();
     let (mut collection, mut custody) = collect_members_identity(
         hints,
@@ -4079,6 +4615,7 @@ pub(crate) fn collect_system_with_identity(
         true,
         budget,
         identity_takes_anchors(selection),
+        scanned,
     );
     let stats = OutcomeStats {
         enumerated: collection.enumerated.len(),
@@ -4134,11 +4671,52 @@ pub(crate) fn collect_system_with_identity(
     };
     let segment_policy = identity_confirmation_policy(held, census).map_err(anyhow::Error::msg)?;
     let reservations = held.owner.clone();
+    // No-route userspace passes prove their refused overlay keys through
+    // the private witness session under the no-route budget — the only
+    // prover where no kernel run exists — rotating past them exactly
+    // like the kernel-pass window.
+    let witness_userspace = no_route_userspace_witness(explicit_userspace, has_proof, &attempt);
+    let (window_start, window_denominator) = if witness_userspace {
+        let shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.witness_window()
+    } else {
+        (0, 0)
+    };
+    let mut witness_window: (u32, Option<usize>) = (0, None);
     let attributed = with_confirmation_pools(
         shards,
         segment_policy,
         proof_stat_threads(),
         |pools| match attempt {
+            PassAttempt::Userspace if witness_userspace => attribute_sweep_with(
+                &mut collection,
+                &bound,
+                &bound.aggregate,
+                |sweep, unavailable, selected, index, budget| {
+                    let mut witness =
+                        crate::discovery::overlay_witness::KernelSweepWitness::with_budget(
+                            crate::discovery::overlay_witness::OVERLAY_SWEEP_WITNESS_QUERIES_PER_PASS_NO_ROUTE,
+                        );
+                    let (out, refused) =
+                        crate::discovery::confirm_shards::attribute_unselected_capture_excluded_with_witness(
+                            sweep,
+                            unavailable,
+                            selected,
+                            index,
+                            budget,
+                            segment_policy,
+                            &reservations,
+                            shards,
+                            &|| OsConfirmIo::with_pools(pools),
+                            &bound.aggregate,
+                            &mut witness,
+                            window_start,
+                            window_denominator,
+                        );
+                    witness_window = (witness.used(), Some(refused));
+                    out
+                },
+            ),
             PassAttempt::Userspace => attribute_sweep_with(
                 &mut collection,
                 &bound,
@@ -4171,6 +4749,11 @@ pub(crate) fn collect_system_with_identity(
             ),
         },
     );
+    if witness_userspace {
+        let (spent, refused) = witness_window;
+        let mut shared = shared.lock().unwrap_or_else(|poison| poison.into_inner());
+        shared.advance_witness_rotation(spent, refused);
+    }
     timings.span(StageKind::Scan, "confirm", confirm_start, monotonic_ns());
     prepare_count_manifests(
         &mut collection,
@@ -4248,6 +4831,22 @@ fn decide_pass_attempt(shared: &IdentityShared, has_proof: bool) -> PassAttempt 
             PassAttempt::Kernel { threshold }
         }
     }
+}
+
+/// Whether a userspace-mechanics pass proves its refused overlay keys
+/// through the private witness session: the selection allows BPF, the
+/// sweep planned proof, but this pass runs no kernel run (auto fell
+/// back: a nested observer's numbering mismatch, missing BTF). A
+/// userspace attempt under auto with proof demand is exactly that
+/// shape — an eligible auto pass would attempt the kernel run.
+/// Explicit userspace never loads BPF; kernel passes already prove
+/// through their own run; without proof demand nothing loads.
+fn no_route_userspace_witness(
+    explicit_userspace: bool,
+    has_proof: bool,
+    attempt: &PassAttempt,
+) -> bool {
+    has_proof && !explicit_userspace && matches!(attempt, PassAttempt::Userspace)
 }
 
 /// One pass's exclusive session takeout: the capture-owned session plus
@@ -4648,12 +5247,42 @@ where
 mod tests {
     use super::{
         IdentityNumbering, IdentityRunShared, IdentityShared, IdentityUnavailable,
-        LiveIdentityChecks, ProbeDir, ScriptedIdentityChecks, apply_kernel_fallback,
-        decide_pass_attempt, forced_kernel_refusal, preflight_forced_kernel,
-        runtime_fallback_label, take_session_for_pass,
+        LiveIdentityChecks, PassAttempt, ProbeDir, ScriptedIdentityChecks, apply_kernel_fallback,
+        decide_pass_attempt, forced_kernel_refusal, no_route_userspace_witness,
+        preflight_forced_kernel, runtime_fallback_label, take_session_for_pass,
     };
     use crate::cli::IdentityBackendSelection;
     use std::sync::atomic::Ordering;
+
+    #[test]
+    fn no_route_userspace_pass_takes_the_witness() {
+        // RED: a userspace-mechanics pass proves its refused overlay
+        // keys through the private witness exactly when the selection
+        // allows BPF and the sweep planned proof but runs no kernel
+        // run (auto fell back). Explicit userspace never loads BPF;
+        // kernel passes already prove through their own run; without
+        // proof demand nothing loads.
+        assert!(no_route_userspace_witness(
+            false,
+            true,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            true,
+            true,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            false,
+            false,
+            &PassAttempt::Userspace
+        ));
+        assert!(!no_route_userspace_witness(
+            false,
+            true,
+            &PassAttempt::Kernel { threshold: None }
+        ));
+    }
 
     #[test]
     fn aimed_system_capture_lowers_without_shared_reserve() {
@@ -5104,6 +5733,238 @@ mod tests {
         for name in ["probe-a", "probe-b", "probe-a-link", "probe-a-copy"] {
             assert!(!path.join(name).exists(), "drop left fixture {name} behind");
         }
+    }
+
+    /// Whether a fresh file under `dir` maps `PROT_EXEC` (the probe
+    /// child's fixture shape: it maps each fixture `PROT_READ|PROT_EXEC`
+    /// `MAP_PRIVATE`). Test-only; the product carries its own check, so
+    /// this asserts the behavior, not the implementation.
+    fn exec_map_smoke(dir: &std::path::Path) -> bool {
+        use std::os::fd::AsRawFd as _;
+        let path = dir.join(format!("probe-smoke-{}", std::process::id()));
+        let Ok(file) = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        else {
+            return false;
+        };
+        if file.set_len(4096).is_err() {
+            let _ = std::fs::remove_file(&path);
+            return false;
+        }
+        // SAFETY: anonymous-length private executable mapping of a
+        // 4096-byte file we just created; unmapped and unlinked below.
+        let addr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                4096,
+                libc::PROT_READ | libc::PROT_EXEC,
+                libc::MAP_PRIVATE,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        let mapped = addr != libc::MAP_FAILED;
+        if mapped {
+            // SAFETY: the successful `mmap` above returned this range.
+            unsafe {
+                libc::munmap(addr, 4096);
+            }
+        }
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        mapped
+    }
+
+    /// The created probe dir exec-maps: the probe child maps its
+    /// fixtures `PROT_EXEC`, so a noexec dir is unusable. Also the
+    /// inner driver of `probe_dir_falls_back_when_temp_is_noexec`,
+    /// which re-execs this binary to run exactly this cell with
+    /// TMPDIR pointed at a noexec tmpfs. Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: created probe dir exec-maps"]
+    fn probe_dir_created_dir_exec_maps() {
+        let dir = ProbeDir::create("p11scope-identity-probe").expect("probe dir");
+        assert!(
+            exec_map_smoke(dir.path()),
+            "probe dir is not exec-capable: {}",
+            dir.path().display()
+        );
+    }
+
+    /// The probe dir under a noexec temp root (kind nodes mount /tmp
+    /// noexec): creation falls back to an exec-capable root instead of
+    /// handing back a dir the probe cannot use. Forks, mounts a noexec
+    /// tmpfs over a scratch dir in a private mount namespace, re-execs
+    /// this binary to run the exec-map cell with TMPDIR pointed at it,
+    /// and asserts the inner positive ran (exit 0 plus `1 passed`,
+    /// never a zero-match pass). Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: probe dir falls back when temp is noexec"]
+    fn probe_dir_falls_back_when_temp_is_noexec() {
+        use std::ffi::CString;
+        use std::io::Read as _;
+        use std::os::unix::ffi::OsStrExt as _;
+        use std::os::unix::io::FromRawFd as _;
+        let scratch = tempfile::tempdir().expect("noexec mountpoint");
+        let mountpoint =
+            CString::new(scratch.path().as_os_str().as_bytes()).expect("mountpoint has no nul");
+        let exe = std::env::current_exe().expect("own test binary");
+        let args = [
+            CString::new(exe.as_os_str().as_bytes()).expect("exe has no nul"),
+            CString::new("--exact").unwrap(),
+            CString::new("inspect_system::tests::probe_dir_created_dir_exec_maps").unwrap(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--test-threads=1").unwrap(),
+            CString::new("--nocapture").unwrap(),
+        ];
+        let argv: Vec<*const libc::c_char> = args
+            .iter()
+            .map(|arg| arg.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        // The re-exec environment: this process's own with TMPDIR
+        // pointed at the noexec mount. Built pre-fork; the child only
+        // passes the pointers to `execve`.
+        let tmpdir = CString::new(format!("TMPDIR={}", scratch.path().to_string_lossy()))
+            .expect("TMPDIR has no nul");
+        let mut env: Vec<CString> = std::env::vars_os()
+            .filter(|(key, _)| key != "TMPDIR")
+            .map(|(key, value)| {
+                let mut pair = key.into_encoded_bytes();
+                pair.push(b'=');
+                pair.extend_from_slice(&value.into_encoded_bytes());
+                CString::new(pair).expect("env pair has no nul")
+            })
+            .collect();
+        env.push(tmpdir);
+        let envp: Vec<*const libc::c_char> = env
+            .iter()
+            .map(|var| var.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        let mut pipe = [0 as libc::c_int; 2];
+        // SAFETY: out-param pipe pair; the parent closes the write end
+        // after forking and reads the read end to EOF.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe works");
+        // SAFETY: the child only calls async-signal-safe libc, then
+        // re-execs or exits with a distinct status; all CStrings were
+        // built before forking. The parent waits below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for the noexec probe runner");
+        if pid == 0 {
+            noexec_probe_child(&mountpoint, pipe[1], &argv, &envp);
+        }
+        // SAFETY: our own pipe write end; closing first lets EOF arrive
+        // when the re-exec'd child exits.
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0, "close our write end");
+        // SAFETY: our own pipe read end, owned from here to EOF.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read inner output");
+        let mut status: libc::c_int = 0;
+        // SAFETY: waiting for our own forked child.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "reap the noexec probe runner");
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "inner exec-map cell passed under noexec TMPDIR (runner status {status}): {text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed; 0 failed"),
+            "the inner positive ran (not a zero-match pass): {text}"
+        );
+    }
+
+    /// Child side of the noexec probe runner: a private mount namespace
+    /// with a noexec tmpfs over `mountpoint`, then re-exec with the
+    /// prebuilt argv/envp. Async-signal-safe only: no allocation, no
+    /// locks, `_exit` on every path. Call only in the post-fork child.
+    fn noexec_probe_child(
+        mountpoint: &std::ffi::CString,
+        write_fd: libc::c_int,
+        argv: &[*const libc::c_char],
+        envp: &[*const libc::c_char],
+    ) -> ! {
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                libc::_exit(70);
+            }
+            // Private first: without this the tmpfs mount below would
+            // propagate to the host through the shared mount tree.
+            if libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            ) != 0
+            {
+                libc::_exit(70);
+            }
+            if libc::mount(
+                c"tmpfs".as_ptr(),
+                mountpoint.as_ptr(),
+                c"tmpfs".as_ptr(),
+                libc::MS_NOEXEC,
+                std::ptr::null(),
+            ) != 0
+            {
+                libc::_exit(70);
+            }
+            if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0
+                || libc::dup2(write_fd, libc::STDERR_FILENO) < 0
+            {
+                libc::_exit(70);
+            }
+            libc::execve(argv[0], argv.as_ptr(), envp.as_ptr());
+            libc::_exit(70);
+        }
+    }
+
+    /// Inner driver of `probe_dir_fallback_prints_no_notice_by_default`:
+    /// creates one probe dir and proves it usable. Re-exec-only
+    /// meaningful under a TMPDIR that forces the fallback; harmless
+    /// (drop removes the dir) as an ordinary passing cell.
+    #[test]
+    fn probe_dir_create_smoke() {
+        let dir = ProbeDir::create("p11scope-identity-probe").expect("probe dir");
+        assert!(dir.path().is_dir(), "probe dir exists");
+    }
+
+    /// CLI-1 suppresses informational stderr notes by default: a temp
+    /// fallback must not print. Re-execs this binary to run exactly
+    /// the smoke cell with TMPDIR pointed at a missing dir (creation
+    /// there fails, so `/var/tmp` is tried), and asserts the inner
+    /// positive ran (exit 0 plus `1 passed`, never a zero-match pass)
+    /// with no fallback notice on either stream.
+    #[test]
+    fn probe_dir_fallback_prints_no_notice_by_default() {
+        let scratch = tempfile::tempdir().expect("scratch");
+        let missing = scratch.path().join("missing-temp-root");
+        let exe = std::env::current_exe().expect("own test binary");
+        let output = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("inspect_system::tests::probe_dir_create_smoke")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env("TMPDIR", &missing)
+            .output()
+            .expect("re-exec the smoke cell");
+        assert!(output.status.success(), "inner exit: {}", output.status);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stdout.contains("test result: ok. 1 passed; 0 failed"),
+            "inner positive missing: {stdout}"
+        );
+        assert!(
+            !stdout.contains("fell back") && !stderr.contains("fell back"),
+            "fallback notice printed: {stdout}{stderr}"
+        );
     }
 
     /// Fresh probe dirs are unique per call.
@@ -5797,7 +6658,7 @@ mod tests {
             let catalog = catalog_for(member);
             (
                 render_json(&catalog),
-                render_text(&catalog),
+                render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose),
                 before.path.unwrap(),
             )
         }
@@ -5932,7 +6793,7 @@ mod tests {
                 catalog.objects.clear();
                 catalog.processes[0].objects.clear();
                 let json = render_json(&catalog);
-                let text = render_text(&catalog);
+                let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
                 assert_eq!(json["processes"][0]["application_status"], "not_examined");
                 assert!(json["processes"][0]["application"].is_null());
                 assert!(text.contains(&format!("Unknown executable (PID {})", view.pid())));
@@ -6079,7 +6940,7 @@ mod tests {
             catalog.processes[0].application = confirmed("/opt/a/app", 2);
             catalog.processes[1].application = confirmed("/opt/b/app", 3);
             let json = render_json(&catalog);
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert_eq!(json["processes"][0]["application"]["path"], "/opt/a/app");
             assert_eq!(json["processes"][1]["application"]["path"], "/opt/b/app");
             assert_eq!(json["objects"].as_array().unwrap().len(), 2);
@@ -6161,11 +7022,15 @@ mod tests {
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Admitted { .. }))
             .count();
+        let partial = objects
+            .iter()
+            .filter(|object| matches!(object.admission, AdmissionRecord::Partial { .. }))
+            .count();
         let refused = objects
             .iter()
             .filter(|object| matches!(object.admission, AdmissionRecord::Refused { .. }))
             .count();
-        let unresolved = objects.len() - admitted - refused;
+        let unresolved = objects.len() - admitted - partial - refused;
         Catalog {
             lowering: None,
             scan_status: "complete",
@@ -6209,6 +7074,7 @@ mod tests {
                 uncorroborated_candidates: 0,
                 module_ambiguous: 0,
                 admitted,
+                partial,
                 refused,
                 unresolved,
             },
@@ -6581,7 +7447,7 @@ mod tests {
             // the 32-endpoint heuristic module is refused whole.
             let catalog = inventory_catalog(heuristic_provider(1, 32), &[]);
             match catalog_admission(&catalog) {
-                AdmissionRecord::Refused { class, reason } => {
+                AdmissionRecord::Refused { class, reason, .. } => {
                     assert_eq!(*class, "heuristic");
                     assert!(reason.contains("reserved"), "{reason}");
                 }
@@ -6613,8 +7479,8 @@ mod tests {
             // and discloses the spilled table. JK-22a: the unaimed capture
             // admits the reserve-capped 300-endpoint prefix with a named
             // provider-prefix gap instead of refusing the module whole; the
-            // catalog still files a gapped module under `refused`, carrying
-            // the prefix reason.
+            // catalog files that gapped prefix as partial with its
+            // attached count, carrying the prefix reason.
             let aimed = scoped_catalog(
                 heuristic_provider(4, 150),
                 AdmissionPolicy::detailed(),
@@ -6634,8 +7500,13 @@ mod tests {
             let unaimed =
                 scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
             match catalog_admission(&unaimed) {
-                AdmissionRecord::Refused { class, reason } => {
+                AdmissionRecord::Partial {
+                    class,
+                    endpoints,
+                    reason,
+                } => {
                     assert_eq!(*class, "heuristic");
+                    assert_eq!(*endpoints, 300);
                     assert!(reason.contains("reserved"), "{reason}");
                     assert!(
                         reason.contains("300 of 600 endpoints attached")
@@ -6645,6 +7516,50 @@ mod tests {
                 }
                 other => panic!("the unaimed inspect must file the gapped prefix, got {other:?}"),
             }
+        }
+
+        #[test]
+        fn prefix_admitted_provider_reports_partial_state_with_counts() {
+            // A prefix-admitted object is partially covered, never
+            // refused: JSON and text must agree on the partial state
+            // and carry the attached-vs-needed counts.
+            let unaimed =
+                scoped_catalog(heuristic_provider(4, 150), AdmissionPolicy::detailed(), &[]);
+            let json = render_json(&unaimed);
+            let admission = json["objects"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|object| object["path"] == PATH)
+                .unwrap()["admission"]
+                .clone();
+            assert_eq!(admission["state"], "partial");
+            assert_eq!(admission["class"], "heuristic");
+            assert_eq!(admission["endpoints"], 300);
+            let reason = admission["reason"].as_str().unwrap();
+            assert!(
+                reason.contains("300 of 600 endpoints attached")
+                    && reason.contains("(provider_prefix)"),
+                "the partial record keeps the prefix counts: {reason}"
+            );
+            let text = render_text(&unaimed);
+            let line = text
+                .lines()
+                .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))
+                .expect("the text catalog names the prefix gap");
+            assert!(
+                line.contains("partial:"),
+                "the text verdict must read partial, got: {line}"
+            );
+            let verbose = render_text_with_verbosity(&unaimed, crate::cli::TextVerbosity::Verbose);
+            let vline = verbose
+                .lines()
+                .find(|line| line.contains("admission") && line.contains("(provider_prefix)"))
+                .expect("verbose names the prefix gap");
+            assert!(
+                vline.contains("partial (heuristic)"),
+                "verbose pairs the machine class, got: {vline}"
+            );
         }
 
         fn capped_gaps(catalog: &Catalog) -> Vec<&PidGap> {
@@ -7071,12 +7986,15 @@ mod tests {
                 .unwrap()
                 .clone();
             assert_eq!(mapping["view"], serde_json::Value::Null);
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
-                text.contains("2 deep-scanned and 299 maps-matched of 448"),
+                text.contains("2 checked in detail, 299 matched from maps, of 448 found"),
                 "{text}"
             );
-            assert!(text.contains("299 maps_matched"), "{text}");
+            assert!(
+                text.contains("299 matched from maps (maps_matched)"),
+                "{text}"
+            );
         }
 
         #[test]
@@ -7160,7 +8078,7 @@ mod tests {
                 .find(|process| process.pid == 20_005)
                 .unwrap();
             assert_eq!(process.status, MemberStatus::NotSelected { loss: None });
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
                 text.contains("(PID 20005) — not_selected"),
                 "unexamined unmatched pid must stay listed: {text}"
@@ -7198,7 +8116,7 @@ mod tests {
                 gap.reason.contains("no maps snapshot"),
                 "unexpected gap reason: {gap:?}"
             );
-            let text = render_text(&catalog);
+            let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
             assert!(
                 text.contains("(PID 20006) — not_selected"),
                 "unavailable pid must stay listed: {text}"
@@ -7727,6 +8645,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more; only 512 attach slots are available".into(),
+                    kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7790,6 +8709,7 @@ mod tests {
                 AdmissionRecord::Refused {
                     class: "closure_array",
                     reason: "module needs 388 more".into(),
+                    kind: crate::plan::RefusalKind::CapacityWhole,
                 },
             ),
             object(
@@ -7832,7 +8752,7 @@ mod tests {
             "{document}"
         );
         let text = render_text(&catalog);
-        assert!(text.contains("0 PKCS#11 objects"), "{text}");
+        assert!(text.contains("0 provider files"), "{text}");
         assert!(text.contains("deep-scanned 2 of 2"), "{text}");
     }
 
@@ -7846,10 +8766,11 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
-        let text = render_text(&catalog);
-        assert!(text.contains("system — 1 PKCS#11 object"), "{text}");
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(text.contains("system — 1 provider file"), "{text}");
         assert!(text.contains("/opt/provider.so"), "{text}");
         assert!(text.contains("sha256 aa"), "{text}");
         assert!(
@@ -7860,12 +8781,15 @@ mod tests {
             text.contains("refused (closure_array): module needs 388 more"),
             "{text}"
         );
-        assert!(text.contains(SCAN_ONLY_NOTE), "{text}");
+        assert!(text.contains(TEXT_SCAN_ONLY_NOTE), "{text}");
         assert!(text.contains("2.40"), "{text}");
         assert!(text.contains("PKCS 11"), "{text}");
-        assert!(text.contains("processes: 2 scanned"), "{text}");
         assert!(
-            text.contains("0 admitted, 1 refused, 0 unresolved"),
+            text.contains("processes: 2 checked in detail (scanned)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("0 admitted, 0 partial, 1 refused, 0 unresolved"),
             "{text}"
         );
     }
@@ -7889,17 +8813,19 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: reason.into(),
+                kind: crate::plan::RefusalKind::AwaitingPublication,
             },
         )]);
         let text = render_text(&catalog);
         assert!(
             text.contains(
-                "refused (closure_array): p11-kit proxy not attached by design; the providers \
-                 it forwards to attach when they load (--json shows the full reason)"
+                "refused (proxy): p11-kit proxy not attached by design; the providers it forwards \
+                 to attach when they load"
             ),
             "{text}"
         );
         assert!(!text.contains("lookalike"), "{text}");
+        assert!(!text.contains("closure_array"), "{text}");
         let document = render_json(&catalog);
         assert_eq!(
             document["objects"][0]["admission"]["reason"].as_str(),
@@ -7927,20 +8853,24 @@ mod tests {
                      by the operator, or as published tables); the providers it forwards to \
                      attach when they load"
                     .into(),
+                kind: crate::plan::RefusalKind::AwaitingPublication,
             },
         )]);
         let text = render_text(&catalog);
         assert!(
             text.contains(
-                "refused (closure_array): proxy closure array not attached by design; the \
-                 providers it forwards to attach when they load (--json shows the full reason)"
+                "refused (proxy): proxy closure array not attached by design; the providers it \
+                 forwards to attach when they load"
             ),
             "{text}"
         );
+        assert!(!text.contains("closure_array"), "{text}");
     }
 
-    /// A capacity closure refusal keeps its full text: the demand it states
-    /// is actionable, not a by-design constant.
+    /// A capacity closure refusal keeps its full text under `-v`: the demand
+    /// it states is actionable, not a by-design constant. Concise folds it
+    /// to the plain budget line (see
+    /// `concise_capacity_refusal_is_plain_budget_line`).
     #[test]
     fn text_keeps_capacity_closure_refusal_verbatim() {
         let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
@@ -7956,14 +8886,296 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: reason.into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         )]);
-        let text = render_text(&catalog);
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
-            text.contains(&format!(
+            verbose.contains(&format!(
                 "refused (closure_array): {reason} [{SCAN_ONLY_NOTE}]"
             )),
+            "{verbose}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["objects"][0]["admission"]["reason"].as_str(),
+            Some(reason),
+            "{document}"
+        );
+    }
+
+    /// Item 11: the header and the processes line use one count for
+    /// "checked in detail" (deep-scanned members only; memory-unreadable
+    /// members are named separately, never folded in).
+    #[test]
+    fn header_and_processes_line_agree_on_checked_in_detail() {
+        let mut catalog = catalog_with(Vec::new());
+        catalog.processes[1].status = MemberStatus::MemoryUnavailable { reason: "denied" };
+        // Stale inventoried total: the header must count processes, not it.
+        catalog.scanned = 2;
+        catalog.maps_matched = 0;
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("1 checked in detail, 0 matched from maps, 1 memory unreadable"),
+            "{concise}"
+        );
+        assert!(
+            concise.contains("processes: 1 memory unreadable, 1 checked in detail"),
+            "{concise}"
+        );
+        assert!(!concise.contains("2 checked in detail"), "{concise}");
+    }
+
+    /// Item 11: the header labels the summed deep-scan time as deep scans,
+    /// never "scan took" (the command's wall time is longer).
+    #[test]
+    fn header_labels_deep_scan_time_not_scan_took() {
+        let catalog = catalog_with(Vec::new());
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(concise.contains("deep scans 7 ms"), "{concise}");
+        assert!(!concise.contains("scan took"), "{concise}");
+    }
+
+    /// Item 31: concise object headers name the provider file without an
+    /// index; verbose keeps `object[N]` for cross-references.
+    #[test]
+    fn concise_object_header_has_no_index() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(!concise.contains("object[0]"), "{concise}");
+        assert!(concise.contains("/opt/provider.so"), "{concise}");
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("object[0]"), "{verbose}");
+    }
+
+    /// Item 12: concise admitted text says what profile/run would watch;
+    /// inspect itself watches nothing.
+    #[test]
+    fn concise_admitted_says_profile_run_would_watch() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            text.contains("profile/run would watch 68 functions"),
             "{text}"
+        );
+        assert!(!text.contains("admission  watched"), "{text}");
+    }
+
+    /// Item 12: verbose admitted text also avoids claiming inspect watches.
+    #[test]
+    fn verbose_admitted_says_profile_run_would_watch() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            text.contains("profile/run would watch 68 functions"),
+            "{text}"
+        );
+        assert!(!text.contains("admission  watched"), "{text}");
+    }
+
+    /// Item 12: the admission summary uses the JSON-aligned verdict
+    /// terms (admitted/refused/unresolved), never "watched": inspect
+    /// watches nothing.
+    #[test]
+    fn admission_summary_uses_json_aligned_terms() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "standard",
+                endpoints: 68,
+            },
+        )]);
+        for (verbosity, summary) in [
+            (
+                crate::cli::TextVerbosity::Concise,
+                "admission: 1 admitted, 0 partial, 0 refused, 0 unresolved (scan only: names \
+                 below come from the files themselves)",
+            ),
+            (
+                crate::cli::TextVerbosity::Verbose,
+                "admission: 1 admitted, 0 partial, 0 refused, 0 unresolved (0 possible \
+                 functions not yet confirmed from a second source \
+                 (uncorroborated_candidates); 0 functions claimed by two providers \
+                 (module_ambiguous); scan only: names below come from the files themselves)",
+            ),
+        ] {
+            let text = render_text_with_verbosity(&catalog, verbosity);
+            let line = text.lines().find(|line| line.starts_with("admission: "));
+            assert_eq!(line, Some(summary), "{text}");
+            for line in text.lines() {
+                for (at, _) in line.match_indices("watch") {
+                    let context = &line[at.saturating_sub(6)..];
+                    assert!(
+                        context.starts_with("would watch"),
+                        "every watch claim is a would-watch prediction: {line}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Item 12 adjacent: an admitted record with zero endpoints from
+    /// this scan qualifies the prediction instead of asserting
+    /// "would watch 0 functions" (an unscanned module deep-scans on
+    /// capture; a genuinely empty table admits nothing).
+    #[test]
+    fn admitted_zero_endpoints_qualifies_scan_prediction() {
+        let catalog = catalog_with(vec![object(
+            "/opt/unreadable.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Admitted {
+                class: "heuristic",
+                endpoints: 0,
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("admission  0 functions admitted from this scan"),
+            "{concise}"
+        );
+        assert!(!concise.contains("would watch 0"), "{concise}");
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains("admission  0 functions admitted from this scan (class heuristic;"),
+            "{verbose}"
+        );
+        assert!(!verbose.contains("would watch 0"), "{verbose}");
+    }
+
+    /// Item 10: concise capacity refusal is one plain budget line; verbose
+    /// keeps the full planner reason.
+    #[test]
+    fn concise_capacity_refusal_is_plain_budget_line() {
+        let reason = "module needs 388 more; only 512 attach slots are available; 480 are in \
+             use — refusing to attach a prefix of its 67 lookalike function tables \
+             (a proxy closure array is admitted whole, as a prefix when mapped before the \
+             capture's first plan beside a provider or named by the operator, or as published \
+             tables)";
+        let catalog = catalog_with(vec![object(
+            "/usr/lib64/libp11-kit.so.0.4.11",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: reason.into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains(
+                "refused: too many functions for the remaining probe budget; name it \
+                 with --module to capture it alone"
+            ),
+            "{concise}"
+        );
+        assert!(!concise.contains("lookalike"), "{concise}");
+        assert!(!concise.contains("closure_prefix"), "{concise}");
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("module needs 388 more"), "{verbose}");
+    }
+
+    /// Item 10: unexamined-maps skips with different counts fold to one
+    /// plain concise line; verbose lists each pid record.
+    #[test]
+    fn concise_folds_unexamined_maps_gaps_to_one_plain_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for (pid, count) in [(11u32, 13usize), (12, 14), (13, 9)] {
+            catalog.skipped.push(unexamined_maps_gap(pid, count));
+        }
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains(
+                "3 processes map libraries that were not deep-scanned (may hide providers)"
+            ),
+            "{concise}"
+        );
+        assert_eq!(
+            concise
+                .lines()
+                .filter(|line| line.starts_with("skipped"))
+                .count(),
+            1,
+            "{concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("maps 13 shared objects"), "{verbose}");
+        assert!(verbose.contains("maps 14 shared objects"), "{verbose}");
+    }
+
+    /// Item 10: over-capacity file skips with different sizes fold to one
+    /// plain concise line; verbose lists each record. Both producer
+    /// formats fold together.
+    #[test]
+    fn concise_folds_too_large_gaps_to_one_plain_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for (pid, size) in [(21u32, 319346888u64), (22, 300000000)] {
+            catalog.skipped.push(PidGap::member(
+                pid,
+                Skipped {
+                    subject: format!("/proc/{pid}/root/usr/lib/big.so"),
+                    reason: format!("too_large ({size} bytes; per-object cap is 268435456)"),
+                },
+            ));
+        }
+        catalog.skipped.push(PidGap::member(
+            23,
+            Skipped {
+                subject: "/proc/23/root/usr/lib/huge.so".into(),
+                reason: "object is 407976096 bytes; limit is 268435456".into(),
+            },
+        ));
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("3 files over 256 MiB not read"),
+            "{concise}"
+        );
+        assert_eq!(
+            concise
+                .lines()
+                .filter(|line| line.starts_with("skipped"))
+                .count(),
+            1,
+            "{concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(verbose.contains("too_large (319346888 bytes"), "{verbose}");
+        assert!(
+            verbose.contains("object is 407976096 bytes; limit is 268435456"),
+            "{verbose}"
         );
     }
 
@@ -8008,6 +9220,176 @@ mod tests {
         );
     }
 
+    /// Verbose lists every skipped record: `-v` is the full per-gap
+    /// detail, never a fold.
+    #[test]
+    fn text_lists_every_skipped_gap_in_verbose() {
+        let mut catalog = catalog_with(Vec::new());
+        for pid in [639, 640] {
+            for index in 0..10 {
+                catalog.skipped.push(PidGap::member(
+                    pid,
+                    Skipped {
+                        subject: format!("/proc/{pid}/root/usr/lib/object{index}.so"),
+                        reason: "opening object within retained target root: No such file or \\
+                             directory (os error 2)"
+                            .into(),
+                    },
+                ));
+            }
+        }
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("skipped: pid"))
+                .count(),
+            20,
+            "{text}"
+        );
+        assert!(
+            !text.lines().any(|line| line.starts_with("skipped (")),
+            "verbose never folds: {text}"
+        );
+    }
+
+    /// Repeated per-pid notes fold to one counted line in concise
+    /// text, like skipped gaps; JSON still lists every record.
+    #[test]
+    fn text_folds_repeated_notes_to_one_counted_line() {
+        let mut catalog = catalog_with(Vec::new());
+        for pid in [639, 640] {
+            for index in 0..5 {
+                catalog.notes.push(PidGap::member(
+                    pid,
+                    Skipped {
+                        subject: format!("/usr/lib/object{index}.so (deleted)"),
+                        reason: "deleted mapping".into(),
+                    },
+                ));
+            }
+        }
+        let text = render_text(&catalog);
+        assert!(
+            text.contains("notes (10 gaps in 2 processes): deleted mapping (--json lists each)"),
+            "{text}"
+        );
+        assert_eq!(
+            text.lines()
+                .filter(|line| line.starts_with("notes"))
+                .count(),
+            1,
+            "{text}"
+        );
+        let document = render_json(&catalog);
+        assert_eq!(
+            document["notes"].as_array().map(Vec::len),
+            Some(10),
+            "{document}"
+        );
+    }
+
+    /// CLI-1: concise system inspect keeps the plain header, one
+    /// short block per provider, the folded lines, coverage and the
+    /// `-v` hint; per-table observations are verbose-only.
+    #[test]
+    fn concise_system_inspect_keeps_providers_coverage_and_hint() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(out.contains("1 provider file"), "{out}");
+        assert!(out.contains("/opt/provider.so"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("observed   pid"), "{out}");
+        assert!(!out.contains("PKCS 11"), "{out}");
+        assert!(!out.contains("closure_array"), "{out}");
+        assert!(!out.contains("uncorroborated"), "{out}");
+        assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// F7: concise system inspect omits internal `(view N)` ids from
+    /// the mapped-by lines (first-timers need names, not view ids);
+    /// verbose keeps them beside the names, JSON keeps every process.
+    #[test]
+    fn concise_system_inspect_omits_view_ids_verbose_keeps_them() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            },
+        )]);
+        let concise = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Concise);
+        assert!(
+            concise.contains("Unknown executable (PID 100)"),
+            "{concise}"
+        );
+        assert!(
+            !concise.contains("(view "),
+            "concise leaks view ids: {concise}"
+        );
+        let verbose = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(
+            verbose.contains("Unknown executable (PID 100) (view 0)"),
+            "{verbose}"
+        );
+    }
+
+    /// CLI-1: verbose system inspect pairs machine names with the plain
+    /// words and keeps the per-table observations.
+    #[test]
+    fn verbose_system_inspect_pairs_machine_names_with_plain_words() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
+        assert!(out.contains("observed   pid"), "{out}");
+        assert!(out.contains("PKCS 11"), "{out}");
+        assert!(out.contains("closure_array"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: quiet system inspect is the header and coverage only.
+    #[test]
+    fn quiet_system_inspect_keeps_header_and_coverage_only() {
+        let catalog = catalog_with(vec![object(
+            "/opt/provider.so",
+            11,
+            Some("aa"),
+            100,
+            AdmissionRecord::Refused {
+                class: "closure_array",
+                reason: "module needs 388 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
+            },
+        )]);
+        let out = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Quiet);
+        assert!(out.contains("1 provider file"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("/opt/provider.so"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
     /// A lone skip keeps its pid and subject: there is nothing to fold.
     #[test]
     fn text_keeps_a_single_skipped_gap_verbatim() {
@@ -8041,6 +9423,7 @@ mod tests {
             AdmissionRecord::Refused {
                 class: "closure_array",
                 reason: "module needs 6734 more".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
         );
         let mut prefix = table((3, 2), 68);
@@ -8051,7 +9434,7 @@ mod tests {
         proxy.observations[0].tables = tables;
         let catalog = catalog_with(vec![proxy]);
 
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         let lines: Vec<&str> = text
             .lines()
             .filter(|line| line.trim_start().starts_with("table "))
@@ -8059,9 +9442,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "    table      3.2  known_prefix  68 entries",
-                "    table      3.2  full  104 entries  (×65 identical)",
-                "    table      3.2  known_prefix  68 entries  (×2 identical)",
+                "    table      3.2, 68 known functions (newer functions unknown)",
+                "    table      3.2, 104 functions (fully walked)  (×65 identical)",
+                "    table      3.2, 68 known functions (newer functions unknown)  (×2 identical)",
             ],
             "{text}"
         );
@@ -8133,7 +9516,7 @@ mod tests {
             ),
         ]);
 
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains("Unknown executable (PID 100) — scanned"),
             "{text}"
@@ -8159,7 +9542,7 @@ mod tests {
         assert!(
             text.contains(
                 "  3 other processes are not listed: no PKCS#11 object found or attributed \
-                 (1 deep-scanned, 1 past the deep-scan cap, 1 exited); --json lists every process"
+                 (1 checked in detail, 1 past the scan cap, 1 exited); --json lists every process"
             ),
             "{text}"
         );
@@ -8186,11 +9569,11 @@ mod tests {
                 endpoints: 68,
             },
         )]);
-        let text = render_text(&catalog);
+        let text = render_text_with_verbosity(&catalog, crate::cli::TextVerbosity::Verbose);
         assert!(
             text.contains(
                 "  1 other process is not listed: no PKCS#11 object found or attributed \
-                 (1 deep-scanned, 0 past the deep-scan cap, 0 exited); --json lists every process"
+                 (1 checked in detail, 0 past the scan cap, 0 exited); --json lists every process"
             ),
             "{text}"
         );
@@ -9023,6 +10406,8 @@ mod take_anchors_wiring_tests {
                 true,
                 CaptureWorkBudget::default(),
                 take_anchors,
+                // Cap 0 selects nothing; freshness is moot.
+                &std::collections::BTreeSet::new(),
             );
             assert!(
                 collection.selected.is_empty(),

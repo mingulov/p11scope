@@ -123,7 +123,8 @@ def artifact_freshness(artifact, job):
 
 def producer_route(path, jobs):
     direct = set(PACKAGE_GATES) | {"package-p0"}
-    nested = set(DELIVERY_GATES) | {"package-delivery / package-p0", "package-delivery"}
+    nested = set(DELIVERY_GATES) | {"package-delivery / package-p0", "package-delivery",
+                                    "package-delivery / attest", "package-delivery / install-test"}
     known = direct | nested | {"release-preview"}
     # Lookalikes never authorize a route or hide an attempted producer behind
     # a different successful job. Only literal names below grant admission.
@@ -230,7 +231,7 @@ def static_elf(data):
 def public_observer(path, sha, tree, version, rust, bpf_rust):
     with zipfile.ZipFile(path) as archive:
         members = archive.infolist()
-        require(len(members) == 6, "exact six-file public artifact required")
+        require(len(members) == 8, "exact eight-file public artifact required")
         files = {}
         total = 0
         for member in members:
@@ -246,8 +247,9 @@ def public_observer(path, sha, tree, version, rust, bpf_rust):
     observer_archive = observer_prefix + ".tar.gz"
     payloads = {"RELEASE.json", observer_archive, f"p11scope-{version}-source.tar.gz",
                 f"p11scope-discover-{version}-x86_64-linux-gnu.tar.gz",
-                f"p11scope-discover-{version}-x86_64-linux-musl.tar.gz"}
-    require(set(files) == payloads | {"SHA256SUMS"}, "exact six-file public package required")
+                f"p11scope-discover-{version}-x86_64-linux-musl.tar.gz",
+                f"p11scope_{version}_amd64.deb", f"p11scope-{version}-1.x86_64.rpm"}
+    require(set(files) == payloads | {"SHA256SUMS"}, "exact eight-file public package required")
     checksums = {}
     for line in files["SHA256SUMS"].decode("ascii").splitlines():
         match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9_.-]+)", line)

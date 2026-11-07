@@ -697,6 +697,10 @@ def joint_hot_last_t1(ledger_paths):
     return last
 
 
+OTHER_UNROUTED = "semantic calls unrouted from other callers"
+PREBINDING_NOTE = "pre-binding unrouted calls resolved to other callers"
+
+
 class HealthyTwin(unittest.TestCase):
     def test_healthy_10k_passes_with_recorded_windows_and_latency(self):
         s1 = require_s1(self)
@@ -1199,6 +1203,19 @@ class LossGate(unittest.TestCase):
                 write_jsonl(events_path, events)
             return s1.compare([str(ledger_path)], [str(events_path)],
                               str(inventory_path), 10)
+
+    def test_other_caller_unrouted_gap_fails_outside_joint(self):
+        # Without a bound Joint caller nothing separates the loss.
+        def mutate(inventory):
+            inventory["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": OTHER_UNROUTED,
+                 "reason": "3 calls shed without a route (unobserved=3) "
+                           "from callers other than the 0 bound callers",
+                 "budget": None, "repeats": 1})
+        with self.assertRaises(ValueError) as ctx:
+            self.run_mutation(mutate_inventory=mutate)
+        self.assertIn("loss gap", str(ctx.exception))
 
     def test_unrouted_returns_1_fails(self):
         def mutate(inventory):
@@ -2872,6 +2889,78 @@ class JointConservationGate(unittest.TestCase):
             with self.assertRaisesRegex(require_s1(self).S1Error,
                                         "loss gap"):
                 self.run_joint(Path(tmp), mutate)
+
+    def test_other_caller_unrouted_gap_is_reported_never_gated(self):
+        # A shed whose records prove a caller other than the bound one
+        # is the other caller's loss: reported beside the verdict, not
+        # a gap in the bound caller's completeness.
+        with tempfile.TemporaryDirectory(prefix="joint-oshed-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": OTHER_UNROUTED,
+                     "reason": "18 calls shed without a route "
+                               "(unobserved=18) from callers other than "
+                               "the 1 bound callers",
+                     "budget": None, "repeats": 1})
+            result = self.run_joint(Path(tmp), mutate)
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["other_caller_unrouted"], 18)
+
+    def test_other_caller_unrouted_gap_on_the_bound_caller_fails(self):
+        # Never trust the subject alone: attributed to the bound caller
+        # itself it stays a loss gap.
+        with tempfile.TemporaryDirectory(prefix="joint-oshedb-") as tmp:
+            def mutate(doc):
+                doc["gaps"].append(
+                    {"caller": "c1", "module": None, "pid": None,
+                     "subject": OTHER_UNROUTED,
+                     "reason": "2 calls shed without a route "
+                               "(unobserved=2) from callers other than "
+                               "the 1 bound callers",
+                     "budget": None, "repeats": 1})
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), mutate)
+
+    def prebinding_gaps(self, shed, noted):
+        def mutate(doc):
+            doc["gaps"].append(
+                {"caller": None, "module": None, "pid": None,
+                 "subject": "semantic calls unrouted",
+                 "reason": f"{shed} calls shed without a route "
+                           f"(unobserved={shed}) with 0 bindings",
+                 "budget": None, "repeats": 1})
+            if noted:
+                doc["gaps"].append(
+                    {"caller": None, "module": None, "pid": None,
+                     "subject": PREBINDING_NOTE,
+                     "reason": f"{noted} calls shed before the first binding "
+                               "came from callers other than the 1 bound "
+                               "callers; their history is kept",
+                     "budget": None, "repeats": 1})
+        return mutate
+
+    def test_prebinding_sheds_resolved_to_other_callers_are_reported(self):
+        with tempfile.TemporaryDirectory(prefix="joint-pre-") as tmp:
+            result = self.run_joint(Path(tmp), self.prebinding_gaps(6, 6))
+            self.assertEqual(result["verdict"], "pass")
+            self.assertEqual(result["loss"]["other_caller_unrouted"], 6)
+
+    def test_prebinding_sheds_not_all_resolved_fail(self):
+        with tempfile.TemporaryDirectory(prefix="joint-pre2-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), self.prebinding_gaps(6, 5))
+
+    def test_prebinding_note_overcounting_the_sheds_fails(self):
+        # The NOTE counts a subset of the "with 0 bindings" sheds, so a
+        # NOTE above the shed count is a product miscount, not a
+        # resolution: it must stay a loss gap.
+        with tempfile.TemporaryDirectory(prefix="joint-pre3-") as tmp:
+            with self.assertRaisesRegex(require_s1(self).S1Error,
+                                        "loss gap"):
+                self.run_joint(Path(tmp), self.prebinding_gaps(6, 7))
 
     def test_slot_refused_setup_conserved(self):
         # The live keyed shape: the two COUNT_ONLY slot probes are

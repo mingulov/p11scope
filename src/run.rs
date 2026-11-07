@@ -728,7 +728,11 @@ fn script_snap_refusal_error(
 /// Refuses a command that cannot run as an owned target by name, before
 /// anything is forked. Name errors precede hazard errors: a script is
 /// told about its interpreter before any kernel verdict is consulted.
-fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result<()> {
+fn check_owned_target_runnable(
+    program: &OsStr,
+    args: &[OsString],
+    user: Option<&OsStr>,
+) -> io::Result<()> {
     let probes = SnapProbes {
         exists: &|candidate: &Path| std::fs::symlink_metadata(candidate).is_ok(),
         is_runnable: &snap_path_candidate_is_runnable,
@@ -739,7 +743,7 @@ fn check_owned_target_runnable(program: &OsStr, args: &[OsString]) -> io::Result
         args,
         std::env::var_os("PATH").as_deref(),
         &std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/")),
-        ChildIdentity::for_invoker()
+        ChildIdentity::for_run_selection(user)
             .ok()
             .map(|identity| (identity.uid, identity.gid)),
         &probes,
@@ -809,15 +813,85 @@ fn check_owned_target_runnable_with(
     Err(script_refusal_error(&resolved, token, &error))
 }
 
+/// The credential selection for the owned child, before any account
+/// lookup: `sudo_drop` names the sudo path, where the parent still has
+/// to resolve the invoker's account below.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SelectedIdentity {
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    sudo_drop: bool,
+}
+
+/// One passwd row an account-drop path consumes: the account name, home
+/// directory, login shell, and ids. Values come from the account database,
+/// never from the environment — the child-environment rule that values
+/// are never read still holds, because nothing here reads env values.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PasswdRecord {
+    name: OsString,
+    home: OsString,
+    shell: OsString,
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+}
+
+/// The target account's session as an account-drop path restores it:
+/// passwd identity plus the supplementary group list (mirroring initgroups,
+/// so the primary group is included) and the runtime directory, but only
+/// when that directory is provably the account's own. Both the sudo-drop
+/// path (the invoker) and `--user` (the named account) restore this shape.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InvokerAccount {
+    user: OsString,
+    home: OsString,
+    shell: OsString,
+    groups: Vec<libc::gid_t>,
+    xdg_runtime_dir: Option<OsString>,
+}
+
+/// Account-database probes for target-account resolution, injectable for
+/// tests: `passwd` reads one passwd row by uid, `passwd_by_name` by name,
+/// `grouplist` reads the initgroups list for a name, `dir_owner` reports
+/// `(is_dir, owner)` for a path. Production passes the real database;
+/// behavior is identical.
+struct InvokerProbes<'a> {
+    passwd: &'a dyn Fn(libc::uid_t) -> Option<PasswdRecord>,
+    passwd_by_name: &'a dyn Fn(&OsStr) -> Option<PasswdRecord>,
+    grouplist: &'a dyn Fn(&OsStr, libc::gid_t) -> Option<Vec<libc::gid_t>>,
+    dir_owner: &'a dyn Fn(&Path) -> Option<(bool, libc::uid_t)>,
+}
+
+/// What `setgroups` accepts on Linux (`NGROUPS_MAX`); a longer resolved
+/// list is refused in the parent with the plain groups message rather
+/// than failing inside the fork child.
+const MAX_SUPPLEMENTARY_GROUPS: usize = 65536;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ChildIdentity {
     uid: libc::uid_t,
     gid: libc::gid_t,
-    clear_groups: bool,
+    sudo_drop: Option<InvokerAccount>,
+    run_as: Option<InvokerAccount>,
 }
 
 impl ChildIdentity {
+    /// The restored account session, if either account-drop path selected
+    /// one: at most one of `sudo_drop` and `run_as` is ever set, because
+    /// an explicit `--user` replaces the sudo default.
+    fn restored(&self) -> Option<&InvokerAccount> {
+        self.sudo_drop.as_ref().or(self.run_as.as_ref())
+    }
+
+    #[cfg(test)]
     fn for_invoker() -> io::Result<Self> {
+        Self::for_run_selection(None)
+    }
+
+    /// The owned child's identity: an explicit `--user` resolves that
+    /// account, otherwise the default (under sudo the invoker with its
+    /// restored session, otherwise the observer itself).
+    fn for_run_selection(user: Option<&OsStr>) -> io::Result<Self> {
         let mut uids = [0; 3];
         let mut gids = [0; 3];
         // SAFETY: each call receives three valid output pointers.
@@ -826,16 +900,137 @@ impl ChildIdentity {
         {
             return Err(io::Error::last_os_error());
         }
-        let identity = Self::from_ids(
+        Self::for_run_selection_with(
             uids,
             gids,
             std::env::var_os("SUDO_UID").as_deref(),
             std::env::var_os("SUDO_GID").as_deref(),
-        )?;
-        if identity.clear_groups {
-            validate_account_pair(identity.uid, identity.gid)?;
+            user,
+            &InvokerProbes {
+                passwd: &production_passwd_lookup,
+                passwd_by_name: &production_passwd_by_name,
+                grouplist: &production_group_lookup,
+                dir_owner: &production_dir_owner,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    fn for_invoker_with(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        sudo_uid: Option<&OsStr>,
+        sudo_gid: Option<&OsStr>,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        Self::for_run_selection_with(uids, gids, sudo_uid, sudo_gid, None, probes)
+    }
+
+    fn for_run_selection_with(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        sudo_uid: Option<&OsStr>,
+        sudo_gid: Option<&OsStr>,
+        user: Option<&OsStr>,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        if let Some(user) = user {
+            return Self::for_explicit_user(uids, gids, user, probes);
         }
-        Ok(identity)
+        let selected = Self::from_ids(uids, gids, sudo_uid, sudo_gid)?;
+        let sudo_drop = if selected.sudo_drop {
+            Some(resolve_invoker_account_with(
+                selected.uid,
+                selected.gid,
+                probes,
+            )?)
+        } else {
+            None
+        };
+        Ok(Self {
+            uid: selected.uid,
+            gid: selected.gid,
+            sudo_drop,
+            run_as: None,
+        })
+    }
+
+    /// The `--user` selection (owner decision RUN-USER, like `strace -u`):
+    /// the named account with its groups and home environment, resolved
+    /// here in the parent. Needs root; `--user root` stays root on purpose.
+    /// A set-id observer is refused exactly like the default path refuses
+    /// it, before the root check.
+    fn for_explicit_user(
+        uids: [libc::uid_t; 3],
+        gids: [libc::gid_t; 3],
+        user: &OsStr,
+        probes: &InvokerProbes,
+    ) -> io::Result<Self> {
+        if uids != [uids[1]; 3] || gids != [gids[1]; 3] {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing owned child with set-id observer credentials",
+            ));
+        }
+        if uids[1] != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "--user needs root (sudo)",
+            ));
+        }
+        let display = crate::render::escape_controls(&user.to_string_lossy()).into_owned();
+        let unknown = || {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("--user {display}: unknown account"),
+            )
+        };
+        // An all-digit value names a uid; anything else names an account.
+        // Linux argv cannot carry NUL, but the lookup treats one as unknown
+        // rather than truncating the name.
+        let bytes = std::os::unix::ffi::OsStrExt::as_bytes(user);
+        let record = if !bytes.is_empty() && bytes.iter().all(u8::is_ascii_digit) {
+            // Like `from_ids`, uid 2^32-1 is no account: `setresuid(-1)`
+            // would be a silent no-change, so refuse before any lookup.
+            let uid: libc::uid_t = bytes
+                .iter()
+                .fold(0u64, |acc, digit| {
+                    acc.saturating_mul(10)
+                        .saturating_add(u64::from(digit - b'0'))
+                })
+                .try_into()
+                .map_err(|_| unknown())
+                .and_then(|uid: libc::uid_t| {
+                    (uid != u32::MAX).then_some(uid).ok_or_else(unknown)
+                })?;
+            (probes.passwd)(uid).filter(|record| record.uid == uid)
+        } else {
+            (probes.passwd_by_name)(user)
+        };
+        // M3: gid 2^32-1 is no account either (like uid MAX, setresgid(-1)
+        // would be a silent no-change).
+        let record = record
+            .filter(|record| {
+                !record.name.is_empty() && record.uid != u32::MAX && record.gid != u32::MAX
+            })
+            .ok_or_else(unknown)?;
+        // M4: only "root" and "0" may resolve to uid 0; any other spelling
+        // naming uid 0 (an alias, "00", "000") refuses as unknown.
+        if record.uid == 0 && bytes != b"root" && bytes != b"0" {
+            return Err(unknown());
+        }
+        let session = finish_account_session(record.uid, &record, probes).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!("--user {display}: cannot resolve supplementary groups"),
+            )
+        })?;
+        Ok(Self {
+            uid: record.uid,
+            gid: record.gid,
+            sudo_drop: None,
+            run_as: Some(session),
+        })
     }
 
     fn from_ids(
@@ -843,7 +1038,7 @@ impl ChildIdentity {
         gids: [libc::gid_t; 3],
         sudo_uid: Option<&OsStr>,
         sudo_gid: Option<&OsStr>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<SelectedIdentity> {
         if uids != [uids[1]; 3] || gids != [gids[1]; 3] {
             return Err(io::Error::new(
                 io::ErrorKind::PermissionDenied,
@@ -857,10 +1052,10 @@ impl ChildIdentity {
                     "refusing owned child with root group credentials",
                 ));
             }
-            return Ok(Self {
+            return Ok(SelectedIdentity {
                 uid: uids[1],
                 gid: gids[1],
-                clear_groups: false,
+                sudo_drop: false,
             });
         }
         let parse = |name: &str, value: Option<&OsStr>| -> io::Result<u32> {
@@ -879,62 +1074,232 @@ impl ChildIdentity {
                 })?;
             Ok(value)
         };
-        Ok(Self {
+        Ok(SelectedIdentity {
             uid: parse("SUDO_UID", sudo_uid)?,
             gid: parse("SUDO_GID", sudo_gid)?,
-            clear_groups: true,
+            sudo_drop: true,
         })
     }
 }
 
-fn validate_account_pair(uid: libc::uid_t, gid: libc::gid_t) -> io::Result<()> {
-    let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
-    let mut result = std::ptr::null_mut();
-    let mut buffer = vec![0; 16 * 1024];
-    // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut account,
-            buffer.as_mut_ptr().cast(),
-            buffer.len(),
-            &mut result,
-        )
+/// Resolves the sudo-drop target account in the parent, before the fork;
+/// the child only applies the resolved list through raw syscalls (name
+/// service calls are not async-signal-safe). The passwd row must exist
+/// and name `gid` as its primary group (message unchanged), and the
+/// initgroups list must resolve to a non-empty settable list. An
+/// unresolvable account refuses with a plain message before anything is
+/// forked, attached, or released.
+fn resolve_invoker_account_with(
+    uid: libc::uid_t,
+    gid: libc::gid_t,
+    probes: &InvokerProbes,
+) -> io::Result<InvokerAccount> {
+    // M2: the row must name the requested uid, not just a non-empty name.
+    let record = (probes.passwd)(uid).filter(|record| !record.name.is_empty() && record.uid == uid);
+    let Some(record) = record else {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "SUDO_UID/SUDO_GID do not name one existing account",
+        ));
     };
-    if status != 0 {
-        return Err(io::Error::from_raw_os_error(status));
-    }
-    if result.is_null() || account.pw_gid != gid {
+    if record.gid != gid {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
             "SUDO_UID/SUDO_GID do not name one existing account",
         ));
     }
-    Ok(())
+    finish_account_session(uid, &record, probes).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "cannot resolve supplementary groups for the sudo invoker",
+        )
+    })
 }
 
+/// The initgroups list plus the provable runtime directory for a resolved
+/// passwd row, shared by the sudo-drop and `--user` paths. `None` names a
+/// group list that cannot be applied (unresolvable, empty, or past the
+/// kernel limit); each caller phrases that refusal for its own selection.
+/// An unprovable runtime dir is skipped, never a refusal.
+fn finish_account_session(
+    uid: libc::uid_t,
+    record: &PasswdRecord,
+    probes: &InvokerProbes,
+) -> Option<InvokerAccount> {
+    let mut groups = (probes.grouplist)(&record.name, record.gid).unwrap_or_default();
+    groups.sort_unstable();
+    groups.dedup();
+    if groups.is_empty() || groups.len() > MAX_SUPPLEMENTARY_GROUPS {
+        return None;
+    }
+    let runtime_dir = PathBuf::from(format!("/run/user/{uid}"));
+    let xdg_runtime_dir = match (probes.dir_owner)(&runtime_dir) {
+        Some((true, owner)) if owner == uid => Some(runtime_dir.into_os_string()),
+        _ => None,
+    };
+    Some(InvokerAccount {
+        user: record.name.clone(),
+        home: record.home.clone(),
+        shell: record.shell.clone(),
+        groups,
+        xdg_runtime_dir,
+    })
+}
+
+/// The `--user` preflight `main` runs before `run_owned` does anything:
+/// needs root, a non-set-id observer, and a resolvable account with a
+/// settable group list. On success the spawn resolves the same selection
+/// again; a database change in between still refuses at the spawn, with
+/// the same plain message but the spawn's exit status.
+pub fn check_run_user(user: &OsStr) -> Result<(), String> {
+    ChildIdentity::for_run_selection(Some(user))
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+/// Copies one passwd string field out of the `getpwuid_r` buffer.
+unsafe fn passwd_field(value: *mut libc::c_char) -> Option<OsString> {
+    if value.is_null() {
+        return None;
+    }
+    // SAFETY: the caller guarantees a live NUL-terminated string.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(value) }.to_bytes();
+    Some(OsStr::from_bytes(bytes).to_os_string())
+}
+
+fn production_passwd_lookup(uid: libc::uid_t) -> Option<PasswdRecord> {
+    passwd_lookup(|account, buffer, len, result| {
+        // SAFETY: account, buffer, and result are valid writable storage for getpwuid_r.
+        unsafe { libc::getpwuid_r(uid, account, buffer, len, result) }
+    })
+}
+
+/// One passwd row by account name, for `--user`, via `getpwnam_r`. A name
+/// that cannot reach the lookup (an embedded NUL, impossible from argv)
+/// resolves to no account rather than a truncated one.
+fn production_passwd_by_name(user: &OsStr) -> Option<PasswdRecord> {
+    let name = CString::new(user.as_bytes()).ok()?;
+    passwd_lookup(|account, buffer, len, result| {
+        // SAFETY: account, buffer, and result are valid writable storage
+        // for getpwnam_r; name is NUL-terminated.
+        unsafe { libc::getpwnam_r(name.as_ptr(), account, buffer, len, result) }
+    })
+}
+
+/// One passwd row through a reentrant lookup, growing the buffer on
+/// `ERANGE` up to 1 MiB. Returns `None` on any lookup failure.
+fn passwd_lookup(
+    fill: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+) -> Option<PasswdRecord> {
+    let mut capacity = 16 * 1024;
+    loop {
+        let mut account = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0; capacity];
+        let status = fill(
+            &mut account,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        );
+        if status == libc::ERANGE {
+            capacity *= 2;
+            if capacity > 1024 * 1024 {
+                return None;
+            }
+            continue;
+        }
+        if status != 0 || result.is_null() {
+            return None;
+        }
+        // SAFETY: on success the pointers name NUL-terminated strings owned by `buffer`.
+        return Some(PasswdRecord {
+            name: unsafe { passwd_field(account.pw_name) }?,
+            home: unsafe { passwd_field(account.pw_dir) }?,
+            shell: unsafe { passwd_field(account.pw_shell) }?,
+            uid: account.pw_uid,
+            gid: account.pw_gid,
+        });
+    }
+}
+
+/// The initgroups list for `user` with primary group `gid`, mirroring
+/// what a direct login would set: `getgrouplist` includes `gid` itself.
+fn production_group_lookup(user: &OsStr, gid: libc::gid_t) -> Option<Vec<libc::gid_t>> {
+    let name = CString::new(user.as_bytes()).ok()?;
+    let mut capacity: usize = 16;
+    loop {
+        let mut groups = vec![0 as libc::gid_t; capacity];
+        let mut count = capacity as libc::c_int;
+        // SAFETY: name is NUL-terminated; groups and count are valid writable storage.
+        let status =
+            unsafe { libc::getgrouplist(name.as_ptr(), gid, groups.as_mut_ptr(), &mut count) };
+        if status == -1 {
+            let needed = usize::try_from(count).unwrap_or(0);
+            if needed <= capacity || needed > MAX_SUPPLEMENTARY_GROUPS {
+                return None;
+            }
+            capacity = needed;
+            continue;
+        }
+        groups.truncate(usize::try_from(count).unwrap_or(0).min(groups.len()));
+        return Some(groups);
+    }
+}
+
+fn production_dir_owner(path: &Path) -> Option<(bool, libc::uid_t)> {
+    // M1: the runtime dir proves only under a trusted /run/user (root-owned,
+    // not group/other-writable, not a symlink); a symlink at the target is
+    // not a dir (lstat, never stat).
+    if !runtime_dir_parent_trusted(Path::new("/run/user")) {
+        return None;
+    }
+    let metadata = std::fs::symlink_metadata(path).ok()?;
+    Some((metadata.is_dir(), metadata.uid()))
+}
+
+/// Whether a `/run/user`-style parent may vouch for a runtime dir: a real
+/// dir (not a symlink), owned by root, not group/other-writable.
+fn runtime_dir_parent_trusted(parent: &Path) -> bool {
+    let Ok(metadata) = std::fs::symlink_metadata(parent) else {
+        return false;
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return false;
+    }
+    if metadata.uid() != 0 {
+        return false;
+    }
+    metadata.mode() & 0o022 == 0
+}
+
+/// Whether `run` withholds an environment variable from its owned child.
+/// The child otherwise inherits the observer's environment unchanged, so the
+/// workload behaves exactly as without p11scope. Only p11scope's own control
+/// inputs are withheld, by name (values are never inspected here):
+/// - `SUDO_*`: the whole sudo namespace (`SUDO_UID`/`SUDO_GID` consumed as
+///   the default target-account selection, plus `SUDO_USER`,
+///   `SUDO_COMMAND`, `SUDO_HOME`, `SUDO_TTY`, and any future addition).
+///   They describe the observer's launch, not the workload; a bare
+///   execution has none, so keeping any of them would mislead the child.
+/// - `P11SCOPE_*`: p11scope's own control namespace (observer and test
+///   controls); never workload input, and passing them on would confuse a
+///   nested p11scope run.
+fn child_env_controlled(name: &OsStr) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let bytes = name.as_bytes();
+    bytes.starts_with(b"SUDO_") || bytes.starts_with(b"P11SCOPE_")
+}
+
+/// The owned child's environment: the observer's variables unchanged,
+/// except [`child_env_controlled`]. Names are matched; values pass
+/// through opaquely and are never read or logged.
 fn child_environment(
-    identity: ChildIdentity,
     variables: impl IntoIterator<Item = (OsString, OsString)>,
 ) -> io::Result<Vec<CString>> {
-    let variables: Vec<_> = variables.into_iter().collect();
-    let selected: Vec<(OsString, OsString)> = if identity.clear_groups {
-        let mut selected = vec![
-            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
-            (OsString::from("LANG"), OsString::from("C")),
-            (OsString::from("LC_ALL"), OsString::from("C")),
-        ];
-        for allowed in ["TERM", "TZ", "SOFTHSM2_CONF"] {
-            if let Some((name, value)) = variables.iter().find(|(name, _)| name == allowed) {
-                selected.push((name.clone(), value.clone()));
-            }
-        }
-        selected
-    } else {
-        variables
-    };
-    selected
+    variables
         .into_iter()
+        .filter(|(name, _)| !child_env_controlled(name))
         .map(|(name, value)| {
             let mut entry = name.into_vec();
             entry.push(b'=');
@@ -944,6 +1309,154 @@ fn child_environment(
             })
         })
         .collect()
+}
+
+/// The one stderr line naming variables withheld from the owned child,
+/// or `None` when nothing was withheld. Names only, sorted and escaped;
+/// values are never included (environment values are never captured).
+fn child_env_removal_notice(
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<String> {
+    let mut removed: Vec<String> = variables
+        .into_iter()
+        .filter(|(name, _)| child_env_controlled(name))
+        .map(|(name, _)| crate::render::escape_controls(&name.to_string_lossy()).into_owned())
+        .collect();
+    removed.sort();
+    removed.dedup();
+    if removed.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "p11scope: run: removed {} environment variable{} from the child: {}",
+        removed.len(),
+        if removed.len() == 1 { "" } else { "s" },
+        removed.join(", ")
+    ))
+}
+
+/// The `-v` removal notice for a spawn: `Some` only when verbose and a
+/// controlled variable was actually withheld. Without `-v` the spawn
+/// stays quiet even when variables were removed.
+fn verbose_removal_notice(
+    verbose: bool,
+    variables: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Option<String> {
+    verbose
+        .then(|| child_env_removal_notice(variables))
+        .flatten()
+}
+
+/// The sudo-drop environment overrides: `USER`/`LOGNAME` always, `HOME`
+/// and `SHELL` from the invoker's passwd row when the row names them,
+/// `XDG_RUNTIME_DIR` when the runtime directory is provably the
+/// invoker's own. Names and values alike come from the account database
+/// and these fixed override names — never from reading the inherited
+/// environment's values. An empty passwd field leaves the inherited
+/// value alone rather than writing an empty one.
+fn drop_env_overrides(drop: &InvokerAccount) -> Vec<(OsString, OsString)> {
+    let mut overrides = Vec::with_capacity(5);
+    overrides.push((OsString::from("USER"), drop.user.clone()));
+    overrides.push((OsString::from("LOGNAME"), drop.user.clone()));
+    if !drop.home.is_empty() {
+        overrides.push((OsString::from("HOME"), drop.home.clone()));
+    }
+    if !drop.shell.is_empty() {
+        overrides.push((OsString::from("SHELL"), drop.shell.clone()));
+    }
+    if let Some(dir) = &drop.xdg_runtime_dir {
+        overrides.push((OsString::from("XDG_RUNTIME_DIR"), dir.clone()));
+    }
+    overrides
+}
+
+/// Drops `MAIL` from an already-filtered child environment. The account
+/// database names no mailbox, so on an account-drop path the inherited
+/// value (under sudo, root's mailbox) would misdescribe the new account;
+/// without a drop the inherited value already describes the child and is
+/// kept. Name-matched; the value is never read.
+fn strip_drop_mail(environment: &mut Vec<CString>) {
+    environment.retain(|entry| {
+        entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .is_none_or(|name| name != b"MAIL")
+    });
+}
+
+/// Drops an inherited `XDG_RUNTIME_DIR` from an already-filtered child
+/// environment on every account-drop path, before the overrides re-add
+/// only a provable directory. The inherited value names the observer's
+/// runtime dir (under sudo, root's `/run/user/0`), which would misdescribe
+/// the new account; without a drop the inherited value already describes
+/// the child and is kept. Name-matched; the value is never read.
+fn strip_drop_xdg_runtime_dir(environment: &mut Vec<CString>) {
+    environment.retain(|entry| {
+        entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .is_none_or(|name| name != b"XDG_RUNTIME_DIR")
+    });
+}
+
+/// Applies account-drop overrides to an already-filtered child environment:
+/// every entry naming an overridden variable is replaced by the
+/// account-database value. An empty override list changes nothing, so
+/// the non-drop path keeps byte-identical passthrough.
+fn apply_env_overrides(
+    environment: &mut Vec<CString>,
+    overrides: &[(OsString, OsString)],
+) -> io::Result<()> {
+    if overrides.is_empty() {
+        return Ok(());
+    }
+    environment.retain(|entry| {
+        let name = entry
+            .to_bytes()
+            .split(|byte| *byte == b'=')
+            .next()
+            .unwrap_or_default();
+        !overrides.iter().any(|(key, _)| key.as_bytes() == name)
+    });
+    for (name, value) in overrides {
+        let mut entry = name.clone().into_vec();
+        entry.push(b'=');
+        entry.extend(value.clone().into_vec());
+        environment.push(CString::new(entry).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "environment override contains NUL",
+            )
+        })?);
+    }
+    Ok(())
+}
+
+/// The one `-v` line naming the sudo-drop identity. Plain text, one
+/// line, stderr only: the command spelling is the operator's own argv
+/// and the user is the passwd name, never `SUDO_USER`, with its uid.
+/// Both are escaped, so a hostile argv or account name cannot inject a
+/// terminal escape.
+fn sudo_drop_notice(program: &OsStr, user: &OsStr, uid: libc::uid_t) -> String {
+    format!(
+        "running {} as {} (uid {}) (groups and home restored)",
+        crate::render::escape_controls(&program.to_string_lossy()),
+        crate::render::escape_controls(&user.to_string_lossy()),
+        uid
+    )
+}
+
+/// The one `-v` line naming the `--user` identity: the requested account
+/// with its uid, likewise escaped and stderr-only.
+fn run_as_notice(program: &OsStr, user: &OsStr, uid: libc::uid_t) -> String {
+    format!(
+        "running {} as {} (uid {})",
+        crate::render::escape_controls(&program.to_string_lossy()),
+        crate::render::escape_controls(&user.to_string_lossy()),
+        uid
+    )
 }
 
 #[repr(C)]
@@ -1266,7 +1779,7 @@ unsafe fn close_sweep_range(first: u32, last: u32) -> std::result::Result<(), i3
     Ok(())
 }
 
-unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(), i32> {
+unsafe fn harden_owned_child(identity: &ChildIdentity) -> std::result::Result<(), i32> {
     if unsafe { libc::syscall(libc::SYS_prctl, libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) } != 0
         || unsafe {
             libc::syscall(
@@ -1281,10 +1794,15 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
     {
         return Err(unsafe { last_errno() });
     }
-    if identity.clear_groups
-        && unsafe { libc::syscall(libc::SYS_setgroups, 0, std::ptr::null::<libc::gid_t>()) } != 0
-    {
-        return Err(unsafe { last_errno() });
+    if let Some(drop) = identity.restored() {
+        // Before setresgid/setresuid: only root may change the group list.
+        // The list was resolved in the parent (name service calls are not
+        // async-signal-safe); the child only applies it.
+        if unsafe { libc::syscall(libc::SYS_setgroups, drop.groups.len(), drop.groups.as_ptr()) }
+            != 0
+        {
+            return Err(unsafe { last_errno() });
+        }
     }
     if unsafe {
         libc::syscall(
@@ -1357,9 +1875,7 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
     }
     if uids != [identity.uid; 3]
         || gids != [identity.gid; 3]
-        || (identity.clear_groups
-            && unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null::<libc::gid_t>()) }
-                != 0)
+        || !unsafe { child_groups_match(identity) }
         || actual_caps
             .iter()
             .any(|caps| caps.effective != 0 || caps.permitted != 0 || caps.inheritable != 0)
@@ -1368,6 +1884,45 @@ unsafe fn harden_owned_child(identity: ChildIdentity) -> std::result::Result<(),
         return Err(libc::EPERM);
     }
     Ok(())
+}
+
+/// Proves the child runs with the intended group list. The non-drop
+/// child keeps whatever it inherited, so there is nothing to prove;
+/// the account-dropped child must show exactly the restored list. The
+/// count check is unbounded; the exact sorted compare runs when the
+/// list fits a small stack buffer (beyond that the count stands alone).
+/// The parent sorts the expected list; the child sorts its readback the
+/// same way. Async-signal-safe: stack data and raw syscalls only —
+/// `identity` is read-only mapped memory, never a lock.
+unsafe fn child_groups_match(identity: &ChildIdentity) -> bool {
+    const STACK_GROUPS: usize = 128;
+    let Some(drop) = identity.restored() else {
+        return true;
+    };
+    let expected = drop.groups.as_slice();
+    // SAFETY: raw getgroups syscalls; the stack buffer is valid writable storage.
+    let count = unsafe { libc::syscall(libc::SYS_getgroups, 0, std::ptr::null::<libc::gid_t>()) };
+    if count < 0 || usize::try_from(count).unwrap_or(usize::MAX) != expected.len() {
+        return false;
+    }
+    if expected.len() > STACK_GROUPS {
+        return true;
+    }
+    let mut actual = [0 as libc::gid_t; STACK_GROUPS];
+    let read = unsafe { libc::syscall(libc::SYS_getgroups, expected.len(), actual.as_mut_ptr()) };
+    if read < 0 || usize::try_from(read).unwrap_or(usize::MAX) != expected.len() {
+        return false;
+    }
+    let actual = &mut actual[..expected.len()];
+    for index in 1..actual.len() {
+        let mut at = index;
+        while at > 0 && actual[at - 1] > actual[at] {
+            actual.swap(at - 1, at);
+            at -= 1;
+        }
+    }
+    let actual: &[libc::gid_t] = actual;
+    actual == expected
 }
 
 #[cfg(test)]
@@ -1470,14 +2025,63 @@ pub(crate) struct OwnedChild {
     exec_confirmed: bool,
     reaped: bool,
     reaped_exit_code: Option<i32>,
+    /// Whether the reap observed `CLD_KILLED`/`CLD_DUMPED` (a signal
+    /// death) rather than `CLD_EXITED` (a voluntary exit): the
+    /// flattened `reaped_exit_code` alone cannot tell a voluntary
+    /// 200 from a signal death. `None` until reaped.
+    reaped_signalled: Option<bool>,
+    /// Whether the observer's graceful settlement successfully sent
+    /// SIGTERM / SIGKILL before the reap: a pre-signal death (the
+    /// initial probe's reap, or a reap after a failed send) is never
+    /// the observer's kill, however signalled its code.
+    sent_term: bool,
+    sent_kill: bool,
     handed_off: bool,
     interrupt_count: u8,
     settlement_deadline: Option<Instant>,
 }
 
 impl OwnedChild {
+    #[cfg(test)]
     pub(crate) fn spawn(program: OsString, args: Vec<OsString>) -> io::Result<Self> {
-        let identity = ChildIdentity::for_invoker()?;
+        Self::spawn_verbose_as(program, args, false, None)
+    }
+
+    /// Spawns with an explicit `--user` selection: `None` keeps the default
+    /// (under sudo the invoker, otherwise the observer itself).
+    pub(crate) fn spawn_verbose_as(
+        program: OsString,
+        args: Vec<OsString>,
+        verbose: bool,
+        user: Option<&OsStr>,
+    ) -> io::Result<Self> {
+        let identity = ChildIdentity::for_run_selection(user)?;
+        // One read: the filtered environment and the removal notice name the
+        // same variables, so a concurrent `setenv` cannot split them.
+        let variables: Vec<(OsString, OsString)> = std::env::vars_os().collect();
+        Self::spawn_prepared(program, args, verbose, identity, variables)
+    }
+
+    /// Test seam: the spawn core with an explicit identity and environment,
+    /// so spawn-level tests pin the wiring without touching the process
+    /// environment or the account database.
+    #[cfg(test)]
+    fn spawn_for_test(
+        program: OsString,
+        args: Vec<OsString>,
+        identity: ChildIdentity,
+        variables: Vec<(OsString, OsString)>,
+    ) -> io::Result<Self> {
+        Self::spawn_prepared(program, args, false, identity, variables)
+    }
+
+    fn spawn_prepared(
+        program: OsString,
+        args: Vec<OsString>,
+        verbose: bool,
+        identity: ChildIdentity,
+        variables: Vec<(OsString, OsString)>,
+    ) -> io::Result<Self> {
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
         check_launch_file(&launch_file)?;
@@ -1502,7 +2106,17 @@ impl OwnedChild {
             .map(|arg| arg.as_ptr())
             .chain(std::iter::once(std::ptr::null()))
             .collect();
-        let environment = child_environment(identity, std::env::vars_os())?;
+        let mut environment = child_environment(variables.iter().cloned())?;
+        if let Some(drop) = identity.restored() {
+            strip_drop_mail(&mut environment);
+            strip_drop_xdg_runtime_dir(&mut environment);
+            apply_env_overrides(&mut environment, &drop_env_overrides(drop))?;
+        }
+        // M10 (CLI-1): the removal notice is a -v detail, like the identity
+        // notices below; without -v the spawn stays quiet.
+        if let Some(notice) = verbose_removal_notice(verbose, variables.iter().cloned()) {
+            emit_capture_diagnostic(&notice);
+        }
         let envp: Vec<*const libc::c_char> = environment
             .iter()
             .map(|entry| entry.as_ptr())
@@ -1529,6 +2143,17 @@ impl OwnedChild {
         let test_parent = unsafe { libc::getpid() };
         #[cfg(test)]
         let test_parent_death = TEST_PARENT_DEATH_SIGNAL.with(std::cell::Cell::get);
+        // The `-v` identity line, after every fallible setup step: it names a
+        // child that is actually about to be forked, and only on an
+        // account-drop path. The non-drop path stays silent.
+        if verbose {
+            let command = OsStr::from_bytes(program.to_bytes());
+            if let Some(drop) = identity.sudo_drop.as_ref() {
+                emit_capture_diagnostic(&sudo_drop_notice(command, &drop.user, identity.uid));
+            } else if let Some(run_as) = identity.run_as.as_ref() {
+                emit_capture_diagnostic(&run_as_notice(command, &run_as.user, identity.uid));
+            }
+        }
 
         // SAFETY: all allocations and C strings were prepared above. The child
         // executes only async-signal-safe syscalls before exec/_exit.
@@ -1587,7 +2212,7 @@ impl OwnedChild {
                 if libc::setsid() < 0 {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
                 }
-                if let Err(errno) = harden_owned_child(identity) {
+                if let Err(errno) = harden_owned_child(&identity) {
                     child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                 }
                 // Again after the identity change, which clears it when the
@@ -1650,6 +2275,9 @@ impl OwnedChild {
             exec_confirmed: false,
             reaped: false,
             reaped_exit_code: None,
+            reaped_signalled: None,
+            sent_term: false,
+            sent_kill: false,
             handed_off: false,
             interrupt_count: 0,
             settlement_deadline: None,
@@ -1927,6 +2555,7 @@ impl OwnedChild {
             }
             return self.kill_and_reap_tail();
         }
+        self.sent_term = true;
         if self.wait_ready_until(Some(term_deadline))? {
             return self.try_reap_until(Some(term_deadline))?.ok_or_else(|| {
                 io::Error::other("pidfd was ready without a reapable child status after SIGTERM")
@@ -1942,6 +2571,9 @@ impl OwnedChild {
         }
         let group_error = signal_group(self.pid, libc::SIGKILL).err();
         let direct_error = self.pin.send_signal(libc::SIGKILL).err();
+        if group_error.is_none() || direct_error.is_none() {
+            self.sent_kill = true;
+        }
         if let Some(error) = direct_error {
             if let Some(code) = self.try_reap()? {
                 return if self.released
@@ -2095,9 +2727,9 @@ impl OwnedChild {
             return Ok(None);
         }
         let status = unsafe { info.si_status() };
-        let code = match info.si_code {
-            libc::CLD_EXITED => status,
-            libc::CLD_KILLED | libc::CLD_DUMPED => 128 + status,
+        let (code, signalled) = match info.si_code {
+            libc::CLD_EXITED => (status, false),
+            libc::CLD_KILLED | libc::CLD_DUMPED => (128 + status, true),
             other => {
                 return Err(io::Error::other(format!(
                     "unexpected waitid child status code {other}"
@@ -2106,6 +2738,7 @@ impl OwnedChild {
         };
         self.reaped = true;
         self.reaped_exit_code = Some(code);
+        self.reaped_signalled = Some(signalled);
         Ok(Some(code))
     }
 
@@ -2744,6 +3377,16 @@ pub fn capture(a: &CaptureArgs) -> Result<()> {
     capture_with_host(a, &crate::attach::require_multi_capable_host)
 }
 
+/// Attach-start context for every failure except the already-complete
+/// missing-process line, which passes through untouched.
+fn attach_session_context(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<crate::process::MissingNamedProcess>() {
+        error
+    } else {
+        error.context("starting attach session")
+    }
+}
+
 fn capture_with_host(
     a: &CaptureArgs,
     host: &dyn Fn() -> crate::attach::MultiHostVerdict,
@@ -2768,6 +3411,11 @@ fn capture_with_host(
             match ProcessView::open(ProcessViewId(0), *p) {
                 Ok(view) => (Scope::Pid(*p), Some(view)),
                 Err(error) => {
+                    // A pid with no live process fails here with the one
+                    // operator line: attach would refuse it below anyway.
+                    if crate::process::generation_gone(*p) {
+                        return Err(crate::process::MissingNamedProcess { pid: *p }.into());
+                    }
                     emit_capture_diagnostic(&format!(
                         "p11scope: --pid {p}: {error}; reporting an empty partial capture"
                     ));
@@ -2832,12 +3480,16 @@ fn capture_with_host(
     ));
     // Zero modules is not an error (spec §4.10): the capture still runs, still
     // writes its report, and says here how to find out why it found nothing.
-    if engine.plan().modules.is_empty() {
+    // A named pid that died after scope resolution fails below with the one
+    // missing-process line instead; the hint would only restate it.
+    let named_pid_gone =
+        matches!(&a.scope, ScopeArg::Pid(pid) if crate::process::generation_gone(*pid));
+    if engine.plan().modules.is_empty() && !named_pid_gone {
         emit_capture_diagnostic(&no_modules_hint(&a.scope));
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
-        .context("starting attach session")?;
+        .map_err(attach_session_context)?;
     run_loop(
         &mut engine,
         &mut session,
@@ -2854,6 +3506,7 @@ fn capture_with_host(
         uretprobe_override,
         resource_start,
         a.select_endpoint.as_deref(),
+        None,
     )?;
     // A non-child's exit and explicit risk acceptance are observable facts.
     // Neither establishes its seccomp state, an affected kernel, or causation.
@@ -3056,6 +3709,7 @@ fn run_loop(
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
     select_endpoint: Option<&str>,
+    owned_command: Option<&str>,
 ) -> Result<render::Evidence> {
     report_attach_failures(session);
     // Authoritative attach stamp (T2, G-14): the session is fully attached
@@ -3108,6 +3762,7 @@ fn run_loop(
                 drain,
                 uretprobe_override,
                 resource_start,
+                owned_command,
             )
         }
     };
@@ -3151,6 +3806,7 @@ pub(crate) fn run_profile_loop_for_test(
         None,
         resource_start,
         select_endpoint,
+        None,
     )
 }
 
@@ -3162,12 +3818,29 @@ pub struct OwnedRunOutcome {
     /// signalled). `None` exactly when `--duration` expired without
     /// `--kill-on-timeout` and the child was handed back still running.
     pub child_exit_code: Option<i32>,
+    /// True when `--kill-on-timeout` was requested and the timeout kill
+    /// reaped a live child by signal: a normal end, reported as
+    /// success even though the child's own status is a signal death.
+    pub requested_timeout_kill: bool,
     /// Mirrors `evidence.child_still_running`.
     pub child_still_running: bool,
     /// The child this run owned. A handed-back child must be nameable or the
     /// operator cannot find what `run` left alive. Not a rendered field.
     pub child_pid: u32,
     pub evidence: render::Evidence,
+}
+
+impl OwnedRunOutcome {
+    /// The process exit code for this run: a requested timeout kill
+    /// and a handed-back child are observer success (0); otherwise
+    /// the child's own status, as a shell would report it.
+    pub fn exit_code(&self) -> i32 {
+        if self.requested_timeout_kill {
+            0
+        } else {
+            self.child_exit_code.unwrap_or(0)
+        }
+    }
 }
 
 /// The owned child and the coordinator that protects its live windows, plus
@@ -3181,6 +3854,7 @@ struct Owned {
     kill_on_timeout: bool,
     pid: u32,
     exit_code: Option<i32>,
+    requested_kill: bool,
     still_running: bool,
     /// The run's own pre-spawn scope start: the claim start the terminal
     /// pre-arm hold composes with the coordinator's proven segment.
@@ -3288,6 +3962,7 @@ impl Owned {
             signals,
             &mut self.pending_handoff,
             &mut self.exit_code,
+            &mut self.requested_kill,
             &mut self.still_running,
         );
         // A reaped child is an expected target exit: without the mark, a
@@ -3315,8 +3990,10 @@ fn settle_owned_child(
     signals: &SignalState,
     pending: &mut Option<OwnedChild>,
     exit_code: &mut Option<i32>,
+    requested_kill: &mut bool,
     still_running: &mut bool,
 ) -> Result<()> {
+    *requested_kill = false;
     let end = if end == CaptureEnd::DurationExpired && signals.interrupted() {
         CaptureEnd::Signal
     } else {
@@ -3342,6 +4019,14 @@ fn settle_owned_child(
     let child = retained
         .as_mut()
         .context("owned child missing during settlement")?;
+    // A requested timeout kill of a live child is a normal end. Probe
+    // liveness before the reap: a child that already exited keeps its
+    // own status unmarked. Only a death by the observer's own signal
+    // counts as our kill: a voluntary exit (however high its code)
+    // and a spontaneous signal death before our signal was sent both
+    // propagate unmarked.
+    let requested = end == CaptureEnd::DurationExpired && kill_on_timeout;
+    let was_alive = requested && child.still_running();
     let settled: Result<ChildOutcome> =
         if (end == CaptureEnd::Signal || signals.interrupted()) && child.still_running() {
             settle_after_signal(child, signals)
@@ -3351,6 +4036,12 @@ fn settle_owned_child(
                 .map(ChildOutcome::Exited)
                 .map_err(|error| anyhow!("run: reaping the owned child: {error}"))
         };
+    if let Ok(ChildOutcome::Exited(code)) = &settled {
+        let signalled = child.reaped_signalled == Some(true);
+        let term_kill = *code == 128 + libc::SIGTERM && child.sent_term;
+        let kill_kill = *code == 128 + libc::SIGKILL && child.sent_kill;
+        *requested_kill = was_alive && signalled && (term_kill || kill_kill);
+    }
     record_settlement_result(child, settled, exit_code, still_running)
 }
 
@@ -3816,13 +4507,16 @@ fn run_owned_inner_with_host(
         .ok_or_else(|| anyhow!("run: no command to exec"))?;
     // An exec failure is its own finite category (design §10.3). Resolving the
     // command first means a command that cannot run is refused by name before
-    // anything is forked, attached, or released past its barrier.
-    resolve_program(&program)
+    // anything is forked, attached, or released past its barrier. The
+    // canonical path also labels the trace lines the identity proof cannot
+    // resolve.
+    let resolved_command = resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
+    let owned_command = resolved_command.to_string_lossy();
     // Name errors precede hazard errors: a script (or a non-executable)
     // is refused with its interpreter fix before any kernel verdict is
     // consulted, exactly as `spawn` would refuse it at the fork.
-    check_owned_target_runnable(&program, &args.command[1..])
+    check_owned_target_runnable(&program, &args.command[1..], args.user.as_deref())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let _host = host()?;
     // Before the fork: the owned child can install a seccomp filter after
@@ -3838,11 +4532,20 @@ fn run_owned_inner_with_host(
                 reason: reason.to_owned(),
             });
 
+    // The overlay-witness BPF session load is process setup, not query
+    // work: run it before the child exists, never lazily inside a
+    // pause-cycle engine apply it can outlast (see preload_session).
+    crate::discovery::overlay_witness::preload_session();
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
-    let mut child = OwnedChild::spawn(program, command.collect())
-        .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
+    let mut child = OwnedChild::spawn_verbose_as(
+        program,
+        command.collect(),
+        args.verbose,
+        args.user.as_deref(),
+    )
+    .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let pid = child.pid();
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
         combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
@@ -3850,6 +4553,8 @@ fn run_owned_inner_with_host(
     let scope = Scope::Pid(pid);
     let capture_args = CaptureArgs {
         track_short_lived: args.track_short_lived,
+        verbose: false,
+        quiet: false,
         kind: args.kind,
         modules: args.modules.clone(),
         exclude_modules: args.exclude_modules.clone(),
@@ -3901,7 +4606,7 @@ fn run_owned_inner_with_host(
     // `initial_set_capture = none` with sticky `PARTIAL`.
     let mut session = engine
         .start_owned_session(policy, &mut child, args.ring_bytes, args.attach_backend)
-        .context("starting attach session")
+        .map_err(attach_session_context)
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 
     let preflight = {
@@ -3938,6 +4643,7 @@ fn run_owned_inner_with_host(
         kill_on_timeout: args.kill_on_timeout,
         pid,
         exit_code: None,
+        requested_kill: false,
         still_running: false,
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
@@ -4039,6 +4745,7 @@ fn run_owned_inner_with_host(
         uretprobe_override,
         resource_start,
         args.select_endpoint.as_deref(),
+        Some(&owned_command),
     )
     .map_err(|error| {
         combine_handoff_failure(error, abort_pending_handoff(&mut owned.pending_handoff))
@@ -4065,8 +4772,15 @@ fn run_owned_inner_with_host(
     if owned.still_running {
         emit_capture_diagnostic(&format_handoff_note(owned.pid));
     }
+    // A nonzero child status is named on stderr: the observer exits
+    // with it, and that exit must never be silent about whose status
+    // it is. A clean exit needs no line; a handed-back child has none.
+    if let Some(line) = child_exit_status_line(owned.exit_code) {
+        emit_capture_diagnostic(&line);
+    }
     Ok(OwnedRunOutcome {
         child_exit_code: owned.exit_code,
+        requested_timeout_kill: owned.requested_kill,
         child_still_running: owned.still_running,
         child_pid: owned.pid,
         evidence,
@@ -5144,8 +5858,28 @@ fn observe_capture_cancel(
 /// The one readiness line, printed on stderr once probes are attached and the
 /// capture loop starts. The live frame is TTY-only, so scripts and supervisors
 /// wait for this line instead of guessing when calls start being observed.
-pub(crate) fn capture_ready_line(attached_probes: usize) -> String {
-    format!("p11scope: capturing: {attached_probes} probe(s) attached; stop with Ctrl-C")
+/// Extra capture diagnostics on stderr: verbose text or the explicit
+/// opt-in switch. Default stderr keeps the readiness line and real
+/// warnings only; progress, statistics and all-clear lines stay behind
+/// this gate.
+pub(crate) fn capture_diagnostics_on() -> bool {
+    crate::cli::text_is_verbose()
+        || std::env::var("P11SCOPE_CAPTURE_DIAGNOSTICS").as_deref() == Ok("1")
+}
+
+pub(crate) fn capture_ready_line(attached_probes: usize, owned: bool) -> String {
+    if attached_probes == 0 {
+        return if owned {
+            "p11scope: capturing: waiting for the command to load a provider; stop with Ctrl-C"
+                .to_string()
+        } else {
+            "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C".to_string()
+        };
+    }
+    format!(
+        "p11scope: capturing: {attached_probes} probe{} attached; stop with Ctrl-C",
+        if attached_probes == 1 { "" } else { "s" },
+    )
 }
 
 fn loader_readiness_line(active_hooks: usize) -> String {
@@ -5159,8 +5893,11 @@ pub(crate) fn attach_fallback_line(fallback: Option<&str>) -> Option<String> {
     fallback.map(|reason| format!("p11scope: attach backend: per-offset links ({reason})"))
 }
 
-fn target_exit_marker(ticks: u64) -> String {
-    format!("p11scope: capture ended: target exited after {ticks} ticks")
+/// A non-owned target's exit ends the capture: one plain line naming
+/// it. Owned runs name the child's status instead, so they never
+/// print this marker.
+fn target_exit_marker() -> String {
+    "p11scope: capture ended: target exited".to_string()
 }
 
 /// The plain-words stderr line emitted beside the target-exit marker when
@@ -5175,9 +5912,19 @@ fn target_exit_cleanup_pending_line(tripped: bool) -> Option<String> {
     })
 }
 
+/// The owned child's nonzero status, named on stderr beside the
+/// capture's own diagnostics. `None` for a clean exit or a
+/// handed-back child, which need no line.
+fn child_exit_status_line(exit_code: Option<i32>) -> Option<String> {
+    match exit_code {
+        Some(code) if code != 0 => Some(format!("command exited with status {code}")),
+        _ => None,
+    }
+}
+
 const PROFILE_CADENCE: Duration = Duration::from_secs(1);
 const TRACE_CADENCE: Duration = Duration::from_millis(200);
-const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
+pub(crate) const DEFAULT_TRACE_MAX_EVENTS: u64 = 10_000_000;
 
 fn resolve_trace_max_events(max_events: Option<u64>) -> u64 {
     max_events.unwrap_or(DEFAULT_TRACE_MAX_EVENTS)
@@ -5427,7 +6174,7 @@ pub(crate) fn stop_quiescence_for(state: StopState) -> render::StopQuiescence {
 /// stalls here for the full budget with no other symptom).
 fn quiescence_unproven_line(waited: Duration, in_flight: u64) -> String {
     format!(
-        "p11scope: terminal quiescence: QuiescenceUnproven after {waited:?}, {in_flight} calls still in flight"
+        "p11scope: terminal quiescence unproven after {waited:?}, {in_flight} calls still in flight"
     )
 }
 
@@ -5553,8 +6300,23 @@ fn capture_profile(
             &mut selection_ledger,
         );
     }
+    // A selection that never opened a window says so once, here:
+    // the JSON ledger alone left `--select-endpoint` a silent
+    // no-op. The close path stays quiet for these (no window opened).
+    if let Some(name) = select_endpoint
+        && k0_window.is_none()
+        && let Some((_, Some(refusal))) = selection_ledger.selection_outcome()
+    {
+        emit_capture_diagnostic(
+            &metrics::selected_detail_driver::format_selection_refused_line(
+                name,
+                refusal,
+                owned.is_some(),
+            ),
+        );
+    }
     let cancellation = CaptureCancellation::default();
-    let live_display = LiveDisplay::for_stdout();
+    let live_display = LiveDisplay::for_capture(owned.is_some());
     let mut stdout_sink = crate::sink::stdout_sink()?;
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
@@ -5677,8 +6439,13 @@ fn capture_profile(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
     }
-    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
+    if capture_diagnostics_on() {
+        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    }
+    emit_capture_diagnostic(&capture_ready_line(
+        session.attached_probes(),
+        owned.is_some(),
+    ));
     #[cfg(test)]
     crate::first_use_probe::loop_started(&session.events_domain(), scheduling.loop_start_mono_ns);
     #[rustfmt::skip]
@@ -5864,6 +6631,9 @@ fn capture_profile(
                 engine.pinned().provider_changed(),
                 profile,
                 owned.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                owned
+                    .as_deref()
+                    .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
                 owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
                 scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
@@ -5875,6 +6645,7 @@ fn capture_profile(
                 session.unpublished_mechanisms(),
             );
             render::apply_counter_snapshot(&mut ev, &snapshot);
+            render::apply_legacy_gaps(&mut ev, &snapshot);
             let frame = render::live_snapshot_scoped(
                 &snapshot,
                 &ev,
@@ -5954,7 +6725,10 @@ fn capture_profile(
         );
     };
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        // Owned runs name the child's status instead of this marker.
+        if owned.is_none() {
+            let _ = crate::sink::try_stderr_line(&target_exit_marker());
+        }
         if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
         {
             let _ = crate::sink::try_stderr_line(&line);
@@ -5989,7 +6763,10 @@ fn capture_profile(
     );
     // Diagnostics are optional; closed/slow stderr cannot skip owned cleanup.
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
-    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // Findings always warn; a clean or unavailable detector is diagnostics.
+    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
+        let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    }
     // K0: snapshot the exec witness while the tap is still live.
     // Quiescence invalidates the PID lifecycle tap (and the later
     // terminal drain would too), so a snapshot past this point always
@@ -6494,6 +7271,17 @@ fn capture_profile(
                 after_losses,
                 ledger,
             );
+            // A resolved selection whose detail voided at close says
+            // so once, here: the JSON ledger alone left the void
+            // silent. Selections refused before any window opened
+            // already spoke at selection time, never here.
+            if let Some((endpoint, Some(refusal))) = ledger.selection_outcome() {
+                emit_capture_diagnostic(
+                    &metrics::selected_detail_driver::format_selection_withheld_line(
+                        endpoint, refusal,
+                    ),
+                );
+            }
         }
         poll_terminal_cancellation();
         consumers
@@ -6566,6 +7354,10 @@ fn capture_profile(
                 .2
                 .as_deref()
                 .map_or_else(Default::default, |owned| owned.coordinator.counters()),
+            context
+                .2
+                .as_deref()
+                .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
             context.2.as_deref().map(|owned| owned.still_running),
             capture_tracking_degraded,
             consumers
@@ -6582,6 +7374,7 @@ fn capture_profile(
         ev.apply_stop_quiescence(consumers.stop_quiescence);
         ev.settle_terminal(profile);
         render::apply_counter_snapshot(&mut ev, &snapshot);
+        render::apply_legacy_gaps(&mut ev, &snapshot);
         let facts = context.0.capture_facts();
         let frame = render::live_snapshot_scoped(
             &snapshot,
@@ -6609,11 +7402,10 @@ fn capture_profile(
             profile,
         );
         render::apply_counter_snapshot(&mut ev, &snapshot);
+        render::apply_legacy_gaps(&mut ev, &snapshot);
         let summaries = timing_summary_lines(&ev.scheduling);
         poll_terminal_cancellation();
-        for summary in &summaries {
-            let _ = crate::sink::try_stderr_line(summary);
-        }
+        emit_timing_summaries(&summaries);
 
         poll_terminal_cancellation();
         if let Some(mut out_file) = context.5.take() {
@@ -6643,6 +7435,7 @@ fn capture_profile(
                 render::json(reports, &ev, &capture)
             };
             let j = render::with_counter_snapshot(j, &snapshot);
+            let j = render::with_legacy_snapshot(j, &snapshot);
             let j = match selection_ledger {
                 Some(ledger) => metrics::selected_detail_driver::with_selected_detail(j, ledger),
                 None => j,
@@ -6691,6 +7484,7 @@ fn capture_trace(
     drain: Duration,
     uretprobe_override: Option<render::UretprobeOverride>,
     resource_start: crate::timing::ResourceSample,
+    owned_command: Option<&str>,
 ) -> Result<render::Evidence> {
     let trace_limit = resolve_trace_max_events(max_events);
     let cancellation = CaptureCancellation::default();
@@ -6741,6 +7535,9 @@ fn capture_trace(
         ));
     }
     let mut tracer = trace::Tracer::new(engine.plan());
+    if let (Some(command), Some(owned)) = (owned_command, owned.as_deref()) {
+        tracer.set_owned_command(owned.pid, command.to_string());
+    }
     #[cfg(feature = "h6-reexec-diagnostic")]
     let reexec_diagnostic = session.reexec_diagnostic();
 
@@ -6760,16 +7557,18 @@ fn capture_trace(
     let mut frames = 0u64;
     let mut ticks = 0u64;
     let mut pin_gate = crate::timing::PinSweepGate::new();
-    if let Err(error) = emit_trace_line(
-        &format!(
-            "{}\n{}",
-            trace::capture_line(policy),
-            trace::identity_note()
-        ),
-        stdout,
-        &mut stdout_open,
-        out_file,
-    ) {
+    // The header says once that unverified calls are not decoded, when
+    // the plan watches any: no per-line marker repeats it.
+    let mut header = format!(
+        "{}\n{}",
+        trace::capture_line(policy),
+        trace::identity_note()
+    );
+    if trace::watches_unverified(engine.plan()) {
+        header.push('\n');
+        header.push_str(trace::unverified_note());
+    }
+    if let Err(error) = emit_trace_line(&header, stdout, &mut stdout_open, out_file) {
         return Err(finish_capture_error(
             error,
             engine,
@@ -6787,8 +7586,13 @@ fn capture_trace(
     if let Some(line) = attach_fallback_line(session.backend_fallback()) {
         emit_capture_diagnostic(&line);
     }
-    emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
-    emit_capture_diagnostic(&capture_ready_line(session.attached_probes()));
+    if capture_diagnostics_on() {
+        emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
+    }
+    emit_capture_diagnostic(&capture_ready_line(
+        session.attached_probes(),
+        owned.is_some(),
+    ));
     #[rustfmt::skip]
     let loop_result = (|| -> Result<CaptureEnd> {
     loop {
@@ -7037,7 +7841,10 @@ fn capture_trace(
         STOP_QUIESCE_BUDGET.saturating_sub(stop_started.elapsed()),
     );
     if matches!(loop_result, Ok(CaptureEnd::TargetExit)) {
-        let _ = crate::sink::try_stderr_line(&target_exit_marker(ticks));
+        // Owned runs name the child's status instead of this marker.
+        if owned.is_none() {
+            let _ = crate::sink::try_stderr_line(&target_exit_marker());
+        }
         if let Some(line) = target_exit_cleanup_pending_line(engine.expected_target_exit_tripped())
         {
             let _ = crate::sink::try_stderr_line(&line);
@@ -7067,7 +7874,10 @@ fn capture_trace(
         loop_end_reason,
     );
     scheduling.sample_resource(crate::timing::ResourcePoint::End);
-    let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    // Findings always warn; a clean or unavailable detector is diagnostics.
+    if capture_diagnostics_on() || scheduling.longrun_has_findings(loop_event_loss.is_some()) {
+        let _ = crate::sink::try_stderr_line(&scheduling.longrun_line(loop_event_loss.is_some()));
+    }
     // Poll for quiescence (owner budget), servicing the drains between
     // polls without admitting producers. Discovery records stage here and
     // apply after the poll; EVENTS reduce in place. Every failure below
@@ -7423,39 +8233,41 @@ fn capture_trace(
                         .scheduling
                         .sync_newcomer_stats(context.0, crate::attach::monotonic_ns());
                     consumers.scheduling.sync_tail_stats(context.0);
-                    let mut evidence = evidence_for(
-                        context.0,
-                        context.0.capture_facts(),
-                        context.1.attached_probes(),
-                        context.1.dynamic_per_offset_attached(),
-                        context.1.static_multi_attached(),
-                        context.1.attach_backend_evidence(),
-                        context.1.object_capture_evidence(),
-                        context.1.attach_failures(),
-                        &reports,
-                        terminal_kernel,
-                        consumers.tracker.evidence(),
-                        *consumers.malformed_records,
-                        consumers.state,
-                        context.0.pinned().provider_changed(),
-                        true,
-                        context
-                            .2
-                            .as_deref()
-                            .map_or_else(Default::default, |owned| owned.coordinator.counters()),
-                        context.2.as_deref().map(|owned| owned.still_running),
-                        capture_tracking_degraded,
-                        consumers
-                            .scheduling
-                            .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
-                        uretprobe_override.clone(),
-                        context
-                            .2
-                            .as_deref()
-                            .and_then(|owned| owned.still_running.then_some(owned.pid)),
-                        None,
-                        context.1.unpublished_mechanisms(),
-                    );
+                    // The frozen consumer map pins the single-line coordinator
+                    // projections below; keep them byte-stable for the marker.
+                    #[rustfmt::skip]
+                    let mut evidence =
+                        evidence_for(
+                            context.0,
+                            context.0.capture_facts(),
+                            context.1.attached_probes(),
+                            context.1.dynamic_per_offset_attached(),
+                            context.1.static_multi_attached(),
+                            context.1.attach_backend_evidence(),
+                            context.1.object_capture_evidence(),
+                            context.1.attach_failures(),
+                            &reports,
+                            terminal_kernel,
+                            consumers.tracker.evidence(),
+                            *consumers.malformed_records,
+                            consumers.state,
+                            context.0.pinned().provider_changed(),
+                            true,
+                            context.2.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
+                            context.2.as_deref().map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
+                            context.2.as_deref().map(|owned| owned.still_running),
+                            capture_tracking_degraded,
+                            consumers
+                                .scheduling
+                                .snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
+                            uretprobe_override.clone(),
+                            context
+                                .2
+                                .as_deref()
+                                .and_then(|owned| owned.still_running.then_some(owned.pid)),
+                            None,
+                            context.1.unpublished_mechanisms(),
+                        );
                     // Trace without `-o` writes its data to stdout, so only
                     // there are slow-sink drops lost data (review F-4).
                     evidence.stdout_data_sink = context.7.is_none();
@@ -7482,6 +8294,7 @@ fn capture_trace(
                         context.5,
                         context.6,
                         context.7,
+                        crate::cli::text_verbosity(),
                     )?;
                     crate::attach::reexec_diagnostic::terminal!(context.1, |diag| {
                         let gap = context.1.physical_gap_summary();
@@ -7508,9 +8321,7 @@ fn capture_trace(
                     });
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
-                    for summary in &summaries {
-                        let _ = crate::sink::try_stderr_line(summary);
-                    }
+                    emit_timing_summaries(&summaries);
                     Ok(evidence)
                 },
             )
@@ -7585,6 +8396,7 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
     stdout_open: &mut bool,
     out_file: &mut Option<W>,
+    verbosity: crate::cli::TextVerbosity,
 ) -> Result<()> {
     if evidence.trace_truncated {
         emit_trace_line(
@@ -7624,9 +8436,41 @@ fn emit_trace_terminal_accounted<W: Write>(
     stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
     flush_stdout(stdout, stdout_open)?;
     collect_sink_drops(stdout, scheduling, &mut None, Instant::now());
-    // Refresh from the accumulator — the profile terminal does the same —
-    // then resolve the file record's exact total: counted drops plus any
-    // file/stdout record-length delta from the terminal flush's own drops.
+    // Refresh from the accumulator — the profile terminal does the same.
+    evidence.scheduling = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
+    // F-4: the terminal flush's own drops landed after the verdict. Judge the
+    // record and the returned evidence on the final data accounting. With `-o`
+    // stdout is display only, so this never changes the file record's
+    // length and the byte-exact total below stays exact. The verdict judges
+    // the data bytes only: the human tail below is display, and its drops
+    // must never gate PARTIAL.
+    evidence.settle_terminal(true);
+    // The human tail, after the machine records: totals, one coverage
+    // line, and the `-v` hint in default text. Its stdout copy flushes
+    // with the terminal bytes so the file record's total below stays
+    // byte-exact; its file copy lands after the file EVIDENCE so COUNT
+    // still immediately precedes EVIDENCE there.
+    let sum = |field: fn(&metrics::SlotReport) -> u64| {
+        reports
+            .iter()
+            .fold(0u64, |total, row| total.saturating_add(field(row)))
+    };
+    let tail = trace::terminal_summary(
+        sum(|row| row.calls),
+        sum(|row| row.errors),
+        sum(|row| row.in_flight),
+        evidence,
+        verbosity,
+    );
+    for line in &tail {
+        emit_trace_line(line, stdout, stdout_open, &mut None::<std::io::Sink>)?;
+    }
+    stdout.begin_tick(crate::sink::SINK_TICK_BUDGET);
+    flush_stdout(stdout, stdout_open)?;
+    collect_sink_drops(stdout, scheduling, &mut None, Instant::now());
+    // Refresh again — now including the tail's own drops — then resolve
+    // the file record's exact total: counted drops plus any file/stdout
+    // record-length delta from the terminal flushes' own drops.
     evidence.scheduling = scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64);
     let counted = evidence.scheduling.sink_dropped_bytes;
     let total = resolve_terminal_sink_total(counted, stdout_line_len, |candidate| {
@@ -7634,15 +8478,17 @@ fn emit_trace_terminal_accounted<W: Write>(
         trace::evidence_line(evidence, policy).len() + 1
     });
     evidence.scheduling.sink_dropped_bytes = total;
-    // F-4: the terminal flush's own drops landed after the verdict. Judge the
-    // record and the returned evidence on the final accounting. With `-o`
-    // stdout is display only, so this never changes the file record's
-    // length and the byte-exact total above stays exact.
-    evidence.settle_terminal(true);
     if let Some(file) = out_file.as_mut() {
         writeln!(file, "{}", trace::evidence_line(evidence, policy))
             .context("writing trace output file")?;
         file.flush().context("flushing trace output file")?;
+    }
+    {
+        let mut discard = std::io::sink();
+        let mut discard_open = true;
+        for line in &tail {
+            emit_trace_line(line, &mut discard, &mut discard_open, out_file)?;
+        }
     }
     Ok(())
 }
@@ -7700,10 +8546,13 @@ struct LiveDisplay {
 }
 
 impl LiveDisplay {
-    fn for_stdout() -> Self {
+    /// An owned run never clears: the child's own output shares the
+    /// terminal, so per-frame redraws are suppressed and the final
+    /// frame prints once, as plain text.
+    fn for_capture(owned: bool) -> Self {
         use std::io::IsTerminal as _;
         Self {
-            terminal: std::io::stdout().is_terminal(),
+            terminal: !owned && std::io::stdout().is_terminal(),
         }
     }
 
@@ -8040,6 +8889,14 @@ impl SchedulingAccumulator {
         )
     }
 
+    /// True when the long-run detector has findings worth warning
+    /// about. A clean or unavailable detector stays behind the
+    /// diagnostics gate; findings always print.
+    fn longrun_has_findings(&self, end_loss_available: bool) -> bool {
+        self.longrun_report(end_loss_available)
+            .is_some_and(|report| !report.is_clean())
+    }
+
     pub(crate) fn note_live_drain(&mut self, outcome: &ReadyOutcome) {
         self.drain_repolls = self.drain_repolls.saturating_add(outcome.repolls);
         if outcome.budget_exhausted {
@@ -8328,6 +9185,24 @@ fn resource_evidence_of(timeline: &crate::timing::ResourceTimeline) -> render::R
         end: resource_sample_of(&timeline.end),
         last_periodic: resource_sample_of(&timeline.last_periodic),
     }
+}
+
+/// Emits the Phase-2 timing summary: the newcomer-queue line always
+/// (the stop-race oracle cross-checks stderr pending against the
+/// report), the rest verbose-only.
+fn emit_timing_summaries(summaries: &[String]) {
+    for summary in timing_summaries_to_emit(summaries, crate::cli::text_is_verbose()) {
+        let _ = crate::sink::try_stderr_line(summary);
+    }
+}
+
+/// The [`emit_timing_summaries`] gate as a pure predicate, so tests
+/// pin it without capturing stderr.
+fn timing_summaries_to_emit(summaries: &[String], verbose: bool) -> Vec<&String> {
+    summaries
+        .iter()
+        .filter(|summary| summary.contains("timing: newcomer queue:") || verbose)
+        .collect()
 }
 
 /// The concise operator-visible timing summary (Phase 2): stage totals,
@@ -8902,6 +9777,7 @@ pub(crate) fn evidence_for(
     provider_changed: bool,
     include_selection: bool,
     pause: crate::discovery::pause::PauseCounters,
+    pause_engine_incomplete_retirements: u64,
     child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
     scheduling: render::SchedulingEvidence,
@@ -9018,6 +9894,7 @@ pub(crate) fn evidence_for(
         pause_confirmed: pause.confirmed,
         pause_partial: pause.partial,
         pause_unavailable: pause.unavailable,
+        pause_engine_incomplete_retirements,
         child_still_running,
         discovery_ring_loss,
         discovery_state_failures,
@@ -9106,6 +9983,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         false,
         true,
         Default::default(),
+        0,
         None,
         false,
         render::SchedulingEvidence::default(),
@@ -9202,6 +10080,78 @@ mod tests {
     use std::time::{Duration, Instant};
 
     static ACTUAL_SIGNAL_TEST: Mutex<()> = Mutex::new(());
+
+    /// CLI-1: default runs emit only the newcomer-queue timing line
+    /// (the oracle's cross-check); `-v` emits every timing line.
+    #[test]
+    fn timing_summaries_emit_only_the_newcomer_queue_by_default() {
+        let summaries = vec![
+            "p11scope: timing: stages: scan 6ms".to_string(),
+            "p11scope: timing: newcomer queue: admitted 1 (max/mean age 2ms/1ms), pending 0 (oldest -), dropped 0 (max age -)".to_string(),
+        ];
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, false),
+            vec![&summaries[1]],
+        );
+        assert_eq!(
+            timing_summaries_to_emit(&summaries, true),
+            vec![&summaries[0], &summaries[1]],
+        );
+    }
+
+    /// F7: `run --quiet` frames are header, totals and coverage only —
+    /// no function table, no Evidence, no `-v` hint. Mirrors
+    /// `render::tests::quiet_live_frame_keeps_header_totals_coverage_only`
+    /// from run's perspective (run renders through the shared live
+    /// frame); a quiet-shape regression in the shared renderer would
+    /// break run's quiet output here as well as there.
+    #[test]
+    fn run_quiet_frame_keeps_header_totals_coverage_only() {
+        use crate::attach::CapturePolicy;
+        use crate::render::tests::evidence;
+        use p11scope_ebpf_common::{CounterMode, LATENCY_BUCKETS};
+        use std::collections::BTreeMap;
+        use std::time::Duration;
+        let report = crate::metrics::SlotReport {
+            file_offset: 0,
+            target_object: None,
+            ordinals: Vec::new(),
+            names: vec!["C_Sign".into()],
+            aliased: false,
+            semantic_authorized: true,
+            module: None,
+            module_ambiguous: false,
+            module_unresolved: false,
+            mode: CounterMode::Latency,
+            calls: 10,
+            errors: 0,
+            in_flight: 0,
+            total_ns: 0,
+            max_ns: 0,
+            buckets: [0; LATENCY_BUCKETS],
+            rv_counts: Default::default(),
+        };
+        let mut ev = evidence();
+        ev.event_loss = 12;
+        ev.verdict();
+        let out = crate::render::live_scoped_with_verbosity(
+            &[report],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("p11scope — PID scope"), "{out}");
+        assert!(out.contains("10 completed calls;"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("FUNCTION"), "{out}");
+        assert!(!out.contains("Evidence:"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
 
     /// The timing summary wraps to short prefixed stderr lines: every line
     /// stays greppable under `p11scope: timing:`, every token of the old
@@ -10023,6 +10973,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,
@@ -10111,10 +11062,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             nonroot,
-            ChildIdentity {
+            SelectedIdentity {
                 uid: 1000,
                 gid: 1001,
-                clear_groups: false,
+                sudo_drop: false,
             }
         );
 
@@ -10127,10 +11078,10 @@ mod tests {
         .unwrap();
         assert_eq!(
             sudo,
-            ChildIdentity {
+            SelectedIdentity {
                 uid: 1000,
                 gid: 1001,
-                clear_groups: true,
+                sudo_drop: true,
             }
         );
 
@@ -10186,25 +11137,28 @@ mod tests {
     }
 
     #[test]
-    fn privileged_child_environment_is_an_allowlist() {
-        let identity = ChildIdentity {
-            uid: 1000,
-            gid: 1000,
-            clear_groups: true,
-        };
-        let environment = child_environment(
-            identity,
-            [
-                (OsString::from("PATH"), OsString::from("/root/bin")),
-                (OsString::from("SSH_AUTH_SOCK"), OsString::from("/secret")),
-                (OsString::from("API_TOKEN"), OsString::from("secret")),
-                (OsString::from("TERM"), OsString::from("xterm")),
-                (
-                    OsString::from("SOFTHSM2_CONF"),
-                    OsString::from("/tmp/softhsm2.conf"),
-                ),
-            ],
-        )
+    fn child_environment_passes_the_user_environment_through_unchanged() {
+        // The base passthrough both paths share; the sudo-drop path then
+        // replaces only the account-database variables on top of it
+        // (apply_env_overrides), so the workload behaves as without p11scope.
+        let environment = child_environment([
+            (OsString::from("PATH"), OsString::from("/user/bin:/bin")),
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("LANG"), OsString::from("en_US.UTF-8")),
+            (
+                OsString::from("PKCS11_PROVIDER_MODULE"),
+                OsString::from("/usr/lib64/pkcs11/libsofthsm2.so"),
+            ),
+            (
+                OsString::from("XDG_CONFIG_HOME"),
+                OsString::from("/home/user/.config"),
+            ),
+            (OsString::from("TERM"), OsString::from("xterm")),
+            (
+                OsString::from("SOFTHSM2_CONF"),
+                OsString::from("/tmp/softhsm2.conf"),
+            ),
+        ])
         .unwrap();
         let environment: Vec<_> = environment
             .iter()
@@ -10213,13 +11167,1271 @@ mod tests {
         assert_eq!(
             environment,
             [
-                "PATH=/usr/bin:/bin",
-                "LANG=C",
-                "LC_ALL=C",
+                "PATH=/user/bin:/bin",
+                "HOME=/home/user",
+                "LANG=en_US.UTF-8",
+                "PKCS11_PROVIDER_MODULE=/usr/lib64/pkcs11/libsofthsm2.so",
+                "XDG_CONFIG_HOME=/home/user/.config",
                 "TERM=xterm",
                 "SOFTHSM2_CONF=/tmp/softhsm2.conf",
             ]
         );
+    }
+
+    #[test]
+    fn child_environment_removes_only_p11scope_controlled_variables() {
+        let environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (OsString::from("SUDO_GID"), OsString::from("1000")),
+            (OsString::from("SUDO_USER"), OsString::from("user")),
+            (
+                OsString::from("SUDO_COMMAND"),
+                OsString::from("/usr/bin/p11scope"),
+            ),
+            // The whole SUDO_ prefix is controlled, not just the four
+            // names above: SUDO_HOME reached a child before this strip.
+            (OsString::from("SUDO_HOME"), OsString::from("/root")),
+            (OsString::from("SUDO_TTY"), OsString::from("/dev/pts/0")),
+            (
+                OsString::from("P11SCOPE_LOADER_ENV_SANITIZED"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("P11SCOPE_TEST_DISCOVERY_PROVIDER"),
+                OsString::from("/tmp/x.so"),
+            ),
+            (OsString::from("NOT_P11SCOPE"), OsString::from("kept")),
+            // Near-misses without the underscore stay workload input.
+            (OsString::from("SUDOISH"), OsString::from("kept")),
+        ])
+        .unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            ["HOME=/home/user", "NOT_P11SCOPE=kept", "SUDOISH=kept"]
+        );
+    }
+
+    #[test]
+    fn child_env_removal_notice_names_variables_never_values() {
+        assert_eq!(child_env_removal_notice([]), None);
+        assert_eq!(
+            child_env_removal_notice([
+                (OsString::from("HOME"), OsString::from("/home/user")),
+                (OsString::from("PATH"), OsString::from("/bin")),
+            ]),
+            None
+        );
+        let notice = child_env_removal_notice([
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (
+                OsString::from("P11SCOPE_LOADER_ENV_SANITIZED"),
+                OsString::from("s3cret-value"),
+            ),
+            (OsString::from("SUDO_COMMAND"), OsString::from("s3cret-cmd")),
+        ])
+        .unwrap();
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+        assert!(notice.contains("SUDO_UID"), "{notice:?}");
+        assert!(notice.contains("SUDO_COMMAND"), "{notice:?}");
+        assert!(
+            notice.contains("P11SCOPE_LOADER_ENV_SANITIZED"),
+            "{notice:?}"
+        );
+        assert!(!notice.contains("1000"), "{notice:?}");
+        assert!(!notice.contains("s3cret"), "{notice:?}");
+        assert!(!notice.contains("HOME"), "{notice:?}");
+    }
+
+    #[test]
+    fn removal_notice_is_absent_without_verbose() {
+        // The spawn gate: the same withheld variables that name a notice
+        // under -v stay quiet without it, and -v with nothing withheld
+        // stays quiet too.
+        let variables = || {
+            [
+                (OsString::from("SUDO_UID"), OsString::from("1000")),
+                (OsString::from("HOME"), OsString::from("/home/user")),
+            ]
+        };
+        assert!(verbose_removal_notice(false, variables()).is_none());
+        let notice = verbose_removal_notice(true, variables()).unwrap();
+        assert!(notice.contains("SUDO_UID"), "{notice:?}");
+        assert!(verbose_removal_notice(true, []).is_none());
+    }
+
+    fn fake_passwd(
+        name: &str,
+        home: &str,
+        shell: &str,
+        uid: libc::uid_t,
+        gid: libc::gid_t,
+    ) -> PasswdRecord {
+        PasswdRecord {
+            name: OsString::from(name),
+            home: OsString::from(home),
+            shell: OsString::from(shell),
+            uid,
+            gid,
+        }
+    }
+
+    #[test]
+    fn sudo_drop_restores_the_invokers_groups_home_and_runtime_dir() {
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1000);
+                Some(fake_passwd(
+                    "testuser",
+                    "/home/testuser",
+                    "/bin/bash",
+                    1000,
+                    1001,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("the sudo path resolves by uid, never by name");
+            },
+            grouplist: &|user: &OsStr, gid: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                assert_eq!(user, OsStr::new("testuser"));
+                assert_eq!(gid, 1001);
+                Some(vec![27, 1001, 27, 44])
+            },
+            dir_owner: &|path: &Path| -> Option<(bool, libc::uid_t)> {
+                assert_eq!(path, Path::new("/run/user/1000"));
+                Some((true, 1000))
+            },
+        };
+        let identity = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1000);
+        assert_eq!(identity.gid, 1001);
+        let restored = identity
+            .sudo_drop
+            .as_ref()
+            .expect("sudo selects the drop path");
+        assert_eq!(restored.user, OsString::from("testuser"));
+        assert_eq!(restored.groups, vec![27, 44, 1001]);
+        assert_eq!(
+            restored.xdg_runtime_dir.as_deref(),
+            Some(OsStr::new("/run/user/1000"))
+        );
+    }
+
+    #[test]
+    fn sudo_drop_without_sudo_touches_no_account_database() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("non-sudo run must not read passwd");
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("non-sudo run must not read passwd");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("non-sudo run must not read groups");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("non-sudo run must not stat the runtime dir");
+            },
+        };
+        let identity = ChildIdentity::for_invoker_with(
+            [1000; 3],
+            [1001; 3],
+            Some(OsStr::new("not-an-id")),
+            Some(OsStr::new("also-not-an-id")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1000);
+        assert_eq!(identity.gid, 1001);
+        assert_eq!(identity.sudo_drop, None);
+    }
+
+    #[test]
+    fn sudo_drop_refuses_an_unresolvable_account() {
+        let resolve = |passwd: Option<PasswdRecord>, groups: Option<Vec<libc::gid_t>>| {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| passwd.clone(),
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    panic!("the sudo path resolves by uid, never by name");
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| groups.clone(),
+                dir_owner: &|_: &Path| Some((true, 1000)),
+            };
+            ChildIdentity::for_invoker_with(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1001")),
+                &probes,
+            )
+        };
+        let missing = resolve(None, Some(vec![1001])).unwrap_err();
+        assert_eq!(
+            missing.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let empty_name = resolve(
+            Some(fake_passwd("", "/home/x", "/bin/sh", 1000, 1001)),
+            Some(vec![1001]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_name.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let gid_mismatch = resolve(
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                9999,
+            )),
+            Some(vec![9999]),
+        )
+        .unwrap_err();
+        assert_eq!(
+            gid_mismatch.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+        let no_groups = resolve(
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                1001,
+            )),
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(
+            no_groups.to_string(),
+            "cannot resolve supplementary groups for the sudo invoker"
+        );
+        let empty_groups = resolve(
+            Some(fake_passwd(
+                "testuser",
+                "/home/testuser",
+                "/bin/bash",
+                1000,
+                1001,
+            )),
+            Some(Vec::new()),
+        )
+        .unwrap_err();
+        assert_eq!(
+            empty_groups.to_string(),
+            "cannot resolve supplementary groups for the sudo invoker"
+        );
+    }
+
+    #[test]
+    fn sudo_drop_skips_a_runtime_dir_it_cannot_prove() {
+        for dir_owner in [None, Some((false, 1000)), Some((true, 0))] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| {
+                    Some(fake_passwd(
+                        "testuser",
+                        "/home/testuser",
+                        "/bin/bash",
+                        1000,
+                        1001,
+                    ))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    panic!("the sudo path resolves by uid, never by name");
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+                dir_owner: &|_: &Path| dir_owner,
+            };
+            let identity = ChildIdentity::for_invoker_with(
+                [0; 3],
+                [0; 3],
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1001")),
+                &probes,
+            )
+            .unwrap();
+            let restored = identity.sudo_drop.as_ref().expect("account resolves");
+            assert_eq!(restored.xdg_runtime_dir, None, "{dir_owner:?}");
+        }
+    }
+
+    #[test]
+    fn production_dir_owner_rejects_symlink_runtime_dir() {
+        // M1: a symlink at /run/user/<uid> is not a provable dir, even when
+        // it points at a dir owned by the uid (lstat, not stat).
+        let directory = tempfile::tempdir().unwrap();
+        let real = directory.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let owner = production_dir_owner(&link);
+        assert!(
+            !matches!(owner, Some((true, _))),
+            "symlink must not prove as a runtime dir: {owner:?}"
+        );
+    }
+
+    #[test]
+    fn sudo_drop_refuses_passwd_row_with_mismatched_uid() {
+        // M2: the sudo-path row must name the requested uid, not just a
+        // non-empty name with a matching gid.
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1000);
+                Some(fake_passwd(
+                    "testuser",
+                    "/home/testuser",
+                    "/bin/bash",
+                    9999,
+                    1001,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("the sudo path resolves by uid, never by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "SUDO_UID/SUDO_GID do not name one existing account"
+        );
+    }
+
+    #[test]
+    fn run_user_refuses_gid_max_as_unknown() {
+        // M3: a passwd row with gid 2^32-1 is no account on the --user path,
+        // by name and by uid alike.
+        for user in ["alice", "1001"] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                    Some(fake_passwd(
+                        "alice",
+                        "/home/alice",
+                        "/bin/bash",
+                        1001,
+                        u32::MAX,
+                    ))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    Some(fake_passwd(
+                        "alice",
+                        "/home/alice",
+                        "/bin/bash",
+                        1001,
+                        u32::MAX,
+                    ))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+                dir_owner: &|_: &Path| None,
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(user)),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {user}: unknown account"),
+                "user {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_user_refuses_non_root_name_with_uid_zero() {
+        // M4: only "root" and "0" may resolve to uid 0; any other spelling
+        // (including a numeric alias like "00") refuses as unknown.
+        for user in ["alice", "00", "000"] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                    Some(fake_passwd("alice", "/root", "/bin/bash", 0, 0))
+                },
+                passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                    Some(fake_passwd("alice", "/root", "/bin/bash", 0, 0))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![0]),
+                dir_owner: &|_: &Path| Some((true, 0)),
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(user)),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {user}: unknown account"),
+                "user {user}"
+            );
+        }
+    }
+
+    #[test]
+    fn production_probes_resolve_the_current_user() {
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let record = production_passwd_lookup(uid).expect("the test user has a passwd entry");
+        assert!(!record.name.is_empty());
+        // The by-name lookup agrees with the by-uid row (the `--user` path).
+        let by_name =
+            production_passwd_by_name(&record.name).expect("the test user resolves by name");
+        assert_eq!((by_name.uid, by_name.gid), (record.uid, record.gid));
+        assert_eq!((by_name.home, by_name.shell), (record.home, record.shell));
+        let groups = production_group_lookup(&record.name, record.gid)
+            .expect("the test user has a group list");
+        assert!(
+            groups.contains(&record.gid),
+            "initgroups list carries the primary group: {groups:?}"
+        );
+        let probes = InvokerProbes {
+            passwd: &production_passwd_lookup,
+            passwd_by_name: &production_passwd_by_name,
+            grouplist: &production_group_lookup,
+            dir_owner: &production_dir_owner,
+        };
+        let account = resolve_invoker_account_with(uid, gid, &probes);
+        // The full resolution agrees with the passwd row: it succeeds for
+        // the test user's own primary group and refuses any other.
+        assert_eq!(account.is_ok(), record.gid == gid, "{account:?}");
+        if record.gid == gid {
+            let account = account.unwrap();
+            assert_eq!(account.user, record.name);
+            assert!(account.groups.contains(&gid), "{:?}", account.groups);
+        }
+    }
+
+    #[test]
+    fn child_env_overrides_rewrite_only_the_account_variables() {
+        let account = InvokerAccount {
+            user: OsString::from("testuser"),
+            home: OsString::from("/home/testuser"),
+            shell: OsString::from("/bin/bash"),
+            groups: vec![1001],
+            xdg_runtime_dir: Some(OsString::from("/run/user/1000")),
+        };
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/root")),
+            (OsString::from("USER"), OsString::from("root")),
+            (OsString::from("LOGNAME"), OsString::from("root")),
+            (OsString::from("SHELL"), OsString::from("/bin/sh")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("SUDO_UID"), OsString::from("1000")),
+            (
+                OsString::from("SOFTHSM2_CONF"),
+                OsString::from("/tmp/x.conf"),
+            ),
+        ])
+        .unwrap();
+        // I1: the drop path strips before overrides; a provable dir is re-added.
+        strip_drop_mail(&mut environment);
+        strip_drop_xdg_runtime_dir(&mut environment);
+        apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "PATH=/usr/bin:/bin",
+                "SOFTHSM2_CONF=/tmp/x.conf",
+                "USER=testuser",
+                "LOGNAME=testuser",
+                "HOME=/home/testuser",
+                "SHELL=/bin/bash",
+                "XDG_RUNTIME_DIR=/run/user/1000",
+            ]
+        );
+    }
+
+    #[test]
+    fn child_env_overrides_leave_empty_passwd_fields_alone() {
+        let account = InvokerAccount {
+            user: OsString::from("testuser"),
+            home: OsString::new(),
+            shell: OsString::new(),
+            groups: vec![1001],
+            xdg_runtime_dir: None,
+        };
+        assert_eq!(
+            drop_env_overrides(&account),
+            [
+                (OsString::from("USER"), OsString::from("testuser")),
+                (OsString::from("LOGNAME"), OsString::from("testuser")),
+            ]
+        );
+        // I1: an unprovable runtime dir strips the inherited value (root's
+        // /run/user/0 must not leak to the target); empty HOME/SHELL still
+        // leave the inherited values alone. The strips mirror spawn_prepared's
+        // drop path (strip before overrides, re-add only when provable).
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/root")),
+            (OsString::from("SHELL"), OsString::from("/bin/sh")),
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+        ])
+        .unwrap();
+        strip_drop_mail(&mut environment);
+        strip_drop_xdg_runtime_dir(&mut environment);
+        apply_env_overrides(&mut environment, &drop_env_overrides(&account)).unwrap();
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "HOME=/root",
+                "SHELL=/bin/sh",
+                "USER=testuser",
+                "LOGNAME=testuser",
+            ]
+        );
+    }
+
+    #[test]
+    fn child_env_overrides_with_no_drop_change_nothing() {
+        let mut environment = child_environment([
+            (OsString::from("HOME"), OsString::from("/home/user")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        let before = environment.clone();
+        apply_env_overrides(&mut environment, &[]).unwrap();
+        assert_eq!(environment, before);
+    }
+
+    #[test]
+    fn sudo_drop_notice_is_one_plain_line() {
+        // M4: the -v notice names the uid alongside the account.
+        assert_eq!(
+            sudo_drop_notice(OsStr::new("/usr/bin/id"), OsStr::new("testuser"), 1000),
+            "running /usr/bin/id as testuser (uid 1000) (groups and home restored)"
+        );
+        let notice = sudo_drop_notice(OsStr::new("id"), OsStr::new("testuser"), 1000);
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+    }
+
+    #[test]
+    fn run_user_resolves_a_named_account_with_groups_and_home() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("a name selection must not resolve by uid");
+            },
+            passwd_by_name: &|user: &OsStr| -> Option<PasswdRecord> {
+                assert_eq!(user, OsStr::new("alice"));
+                Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+            },
+            grouplist: &|user: &OsStr, gid: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                assert_eq!(user, OsStr::new("alice"));
+                assert_eq!(gid, 1002);
+                Some(vec![1002, 44])
+            },
+            dir_owner: &|path: &Path| -> Option<(bool, libc::uid_t)> {
+                assert_eq!(path, Path::new("/run/user/1001"));
+                Some((true, 1001))
+            },
+        };
+        // SUDO_* names another account: the explicit selection wins.
+        let identity = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("1000")),
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1001);
+        assert_eq!(identity.gid, 1002);
+        assert_eq!(identity.sudo_drop, None);
+        let run_as = identity
+            .run_as
+            .as_ref()
+            .expect("--user selects its own drop");
+        assert_eq!(run_as.user, OsString::from("alice"));
+        assert_eq!(run_as.home, OsString::from("/home/alice"));
+        assert_eq!(run_as.groups, vec![44, 1002]);
+        assert_eq!(
+            run_as.xdg_runtime_dir.as_deref(),
+            Some(OsStr::new("/run/user/1001"))
+        );
+    }
+
+    #[test]
+    fn run_user_accepts_a_numeric_uid() {
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                assert_eq!(uid, 1001);
+                Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let identity = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap();
+        assert_eq!(identity.uid, 1001);
+        assert_eq!(identity.gid, 1002);
+        let run_as = identity.run_as.as_ref().expect("numeric --user resolves");
+        assert_eq!(run_as.user, OsString::from("alice"));
+        assert_eq!(run_as.xdg_runtime_dir, None);
+    }
+
+    #[test]
+    fn run_user_root_stays_root_on_purpose() {
+        for value in ["root", "0"] {
+            let probes = InvokerProbes {
+                passwd: &|uid: libc::uid_t| -> Option<PasswdRecord> {
+                    assert_eq!(uid, 0);
+                    Some(fake_passwd("root", "/root", "/bin/bash", 0, 0))
+                },
+                passwd_by_name: &|user: &OsStr| -> Option<PasswdRecord> {
+                    assert_eq!(user, OsStr::new("root"));
+                    Some(fake_passwd("root", "/root", "/bin/bash", 0, 0))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![0]),
+                dir_owner: &|_: &Path| Some((true, 0)),
+            };
+            let identity = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new(value)),
+                &probes,
+            )
+            .unwrap();
+            assert_eq!((identity.uid, identity.gid), (0, 0), "{value}");
+            let run_as = identity.run_as.as_ref().expect("root resolves");
+            assert_eq!(run_as.user, OsString::from("root"), "{value}");
+        }
+    }
+
+    #[test]
+    fn run_user_refuses_unknown_accounts() {
+        let resolve = |user: &OsStr| {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| None,
+                passwd_by_name: &|_: &OsStr| None,
+                grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1001]),
+                dir_owner: &|_: &Path| None,
+            };
+            ChildIdentity::for_run_selection_with([0; 3], [0; 3], None, None, Some(user), &probes)
+        };
+        for value in ["alice", "1001", "4294967296", "+1000", " 1000", "1000 ", ""] {
+            let error = resolve(OsStr::new(value)).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("--user {value}: unknown account"),
+                "{value:?}"
+            );
+        }
+        // A NUL cannot reach the by-name lookup at all.
+        assert_eq!(
+            production_passwd_by_name(OsStr::from_bytes(b"al\x00ice")),
+            None
+        );
+        // A row with an empty name is no account either.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| None,
+            passwd_by_name: &|_: &OsStr| Some(fake_passwd("", "/home/x", "/bin/sh", 1001, 1002)),
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user alice: unknown account");
+        // A numeric selection whose row names another uid is refused, not trusted.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| {
+                Some(fake_passwd(
+                    "mallory",
+                    "/home/mallory",
+                    "/bin/sh",
+                    6666,
+                    6666,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![6666]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("1001")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user 1001: unknown account");
+    }
+
+    #[test]
+    fn run_user_refuses_uid_max_as_unknown() {
+        // Numeric form: a passwd source serving uid 2^32-1 must refuse with
+        // the plain preflight message, never reach setresuid(-1).
+        let probes = InvokerProbes {
+            passwd: &|uid: libc::uid_t| {
+                assert_eq!(uid, u32::MAX);
+                Some(fake_passwd(
+                    "maxuser",
+                    "/home/maxuser",
+                    "/bin/sh",
+                    u32::MAX,
+                    1002,
+                ))
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("a numeric selection must not resolve by name");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("4294967295")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user 4294967295: unknown account");
+        // Named form: a row naming uid 2^32-1 is no account either.
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("a name selection must not resolve by uid");
+            },
+            passwd_by_name: &|user: &OsStr| {
+                assert_eq!(user, OsStr::new("alice"));
+                Some(fake_passwd(
+                    "alice",
+                    "/home/alice",
+                    "/bin/sh",
+                    u32::MAX,
+                    1002,
+                ))
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| Some(vec![1002]),
+            dir_owner: &|_: &Path| None,
+        };
+        let error = ChildIdentity::for_run_selection_with(
+            [0; 3],
+            [0; 3],
+            None,
+            None,
+            Some(OsStr::new("alice")),
+            &probes,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), "--user alice: unknown account");
+    }
+
+    #[test]
+    fn run_user_needs_root_and_refuses_set_id_observers() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("refused before any lookup");
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("refused before any lookup");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("refused before any lookup");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("refused before any lookup");
+            },
+        };
+        // Unprivileged, even with sudo variables set: euid decides, and
+        // `--user` has no root-group branch.
+        for gids in [[1000; 3], [0; 3]] {
+            let error = ChildIdentity::for_run_selection_with(
+                [1000; 3],
+                gids,
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("1000")),
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(error.to_string(), "--user needs root (sudo)", "{gids:?}");
+        }
+        // Set-id observers refuse before the root check, as root or not.
+        for (uids, gids) in [
+            ([1000, 0, 0], [0; 3]),
+            ([0, 0, 1000], [0; 3]),
+            ([0; 3], [1000, 0, 0]),
+        ] {
+            let error = ChildIdentity::for_run_selection_with(
+                uids,
+                gids,
+                None,
+                None,
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "refusing owned child with set-id observer credentials",
+                "{uids:?}/{gids:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn run_user_group_failures_name_the_selection() {
+        for groups in [None, Some(Vec::new())] {
+            let probes = InvokerProbes {
+                passwd: &|_: libc::uid_t| None,
+                passwd_by_name: &|_: &OsStr| {
+                    Some(fake_passwd("alice", "/home/alice", "/bin/bash", 1001, 1002))
+                },
+                grouplist: &|_: &OsStr, _: libc::gid_t| groups.clone(),
+                dir_owner: &|_: &Path| None,
+            };
+            let error = ChildIdentity::for_run_selection_with(
+                [0; 3],
+                [0; 3],
+                None,
+                None,
+                Some(OsStr::new("alice")),
+                &probes,
+            )
+            .unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                "--user alice: cannot resolve supplementary groups",
+                "{groups:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn default_selection_without_user_is_unchanged() {
+        let probes = InvokerProbes {
+            passwd: &|_: libc::uid_t| -> Option<PasswdRecord> {
+                panic!("no account database on these paths");
+            },
+            passwd_by_name: &|_: &OsStr| -> Option<PasswdRecord> {
+                panic!("no account database on these paths");
+            },
+            grouplist: &|_: &OsStr, _: libc::gid_t| -> Option<Vec<libc::gid_t>> {
+                panic!("no account database on these paths");
+            },
+            dir_owner: &|_: &Path| -> Option<(bool, libc::uid_t)> {
+                panic!("no account database on these paths");
+            },
+        };
+        // Unprivileged: self, no drop of either kind.
+        let identity =
+            ChildIdentity::for_run_selection_with([1000; 3], [1001; 3], None, None, None, &probes)
+                .unwrap();
+        assert_eq!((identity.uid, identity.gid), (1000, 1001));
+        assert_eq!(identity.sudo_drop, None);
+        assert_eq!(identity.run_as, None);
+        // Root without sudo still needs its explicit target (message unchanged).
+        let error =
+            ChildIdentity::for_run_selection_with([0; 3], [0; 3], None, None, None, &probes)
+                .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "root observer requires a valid non-root SUDO_UID"
+        );
+    }
+
+    #[test]
+    fn run_as_notice_is_one_plain_line() {
+        // M4: the -v notice names the uid alongside the account.
+        assert_eq!(
+            run_as_notice(OsStr::new("/usr/bin/id"), OsStr::new("alice"), 1001),
+            "running /usr/bin/id as alice (uid 1001)"
+        );
+        let notice = run_as_notice(OsStr::new("id"), OsStr::new("alice"), 1001);
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+    }
+
+    #[test]
+    fn identity_notices_escape_hostile_names() {
+        for notice in [
+            sudo_drop_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb"), 1000),
+            run_as_notice(OsStr::new("/bin/x\nINJECTED"), OsStr::new("a\x1blb"), 1001),
+        ] {
+            assert_eq!(notice.lines().count(), 1, "{notice:?}");
+            assert!(notice.contains(r"/bin/x\nINJECTED"), "{notice:?}");
+            assert!(notice.contains(r"a\u{1b}lb"), "{notice:?}");
+        }
+    }
+
+    #[test]
+    fn child_env_removal_notice_escapes_control_characters() {
+        let notice = child_env_removal_notice([
+            (
+                OsString::from("SUDO_EVIL\nINJECTED"),
+                OsString::from("s3cret"),
+            ),
+            (
+                OsString::from("P11SCOPE_X\x1b[2J"),
+                OsString::from("s3cret"),
+            ),
+        ])
+        .unwrap();
+        assert_eq!(notice.lines().count(), 1, "{notice:?}");
+        assert!(notice.contains(r"SUDO_EVIL\nINJECTED"), "{notice:?}");
+        assert!(notice.contains(r"P11SCOPE_X\u{1b}[2J"), "{notice:?}");
+        assert!(!notice.contains("s3cret"), "{notice:?}");
+    }
+
+    #[test]
+    fn drop_mail_strips_only_the_mailbox_name() {
+        let mut environment = child_environment([
+            (
+                OsString::from("MAIL"),
+                OsString::from("/var/spool/mail/root"),
+            ),
+            (OsString::from("MAILMAN"), OsString::from("kept")),
+            (OsString::from("XMAIL"), OsString::from("kept")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        strip_drop_mail(&mut environment);
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(environment, ["MAILMAN=kept", "XMAIL=kept", "PATH=/bin"]);
+        let mut bare =
+            child_environment([(OsString::from("PATH"), OsString::from("/bin"))]).unwrap();
+        let before = bare.clone();
+        strip_drop_mail(&mut bare);
+        assert_eq!(bare, before);
+    }
+
+    #[test]
+    fn drop_xdg_runtime_dir_strips_only_the_runtime_name() {
+        // I1: exact-name match; near-miss names and other variables stay.
+        let mut environment = child_environment([
+            (
+                OsString::from("XDG_RUNTIME_DIR"),
+                OsString::from("/run/user/0"),
+            ),
+            (OsString::from("XDG_RUNTIME_DIRS"), OsString::from("kept")),
+            (OsString::from("XXDG_RUNTIME_DIR"), OsString::from("kept")),
+            (OsString::from("PATH"), OsString::from("/bin")),
+        ])
+        .unwrap();
+        strip_drop_xdg_runtime_dir(&mut environment);
+        let environment: Vec<_> = environment
+            .iter()
+            .map(|entry| entry.to_str().unwrap())
+            .collect();
+        assert_eq!(
+            environment,
+            [
+                "XDG_RUNTIME_DIRS=kept",
+                "XXDG_RUNTIME_DIR=kept",
+                "PATH=/bin"
+            ]
+        );
+        let mut bare =
+            child_environment([(OsString::from("PATH"), OsString::from("/bin"))]).unwrap();
+        let before = bare.clone();
+        strip_drop_xdg_runtime_dir(&mut bare);
+        assert_eq!(bare, before);
+    }
+
+    #[test]
+    fn runtime_dir_parent_trusted_rejects_untrusted_parents() {
+        // M1: root-owned and not group/other-writable, not a symlink, a dir.
+        // / is the success witness (0755 root); /tmp fails on writability.
+        assert!(runtime_dir_parent_trusted(Path::new("/")), "/ must trust");
+        assert!(
+            !runtime_dir_parent_trusted(Path::new("/tmp")),
+            "/tmp is writable"
+        );
+        let directory = tempfile::tempdir().unwrap();
+        // Ownership: a dir not owned by root never vouches. When running as
+        // root (privileged lanes, containers), chown one to a non-root uid
+        // first; 65534 need not name an account for the ownership check.
+        let owned = directory.path().join("owned");
+        std::fs::create_dir(&owned).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        if unsafe { libc::geteuid() } == 0 {
+            let path =
+                std::ffi::CString::new(std::os::unix::ffi::OsStrExt::as_bytes(owned.as_os_str()))
+                    .unwrap();
+            // SAFETY: path is NUL-terminated.
+            assert_eq!(unsafe { libc::chown(path.as_ptr(), 65534, 65534) }, 0);
+        }
+        assert!(
+            !runtime_dir_parent_trusted(&owned),
+            "a non-root-owned dir never vouches"
+        );
+        // Perms: group/other-writable never vouches, even when root-owned.
+        let writable = directory.path().join("writable");
+        std::fs::create_dir(&writable).unwrap();
+        std::fs::set_permissions(&writable, std::fs::Permissions::from_mode(0o775)).unwrap();
+        assert!(
+            !runtime_dir_parent_trusted(&writable),
+            "a writable dir never vouches"
+        );
+        let link = directory.path().join("link");
+        std::os::unix::fs::symlink("/", &link).unwrap();
+        assert!(
+            !runtime_dir_parent_trusted(&link),
+            "a symlink parent never vouches"
+        );
+        let missing = directory.path().join("missing");
+        assert!(
+            !runtime_dir_parent_trusted(&missing),
+            "a missing parent never vouches"
+        );
+        // The live parent vouches on a normal host (root-owned 0755); when
+        // /run/user is absent (a container without logind), the check fails
+        // closed and the runtime dir is simply never re-added.
+        if Path::new("/run/user").exists() {
+            assert!(
+                runtime_dir_parent_trusted(Path::new("/run/user")),
+                "/run/user must trust when present"
+            );
+        }
+    }
+
+    /// One process's post-exec environment as `NAME=value` strings
+    /// (`/proc/<pid>/environ`, NUL-separated).
+    fn child_environ(pid: u32) -> Vec<String> {
+        std::fs::read(format!("/proc/{pid}/environ"))
+            .unwrap()
+            .split(|byte| *byte == 0)
+            .filter(|entry| !entry.is_empty())
+            .map(|entry| String::from_utf8_lossy(entry).into_owned())
+            .collect()
+    }
+
+    #[test]
+    fn spawned_child_environment_passes_sentinels_and_strips_controlled_names() {
+        // The spawn core with an explicit non-drop identity and a sentinel
+        // environment: the sentinels pass through, SUDO_*/P11SCOPE_* do
+        // not. Observed through /proc after the release proves the exec —
+        // a pre-exec read would still show the inherited table.
+        // SAFETY: getuid/getgid have no preconditions.
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let identity = ChildIdentity {
+            uid,
+            gid,
+            sudo_drop: None,
+            run_as: None,
+        };
+        let mut child = OwnedChild::spawn_for_test(
+            OsString::from("/bin/sleep"),
+            vec![OsString::from("30")],
+            identity,
+            vec![
+                (
+                    OsString::from("RUN_SPAWN_SENTINEL"),
+                    OsString::from("pass-me"),
+                ),
+                (OsString::from("SUDO_HOME"), OsString::from("/root")),
+                (OsString::from("SUDO_UID"), OsString::from("0")),
+                (
+                    OsString::from("P11SCOPE_TEST_SPAWN_SENTINEL"),
+                    OsString::from("strip-me"),
+                ),
+            ],
+        )
+        .unwrap();
+        child.release().unwrap();
+        let environ = child_environ(child.pid());
+        assert!(
+            environ
+                .iter()
+                .any(|entry| entry == "RUN_SPAWN_SENTINEL=pass-me"),
+            "{environ:?}"
+        );
+        assert!(
+            !environ.iter().any(|entry| entry.starts_with("SUDO_")),
+            "{environ:?}"
+        );
+        assert!(
+            !environ
+                .iter()
+                .any(|entry| entry.starts_with("P11SCOPE_TEST_")),
+            "{environ:?}"
+        );
+        child.terminate_and_reap().unwrap();
+    }
+
+    #[test]
+    #[ignore = "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1"]
+    fn privileged_spawned_child_home_matches_the_target_passwd_row() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root: the drop needs privilege"
+        );
+        let target =
+            production_passwd_by_name(OsStr::new("nobody")).expect("the nobody account exists");
+        let probes = InvokerProbes {
+            passwd: &production_passwd_lookup,
+            passwd_by_name: &production_passwd_by_name,
+            grouplist: &production_group_lookup,
+            dir_owner: &production_dir_owner,
+        };
+        // The sudo-drop shape: a root observer, SUDO_* naming the target.
+        let uid_text = target.uid.to_string();
+        let gid_text = target.gid.to_string();
+        let identity = ChildIdentity::for_invoker_with(
+            [0; 3],
+            [0; 3],
+            Some(OsStr::new(&uid_text)),
+            Some(OsStr::new(&gid_text)),
+            &probes,
+        )
+        .unwrap();
+        let expected_groups = identity
+            .sudo_drop
+            .as_ref()
+            .expect("the sudo-drop session resolves")
+            .groups
+            .clone();
+        let mut child = OwnedChild::spawn_for_test(
+            OsString::from("/bin/sleep"),
+            vec![OsString::from("30")],
+            identity,
+            vec![
+                (OsString::from("HOME"), OsString::from("/root")),
+                (OsString::from("USER"), OsString::from("root")),
+                (
+                    OsString::from("MAIL"),
+                    OsString::from("/var/spool/mail/root"),
+                ),
+                (
+                    OsString::from("XDG_RUNTIME_DIR"),
+                    OsString::from("/run/user/0"),
+                ),
+                (
+                    OsString::from("RUN_SPAWN_SENTINEL"),
+                    OsString::from("pass-me"),
+                ),
+            ],
+        )
+        .unwrap();
+        child.release().unwrap();
+        let environ = child_environ(child.pid());
+        let home = format!("HOME={}", target.home.to_string_lossy());
+        let user = format!("USER={}", target.name.to_string_lossy());
+        assert!(environ.iter().any(|entry| entry == &home), "{environ:?}");
+        assert!(environ.iter().any(|entry| entry == &user), "{environ:?}");
+        assert!(
+            !environ.iter().any(|entry| entry.starts_with("MAIL=")),
+            "{environ:?}"
+        );
+        // I1: nobody has no provable /run/user/<uid>, so the inherited
+        // runtime dir strips rather than leaks.
+        assert!(
+            !environ
+                .iter()
+                .any(|entry| entry.starts_with("XDG_RUNTIME_DIR=")),
+            "{environ:?}"
+        );
+        assert!(
+            environ
+                .iter()
+                .any(|entry| entry == "RUN_SPAWN_SENTINEL=pass-me"),
+            "{environ:?}"
+        );
+        // And the child really runs as the target account.
+        let status = std::fs::read_to_string(format!("/proc/{}/status", child.pid())).unwrap();
+        let uids = format!(
+            "Uid:\t{}\t{}\t{}\t{}",
+            target.uid, target.uid, target.uid, target.uid
+        );
+        assert!(status.lines().any(|line| line == uids), "{status}");
+        // M9: the drop's groups plus the hardening (no caps, no_new_privs).
+        let groups_line = status
+            .lines()
+            .find(|line| line.starts_with("Groups:"))
+            .expect("status carries a Groups line");
+        let mut actual: Vec<libc::gid_t> = groups_line
+            .strip_prefix("Groups:")
+            .unwrap_or_default()
+            .split_whitespace()
+            .map(|gid| gid.parse().expect("a decimal gid"))
+            .collect();
+        actual.sort_unstable();
+        let mut expected = expected_groups;
+        expected.sort_unstable();
+        assert_eq!(actual, expected, "{status}");
+        assert!(
+            status
+                .lines()
+                .any(|line| line == "CapEff:\t0000000000000000"),
+            "{status}"
+        );
+        assert!(
+            status.lines().any(|line| line == "NoNewPrivs:\t1"),
+            "{status}"
+        );
+        child.terminate_and_reap().unwrap();
     }
 
     #[test]
@@ -11431,6 +13643,7 @@ mod tests {
         let fd = child.pin().pidfd().unwrap().as_raw_fd();
         let mut pending = None;
         let mut exit_code = None;
+        let mut requested_kill = false;
         let mut running = false;
         let mut retained = Some(child);
         settle_owned_child(
@@ -11441,6 +13654,7 @@ mod tests {
             &SignalState::new(),
             &mut pending,
             &mut exit_code,
+            &mut requested_kill,
             &mut running,
         )
         .unwrap();
@@ -11576,6 +13790,7 @@ mod tests {
             }
             let mut pending = None;
             let mut exit_code = None;
+            let mut requested_kill = false;
             let mut still_running = false;
             let mut retained = Some(child);
             settle_owned_child(
@@ -11586,6 +13801,7 @@ mod tests {
                 &signals,
                 &mut pending,
                 &mut exit_code,
+                &mut requested_kill,
                 &mut still_running,
             )
             .unwrap();
@@ -11600,6 +13816,193 @@ mod tests {
                 assert_eq!(pending.pid(), pid);
             }
         }
+    }
+
+    /// A requested timeout kill of a live child is a normal end: the
+    /// settlement marks it so the run exits 0, while the child's own
+    /// signal status stays exact for the death note. A child that
+    /// already exited keeps its own status unmarked.
+    #[test]
+    fn requested_timeout_kill_marks_a_live_child_reaped_by_signal() {
+        let signals = SignalState::new();
+        // Live sleeper, timeout expiry with the kill requested: marked.
+        let mut child = spawn("/bin/sleep", &["10"]);
+        child.release().unwrap();
+        assert!(child.still_running());
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(128 + libc::SIGTERM));
+        assert!(!still_running);
+        assert!(
+            requested_kill,
+            "a requested kill of a live child must be marked"
+        );
+        // Exited child, same end: its own status, unmarked.
+        let mut child = spawn("/bin/true", &[]);
+        child.release().unwrap();
+        wait_until(
+            || !child.still_running(),
+            "target fixture never reached its exit state",
+        );
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(0));
+        assert!(!still_running);
+        assert!(
+            !requested_kill,
+            "a child that exited on its own keeps its status unmarked"
+        );
+    }
+
+    /// A child that answers the timeout SIGTERM by voluntarily exiting
+    /// with a high status keeps its own status unmarked: only a death
+    /// by the observer's signal is a requested kill, never a voluntary
+    /// exit, however high its code.
+    #[test]
+    fn requested_timeout_kill_must_not_claim_a_voluntary_high_exit() {
+        let signals = SignalState::new();
+        let mut child = spawn("/bin/sh", &["-c", "trap 'exit 200' TERM; sleep 10"]);
+        child.release().unwrap();
+        // Let the shell install its TERM trap and start sleeping, so the
+        // timeout SIGTERM below answers with a voluntary exit, not a race
+        // against startup.
+        std::thread::sleep(Duration::from_millis(500));
+        assert!(child.still_running());
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            true,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(200));
+        assert!(!still_running);
+        assert!(
+            !requested_kill,
+            "a voluntary exit keeps its status unmarked even above 128"
+        );
+    }
+
+    /// A child killed from outside the observer keeps its real signal
+    /// status unmarked: an external SIGKILL stays exit 137 and an
+    /// external SIGTERM stays exit 143, neither claimed as a requested
+    /// timeout kill. The initial probe reaps both before the observer
+    /// sends any signal of its own.
+    #[test]
+    fn requested_timeout_kill_must_not_claim_an_externally_killed_child() {
+        for (signal, want) in [
+            (libc::SIGKILL, 128 + libc::SIGKILL),
+            (libc::SIGTERM, 128 + libc::SIGTERM),
+        ] {
+            let signals = SignalState::new();
+            let mut child = spawn("/bin/sleep", &["10"]);
+            let pid = child.pid();
+            child.release().unwrap();
+            assert!(child.still_running());
+            // SAFETY: signals the exact owned child only, from outside
+            // the observer's own settlement path; the pid cannot be
+            // reused while the child is unreaped.
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, signal) }, 0);
+            wait_until(
+                || !child.still_running(),
+                "externally killed fixture never reported dead",
+            );
+            let mut retained = Some(child);
+            let mut pending = None;
+            let mut exit_code = None;
+            let mut requested_kill = false;
+            let mut still_running = false;
+            settle_owned_child(
+                &mut retained,
+                CaptureEnd::DurationExpired,
+                true,
+                true,
+                &signals,
+                &mut pending,
+                &mut exit_code,
+                &mut requested_kill,
+                &mut still_running,
+            )
+            .unwrap();
+            assert_eq!(exit_code, Some(want));
+            assert!(!still_running);
+            assert!(
+                !requested_kill,
+                "an external signal death keeps its status unmarked"
+            );
+        }
+    }
+
+    /// The run's process exit code: a requested timeout kill and a
+    /// handed-back child are observer success; otherwise the child's
+    /// own status, as a shell would report it.
+    #[test]
+    fn run_exit_code_maps_requested_kills_and_handoffs_to_success() {
+        let outcome =
+            |child_exit_code: Option<i32>, requested_timeout_kill: bool| OwnedRunOutcome {
+                child_exit_code,
+                requested_timeout_kill,
+                child_still_running: child_exit_code.is_none(),
+                child_pid: 4242,
+                evidence: render::tests::evidence(),
+            };
+        assert_eq!(
+            outcome(Some(128 + libc::SIGTERM), true).exit_code(),
+            0,
+            "a requested timeout kill is a normal end"
+        );
+        assert_eq!(
+            outcome(None, false).exit_code(),
+            0,
+            "a handed-back child stays success"
+        );
+        assert_eq!(outcome(Some(0), false).exit_code(), 0);
+        assert_eq!(outcome(Some(1), false).exit_code(), 1);
+        assert_eq!(
+            outcome(Some(128 + libc::SIGTERM), false).exit_code(),
+            128 + libc::SIGTERM,
+            "an unrequested signal death keeps the child's status"
+        );
     }
 
     /// I1: a quiesce failure after `--duration` without
@@ -11618,6 +14021,7 @@ mod tests {
             let mut retained = Some(child);
             let mut pending = None;
             let mut exit_code = None;
+            let mut requested_kill = false;
             let mut still_running = false;
             let mut detached = false;
             let published = std::cell::Cell::new(false);
@@ -11639,6 +14043,7 @@ mod tests {
                         &signals,
                         &mut pending,
                         &mut exit_code,
+                        &mut requested_kill,
                         &mut still_running,
                     )
                 },
@@ -12508,6 +14913,7 @@ mod tests {
                 let mut retained = Some(child);
                 let mut pending = None;
                 let mut exit_code = None;
+                let mut requested_kill = false;
                 let mut still_running = false;
                 settle_owned_child(
                     &mut retained,
@@ -12517,6 +14923,7 @@ mod tests {
                     &signals,
                     &mut pending,
                     &mut exit_code,
+                    &mut requested_kill,
                     &mut still_running,
                 )
                 .unwrap();
@@ -13173,14 +15580,14 @@ mod tests {
         let script = dir.path().join("hello.sh");
         std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_owned_target_runnable(script.as_os_str(), &[]).unwrap_err();
+        let error = check_owned_target_runnable(script.as_os_str(), &[], None).unwrap_err();
         let text = format!("{error}");
         assert!(text.contains("must be an ELF executable"), "{text}");
         assert!(
             text.contains("invoke scripts through an interpreter"),
             "{text}"
         );
-        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[]).is_ok());
+        assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[], None).is_ok());
     }
 
     /// A `#!` launcher (Ubuntu's `/usr/bin/firefox`) is named as a script,
@@ -13192,7 +15599,7 @@ mod tests {
         let script = dir.path().join("browser");
         std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let text = check_owned_target_runnable(script.as_os_str(), &[])
+        let text = check_owned_target_runnable(script.as_os_str(), &[], None)
             .unwrap_err()
             .to_string();
         assert!(
@@ -13208,6 +15615,30 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
+    }
+
+    /// A `--user` that resolves nowhere leaves the invoker unknown, so the
+    /// script refusal hides the interpreter token (fail-closed) while still
+    /// naming the script and its fix.
+    #[test]
+    fn runnable_check_with_an_unresolvable_user_hides_the_token() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = dir.path().join("browser");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let text = check_owned_target_runnable(
+            script.as_os_str(),
+            &[],
+            Some(OsStr::new("p11scope-definitely-no-such-user")),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(text.contains("is a script: run"), "{text}");
+        assert!(
+            text.contains("is not shown because the invoking user"),
+            "{text}"
+        );
+        assert!(!text.contains("/bin/sh"), "{text}");
     }
 
     fn snap_probes<'a>(
@@ -13845,6 +16276,7 @@ mod tests {
                 source: "prearm",
                 corroborated: false,
                 skipped: Vec::new(),
+                admission_class: None,
             })
             .collect();
         plan
@@ -13948,6 +16380,8 @@ mod tests {
                 counter_mode: None,
                 select_endpoint: None,
                 track_short_lived: false,
+                verbose: false,
+                quiet: false,
                 duration: None,
                 out: None,
                 max_events: None,
@@ -14095,6 +16529,41 @@ mod tests {
         );
     }
 
+    /// The owned-run startup preloads the overlay-witness BPF session
+    /// before spawning the child: the one-time session load (BPF
+    /// verifier plus functional probe, ~1s in slow guests) must not
+    /// land inside a 500ms pause-cycle engine apply, where it
+    /// fail-closes the first overlay join unavailable and turns the
+    /// pause partial. The startup needs a live child, so the order is
+    /// pinned statically (same `split_once` precedent as
+    /// `prearm_release_wiring_sits_between_release_and_revalidate`).
+    #[test]
+    fn witness_preload_sits_before_owned_spawn() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_owned_inner_with_host(")
+            .unwrap()
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .unwrap()
+            .0;
+        let preloaded = body
+            .find("overlay_witness::preload_session()")
+            .expect("owned startup preloads the witness session");
+        let spawned = body
+            .find("OwnedChild::spawn_verbose_as(")
+            .expect("owned startup spawns the child");
+        assert!(
+            preloaded < spawned,
+            "witness preload sits before OwnedChild::spawn_verbose_as"
+        );
+        assert_eq!(
+            body.matches("overlay_witness::preload_session()").count(),
+            1,
+            "one preload site feeds the owned run"
+        );
+    }
+
     #[test]
     fn prearm_terminal_pause_hold_empties_windows() {
         use crate::attach::BackendSelection;
@@ -14140,6 +16609,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14236,6 +16707,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14325,6 +16798,8 @@ mod tests {
             counter_mode: None,
             select_endpoint: None,
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             duration: None,
             out: None,
             max_events: None,
@@ -14395,6 +16870,8 @@ mod tests {
     fn run_args(pause: cli::PausePolicy, command: &[&str]) -> RunArgs {
         RunArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],
@@ -14415,6 +16892,7 @@ mod tests {
             pause,
             attach_backend: BackendSelection::default(),
             kill_on_timeout: false,
+            user: None,
             command: command.iter().map(OsString::from).collect(),
         }
     }
@@ -14447,6 +16925,8 @@ mod tests {
     fn capture_args(scope: ScopeArg) -> CaptureArgs {
         CaptureArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],
@@ -15265,11 +17745,8 @@ mod tests {
             // HIGH-1: without privilege the self-probe's refusal names the
             // missing privilege instead of a hazard; either is the
             // environment's own category, never a pause failure.
-            let environment = |text: &str| {
-                text.contains("refusing to attach")
-                    || text.contains("cannot load p11scope's BPF programs")
-                    || text.contains("uprobe-multi-required:")
-            };
+            let environment =
+                |text: &str| text.contains("refusing to attach") || text.contains("live capture ");
             assert!(environment(&never), "{never}");
             assert!(
                 !never.contains("pause"),
@@ -15285,8 +17762,7 @@ mod tests {
             );
             assert!(
                 behind_override.contains("attach session")
-                    || behind_override.contains("cannot load p11scope's BPF programs")
-                    || behind_override.contains("uprobe-multi-required:"),
+                    || behind_override.contains("live capture "),
                 "{behind_override}"
             );
             assert!(
@@ -15855,6 +18331,24 @@ mod tests {
                 over
             );
         }
+    }
+
+    /// CLI text: only a detector with findings warns on default
+    /// stderr; a clean or unavailable detector stays diagnostics.
+    #[test]
+    fn longrun_findings_gate_the_stderr_warning() {
+        let quiet = SchedulingAccumulator::default();
+        assert!(!quiet.longrun_has_findings(true));
+        let mut clean = SchedulingAccumulator::default();
+        clean.note_longrun_first_loss(Some(0), 0, true);
+        clean.note_longrun_tick(1, Duration::from_millis(50));
+        clean.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(!clean.longrun_has_findings(true));
+        let mut loud = SchedulingAccumulator::default();
+        loud.note_longrun_first_loss(Some(0), 0, true);
+        loud.note_longrun_tick(1, Duration::from_millis(1_895) + Duration::from_nanos(1));
+        loud.note_loop_end(0, 0, Some(300), render::LOOP_END_EXPIRY);
+        assert!(loud.longrun_has_findings(true));
     }
 
     #[test]
@@ -17115,12 +19609,26 @@ mod tests {
     #[test]
     fn capture_ready_line_names_probes_and_how_to_stop() {
         assert_eq!(
-            capture_ready_line(136),
-            "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C"
+            capture_ready_line(136, false),
+            "p11scope: capturing: 136 probes attached; stop with Ctrl-C"
         );
         assert_eq!(
-            capture_ready_line(0),
-            "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C"
+            capture_ready_line(1, false),
+            "p11scope: capturing: 1 probe attached; stop with Ctrl-C"
+        );
+    }
+
+    /// CLI text: with nothing attached yet, the readiness line says
+    /// what the capture waits for instead of reading as a failure.
+    #[test]
+    fn capture_ready_line_waits_for_the_provider_when_nothing_attached() {
+        assert_eq!(
+            capture_ready_line(0, true),
+            "p11scope: capturing: waiting for the command to load a provider; stop with Ctrl-C"
+        );
+        assert_eq!(
+            capture_ready_line(0, false),
+            "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C"
         );
     }
 
@@ -17137,10 +19645,10 @@ mod tests {
     }
 
     #[test]
-    fn target_exit_marker_names_the_tick_count() {
+    fn target_exit_marker_says_the_target_exited() {
         assert_eq!(
-            target_exit_marker(12),
-            "p11scope: capture ended: target exited after 12 ticks"
+            target_exit_marker(),
+            "p11scope: capture ended: target exited"
         );
     }
 
@@ -17154,6 +19662,41 @@ mod tests {
             )
         );
         assert_eq!(target_exit_cleanup_pending_line(false), None);
+    }
+
+    /// CLI text: an owned run never clears the screen — the child's own
+    /// output shares the terminal — so no per-frame redraws happen and
+    /// the final frame prints once, as plain text without escapes.
+    #[test]
+    fn owned_run_display_never_clears_and_prints_final_once() {
+        let frame = "p11scope — PID scope — up 00:00:01 — mode profile — /bin/false\n";
+        let owned = LiveDisplay::for_capture(true);
+        assert_eq!(owned.frame_bytes(frame, false), None);
+        assert_eq!(owned.frame_bytes(frame, true).as_deref(), Some(frame));
+        assert!(
+            !owned
+                .frame_bytes(frame, true)
+                .expect("final frame")
+                .contains('\x1b'),
+            "owned final frame must carry no escape"
+        );
+    }
+
+    /// CLI text: `run` names a nonzero child status on stderr, so a
+    /// nonzero observer exit is never silent about whose status it is.
+    /// A clean exit and a handed-back child stay silent.
+    #[test]
+    fn nonzero_child_status_renders_its_exit_line() {
+        assert_eq!(
+            child_exit_status_line(Some(1)).as_deref(),
+            Some("command exited with status 1")
+        );
+        assert_eq!(
+            child_exit_status_line(Some(127)).as_deref(),
+            Some("command exited with status 127")
+        );
+        assert_eq!(child_exit_status_line(Some(0)), None);
+        assert_eq!(child_exit_status_line(None), None);
     }
 
     /// The sink watches the same observation the loop polls: the first
@@ -17518,6 +20061,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,
@@ -17602,6 +20146,7 @@ mod tests {
             &mut sink,
             &mut stdout_open,
             &mut file,
+            crate::cli::TextVerbosity::Concise,
         )
         .unwrap();
         done.store(true, Ordering::SeqCst);
@@ -17618,7 +20163,7 @@ mod tests {
             "EVIDENCE sink_dropped_bytes ({reported}) != actual missing bytes ({missing})"
         );
         assert!(reported > 0, "fixture dropped nothing: test is vacuous");
-        assert_eq!(timeouts, 3, "expected a drop in every phase");
+        assert_eq!(timeouts, 4, "expected a drop in every phase");
         assert_eq!(
             record["scheduling"]["sink_policy"].as_str().unwrap(),
             render::SINK_POLICY_BOUNDED_WAIT_DROP,
@@ -17664,6 +20209,7 @@ mod tests {
             &mut sink,
             &mut stdout_open,
             &mut None::<Vec<u8>>,
+            crate::cli::TextVerbosity::Concise,
         )
         .unwrap();
         let done = Arc::new(AtomicBool::new(true));
@@ -17987,7 +20533,7 @@ mod tests {
     fn quiescence_unproven_line_names_waited_and_in_flight() {
         let line = quiescence_unproven_line(Duration::from_secs(5), 3);
         assert!(
-            line.contains("QuiescenceUnproven"),
+            line.contains("quiescence unproven"),
             "the state must be named: {line}"
         );
         assert!(line.contains("5s"), "the waited budget: {line}");
@@ -19546,6 +22092,7 @@ mod tests {
                 false,
                 include_selection,
                 Default::default(),
+                0,
                 None,
                 false,
                 render::SchedulingEvidence::default(),
@@ -19607,8 +22154,8 @@ mod tests {
         let state = semantics::State::new(engine.plan());
         let mut facts = engine.capture_facts();
         facts.loader_discovery.hits = 17;
-        for (pause, status, unprotected) in [
-            (PauseCounters::default(), "none", 1),
+        for (pause, status, unprotected, retirements) in [
+            (PauseCounters::default(), "none", 1, 0),
             (
                 PauseCounters {
                     attempts: 5,
@@ -19617,6 +22164,7 @@ mod tests {
                     unavailable: 0,
                 },
                 "sigstop",
+                0,
                 0,
             ),
             (
@@ -19627,6 +22175,7 @@ mod tests {
                     unavailable: 0,
                 },
                 "partial",
+                1,
                 1,
             ),
         ] {
@@ -19650,6 +22199,7 @@ mod tests {
                     false,
                     true,
                     pause,
+                    retirements,
                     child_still_running,
                     false,
                     render::SchedulingEvidence::default(),
@@ -19687,6 +22237,7 @@ mod tests {
                     assert_eq!(document["pause_attempts"], pause.attempts);
                     assert_eq!(document["pause_confirmed"], pause.confirmed);
                     assert_eq!(document["pause_partial"], pause.partial);
+                    assert_eq!(document["pause_engine_incomplete_retirements"], retirements);
                     match child_still_running {
                         Some(running) => {
                             assert_eq!(document["child_still_running"], running);
@@ -19725,6 +22276,7 @@ mod tests {
                 false,
                 true,
                 PauseCounters::default(),
+                0,
                 None,
                 false,
                 render::SchedulingEvidence::default(),
@@ -19767,6 +22319,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             render::SchedulingEvidence::default(),
@@ -19823,6 +22376,7 @@ mod tests {
             false,
             true,
             Default::default(),
+            0,
             None,
             true,
             render::SchedulingEvidence::default(),
@@ -22751,7 +25305,7 @@ mod correction1_tests {
     }
 
     #[test]
-    fn authentic_unbound_and_closed_trace_preserves_unverified_provider_annotation() {
+    fn authentic_unbound_and_closed_trace_withholds_unverified_provider_semantics() {
         for closed in [false, true] {
             let mut c = Consumer::new(true, false);
             if closed {
@@ -22772,10 +25326,8 @@ mod correction1_tests {
             ev.mechanism = 1;
             c.feed([ev]);
             let line = String::from_utf8(c.output).unwrap();
-            assert!(
-                line.contains("C_OpenSession [semantics unverified]"),
-                "{line}"
-            );
+            assert!(line.contains("C_OpenSession"), "{line}");
+            assert!(!line.contains("[semantics unverified]"), "{line}");
             assert!(!line.contains("sess#"));
             assert!(!line.contains("CKM_"));
             assert_eq!(c.tracer.raw_calls(), before + 1);

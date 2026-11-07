@@ -168,6 +168,22 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
     cmd.die_with_parent();
     let mut child = cmd.spawn().unwrap();
     let pid = child.id();
+    // Drain stdout while the child runs: the final report can exceed the
+    // 64 KiB pipe (an unaimed --system run names every unselected process),
+    // and the observer's writer watchdog fails the run when nobody reads.
+    let stdout = child
+        .stdout
+        .take()
+        .expect("spawn_with_peak callers pipe stdout");
+    let drain = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut stdout = stdout;
+        let mut bytes = Vec::new();
+        stdout
+            .read_to_end(&mut bytes)
+            .expect("drain observer stdout");
+        bytes
+    });
     let mut peak = 0u64;
     loop {
         if let Ok(status) = std::fs::read_to_string(format!("/proc/{pid}/status")) {
@@ -187,7 +203,8 @@ fn spawn_with_peak(cmd: &mut Command, stderr_log: &Path) -> (std::process::Outpu
             None => std::thread::sleep(Duration::from_millis(5)),
         }
     }
-    let output = child.wait_with_output().unwrap();
+    let mut output = child.wait_with_output().unwrap();
+    output.stdout = drain.join().expect("stdout drain thread");
     (output, peak)
 }
 
@@ -223,7 +240,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     let events = dir.join("events.jsonl");
     let diagnostics = dir.join("diagnostics");
     let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
-        .args(["inventory", "--system", "--max-endpoints", "8193"])
+        .args(["inventory", "--system", "--max-endpoints", "131073"])
         .arg("-o")
         .arg(&report)
         .arg("--event-log")
@@ -235,7 +252,7 @@ fn invalid_inventory_endpoint_budget_precedes_every_sink() {
     assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8(output.stderr).unwrap();
     assert!(
-        stderr.contains("--max-endpoints") && stderr.contains("1..=8192"),
+        stderr.contains("--max-endpoints") && stderr.contains("1–131072"),
         "a policy error names the selected endpoint range: {stderr}"
     );
     assert!(output.stdout.is_empty());
@@ -484,7 +501,7 @@ fn inventory_capacity_public_exact_discoverable_boundaries() {
 }
 
 #[test]
-fn inventory_capacity_default_refuses_and_override_admits() {
+fn inventory_capacity_default_admits_and_override_admits() {
     let _guard = serial_guard();
     let dir = tmp("inventory-selected-endpoint-capacity");
     let driver = gcc(
@@ -588,9 +605,9 @@ fn inventory_capacity_default_refuses_and_override_admits() {
         );
         let document: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
         let budget = &document["budgets"]["inventory_endpoints"];
-        assert_eq!(budget["limit"], selected.unwrap_or(4096));
+        assert_eq!(budget["limit"], selected.unwrap_or(32768));
         assert_eq!(document["budgets"]["endpoints"]["limit"], 1_048_576);
-        if selected.is_some() {
+        {
             assert_eq!(budget["occupied"], physical_union.len());
             assert_eq!(budget["refused"], 0);
             assert_eq!(
@@ -631,17 +648,6 @@ fn inventory_capacity_default_refuses_and_override_admits() {
                     }
                 );
             }
-        } else {
-            assert!(budget["occupied"].as_u64().unwrap() <= 4096);
-            assert!(
-                document["modules"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|module| module["admission"]["state"] == "refused"
-                        && module["admission"]["reasons"].to_string().contains("4096")),
-                "the default lowering refuses owned demand and names its physical endpoint capacity"
-            );
         }
         drop(fixture);
     }
@@ -1224,6 +1230,8 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
     // counts it otherwise).
     let (output, peak) = {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_p11scope"));
+        // The per-pass gap line is verbose-only since CLI-1 (the concise
+        // head carries the PARTIAL coverage); full detail for the pin.
         cmd.args([
             "inventory",
             "--system",
@@ -1234,6 +1242,7 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
             "userspace",
             "--max-scan-pids",
             "1",
+            "-v",
             "-o",
         ])
         .arg(&file)
@@ -1248,6 +1257,8 @@ fn scan_cap_overflow_reports_exact_gap_line_on_stderr() {
         output.status,
     );
     // Both sinks carry the same bytes: the `-o` file and stdout agree.
+    // Piped: `spawn_with_peak` drains stdout mid-run, so the 64 KiB
+    // pipe never deadlocks; a file stdout would panic its contract.
     assert_eq!(
         output.stdout,
         std::fs::read(&file).unwrap(),

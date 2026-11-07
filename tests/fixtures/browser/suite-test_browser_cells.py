@@ -37,6 +37,7 @@ sys.path.insert(0, str(ROOT / "tests" / "fixtures" / "browser"))
 import cells
 import flows
 import oracle
+import profiles
 import softhsm
 import tls_server
 
@@ -166,6 +167,90 @@ def needs_chromium(test):
         return test(self)
 
     return wrapper
+
+
+class NssSeedCells(unittest.TestCase):
+    """DEMO-4: the empty-password NSS DB seed gives a browser its own
+    token with a usable client key — no PIN prompt, no external token."""
+
+    def test_seed_nss_client_credential_installs_key_and_cert(self):
+        for tool in ("certutil", "pk12util", "openssl"):
+            if shutil.which(tool) is None:
+                self.skipTest(f"{tool} missing")
+        work = Path(tempfile.mkdtemp(prefix="g33-nssseed-"))
+        self.addCleanup(shutil.rmtree, work, True)
+        cred = softhsm.generate_client_credential(work / "cred")
+        dbdir = work / "nssdb"
+        profiles.seed_nss_client_credential(dbdir, cred, "g33-nss-client")
+        import subprocess
+        listing = subprocess.run(
+            ["certutil", "-K", "-d", f"sql:{dbdir}"],
+            check=True, capture_output=True, text=True)
+        self.assertIn("g33-nss-client", listing.stdout)
+        certs = subprocess.run(
+            ["certutil", "-L", "-d", f"sql:{dbdir}"],
+            check=True, capture_output=True, text=True)
+        self.assertIn("g33-nss-client", certs.stdout)
+
+    def test_chrome_auto_select_policy_document_and_patterns(self):
+        """DEMO-4 (fedora certprobe15/16): Chrome for Testing 156 has
+        no `--auto-select-certificate-for-urls` switch; it reads the
+        AutoSelectCertificateForUrls policy from
+        /etc/opt/chrome_for_testing/policies/managed. The document
+        carries one JSON string per pattern, and a plain flow URL
+        derives loopback patterns that also cover a fresh port."""
+        import json
+        doc = json.loads(profiles.chrome_auto_select_policy_document(
+            ["https://127.0.0.1:*/*"]))
+        entries = doc["AutoSelectCertificateForUrls"]
+        self.assertEqual(
+            [json.loads(e) for e in entries],
+            [{"pattern": "https://127.0.0.1:*/*", "filter": {}}])
+        self.assertEqual(
+            str(profiles.CHROME_POLICY_DIR),
+            "/etc/opt/chrome_for_testing/policies/managed")
+        derived = profiles.chrome_auto_select_patterns(
+            "https://127.0.0.1:8443/")
+        self.assertIn("https://127.0.0.1:*/*", derived)
+        self.assertIn("https://127.0.0.1:8443/", derived)
+        from_json = profiles.chrome_auto_select_patterns(
+            '[{"pattern": "https://127.0.0.1:*/*", "filter": {}}]')
+        self.assertEqual(from_json, ["https://127.0.0.1:*/*"])
+
+    def test_chromium_launch_installs_policy_not_dead_switch(self):
+        """The launch installs the CfT managed policy (and registers
+        its removal at exit) instead of passing the removed
+        `--auto-select-certificate-for-urls` switch."""
+        work = Path(tempfile.mkdtemp(prefix="g33-pol-"))
+        self.addCleanup(shutil.rmtree, work, True)
+        installed = {}
+
+        def fake_install(patterns, name, staging):
+            installed["patterns"] = list(patterns)
+            installed["name"] = name
+            return profiles.CHROME_POLICY_DIR / f"{name}.json"
+
+        class FakeChromium:
+            def launch_persistent_context(self, profile, **kwargs):
+                installed["launch_kwargs"] = kwargs
+                return object()
+
+        class FakePw:
+            chromium = FakeChromium()
+
+        orig = profiles.install_chrome_auto_select_policy
+        profiles.install_chrome_auto_select_policy = fake_install
+        try:
+            cells.launch_browser_context(
+                FakePw(), "chromium", work / "cell",
+                flow_url="https://127.0.0.1:8443/", auto_select_cert=True)
+        finally:
+            profiles.install_chrome_auto_select_policy = orig
+        self.assertIn("https://127.0.0.1:*/*", installed["patterns"])
+        args = installed["launch_kwargs"]["args"]
+        self.assertFalse(
+            any(a.startswith("--auto-select-certificate") for a in args),
+            f"dead switch still passed: {args}")
 
 
 class BrowserCells(unittest.TestCase):

@@ -53,6 +53,81 @@ pub(in crate::discovery::engine::inventory_coordinator) struct SessionFinalizerS
     #[cfg_attr(not(test), allow(dead_code))]
     // Staged: tested only; no production render path reads it yet.
     pub(super) joined_across_global: u64,
+    /// Unrouted calls shed before the namespace's first binding (JK-18),
+    /// held instead of barriering until a binding can prove their caller.
+    pub(super) pre_binding: PreBindingHold,
+    /// Set at the first finalize that sees a binding: holding ends there.
+    pub(super) bound_once: bool,
+}
+
+/// Unrouted calls shed before any binding existed: their distinct images,
+/// lowest position and route labels. They are disclosed and counted
+/// when shed, and their positions are provisionally disposed (no bound key
+/// can seal before a binding). The first finalize that sees a binding keeps
+/// them disposed when every cookie proves another caller, and otherwise
+/// (any match, overflow, or a stop before any binding) barriers at the
+/// lowest held position. Bounded by distinct images.
+pub(in crate::discovery::engine::inventory_coordinator) struct PreBindingHold {
+    pub(super) images: BTreeSet<(u64, u64)>,
+    pub(super) min: u64,
+    pub(super) labels: Vec<(&'static str, u64)>,
+    pub(super) pid: Option<Option<u32>>,
+    pub(super) limit: usize,
+}
+
+impl PreBindingHold {
+    fn new() -> Self {
+        Self {
+            images: BTreeSet::new(),
+            min: u64::MAX,
+            labels: Vec::new(),
+            pid: None,
+            // The capture-wide waiting-call queue: held calls are calls
+            // still waiting for a caller proof.
+            limit: crate::discovery::instances::MAX_PENDING,
+        }
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.labels.is_empty()
+    }
+
+    /// Hold one positioned call. Refuses (holding nothing) when a new
+    /// image would pass the limit.
+    pub(super) fn hold(
+        &mut self,
+        image: (u64, u64),
+        position: u64,
+        label: &'static str,
+        pid: u32,
+    ) -> bool {
+        if !self.images.contains(&image) {
+            if self.images.len() >= self.limit {
+                return false;
+            }
+            self.images.insert(image);
+        }
+        self.min = self.min.min(position);
+        match self.labels.iter_mut().find(|(known, _)| *known == label) {
+            Some((_, count)) => *count += 1,
+            None => self.labels.push((label, 1)),
+        }
+        self.pid = match self.pid {
+            None => Some(Some(pid)),
+            Some(Some(seen)) if seen == pid => Some(Some(pid)),
+            Some(_) => Some(None),
+        };
+        true
+    }
+
+    /// Take everything held, keeping the limit.
+    pub(super) fn take(&mut self) -> Self {
+        let limit = self.limit;
+        let mut taken = std::mem::replace(self, Self::new());
+        self.limit = limit;
+        taken.limit = limit;
+        taken
+    }
 }
 
 impl SessionFinalizerState {
@@ -86,7 +161,14 @@ impl SessionFinalizerState {
             reload_shed: 0,
             continued_across_global: 0,
             joined_across_global: 0,
+            pre_binding: PreBindingHold::new(),
+            bound_once: false,
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reference_pre_binding_limit(&mut self, limit: usize) {
+        self.pre_binding.limit = limit.min(crate::discovery::instances::MAX_PENDING);
     }
 
     /// Stage one batch's disclosure quadrant into the namespace

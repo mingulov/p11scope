@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import gzip
 import hashlib
 import importlib.util
@@ -18,6 +19,7 @@ import stat
 import subprocess
 import sys
 import tarfile
+import tempfile
 
 sys.dont_write_bytecode = True
 ARTIFACTS = ("p11scope", "p11scope-discover", "p11scope-discover-glibc", "p11scope-discover-musl")
@@ -313,6 +315,143 @@ def write_archive(path: Path, prefix: str, payload):
     path.chmod(0o644)
 
 
+# System packages reuse the exact tarball bytes (no second build). The
+# observer is the static musl binary; the helper is the glibc binary
+# because DEB/RPM target glibc distributions (Debian/Ubuntu, Fedora/RHEL)
+# where a musl-dynamic helper would not execute without a musl loader.
+# The musl helper stays tarball-only for musl systems (Alpine uses apk).
+SYSTEM_PACKAGE_OBSERVER = "p11scope"
+SYSTEM_PACKAGE_HELPER = "p11scope-discover-glibc"
+SYSTEM_PACKAGE_MAINTAINER = "mingulov <mingulov@users.noreply.github.com>"
+SYSTEM_PACKAGE_SUMMARY = "Non-interposing PKCS#11 observer on eBPF uprobes"
+SYSTEM_PACKAGE_URL = "https://github.com/mingulov/p11scope"
+
+
+def commit_epoch(root: Path) -> int:
+    """Commit time as SOURCE_DATE_EPOCH for deterministic system packages."""
+    out = git(root, "show", "-s", "--format=%ct", "HEAD").decode().strip()
+    if not re.fullmatch(r"[0-9]+", out):
+        raise ValueError("invalid commit timestamp")
+    value = int(out)
+    if value <= 0:
+        raise ValueError("invalid commit timestamp")
+    return value
+
+
+def system_package_description(capture_mode: str, version: str) -> str:
+    variant = ("FULL official build with object-attribute capture enabled"
+               if capture_mode == "full" else
+               "P0 official build with object-attribute capture disabled")
+    return (f"{SYSTEM_PACKAGE_SUMMARY}.\n"
+            f" This is the {variant} ({version}).\n"
+            " .\n"
+            " Installed files carry no file capabilities, set-id bits,\n"
+            " services or maintainer scripts.\n"
+            " See /usr/share/doc/p11scope/RELEASE.json for build provenance.")
+
+
+def write_tree(base: Path, files, epoch: int):
+    """Write sorted files with fixed modes, ownership-neutral mtimes."""
+    for name, (data, mode) in sorted(files.items()):
+        target = base / name
+        if target.is_symlink() or target.exists():
+            raise ValueError(f"system package staging collision: {name}")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(data)
+        target.chmod(mode)
+        os.utime(target, (epoch, epoch))
+    for directory in sorted(base.rglob("*")):
+        if directory.is_dir() and not directory.is_symlink():
+            directory.chmod(0o755)
+            os.utime(directory, (epoch, epoch))
+    base.chmod(0o755)
+    os.utime(base, (epoch, epoch))
+
+
+def run_tool(arguments, epoch: int, what: str):
+    environment = {k: v for k, v in os.environ.items()
+                   if k not in ("SOURCE_DATE_EPOCH",)}
+    environment["SOURCE_DATE_EPOCH"] = str(epoch)
+    # LC_ALL=C for stable tool messages; PATH is the caller's.
+    environment["LC_ALL"] = "C"
+    result = subprocess.run(arguments, env=environment,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if result.returncode != 0:
+        detail = result.stderr.decode(errors="replace")[:500]
+        raise ValueError(f"{what} failed with exit {result.returncode}: {detail}")
+
+
+def build_deb(staging: Path, observer: bytes, helper: bytes, docs,
+              version: str, capture_mode: str, epoch: int) -> bytes:
+    dpkg_deb = shutil.which("dpkg-deb")
+    if not dpkg_deb:
+        raise ValueError("dpkg-deb is required to build the DEB package")
+    root = staging / "deb"
+    control = (f"Package: p11scope\nVersion: {version}\nSection: utils\n"
+               f"Priority: optional\nArchitecture: amd64\n"
+               f"Maintainer: {SYSTEM_PACKAGE_MAINTAINER}\n"
+               f"Description: {system_package_description(capture_mode, version)}\n")
+    files = {"DEBIAN/control": (control.encode(), 0o644),
+             "usr/bin/p11scope": (observer, 0o755),
+             "usr/bin/p11scope-discover": (helper, 0o755)}
+    for name, (data, mode) in docs.items():
+        files[f"usr/share/doc/p11scope/{name}"] = (data, mode)
+    write_tree(root, files, epoch)
+    output = staging / "p11scope.deb"
+    run_tool([dpkg_deb, "--build", "--root-owner-group", str(root), str(output)],
+             epoch, "dpkg-deb")
+    return regular(output)
+
+
+def build_rpm(staging: Path, observer: bytes, helper: bytes, docs,
+              version: str, capture_mode: str, epoch: int) -> bytes:
+    rpmbuild = shutil.which("rpmbuild")
+    if not rpmbuild:
+        raise ValueError("rpmbuild is required to build the RPM package")
+    date = datetime.datetime.fromtimestamp(epoch, datetime.timezone.utc)
+    changelog_date = date.strftime("%a %b %d %Y")
+    top = staging / "rpm"
+    for name in ("BUILD", "RPMS", "SOURCES", "SPECS", "SRPMS"):
+        (top / name).mkdir(parents=True, exist_ok=True)
+    buildroot = staging / "rpmbuild-root"
+    files = {"usr/bin/p11scope": (observer, 0o755),
+             "usr/bin/p11scope-discover": (helper, 0o755)}
+    for name, (data, mode) in docs.items():
+        files[f"usr/share/doc/p11scope/{name}"] = (data, mode)
+    write_tree(buildroot, files, epoch)
+    variant = ("FULL official build with object-attribute capture enabled"
+               if capture_mode == "full" else
+               "P0 official build with object-attribute capture disabled")
+    doc_entries = "\n".join(f"/usr/share/doc/p11scope/{name}"
+                            for name in sorted(docs))
+    spec = (f"Name: p11scope\nVersion: {version}\nRelease: 1\n"
+            f"Summary: {SYSTEM_PACKAGE_SUMMARY}\nLicense: GPL-3.0-or-later\n"
+            f"URL: {SYSTEM_PACKAGE_URL}\nBuildArch: x86_64\n"
+            "%global __os_install_post %{nil}\n"
+            "%description\n"
+            f"{SYSTEM_PACKAGE_SUMMARY}.\n"
+            f"This is the {variant} ({version}).\n"
+            "Installed files carry no file capabilities, set-id bits,\n"
+            "services or maintainer scripts.\n"
+            "See /usr/share/doc/p11scope/RELEASE.json for build provenance.\n"
+            "%files\n/usr/bin/p11scope\n/usr/bin/p11scope-discover\n"
+            "%dir /usr/share/doc/p11scope\n"
+            f"{doc_entries}\n"
+            "%changelog\n"
+            f"* {changelog_date} {SYSTEM_PACKAGE_MAINTAINER} - {version}-1\n"
+            f"- {variant}.\n")
+    (top / "SPECS" / "p11scope.spec").write_text(spec)
+    run_tool([rpmbuild, "-bb", "--define", f"_topdir {top}",
+              "--define", "_buildhost reproducible",
+              "--define", "use_source_date_epoch_as_buildtime 1",
+              "--buildroot", str(buildroot), str(top / "SPECS" / "p11scope.spec")],
+             epoch, "rpmbuild")
+    found = sorted((top / "RPMS").rglob("*.rpm"))
+    if len(found) != 1:
+        raise ValueError("rpmbuild did not produce exactly one RPM")
+    return regular(found[0])
+
+
 def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path,
             capture_mode: str = "full"):
     if capture_mode not in OFFICIAL_P11SCOPE_FEATURES:
@@ -337,7 +476,7 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
     notices_files, notices_hash = notices_payload(root, notices, head, tree)
     source_data = source_archive(root, source, head)
     source_name = f"p11scope-{version}-source.tar.gz"
-    provenance = {
+    pre_provenance = {
         "schema_version": 1, "version": version, "head": head, "tree": tree,
         "build_receipt_status": 0, "release_artifacts_sha256": facts["release_artifacts_sha256"],
         "artifacts": hashes, "notices_manifest_sha256": notices_hash,
@@ -346,9 +485,31 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
         "rust": (root / ".release-rust-version").read_text(encoding="utf-8").strip(), "bpf_rust": "nightly-2026-05-20",
         "scope": OFFICIAL_SCOPE[capture_mode],
     }
+    # System packages embed the pre-package provenance (they cannot contain
+    # their own hashes); the top-level and tarball RELEASE.json records the
+    # final hashes below.
+    pre_public = encoded(pre_provenance)
+    licenses = {name: (regular(root / name), 0o644) for name in LICENSES}
+    licenses.update({"notices/" + name: (data, 0o644) for name, data in notices_files.items()})
+    system_docs = dict(licenses)
+    system_docs["RELEASE.json"] = (pre_public, 0o644)
+    epoch = commit_epoch(root)
+    deb_name = f"p11scope_{version}_amd64.deb"
+    rpm_name = f"p11scope-{version}-1.x86_64.rpm"
+    with tempfile.TemporaryDirectory(prefix="p11scope-system-", dir=parent) as staging_name:
+        staging = Path(staging_name)
+        staging.chmod(0o700)
+        deb_data = build_deb(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
+                             system_docs, version, capture_mode, epoch)
+        rpm_data = build_rpm(staging, binaries[SYSTEM_PACKAGE_OBSERVER], binaries[SYSTEM_PACKAGE_HELPER],
+                             system_docs, version, capture_mode, epoch)
+    provenance = dict(pre_provenance)
+    provenance["packages"] = {
+        "deb": {"file": deb_name, "sha256": digest(deb_data)},
+        "rpm": {"file": rpm_name, "sha256": digest(rpm_data)},
+    }
     public = encoded(provenance)
-    common = {name: (regular(root / name), 0o644) for name in LICENSES}
-    common.update({"notices/" + name: (data, 0o644) for name, data in notices_files.items()})
+    common = dict(licenses)
     common["RELEASE.json"] = (public, 0o644)
     # Recheck retained identities before emitting anything; final rereads below
     # also catch an input changed while the archives were written.
@@ -366,6 +527,8 @@ def package(root: Path, receipt: Path, notices: Path, source: Path, output: Path
             payload[installed_name] = (binaries[artifact], 0o755)
             write_archive(output / f"{prefix}.tar.gz", prefix, payload)
         (output / source_name).write_bytes(source_data)
+        (output / deb_name).write_bytes(deb_data)
+        (output / rpm_name).write_bytes(rpm_data)
         (output / "RELEASE.json").write_bytes(public)
         sums = "".join(f"{digest(regular(path))}  {path.name}\n" for path in sorted(output.iterdir()))
         (output / "SHA256SUMS").write_text(sums)

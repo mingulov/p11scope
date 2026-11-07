@@ -26,8 +26,8 @@ use crate::discovery::identity::{
 };
 use crate::discovery::loader::LoaderContextSpec;
 use crate::discovery::scan::{
-    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScannedEntry, ScannedTable,
-    WORK_CEILING_REASON, order_tables_by_evidence,
+    IO_CEILING_REASON, ObjectExports, SCAN_DEADLINE_REASON, ScanLimits, ScanOutcome, ScannedEntry,
+    ScannedTable, WORK_CEILING_REASON, order_tables_by_evidence,
 };
 use crate::discovery::scheduler::MAX_PENDING_REFRESH;
 use crate::{semantics, trace};
@@ -2121,6 +2121,7 @@ fn double_load_transition_keeps_its_hit_unresolved() {
         double_loaded,
         same_file_loads: u32::from(double_loaded) + 1,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2167,6 +2168,7 @@ fn same_file_load_count_change_keeps_its_hit_unresolved() {
         double_loaded,
         same_file_loads,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2213,6 +2215,7 @@ fn stable_same_file_load_count_resolves_benignly() {
         double_loaded: true,
         same_file_loads: 2,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -2256,6 +2259,7 @@ fn incomplete_loader_record_scan_keeps_its_hit_unresolved() {
         double_loaded: false,
         same_file_loads: 1,
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -3473,7 +3477,7 @@ fn a_later_closure_prefix_replaces_the_earlier_whole_refusal() {
          (68 active, 0 retired; held by /opt/p11-kit-trust.so 68) — refusing to attach a prefix \
          of its 64 lookalike function tables (a proxy closure array is admitted whole, as a prefix \
          when mapped before the capture's first plan, or as published tables)";
-    let prefix = "2 of 64 template tables attached; calls through the others are not counted";
+    let prefix = "2 of 64 template tables attached; calls through the others are not counted (closure_prefix)";
     assert!(
         plan::is_closure_array_refusal(whole),
         "whole refusal recognized"
@@ -3790,6 +3794,325 @@ fn a_counted_capacity_refusal_replaces_the_unpublished_closure_gap() {
             .starts_with("module needs 416 more;"),
         "the counted refusal is the high-water mark: {}",
         engine.discovery.modules_skipped[0].reason
+    );
+}
+
+/// Renaming an awaiting-publication gap's display text must not change the
+/// pause-seed decision: a seed with no plan owner stays terminal for the
+/// cycle whatever the gap says.
+#[test]
+fn awaiting_seed_decision_survives_a_gap_rewording() {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let mut candidate = engine
+        .live_candidate(pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&candidate.plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        candidate.plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &seed),
+        "the unpublished seed is terminal before the rewording"
+    );
+    for skipped in &mut candidate.plan.modules_skipped {
+        skipped.reason = "a reworded gap that names no rule".to_string();
+    }
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &seed),
+        "renaming the gap text must not make the seed incomplete: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
+/// The loader route with an owned seed completes: the real
+/// armed-seed batch path, not the predicate alone.
+#[test]
+fn loader_route_with_an_owned_seed_completes() {
+    let (_fixture, mut engine, _context, record, mut session) = armed_seed_route(1);
+    let outcome = apply_ordinary_batch(&mut engine, &mut session, vec![record]).unwrap();
+    assert!(
+        outcome.required_complete,
+        "an owned seed via the loader route completes"
+    );
+}
+
+/// An awaiting layer's real collected seed stays terminal: the export
+/// file provides C_GetFunctionList (so collection succeeds) while the
+/// closure description is unpublished (so the plan refuses awaiting).
+#[test]
+fn awaiting_layer_seed_from_real_export_collects_and_stays_terminal() {
+    let (_fixture, _view, provider_module, provider_pins) = loaded_seed_provider();
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    closure.key = provider_module.key;
+    closure.path = provider_module.path.clone();
+    closure.exports = provider_module.exports.clone();
+    closure.view = provider_module.view;
+    closure.mount_namespace = provider_module.mount_namespace;
+    closure.mapped_identity = provider_module.mapped_identity;
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(provider_pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        candidate.plan.object_awaits_publication(object),
+        "the closure refuses awaiting: {:?}",
+        candidate.plan.modules_skipped
+    );
+    let collected = engine.collect_dynamic_export_work(
+        LoaderContextId::from_case_id(0),
+        std::slice::from_ref(&closure),
+        &candidate.pinned,
+        &ScriptedSession::default(),
+        false,
+        &[],
+    );
+    assert!(collected.required_seed_complete);
+    assert_eq!(collected.count_only_seeds.len(), 1);
+    assert_eq!(collected.count_only_seeds[0].object, object);
+    let mut owners = candidate
+        .plan
+        .modules
+        .iter()
+        .filter(|module| module.object == collected.count_only_seeds[0].object);
+    assert!(
+        owners.next().is_none(),
+        "the awaiting seed has no plan owner: it takes the seed loop's ownerless branch"
+    );
+    assert!(
+        seed_without_owner_is_terminal(&candidate, &collected.count_only_seeds[0]),
+        "the awaiting layer's real seed is terminal"
+    );
+}
+
+/// Negative twin: a capacity-refused provider's ownerless seed stays
+/// incomplete (required_complete == false via the seed loop).
+#[test]
+fn capacity_refused_provider_seed_without_owner_stays_incomplete() {
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(
+        &provider,
+        first_offsets(p11scope_ebpf_common::MAX_SLOTS + 1),
+    );
+    let pins = overlay_pins(&[(provider.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(pins, vec![provider.clone()], Vec::new())
+        .expect("the over-budget rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert_eq!(
+        candidate.plan.modules_skipped.len(),
+        1,
+        "{:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        !candidate.plan.object_awaits_publication(object),
+        "a crowded provider is capacity, never awaiting: {:?}",
+        candidate.plan.modules_skipped
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: provider.path.clone(),
+        file_offset: 0x10000,
+    };
+    assert!(
+        !seed_without_owner_is_terminal(&candidate, &seed),
+        "a capacity-refused seed stays incomplete: {:?}",
+        candidate.plan.modules_skipped
+    );
+}
+
+/// The start gate keeps reading gap text for hand-built plans (which
+/// carry gaps without refused records): awaiting text starts PARTIAL,
+/// a reworded gap is fatal. Pins the disclosed fallback.
+#[test]
+fn start_gate_falls_back_to_gap_text_for_hand_built_plans() {
+    let mut plan = plan_with(0, 1);
+    assert_eq!(plan.refused_modules_typed().count(), 0);
+    plan.modules_skipped[0].reason = format!(
+        "none is published yet {}",
+        plan::CLOSURE_ARRAY_NOTE_DETAILED
+    );
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "awaiting text: {}",
+        plan.modules_skipped[0].reason
+    );
+    assert_eq!(
+        refusal_error(&plan),
+        None,
+        "awaiting text starts PARTIAL via the fallback"
+    );
+    plan.modules_skipped[0].reason = "a reworded gap that names no rule".to_string();
+    assert!(
+        !plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "reworded text names no rule"
+    );
+    let error = refusal_error(&plan).expect("a reworded hand-built gap is fatal via the fallback");
+    assert!(error.contains("nothing to attach"), "{error}");
+}
+
+fn unpublished_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
+    let published_source = p11kit_like_64_table_module();
+    let mut closure = published_source.clone();
+    closure.interfaces.clear();
+    let pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let mut engine = Engine::empty();
+    let candidate = engine
+        .live_candidate(pins, vec![closure.clone()], Vec::new())
+        .expect("the unpublished rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert!(
+        plan::is_closure_awaiting_publication(&candidate.plan.modules_skipped[0].reason),
+        "starts unpublished: {}",
+        candidate.plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    (engine, candidate, seed)
+}
+
+/// A loader cycle whose only incompleteness is an unpublished closure
+/// completes: the awaiting seed places terminal, never partial.
+#[test]
+fn loader_seed_for_an_unpublished_closure_places_terminal() {
+    let (_, mut candidate, seed) = unpublished_closure_seed();
+    assert_eq!(
+        place_count_only_seed(&mut candidate, &seed),
+        SeedPlacement::Terminal,
+        "the unpublished closure's seed is terminal for the cycle"
+    );
+}
+
+fn refused_closure_seed() -> (Engine, LiveCandidate, CountOnlySeedWork) {
+    let published_source = p11kit_like_64_table_module();
+    let closure = published_source.clone();
+    let crowded = p11scope_ebpf_common::MAX_SLOTS - 312;
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(crowded));
+    let mut published = closure.clone();
+    let link = published_source.interfaces[0].clone();
+    published.interfaces = vec![link.clone(), link.clone(), link.clone(), link];
+    for (index, interface) in published.interfaces.iter_mut().enumerate() {
+        interface.index = index;
+        interface.table = Some(60 + index);
+    }
+    let mut engine = Engine::empty();
+    let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(candidate_pins, vec![published, provider], skipped)
+        .expect("the crowded rebuild");
+    let object = candidate
+        .pinned
+        .id_for_scanned(&closure, closure.key, &closure.path)
+        .expect("the closure is pinned");
+    assert!(
+        candidate
+            .plan
+            .modules_skipped
+            .iter()
+            .any(|skip| plan::is_closure_array_refusal(&skip.reason)),
+        "the crowded closure is refused: {:?}",
+        candidate.plan.modules_skipped
+    );
+    assert!(
+        !candidate.plan.object_awaits_publication(object),
+        "a refused closure awaits nothing"
+    );
+    let seed = CountOnlySeedWork {
+        object,
+        object_path: closure.path.clone(),
+        file_offset: 0x10000,
+    };
+    (engine, candidate, seed)
+}
+
+/// ...but a seed the solver selected aside stays partial: the exemption
+/// never masks a solver-selected loss.
+#[test]
+fn loader_seed_for_a_refused_closure_stays_partial() {
+    let (_, mut candidate, seed) = refused_closure_seed();
+    assert!(
+        matches!(
+            place_count_only_seed(&mut candidate, &seed),
+            SeedPlacement::Partial(_)
+        ),
+        "the refused closure's seed stays partial"
+    );
+}
+
+/// The pause-completeness twin: terminal seeds never poison the cycle's
+/// required-complete, so a cycle whose only incompleteness is an
+/// unpublished closure completes; a partial seed clears it and marks the
+/// named gap.
+#[test]
+fn loader_terminal_seeds_keep_required_complete() {
+    let (mut engine, mut candidate, seed) = unpublished_closure_seed();
+    let kept = engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(
+        kept,
+        "terminal seeds must not poison the cycle's required-complete"
+    );
+    assert!(
+        engine.counters.object_skips.is_empty(),
+        "a terminal seed marks no partial gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
+#[test]
+fn loader_partial_seed_clears_required_complete() {
+    let (mut engine, mut candidate, seed) = refused_closure_seed();
+    let kept = engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(
+        !kept,
+        "a partial seed must clear the cycle's required-complete"
+    );
+    assert_eq!(
+        engine.counters.object_skips.len(),
+        1,
+        "the partial seed marks its named gap"
     );
 }
 
@@ -6082,6 +6405,8 @@ fn exit_mappings_live_cgroup_split_and_default_twin() {
         let cgroup = OwnedCgroup::create(tag, what);
         let args = crate::cli::CaptureArgs {
             track_short_lived: armed,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: vec![fixtures.provider.clone()],
             exclude_modules: vec![],
@@ -8898,6 +9223,7 @@ fn an_empty_scan_pass_is_not_a_loss_once_the_capture_attaches_that_table() {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     let empty_scan = |path: &str| Skipped {
         subject: path.into(),
@@ -9128,6 +9454,33 @@ fn module_refusal_diagnostics_escape_target_controls() {
     assert!(!message.contains('\u{1b}') && !message.contains('\r'));
 }
 
+#[test]
+fn prefix_gap_stderr_names_partial_coverage_not_refusal() {
+    // The terminal stderr verdict must agree with the report: a
+    // prefix-admitted (or growth-omitted) module is partially
+    // covered, never refused. Whole refusals keep their verb.
+    for reason in [
+        "2 of 67 template tables attached; calls through the others are not counted (closure_prefix)",
+        "300 of 600 endpoints attached; calls through the others are not counted (provider_prefix)",
+        "admitted module needs 2 more; only 512 attach slots are available; 511 are in use — 2 endpoints not attached; kept its 511 attached endpoints",
+    ] {
+        let message = format_module_refusal("/opt/prefix.so", reason);
+        assert!(
+            message.starts_with("p11scope: module partially covered: /opt/prefix.so — "),
+            "a partial gap must not read refused: {message}"
+        );
+        assert!(message.contains(reason), "{message}");
+    }
+    let whole = format_module_refusal(
+        "/opt/crowded.so",
+        "module needs 150 more; only 512 attach slots are available — refusing to attach a prefix",
+    );
+    assert!(
+        whole.starts_with("p11scope: module refused: /opt/crowded.so — "),
+        "a whole refusal keeps its verb: {whole}"
+    );
+}
+
 /// Task 9.2-fix5 item B, first half. The same `exec` transition, one step
 /// earlier: when the whole image is replaced the moved hook address often
 /// resolves to *no* mapping at all rather than to a moved one, so the
@@ -9317,6 +9670,8 @@ fn capture_start_members_that_ended_are_not_losses() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9372,6 +9727,8 @@ fn discover_wires_metrics_without_counter_mode_to_the_remedy_hint() {
         std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
         let args = CaptureArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: vec![],
             exclude_modules: vec![],
@@ -9436,6 +9793,8 @@ fn max_scan_pids_bounds_initial_scan_and_refresh() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let mut args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9608,6 +9967,8 @@ fn some_zero_max_scan_pids_clamps_to_default_like_none() {
     let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
     let args_with = |max_scan_pids| CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9679,6 +10040,8 @@ fn zero_cap_refresh_short_circuits_the_sweep_to_empty() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9786,6 +10149,8 @@ fn ordinary_over_cap_refresh_performs_no_maps_sweep() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -9957,6 +10322,8 @@ fn retained_views_survive_ordinary_rotation_passes() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10093,6 +10460,8 @@ fn reconcile_pass_rereads_maps_rarity_selects_and_advances_cursor() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10325,6 +10694,8 @@ fn reconcile_cursor_advances_incrementally_and_wraps() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10524,6 +10895,8 @@ fn reconcile_waiter_outside_slice_settles_within_one_sweep() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10641,6 +11014,8 @@ fn reconcile_quantum_zero_defers_the_whole_slice() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10779,6 +11154,8 @@ fn refresh_requests_survive_allocation_exhaustion() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -10876,6 +11253,8 @@ fn id_exhaustion_publishes_skip_instead_of_failing() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -14139,6 +14518,7 @@ fn evidence_verdict(
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -14256,6 +14636,7 @@ fn capture_facts_reports_active_slots_separately_from_churned_allocations() {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     let delta = engine.plan.extend_exact(rebuilt).unwrap();
     assert_eq!(
@@ -21888,6 +22269,280 @@ fn overflowing_export_cookie_id_refuses_dynamic_work_with_partial_evidence() {
 }
 
 #[test]
+fn seed_for_unadmitted_closure_skips_the_owner_check() {
+    // A proxy closure array awaiting publication is deliberately
+    // unadmitted (0 published tables): its C_GetFunctionList seed can
+    // hook nothing, and the closure gap already discloses the
+    // non-coverage. The seed must skip benignly instead of failing the
+    // batch (which would kill pause protection for the whole capture).
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    assert!(plan.slots.is_empty(), "the closure takes no slot");
+    assert_eq!(plan.modules_skipped.len(), 1, "{:?}", plan.modules_skipped);
+    assert!(
+        plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
+        "the skip names the awaiting closure: {}",
+        plan.modules_skipped[0].reason
+    );
+    let seed = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: closure.path.clone(),
+        file_offset: 60384,
+    };
+    assert!(
+        seed_object_is_unadmitted_closure(&plan, &seed),
+        "the closure seed skips benignly"
+    );
+}
+
+#[test]
+fn seed_for_admitted_provider_keeps_the_owner_check() {
+    // The downgrade applies only to deliberately unadmitted objects:
+    // a seed for an admitted provider module keeps the exact owner
+    // requirement.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut provider = overlay_module(overlay_key(58));
+    provider.tables[0].entries = overlay_entries(&provider, first_offsets(68));
+    let mut engine = Engine::empty();
+    let mut candidate_pins = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let skipped = candidate_pins.absorb(overlay_pins(&[(provider.key, "c3a91d07", 1)]));
+    let candidate = engine
+        .live_candidate(
+            candidate_pins,
+            vec![closure.clone(), provider.clone()],
+            skipped,
+        )
+        .expect("the provider beside the closure rebuilds");
+    let provider_object = candidate
+        .pinned
+        .id_for_scanned(&provider, provider.key, &provider.path)
+        .expect("the provider is pinned");
+    assert!(
+        candidate
+            .plan
+            .modules
+            .iter()
+            .any(|summary| summary.object == provider_object),
+        "the provider is admitted"
+    );
+    let seed = CountOnlySeedWork {
+        object: provider_object,
+        object_path: provider.path.clone(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&candidate.plan, &seed),
+        "an admitted provider seed keeps the owner check"
+    );
+}
+
+#[test]
+fn seed_for_unknown_or_refused_object_keeps_the_owner_check() {
+    // Unknown objects and non-closure refusals (capacity, safety)
+    // still fail: only the awaiting-publication closure downgrades.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let mut plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let unknown = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: "/opt/unknown-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&plan, &unknown),
+        "an unknown object keeps the owner check"
+    );
+    plan.modules_skipped.push(crate::discovery::scan::Skipped {
+        subject: "/opt/capped-provider.so".to_string(),
+        reason: "module needs 5 more; only 3 attach slots are available".to_string(),
+    });
+    let refused = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: "/opt/capped-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    assert!(
+        !seed_object_is_unadmitted_closure(&plan, &refused),
+        "a non-closure refusal keeps the owner check"
+    );
+}
+
+/// A seed-loop candidate around a hand-built plan: seed placement
+/// reads only the plan and the delta, so the remaining candidate
+/// state stays empty.
+fn seed_loop_candidate(plan: plan::AttachPlan, pinned: PinnedObjects) -> LiveCandidate {
+    LiveCandidate {
+        pinned,
+        modules: Vec::new(),
+        plan,
+        delta: plan::AttachDelta {
+            new: Vec::new(),
+            replace: Vec::new(),
+            retire: Vec::new(),
+        },
+        views: BTreeSet::new(),
+        corroboration: Vec::new(),
+        manifest_fallbacks: Vec::new(),
+        selection_claims: BTreeMap::new(),
+        selection_tables: BTreeMap::new(),
+        selection_admission: None,
+        manifest_selection_admissions: Vec::new(),
+        manifest_inventory_slots: BTreeMap::new(),
+        loader_plan_proof: None,
+        exec_preservations: Vec::new(),
+        exec_completions: Vec::new(),
+        built_by_full_rebuild: false,
+    }
+}
+
+#[test]
+fn seed_loop_skips_an_unadmitted_closure_seed_benignly() {
+    // Loop-level twin of `seed_for_unadmitted_closure_skips_the_owner_check`:
+    // the unadmitted-closure seed goes through the real seed loop, not just
+    // the predicate, so removing the skip from the loop fails this test.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let seed = CountOnlySeedWork {
+        object: modules[0].object,
+        object_path: closure.path.clone(),
+        file_offset: 60384,
+    };
+    let mut candidate = seed_loop_candidate(plan, engine.pinned);
+    let mut loop_engine = Engine::empty();
+    let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(complete, "the closure seed leaves the batch complete");
+    assert!(
+        candidate.delta.new.is_empty(),
+        "the closure seed takes no slot"
+    );
+    assert!(
+        loop_engine.counters.object_skips.is_empty(),
+        "the closure seed marks no partial: {:?}",
+        loop_engine.counters.object_skips
+    );
+}
+
+#[test]
+fn seed_loop_still_fails_a_non_closure_seed_without_an_owner() {
+    // Twin: a seed no closure skip covers still fails the batch loudly
+    // through the same loop, with the owner partial recorded. The seed
+    // names a genuinely unknown object: the terminal rule decides by
+    // object identity, so the closure's own object would place terminal
+    // whatever path it carries.
+    let mut closure = p11kit_like_64_table_module();
+    closure.interfaces.clear();
+    let mut engine = Engine::empty();
+    engine.pinned = overlay_pins(&[(closure.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) =
+        bind_scanned_modules(std::slice::from_ref(&closure), &mut engine.pinned);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut counters = DiscoveryCounters::default();
+    let plan = build_current_plan(
+        &modules,
+        &[],
+        &[],
+        &engine.pinned,
+        &mut counters,
+        &mut BTreeSet::new(),
+        &BTreeSet::new(),
+        0,
+        0,
+        false,
+        plan::AdmissionScope::Named,
+        false,
+    )
+    .expect("a named capture beside an unpublished closure alone starts");
+    let seed = CountOnlySeedWork {
+        object: PinnedObjectId(u32::MAX),
+        object_path: "/opt/unknown-provider.so".to_string(),
+        file_offset: 60384,
+    };
+    let mut candidate = seed_loop_candidate(plan, engine.pinned);
+    let mut loop_engine = Engine::empty();
+    let complete = loop_engine.place_count_only_seeds(&mut candidate, &[seed], true);
+    assert!(
+        !complete,
+        "a non-closure seed without an owner fails the batch"
+    );
+    assert!(
+        candidate.delta.new.is_empty(),
+        "the failed seed takes no slot"
+    );
+    assert_eq!(loop_engine.counters.object_skips.len(), 1);
+    let skipped = &loop_engine.counters.object_skips[0];
+    assert_eq!(skipped.subject, "live export hook");
+    assert!(
+        skipped
+            .reason
+            .contains("had no unique candidate module owner"),
+        "unexpected partial: {skipped:?}"
+    );
+}
+
+#[test]
 fn expired_deadline_names_live_export_snapshot_refusal() {
     let (_fixture, _view, module, pins) = loaded_seed_provider();
     let mut engine = Engine::empty();
@@ -29213,6 +29868,7 @@ fn merge_scanned_modules_retains_names_and_exact_decoder_provenance() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi,
         exports: vec![],
         tables: vec![ScannedTable {
@@ -29283,6 +29939,7 @@ fn incomplete_rescan_preserves_double_load_detection() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -29328,6 +29985,7 @@ fn incomplete_rescan_unions_the_extension_proof() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![ScannedTable {
@@ -29383,6 +30041,7 @@ fn incomplete_rescan_preserves_highest_load_count() {
             inode: 42,
         },
         path: "/opt/p.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -29903,6 +30562,8 @@ fn capture_start_releases_view_ids_for_members_that_ended_before_scan() {
     std::fs::write(dir.path().join("cgroup.procs"), listing).expect("a cgroup.procs");
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -32493,6 +33154,7 @@ fn scanned_manifest_replacement(paths: &[PathBuf], targets: &[u32]) -> ScannedMo
         mount_namespace: current_mount_namespace(),
         key: facts[0].0,
         path: paths[0].display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -33559,6 +34221,7 @@ fn stale_only_identity_mismatch_becomes_manifest_fallback_for_stable_scope() {
         mount_namespace: current_mount_namespace(),
         key,
         path: path.clone(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -33795,6 +34458,7 @@ fn corroboration_marks_the_exact_reconciled_object_not_the_raw_key_peer() {
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -33892,6 +34556,7 @@ fn pending_fallback_outcome_follows_the_final_overlay_canonical_id_without_autho
             mount_namespace: current_mount_namespace(),
             key,
             path: path.into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -33965,6 +34630,7 @@ fn pending_corroboration_rebuild_resolves_the_current_final_id() {
             mount_namespace: current_mount_namespace(),
             key,
             path: "/stable-view.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -34050,6 +34716,7 @@ fn pinned_owned_fixture() -> (Vec<ScannedModule>, PinnedObjects) {
         mount_namespace: view.mount_namespace(),
         key,
         path: object.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(if usize::BITS == 64 {
             ElfAbi::Lp64
         } else {
@@ -34380,6 +35047,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -34742,6 +35410,7 @@ fn plan_with(slots: usize, refused: usize) -> plan::AttachPlan {
         source: "scan",
         corroborated: false,
         skipped: vec![],
+        admission_class: None,
     }];
     plan.modules_skipped = (0..refused)
         .map(|i| Skipped {
@@ -35055,6 +35724,7 @@ fn scan_view_does_not_choose_the_first_byte_identical_ordinary_file() {
                 inode: key.inode,
             },
             path: path.display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: vec![],
             tables: vec![],
@@ -35137,6 +35807,7 @@ fn byte_identical_distinct_entry_objects_conflict_and_attach_the_union() {
         mount_namespace: current_mount_namespace(),
         key: key(module_mapping),
         path: module_path.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: Some(ElfAbi::Lp64),
         exports: vec!["C_GetFunctionList".into()],
         tables: vec![ScannedTable {
@@ -35319,6 +35990,7 @@ fn retargeting_only_adopts_the_matched_scanned_object() {
             inode: 7,
         },
         path: "/opt/decoy.so".into(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![],
         tables: vec![],
@@ -35576,6 +36248,7 @@ fn merged_object(sources: Vec<&'static str>) -> render::ObjectSummary {
 fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
     render::DiscoveredModule {
         id: plan::ModuleId(0),
+        admission_class: None,
         dev: (0, 30),
         ino: 12_043_768,
         sha256: Some("5f48fcc1".into()),
@@ -35627,6 +36300,26 @@ fn distinct_objects_are_never_coalesced_by_the_source_union() {
     merge_discovered_module(&mut retained, incoming);
     assert_eq!(retained.objects.len(), 2);
     assert_eq!(retained.sources, vec!["scan", "manifest"]);
+}
+
+/// The retained record takes the fresher incoming deciding class: early
+/// evidence may show a closure array as heuristic before all its lookalike
+/// tables decode. Incoming `None` keeps the retained class.
+#[test]
+fn retained_module_takes_the_fresher_incoming_admission_class() {
+    let mut retained = merged_module(vec!["scan"]);
+    retained.admission_class = Some("heuristic");
+    let mut incoming = merged_module(vec!["scan"]);
+    incoming.admission_class = Some("closure_array");
+    merge_discovered_module(&mut retained, incoming);
+    assert_eq!(retained.admission_class, Some("closure_array"));
+
+    let mut retained = merged_module(vec!["scan"]);
+    retained.admission_class = Some("heuristic");
+    let mut incoming = merged_module(vec!["scan"]);
+    incoming.admission_class = None;
+    merge_discovered_module(&mut retained, incoming);
+    assert_eq!(retained.admission_class, Some("heuristic"));
 }
 
 #[test]
@@ -36017,6 +36710,86 @@ fn selection_edges_tie_break_empty_key_under_cap() {
     assert_eq!(select_deep_scan_candidates(&under, 3), vec![9, 30, 50]);
 }
 
+/// Freshness-tiered selection with nothing scanned agrees exactly with
+/// rarity selection: every group is fresh, representatives stay lowest,
+/// unmapped trail in pid order. Single-pass sites keep today's behavior.
+#[test]
+fn fresh_first_selection_with_empty_scanned_matches_rarity_selection() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (30, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (31, vec![map_entry("/usr/lib/liba.so", 11)]),
+        (40, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (41, vec![map_entry("/usr/lib/libb.so", 12)]),
+        (50, vec![]),
+        (9001, vec![map_entry("/tmp/uniq-p11.so", 10)]),
+    ];
+    let empty: BTreeSet<u32> = BTreeSet::new();
+    for cap in 1..=sweep.len() {
+        assert_eq!(
+            select_fresh_first_candidates(&sweep, cap, &empty),
+            select_deep_scan_candidates(&sweep, cap),
+            "empty freshness agrees at cap {cap}"
+        );
+    }
+}
+
+/// A newcomer group ranked below the cut by pure rarity is never
+/// selected across identical passes (today's starvation, pinned); once
+/// earlier passes scanned the incumbents, freshness tiers rescue it in
+/// the next pass instead of losing every pass.
+#[test]
+fn fresh_first_selection_rescues_a_newcomer_group_below_the_cut() {
+    fn map_entry(path: &str, inode: u64) -> MapEntry {
+        MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            file_offset: 0,
+            permissions: *b"r-xp",
+            device: Device { major: 8, minor: 1 },
+            inode,
+            raw_path: Some(path.as_bytes().to_vec()),
+        }
+    }
+    // G_rare={10} (min_global 1), G_common={20,21,22} (min_global 3),
+    // G_new={30,31,32,33} (min_global 4). Cap 2.
+    let sweep: Vec<(u32, Vec<MapEntry>)> = vec![
+        (10, vec![map_entry("/tmp/rare-p11.so", 1)]),
+        (20, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (21, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (22, vec![map_entry("/usr/lib/libcommon.so", 2)]),
+        (30, vec![map_entry("/opt/new-p11.so", 3)]),
+        (31, vec![map_entry("/opt/new-p11.so", 3)]),
+        (32, vec![map_entry("/opt/new-p11.so", 3)]),
+        (33, vec![map_entry("/opt/new-p11.so", 3)]),
+    ];
+    // Pass 1: nothing scanned yet; the newcomer group loses the cut.
+    let first: BTreeSet<u32> = BTreeSet::new();
+    assert_eq!(
+        select_fresh_first_candidates(&sweep, 2, &first),
+        vec![10, 20]
+    );
+    // Pure rarity repeats pass 1 forever: the newcomer never scans.
+    assert_eq!(select_deep_scan_candidates(&sweep, 2), vec![10, 20]);
+    // Pass 2: pass 1 scanned {10, 20}; the all-fresh newcomer group
+    // jumps ahead of the all-scanned rare group.
+    let scanned: BTreeSet<u32> = [10, 20].into_iter().collect();
+    assert_eq!(
+        select_fresh_first_candidates(&sweep, 2, &scanned),
+        vec![21, 30]
+    );
+}
+
 /// Deep-scan selection never spends slots on kernel threads: they have no
 /// user address space to scan. A fixture /proc with 260 kernel threads at
 /// the lowest pids and 40 unmapped user processes at high pids still
@@ -36161,8 +36934,14 @@ fn select_excluding_kernel_threads_counts_absences_on_the_budget() {
     ];
     let unavailable: BTreeSet<u32> = [12].into_iter().collect();
     let mut budget = CaptureWorkBudget::default();
-    let selected =
-        select_excluding_kernel_threads(&sweep, &unavailable, &proc_root, 4, &mut budget);
+    let selected = select_excluding_kernel_threads(
+        &sweep,
+        &unavailable,
+        &proc_root,
+        4,
+        &mut budget,
+        &BTreeSet::new(),
+    );
     // Only pid 10 is a flagged thread with an empty available snapshot;
     // the cap then fits every remaining pid.
     assert_eq!(selected, vec![11, 12, 13, 14], "{selected:?}");
@@ -36445,6 +37224,8 @@ fn system_scope_spawn_loaded_multi(driver: &Path, providers: &[PathBuf]) -> Syst
 fn system_args(hints: Vec<PathBuf>, max_scan_pids: Option<usize>) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         exclude_modules: vec![],
@@ -36978,8 +37759,8 @@ fn p11kit_like_64_table_module() -> ScannedModule {
 /// Part 0: the admitted prefix is reported as a partial-coverage record
 /// naming the covered templates, not as silence; the reported total counts
 /// the linked table beside the heuristic ones.
-/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
-/// prefix applies; closure-alone would take published-only and spill nothing.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan and is
+/// operator-named, so the prefix applies.
 #[test]
 fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     let admitted_heuristics = if cfg!(feature = "wide-detailed-2112") {
@@ -36989,12 +37770,14 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     };
     // Reported attached tables: heuristic plus the linked one.
     let reported_attached = admitted_heuristics + 1;
-    // Plus the sidecar provider's single slot: a closure alone in the first
-    // plan takes no prefix (PA-9/C1), so the prefix mechanics under test
-    // hold a provider beside the closure; the closure stays unnamed.
+    // Plus the sidecar provider's single slot: the prefix mechanics under
+    // test hold a provider beside the closure, and the closure is
+    // operator-named — unlinked templates attach only through the
+    // named-prefix path in a per-call capture.
     let expected_slots = ((admitted_heuristics + 1) * 104) as usize + 1;
     let expected_spill = 63 - admitted_heuristics;
-    let raw = p11kit_like_64_table_module();
+    let mut raw = p11kit_like_64_table_module();
+    raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
@@ -37080,12 +37863,69 @@ fn ordered_admission_resource_bound_caps_heuristic_tables_per_object() {
     );
 }
 
+/// Unnamed twin of the resource-bound test: without `--module` the same
+/// 64-table layer attaches only its published table 63 beside the sidecar
+/// provider — 105 slots, no gap, 63 templates spilled as uncorroborated
+/// evidence. Both builds give the same values: published-only admission
+/// does not depend on the resource bound.
+#[test]
+fn ordered_admission_unnamed_closure_attaches_only_its_published_table() {
+    let raw = p11kit_like_64_table_module();
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert_eq!(
+        plan.modules_skipped.len(),
+        1,
+        "published-only admission carries its named partial gap: {:?}",
+        plan.modules_skipped
+    );
+    assert!(
+        plan.modules_skipped[0]
+            .reason
+            .contains("1 of 64 template tables attached")
+            && plan.modules_skipped[0]
+                .reason
+                .contains("(closure_published_only)"),
+        "unexpected published-only gap: {:?}",
+        plan.modules_skipped[0]
+    );
+    assert_eq!(
+        plan.slots.len(),
+        105,
+        "table 63 plus the sidecar's one slot"
+    );
+    assert_eq!(
+        plan.uncorroborated_candidates, 63,
+        "unpublished templates spill as evidence, never slots"
+    );
+    assert_eq!(
+        plan.entries_seen, 6657,
+        "seen counts every decoded record, admitted or spilled, plus the sidecar's one"
+    );
+
+    // Evidence order, not discovery order: only the linked table (index
+    // 63) attaches, via the published bypass.
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..64u64 {
+        let first_entry = 0x10000 + table * 104 * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table == 63,
+            "table {table} attaches only when published"
+        );
+    }
+}
+
 /// Task 1.3 mislabel guard on the 64-table replica: every admitted
 /// unlinked tables' slots are named `unknown` — never the ordinal PKCS#11
 /// labels — while the linked table keeps its names. Every table carries
 /// (file_offset, entry count, linkage kind) into published evidence.
-/// PA-9/C1: the closure holds a sidecar provider in the first plan, so the
-/// prefix (whose labels this guards) applies; the closure stays unnamed.
+/// PA-9/C1: the closure holds a sidecar provider in the first plan and is
+/// operator-named, so the prefix (whose labels this guards) applies.
 #[test]
 fn admitted_heuristic_tables_are_unknown_with_provenance() {
     // Two, like the resource-bound twin: the reserve-capped 384-slot prefix
@@ -37096,7 +37936,10 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
     } else {
         2u64
     };
-    let raw = p11kit_like_64_table_module();
+    let mut raw = p11kit_like_64_table_module();
+    // Operator-named layer: unlinked templates attach only through the
+    // named-prefix path in a per-call capture.
+    raw.module_hint = Some(PathBuf::from(&raw.path));
     let sidecar = overlay_module(overlay_key(58));
     let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
     let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
@@ -37189,6 +38032,43 @@ fn admitted_heuristic_tables_are_unknown_with_provenance() {
             }
         );
     }
+}
+
+/// Unnamed twin of the mislabel guard: without `--module` only table 63's
+/// entries attach beside the sidecar provider — 105 slots — keeping their
+/// interface-linked names, while no heuristic table contributes a slot
+/// that could carry an ordinal label. Both builds give the same values.
+#[test]
+fn unnamed_closure_attaches_only_its_published_table_without_heuristic_names() {
+    let raw = p11kit_like_64_table_module();
+    let sidecar = overlay_module(overlay_key(58));
+    let mut pins = overlay_pins(&[(raw.key, OVERLAY_SHA, 1), (sidecar.key, OVERLAY_SHA, 1)]);
+    let (modules, skipped) = bind_scanned_modules(&[raw, sidecar], &mut pins);
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let plan = plan::build_from_reconciled_modules(&modules);
+
+    assert_eq!(
+        plan.slots.len(),
+        105,
+        "table 63 plus the sidecar's one slot"
+    );
+    let attached: BTreeSet<u64> = plan.slots.iter().map(|slot| slot.file_offset).collect();
+    for table in 0..64u64 {
+        let first_entry = 0x10000 + table * 104 * 8;
+        assert_eq!(
+            attached.contains(&first_entry),
+            table == 63,
+            "table {table} attaches only when published"
+        );
+    }
+
+    // Table 63 is interface-linked: ordinal 63*104 % 8 == 0 keeps C_Initialize.
+    let linked = plan
+        .slots
+        .iter()
+        .find(|slot| slot.file_offset == 0x10000 + 63 * 104 * 8)
+        .unwrap();
+    assert_eq!(linked.names, ["C_Initialize"]);
 }
 
 /// Task 1.3: a table returned by a live provider export carries publication
@@ -37669,7 +38549,7 @@ fn two_views_share_one_per_object_union_preserving_pins_and_interfaces() {
 }
 
 // Audit F5/F7 spill-then-settle publication pair: five distinct one-target
-// heuristic tables, four admitted under K=4, one omitted; the second
+// heuristic tables, admitted whole beside the sidecar provider; the second
 // publication corroborates the fifth table with a live return and rebuilds
 // through the same stable-ID extension path the engine uses.
 // PA-9/C1: every build holds a sidecar provider beside the closure, so the
@@ -38469,6 +39349,7 @@ fn loader_rescan_with_a_stale_generation_refuses_without_mutation() {
                 inode: 7,
             },
             path: "/lib/provider.so".to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: Vec::new(),
             tables: Vec::new(),
@@ -38557,6 +39438,7 @@ fn view_pin_revalidation_detects_replaced_files() {
         mount_namespace: view.mount_namespace(),
         key,
         path: path.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: Vec::new(),
         tables: Vec::new(),
@@ -38982,6 +39864,8 @@ fn e06_cgroup_args(
 ) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: hints,
         exclude_modules: vec![],
@@ -54249,6 +55133,7 @@ fn midfinal_res3_provider_module(view: ProcessViewId, offsets: &[u64]) -> Reconc
             mount_namespace: current_mount_namespace(),
             key,
             path: "/provider.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {
@@ -62275,6 +63160,455 @@ int main(int argc, char **argv) {
     assert!(!table.live_return && !table.manifest_supported);
 }
 
+/// The tables-scan finished flag from a real scan: a default-budget scan
+/// of a loader child finishes the provider module, while a per-object
+/// cap that skips the module leaves it unfinished. A work ceiling cannot
+/// twin the failure leg here: any mid-scan stop fails the maps-B bracket
+/// and drops every module, so no stopped module is observable.
+#[test]
+fn raw_scan_tables_scan_finished_and_skipped_unfinished() {
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let library = dir.path().join("provider.so");
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/provider-compatibility.c");
+    assert!(
+        Command::new("cc")
+            .args(["-shared", "-fPIC", "-std=c11", "-O0", "-DCOMPAT_FAT_DATA"])
+            .arg(&fixture)
+            .arg("-o")
+            .arg(&library)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let loader_source = dir.path().join("loader.c");
+    std::fs::write(
+        &loader_source,
+        r#"
+#include <dlfcn.h>
+#include <stdio.h>
+#include <unistd.h>
+int main(int argc, char **argv) {
+    (void)argc;
+    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 1;
+    unsigned long (*get)(void **) = dlsym(h, "C_GetFunctionList");
+    void *table = 0;
+    if (!get || get(&table)) return 2;
+    printf("%p\n", table);
+    fflush(stdout);
+    char byte;
+    (void)read(STDIN_FILENO, &byte, 1);
+    return 0;
+}
+"#,
+    )
+    .unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&loader_source)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    {
+        use std::io::{BufRead as _, BufReader};
+        let mut address = String::new();
+        BufReader::new(child.0.stdout.take().unwrap())
+            .read_line(&mut address)
+            .unwrap();
+    }
+    let hooks = HookRegistry::builtin();
+    let scan = |budget: &mut CaptureWorkBudget| {
+        let view = ProcessView::open(ProcessViewId(4301), child.0.id()).unwrap();
+        crate::discovery::scan::scan_process_view(
+            &ScanRequest {
+                pid: child.0.id(),
+                hints: &[],
+                hooks: &hooks,
+            },
+            &view,
+            budget,
+        )
+        .unwrap()
+    };
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = scan(&mut budget);
+    let provider = outcome
+        .modules()
+        .iter()
+        .find(|module| module.path.ends_with("provider.so"))
+        .expect("the default scan reaches the provider module");
+    assert_eq!(provider.tables.len(), 1, "the fat BSS adds no table");
+    assert!(
+        provider.tables_scan_finished,
+        "a default-budget scan finishes the provider tables scan"
+    );
+    assert_eq!(budget.stopped_reason(), None);
+    let mut budget = CaptureWorkBudget::new(ScanLimits {
+        per_object_bytes: 100 * 1024,
+        ..ScanLimits::default()
+    });
+    let outcome = scan(&mut budget);
+    let provider = outcome
+        .modules()
+        .iter()
+        .find(|module| module.path.ends_with("provider.so"))
+        .expect("a skipped module is still reported");
+    assert!(
+        outcome
+            .skipped()
+            .iter()
+            .any(|skip| skip.subject.ends_with("provider.so") && skip.reason.contains("too_large")),
+        "the cap skipped the provider module: {:?}",
+        outcome.skipped()
+    );
+    assert!(
+        provider.tables.is_empty(),
+        "a skipped module carries no tables"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "a skipped tables scan reports unfinished"
+    );
+}
+
+/// Broad-pool stride mismatch clears the finished flag: when the pool's
+/// first table validates short of the 840-byte recipe, the pool
+/// contributes nothing and the sweep's finished verdict must not survive.
+/// The child poisons the page past the 552-byte legacy prefix after the
+/// sweep (two-phase handshake), so the probe reads the prefix alone. The
+/// unpoisoned twin validates the full table and refuses unfinished
+/// through the ordinary added/refused tail instead.
+#[test]
+fn broad_pool_stride_mismatch_clears_tables_scan_finished() {
+    use std::io::{BufRead as _, BufReader};
+    use std::process::{Command, Stdio};
+    struct ChildGuard(std::process::Child);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    const POOL_SOURCE: &str = r#"
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <stdint.h>
+
+#ifndef POOL_PAD_BYTES
+#define POOL_PAD_BYTES 0
+#endif
+
+/* .data pad the test sizes so the pool's page offset lands a page
+ * boundary inside (pool+551, pool+840]. Fully nonzero: the compiler
+ * demotes a mostly-zero array to BSS, which would not shift the pool. */
+static char pool_pad[POOL_PAD_BYTES + 1] = { [0 ... POOL_PAD_BYTES] = 1 };
+
+static void *slot_target(void) { return 0; }
+
+/* One valid {3,2} table plus zero tables: 64 contiguous 840-byte tables,
+ * the fixed-family pool contract. Slack keeps pool+53760 strictly inside
+ * the load for the symbol lookup. */
+typedef struct {
+    uint64_t header;
+    void *slots[104];
+} PoolTable;
+
+PoolTable p11scope_fixed[64] = {
+    [0] = { .header = UINT64_C(0x0203), .slots = { [0 ... 103] = slot_target } },
+};
+
+static char pool_slack[8192] = { [0 ... 8191] = 2 };
+
+uintptr_t C_GetFunctionList(void **out) {
+    *out = 0;
+    return 0;
+}
+"#;
+    const LOADER_SOURCE: &str = r#"
+/* SPDX-License-Identifier: GPL-3.0-or-later */
+#include <dlfcn.h>
+#include <stdio.h>
+#include <string.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+int main(int argc, char **argv) {
+    if (argc < 3) return 9;
+    void *h = dlopen(argv[1], RTLD_NOW | RTLD_LOCAL);
+    if (!h) return 1;
+    void *pool = dlsym(h, "p11scope_fixed");
+    if (!pool) return 2;
+    long page = sysconf(_SC_PAGESIZE);
+    if (page <= 0) return 3;
+    if (!strcmp(argv[2], "phase")) {
+        printf("%p %ld\n", pool, page);
+        return 0;
+    }
+    printf("%p\n", pool);
+    fflush(stdout);
+    char byte;
+    if (read(STDIN_FILENO, &byte, 1) != 1) return 6;
+    if (!strcmp(argv[2], "twophase")) {
+        unsigned long mask = ~((unsigned long)page - 1);
+        unsigned long poison = ((unsigned long)pool + 840) & mask;
+        unsigned long prefix = ((unsigned long)pool + 551) & mask;
+        if (poison <= prefix) return 4;
+        if (mprotect((void *)poison, (size_t)page, PROT_NONE)) return 5;
+        printf("poisoned %p\n", (void *)poison);
+        fflush(stdout);
+        if (read(STDIN_FILENO, &byte, 1) != 1) return 6;
+    }
+    return 0;
+}
+"#;
+    let dir = tempfile::tempdir().unwrap();
+    let pool_c = dir.path().join("pool.c");
+    std::fs::write(&pool_c, POOL_SOURCE).unwrap();
+    let loader_c = dir.path().join("loader.c");
+    std::fs::write(&loader_c, LOADER_SOURCE).unwrap();
+    let loader = dir.path().join("loader");
+    assert!(
+        Command::new("cc")
+            .arg(&loader_c)
+            .arg("-ldl")
+            .arg("-o")
+            .arg(&loader)
+            .status()
+            .unwrap()
+            .success()
+    );
+    let page = usize::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    assert!(page > 840);
+    // Feasible pool page offsets: a page boundary strictly inside
+    // (pool+551, pool+840], so the poison page holds extent bytes but no
+    // prefix byte.
+    let feasible: Vec<usize> = (0..page)
+        .filter(|offset| (offset + 840) / page > (offset + 551) / page)
+        .collect();
+    assert!(!feasible.is_empty());
+    let target = feasible[feasible.len() / 2];
+    // Tune the .data pad so the pool lands mid-window; the layout is
+    // measured, never assumed. Page offsets survive ASLR (mmap aligns),
+    // so the tuned build serves every child below.
+    let library = dir.path().join("pool.so");
+    let compile = |pad: usize| {
+        assert!(
+            Command::new("cc")
+                .args(["-shared", "-fPIC", "-std=c11", "-O0"])
+                .arg(format!("-DPOOL_PAD_BYTES={pad}"))
+                .arg(&pool_c)
+                .arg("-o")
+                .arg(&library)
+                .status()
+                .unwrap()
+                .success()
+        );
+    };
+    let phase = || -> usize {
+        let output = Command::new(&loader)
+            .arg(&library)
+            .arg("phase")
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "phase child failed: {output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        let mut words = text.split_whitespace();
+        let pool =
+            u64::from_str_radix(words.next().unwrap().trim().trim_start_matches("0x"), 16).unwrap();
+        let child_page: usize = words.next().unwrap().trim().parse().unwrap();
+        assert_eq!(child_page, page);
+        (pool as usize) % page
+    };
+    let mut pad = 0;
+    compile(pad);
+    let mut offset = phase();
+    for _ in 0..2 {
+        if feasible.contains(&offset) {
+            break;
+        }
+        pad += ((target + page - offset) % page + 7) & !7;
+        compile(pad);
+        offset = phase();
+    }
+    assert!(
+        feasible.contains(&offset),
+        "the pool phase missed its window: {offset:#x}"
+    );
+    // Experiment: a clean sweep, then the poisoned broad pass.
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .arg("twophase")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    lines.read_line(&mut line).unwrap();
+    let pool = u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).unwrap() as usize;
+    assert!(
+        feasible.contains(&(pool % page)),
+        "the experiment child missed the tuned window"
+    );
+    let view = ProcessView::open(ProcessViewId(4302), child.0.id()).unwrap();
+    let hooks = HookRegistry::builtin();
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = crate::discovery::scan::scan_process_view(
+        &ScanRequest {
+            pid: child.0.id(),
+            hints: &[],
+            hooks: &hooks,
+        },
+        &view,
+        &mut budget,
+    )
+    .unwrap();
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the sweep finds the pool provider");
+    assert_eq!(provider.tables.len(), 1, "the sweep decodes table 0");
+    assert_eq!(provider.tables[0].address, pool as u64);
+    assert!(provider.tables_scan_finished, "the clean sweep finishes");
+    assert_eq!(budget.stopped_reason(), None);
+    // Poison now; the sweep above never saw it.
+    child.0.stdin.as_mut().unwrap().write_all(b"x").unwrap();
+    line.clear();
+    lines.read_line(&mut line).unwrap();
+    let poison = u64::from_str_radix(
+        line.trim()
+            .strip_prefix("poisoned ")
+            .unwrap()
+            .trim_start_matches("0x"),
+        16,
+    )
+    .unwrap() as usize;
+    assert!(
+        poison / page > (pool + 551) / page,
+        "the poison page holds no prefix byte"
+    );
+    assert!(
+        (pool + 840) / page == poison / page,
+        "the poison page breaks the 840-byte extent"
+    );
+    let mut counters = DiscoveryCounters::default();
+    broad_fixed_pool_pass(&view, &mut modules, &mut budget, &mut counters);
+    assert!(
+        counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("not the 840-byte recipe")),
+        "the pool probe hit the stride mismatch: {:?}",
+        counters.object_skips
+    );
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the pool provider survives the broad pass");
+    assert!(
+        !provider
+            .tables
+            .iter()
+            .any(|table| table.address == pool as u64),
+        "the stride mismatch drops the pool table"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "a stride mismatch clears the finished flag"
+    );
+    drop(child);
+    // Control: no poison — the full table validates and the ordinary
+    // added/refused tail reports unfinished instead.
+    let mut child = ChildGuard(
+        Command::new(&loader)
+            .arg(&library)
+            .arg("plain")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .die_with_parent()
+            .spawn()
+            .unwrap(),
+    );
+    let mut lines = BufReader::new(child.0.stdout.take().unwrap());
+    let mut line = String::new();
+    lines.read_line(&mut line).unwrap();
+    let pool = u64::from_str_radix(line.trim().trim_start_matches("0x"), 16).unwrap() as usize;
+    let view = ProcessView::open(ProcessViewId(4303), child.0.id()).unwrap();
+    let mut budget = CaptureWorkBudget::default();
+    let outcome = crate::discovery::scan::scan_process_view(
+        &ScanRequest {
+            pid: child.0.id(),
+            hints: &[],
+            hooks: &hooks,
+        },
+        &view,
+        &mut budget,
+    )
+    .unwrap();
+    let mut modules = match outcome {
+        ScanOutcome::Scanned { modules, .. } | ScanOutcome::Unavailable { modules, .. } => modules,
+    };
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the sweep finds the pool provider");
+    assert_eq!(provider.tables.len(), 1, "the sweep decodes table 0");
+    assert!(provider.tables_scan_finished, "the clean sweep finishes");
+    let mut counters = DiscoveryCounters::default();
+    broad_fixed_pool_pass(&view, &mut modules, &mut budget, &mut counters);
+    assert!(
+        !counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.reason.contains("not the 840-byte recipe")),
+        "no stride mismatch without the poison: {:?}",
+        counters.object_skips
+    );
+    let provider = modules
+        .iter()
+        .find(|module| module.path.ends_with("pool.so"))
+        .expect("the pool provider survives the broad pass");
+    assert!(
+        provider
+            .tables
+            .iter()
+            .any(|table| table.address == pool as u64),
+        "the validated pool table stays"
+    );
+    assert!(
+        !provider.tables_scan_finished,
+        "the added/refused tail reports unfinished"
+    );
+}
+
 #[test]
 fn acquired_interfaces_keep_the_observed_extent_across_version_labels() {
     let fixture = LegacyPrefixBoundaryFixture::new();
@@ -63478,6 +64812,8 @@ fn named_pid_race_reports_partial_instead_of_aborting() {
     let pid = u32::MAX;
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -63544,6 +64880,8 @@ fn named_pid_scan_failure_after_exit_gaps_instead_of_aborting() {
     child.wait().unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],
@@ -63602,6 +64940,8 @@ fn named_pid_with_live_view_still_discovers() {
     let view = ProcessView::open(ProcessViewId(41), pid).unwrap();
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind: crate::cli::Kind::Profile,
         modules: vec![],
         exclude_modules: vec![],

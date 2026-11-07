@@ -9,7 +9,7 @@ use super::joint_driver::{
 use super::seal_replay::{ReplayBounds, ReplayPreparation, SealBatchDelivery, SealReplayCursor};
 use super::{
     BirthEvidenceSource, BootstrapReceipt, H3DispositionEvidence, H3FinalizerPort,
-    H3VoidAcknowledgement, JournalGap, SealSuccess, SealedCall, SessionBirthEvidence,
+    H3VoidAcknowledgement, JournalGap, SealSuccess, SealWait, SealedCall, SessionBirthEvidence,
     StagingLedger,
 };
 use super::{
@@ -43,6 +43,10 @@ pub(crate) struct IngestedJointQuantum {
     // Original bulk S1Only refusal and original audit result remain distinct.
     // Both buffers are precharged before the first taint/model mutation.
     raw_failure: Option<SealFailure>,
+    // A carried ingest-break void's own original failure (its pre-break
+    // keys' abandonment), in a slot of its own so any next frame, ingested
+    // or disposed, takes it whatever the other two slots hold.
+    void_failure: Option<SealFailure>,
     failure: Option<SealFailure>,
     consumers: Vec<FrameConsumer>,
     bound: bool,
@@ -55,6 +59,8 @@ pub(crate) struct IngestedJointQuantum {
     targets_storage: Option<ResourceLease>,
     // Every owned failure buffer drops before its retained storage is refunded.
     _storage: ResourceLease,
+    // The carried ingest-break void's own prepaid lease (its raw failure).
+    _void_storage: Option<ResourceLease>,
 }
 
 pub(crate) type AuditAcquisition = Result<IngestedJointQuantum, (IngestedRaw, RawQuantumRefusal)>;
@@ -190,7 +196,7 @@ impl<'q> AuditedDomainInput<'q> {
 /// No Clone/Copy, supplied failure/H3 pair or production escape constructor.
 pub(crate) struct AuditedFailure<'q> {
     failure: &'q SealFailure,
-    originals: [Option<&'q SealFailure>; 2],
+    originals: [Option<&'q SealFailure>; 3],
     audit: &'q JournalAuditReceipt,
     provenance: &'q RawProvenance,
     frontier: ConsumptionOrdinal,
@@ -279,7 +285,7 @@ fn failure_rank(failure: &SealFailure) -> u8 {
 
 impl<'q> AuditedFailure<'q> {
     fn new(
-        originals: [Option<&'q SealFailure>; 2],
+        originals: [Option<&'q SealFailure>; 3],
         audit: &'q JournalAuditReceipt,
         provenance: &'q RawProvenance,
         frontier: ConsumptionOrdinal,
@@ -356,7 +362,7 @@ impl<'q> FailureBatchDelivery<'q> {
             })
     }
     pub(crate) fn advance_effect(&mut self) -> Option<Option<&'q ObjectEffect>> {
-        while self.cursor.slot < 2 {
+        while self.cursor.slot < self.audited.originals.len() {
             let Some(failure) = self.audited.originals[self.cursor.slot] else {
                 self.cursor.slot += 1;
                 continue;
@@ -557,6 +563,15 @@ fn lookup_storage(outcome: &Result<SealSuccess, SealFailure>) -> Option<usize> {
         Err(_) => Some(0),
     }
 }
+/// Take the owner's pending ingest-break void: its failure, its prepaid
+/// lease and the bytes that lease paid.
+fn take_void(owner: &mut JointCaptureOwner) -> (Option<SealFailure>, Option<ResourceLease>, usize) {
+    match owner.take_pending_void() {
+        Some(void) => (Some(void.failure), Some(void.lease), void.bytes),
+        None => (None, None, 0),
+    }
+}
+
 fn failure_storage(failure: &SealFailure) -> Option<usize> {
     let domains = match &failure.scope {
         SealFailureScope::AffectedDomains(domains) => domains.capacity(),
@@ -584,11 +599,15 @@ impl IngestedJointQuantum {
     }
 
     fn original_failures(&self) -> impl Iterator<Item = &SealFailure> {
-        self.raw_failure.iter().chain(self.failure.iter()).chain(
-            self.active
-                .as_ref()
-                .and_then(|active| active.outcome.as_ref().err()),
-        )
+        self.void_failure
+            .iter()
+            .chain(self.raw_failure.iter())
+            .chain(self.failure.iter())
+            .chain(
+                self.active
+                    .as_ref()
+                    .and_then(|active| active.outcome.as_ref().err()),
+            )
     }
 
     /// The only constructor requires both actual ingestion and the retained
@@ -643,12 +662,16 @@ impl IngestedJointQuantum {
         let (adapter, model) = owner.parts();
         let raw_failure = adapter.refuse_s1only_subjects(model);
         let failure = adapter.audit_collected(model, &audit, fault).err();
+        // An ingest-break void's abandonment rides the next frame in its
+        // own slot, so every pre-break consumer receives it.
+        let (void_failure, void_storage, void_bytes) = take_void(owner);
         let frame = Self {
             provenance,
             ingress: FrameIngress::Ingested,
             frontier,
             audit,
             raw_failure,
+            void_failure,
             failure,
             consumers: Vec::new(),
             bound: false,
@@ -659,11 +682,12 @@ impl IngestedJointQuantum {
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
+            _void_storage: void_storage,
         };
         assert!(
-            frame
-                .retained_storage_bytes()
-                .is_some_and(|owned| owned <= bytes),
+            frame.retained_storage_bytes().is_some_and(|owned| bytes
+                .checked_add(void_bytes)
+                .is_some_and(|paid| owned <= paid)),
             "audit loss storage exceeds its checked preflight bound"
         );
         Ok(frame)
@@ -745,12 +769,14 @@ impl IngestedJointQuantum {
         let audit = JournalAuditReceipt::collect(provenance.collection(), &mut finalizer, observed);
         let (adapter, model) = owner.parts();
         let failure = adapter.audit_collected(model, &audit, fault).err();
+        let (void_failure, void_storage, void_bytes) = take_void(owner);
         let frame = Self {
             provenance,
             ingress: FrameIngress::Disposed(reason),
             frontier,
             audit,
             raw_failure,
+            void_failure,
             failure,
             consumers: Vec::new(),
             bound: false,
@@ -761,11 +787,12 @@ impl IngestedJointQuantum {
             failure_storage: None,
             targets_storage: None,
             _storage: storage,
+            _void_storage: void_storage,
         };
         assert!(
-            frame
-                .retained_storage_bytes()
-                .is_some_and(|actual| actual <= bytes),
+            frame.retained_storage_bytes().is_some_and(|actual| bytes
+                .checked_add(void_bytes)
+                .is_some_and(|paid| actual <= paid)),
             "negative audit exceeded its fresh precharge"
         );
         Ok(frame)
@@ -794,6 +821,11 @@ impl IngestedJointQuantum {
     fn retained_storage_bytes(&self) -> Option<usize> {
         size_of::<Self>()
             .checked_add(self.raw_failure.as_ref().map_or(Some(0), failure_storage)?)?
+            .checked_add(
+                self.void_failure
+                    .as_ref()
+                    .map_or(Some(0), failure_storage)?,
+            )?
             .checked_add(self.failure.as_ref().map_or(Some(0), failure_storage)?)?
             .checked_add(allocation_bytes::<FrameConsumer>(
                 self.consumers.capacity(),
@@ -1440,6 +1472,7 @@ impl IngestedJointQuantum {
     fn failure_for(&self, domain: ObjectDomain) -> Option<AuditedFailure<'_>> {
         AuditedFailure::new(
             [
+                self.void_failure.as_ref(),
                 self.raw_failure.as_ref(),
                 self.failure
                     .as_ref()
@@ -1561,8 +1594,15 @@ impl IngestedJointQuantum {
                 self.failure_storage = Some(storage);
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
+            // A fresh birth with no staged call of its own inside this
+            // frontier (late attach, an idle caller) can only be grounded
+            // by the caller's future calls: this immutable frame never
+            // seals it, so it waits as future input exactly like an
+            // awaited terminal, instead of retrying until the lane-wide
+            // no-progress bound stops every caller.
             if failure.gap == JournalGap::BoundNotReady
-                && adapter.awaits_future_terminal(target.bootstrap(), self.frontier)
+                && (adapter.last_seal_wait() == SealWait::FreshBirthNoHistory
+                    || adapter.awaits_future_terminal(target.bootstrap(), self.frontier))
             {
                 // This original target advanced without a delivery. Charge
                 // the same shared slice so later targets and the machine's
@@ -1643,6 +1683,7 @@ impl IngestedJointQuantum {
         }
         let Some(audited) = AuditedFailure::new(
             [
+                self.void_failure.as_ref(),
                 self.raw_failure.as_ref(),
                 self.failure
                     .as_ref()
@@ -1703,6 +1744,9 @@ impl IngestedJointQuantum {
                     ..
                 }
             );
+        // A retry replays this visit from the start next time, so what it
+        // spends here is refunded below: it delivers nothing.
+        let before = *remaining;
         let mut batch = FailureBatchDelivery {
             audited,
             cursor: &mut self.consumers[index].failure,
@@ -1753,6 +1797,10 @@ impl IngestedJointQuantum {
             FailureBatchProgress::Complete(FailureApplyOutcome::Retried) => {
                 self.active = None;
                 self.consumers[index].failure = FailureReplayCursor::default();
+                // Nothing was delivered and the next visit replays the
+                // same spans: no progress, so the running Audited bound
+                // can end a seal that only ever retries.
+                *remaining = before;
                 Ok(QuantumSealProgress::LocalPending)
             }
             FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness) => {

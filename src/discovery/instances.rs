@@ -642,6 +642,11 @@ struct Observed {
     /// place, later global-only entries inherit it, and only a genuine
     /// mint or eviction/retirement clears it (by replacing the entry).
     continued_across_global: bool,
+    /// This entry reused the previous era's instance across a hook-miss
+    /// fault era: a same-address reload hidden by the miss is not
+    /// excluded. Sticky like `continued_across_global`; the identity is
+    /// disclosed once, on its first such reuse.
+    continued_across_miss: bool,
 }
 
 /// A private load-base address.
@@ -688,6 +693,10 @@ pub(crate) struct RouterCounters {
     /// lifetime whose break is missing) and consumes the latch, so one
     /// dropped flag costs at most one spurious split.
     pub(crate) absence_overflows: u64,
+    /// Observations that reused the previous era's instance across a
+    /// hook-miss fault era (same load and local epoch; continuity
+    /// uncertain, disclosed once per identity).
+    pub(crate) continued_across_miss_era: u64,
 }
 
 /// Capture-owned instance registry and per-call router. `Debug` is redacted
@@ -769,6 +778,17 @@ pub(crate) struct InstanceRouter {
     /// [`RELOAD_NOT_EXCLUDED_LABEL`] disclosure. Each entry is pushed once
     /// per identity, so the queue shares the retained-history bound.
     reload_not_excluded: Vec<ReloadNotExcluded>,
+    /// The next fault move was raised for a hook-program miss (set by
+    /// [`Self::note_hook_miss_era`], consumed by the next audit).
+    miss_era_pending: bool,
+    /// The newest observation of each key from before the last hook-miss
+    /// eras, for the first re-proof in a later era: a matching load and
+    /// local epoch reuse its instance instead of minting, so IDs stay
+    /// bounded by distinct loads, not by eras. Bounded by the same
+    /// observed-key and range ceilings as `observed`; any non-miss era,
+    /// coverage failure, proven absence or retirement drops it.
+    era_carry: BTreeMap<(ImageKey, u32), Observed>,
+    carry_ranges: usize,
 }
 
 pub(crate) struct ObservationLoss {
@@ -845,6 +865,9 @@ impl InstanceRouter {
             observation_losses: Vec::new(),
             storage_snapshot: None,
             reload_not_excluded: Vec::new(),
+            miss_era_pending: false,
+            era_carry: BTreeMap::new(),
+            carry_ranges: 0,
         }
     }
 
@@ -858,6 +881,12 @@ impl InstanceRouter {
 
     pub(crate) fn ranges_retained(&self) -> usize {
         self.ranges
+    }
+
+    /// Retained observed keys and the hook-miss carry (keys, ranges).
+    #[cfg(test)]
+    pub(crate) fn retained_keys_and_carry(&self) -> (usize, usize, usize) {
+        (self.observed.len(), self.era_carry.len(), self.carry_ranges)
     }
 
     pub(crate) fn pending_len(&self) -> usize {
@@ -978,6 +1007,97 @@ impl InstanceRouter {
         self.fence
     }
 
+    /// The next fault move was raised for a hook-program miss: that audit
+    /// carries each key's newest observation into the new era, so an
+    /// unchanged load re-proves onto its previous instance (continuity
+    /// uncertain across the miss, disclosed) instead of minting.
+    pub(crate) fn note_hook_miss_era(&mut self) {
+        self.miss_era_pending = true;
+    }
+
+    fn clear_carry(&mut self) {
+        self.era_carry.clear();
+        self.carry_ranges = 0;
+    }
+
+    fn drop_carry(&mut self, key: &(ImageKey, u32)) -> Option<Observed> {
+        let old = self.era_carry.remove(key)?;
+        self.carry_ranges -= old.ranges.len();
+        Some(old)
+    }
+
+    /// Evicts the first carried entry; false when the carry is empty.
+    fn evict_one_carry(&mut self) -> bool {
+        let Some((_, old)) = self.era_carry.pop_first() else {
+            return false;
+        };
+        self.carry_ranges -= old.ranges.len();
+        true
+    }
+
+    /// Makes room for one more observed key under `observed_keys`, which
+    /// live and carried keys share: carried entries go first, then the
+    /// oldest live key (its late calls degrade, its IDs are reported).
+    fn make_room_for(&mut self, key: (ImageKey, u32)) {
+        while self.observed.len() + self.era_carry.len() >= self.limits.observed_keys
+            && !self.observed.contains_key(&key)
+        {
+            if self.evict_one_carry() {
+                continue;
+            }
+            let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
+                break;
+            };
+            let ids: Vec<_> = evicted
+                .back()
+                .into_iter()
+                .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
+                .collect();
+            if !ids.is_empty() {
+                self.observation_losses.push(ObservationLoss {
+                    image: ImageIdentity {
+                        task_cookie: owner.cookie,
+                        exec_id: owner.exec,
+                    },
+                    file_slot,
+                    ids,
+                });
+            }
+            self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
+            self.absent.remove(&(owner, file_slot));
+            self.counters.observed_evictions = self.counters.observed_evictions.saturating_add(1);
+        }
+        self.debug_check_absent_subset();
+    }
+
+    /// Moves the newest observation of every key with a minted instance
+    /// into the carry (newer eras replace older carries), dropping keys
+    /// whose latest scan proved the module unmapped, then bounds it.
+    fn carry_observations(&mut self) {
+        for (key, list) in std::mem::take(&mut self.observed) {
+            self.drop_carry(&key);
+            if self.absent.contains(&key) {
+                continue;
+            }
+            let Some(back) = list.into_iter().next_back() else {
+                continue;
+            };
+            if back.partitions.iter().all(|(_, id)| id.is_none()) {
+                continue;
+            }
+            self.carry_ranges += back.ranges.len();
+            self.era_carry.insert(key, back);
+        }
+        while self.era_carry.len() > self.limits.observed_keys
+            || self.carry_ranges > self.limits.ranges
+        {
+            let Some((_, old)) = self.era_carry.pop_first() else {
+                break;
+            };
+            self.carry_ranges -= old.ranges.len();
+        }
+    }
+
     pub(crate) fn counters(&self) -> RouterCounters {
         self.counters
     }
@@ -1029,6 +1149,7 @@ impl InstanceRouter {
         if fault > u64::from(u32::MAX) || fault < self.fault {
             self.authority_failed = true;
             self.observed.clear();
+            self.clear_carry();
             self.absent.clear();
             self.absence_overflowed = false;
             self.ranges = 0;
@@ -1047,6 +1168,7 @@ impl InstanceRouter {
             let Some(next_fence) = self.fence.checked_add(1) else {
                 self.authority_failed = true;
                 self.observed.clear();
+                self.clear_carry();
                 self.absent.clear();
                 self.absence_overflowed = false;
                 self.ranges = 0;
@@ -1058,6 +1180,11 @@ impl InstanceRouter {
             self.fence = next_fence;
             self.miss_latched = false;
             self.counters.eras = self.counters.eras.saturating_add(1);
+            if std::mem::take(&mut self.miss_era_pending) {
+                self.carry_observations();
+            } else {
+                self.clear_carry();
+            }
             self.observed.clear();
             self.absent.clear();
             self.absence_overflowed = false;
@@ -1069,12 +1196,14 @@ impl InstanceRouter {
             self.miss_latched = true;
             self.counters.eras = self.counters.eras.saturating_add(1);
             self.counters.miss_eras = self.counters.miss_eras.saturating_add(1);
+            self.clear_carry();
             self.observed.clear();
             self.absent.clear();
             self.absence_overflowed = false;
             self.ranges = 0;
             resolved.extend(self.fail_pending(|_| true, UnknownReason::FaultEra));
         }
+        self.miss_era_pending = false;
         self.debug_check_absent_subset();
         resolved
     }
@@ -1082,6 +1211,7 @@ impl InstanceRouter {
     pub(crate) fn fail_image_coverage(&mut self) -> Vec<(u64, Route)> {
         self.image_failed = true;
         self.observed.clear();
+        self.clear_carry();
         self.absent.clear();
         self.absence_overflowed = false;
         self.ranges = 0;
@@ -1097,6 +1227,7 @@ impl InstanceRouter {
     /// and later quanta route normally.
     pub(crate) fn fail_quantum_coverage(&mut self) -> Vec<(u64, Route)> {
         self.observed.clear();
+        self.clear_carry();
         self.absent.clear();
         self.absence_overflowed = false;
         self.ranges = 0;
@@ -1107,6 +1238,7 @@ impl InstanceRouter {
     pub(crate) fn refuse_exhaustion(&mut self) -> Vec<(u64, Route)> {
         self.authority_failed = true;
         self.observed.clear();
+        self.clear_carry();
         self.absent.clear();
         self.absence_overflowed = false;
         self.ranges = 0;
@@ -1242,6 +1374,11 @@ impl InstanceRouter {
     /// unreachable backstop. Never allocates past the cap.
     pub(crate) fn note_proven_absence(&mut self, image: ImageIdentity, file: u32) {
         let key = ImageKey::from(image);
+        if RetirementLedger::index(key.cookie).is_some() && file < instance::FILE_SLOTS {
+            // A proven absence ends the carried load too: a later re-proof
+            // mints, as it would within one era.
+            self.drop_carry(&(key, file));
+        }
         if RetirementLedger::index(key.cookie).is_none()
             || file >= instance::FILE_SLOTS
             || self.image_retired(key)
@@ -1393,6 +1530,19 @@ impl InstanceRouter {
                 ObserveOutcome::Continued
             }
             None => {
+                // The first re-proof of this key in a later hook-miss era
+                // consumes its carried observation whether or not it
+                // matches. Carried entries count against the same private
+                // range limit as live ones and give way first.
+                let carried = if self.observed.contains_key(&key) {
+                    None
+                } else {
+                    self.drop_carry(&key)
+                };
+                while self.ranges + self.carry_ranges + observation.ranges.len()
+                    > self.limits.ranges
+                    && self.evict_one_carry()
+                {}
                 if self.ranges + observation.ranges.len() > self.limits.ranges {
                     let resolved = self.fail_pending(
                         |call| {
@@ -1418,6 +1568,57 @@ impl InstanceRouter {
                 // split/merge artifacts; a real remap, unmap, permission
                 // change, exec or new incarnation still mints.
                 let broken = self.absent.remove(&key);
+                // A load whose ranges and local epoch match the carried
+                // observation reuses its instance (and registry row), so a
+                // miss storm never uses up the instance ceiling. A
+                // same-address reload hidden inside the miss merges into
+                // that row, which is why it is disclosed as uncertain. A
+                // storage_null move since the carried observation is an
+                // unattributed hook event that is not the miss: it mints,
+                // as it does within one era.
+                if let Some(previous) = carried.filter(|previous| {
+                    !broken
+                        && !storage_moved_since(storage_snapshot, previous.storage_seen)
+                        && previous.epochs.local == epochs.local
+                        && same_mapping(&previous.ranges, &observation.ranges)
+                }) {
+                    self.counters.continued += 1;
+                    self.counters.continued_across_miss_era =
+                        self.counters.continued_across_miss_era.saturating_add(1);
+                    if !previous.continued_across_miss {
+                        let ids: Vec<InstanceId> = previous
+                            .partitions
+                            .iter()
+                            .filter_map(|(_, id)| *id)
+                            .collect();
+                        if !ids.is_empty() {
+                            self.reload_not_excluded.push(ReloadNotExcluded {
+                                image: ImageIdentity {
+                                    task_cookie: image.cookie,
+                                    exec_id: image.exec,
+                                },
+                                file_slot: file,
+                                ids,
+                            });
+                        }
+                    }
+                    self.make_room_for(key);
+                    self.ranges += observation.ranges.len();
+                    // A reuse that also crosses a global-epoch move carries
+                    // the global taint, as a global-only continuation does.
+                    let across_global =
+                        previous.continued_across_global || previous.epochs.global != epochs.global;
+                    self.observed.entry(key).or_default().push_back(Observed {
+                        epochs,
+                        ranges: observation.ranges,
+                        partitions: previous.partitions,
+                        storage_seen: storage_snapshot,
+                        continued_across_global: across_global,
+                        continued_across_miss: true,
+                    });
+                    let resolved = self.resolve_pending(image, file);
+                    return (ObserveOutcome::Continued, resolved);
+                }
                 let mut continued = self
                     .observed
                     .get(&key)
@@ -1433,7 +1634,13 @@ impl InstanceRouter {
                             && current.epochs.global != epochs.global
                             && same_mapping(&current.ranges, &observation.ranges)
                     })
-                    .map(|current| (current.partitions.clone(), current.continued_across_global));
+                    .map(|current| {
+                        (
+                            current.partitions.clone(),
+                            current.continued_across_global,
+                            current.continued_across_miss,
+                        )
+                    });
                 if continued.is_some() && self.absence_overflowed {
                     // The flag table dropped a proven absence earlier, so
                     // some key's break is missing: split (mint) instead of
@@ -1443,7 +1650,7 @@ impl InstanceRouter {
                     self.absence_overflowed = false;
                     continued = None;
                 }
-                if let Some((partitions, back_tainted)) = continued {
+                if let Some((partitions, back_tainted, back_miss)) = continued {
                     self.counters.continued += 1;
                     self.counters.continued_across_global =
                         self.counters.continued_across_global.saturating_add(1);
@@ -1472,6 +1679,7 @@ impl InstanceRouter {
                         partitions,
                         storage_seen: storage_snapshot,
                         continued_across_global: true,
+                        continued_across_miss: back_miss,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {
@@ -1487,32 +1695,7 @@ impl InstanceRouter {
                         .map(|range| (Base(range.start), self.mint()))
                         .collect();
                     self.ranges += observation.ranges.len();
-                    while self.observed.len() >= self.limits.observed_keys
-                        && !self.observed.contains_key(&key)
-                    {
-                        let Some(((owner, file_slot), evicted)) = self.observed.pop_first() else {
-                            break;
-                        };
-                        let ids: Vec<_> = evicted
-                            .back()
-                            .into_iter()
-                            .flat_map(|o| o.partitions.iter().filter_map(|(_, id)| *id))
-                            .collect();
-                        if !ids.is_empty() {
-                            self.observation_losses.push(ObservationLoss {
-                                image: ImageIdentity {
-                                    task_cookie: owner.cookie,
-                                    exec_id: owner.exec,
-                                },
-                                file_slot,
-                                ids,
-                            });
-                        }
-                        self.ranges -= evicted.iter().map(|o| o.ranges.len()).sum::<usize>();
-                        self.absent.remove(&(owner, file_slot));
-                        self.counters.observed_evictions =
-                            self.counters.observed_evictions.saturating_add(1);
-                    }
+                    self.make_room_for(key);
                     self.debug_check_absent_subset();
                     let list = self.observed.entry(key).or_default();
                     list.push_back(Observed {
@@ -1521,6 +1704,7 @@ impl InstanceRouter {
                         partitions,
                         storage_seen: storage_snapshot,
                         continued_across_global: false,
+                        continued_across_miss: false,
                     });
                     while list.len() > KEYS_PER_PROCESS_FILE {
                         if let Some(old) = list.pop_front() {

@@ -42,7 +42,13 @@ which names the admitted-prefix counts in module gaps,
 and [detach-quarantine refusal publication](#detach-quarantine-refusal-publication-ruling-jk-22a-2026-11-05),
 which names refused slots with their recorded detach reason and no new capture,
 and [unpublished mechanism approval count](#unpublished-mechanism-approval-count-ruling-jk-22a-2026-11-05),
-which gaps shed approval ids by count only.**
+which gaps shed approval ids by count only,
+and [legacy collection gaps](#legacy-collection-gaps-v060),
+which names the `legacy_collection` counts-and-reasons projection,
+and [counter bank gaps](#counter-bank-gaps-v060),
+which names the `bank_gaps` counts-and-flags projection,
+and [derived count projections](#derived-count-projections-v060),
+which are derived counts with no new capture.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -61,13 +67,63 @@ globally unique key, token inventory, or age before observation.
 
 ## Authority and ABI rules
 
-Every new call-derived field requires all of: an explicitly operator-attested
-function/offset claim, its retained and unchanged physical provider pin, one
-unambiguous named descriptor, an accepted LP64 or ia32 specialization, exact
-process-image identity, and the matching owned entry/return lifetime. A
+Every new call-derived field requires all of: a function/offset claim with
+semantic authority (below), its retained and unchanged physical provider pin,
+one unambiguous named descriptor, an accepted LP64 or ia32 specialization,
+exact process-image identity, and the matching owned entry/return lifetime. A
 provider export, readable pointer, equal path/hash, scan result, or successful
-return alone is insufficient. Scan-only and ambiguous slots remain count-only.
+return alone is insufficient. Ambiguous slots remain count-only.
 Public inventory must retain modules and callers when semantics are withheld.
+
+Semantic authority comes from exactly one of three sources:
+
+- an operator-attested claim (`--manifest`), as before; or
+- a scan-derived publication-proved claim, only in `inventory --key-operations`
+  runs started without a manifest (the explicit key-operations opt-in), and
+  only for a scanned function table that meets every condition: its
+  publication is proved by standard interface linkage (`C_GetInterfaceList` /
+  `C_GetInterface` naming the table) or by a live function-list return —
+  export-name agreement alone never grants it; and
+  every required key lives in the provider's own object (a provider whose
+  table entries point into another object, such as the p11-kit trust shim,
+  is refused). A non-full walk or an unpinned affecting entry refuses the
+  provider whole; a rival, aliased or degraded entry, including one reached
+  only through an exports-only table, stays count-only at that entry, with
+  no argument reads there; or
+- a scan-derived sole-complete-table claim, only in the same no-manifest
+  `inventory --key-operations` opt-in, and only when every condition holds
+  together: (a) at least one view's tables scan finished with no
+  truncating skip, I/O ceiling, budget or table-cap stop on that module,
+  proving the provider object holds exactly one function-table candidate
+  — no rival, aliased or degraded second candidate (including no
+  exports-only second table), every other view of the object agreeing,
+  and no vendor or opaque interface claiming this table's layout; (b)
+  that table's published walk is full with a
+  version-consistent 2.x 68-slot layout (a 3.x label with a proven complete
+  68-slot legacy prefix counts as full; any other walk, version or slot
+  count refuses), with a complete export witness and no 3.x interface
+  getter, and the table is file-backed with every retained entry agreeing
+  with the object's exports; (c) every slot is either NULL (an
+  unimplemented function, which gets no probe and no argument reads) or
+  resolves to code inside the provider's own executable mapping, with
+  every 2.x function with an object-capture descriptor (the 20 the decoder
+  reads: `C_CreateObject`, `C_CopyObject`, `C_DestroyObject`,
+  `C_GetObjectSize`, `C_GetAttributeValue`, `C_SetAttributeValue`,
+  `C_FindObjects`, `C_EncryptInit`, `C_DecryptInit`, `C_DigestKey`,
+  `C_SignInit`, `C_SignRecoverInit`, `C_VerifyInit`, `C_VerifyRecoverInit`,
+  `C_GenerateKey`, `C_GenerateKeyPair`, `C_WrapKey`, `C_UnwrapKey`,
+  `C_DeriveKey`, `C_SetOperationState`) non-NULL and in own code; (d) the
+  object exports `C_GetFunctionList`; (e) the provider file has a single
+  load in the process, not a proxy's multi-table closure array. A rival,
+  aliased or degraded entry stays count-only at that entry, as above.
+  Anything else stays refused as today.
+
+Every other scan result, including every ordinary (non-`--key-operations`)
+capture, stays count-only. The read set is the same in all sources: a
+scan-derived claim never adds a field, an argument or a read beyond the rows
+below; it only replaces the operator attestation as the source of the
+function/offset claim, and the run discloses it as the
+`semantic subset scan-derived` scope gap.
 
 Arguments below are **zero-based**. Linux x86-64 LP64 uses eight-byte pointers,
 handles and `CK_ULONG`; Linux ia32 uses four-byte words, zero-extended after a
@@ -494,8 +550,9 @@ whether they mint at runtime is not yet measured live. Ordinary
 sessions never get a generation, so the Detailed object's marker stays inactive: its hooks do one gated
 read and return.
 In a marker build, this adds state only in a lane Session that has published an attach generation
-(closure): only an `inventory --manifest --key-operations` capture whose semantic lane seals over the
-loaded journal pair publishes the attach generation. That Session runs the journal object, which carries
+(closure): only an `inventory --key-operations` capture whose semantic lane seals over the loaded
+journal pair publishes the attach generation — with `--manifest` over the attested subset, or without
+one over the scan-derived subset under the conditions in "Authority and ABI rules". That Session runs the journal object, which carries
 both the READY exec writer and the DIRTY gap writer, so the generation arms gap marking and exec-time
 READY records. Ordinary captures seal with generation 0 and never touch the attach cell; their marker
 hooks stop at the gated read. Under `--system` with the flag, records come from both writers: DIRTY
@@ -912,7 +969,7 @@ observer. No unrelated process or map is a substitute.
 | Evidence | Required positive and negative controls |
 | --- | --- |
 | C1 — field custody | Place unique addresses/handles in every authorized position and forbidden neighbor. Prove addresses exist only in their exact private in-flight/join cells and handles only in designated call/binding cells; prove cleanup after return, failure, loss and teardown. Descriptor-specific index 7 positive controls plus every other function's 7 and all 8/9 negatives. Failed/overflowing and page-straddling LP64/ia32 reads. |
-| C2 — instance authority | Same-file `dlmopen` siblings with overlapping handles separate; same-object repeated `dlopen` remains one while proven continuous. Same-address unload/reload, missing loader notification, direct remap, wrong image, stale scan, range ambiguity and in-progress mutation never join old state. |
+| C2 — instance authority | Same-file `dlmopen` siblings with overlapping handles separate; same-object repeated `dlopen` remains one while proven continuous. Same-address unload/reload, missing loader notification, direct remap, wrong image, stale scan, range ambiguity and in-progress mutation never join old state. One named exception (JK-16): after a fault era raised for skipped mapping hooks, a load whose ranges and local epoch match its previous observation (with no proven absence and no unrecorded hook event since) reuses its instance row, marked uncertain; a same-address reload hidden by the skip itself merges into that row. |
 | C3 — object lifetime | Every named create family, including the four permitted scalar-result derive mechanisms; ignored `phKey` cells containing nonzero sentinels on successful SSL3/TLS12/WTLS key-material/PRF and unknown mechanisms must not be retained/read or create result identities. Changed/missing return mechanism likewise refuses the result. Distinct pair members and partial pair-read failure; caller/session/token/instance/lifetime collisions, failed destroy, mid-lifetime attach, shared access, creator/accessing close, logout, finalize, token epoch, exec/fork/unload and stale completion. Successful null-mechanism Init cancellation with an unrelated key makes no object/access/key-use claim. Compare an independent workload ledger; object age is never invented. |
 | C4 — find bounds | Zero through eight, nine and huge count/capacity; returned count exceeding entry capacity, changed count, null/aliasing pointers, unreadable element and full-span overflow. No arbitrary array retention and no exhaustive-result claim after truncation. |
 | C5 — safe values | Positive exact classes/types, AES-128/256, selected RSA size and every listed curve. Check request/result separation, key-pair template separation, no labels from mechanism alone, unknown type/size and finite-value conflicts. |
@@ -1220,6 +1277,58 @@ summed into a global operation denominator. Approval does not enable
 delivery. While H9 delivery is gated, production captures carry
 `object_observations` only as an explicit `unavailable` marker.
 
+## Not-attributed key-operation counters (owner ruling JK-22, 2026-11-05)
+
+**Status: APPROVED by owner ruling JK-22 (2026-11-05).** This section
+scopes section version 3 of
+[docs/schema/inventory-v1-object-observations-v3.schema.json](../schema/inventory-v1-object-observations-v3.schema.json):
+the `object_observations.unattributed` counters and their aggregate
+rendering on the text `key operations:` line. It grants no read: every
+count derives from counters the observer already retains for its own
+accounting (staged-call disposal, fallback replay, unsealable-shape
+refusal, direct reduction without a witnessed birth, and pre-application
+caller refusal). No target memory, argument, template, handle, label,
+PIN or payload is read or published for these rows; `CKA_ID`, object
+handles and labels remain excluded exactly as above.
+
+Each row is exactly one finite reason name and one saturating count of
+calls that carry no per-key row because no key could be proved:
+
+| Reason | What the count means |
+| --- | --- |
+| `started_before_attach` | Direct reductions on a feed registered without a witnessed birth (attach after start, or the birth race). Proved-irrelevant info calls are not key operations and never count. |
+| `record_lost` | Staged calls disposed once as history after bounded loss, plus direct reductions in the degraded window after such a loss ended a segment, before its next clean point. |
+| `foreign_or_unproven_caller` | Calls refused before application for an unproven or unbound caller. |
+| `session_state_lost` | Reserved: calls whose session state was lost before a clean point. |
+| `watchdog_no_progress` | Staged calls left unsealed when the named no-progress watchdog trip ended the lane (finish or running audit), snapshotted once at the trip. |
+| `unmodelled_call_shape` | Affecting calls the frozen endpoint table cannot seal, reduced S1-direct. Proved-irrelevant info calls are not key operations and never count. |
+| `proof_refused_fallback` | Staged calls a proof-only or ordered fallback replayed S1-direct without object proof, plus direct reductions in the degraded window after such a fallback ended a segment, before its next clean point. |
+
+Attributed rows beside these counters stay exact: the certainty bar for
+attributing an operation to a key is unchanged, and no counter is ever
+converted into a guessed key row. The key is present exactly when the
+section version is 3, which is exactly when at least one count is
+nonzero; fully attributed publications stay byte-stable at versions 1
+and 2. Profile, trace and metrics never carry these counters.
+
+## Unknown-metadata key rows (owner ruling DEMO-4, 2026-11-05)
+
+**Status: APPROVED by owner ruling DEMO-4 (2026-11-05).** This section
+scopes section version 4 of
+[docs/schema/inventory-v1-object-observations-v4.schema.json](../schema/inventory-v1-object-observations-v4.schema.json):
+one additional finite `metadata_at_use` label, `unknown`, on a per-key
+row whose object the model first observed in the observed window
+(the key's creation or lookup predates attach) and whose type/size
+were never established by an already-observed attribute call. The
+label states an absence of already-held facts only: it grants no
+read, derives from the object's existing first-observed origin and
+its empty established metadata, and never guesses a type or size.
+If a later already-observed `C_GetAttributeValue` establishes the
+type, later uses row under their exact label; earlier uses are never
+backfilled. No `CKA_ID`, object handle, label, PIN or payload is read
+or published for these rows. Version 4 is present exactly when such
+a row exists; versions 1, 2 and 3 stay frozen and byte-stable.
+
 ## DR04 caller metadata (2026-10-18)
 
 **Status: opt-in implementation contract; installed qualification remains
@@ -1515,6 +1624,7 @@ the gap-reason text itself.
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
 | Closure prefix gap (`closure_prefix`) | A pure projection of the planner's prefix decision: the count of leading template tables attached and the count of distinct tables decoded for that closure-array object. No target-memory, argument, pointer or file read happens for this field; the tables were decoded by the existing scan. The record exists only when at least one table attached and at least one did not. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` ends with the `(closure_prefix)` name beside the `N of M template tables attached` counts, in every scope. Terminal text carries the same reason through the `Module gaps` section. A zero-table outcome stays a whole refusal, never a `0 of M` partial. | No address, offset, entry name, table content, key or payload value reaches output. A refused whole closure keeps its existing refusal text. Required evidence: the shared-scope prefix test with its `(closure_prefix)` pin, the named-scope prefix tests, the whole-admission healthy twin, and the start-anchored `N of M` reader pins in `scripts/check-capture-evidence.py` and `scripts/verify-p11kit-remote.sh`. |
+| Closure published-only spill gap (`closure_published_only`) | A pure projection of the planner's published-only decision: the count of attached (published) template tables and the count of distinct tables decoded for that closure-array object. No target-memory, argument, pointer or file read happens for this field; the tables were decoded by the existing scan. The record exists only for an already-loaded unnamed layer that attached at least one table and spilled at least one unpublished template. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` ends with the `(closure_published_only)` name beside the `K of M template tables attached` counts, in every scope. Terminal text carries the same reason through the `Module gaps` section with `partially covered` status. A zero-table outcome stays a whole refusal, never a `0 of M` partial. | No address, offset, entry name, table content, key or payload value reaches output. A named layer that falls through to published-only stays silent, as does a mid-capture spill and a spill-free re-admission. Required evidence: the already-loaded spill twin with its `(closure_published_only)` pin, the mid-capture guard, the named fall-through silence twin, the full-re-admission no-spill twin, and the zero-published whole-refusal pins. |
 | Provider prefix gap (`provider_prefix`) | A pure projection of the planner's prefix decision: the count of leading endpoints attached and the count of fresh endpoints the shared-scope Detailed provider needed. No target-memory, argument, pointer or file read happens for this field; the endpoints were decoded by the existing scan. The record exists only when at least one endpoint attached and at least one did not; a provider whose strongest table does not fit within its reserve-aware budget, or whose corroborated (published) tables together do not fit, stays a whole refusal — published tables stay atomic and never prefix. | The existing `evidence.modules_skipped[]` entry for the module, whose `reason` carries the `A of N endpoints attached` counts with the `(provider_prefix)` name, plus the reserve clause when the module was held out of the shared-scope reserve. Terminal text carries the same reason through the `Module gaps` section with `partially covered` status. | No address, offset, entry name, table content, key or payload value reaches output. Operator (manifest), Inventory, counter and broad modules keep their whole-only rule and existing refusal text. Required evidence: the shared-scope provider-prefix test with its `(provider_prefix)` pin, the exact-fit healthy twin, the strongest-table whole-refusal pins, the published-union whole-refusal pin, and the catalog prefix-gap test. |
 
 ## Detach-quarantine refusal publication (ruling JK-22a, 2026-11-05)
@@ -1565,3 +1675,36 @@ new capture, no path/PID/error publication. Allowlist-v1 bytes are unchanged.
 | Discovery transport gap (`discovery transport unavailable`) | A live `discovery_dequeue` failure after a prefix was already pulled off the ring. The exact prefix is applied before the gap is recorded; the failure itself is a transport error, never a record. One internal record per failing tick (deduplicated). | Public `evidence.skipped[]` records with `name: "discovery subject"`, `reason: "discovery transport unavailable"`. No record content, address, or error chain is published. Forces `PARTIAL` via `skipped`. | Ring destruction (producers detached) ends the capture through the existing terminal path, which still publishes the retained prefix before detach. Required evidence: prefix-retained and healthy-twin at the live-drain seam. |
 
 | Pause unavailable gap (`pause_unavailable`) | A `--pause always` arm or service failure that is not lifecycle (child alive, ring present): the observer could not pause, so it collected unpaused. Decided by the pause coordinator's own arm/service result against the owned child; no target memory or key material is read for the gap itself. One count per degraded attempt. | Public `evidence.pause_unavailable` count (integer, 0 when never degraded) plus `evidence.pause: "partial"`. No PID, timing, or error chain is published. Forces `PARTIAL` via the new `pause_unavailable` cause. | Lifecycle failures (child gone, ring destroyed) still abort with cleanup, never a silent unpaused run. `--pause auto` behavior is unchanged (`pause_partial`, no `pause_unavailable`). Required evidence: always-degrade and healthy-twin at the pause seam. |
+
+## Legacy collection gaps (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0 under the owner never-stop rule
+(2026-11-05): a legacy aggregate read that cannot read one slot's counters
+or one kernel-evidence cell reports zeros as unknown with named gaps instead
+of blanking the capture. No new capture exists; the gaps project read-failure
+facts the observer already holds. Allowlist-v1 bytes are unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Legacy gap object (`evidence.legacy_collection`) | A pure projection of the legacy read's per-slot and per-cell failure flags: the STATS slots whose map read failed, whether any RV-table entry read failed, and the EVIDENCE/control cells whose map read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted aggregate reads; a missing STATS/RV/EVIDENCE map remains fatal (the data source itself is gone), and missing control maps (Inventory flavors) contribute nothing without a gap bit. The key stays absent (never null) when the legacy read was exact. | Public profile/metrics JSON only: `unread_stats` (saturating u64 count of slots that read zero as unknown), `rv_failed` (whether the RV table read failed), and `unknown_evidence` (finite names of the unread cells, in bit order: the nine EVIDENCE names plus `owner`, `cookie`, `root`). Counts and reason names only; no per-slot index, offset, timing, RV value or control word reaches output. Zeros in the rows are unknown, not exact, whenever this object is present, and the report reads PARTIAL with cause `legacy_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and an empty name list is never emitted. Required evidence: per-slot zero-with-gap and per-cell unknown twins at the legacy collection seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
+## Counter bank gaps (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0 under the owner never-stop rule
+(2026-11-05): one bank's unreadable cell gaps only its slots with a named
+count, and a health or kernel read failure degrades the evidence without
+voiding the folded rows. No new capture exists; the gaps project
+read-failure facts the observer already holds. Allowlist-v1 bytes are
+unchanged.**
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Bank gap object (`evidence.counter_collection.bank_gaps`) | A pure projection of the counter acquisition's per-bank failure flags: how many slots failed to fold, and whether the health or kernel evidence read failed. No target-memory, argument, pointer, map-content or file read happens for this field beyond the already-attempted bank reads; a missing bank map or a global quarantine/routing refusal still voids via the existing failure cause. The key stays absent (never null) when the acquisition was exact. | Public profile/metrics JSON only, inside `counter_collection`: `failed_slots` (saturating u64 count of slots that failed to fold), `health_failed` (whether the health read failed), and `kernel_failed` (whether the kernel evidence read failed). Counts and finite flags only; no per-slot index, offset, timing, RV value, health word or control word reaches output. A gap read publishes the last good values (stale) until the next exact read telescopes, except the first read of a generation, which publishes its current rows with zeros as unknown for the failed slots; either way the report reads PARTIAL with cause `counter_collection`. | No slot index, file offset, ordinal, name, RV value, timing, bucket, health word, control word, address, session, PID, argv, environ, PIN, key or payload value reaches output. A gap object with zero counts and false flags is never emitted. Required evidence: per-bank partition and evidence-degradation twins at the counter acquisition seam, an exact-read omission twin, and the matching shape in `docs/schema/observed-profile-v3.md`. |
+
+## Derived count projections (v0.6.0)
+
+**Status: IMPLEMENTED in v0.6.0: `forwarding_layer`, `layer_totals`,
+`observation.semantic_capture.events_lost` and `selected_detail` are
+derived counts over already-observed calls, admission decisions and
+loss counters — no new capture, no new read, no new retained field.
+Allowlist-v1 bytes are unchanged.**

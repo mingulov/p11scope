@@ -224,6 +224,11 @@ pub struct Expect<'a> {
     pub slots: u32,
     /// In-scope tgids.
     pub scope: &'a BTreeSet<u32>,
+    /// Whether an emitted tgid outside `scope` rejects the run. False
+    /// only for pidfd-bound witness runs under a nested observer, where
+    /// the emitted initial-namespace tgids are unknowable and the pidfd
+    /// (plus the single-tgid walk shape) is already the scope.
+    pub enforce_scope: bool,
     /// Walk shape.
     pub mode: RunMode,
     /// Producing program.
@@ -448,7 +453,7 @@ pub fn parse(bytes: &[u8], expect: &Expect) -> Result<Run, Invalid> {
                 } else {
                     return Err(Invalid::VerdictRange);
                 };
-                if !expect.scope.contains(&a) {
+                if expect.enforce_scope && !expect.scope.contains(&a) {
                     return Err(Invalid::TgidScope);
                 }
                 match expect.mode {
@@ -1355,6 +1360,8 @@ pub(crate) const STRICT_LOAD_RETAINED_FDS: usize = 10;
 /// peak: the 2 anchor files, the observer pidfd, and one attach link
 /// plus its iterator (runs are sequential). The fork pipe's read end
 /// closes before the first iterator runs, so it is not counted.
+/// Nested, the child pidfd replaces the observer pidfd (closed first),
+/// so the peak stays 5 there too.
 pub(crate) const FUNCTIONAL_PROBE_TRANSIENT_FDS: usize = 5;
 
 /// FDs a session setup may hold at peak: the probe load (10) plus the
@@ -1826,6 +1833,9 @@ impl AnchorArena {
     /// this reservation, observed by `observer_tgid`. Validate with
     /// [`validate_arena_config`] before writing (the probe does). Member
     /// runs are never installed configs: the target fields stay zeroed.
+    /// Pass [`observer_tgid_for_config`]: a nested observer cannot name
+    /// its own initial-namespace tgid, so it passes the zero wildcard
+    /// (the anchor runs are pidfd-bound; see the BPF header).
     pub fn config(&self, generation: u64, installed: u32, observer_tgid: u32) -> IdentityConfig {
         IdentityConfig {
             generation,
@@ -1847,6 +1857,19 @@ impl Drop for AnchorArena {
         unsafe {
             libc::munmap(self.base as *mut libc::c_void, self.len() as usize);
         }
+    }
+}
+
+/// The `observer_tgid` config value: our own pid where numbering agrees
+/// (the BPF check verifies the pidfd binding), else the zero wildcard.
+/// A nested observer cannot name its own initial-namespace tgid (this
+/// /proc numbers only its own namespace, so the lineage never lists
+/// it); tgids are never zero, so the wildcard is unambiguous.
+pub(crate) fn observer_tgid_for_config() -> u32 {
+    if crate::pidns::numbering().agrees() {
+        std::process::id()
+    } else {
+        0
     }
 }
 
@@ -2387,12 +2410,64 @@ pub fn write_scope_bitmap(ebpf: &mut aya::Ebpf, tgids: &[u32]) -> Result<(), Pro
     Ok(())
 }
 
+/// Write a permissive scope bitmap (every representable tgid in scope).
+/// Nested witness runs bind the target by pidfd instead of the bitmap
+/// (its initial-namespace tgid is unknowable from a nested namespace);
+/// the bitmap must not filter the bound task out. The pidfd is already
+/// the scope, so the permissive bitmap widens nothing.
+pub fn write_permissive_scope_bitmap(ebpf: &mut aya::Ebpf) -> Result<(), ProbeError> {
+    let map = ebpf.map_mut("scope_bitmap").ok_or_else(|| ProbeError {
+        stage: "scope-map",
+        detail: "scope_bitmap map missing from the loaded object".to_owned(),
+    })?;
+    let mut array = aya::maps::Array::<_, u64>::try_from(map).map_err(|error| ProbeError {
+        stage: "scope-cast",
+        detail: error.to_string(),
+    })?;
+    for word in 0..SCOPE_WORDS as u32 {
+        array.set(word, u64::MAX, 0).map_err(|error| ProbeError {
+            stage: "scope-write",
+            detail: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
+/// Clear every scope word. Backstop for the permissive-to-selective
+/// transition only (see [`ScopeBitmap`]); the tracked-word path clears
+/// its own cells.
+fn write_permissive_cleared(ebpf: &mut aya::Ebpf) -> Result<(), ProbeError> {
+    let map = ebpf.map_mut("scope_bitmap").ok_or_else(|| ProbeError {
+        stage: "scope-map",
+        detail: "scope_bitmap map missing from the loaded object".to_owned(),
+    })?;
+    let mut array = aya::maps::Array::<_, u64>::try_from(map).map_err(|error| ProbeError {
+        stage: "scope-cast",
+        detail: error.to_string(),
+    })?;
+    for word in 0..SCOPE_WORDS as u32 {
+        array.set(word, 0, 0).map_err(|error| ProbeError {
+            stage: "scope-write",
+            detail: error.to_string(),
+        })?;
+    }
+    Ok(())
+}
+
 /// Tracks the words written on one fresh strict-loaded identity object.
 /// A failed replacement cannot authorize an iterator run.
 #[derive(Default)]
 pub(crate) struct ScopeBitmap {
     words: BTreeSet<u32>,
     ready: bool,
+    /// The map currently holds the permissive bitmap (see
+    /// [`write_permissive_scope_bitmap`]): a later selective replace
+    /// must clear every word first, since the tracked `words` do not
+    /// cover it. No production path transitions back (nested installs
+    /// skip the selective write and non-nested sessions never go
+    /// permissive; numbering is fixed per process), so the full clear
+    /// is a correctness backstop only.
+    permissive: bool,
 }
 
 impl ScopeBitmap {
@@ -2402,6 +2477,9 @@ impl ScopeBitmap {
         tgids: &[u32],
         mut write: impl FnMut(u32, u64),
     ) -> Result<(), &'static str> {
+        // Fixture permissive writes record nothing (there is no map),
+        // so a selective replace only resets the flag.
+        self.permissive = false;
         self.replace_with(
             tgids,
             |word, bits| {
@@ -2420,12 +2498,32 @@ impl ScopeBitmap {
         self.ready = false;
     }
 
+    /// Authorize the install's anchor run without touching the map.
+    /// Nested installs only: the anchor program never reads the bitmap
+    /// (see `p11_anchor_vma`), and every nested target run
+    /// re-establishes the permissive bitmap before reading, so the
+    /// skipped selective write can neither widen nor narrow any run.
+    /// The `permissive` flag is untouched: a sticky permissive map
+    /// stays sticky, and a fresh zero map stays zero until the first
+    /// nested target run fills it.
+    pub(crate) fn mark_ready_without_write(&mut self) {
+        self.ready = true;
+    }
+
     pub(crate) fn replace(
         &mut self,
         ebpf: &mut aya::Ebpf,
         tgids: &[u32],
     ) -> Result<(), ProbeError> {
         self.ready = false;
+        // A permissive map is not covered by the tracked words: clear
+        // every word before the selective rewrite. No production path
+        // takes this transition (nested installs skip the selective
+        // write), so the clear is a backstop only.
+        if self.permissive {
+            write_permissive_cleared(ebpf)?;
+            self.permissive = false;
+        }
         let map = ebpf.map_mut("scope_bitmap").ok_or_else(|| ProbeError {
             stage: "scope-map",
             detail: "scope_bitmap map missing from the loaded object".into(),
@@ -2447,6 +2545,31 @@ impl ScopeBitmap {
                 detail: "tgid outside the scope bitmap".into(),
             },
         )
+    }
+
+    /// Make the map permissive for nested pidfd-bound runs (see
+    /// [`write_permissive_scope_bitmap`]). Sticky: later calls are
+    /// no-ops, since the map already permits every representable tgid
+    /// and numbering never changes under a running process.
+    pub(crate) fn replace_permissive(&mut self, ebpf: &mut aya::Ebpf) -> Result<(), ProbeError> {
+        self.ready = false;
+        if !self.permissive {
+            write_permissive_scope_bitmap(ebpf)?;
+            self.words.clear();
+            self.permissive = true;
+        }
+        self.ready = true;
+        Ok(())
+    }
+
+    /// Fixture twin of [`ScopeBitmap::replace_permissive`]: no map
+    /// exists, so only the sticky flag is set.
+    #[cfg(test)]
+    pub(crate) fn replace_permissive_fixture(&mut self) {
+        self.ready = false;
+        self.words.clear();
+        self.permissive = true;
+        self.ready = true;
     }
 
     fn replace_with<E>(
@@ -2598,6 +2721,20 @@ fn find_exec_range(maps: &str, path: &Path) -> Result<(u64, u64), ProbeError> {
     Ok(hits[0])
 }
 
+/// The verdicts of a pidfd-bound run's sole emitter, if the run has
+/// exactly one. Nested witness runs match this instead of a numbered
+/// pid: the pidfd already bound the task, and its initial-namespace
+/// tgid is unknowable from a nested namespace. Zero emitters is an
+/// unvisited target; more than one is impossible (the parser's
+/// single-tgid walk shape rejects it) and fails closed here anyway.
+pub(crate) fn sole_target_records(run: &Run) -> Option<&BTreeMap<(u64, u64), TargetVerdict>> {
+    if run.by_pid.len() == 1 {
+        run.by_pid.values().next()
+    } else {
+        None
+    }
+}
+
 /// The §6.5 verdicts, as data: callers assert (tests) or print (the
 /// `identity_probe` example) — this function never decides pass/fail
 /// itself beyond failing loudly on malformed runs.
@@ -2644,6 +2781,11 @@ pub fn run_functional_probe(
             detail: format!("generation {generation} outside 1..u32::MAX"),
         });
     }
+    // Under a nested observer the emitted initial-namespace tgids are
+    // unknowable (this /proc numbers only its own namespace), so the
+    // target runs bind the child by pidfd instead of the scope bitmap
+    // and match the sole emitter instead of a numbered pid.
+    let nested = !crate::pidns::numbering().agrees();
     let fixture = write_probe_fixture(dir).map_err(|error| probe_io("fixture", error))?;
     let mut child = spawn_exec_mapping_child(&[
         fixture.hardlink.clone(),
@@ -2671,13 +2813,17 @@ pub fn run_functional_probe(
         .map_slot(1, file_b.as_fd())
         .map_err(|error| probe_io("anchor-map", error))?;
     let observer = std::process::id();
-    let config = arena.config(generation, 2, observer);
+    let config = arena.config(generation, 2, observer_tgid_for_config());
     validate_arena_config(&config).map_err(|error| ProbeError {
         stage: "arena-config",
         detail: format!("{error:?}"),
     })?;
     write_identity_config(&mut loaded.ebpf, &config)?;
-    write_scope_bitmap(&mut loaded.ebpf, &[child.pid()])?;
+    if nested {
+        write_permissive_scope_bitmap(&mut loaded.ebpf)?;
+    } else {
+        write_scope_bitmap(&mut loaded.ebpf, &[child.pid()])?;
+    }
     // Anchor run: ALWAYS per-pid on the observer.
     let pidfd = open_pidfd(observer).map_err(|error| probe_io("pidfd", error))?;
     let anchor_bytes = attach_and_read_run(
@@ -2692,6 +2838,7 @@ pub fn run_functional_probe(
             generation,
             slots: 2,
             scope: &BTreeSet::from([observer]),
+            enforce_scope: true,
             mode: RunMode::PerPid,
             run: RunKind::Anchor,
         },
@@ -2702,10 +2849,21 @@ pub fn run_functional_probe(
     })?;
     let mut anchor_outcomes: Vec<(u32, AnchorOutcome)> = anchor_run.anchors.into_iter().collect();
     anchor_outcomes.sort_by_key(|(slot, _)| *slot);
-    // Target run: whole-system, only the child in scope.
+    // The observer pidfd served only the anchor run above: close it
+    // before the child pidfd opens, so the nested probe holds 5
+    // transient fds like the pin counts, never 6.
+    drop(pidfd);
+    // Target run: whole-system with only the child in scope where
+    // numbering agrees, else pidfd-bound on the live child (its
+    // initial-namespace tgid is unknowable nested).
+    let child_pidfd = if nested {
+        Some(open_pidfd(child.pid()).map_err(|error| probe_io("child-pidfd", error))?)
+    } else {
+        None
+    };
     let target_bytes = attach_and_read_run(
         loaded.target_fd.as_fd(),
-        None,
+        child_pidfd.as_ref().map(|fd| fd.as_fd()),
         Instant::now() + Duration::from_secs(5),
         64 * 1024,
     )?;
@@ -2715,7 +2873,12 @@ pub fn run_functional_probe(
             generation,
             slots: 2,
             scope: &BTreeSet::from([child.pid()]),
-            mode: RunMode::WholeSystem,
+            enforce_scope: !nested,
+            mode: if nested {
+                RunMode::PerPid
+            } else {
+                RunMode::WholeSystem
+            },
             run: RunKind::Target,
         },
     )
@@ -2723,13 +2886,20 @@ pub fn run_functional_probe(
         stage: "parse-target",
         detail: format!("{error:?}"),
     })?;
-    let child_ranges = target_run
-        .by_pid
-        .get(&child.pid())
-        .ok_or_else(|| ProbeError {
+    let child_ranges = if nested {
+        sole_target_records(&target_run).ok_or_else(|| ProbeError {
             stage: "join",
-            detail: format!("child {} emitted no records", child.pid()),
-        })?;
+            detail: format!("child {} emitted no unique records", child.pid()),
+        })?
+    } else {
+        target_run
+            .by_pid
+            .get(&child.pid())
+            .ok_or_else(|| ProbeError {
+                stage: "join",
+                detail: format!("child {} emitted no records", child.pid()),
+            })?
+    };
     let verdict_at = |range: &(u64, u64)| {
         child_ranges.get(range).copied().ok_or_else(|| ProbeError {
             stage: "join",
@@ -2760,7 +2930,7 @@ pub fn run_functional_probe(
     )?;
     let stale_bytes = attach_and_read_run(
         loaded.target_fd.as_fd(),
-        None,
+        child_pidfd.as_ref().map(|fd| fd.as_fd()),
         Instant::now() + Duration::from_secs(5),
         64 * 1024,
     )?;
@@ -2770,7 +2940,12 @@ pub fn run_functional_probe(
             generation: stale_generation,
             slots: 2,
             scope: &BTreeSet::from([child.pid()]),
-            mode: RunMode::WholeSystem,
+            enforce_scope: !nested,
+            mode: if nested {
+                RunMode::PerPid
+            } else {
+                RunMode::WholeSystem
+            },
             run: RunKind::Target,
         },
     )
@@ -2778,13 +2953,20 @@ pub fn run_functional_probe(
         stage: "parse-stale",
         detail: format!("{error:?}"),
     })?;
-    let stale_ranges = stale_run
-        .by_pid
-        .get(&child.pid())
-        .ok_or_else(|| ProbeError {
+    let stale_ranges = if nested {
+        sole_target_records(&stale_run).ok_or_else(|| ProbeError {
             stage: "join",
-            detail: format!("child {} emitted no stale records", child.pid()),
-        })?;
+            detail: format!("child {} emitted no unique stale records", child.pid()),
+        })?
+    } else {
+        stale_run
+            .by_pid
+            .get(&child.pid())
+            .ok_or_else(|| ProbeError {
+                stage: "join",
+                detail: format!("child {} emitted no stale records", child.pid()),
+            })?
+    };
     let stale_unmatched = [hardlink_range, second_range]
         .iter()
         .all(|range| stale_ranges.get(range) == Some(&TargetVerdict::Unmatched));
@@ -2920,6 +3102,7 @@ mod tests {
             generation: 7,
             slots: 4,
             scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         }
@@ -2930,6 +3113,7 @@ mod tests {
             generation: 7,
             slots: 4,
             scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Anchor,
         }
@@ -3051,6 +3235,7 @@ mod tests {
                 generation: 7,
                 slots: 4,
                 scope: &scope,
+                enforce_scope: true,
                 mode,
                 run,
             };
@@ -3153,6 +3338,7 @@ mod tests {
             generation: 7,
             slots: 4,
             scope: &wide,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -3163,6 +3349,7 @@ mod tests {
             generation: 7,
             slots: 4,
             scope: &wide,
+            enforce_scope: true,
             mode: RunMode::PerPid,
             run: RunKind::Target,
         };
@@ -3200,6 +3387,109 @@ mod tests {
         );
     }
 
+    /// Pidfd-bound nested runs cannot name the emitted
+    /// initial-namespace tgid in the scope, so the parser must accept
+    /// out-of-scope tgids when enforcement is off, while still rejecting
+    /// them when it is on.
+    #[test]
+    fn parse_scope_enforcement_is_selectable() {
+        let scope: BTreeSet<u32> = [100].into_iter().collect();
+        let bytes = [
+            record(KIND_VMA, 101, 0x1000, 0x2000, 3, 7).to_vec(),
+            end(7).to_vec(),
+        ]
+        .concat();
+        let enforced = Expect {
+            generation: 7,
+            slots: 4,
+            scope: &scope,
+            enforce_scope: true,
+            mode: RunMode::WholeSystem,
+            run: RunKind::Target,
+        };
+        assert_eq!(parse(&bytes, &enforced), Err(Invalid::TgidScope));
+        let unenforced = Expect {
+            enforce_scope: false,
+            ..enforced
+        };
+        let run = parse(&bytes, &unenforced).expect("unenforced out-of-scope parses");
+        assert_eq!(run.by_pid.len(), 1, "one emitter parsed");
+        assert!(run.by_pid.contains_key(&101), "emitter keyed by tgid");
+    }
+
+    /// The sole-emitter matcher takes exactly-one-emitter runs and
+    /// refuses empty and multi-emitter runs (the latter is impossible
+    /// past the single-tgid walk shape, and fails closed here anyway).
+    #[test]
+    fn sole_target_records_matches_exactly_one_emitter() {
+        let run_with = |tgids: &[u32]| {
+            let mut records = Vec::new();
+            for tgid in tgids {
+                records.extend(record(KIND_VMA, *tgid, 0x1000, 0x2000, 3, 7));
+            }
+            records.extend(end(7));
+            let scope: BTreeSet<u32> = tgids.iter().copied().collect();
+            parse(
+                &records,
+                &Expect {
+                    generation: 7,
+                    slots: 4,
+                    scope: &scope,
+                    enforce_scope: false,
+                    mode: RunMode::WholeSystem,
+                    run: RunKind::Target,
+                },
+            )
+            .expect("emitters parse")
+        };
+        let none_run = run_with(&[]);
+        assert!(
+            sole_target_records(&none_run).is_none(),
+            "no emitter is unvisited"
+        );
+        let one_run = run_with(&[4242]);
+        let sole = sole_target_records(&one_run).expect("one emitter matches");
+        assert_eq!(sole.len(), 1, "one range verdict");
+        let two_run = run_with(&[4242, 4243]);
+        assert!(
+            sole_target_records(&two_run).is_none(),
+            "two emitters refuse"
+        );
+    }
+
+    /// The config tgid is our own pid where numbering agrees (the BPF
+    /// check verifies the pidfd binding), else the zero wildcard (a
+    /// nested observer cannot name its initial-namespace tgid).
+    #[test]
+    fn observer_tgid_for_config_wildcards_when_nested() {
+        assert_eq!(
+            observer_tgid_for_config(),
+            std::process::id(),
+            "agreed numbering names ourselves"
+        );
+        let nested = crate::pidns::test_seam::with_numbering(
+            crate::pidns::test_seam::nested(),
+            observer_tgid_for_config,
+        );
+        assert_eq!(nested, 0, "nested numbering wildcards");
+    }
+
+    /// The permissive bitmap is sticky and its fixture twin only flips
+    /// the flag; a selective replace resets it.
+    #[test]
+    fn scope_bitmap_permissive_is_sticky() {
+        let mut bitmap = ScopeBitmap::default();
+        assert!(!bitmap.permissive, "selective by default");
+        bitmap.replace_permissive_fixture();
+        assert!(bitmap.permissive, "fixture twin sets");
+        bitmap.replace_permissive_fixture();
+        assert!(bitmap.permissive, "second call stays");
+        bitmap
+            .fixture_replace_observed(&[7], |_, _| {})
+            .expect("selective replace works");
+        assert!(!bitmap.permissive, "selective resets");
+    }
+
     /// The parser must validate the expectation itself, not just the
     /// stream: `slots` past the kernel capacity admits impossible slots,
     /// and a generation wider than the u32 record field makes distinct
@@ -3216,6 +3506,7 @@ mod tests {
             generation: 7,
             slots: ANCHOR_SLOTS + 1,
             scope: &scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -3228,6 +3519,7 @@ mod tests {
             generation: 0x1_0000_0007,
             slots: 4,
             scope: &scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -3242,6 +3534,7 @@ mod tests {
             generation: 7,
             slots: ANCHOR_SLOTS,
             scope: &scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -3255,6 +3548,7 @@ mod tests {
             generation: u64::from(u32::MAX),
             slots: 4,
             scope: &scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -3268,6 +3562,7 @@ mod tests {
             generation: 7,
             slots: 0,
             scope: &scope,
+            enforce_scope: true,
             mode: RunMode::WholeSystem,
             run: RunKind::Target,
         };
@@ -8370,6 +8665,31 @@ mod tests {
         );
     }
 
+    /// The nested probe must not hold the observer pidfd and the child
+    /// pidfd at once (6 transient fds vs the pinned 5): the observer
+    /// pidfd closes before the child pidfd opens. A source-order pin —
+    /// the peak has no other unprivileged observable; the privileged
+    /// nested probe cell runs the reordered lines live.
+    #[test]
+    fn nested_probe_closes_the_observer_pidfd_before_the_child_pidfd() {
+        let source = include_str!("identity_iter.rs");
+        let body = source
+            .split_once("pub fn run_functional_probe(")
+            .expect("probe fn exists")
+            .1
+            .split_once("#[cfg(test)]\nmod tests {")
+            .expect("test module follows")
+            .0;
+        let close = body.find("drop(pidfd)").expect("observer pidfd closes");
+        let open = body
+            .find("open_pidfd(child.pid())")
+            .expect("child pidfd opens");
+        assert!(
+            close < open,
+            "the observer pidfd must close before the child pidfd opens"
+        );
+    }
+
     /// §6.5 on the host: a hard link to an anchored file reads back its
     /// slot, a byte-identical copy reads NONE, and a stale generation
     /// reads NONE everywhere (the `gen`-check probe). Run as root with
@@ -8390,11 +8710,18 @@ mod tests {
         assert_eq!(report.hardlink_verdict, TargetVerdict::Slot(0));
         assert_eq!(report.second_verdict, TargetVerdict::Slot(1));
         assert_eq!(report.copy_verdict, TargetVerdict::Unmatched);
-        assert_eq!(
-            report.pids_seen,
-            vec![report.child_pid],
-            "only the child emits"
-        );
+        // Numbering-aware like `probe_succeeded`: the nested run proves
+        // the single emitter is the child by pidfd construction, while
+        // its initial-namespace tgid is unknowable to compare by number.
+        if crate::pidns::numbering().agrees() {
+            assert_eq!(
+                report.pids_seen,
+                vec![report.child_pid],
+                "only the child emits"
+            );
+        } else {
+            assert_eq!(report.pids_seen.len(), 1, "only the child emits");
+        }
         assert_eq!(
             report.child_unmatched_count + 2,
             report.child_record_count,
@@ -8407,6 +8734,131 @@ mod tests {
              hardlink=slot0 second=slot1 copy=NONE stale=all-NONE",
             report.child_pid, report.child_record_count, report.child_unmatched_count,
         );
+    }
+
+    /// The functional probe under a nested PID namespace: BPF numbers
+    /// tasks in the initial namespace while the observer numbers them
+    /// in its own, so the probe must translate (kind observers run
+    /// nested). Forks, enters a fresh pid/mount namespace pair with a
+    /// fresh /proc (the `unshare -pf --mount-proc` shape, without the
+    /// binary), re-execs this binary to run the inner probe there, and
+    /// asserts the inner positive ran (exit 0 plus `1 passed`, never a
+    /// zero-match pass). Run as root with `--ignored`.
+    #[test]
+    #[ignore = "privileged: functional probe passes in a nested pid namespace"]
+    fn functional_probe_passes_in_nested_pid_namespace() {
+        use std::ffi::CString;
+        use std::io::Read;
+        use std::os::unix::ffi::OsStrExt;
+        use std::os::unix::io::FromRawFd;
+        let exe = std::env::current_exe().expect("own test binary");
+        let args = [
+            CString::new(exe.as_os_str().as_bytes()).expect("exe has no nul"),
+            CString::new("--exact").unwrap(),
+            CString::new(
+                "attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none",
+            )
+            .unwrap(),
+            CString::new("--ignored").unwrap(),
+            CString::new("--test-threads=1").unwrap(),
+            CString::new("--nocapture").unwrap(),
+        ];
+        let mut argv: Vec<*const libc::c_char> = args.iter().map(|arg| arg.as_ptr()).collect();
+        argv.push(std::ptr::null());
+        let mut pipe = [0 as libc::c_int; 2];
+        // SAFETY: out-param pipe pair; the parent closes the write end
+        // after forking and reads the read end to EOF.
+        assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0, "pipe works");
+        // SAFETY: the child only calls async-signal-safe libc, then
+        // re-execs or exits with a distinct status; all CStrings were
+        // built before forking. The parent waits below.
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork for the nested probe runner");
+        if pid == 0 {
+            nested_probe_child(pipe[1], &argv);
+        }
+        // SAFETY: our own pipe write end; closing first lets EOF arrive
+        // when the re-exec'd grandchild exits.
+        assert_eq!(unsafe { libc::close(pipe[1]) }, 0, "close our write end");
+        // SAFETY: our own pipe read end, owned from here to EOF.
+        let mut reader = unsafe { std::fs::File::from_raw_fd(pipe[0]) };
+        let mut output = Vec::new();
+        reader.read_to_end(&mut output).expect("read inner output");
+        let mut status: libc::c_int = 0;
+        // SAFETY: waiting for our own forked child.
+        let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+        assert_eq!(waited, pid, "reap the nested probe runner");
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "inner probe passed nested (runner status {status}): {text}"
+        );
+        assert!(
+            text.contains("test result: ok. 1 passed; 0 failed"),
+            "the inner positive ran (not a zero-match pass): {text}"
+        );
+    }
+
+    /// Child side of the nested probe runner: enter a fresh PID
+    /// namespace, fork the grandchild into it, and exit with the
+    /// grandchild's status (70 for a setup failure). Async-signal-safe
+    /// only: no allocation, no locks, `_exit` on every path. Call only
+    /// in the post-fork child.
+    fn nested_probe_child(write_fd: libc::c_int, argv: &[*const libc::c_char]) -> ! {
+        unsafe {
+            if libc::unshare(libc::CLONE_NEWPID) != 0 {
+                libc::_exit(70);
+            }
+            let pid = libc::fork();
+            if pid < 0 {
+                libc::_exit(70);
+            }
+            if pid == 0 {
+                // Grandchild: fresh mount namespace, private mounts, a
+                // /proc bound to the new PID namespace, then re-exec.
+                if libc::unshare(libc::CLONE_NEWNS) != 0 {
+                    libc::_exit(70);
+                }
+                if libc::mount(
+                    std::ptr::null(),
+                    c"/".as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_REC | libc::MS_PRIVATE,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(70);
+                }
+                if libc::mount(
+                    c"proc".as_ptr(),
+                    c"/proc".as_ptr(),
+                    c"proc".as_ptr(),
+                    0,
+                    std::ptr::null(),
+                ) != 0
+                {
+                    libc::_exit(70);
+                }
+                if libc::dup2(write_fd, libc::STDOUT_FILENO) < 0
+                    || libc::dup2(write_fd, libc::STDERR_FILENO) < 0
+                {
+                    libc::_exit(70);
+                }
+                libc::execv(argv[0], argv.as_ptr());
+                libc::_exit(70);
+            }
+            // Close our copy of the write end so the parent sees EOF
+            // when the grandchild exits.
+            libc::close(write_fd);
+            let mut status: libc::c_int = 0;
+            if libc::waitpid(pid, &mut status, 0) != pid {
+                libc::_exit(70);
+            }
+            if libc::WIFEXITED(status) {
+                libc::_exit(libc::WEXITSTATUS(status));
+            }
+            libc::_exit(70);
+        }
     }
 
     // -- D2c cost substrate (RED-first) ----------------------------------------
@@ -8535,6 +8987,7 @@ mod tests {
                     generation: 9,
                     slots: 0,
                     scope: &scope,
+                    enforce_scope: true,
                     mode: RunMode::WholeSystem,
                     run: RunKind::Target,
                 },
@@ -8607,6 +9060,7 @@ mod tests {
                 generation,
                 slots: 1,
                 scope: &BTreeSet::from([observer]),
+                enforce_scope: true,
                 mode: RunMode::PerPid,
                 run: RunKind::Anchor,
             },

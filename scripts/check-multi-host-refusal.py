@@ -23,7 +23,16 @@ import subprocess
 import sys
 import tempfile
 
-TOKEN = "uprobe-multi-required"
+REFUSAL_LEADS = (
+    "live capture needs root: ",
+    "live capture unavailable: ",
+    "live capture did not start: ",
+)
+
+
+def refused(output):
+    """Whether the observer refused with its finite live-capture refusal."""
+    return any(lead in output for lead in REFUSAL_LEADS)
 DENIAL_CELL = "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed"
 DENIAL_MARKER = "IDENTITY_515_DENIAL outcome="
 OUTPUT_LIMIT = 4096
@@ -109,17 +118,18 @@ def check_commands(observer, work, progress=None, doctor_timeout=60):
             sink_unchanged = case == "doctor" or (sink.read_bytes() == before and sink.stat().st_ino == identity)
         except OSError:
             sink_unchanged = False
+        output = result.stdout + result.stderr
         complete(case, result, "refused", [
             ("refusal_exit", result.returncode > 0, "expected nonzero setup refusal"),
-            ("named_refusal", TOKEN in result.stdout + result.stderr, "missing " + TOKEN),
+            ("named_refusal", refused(output), "missing live-capture refusal"),
             ("sink_unchanged", sink_unchanged, "pre-existing sink changed"),
             ("workload_not_run", not sentinel.exists(), "user workload executed before refusal"),
-        ], TOKEN)
+        ], "live-capture refusal")
     for case, argv in (("help", ["--help"]), ("version", ["--version"])):
         result = run(case, argv, 20)
         complete(case, result, "offline-ok", [
             ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
-            ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+            ("live_gate_absent", not refused(result.stdout + result.stderr), "offline command blocked: live gate"),
         ])
     report = work / "scan.json"
     result = run("inventory-scan", ["inventory", "--pid", str(os.getpid()),
@@ -127,7 +137,7 @@ def check_commands(observer, work, progress=None, doctor_timeout=60):
     checks = [
         ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
         ("report_exists", report.is_file(), "offline command blocked: missing report"),
-        ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+        ("live_gate_absent", not refused(result.stdout + result.stderr), "offline command blocked: live gate"),
     ]
     if all(passed for _, passed, _ in checks):
         try:
@@ -139,7 +149,7 @@ def check_commands(observer, work, progress=None, doctor_timeout=60):
     result = run("inventory-diff", ["inventory", "diff", str(report), str(report)], 20)
     complete("inventory-diff", result, "offline-ok", [
         ("offline_exit", result.returncode == 0, "offline command blocked: nonzero exit"),
-        ("live_gate_absent", TOKEN not in result.stdout + result.stderr, "offline command blocked: live gate"),
+        ("live_gate_absent", not refused(result.stdout + result.stderr), "offline command blocked: live gate"),
     ])
     return rows
 

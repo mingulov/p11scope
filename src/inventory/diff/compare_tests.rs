@@ -557,6 +557,7 @@ fn changing_only_times_and_local_incarnations_is_not_an_application_change() {
         first_ns: 111,
         rows: 1,
         reasons: [("no_live_caller".into(), 1)].into_iter().collect(),
+        entries: 0,
     });
     let mut after = before.clone();
     after.observation.started_ns = 10000;
@@ -585,6 +586,21 @@ fn changing_only_times_and_local_incarnations_is_not_an_application_change() {
         11000
     );
     assert_eq!(report.after.observation.started_ns, 10000);
+}
+
+#[test]
+fn folded_entry_growth_between_captures_is_a_module_change() {
+    let mut b = document();
+    b["modules"][0]["unbound_use"] = json!({
+        "first_ns": 111, "rows": 1,
+        "reasons": {"before_admission": 1}, "entries": 10
+    });
+    let mut a = b.clone();
+    a["modules"][0]["unbound_use"]["entries"] = json!(25);
+    let report = compare(&snapshot(&b), &snapshot(&a));
+    assert_eq!(report.module_contents.len(), 1);
+    assert_eq!(report.module_contents[0].presence, Presence::Both);
+    assert_eq!(report.module_contents[0].changes, vec!["lifecycle"]);
 }
 
 #[test]

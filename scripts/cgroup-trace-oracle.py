@@ -23,6 +23,8 @@ ROW = re.compile(
     r'(?P<duration>[0-9]+(?:\.[0-9]+)?(?:ns|µs|ms|s))')
 IMAGE_FIELDS = ('image', 'pid', 'start_time', 'path', 'dev', 'ino', 'mtime_ns',
                 'pid_namespace', 'time_namespace')
+TRACE_TOTALS = re.compile(
+    r'\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.')
 
 
 def parse_trace(text):
@@ -62,7 +64,13 @@ def parse_trace(text):
         elif not line or line in (
                 'Trace — completed call events in arrival order',
                 'Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.',
+                'Calls on unverified functions are not decoded (names only).',
                 'CAPTURE privacy=allowlisted'):
+            continue
+        elif line == 'run with -v for details' or line.startswith('coverage: '):
+            # The human summary tail after the machine records.
+            continue
+        elif TRACE_TOTALS.fullmatch(line):
             continue
         else:
             errors.append(f'unexpected trace record: {line[:160]}')

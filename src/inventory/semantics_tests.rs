@@ -129,6 +129,7 @@ impl ProviderFixture {
                 double_loaded: false,
                 same_file_loads: 1,
                 path: self.manifest.module_path.clone(),
+                tables_scan_finished: false,
                 decoder_abi: None,
                 exports: Vec::new(),
                 interfaces: Vec::new(),
@@ -676,6 +677,706 @@ fn native_semantic_reachable_selection_preserves_demand_and_rivals() {
     assert!(
         omitted.is_empty(),
         "reachable selection endpoints and negative alias claims cannot disappear: {omitted:?}"
+    );
+}
+
+/// DEMO-4: with no manifest requested, the scan preparation mints
+/// a subset from scan-discovered tables whose names are authorized
+/// by publication evidence (here: a live return). The manifest
+/// preparation beside it keeps refusing scan-only authority. A
+/// scan table with no name evidence mints nothing.
+#[test]
+fn native_semantic_scan_subset_mints_without_manifest() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let scan = fixture.source(["C_SignInit", "C_Sign"]);
+    let engine = engine_for_test(Vec::new(), vec![scan], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("name-authorized scan tables mint a subset without a manifest");
+    assert_eq!(subset.required().len(), 1);
+    assert_eq!(subset.plan().slots.len(), 2);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "scan-derived slots carry semantics, never count-only"
+    );
+    // The manifest preparation over the same engine is unchanged.
+    let manifest_prepared = prepare_attested_subset(&engine, &[]);
+    assert!(manifest_prepared.subset.is_none());
+    assert_eq!(
+        manifest_prepared.refusals,
+        vec![SemanticRefusal::Unattested]
+    );
+    // No name evidence (no live return, no linkage, no exports):
+    // nothing mints.
+    let mut bare = fixture.source(["C_SignInit", "C_Sign"]);
+    bare.scanned.tables[0].live_return = false;
+    let engine = engine_for_test(Vec::new(), vec![bare], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "bare decode without publication evidence cannot attest names"
+    );
+}
+
+/// DEMO-4 regression (fedora ff-late-2, 2026-11-05): a `--system`
+/// scan also discovers providers that can never mint (the system
+/// p11-kit proxy walks `known_prefix`). Their incompleteness is a
+/// counted gap for that provider only; the complete provider
+/// beside it (the browser's own softokn) must still mint.
+#[test]
+fn native_semantic_scan_subset_mints_beside_incomplete_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let complete = ProviderFixture::new();
+    let partial = ProviderFixture::new();
+    let good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = partial.source(["C_SignInit", "C_Sign"]);
+    bad.scanned.tables[0].walk = "known_prefix";
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![good.scanned, bad.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the partial provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside an incomplete one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 2);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "the complete provider's slots carry semantics"
+    );
+}
+
+/// DEMO-4 regression (fedora ff-late-2, 2026-11-05): the system
+/// p11-kit proxy is not merely incomplete, its closure demand
+/// (thousands of endpoints) exceeds the Detailed subset's slot
+/// space. A provider that can never mint must not consume the
+/// subset budget ahead of the complete provider beside it.
+#[test]
+fn native_semantic_scan_subset_mints_beside_huge_incomplete_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    // The incomplete provider is created (and so pinned) first:
+    // live, the system p11-kit proxy holds the lower object id
+    // and wins the subset plan's budget race ahead of softokn.
+    let partial = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let mut good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = partial.source(["C_SignInit", "C_Sign"]);
+    bad.scanned.tables[0].walk = "known_prefix";
+    // Grow both providers the way they present live (fedora
+    // SUBSETDIAG, 2026-11-05): the incomplete proxy's plan demand
+    // is capped near 410 endpoints and admitted first-come,
+    // leaving less than the complete provider's 212 in the
+    // 512-slot Detailed space, so the complete provider is
+    // refused whole. Here: bad claims 4 tables x 100 endpoints,
+    // good needs 212 in one full table.
+    fn grow(module: &mut ReconciledModule, base: u64, tables: usize, per_table: u64) {
+        let template = module.scanned.tables[0].clone();
+        let names: Vec<&'static str> = template.entries.iter().map(|entry| entry.name).collect();
+        let key = template.entries[0].object;
+        let object_path = template.entries[0].object_path.clone();
+        let first_walk = module.scanned.tables[0].walk;
+        module.scanned.tables.clear();
+        for t in 0..tables {
+            let mut table = template.clone();
+            table.walk = if t == 0 { first_walk } else { "full" };
+            table.entries.clear();
+            for j in 0..per_table {
+                table.entries.push(ScannedEntry {
+                    name: names[(j % 2) as usize],
+                    object: key,
+                    object_path: object_path.clone(),
+                    file_offset: base + (t as u64) * per_table + j,
+                });
+            }
+            module.scanned.tables.push(table);
+        }
+    }
+    grow(&mut bad, partial.offsets[0], 4, 100);
+    grow(&mut good, complete.offsets[0], 1, 212);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the huge partial provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside a huge incomplete one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 212);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "the complete provider's slots carry semantics"
+    );
+}
+
+/// DEMO-4 regression (fedora cr-late-3/4, 2026-11-05): the system
+/// p11-kit trust module's function table entries live in
+/// libp11-kit.so itself — its required keys are cross-object by
+/// construction, so the attested seal's per-provider instance
+/// check (`slot.object == provider`) can never accept it. Seeded
+/// into the scan subset it refuses the whole seal
+/// (`provider_instance_unproven`, surfaced as
+/// `semantic_attachment_refused`) on every pass. The scan mint
+/// must count it incomplete and mint the own-object provider
+/// beside it.
+#[test]
+fn native_semantic_scan_subset_skips_cross_object_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let cross = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = cross.source(["C_SignInit", "C_Sign"]);
+    // Point the cross provider's entries into the complete
+    // provider's object (distinct offsets, so no key is shared).
+    let target_key = complete
+        .pins
+        .raw_keys_for(complete.pins.pinned().next().unwrap().id)[0];
+    for (entry, delta) in bad.scanned.tables[0].entries.iter_mut().zip([2u64, 3]) {
+        entry.object = target_key;
+        entry.object_path = complete.manifest.module_path.clone();
+        entry.file_offset = complete.offsets[0] + delta;
+    }
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the cross-object provider is a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("the own-object provider mints beside a cross-object one");
+    assert_eq!(subset.required().len(), 1, "only the own-object provider");
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
+/// Scan authority for argument reads needs interface linkage, a live
+/// function-list return or manifest corroboration. Export-name
+/// agreement alone (every table entry matches the object's own
+/// `.dynsym`) proves names, not the table a caller actually uses: the
+/// scan subset must not mint from it, and the provider counts as a
+/// refusal. The same table with a live return mints.
+#[test]
+fn native_semantic_scan_subset_refuses_exports_only_tables() {
+    let fixture = ProviderFixture::new();
+    let mut exports_only = fixture.source(["C_SignInit", "C_Sign"]);
+    exports_only.scanned.tables[0].live_return = false;
+    let symbols: Vec<(String, u64)> = exports_only.scanned.tables[0]
+        .entries
+        .iter()
+        .map(|entry| (entry.name.to_string(), entry.file_offset))
+        .collect();
+    exports_only.exports = std::sync::Arc::from(symbols);
+    let plan = crate::plan::build_from_sources_scan_authorized(
+        std::slice::from_ref(&exports_only),
+        &[],
+        &fixture.pins,
+    );
+    assert!(
+        !plan.slots.is_empty(),
+        "the exports-only table is still planned (counts)"
+    );
+    assert!(
+        plan.slots.iter().all(|slot| !slot.semantic_authorized),
+        "an exports-only table never carries semantic authority"
+    );
+
+    let live = fixture.source(["C_SignInit", "C_Sign"]);
+    let plan = crate::plan::build_from_sources_scan_authorized(
+        std::slice::from_ref(&live),
+        &[],
+        &fixture.pins,
+    );
+    assert!(
+        !plan.slots.is_empty() && plan.slots.iter().all(|slot| slot.semantic_authorized),
+        "the live-return twin carries semantic authority"
+    );
+}
+
+/// A sole-complete-table module over a fixture's pins: 68-entry 2.x full
+/// table, no linkage or live return, export witness agreeing, single load,
+/// finished scan. Tests clear the flag for refuse twins; exports always
+/// agree so unfinished-ness is the only refusal leg under test.
+fn sole_complete_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let object = fixture.pins.pinned().next().unwrap().id;
+    let key = fixture.pins.raw_keys_for(object)[0];
+    let view =
+        crate::process::ProcessView::open(crate::process::ProcessViewId(0), std::process::id())
+            .unwrap();
+    let names: Vec<&'static str> = pkcs11_module::FUNCTION_LIST_FIELDS
+        .iter()
+        .map(|field| field.name)
+        .collect();
+    assert_eq!(names.len(), 68);
+    let entries: Vec<ScannedEntry> = names
+        .into_iter()
+        .enumerate()
+        .map(|(index, name)| ScannedEntry {
+            name,
+            object: key,
+            object_path: fixture.manifest.module_path.clone(),
+            file_offset: 0x1000 + (index as u64) * 8,
+        })
+        .collect();
+    let exports: std::sync::Arc<[(String, u64)]> = std::sync::Arc::from(
+        entries
+            .iter()
+            .map(|entry| (entry.name.to_string(), entry.file_offset))
+            .collect::<Vec<_>>(),
+    );
+    ReconciledModule {
+        scanned: ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            view: view.id(),
+            mount_namespace: view.mount_namespace(),
+            key,
+            double_loaded: false,
+            same_file_loads: 1,
+            path: fixture.manifest.module_path.clone(),
+            tables_scan_finished: true,
+            decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: vec![ScannedTable {
+                version: (2, 40),
+                walk: "full",
+                entries,
+                null_entries: vec![],
+                unpinned: vec![],
+                address: 0x7000,
+                file_offset: Some(0),
+                live_return: false,
+                manifest_supported: false,
+                extension_impossible: false,
+            }],
+            interfaces: vec![],
+        },
+        object,
+        entry_objects: vec![vec![object; 68]],
+        exports,
+        getter_present: false,
+        witness_fault: false,
+    }
+}
+
+/// The sole-complete grant through the real mint, not just the plan seam:
+/// a finished single table mints 68 semantic slots without linkage or live
+/// return.
+#[test]
+fn native_semantic_scan_subset_sole_complete_mints_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let sole = sole_complete_source(&fixture);
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("a finished sole complete table mints through the real seam");
+    assert_eq!(subset.plan().slots.len(), 68);
+    assert!(
+        subset
+            .plan()
+            .slots
+            .iter()
+            .all(|slot| slot.descriptor_index != 0 && slot.semantic_authorized),
+        "sole-complete slots carry semantics"
+    );
+}
+
+/// Blocking twin: the same single table from an unfinished scan refuses
+/// through the real mint.
+#[test]
+fn native_semantic_scan_subset_sole_complete_unfinished_refuses_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut sole = sole_complete_source(&fixture);
+    sole.scanned.tables_scan_finished = false;
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an unfinished sole table refuses through the real seam"
+    );
+}
+
+/// A second table candidate refuses the sole grant even when it is
+/// exports-only (agreeing exports, no linkage or live return): any second
+/// candidate — exports-only or otherwise — fails the exactly-one gate.
+#[test]
+fn native_semantic_scan_subset_sole_complete_exports_only_second_table_refuses() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut sole = sole_complete_source(&fixture);
+    let mut second = sole.scanned.tables[0].clone();
+    second.address = 0x8000;
+    second.file_offset = Some(0x1000);
+    sole.scanned.tables.push(second);
+    sole.entry_objects
+        .push(vec![sole.object; sole.scanned.tables[0].entries.len()]);
+    let engine = engine_for_test(Vec::new(), vec![sole], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an exports-only second table refuses the sole grant"
+    );
+}
+
+/// Dedupe twin: two views of one object disagree on tables (one sees a
+/// single table, the other sees two). Both orders refuse — the mint keeps
+/// the maximum, so a truncated single-table view never grants sole.
+#[test]
+fn native_semantic_scan_subset_sole_complete_one_vs_two_views_refuse_both_orders() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let one = sole_complete_source(&fixture);
+    let mut two = one.clone();
+    let mut second = two.scanned.tables[0].clone();
+    second.address = 0x8000;
+    second.file_offset = Some(0x1000);
+    two.scanned.tables.push(second);
+    two.entry_objects
+        .push(vec![two.object; two.scanned.tables[0].entries.len()]);
+    for (label, modules) in [
+        ("one-first", vec![one.clone(), two.clone()]),
+        ("two-first", vec![two.clone(), one.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: 1-vs-2 views of one object refuse the sole grant"
+        );
+    }
+}
+
+/// A same-count different-content sole view: the same 68-entry 2.x full
+/// table decoded at another file offset. Alone it mints (pinned below),
+/// so multi-view refusals blame disagreement, never a defective view.
+fn sole_variant_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let mut variant = sole_complete_source(fixture);
+    variant.scanned.tables[0].address = 0x7100;
+    variant.scanned.tables[0].file_offset = Some(0x1000);
+    variant
+}
+
+/// An empty finished view of the same object: this vantage saw no table.
+fn sole_empty_source(fixture: &ProviderFixture) -> ReconciledModule {
+    let mut empty = sole_complete_source(fixture);
+    empty.scanned.tables.clear();
+    empty.entry_objects.clear();
+    empty
+}
+
+/// Control: the variant table mints alone through the real mint.
+#[test]
+fn native_semantic_scan_subset_sole_complete_variant_mints_alone() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let variant = sole_variant_source(&fixture);
+    let engine = engine_for_test(Vec::new(), vec![variant], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("a sole-valid variant table mints alone");
+    assert_eq!(subset.plan().slots.len(), 68);
+}
+
+/// Same-count different-content views refuse in both orders: two
+/// finished views describing the one table differently prove nothing
+/// about exactly-one.
+#[test]
+fn native_semantic_scan_subset_sole_complete_content_disagree_refuses_both_orders() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let variant = sole_variant_source(&fixture);
+    for (label, modules) in [
+        ("table-first", vec![table.clone(), variant.clone()]),
+        ("variant-first", vec![variant.clone(), table.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: same-count different-content views refuse the sole grant"
+        );
+    }
+}
+
+/// Sticky disagreement: a disagreeing view refuses in every rotation, not
+/// just when it arrives last — a later agreeing view must not OR the
+/// finished flag back.
+#[test]
+fn native_semantic_scan_subset_sole_complete_disagreement_is_sticky_all_rotations() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let variant = sole_variant_source(&fixture);
+    for (label, modules) in [
+        (
+            "variant-middle",
+            vec![table.clone(), variant.clone(), table.clone()],
+        ),
+        (
+            "variant-first",
+            vec![variant.clone(), table.clone(), table.clone()],
+        ),
+        (
+            "variant-last",
+            vec![table.clone(), table.clone(), variant.clone()],
+        ),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: a disagreeing view refuses in every rotation"
+        );
+    }
+}
+
+/// An empty finished view disagrees by count with a single-table view:
+/// it refuses in every rotation and never corroborates one alone.
+#[test]
+fn native_semantic_scan_subset_sole_complete_empty_view_disagreement_is_sticky() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let table = sole_complete_source(&fixture);
+    let empty = sole_empty_source(&fixture);
+    for (label, modules) in [
+        (
+            "empty-first",
+            vec![empty.clone(), table.clone(), table.clone()],
+        ),
+        (
+            "empty-middle",
+            vec![table.clone(), empty.clone(), table.clone()],
+        ),
+        (
+            "empty-last",
+            vec![table.clone(), table.clone(), empty.clone()],
+        ),
+        ("empty-then-table", vec![empty.clone(), table.clone()]),
+        ("table-then-empty", vec![table.clone(), empty.clone()]),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        assert!(
+            prepared.subset.is_none(),
+            "{label}: an empty view refuses beside a single-table view"
+        );
+    }
+}
+
+/// Healthy twin: agreeing finished/unfinished views still mint in both
+/// orders — the finished view proves exactly-one and the unfinished one
+/// does not refute it.
+#[test]
+fn native_semantic_scan_subset_sole_complete_finished_and_unfinished_views_mint() {
+    use crate::discovery::engine::inventory_coordinator::semantics::SemanticInputs;
+    let fixture = ProviderFixture::new();
+    let finished = sole_complete_source(&fixture);
+    let mut unfinished = sole_complete_source(&fixture);
+    unfinished.scanned.tables_scan_finished = false;
+    for (label, modules) in [
+        ("finished-first", vec![finished.clone(), unfinished.clone()]),
+        (
+            "unfinished-first",
+            vec![unfinished.clone(), finished.clone()],
+        ),
+    ] {
+        let engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+        let prepared = SemanticInputs::new(Vec::new())
+            .prepare_scan(&engine, Some((modules, fixture.pins.clone())));
+        let subset = prepared.subset.unwrap_or_else(|| {
+            panic!("{label}: agreeing finished/unfinished views mint the sole grant")
+        });
+        assert_eq!(subset.plan().slots.len(), 68);
+    }
+}
+
+/// Real-seam twin of the exports-only plan test above: export-name
+/// agreement alone (no linkage, live return or sole legs) mints nothing
+/// through the mint, while the live-return twin mints.
+#[test]
+fn native_semantic_scan_subset_refuses_exports_only_tables_via_real_seam() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let mut exports_only = fixture.source(["C_SignInit", "C_Sign"]);
+    exports_only.scanned.tables[0].live_return = false;
+    let symbols: Vec<(String, u64)> = exports_only.scanned.tables[0]
+        .entries
+        .iter()
+        .map(|entry| (entry.name.to_string(), entry.file_offset))
+        .collect();
+    exports_only.exports = std::sync::Arc::from(symbols);
+    let engine = engine_for_test(Vec::new(), vec![exports_only], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_none(),
+        "an exports-only table mints nothing through the real seam"
+    );
+    let live = fixture.source(["C_SignInit", "C_Sign"]);
+    let engine = engine_for_test(Vec::new(), vec![live], fixture.pins.clone());
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("the live-return twin mints through the real seam");
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
+/// The cross-object twin of the huge-incomplete regression: a
+/// cross-object provider can never mint, so it must not consume the
+/// 512-slot subset plan either. Created (and so planned) first, its
+/// 400 cross-object endpoints (into a third, host object, the
+/// libp11-kit shape) left less than the complete provider's 212
+/// slots and refused it whole.
+#[test]
+fn native_semantic_scan_subset_mints_beside_huge_cross_object_provider() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let cross = ProviderFixture::new();
+    let complete = ProviderFixture::new();
+    let host = ProviderFixture::new();
+    let mut good = complete.source(["C_SignInit", "C_Sign"]);
+    let mut bad = cross.source(["C_SignInit", "C_Sign"]);
+    let host_key = host
+        .pins
+        .raw_keys_for(host.pins.pinned().next().unwrap().id)[0];
+    fn grow(
+        module: &mut ReconciledModule,
+        key: p11scope_manifest::maps::ObjectKey,
+        object_path: Option<String>,
+        base: u64,
+        tables: usize,
+        per_table: u64,
+    ) {
+        let template = module.scanned.tables[0].clone();
+        let names: Vec<&'static str> = template.entries.iter().map(|entry| entry.name).collect();
+        let object_path = object_path.unwrap_or_else(|| template.entries[0].object_path.clone());
+        module.scanned.tables.clear();
+        for t in 0..tables {
+            let mut table = template.clone();
+            table.walk = "full";
+            table.entries.clear();
+            for j in 0..per_table {
+                table.entries.push(ScannedEntry {
+                    name: names[(j % 2) as usize],
+                    object: key,
+                    object_path: object_path.clone(),
+                    file_offset: base + (t as u64) * per_table + j,
+                });
+            }
+            module.scanned.tables.push(table);
+        }
+    }
+    let good_key = good.scanned.tables[0].entries[0].object;
+    grow(
+        &mut bad,
+        host_key,
+        Some(host.manifest.module_path.clone()),
+        host.offsets[0],
+        4,
+        100,
+    );
+    grow(&mut good, good_key, None, complete.offsets[0], 1, 212);
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), complete.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![bad.scanned, good.scanned]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared
+            .refusals
+            .contains(&SemanticRefusal::IncompleteProvider),
+        "the cross-object provider stays a counted refusal: {:?}",
+        prepared.refusals
+    );
+    let subset = prepared
+        .subset
+        .expect("a complete provider mints beside a huge cross-object one");
+    assert_eq!(subset.required().len(), 1, "only the complete provider");
+    assert_eq!(subset.plan().slots.len(), 212);
+}
+
+/// DEMO-4 regression (fedora diag1-3, 2026-11-05): in a live
+/// `--system` capture the creation-time `engine.modules` snapshot
+/// stays empty; current scanned tables live in the per-view scan
+/// inputs passes maintain. The scan mint must source its modules
+/// from those current scan inputs, or it silently mints nothing
+/// on every pass.
+#[test]
+fn native_semantic_scan_subset_mints_from_current_scan_inputs() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let scan = fixture.source(["C_SignInit", "C_Sign"]);
+    // Real scan-style pins for the scanned module, exactly as a
+    // pass's scan_and_pin retains them (manifest pins bind under a
+    // different raw instance and cannot stand in here).
+    let (scan_pins, skipped) = crate::discovery::identity::pin_scanned_objects(
+        std::process::id(),
+        std::slice::from_ref(&scan.scanned),
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .unwrap();
+    assert!(skipped.is_empty(), "{skipped:?}");
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    engine.seed_scan_input_for_test(vec![scan.scanned.clone()], scan_pins);
+    let prepared = prepare_scan_attested_subset(&engine);
+    let subset = prepared
+        .subset
+        .expect("current scan inputs mint the subset live captures need");
+    assert_eq!(subset.required().len(), 1);
+    assert_eq!(subset.plan().slots.len(), 2);
+}
+
+/// DEMO-4 (fedora cr-late-2): a multi-process browser maps one
+/// provider in several views; one view's partial table walk must
+/// not poison the provider when another view walked the same
+/// tables fully. The scan mint keeps the best entry per object.
+#[test]
+fn native_semantic_scan_subset_keeps_best_view_per_object() {
+    use crate::discovery::engine::inventory_coordinator::semantics::prepare_scan_attested_subset;
+    let fixture = ProviderFixture::new();
+    let full = fixture.source(["C_SignInit", "C_Sign"]);
+    let mut partial = full.clone();
+    partial.scanned.tables[0].walk = "partial";
+    let mut engine = engine_for_test(Vec::new(), Vec::new(), fixture.pins.clone());
+    engine.seed_scan_input_for_test_multi(vec![full.scanned.clone(), partial.scanned.clone()]);
+    let prepared = prepare_scan_attested_subset(&engine);
+    assert!(
+        prepared.subset.is_some(),
+        "a full view of the provider mints despite a partial sibling view: {:?}",
+        prepared.refusals
     );
 }
 

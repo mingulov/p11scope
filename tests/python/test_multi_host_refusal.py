@@ -21,7 +21,7 @@ FAKE = r'''#!/usr/bin/env python3
 import json,os,pathlib,sys
 a=sys.argv[1:]; mode=os.environ.get('FAKE_MULTI_REFUSAL','healthy')
 if a in [['--help'],['--version']]:
-    if mode=='blocks-offline': print('uprobe-multi-required',file=sys.stderr);sys.exit(1)
+    if mode=='blocks-offline': print('live capture unavailable: test blocks offline',file=sys.stderr);sys.exit(1)
     print('p11scope help/version');sys.exit(0)
 if a==['doctor'] and mode=='slow-doctor':
     import time;time.sleep(3)
@@ -36,7 +36,7 @@ if mode=='writes-sink' and '-o' in a:pathlib.Path(a[a.index('-o')+1]).write_text
 if mode=='runs-child' and a[0]=='run':
     import subprocess
     subprocess.run(a[a.index('--')+1:],check=True)
-print('different-refusal' if mode=='wrong-reason' else 'uprobe-multi-required: unavailable at link',file=sys.stderr)
+print('different-refusal' if mode=='wrong-reason' else 'live capture unavailable: test refuses at link',file=sys.stderr)
 sys.exit(1)
 '''
 
@@ -231,7 +231,7 @@ class CombinedRefusalTests(unittest.TestCase):
 
     def test_an_unrelated_refusal_is_not_capability_evidence(self):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "wrong-reason"}):
-            with self.assertRaisesRegex(RuntimeError, "uprobe-multi-required"):
+            with self.assertRaisesRegex(RuntimeError, "live-capture refusal"):
                 self.check(self.observer, self.work)
 
     def test_output_mutation_is_rejected(self):

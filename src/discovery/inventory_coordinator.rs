@@ -171,6 +171,36 @@ const DEADLINE_DEFERRED: &str = "inventory scan deadline passed; the scan defers
 /// Pinned verbatim: the oracle matches this subject.
 const PARTIAL_ATTACH_SUBJECT: &str = "native endpoint attach failed";
 
+/// Bound on distinct never-admitted EXEC pids awaiting reconcile against
+/// scan enumerations. A quiet host holds tens across two passes and a
+/// tight fork loop hundreds; 4096 (one per retainable caller) absorbs
+/// floods without unbounded growth. Arrivals past the bound count as
+/// untracked instead, disclosed beside the confirmed short-lived count.
+pub(crate) const MAX_PENDING_EXEC_NEWCOMERS: usize = 4096;
+
+/// Terminal gap subject for short-lived programs no scan pass ever
+/// enumerated. Pinned verbatim by the coordinator tests below.
+pub(crate) const SHORT_LIVED_NEVER_SCANNED_SUBJECT: &str = "short-lived processes never scanned";
+
+/// Terminal wording for the short-lived never-scanned count: `confirmed`
+/// programs were never enumerated twice in a row or were listed only as
+/// exited before their scan, so no scan ever examined them; `untracked`
+/// further arrivals could not be reconciled while the pending map was
+/// full. Pinned verbatim below.
+pub(crate) fn short_lived_never_scanned_reason(confirmed: u64, untracked: u64) -> String {
+    let mut reason = format!(
+        "{confirmed} short-lived process(es) started and exited before any scan could examine \
+         them; their provider mappings are unknown, and no caller use is counted for them"
+    );
+    if untracked > 0 {
+        reason.push_str(&format!(
+            "; {untracked} further exec arrival(s) could not be tracked while the newcomer set \
+             was full; their scan coverage is unknown"
+        ));
+    }
+    reason
+}
+
 /// Per-pid authority resolution with a native open attempt: the open is
 /// the check, so the native path is attempted honestly on every pass
 /// and the scan lane is a recorded fallback, not a compile-time fork.
@@ -274,6 +304,41 @@ pub(crate) struct PrearmReportRow {
     pub unobserved_windows: Option<Vec<crate::render::UnobservedWindow>>,
 }
 
+/// A recorded start-time still names the live task: equal proven
+/// generations match, while an unknown generation on either side
+/// matches conservatively (without positive start-time mismatch
+/// evidence nothing is dropped).
+fn same_task_generation(recorded: Option<u64>, live: Option<u64>) -> bool {
+    match (recorded, live) {
+        (Some(was), Some(is)) => was == is,
+        _ => true,
+    }
+}
+
+/// Prune cross-pass task memory to the latest enumeration: drop
+/// entries for departed pids and for pid reuse (same number, new start
+/// time), keep tasks still present with an unchanged generation. Unknown
+/// generations stay conservative: without positive start-time mismatch
+/// evidence nothing is dropped.
+fn retain_current_tasks(
+    tasks: &mut BTreeSet<(u32, Option<u64>)>,
+    current: &BTreeMap<u32, Option<u64>>,
+) {
+    tasks.retain(|(pid, start)| match current.get(pid) {
+        None => false,
+        Some(now) => same_task_generation(*start, *now),
+    });
+}
+
+/// Enumeration memory holds this many distinct tasks at most; past it
+/// departed tasks evict first (one bounded sweep per pass), so a fork
+/// storm cannot grow the observer without bound.
+const EVER_ENUMERATED_CAP: usize = 65_536;
+
+/// Liveness checks per overflow sweep: enough to drain churn (departed
+/// tasks are plentiful past the cap) without stalling a pass.
+const EVER_ENUMERATED_SWEEP: usize = 4_096;
+
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
 /// catalog's Inventory lowering feeds every pass.
@@ -291,10 +356,33 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
+    /// Calls into `note_joint_watchdog_trip` (test count): the exit
+    /// hold's two trip arms are pinned through it.
+    #[cfg(test)]
+    joint_watchdog_notes: u64,
     /// Semantic preparation remains independent of broad count admission.
     semantic_inputs: semantics::SemanticInputs,
+    /// Whether a no-manifest scan seal will be attempted for this
+    /// run (the driver's deferred-seal condition). The mint stash
+    /// below retains a whole pass's aggregate pins, so it is only
+    /// kept when an attempt will actually consume it: an ordinary
+    /// inventory run must not retain pins for providers its broad
+    /// admission never took (e.g. an uninitialized table's object).
+    scan_mint_requested: bool,
+    /// DEMO-4: the latest catalog lowering's reconciled scan
+    /// modules and aggregate pins, stashed at absorb time for
+    /// no-manifest scan-seal attempts (cloned by
+    /// `prepare_scan_semantic_subset`; the next absorb replaces it).
+    scan_mint_sources: Option<(
+        Vec<crate::discovery::identity::ReconciledModule>,
+        crate::discovery::identity::PinnedObjects,
+    )>,
     /// Explicit count inputs enter the catalog's one plan before admission.
     count_manifests: Vec<PathBuf>,
+    /// Whether `--key-operations` was requested for this run (text
+    /// only: the snapshot distinguishes "requested but unavailable"
+    /// from "off"). Set once at run setup; harnesses leave it false.
+    key_operations_requested: bool,
     /// Retained `--prearm-module` pins (packet 6.13 round-2, F5): startup
     /// validation, pin and held-FD custody for supported auto/native
     /// Inventory capture. Proved offsets lower into the run's attach set
@@ -428,12 +516,46 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// attach, successor/name admission, or retry starts afterwards; staged
     /// facts still drain through `commit_batch`.
     stopped: bool,
-    /// Distinct pids with EXEC hooks that drained since the last
-    /// completed scan pass (`apply_catalog` clears): the post-pass
-    /// newcomers the terminal disclosure names. Arrival order, not hook
+    /// Distinct (pid, producer task ticket) EXEC hooks that drained
+    /// since the last completed scan pass (`apply_catalog` clears): the
+    /// post-pass newcomers the terminal disclosure names. The ticket is
+    /// the task identity: a re-exec keeps its ticket and counts once,
+    /// while pid reuse mints a new task and counts again; a missing
+    /// ticket (`None`) keys by pid alone. Arrival order, not hook
     /// stamps, so no clock comparison is needed. Cgroup scope never
     /// inserts (transaction coverage, not scan passes).
-    post_pass_exec_newcomers: BTreeSet<u32>,
+    post_pass_exec_newcomers: BTreeSet<(u32, Option<u64>)>,
+    /// Task identities deep-scanned by applied passes, pruned to the
+    /// latest enumeration: next-pass selection tiers never-scanned
+    /// groups first, so a stable sweep cannot starve a newcomer across
+    /// passes. Discarded passes record nothing (their outcomes never
+    /// applied); pid reuse drops the stale task by start-time mismatch.
+    scan_freshness: BTreeSet<(u32, Option<u64>)>,
+    /// Every task identity enumerated by an applied pass, across passes:
+    /// the terminal stop diff reports live tasks this never saw, so a
+    /// starter that never execs cannot stay invisible. Capped (departed
+    /// tasks evict first); discarded passes record nothing.
+    ever_enumerated: BTreeSet<(u32, Option<u64>)>,
+    /// The terminal stop diff already disclosed: a repeated terminal
+    /// call stays silent.
+    stop_diff_done: bool,
+    /// EXEC hooks for never-admitted pids, awaiting reconcile against
+    /// scan examinations: each entry counts the consecutive completed
+    /// passes that missed it. `apply_catalog` reconciles (admitted pids
+    /// are covered and drop; examined pids were disclosed elsewhere and
+    /// drop; two misses count the pid as short-lived and drop it); the
+    /// terminal disclosure names what is left plus the accumulated
+    /// count. Arrival order, not hook stamps, so no clock comparison is
+    /// needed. Cgroup scope never inserts (transaction coverage, not
+    /// scan passes).
+    pending_exec_newcomers: BTreeMap<u32, u8>,
+    /// Never-admitted exec newcomers no scan ever examined: short-lived
+    /// programs that started and exited before any examination.
+    /// Terminal-disclosed, then drained.
+    short_lived_never_scanned: u64,
+    /// EXEC arrivals dropped while the pending map was full:
+    /// unreconciled, disclosed beside the confirmed count, then drained.
+    short_lived_untracked: u64,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -743,8 +865,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             promotion_records_discarded: 0,
             #[cfg(test)]
             engine_collected_finish_calls: 0,
+            #[cfg(test)]
+            joint_watchdog_notes: 0,
             semantic_inputs: semantics::SemanticInputs::new(Vec::new()),
+            scan_mint_requested: false,
+            scan_mint_sources: None,
             count_manifests: Vec::new(),
+            key_operations_requested: false,
             prearm: None,
             prearm_prior: (0, 0),
             prearm_state: crate::prearm_module::PrearmState::empty(),
@@ -789,6 +916,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             staged_retirements: BTreeSet::new(),
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
+            scan_freshness: BTreeSet::new(),
+            ever_enumerated: BTreeSet::new(),
+            stop_diff_done: false,
+            pending_exec_newcomers: BTreeMap::new(),
+            short_lived_never_scanned: 0,
+            short_lived_untracked: 0,
             completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -820,6 +953,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // setter order is.
         let (objects, bytes) = self.prearm_prior;
         self.semantic_inputs.set_prearm_prior(objects, bytes);
+    }
+
+    /// Whether the run carries manifests (the same inputs the
+    /// semantic-lane gate reads at run setup).
+    pub(crate) fn has_manifests(&self) -> bool {
+        !self.count_manifests.is_empty()
+    }
+
+    /// Record the run's `--key-operations` request for snapshot text.
+    pub(crate) fn set_key_operations_requested(&mut self, requested: bool) {
+        self.key_operations_requested = requested;
+    }
+
+    /// Whether `--key-operations` was requested for this run.
+    pub(crate) fn key_operations_requested(&self) -> bool {
+        self.key_operations_requested
     }
 
     /// Retains an already-validated `--prearm-module` pinning for the run's
@@ -942,6 +1091,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     source: "prearm",
                     corroborated: false,
                     skipped: Vec::new(),
+                    admission_class: None,
                 });
             }
         }
@@ -1458,6 +1608,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     pub(crate) fn prepare_semantic_subset(&mut self) -> semantics::SubsetPreparation {
         self.semantic_inputs.prepare(&self.engine)
+    }
+
+    /// Mark that this run will attempt the no-manifest scan seal,
+    /// so absorb keeps the per-pass mint sources (and their pins)
+    /// the attempt consumes. Called by the driver when it arms
+    /// its deferred scan seal, before the first pass.
+    pub(crate) fn note_scan_mint_requested(&mut self) {
+        self.scan_mint_requested = true;
+    }
+
+    /// The no-manifest scan mint (DEMO-4), over the same retained
+    /// engine facts as [`Self::prepare_semantic_subset`].
+    pub(crate) fn prepare_scan_semantic_subset(&mut self) -> semantics::SubsetPreparation {
+        // Cloned, never consumed: one lane start mints twice
+        // (attach + convert subsets must agree), and a refused
+        // start retries on a later pass whose absorb refills the
+        // stash with fresher tables anyway.
+        let sources = self.scan_mint_sources.clone();
+        self.semantic_inputs.prepare_scan(&self.engine, sources)
     }
 
     pub(crate) fn enable_diagnostics(&mut self, config: DiagnosticConfig) -> Result<(), InitError> {
@@ -1983,6 +2152,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// Note the no-progress watchdog trip on every retained Joint
+    /// feed, so staged calls left unsealed count once as
+    /// `watchdog_no_progress` in the next publication.
+    pub(crate) fn note_joint_watchdog_trip(&mut self) {
+        #[cfg(test)]
+        {
+            self.joint_watchdog_notes = self.joint_watchdog_notes.saturating_add(1);
+        }
+        self.registry.note_joint_watchdog_trip();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn joint_watchdog_notes_for_test(&self) -> u64 {
+        self.joint_watchdog_notes
+    }
+
     /// Observe the actual engine tail attempts without adding counters or
     /// changing the publication path.
     #[cfg(test)]
@@ -2410,6 +2595,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[cfg(test)]
     pub(crate) fn reference_unmatched_finish_exit_for_test(&self, pid: u32, at: u64) -> bool {
         self.engine.unmatched_finish_exit_for_test(pid, at)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_freshness_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
+        self.scan_freshness.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn ever_enumerated_for_test(&self) -> BTreeSet<(u32, Option<u64>)> {
+        self.ever_enumerated.clone()
     }
 
     /// Refuse the final receiver only after its actual disposal is retained.
@@ -3450,6 +3645,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let (prior_objects, prior_bytes) = self.prearm_prior;
         let budget =
             self.collector_budget(crate::discovery::scan::CaptureWorkBudget::default(), false);
+        let scanned = self.scanned_pids_for_selection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3473,6 +3669,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     max_scan_pids,
                     policy,
                     budget,
+                    &scanned,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -3502,6 +3699,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             crate::discovery::scan::CaptureWorkBudget::default(),
             semantic_capture_live,
         );
+        let scanned = self.scanned_pids_for_selection();
         move || {
             if cgroup_requires_transaction {
                 bail!("cgroup inventory requires the bounded scoped collection job");
@@ -3526,6 +3724,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     policy,
                     shared,
                     budget,
+                    &scanned,
                     &manifests,
                     prior_objects,
                     prior_bytes,
@@ -3835,6 +4034,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // (a pending publication's service window) clear as covered
         // though the catalog could not hold them — a known narrow miss.
         self.post_pass_exec_newcomers.clear();
+        // This pass's examined tasks seed the next pass's freshness
+        // selection, so a rotated-out newcomer gets priority next time.
+        self.note_applied_scan_tasks(&catalog);
+        // The scan completed: reconcile hooks that drained before it
+        // against this pass's examination instead of clearing them.
+        // Admitted pids are covered (their fate is tracked); examined
+        // pids were disclosed elsewhere (admission verdicts, skip gaps,
+        // the unexamined record). A pid neither admitted nor examined
+        // may have exec'd after this pass's listing and still be alive,
+        // so it earns a second miss before it counts: only two
+        // consecutive misses prove no scan ever examined it. (Pid reuse
+        // inside the two-pass window would misread a dead pid as
+        // covered; the window is seconds on a four-million pid space, so
+        // the count treats examination as authoritative.) Hooks drained
+        // between this collection's end and this apply reconcile the
+        // same way next pass.
+        self.reconcile_exec_newcomers(&catalog);
         self.completed_scan_pass = true;
         PassReport {
             pass,
@@ -5156,7 +5372,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             return BTreeMap::new();
         };
         let absorbed = self.attach_set.absorb(&lowering.plan, &lowering.pins);
-        drop(lowering);
+        // DEMO-4: retain this pass's reconciled scan modules and
+        // their aggregate pins for one no-manifest scan-seal
+        // attempt after the pass (consumed there; never more than
+        // one pass's lowering is held). Only when the run will
+        // actually attempt that seal: the stash's pins would
+        // otherwise outlive broad admission for providers it
+        // never took.
+        let crate::inspect_system::CatalogLowering { pins, modules, .. } = lowering;
+        if self.scan_mint_requested && !modules.is_empty() {
+            self.scan_mint_sources = Some((modules, pins));
+        }
         self.record_absorbed(absorbed)
     }
 
@@ -5593,12 +5819,15 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let hook_ts_ns = record.hook_ts_ns;
         let original_ticket = record.exec_task_ticket();
         let Some(caller) = self.adapter.live_id(pid) else {
-            // A hook for a process no pass ever admitted: after the last
-            // completed scan it is a newcomer the capture will never
-            // scan, so the terminal disclosure counts it. Cgroup scope
-            // stays out (transaction coverage, not scan passes).
+            // A hook for a process no pass ever admitted: it waits for
+            // the next scan enumerations, which cover it when they see
+            // it or count it short-lived when they twice miss it; hooks
+            // still pending at the stop are post-pass newcomers the
+            // terminal disclosure names. Cgroup scope stays out
+            // (transaction coverage, not scan passes).
             if !matches!(self.engine.scope, Scope::Cgroup { .. }) {
-                self.post_pass_exec_newcomers.insert(pid);
+                self.post_pass_exec_newcomers.insert((pid, original_ticket));
+                self.track_exec_newcomer(pid);
             }
             return Vec::new();
         };
@@ -7622,7 +7851,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// remembers the held absolute, so a later row rebinds past it
     /// instead of attributing pre-drop calls to a new owner (round 4,
     /// rebind).
-    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) {
+    fn drop_pair_count(&mut self, row: &WitnessRow, reason: DiagnosticReason) -> u64 {
         let key = PairKey::of(row);
         let (base, base_since) = self
             .pair_counts
@@ -7650,6 +7879,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.pair_targets
             .insert(key, PairTarget::Dropped { base, base_since });
         self.pair_counts.remove(&key);
+        base
     }
 
     /// Stages one decided row against the modules its witness endpoint is
@@ -7674,11 +7904,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .note_bound_witness(caller, modules, row.recorded_at_ns)
             }
             Binding::Unbound(reason) => {
-                self.drop_pair_count(&row, diagnostic_binding_reason(reason));
+                // The dropped absolute folds into the single module's
+                // lower bound: the pair never publishes, but its held
+                // entries are a positive module-level fact.
+                let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason);
                 self.registry
-                    .note_unbound_witness(modules, row.recorded_at_ns, reason)
+                    .note_unbound_witness(modules, row.recorded_at_ns, reason, folded)
             }
         }
         Ok(())
@@ -8266,14 +8499,115 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
     }
 
+    /// A bounded `pids a, b, ...` list for coverage gaps: names the
+    /// first ten of the sorted unique `pids` and counts the rest
+    /// against the exact entry `count`, so a fork storm cannot flood
+    /// the report while the count stays exact. The count may exceed the
+    /// listed pids when one pid number carried several tasks.
+    fn bounded_pid_list(count: usize, pids: &[u32]) -> String {
+        const PIDS_SHOWN: usize = 10;
+        let shown = pids.len().min(PIDS_SHOWN);
+        let listed: Vec<String> = pids[..shown].iter().map(|pid| pid.to_string()).collect();
+        let mut rendered = format!("pids {}", listed.join(", "));
+        if count > shown {
+            rendered.push_str(&format!(", and {} more", count - shown));
+        }
+        rendered
+    }
+
+    /// Record an applied pass's tasks: examined members (deep-scanned
+    /// and maps-matched) join next-pass freshness after pruning to the
+    /// pass enumeration, while every enumerated member joins cross-pass
+    /// enumeration memory for the terminal stop diff. Memory-unavailable,
+    /// unreadable, exited and not-selected members stay fresh so the
+    /// next pass retries them. Discarded passes record nothing.
+    fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
+        let current: BTreeMap<u32, Option<u64>> = catalog
+            .processes
+            .iter()
+            .map(|process| {
+                (
+                    process.pid,
+                    process
+                        .generation
+                        .as_ref()
+                        .and_then(|member| member.start_time),
+                )
+            })
+            .collect();
+        retain_current_tasks(&mut self.scan_freshness, &current);
+        for process in &catalog.processes {
+            let task = (
+                process.pid,
+                process
+                    .generation
+                    .as_ref()
+                    .and_then(|member| member.start_time),
+            );
+            self.ever_enumerated.insert(task);
+            if matches!(
+                process.status,
+                crate::inspect_system::MemberStatus::Scanned
+                    | crate::inspect_system::MemberStatus::MapsMatched
+            ) {
+                self.scan_freshness.insert(task);
+            }
+        }
+        self.evict_enumerated_overflow();
+    }
+
+    /// Keep enumeration memory capped: one bounded sweep evicts departed
+    /// tasks first; if the set still overflows (more live tasks than the
+    /// cap holds), the lowest identities evict, and a live evicted task
+    /// over-reports as unknown at the stop — the safe direction, and the
+    /// gap list stays bounded.
+    fn evict_enumerated_overflow(&mut self) {
+        if self.ever_enumerated.len() <= EVER_ENUMERATED_CAP {
+            return;
+        }
+        let source = self.adapter.source();
+        let mut checked = 0;
+        self.ever_enumerated.retain(|(pid, _)| {
+            if checked >= EVER_ENUMERATED_SWEEP {
+                return true;
+            }
+            checked += 1;
+            !source.gone(*pid)
+        });
+        while self.ever_enumerated.len() > EVER_ENUMERATED_CAP {
+            self.ever_enumerated.pop_first();
+        }
+    }
+
+    /// Pids the next pass treats as already scanned: recorded tasks whose
+    /// live `/proc` start-time still matches, plus tasks recorded without a
+    /// start-time (nothing verifiable, so nothing dropped). A recycled pid
+    /// reads fresh, so reuse never inherits the old incarnation's slot.
+    fn scanned_pids_for_selection(&self) -> BTreeSet<u32> {
+        self.scan_freshness
+            .iter()
+            .filter(|(pid, start_time)| {
+                start_time.is_none_or(|start| {
+                    crate::process::process_start_time(*pid).is_ok_and(|live| live == start)
+                })
+            })
+            .map(|(pid, _)| *pid)
+            .collect()
+    }
+
     /// A collection the stop discarded before apply: inspect the dropped
-    /// catalog, read-only over admission, for attributable members the
-    /// coordinator never admitted that map a provider — deep-scan
-    /// provider tables or interfaces, or a maps-match against a pinned
-    /// provider — and leave one named gap for their unobserved calls.
-    /// Provider-free and newcomer-free discards stay silent. Cgroup
-    /// retained collections carry transaction state rather than final
-    /// scan verdicts, so provider mappings there stay unjudged.
+    /// catalog, read-only over admission, for members the coordinator
+    /// never admitted. Attributable members that map a provider —
+    /// deep-scan provider tables or interfaces, or a maps-match against
+    /// a pinned provider — leave one named gap for their unobserved
+    /// calls; unscanned members (`NotSelected` past the cap, or
+    /// `Unreadable` whose member gaps drop with the catalog) leave one
+    /// bounded gap naming their unknown provider mappings, so an
+    /// in-window process enumerated only in a discarded collection is
+    /// never silent. Provider-free and newcomer-free discards stay
+    /// silent. Cgroup retained collections carry transaction state
+    /// rather than final scan verdicts, so provider mappings there stay
+    /// unjudged.
     pub(crate) fn note_discarded_collection(
         &mut self,
         collected: &crate::inventory_capture::CollectedPass,
@@ -8306,30 +8640,255 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     "live inventory transaction".into(),
                     "a process mapping a provider was dropped before it was admitted, while the capture was stopping; its calls were not observed".into(),
                 );
-                return;
+                break;
             }
+        }
+        let mut unscanned: BTreeSet<u32> = BTreeSet::new();
+        for process in &catalog.processes {
+            if self.adapter.live_id(process.pid).is_some() {
+                continue;
+            }
+            if !matches!(
+                process.status,
+                crate::inspect_system::MemberStatus::NotSelected { .. }
+                    | crate::inspect_system::MemberStatus::Unreadable { .. }
+            ) {
+                continue;
+            }
+            unscanned.insert(process.pid);
+        }
+        if !unscanned.is_empty() {
+            let listed: Vec<u32> = unscanned.iter().copied().collect();
+            let pids = Self::bounded_pid_list(unscanned.len(), &listed);
+            self.note_scope_gap(
+                "dropped collection coverage".into(),
+                format!(
+                    "{} process(es) in the dropped collection were not scanned; their provider mappings are unknown ({pids})",
+                    unscanned.len()
+                ),
+            );
         }
     }
 
-    /// EXEC hooks for never-admitted pids that drained after the last
-    /// completed scan pass: those processes started too late to be
-    /// scanned, so one scope gap names their unknown provider
-    /// mappings. Silent when nothing drained post-pass or no scan
-    /// completed (the zero-pass diagnostic owns that run). Cgroup
-    /// scope stays unjudged (transaction coverage, not scan passes).
-    /// Drains the set, so a repeated terminal call stays silent.
-    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
-        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
-        if !self.completed_scan_pass || pending.is_empty() {
-            return;
+    /// In-scope tasks live at the stop that no completed pass
+    /// enumerated: never-seen pids, and pids whose live generation
+    /// matches no recorded one (pid reuse reads as its own newcomer,
+    /// never as its predecessor). Unknown generations match
+    /// conservatively, and pids the exec set already names stay out
+    /// (the exec gap reports them instead). Sorted ascending; cgroup
+    /// scope reports nothing (transaction coverage, not scan passes).
+    fn stop_diff_newcomers(
+        &self,
+        live_at_stop: &[u32],
+        exec_newcomers: &BTreeSet<(u32, Option<u64>)>,
+    ) -> Vec<u32> {
+        if matches!(self.engine.scope, Scope::Cgroup { .. }) {
+            return Vec::new();
         }
+        let exec_pids: BTreeSet<u32> = exec_newcomers.iter().map(|(pid, _)| *pid).collect();
+        let mut newcomers = Vec::new();
+        for pid in live_at_stop {
+            if exec_pids.contains(pid) {
+                continue;
+            }
+            if matches!(self.engine.scope, Scope::Pid(target) if *pid != target) {
+                continue;
+            }
+            let recorded: Vec<Option<u64>> = self
+                .ever_enumerated
+                .range((*pid, None)..=(*pid, Some(u64::MAX)))
+                .map(|(_, start)| *start)
+                .collect();
+            if recorded.is_empty() {
+                newcomers.push(*pid);
+                continue;
+            }
+            let live = self.adapter.source().start_time(*pid);
+            if !recorded
+                .iter()
+                .any(|start| same_task_generation(*start, live))
+            {
+                newcomers.push(*pid);
+            }
+        }
+        newcomers.sort_unstable();
+        newcomers.dedup();
+        newcomers
+    }
+
+    /// Post-pass newcomers: EXEC hooks for never-admitted pids that
+    /// drained after the last completed scan pass, plus the stop-diff
+    /// over tasks live at the stop that no completed pass enumerated
+    /// (starters that never exec leave no hook, so only the diff sees
+    /// them). Each population gets its own scope gap naming the unknown
+    /// provider mappings; a pid the exec gap names never double-reports
+    /// in the diff. Silent when nothing is owed or no scan completed
+    /// (the zero-pass diagnostic owns that run). Cgroup scope stays
+    /// unjudged (transaction coverage, not scan passes). Drains the exec
+    /// set and latches the diff (loss mark included), so a repeated
+    /// terminal call stays silent. `stop_lost` counts stop-time
+    /// enumeration members that could not be listed at all: late
+    /// starters among them are invisible, so a nonzero count marks the
+    /// diff incomplete. True when anything staged, so a tail that
+    /// discloses outside the lane stop can publish it.
+    pub(crate) fn note_post_pass_newcomers(
+        &mut self,
+        live_at_stop: &[u32],
+        stop_lost: usize,
+    ) -> bool {
+        let mut staged = false;
+        let pending = std::mem::take(&mut self.post_pass_exec_newcomers);
+        if self.completed_scan_pass && !pending.is_empty() {
+            // Name the unscanned processes, not just their count; the
+            // list is bounded so a fork storm cannot flood the report.
+            let mut unique: Vec<u32> = pending.iter().map(|(pid, _)| *pid).collect();
+            unique.sort();
+            unique.dedup();
+            let pids = Self::bounded_pid_list(pending.len(), &unique);
+            self.note_scope_gap(
+                "discovery coverage ended before stop".into(),
+                format!(
+                    "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown ({pids})",
+                    pending.len()
+                ),
+            );
+            staged = true;
+        }
+        if !self.completed_scan_pass
+            || matches!(self.engine.scope, Scope::Cgroup { .. })
+            || self.stop_diff_done
+        {
+            return staged;
+        }
+        self.stop_diff_done = true;
+        if stop_lost > 0 {
+            self.note_scope_gap(
+                "stop-time enumeration incomplete".into(),
+                format!(
+                    "{stop_lost} /proc member(s) could not be listed at stop; late starters among them are invisible to the stop diff"
+                ),
+            );
+            staged = true;
+        }
+        let newcomers = self.stop_diff_newcomers(live_at_stop, &pending);
+        if newcomers.is_empty() {
+            return staged;
+        }
+        let pids = Self::bounded_pid_list(newcomers.len(), &newcomers);
         self.note_scope_gap(
-            "discovery coverage ended before stop".into(),
+            "processes missed by every scan".into(),
             format!(
-                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown",
-                pending.len()
+                "{} process(es) live at stop were never enumerated by a completed pass; their provider mappings are unknown ({pids})",
+                newcomers.len()
             ),
         );
+        true
+    }
+
+    /// Track one EXEC hook for a never-admitted pid: pending until a
+    /// scan examination covers it or two consecutive examinations miss
+    /// it. Bounded: repeat hooks for a tracked pid change nothing, and
+    /// arrivals past [`MAX_PENDING_EXEC_NEWCOMERS`] distinct pids count
+    /// as untracked instead of growing the map.
+    fn track_exec_newcomer(&mut self, pid: u32) {
+        if self.pending_exec_newcomers.contains_key(&pid) {
+            return;
+        }
+        if self.pending_exec_newcomers.len() >= MAX_PENDING_EXEC_NEWCOMERS {
+            self.short_lived_untracked = self.short_lived_untracked.saturating_add(1);
+            return;
+        }
+        self.pending_exec_newcomers.insert(pid, 0);
+    }
+
+    /// Reconcile pending never-admitted EXEC hooks against one completed
+    /// pass: admitted pids are covered, and so are pids the pass examined
+    /// far enough to disclose elsewhere (deep-scanned, maps-matched,
+    /// unreadable with its skip gap, or past the cap with the unexamined
+    /// record). A pid missing from the examination — absent from the
+    /// listing, or listed only as exited before its scan — earns a miss;
+    /// two consecutive misses count one short-lived never-scanned
+    /// program. An empty pending map costs nothing.
+    fn reconcile_exec_newcomers(&mut self, catalog: &crate::inspect_system::Catalog) {
+        if self.pending_exec_newcomers.is_empty() {
+            return;
+        }
+        let examined: BTreeSet<u32> = catalog
+            .processes
+            .iter()
+            .filter(|process| {
+                !matches!(process.status, crate::inspect_system::MemberStatus::Exited)
+            })
+            .map(|process| process.pid)
+            .collect();
+        let adapter = &self.adapter;
+        let mut counted = 0u64;
+        self.pending_exec_newcomers.retain(|pid, misses| {
+            if adapter.live_id(*pid).is_some() || examined.contains(pid) {
+                return false;
+            }
+            *misses = misses.saturating_add(1);
+            if *misses >= 2 {
+                counted += 1;
+                return false;
+            }
+            true
+        });
+        self.short_lived_never_scanned = self.short_lived_never_scanned.saturating_add(counted);
+    }
+
+    /// Terminal EXEC-newcomer disclosure: hooks still pending after the
+    /// last completed scan pass started too late to be scanned, so one
+    /// scope gap names their unknown provider mappings; the accumulated
+    /// short-lived count names the programs that started and exited
+    /// between passes. Silent when nothing is pending or counted, or no
+    /// scan completed (the zero-pass diagnostic owns that run). Cgroup
+    /// scope stays unjudged (transaction coverage, not scan passes).
+    /// Drains every count, so a repeated terminal call stays silent.
+    ///
+    /// Test-only: production terminal paths disclose the counted gap
+    /// through `note_short_lived_never_scanned` beside the stop-diff
+    /// disclosure (which already names the pending pids), so staging
+    /// this count-only pending gap there would double-report.
+    #[cfg(test)]
+    pub(crate) fn note_post_pass_exec_newcomers(&mut self) {
+        let pending = std::mem::take(&mut self.pending_exec_newcomers);
+        if !self.completed_scan_pass {
+            // Drain the counts silently; the zero-pass diagnostic owns this run.
+            self.note_short_lived_never_scanned();
+            return;
+        }
+        if !pending.is_empty() {
+            self.note_scope_gap(
+                "discovery coverage ended before stop".into(),
+                format!(
+                    "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown",
+                    pending.len()
+                ),
+            );
+        }
+        self.note_short_lived_never_scanned();
+    }
+
+    /// Terminal short-lived disclosure: stage the accumulated
+    /// never-scanned count (plus untracked arrivals) as its named gap.
+    /// The pending population itself is NOT named here: the stop-diff
+    /// disclosure (`note_post_pass_newcomers`) already names those
+    /// pids, so naming them again would double-report. Silent when
+    /// nothing was counted or no scan completed (drains either way, so
+    /// a repeated terminal call stays silent). True when anything
+    /// staged, so the tail can publish it.
+    pub(crate) fn note_short_lived_never_scanned(&mut self) -> bool {
+        let confirmed = std::mem::take(&mut self.short_lived_never_scanned);
+        let untracked = std::mem::take(&mut self.short_lived_untracked);
+        if !self.completed_scan_pass || (confirmed == 0 && untracked == 0) {
+            return false;
+        }
+        self.note_scope_gap(
+            SHORT_LIVED_NEVER_SCANNED_SUBJECT.into(),
+            short_lived_never_scanned_reason(confirmed, untracked),
+        );
+        true
     }
 
     /// The physical tail and registry share the actual publication boundary.
@@ -11315,6 +11874,7 @@ pub(crate) mod tests {
             source: "scan",
             corroborated: false,
             skipped: Vec::new(),
+            admission_class: None,
         });
         let pins = coordinator
             .prearm
@@ -12870,6 +13430,7 @@ pub(crate) mod tests {
             admission: crate::inspect_system::AdmissionRecord::Refused {
                 class: "closure-array",
                 reason: "closure arrays are not attached".into(),
+                kind: crate::plan::RefusalKind::CapacityWhole,
             },
             ..object
         };
@@ -12947,6 +13508,7 @@ pub(crate) mod tests {
                 uncorroborated_candidates: 0,
                 module_ambiguous: 0,
                 admitted: paths.len(),
+                partial: 0,
                 refused: 0,
                 unresolved: 0,
             },
@@ -16975,6 +17537,48 @@ exit 0
     }
 
     #[test]
+    fn an_unbound_row_folds_its_held_count_into_module_level_use() {
+        let (mut native, _) = NativeScene::new();
+        // Same exited tgid as the named-gap twin: the row stays unbound
+        // (no_live_caller) and its pair count drops.
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 744;
+        native.witness(vec![row]);
+        let unbound = native.module_unbound().expect("module-level positive");
+        assert_eq!(unbound.rows, 1);
+        assert_eq!(unbound.reasons.get("no_live_caller"), Some(&1));
+        assert_eq!(
+            unbound.entries, 744,
+            "the dropped absolute folds to the module"
+        );
+    }
+
+    #[test]
+    fn a_refresh_read_after_the_drop_never_folds() {
+        let (mut native, _) = NativeScene::new();
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 10;
+        native.witness(vec![row]);
+        // A refresh read after the decision: the pair is dropped, so the
+        // advance never merges and the folded bound stands.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 999)]);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert_eq!(native.module_unbound().unwrap().entries, 10);
+    }
+
+    #[test]
+    fn a_refresh_read_before_the_decision_folds_the_max() {
+        let (mut native, _) = NativeScene::new();
+        // The refresh lands first: the held count advances to 999 before
+        // any row stages, so the drop folds the max, not first sight.
+        native.counts_read(Vec::new(), vec![(41, 1, 1, 999)]);
+        let mut row = native.row(41, 1, 9, 100, 1);
+        row.entry_count = 10;
+        native.witness(vec![row]);
+        assert_eq!(native.module_unbound().unwrap().entries, 999);
+    }
+
+    #[test]
     fn a_reused_pid_never_inherits_a_witness_by_pid() {
         let (mut native, caller) = NativeScene::new();
         // pid 7 now holds ticket 99; the row's ticket 41 was its previous
@@ -17814,6 +18418,25 @@ exit 0
         assert_eq!(native.scene.coordinator.adapter.live_id(7), Some(successor));
     }
 
+    /// One `EXEC` lifecycle record for `pid` stamped `hook_ts_ns`, drained
+    /// at `at`.
+    fn exec_hook_drain_for_pid(
+        domain: NativeDomainId,
+        pid: u32,
+        at: u64,
+        hook_ts_ns: u64,
+    ) -> DiscoveryBatch {
+        let mut drain = DiscoveryBatch::scripted(domain, Vec::new(), at);
+        // SAFETY: DiscoveryRecord contains only integer fields; this is the
+        // same fixed, zero-reserved lifecycle wire shape the real producer emits.
+        let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+        record.hook_ts_ns = hook_ts_ns;
+        record.pid_tgid = (u64::from(pid) << 32) | u64::from(pid);
+        record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+        drain.records.push(record);
+        drain
+    }
+
     /// One `EXEC` lifecycle record for pid 7 stamped `hook_ts_ns`, drained
     /// at `at`.
     fn exec_hook_drain(domain: NativeDomainId, at: u64, hook_ts_ns: u64) -> DiscoveryBatch {
@@ -17826,6 +18449,649 @@ exit 0
         record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
         drain.records.push(record);
         drain
+    }
+
+    /// The expected terminal wording for `confirmed` short-lived
+    /// never-scanned processes with no untracked overflow.
+    fn short_lived_gap_reason(confirmed: u64) -> String {
+        format!(
+            "{confirmed} short-lived process(es) started and exited before any scan could \
+             examine them; their provider mappings are unknown, and no caller use is counted \
+             for them"
+        )
+    }
+
+    /// `EXEC` hooks for pids no scan pass ever enumerates must be counted
+    /// at the terminal disclosure, never cleared silently: short-lived
+    /// programs that run between passes are scan-invisible by timing, and
+    /// clearing their hooks at each apply leaves them gap-silent too.
+    #[test]
+    fn mid_capture_exec_newcomers_never_enumerated_are_counted_not_silenced() {
+        let (mut native, caller) = NativeScene::new();
+        for pid in [9u32, 10] {
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+                native.domain,
+                pid,
+                at,
+                at,
+            )));
+        }
+        // Two full passes enumerate only the long-lived pid 7: both
+        // newcomers miss two consecutive enumerations.
+        for _ in 0..2 {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let short = gaps
+            .iter()
+            .find(|gap| gap.subject == "short-lived processes never scanned");
+        let Some(gap) = short else {
+            panic!(
+                "two never-enumerated exec newcomers must be counted: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(gap.reason, short_lived_gap_reason(2));
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"discovery coverage ended before stop".to_string()),
+            "mid-capture deaths are not post-pass newcomers: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the next pass enumerates and admits is
+    /// covered, never counted as short-lived.
+    #[test]
+    fn exec_newcomer_admitted_by_the_next_pass_is_covered_not_counted() {
+        let (mut native, caller) = NativeScene::new();
+        native.scene.source.spawn(8, 800);
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // The next pass enumerates pid 8, which admits; a second pass
+        // follows so a missed reconcile would count it.
+        for pids in [vec![7u32, 8], vec![7u32]] {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let mut catalog =
+                capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            for pid in pids {
+                if pid == 7 {
+                    continue;
+                }
+                catalog
+                    .processes
+                    .push(crate::inspect_system::ProcessRecord {
+                        pid,
+                        status: crate::inspect_system::MemberStatus::Scanned,
+                        objects: Vec::new(),
+                        generation: Some(crate::inspect_system::MemberGeneration {
+                            start_time: Some(800),
+                            exe: None,
+                        }),
+                        complete_scan: None,
+                        application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                        ),
+                        hints_examined: false,
+                    });
+            }
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert!(
+            native.scene.coordinator.adapter.live_id(8).is_some(),
+            "pid 8 admits on its enumerated pass"
+        );
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"short-lived processes never scanned".to_string()),
+            "an admitted newcomer is covered: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the next pass enumerates but cannot admit
+    /// (its pin is gone) is seen by scan machinery, never counted as
+    /// short-lived; its fate belongs to the admission-failure gap.
+    #[test]
+    fn exec_newcomer_seen_but_unadmitted_is_covered_not_counted() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        for pids in [vec![7u32, 8], vec![7u32]] {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let mut catalog =
+                capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            for pid in pids {
+                if pid == 7 {
+                    continue;
+                }
+                catalog
+                    .processes
+                    .push(crate::inspect_system::ProcessRecord {
+                        pid,
+                        status: crate::inspect_system::MemberStatus::Scanned,
+                        objects: Vec::new(),
+                        generation: Some(crate::inspect_system::MemberGeneration {
+                            start_time: Some(800),
+                            exe: None,
+                        }),
+                        complete_scan: None,
+                        application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                        ),
+                        hints_examined: false,
+                    });
+            }
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        assert!(
+            native.scene.coordinator.adapter.live_id(8).is_none(),
+            "pid 8 stays unadmitted without a source pin"
+        );
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&"short-lived processes never scanned".to_string()),
+            "an enumerated newcomer is seen: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// An exec newcomer the pass lists but that exits before its scan is
+    /// NOT covered: `Exited` members carry no disclosure anywhere else
+    /// in inventory output, so the newcomer stays pending and counts
+    /// once the next enumeration misses it too.
+    #[test]
+    fn exec_newcomer_exited_before_its_scan_is_counted_not_covered() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // Pass one lists pid 8 but marks it exited before its scan; pass
+        // two never lists it.
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let mut first = capture_catalog(
+            &native.scene.pins,
+            &[&native.scene.path],
+            7,
+            generation.clone(),
+        );
+        first.processes.push(crate::inspect_system::ProcessRecord {
+            pid: 8,
+            status: crate::inspect_system::MemberStatus::Exited,
+            objects: Vec::new(),
+            generation: None,
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: false,
+        });
+        native.scene.coordinator.apply_catalog(
+            first,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let second = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            second,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let short = gaps
+            .iter()
+            .find(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT);
+        let Some(gap) = short else {
+            panic!(
+                "an exited-before-scan newcomer must be counted: {:?}",
+                native.gap_subjects()
+            );
+        };
+        assert_eq!(gap.reason, short_lived_never_scanned_reason(1, 0));
+    }
+
+    /// Twin: one miss is grace, not death. An exec newcomer missing a
+    /// single enumeration stays pending — a live process whose hook
+    /// drains between a pass's listing and its apply must not be
+    /// counted as "started and exited" — and lands in the post-pass
+    /// remainder at the terminal disclosure, never in the short-lived
+    /// count.
+    #[test]
+    fn single_miss_does_not_count_as_short_lived() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            8,
+            at,
+            at,
+        )));
+        // One pass enumerates only the long-lived pid 7: the newcomer
+        // earns its first miss and stays pending.
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            native.stamps.tick(),
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            !native
+                .gap_subjects()
+                .contains(&SHORT_LIVED_NEVER_SCANNED_SUBJECT.to_string()),
+            "one miss is grace: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            native
+                .gap_subjects()
+                .contains(&"discovery coverage ended before stop".to_string()),
+            "the still-pending pid lands in the post-pass remainder: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// Twin: an exec newcomer the passes list as examined-but-unadmitted
+    /// is covered by those listings' own disclosure — dropped from
+    /// pending, never counted as short-lived — for every non-Exited
+    /// listing status, not just `Scanned`. Two passes, so a status
+    /// wrongly earning misses would count.
+    #[test]
+    fn exec_newcomer_listed_but_unadmitted_is_covered_not_counted() {
+        let statuses: Vec<(&str, crate::inspect_system::MemberStatus)> = vec![
+            (
+                "unreadable",
+                crate::inspect_system::MemberStatus::Unreadable {
+                    reason: "test listing".to_string(),
+                },
+            ),
+            (
+                "not_selected",
+                crate::inspect_system::MemberStatus::NotSelected { loss: None },
+            ),
+            (
+                "memory_unavailable",
+                crate::inspect_system::MemberStatus::MemoryUnavailable {
+                    reason: "test listing",
+                },
+            ),
+            (
+                "maps_matched",
+                crate::inspect_system::MemberStatus::MapsMatched,
+            ),
+        ];
+        for (label, status) in statuses {
+            let (mut native, caller) = NativeScene::new();
+            let at = native.stamps.tick();
+            native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+                native.domain,
+                8,
+                at,
+                at,
+            )));
+            // Two passes list pid 8 with the status: covered means
+            // dropped from pending on the first, so the second has
+            // nothing to miss and the terminal stays silent.
+            for _ in 0..2 {
+                let generation = native
+                    .scene
+                    .coordinator
+                    .adapter
+                    .record(caller)
+                    .map(|record| crate::inspect_system::MemberGeneration {
+                        start_time: record.start_time,
+                        exe: record.exe.clone(),
+                    });
+                let mut catalog =
+                    capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+                catalog
+                    .processes
+                    .push(crate::inspect_system::ProcessRecord {
+                        pid: 8,
+                        status: status.clone(),
+                        objects: Vec::new(),
+                        generation: None,
+                        complete_scan: None,
+                        application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+                        ),
+                        hints_examined: false,
+                    });
+                native.scene.coordinator.apply_catalog(
+                    catalog,
+                    &mut UnavailableImageGuard,
+                    &mut native.cookies,
+                    u64::MAX,
+                    native.stamps.tick(),
+                );
+                native.scene.coordinator.commit_batch(false).unwrap();
+            }
+            native.scene.coordinator.note_post_pass_exec_newcomers();
+            native.scene.coordinator.commit_batch(false).unwrap();
+            assert!(
+                !native
+                    .gap_subjects()
+                    .contains(&SHORT_LIVED_NEVER_SCANNED_SUBJECT.to_string()),
+                "a {label}-listed newcomer is covered: {:?}",
+                native.gap_subjects()
+            );
+            assert!(
+                !native
+                    .gap_subjects()
+                    .contains(&"discovery coverage ended before stop".to_string()),
+                "a {label}-listed newcomer leaves no post-pass remainder: {:?}",
+                native.gap_subjects()
+            );
+        }
+    }
+
+    /// The pending map is bounded: arrivals past the bound count as
+    /// untracked and disclose beside the confirmed total, never growing
+    /// the map and never silently dropped.
+    #[test]
+    fn exec_newcomer_overflow_counts_untracked_beside_the_confirmed_total() {
+        let (mut native, caller) = NativeScene::new();
+        for pid in 1000..(1000 + MAX_PENDING_EXEC_NEWCOMERS as u32) {
+            native
+                .scene
+                .coordinator
+                .pending_exec_newcomers
+                .insert(pid, 0);
+        }
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            9,
+            at,
+            at,
+        )));
+        assert_eq!(
+            native.scene.coordinator.pending_exec_newcomers.len(),
+            MAX_PENDING_EXEC_NEWCOMERS,
+            "a full map does not grow"
+        );
+        assert_eq!(native.scene.coordinator.short_lived_untracked, 1);
+        // Two passes miss every pending pid, so all of them count.
+        for _ in 0..2 {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        let short = gaps
+            .iter()
+            .find(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT)
+            .expect("the untracked arrival must disclose");
+        assert_eq!(
+            short.reason,
+            short_lived_never_scanned_reason(MAX_PENDING_EXEC_NEWCOMERS as u64, 1)
+        );
+    }
+
+    /// The terminal disclosure drains every count: a repeated call stages
+    /// nothing. (Gap dedup would hide a missing drain behind a repeat
+    /// bump, so this pins the repeat count, not just the gap list.)
+    #[test]
+    fn terminal_exec_disclosure_drains_so_a_repeat_call_stays_silent() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            9,
+            at,
+            at,
+        )));
+        for _ in 0..2 {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT),
+            "the first terminal call discloses: {:?}",
+            native.gap_subjects()
+        );
+        native.scene.coordinator.note_post_pass_exec_newcomers();
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let (index, _) = registry
+            .gaps()
+            .iter()
+            .enumerate()
+            .find(|(_, gap)| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT)
+            .expect("the disclosed gap stays");
+        assert_eq!(
+            registry.gap_repeats()[index],
+            1,
+            "a repeated terminal call stages nothing: {:?}",
+            native.gap_subjects()
+        );
+    }
+
+    /// The short-lived extractor stages only the counted gap: the
+    /// pending population stays undisclosed (the stop-diff disclosure
+    /// names those pids instead), and a repeat call stays silent.
+    #[test]
+    fn short_lived_extractor_stages_only_the_counted_gap() {
+        let (mut native, caller) = NativeScene::new();
+        let at = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            9,
+            at,
+            at,
+        )));
+        for _ in 0..2 {
+            let generation = native
+                .scene
+                .coordinator
+                .adapter
+                .record(caller)
+                .map(|record| crate::inspect_system::MemberGeneration {
+                    start_time: record.start_time,
+                    exe: record.exe.clone(),
+                });
+            let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+            native.scene.coordinator.apply_catalog(
+                catalog,
+                &mut UnavailableImageGuard,
+                &mut native.cookies,
+                u64::MAX,
+                native.stamps.tick(),
+            );
+            native.scene.coordinator.commit_batch(false).unwrap();
+        }
+        let late = native.stamps.tick();
+        native.stage(NativeBatch::Lifecycle(exec_hook_drain_for_pid(
+            native.domain,
+            10,
+            late,
+            late,
+        )));
+        assert_eq!(native.scene.coordinator.short_lived_never_scanned, 1);
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pending_exec_newcomers
+                .contains_key(&10),
+            "the late hook is still pending at the terminal call"
+        );
+        assert!(native.scene.coordinator.note_short_lived_never_scanned());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps = native.scene.coordinator.registry.gaps();
+        assert!(
+            gaps.iter()
+                .any(|gap| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT),
+            "the extractor discloses the counted gap: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            gaps.iter()
+                .all(|gap| gap.subject != "discovery coverage ended before stop"),
+            "the extractor never names the pending population: {:?}",
+            native.gap_subjects()
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .pending_exec_newcomers
+                .contains_key(&10),
+            "the pending map stays for the stop-diff disclosure"
+        );
+        assert_eq!(native.scene.coordinator.short_lived_never_scanned, 0);
+        assert!(!native.scene.coordinator.note_short_lived_never_scanned());
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let registry = &native.scene.coordinator.registry;
+        let (index, _) = registry
+            .gaps()
+            .iter()
+            .enumerate()
+            .find(|(_, gap)| gap.subject == SHORT_LIVED_NEVER_SCANNED_SUBJECT)
+            .expect("the disclosed gap stays");
+        assert_eq!(
+            registry.gap_repeats()[index],
+            1,
+            "a repeated extractor call stages nothing: {:?}",
+            native.gap_subjects()
+        );
     }
 
     #[test]
@@ -21514,7 +22780,7 @@ exit 0
             DashboardState, DisplayFrame, LogTail, Viewport, render_frame,
         };
         use crate::inventory_present::{
-            Presentation, coverage_label, entries_display, render_snapshot,
+            Presentation, coverage_label_at, entries_display, render_snapshot_with_verbosity,
         };
         let (mut native, _) = NativeScene::new();
         native.answer(7, 500, 41);
@@ -21560,8 +22826,9 @@ exit 0
         assert_eq!(events[0]["activity"], "recently observed");
         assert_eq!(events[0]["capture"], "armed");
         // Pager snapshot and dashboard frame: the same labels.
-        let snapshot = render_snapshot(&presentation);
-        let label = coverage_label(&edge.coverage);
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        let label = coverage_label_at(&edge.coverage, presentation.ended_ns);
         let line = snapshot
             .lines()
             .find(|line| {
@@ -26304,5 +27571,304 @@ mod continuity_clock_tests {
                 "malformed/duplicate offset must not be rescued: {text}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod scan_freshness_tests {
+    use super::*;
+    use crate::discovery::caller_registry::OsProcessSource;
+
+    /// Cross-pass task memory keeps entries still present with an
+    /// unchanged start generation; departed pids and pid reuse (same
+    /// number, new start time) drop, while unknown generations stay
+    /// conservative (no positive reuse evidence, no drop).
+    #[test]
+    fn retain_current_tasks_drops_departed_and_reused_tasks() {
+        let mut tasks: BTreeSet<(u32, Option<u64>)> =
+            [(1, Some(100)), (2, None), (3, Some(300)), (4, Some(400))]
+                .into_iter()
+                .collect();
+        let current: BTreeMap<u32, Option<u64>> = [
+            (1, Some(100)),
+            (2, Some(200)),
+            (3, Some(999)),
+            (5, Some(500)),
+        ]
+        .into_iter()
+        .collect();
+        retain_current_tasks(&mut tasks, &current);
+        let kept: BTreeSet<(u32, Option<u64>)> = [(1, Some(100)), (2, None)].into_iter().collect();
+        assert_eq!(tasks, kept);
+    }
+
+    fn freshness_coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    pub(super) fn unexamined_application() -> crate::inspect_identity::InspectApplicationResult {
+        crate::inspect_identity::InspectApplicationResult::Unknown(
+            crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+        )
+    }
+
+    /// An applied pass records exactly its examined tasks: deep-scanned
+    /// and maps-matched members join cross-pass memory (even without a
+    /// generation), unselected and unreadable members stay fresh for a
+    /// retry, and a task from an earlier pass that this pass never saw is
+    /// pruned instead of lingering as scanned.
+    #[test]
+    fn applied_pass_records_only_examined_tasks() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = freshness_coordinator();
+        coordinator.scan_freshness.insert((999_999_999, Some(7)));
+        let generation = |start_time| {
+            Some(crate::inspect_system::MemberGeneration {
+                start_time,
+                exe: None,
+            })
+        };
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            11,
+            generation(Some(110)),
+        );
+        let record = |pid, start_time, status| ProcessRecord {
+            pid,
+            status,
+            objects: Vec::new(),
+            generation: generation(start_time),
+            complete_scan: None,
+            application: unexamined_application(),
+            hints_examined: true,
+        };
+        catalog
+            .processes
+            .push(record(12, Some(120), MemberStatus::MapsMatched));
+        catalog.processes.push(record(
+            13,
+            Some(130),
+            MemberStatus::NotSelected { loss: None },
+        ));
+        catalog.processes.push(record(
+            14,
+            Some(140),
+            MemberStatus::Unreadable {
+                reason: "injected".into(),
+            },
+        ));
+        catalog
+            .processes
+            .push(record(15, None, MemberStatus::Scanned));
+        coordinator.note_applied_scan_tasks(&catalog);
+        let expected: BTreeSet<(u32, Option<u64>)> = [(11, Some(110)), (12, Some(120)), (15, None)]
+            .into_iter()
+            .collect();
+        assert_eq!(coordinator.scan_freshness_for_test(), expected);
+    }
+
+    /// The selection projection re-validates recorded start-times against
+    /// live `/proc`: the running test process projects scanned, a
+    /// mismatched start-time reads fresh (pid reuse inherits nothing), a
+    /// nonexistent pid drops, and a task recorded without a start-time
+    /// stays scanned (nothing verifiable, nothing dropped).
+    #[test]
+    fn scanned_projection_validates_start_time_against_live_proc() {
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let project = |tasks: &[(u32, Option<u64>)]| {
+            let mut coordinator = freshness_coordinator();
+            coordinator.scan_freshness.extend(tasks.iter().copied());
+            coordinator.scanned_pids_for_selection()
+        };
+        assert_eq!(
+            project(&[(me, Some(live))]),
+            BTreeSet::from([me]),
+            "the live incarnation projects scanned"
+        );
+        assert!(
+            project(&[(me, Some(live.wrapping_add(1)))]).is_empty(),
+            "a mismatched start-time reads fresh"
+        );
+        assert!(
+            project(&[(u32::MAX, Some(7))]).is_empty(),
+            "a nonexistent pid drops"
+        );
+        assert_eq!(
+            project(&[(u32::MAX, None)]),
+            BTreeSet::from([u32::MAX]),
+            "an unknown generation stays scanned"
+        );
+    }
+}
+
+#[cfg(test)]
+mod stop_diff_tests {
+    use super::*;
+    use crate::discovery::caller_registry::OsProcessSource;
+
+    /// A pid `/proc` can never hold: reads fail, so generation checks
+    /// against it are deterministic without fixtures.
+    const NO_SUCH_PID: u32 = u32::MAX;
+
+    fn stop_diff_coordinator(scope: Scope) -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            scope,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    fn seed(scope: Scope, tasks: &[(u32, Option<u64>)]) -> InventoryCoordinator<OsProcessSource> {
+        let mut coordinator = stop_diff_coordinator(scope);
+        coordinator.ever_enumerated.extend(tasks.iter().copied());
+        coordinator
+    }
+
+    /// The stop diff covers what a completed pass enumerated (exact
+    /// generation match, or recorded without a generation), and flags a
+    /// never-seen pid, a reused pid (same number, new start-time) and an
+    /// unreadable-at-stop pid alike as newcomers — except pids the exec
+    /// gap already names, which are never double-reported.
+    #[test]
+    fn stop_diff_covers_enumerated_tasks_and_flags_reuse() {
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let empty_exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::new();
+        assert!(
+            seed(Scope::System, &[(me, Some(live))])
+                .stop_diff_newcomers(&[me], &empty_exec)
+                .is_empty(),
+            "the live enumerated incarnation is covered"
+        );
+        assert!(
+            seed(Scope::System, &[(me, None)])
+                .stop_diff_newcomers(&[me], &empty_exec)
+                .is_empty(),
+            "a task recorded without a generation is covered"
+        );
+        assert_eq!(
+            seed(Scope::System, &[]).stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec),
+            vec![NO_SUCH_PID],
+            "a never-seen pid is a newcomer"
+        );
+        assert_eq!(
+            seed(Scope::System, &[(me, Some(live.wrapping_add(1)))])
+                .stop_diff_newcomers(&[me], &empty_exec),
+            vec![me],
+            "a reused pid reads as a newcomer, never as its predecessor"
+        );
+        assert!(
+            seed(Scope::System, &[(NO_SUCH_PID, Some(7))])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "an unreadable-at-stop pid with a recorded start stays covered"
+        );
+        let exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::from([(NO_SUCH_PID, None)]);
+        assert!(
+            seed(Scope::System, &[])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &exec)
+                .is_empty(),
+            "a pid the exec gap names is never double-reported"
+        );
+    }
+
+    /// The stop diff only considers in-scope tasks: a pid-scoped run
+    /// never reports foreign pids (even unseen ones), and cgroup scope
+    /// runs no stop diff (transaction coverage, not scan passes).
+    #[test]
+    fn stop_diff_respects_scope() {
+        let me = std::process::id();
+        let empty_exec: BTreeSet<(u32, Option<u64>)> = BTreeSet::new();
+        assert!(
+            seed(Scope::Pid(me), &[])
+                .stop_diff_newcomers(&[NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "a pid-scoped run ignores foreign pids"
+        );
+        assert_eq!(
+            seed(Scope::Pid(me), &[]).stop_diff_newcomers(&[me], &empty_exec),
+            vec![me],
+            "an unseen scope target is still a newcomer"
+        );
+        let cgroup = Scope::Cgroup {
+            id: 1,
+            path: "/stop-diff-test".into(),
+            dir: std::sync::Arc::new(std::fs::File::open("/dev/null").unwrap()),
+        };
+        assert!(
+            seed(cgroup, &[])
+                .stop_diff_newcomers(&[me, NO_SUCH_PID], &empty_exec)
+                .is_empty(),
+            "cgroup scope runs no stop diff"
+        );
+    }
+
+    /// Enumeration memory is capped: past the cap departed tasks evict
+    /// first, so a live enumerated task survives a storm of dead ones
+    /// and the set stays bounded.
+    #[test]
+    fn ever_enumerated_cap_evicts_departed_tasks_first() {
+        use crate::inspect_system::{MemberGeneration, MemberStatus, ProcessRecord};
+        let me = std::process::id();
+        let live = crate::process::process_start_time(me).unwrap();
+        let mut catalog = super::tests::capture_catalog(
+            &crate::discovery::identity::PinnedObjects::empty(),
+            &[],
+            me,
+            Some(MemberGeneration {
+                start_time: Some(live),
+                exe: None,
+            }),
+        );
+        // One live scanned member plus more departed never-admitted
+        // members than the cap holds; none of the fabricated pids can
+        // exist, so every sweep check is a deterministic eviction.
+        for index in 0..=EVER_ENUMERATED_CAP {
+            catalog.processes.push(ProcessRecord {
+                pid: NO_SUCH_PID - index as u32,
+                status: MemberStatus::NotSelected { loss: None },
+                objects: Vec::new(),
+                generation: Some(MemberGeneration {
+                    start_time: Some(7_000 + index as u64),
+                    exe: None,
+                }),
+                complete_scan: None,
+                application: super::scan_freshness_tests::unexamined_application(),
+                hints_examined: true,
+            });
+        }
+        let mut coordinator = stop_diff_coordinator(Scope::System);
+        coordinator.note_applied_scan_tasks(&catalog);
+        let remembered = coordinator.ever_enumerated_for_test();
+        assert!(
+            remembered.len() <= EVER_ENUMERATED_CAP,
+            "enumeration memory stays capped: {}",
+            remembered.len()
+        );
+        assert!(
+            remembered.contains(&(me, Some(live))),
+            "the live enumerated task survives the cap"
+        );
+        assert!(
+            !remembered.contains(&(
+                NO_SUCH_PID - EVER_ENUMERATED_CAP as u32,
+                Some(7_000 + EVER_ENUMERATED_CAP as u64)
+            )),
+            "departed tasks evict first"
+        );
     }
 }

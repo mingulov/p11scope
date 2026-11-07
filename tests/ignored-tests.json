@@ -114,6 +114,12 @@
       "until": "0.7.0"
     },
     {
+      "file": "src/attach/identity_iter.rs",
+      "path": "attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace",
+      "reason": "privileged: functional probe passes in a nested pid namespace",
+      "cell": "privileged"
+    },
+    {
       "file": "src/attach/instance_tests.rs",
       "path": "attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32",
       "reason": "privileged: explicit Multi, same-object iterator and nonempty ia32 successor proof",
@@ -467,6 +473,12 @@
       "file": "src/attach/inventory/activation/privileged_tests.rs",
       "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64",
       "reason": "root-owned BPF lane; 8192-endpoint Multi population admits every endpoint with no refusal",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/attach/inventory/activation/privileged_tests.rs",
+      "path": "attach::inventory::activation::privileged_tests::privileged_inventory_multi_n20480_default_lp64",
+      "reason": "root-owned BPF lane; 20480-endpoint default-budget Multi population admits every endpoint with no refusal",
       "cell": "privileged"
     },
     {
@@ -1057,6 +1069,18 @@
       "file": "src/inspect_system.rs",
       "path": "inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed",
       "reason": "privileged: real kernel BTF identity-denial disclosure; lane-classified",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inspect_system.rs",
+      "path": "inspect_system::tests::probe_dir_created_dir_exec_maps",
+      "reason": "privileged: created probe dir exec-maps",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/inspect_system.rs",
+      "path": "inspect_system::tests::probe_dir_falls_back_when_temp_is_noexec",
+      "reason": "privileged: probe dir falls back when temp is noexec",
       "cell": "privileged"
     },
     {
@@ -1915,6 +1939,24 @@
       "file": "src/discovery/d4_overlay_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witness_fresh_joins_stale_refuses",
       "reason": "root: loop overlay mounts drive the sweep-side witness cell",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/output.rs",
+      "path": "output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker",
+      "reason": "privileged: sudo -o ownership cell (root via sudo; invoker-owned reports in an invoker-owned dir, root-owned elsewhere)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness",
+      "reason": "root: loop overlay mounts drive the no-route collect cell",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/run.rs",
+      "path": "run::tests::privileged_spawned_child_home_matches_the_target_passwd_row",
+      "reason": "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1",
       "cell": "privileged"
     }
   ]

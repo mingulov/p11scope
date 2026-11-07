@@ -126,6 +126,197 @@ fn slot_report(
     }
 }
 
+/// Gaps from a legacy aggregate read: slots whose STATS cell could not be
+/// read (zero counts are unknown, not exact) and whether the RV table read
+/// failed (per-slot RV breakdowns may be incomplete).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LegacySlotGaps {
+    pub unread_stats: u64,
+    pub rv_failed: bool,
+}
+
+/// Unknown kernel-evidence cells: one bit per EVIDENCE index and control
+/// cell. A set bit means that cell read 0 as unknown, not exact.
+pub(crate) const LEGACY_UNKNOWN_RING_LOSS: u64 = 1 << 0;
+pub(crate) const LEGACY_UNKNOWN_START_INSERT: u64 = 1 << 1;
+pub(crate) const LEGACY_UNKNOWN_UNMATCHED_RETURNS: u64 = 1 << 2;
+pub(crate) const LEGACY_UNKNOWN_RV_UPDATES: u64 = 1 << 3;
+pub(crate) const LEGACY_UNKNOWN_CGROUP_SCOPE: u64 = 1 << 4;
+pub(crate) const LEGACY_UNKNOWN_SEMANTIC_CAPTURE: u64 = 1 << 5;
+pub(crate) const LEGACY_UNKNOWN_TEMPLATE_TAIL: u64 = 1 << 6;
+pub(crate) const LEGACY_UNKNOWN_UNREGISTERED_MECHANISMS: u64 = 1 << 7;
+pub(crate) const LEGACY_UNKNOWN_ABI_REFUSALS: u64 = 1 << 8;
+pub(crate) const LEGACY_UNKNOWN_OWNER: u64 = 1 << 9;
+pub(crate) const LEGACY_UNKNOWN_COOKIE: u64 = 1 << 10;
+pub(crate) const LEGACY_UNKNOWN_ROOT: u64 = 1 << 11;
+
+/// Finite cell names for the unknown bitmask, in bit order.
+pub(crate) const LEGACY_UNKNOWN_CELLS: &[(&str, u64)] = &[
+    ("ring_loss", LEGACY_UNKNOWN_RING_LOSS),
+    ("start_insert_failures", LEGACY_UNKNOWN_START_INSERT),
+    ("unmatched_returns", LEGACY_UNKNOWN_UNMATCHED_RETURNS),
+    ("rv_update_failures", LEGACY_UNKNOWN_RV_UPDATES),
+    ("cgroup_scope_failures", LEGACY_UNKNOWN_CGROUP_SCOPE),
+    ("semantic_capture_failures", LEGACY_UNKNOWN_SEMANTIC_CAPTURE),
+    ("template_tail_failures", LEGACY_UNKNOWN_TEMPLATE_TAIL),
+    (
+        "unregistered_mechanisms",
+        LEGACY_UNKNOWN_UNREGISTERED_MECHANISMS,
+    ),
+    ("abi_refusals", LEGACY_UNKNOWN_ABI_REFUSALS),
+    ("owner", LEGACY_UNKNOWN_OWNER),
+    ("cookie", LEGACY_UNKNOWN_COOKIE),
+    ("root", LEGACY_UNKNOWN_ROOT),
+];
+
+fn collect_legacy_rvs(
+    entries: Vec<Result<(RvKey, u64), ()>>,
+) -> (BTreeMap<u32, BTreeMap<u64, u64>>, bool) {
+    let mut map: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
+    let mut rv_failed = false;
+    for entry in entries {
+        match entry {
+            Ok((key, total)) => {
+                if total > 0 {
+                    let slot_rv = map.entry(key.slot).or_default().entry(key.rv).or_default();
+                    *slot_rv = slot_rv.saturating_add(total);
+                }
+            }
+            Err(()) => {
+                rv_failed = true;
+            }
+        }
+    }
+    (map, rv_failed)
+}
+
+fn collect_legacy_reports(
+    plan: &AttachPlan,
+    get_stats: impl Fn(u32) -> Result<Vec<SlotStats>, ()>,
+    rvs: Vec<(RvKey, u64)>,
+) -> (Vec<SlotReport>, LegacySlotGaps) {
+    let mut rv_by_slot: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
+    for (key, total) in rvs {
+        if total > 0 {
+            let slot_rv = rv_by_slot
+                .entry(key.slot)
+                .or_default()
+                .entry(key.rv)
+                .or_default();
+            *slot_rv = slot_rv.saturating_add(total);
+        }
+    }
+    let mut out = Vec::with_capacity(plan.slots.len());
+    let mut unread_stats = 0u64;
+    for slot in &plan.slots {
+        match get_stats(slot.index) {
+            Ok(per_cpu) => {
+                let mut acc = SlotStats::ZERO;
+                for cpu in per_cpu {
+                    acc.entered = acc.entered.saturating_add(cpu.entered);
+                    acc.returned = acc.returned.saturating_add(cpu.returned);
+                    acc.errors = acc.errors.saturating_add(cpu.errors);
+                    acc.total_ns = acc.total_ns.saturating_add(cpu.total_ns);
+                    acc.max_ns = acc.max_ns.max(cpu.max_ns);
+                    for (i, bucket) in cpu.buckets.iter().enumerate() {
+                        acc.buckets[i] = acc.buckets[i].saturating_add(*bucket);
+                    }
+                }
+                out.push(slot_report(
+                    plan,
+                    slot,
+                    acc,
+                    rv_by_slot.remove(&slot.index).unwrap_or_default(),
+                ));
+            }
+            Err(()) => {
+                unread_stats = unread_stats.saturating_add(1);
+                rv_by_slot.remove(&slot.index);
+                out.push(slot_report(plan, slot, SlotStats::ZERO, BTreeMap::new()));
+            }
+        }
+    }
+    (
+        out,
+        LegacySlotGaps {
+            unread_stats,
+            rv_failed: false,
+        },
+    )
+}
+
+fn read_legacy_evidence_cell(value: Result<u64, ()>, bit: u64) -> (u64, u64) {
+    match value {
+        Ok(value) => (value, 0),
+        Err(()) => (0, bit),
+    }
+}
+
+/// Compose one legacy aggregate read from scripted inputs: RV entries fold
+/// first, then per-slot STATS, and the RV failure flag rides the returned
+/// gaps together with the unread-STATS count. `read_with_gaps` is this
+/// composition over live maps; tests drive it directly.
+fn compose_legacy_read(
+    plan: &AttachPlan,
+    get_stats: impl Fn(u32) -> Result<Vec<SlotStats>, ()>,
+    entries: Vec<Result<(RvKey, u64), ()>>,
+) -> (Vec<SlotReport>, LegacySlotGaps) {
+    let (rv_map, rv_failed) = collect_legacy_rvs(entries);
+    let flat: Vec<(RvKey, u64)> = rv_map
+        .iter()
+        .flat_map(|(slot, rvs)| {
+            rvs.iter().map(|(rv, total)| {
+                (
+                    RvKey {
+                        slot: *slot,
+                        _pad: 0,
+                        rv: *rv,
+                    },
+                    *total,
+                )
+            })
+        })
+        .collect();
+    let (reports, mut gaps) = collect_legacy_reports(plan, get_stats, flat);
+    gaps.rv_failed = rv_failed;
+    (reports, gaps)
+}
+
+/// Compose kernel control state from typed control reads with gaps: a
+/// failed control read contributes nothing and sets its unknown bit, while
+/// a missing map (`Ok(None)`, Inventory flavors) contributes nothing
+/// without a gap bit. `kernel_evidence_with_gaps` is this composition over
+/// live maps; tests drive it directly.
+fn compose_legacy_controls(
+    owner: Result<Option<ThreadOwnerControl>, ()>,
+    cookie: Result<Option<ImageIdentityControl>, ()>,
+    root: Result<Option<RootAffiliationControl>, ()>,
+) -> (KernelControl, u64) {
+    let mut unknown = 0u64;
+    let owner = match owner {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_OWNER;
+            None
+        }
+    };
+    let cookie = match cookie {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_COOKIE;
+            None
+        }
+    };
+    let root = match root {
+        Ok(cell) => cell,
+        Err(()) => {
+            unknown |= LEGACY_UNKNOWN_ROOT;
+            None
+        }
+    };
+    (KernelControl::from_cells(owner, cookie, root), unknown)
+}
+
 pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
     let stats: PerCpuArray<_, SlotStats> =
         PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS map")?)?;
@@ -167,7 +358,66 @@ pub fn read(session: &Session, plan: &AttachPlan) -> Result<Vec<SlotReport>> {
             rv_by_slot.remove(&slot.index).unwrap_or_default(),
         ));
     }
-    Ok(out)
+    Ok(merge_slot_reports(out))
+}
+
+/// Fold slot reports that count the same function in the same file
+/// into one aggregate row: two incarnations of one owned child (an
+/// exec between them) retire one generation's slots and arm the
+/// next, and the aggregate table must show the function once with
+/// summed counts, not once per generation. Rows for different files
+/// or different counter modes stay apart: sharing a name never
+/// merges two modules, and counts never merge with timing rows.
+/// First-seen order is kept; a merged row keeps the first row's
+/// mode, authorization and module attribution alongside its identity
+/// fields, and sums every counter, bucket and return tally.
+pub fn merge_slot_reports(reports: Vec<SlotReport>) -> Vec<SlotReport> {
+    #[derive(PartialEq, Eq, PartialOrd, Ord)]
+    struct Key {
+        names: Vec<String>,
+        aliased: bool,
+        target: Option<((u64, u64), u64, Option<String>)>,
+        file_offset: u64,
+        mode: u8,
+    }
+    let mut index: BTreeMap<Key, usize> = BTreeMap::new();
+    let mut merged: Vec<SlotReport> = Vec::with_capacity(reports.len());
+    for report in reports {
+        let key = Key {
+            names: report.names.clone(),
+            aliased: report.aliased,
+            target: report
+                .target_object
+                .as_ref()
+                .map(|target| (target.dev, target.ino, target.sha256.clone())),
+            file_offset: report.file_offset,
+            mode: report.mode as u8,
+        };
+        let Some(position) = index.get(&key).copied() else {
+            index.insert(key, merged.len());
+            merged.push(report);
+            continue;
+        };
+        let row = &mut merged[position];
+        row.calls = row.calls.saturating_add(report.calls);
+        row.errors = row.errors.saturating_add(report.errors);
+        row.in_flight = row.in_flight.saturating_add(report.in_flight);
+        row.total_ns = row.total_ns.saturating_add(report.total_ns);
+        row.max_ns = row.max_ns.max(report.max_ns);
+        for (slot, extra) in row.buckets.iter_mut().zip(report.buckets.iter()) {
+            *slot = slot.saturating_add(*extra);
+        }
+        for (rv, count) in report.rv_counts {
+            row.rv_counts
+                .entry(rv)
+                .and_modify(|total| *total = total.saturating_add(count))
+                .or_insert(count);
+        }
+        row.ordinals.extend(report.ordinals);
+        row.ordinals.sort();
+        row.ordinals.dedup();
+    }
+    merged
 }
 
 /// Events the kernel side could not reserve ring buffer space for,
@@ -191,6 +441,9 @@ pub struct KernelEvidence {
     pub abi_refusals: u64,
     /// Native control cells, read with every snapshot (see [`KernelControl`]).
     pub control: KernelControl,
+    /// Bitmask of cells that read 0 as unknown, not exact (see
+    /// [`LEGACY_UNKNOWN_CELLS`]). Zero when every cell read cleanly.
+    pub unknown_cells: u64,
 }
 
 /// Native kernel control state: OWNER_CTL (call-ownership accounting),
@@ -472,6 +725,134 @@ pub fn kernel_evidence(session: &Session) -> Result<KernelEvidence> {
         unregistered_mechanisms: read(EVIDENCE_UNREGISTERED_MECHANISMS)?,
         abi_refusals: read(EVIDENCE_ABI_REFUSALS)?,
         control,
+        unknown_cells: 0,
+    })
+}
+
+/// Combined gaps from one legacy read: unread STATS slots, an RV-table
+/// failure flag, and unknown kernel-evidence cells. All zeros/false/empty
+/// when the read was exact.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct LegacyReadGaps {
+    pub slots: LegacySlotGaps,
+    pub unknown_evidence: u64,
+}
+
+impl LegacyReadGaps {
+    pub(crate) fn is_clean(&self) -> bool {
+        self.slots.unread_stats == 0 && !self.slots.rv_failed && self.unknown_evidence == 0
+    }
+
+    pub(crate) fn unknown_names(&self) -> Vec<&'static str> {
+        LEGACY_UNKNOWN_CELLS
+            .iter()
+            .filter(|(_, bit)| self.unknown_evidence & bit != 0)
+            .map(|(name, _)| *name)
+            .collect()
+    }
+}
+
+/// Legacy aggregate read with per-slot gaps: one unread STATS slot reports
+/// zero as unknown with a gap count, one bad RV entry is skipped with an RV
+/// flag, and the rest stays exact. Missing STATS/RV maps remain fatal (the
+/// data source itself is gone).
+pub(crate) fn read_with_gaps(
+    session: &Session,
+    plan: &AttachPlan,
+) -> Result<(Vec<SlotReport>, LegacySlotGaps)> {
+    let stats: PerCpuArray<_, SlotStats> =
+        PerCpuArray::try_from(session.ebpf.map("STATS").context("STATS map")?)?;
+    let rvs: PerCpuHashMap<_, RvKey, u64> =
+        PerCpuHashMap::try_from(session.ebpf.map("RV_COUNTS").context("RV_COUNTS map")?)?;
+    let mut entries = Vec::new();
+    for entry in rvs.iter() {
+        match entry {
+            Ok((key, per_cpu)) => {
+                entries.push(Ok((key, saturating_total(per_cpu.iter().copied()))));
+            }
+            Err(_) => {
+                entries.push(Err(()));
+            }
+        }
+    }
+    let (reports, gaps) = compose_legacy_read(
+        plan,
+        |index| {
+            stats
+                .get(&index, 0)
+                .map(|per_cpu| per_cpu.iter().copied().collect::<Vec<_>>())
+                .map_err(|_| ())
+        },
+        entries,
+    );
+    Ok((reports, gaps))
+}
+
+/// Kernel evidence with per-cell unknowns: one unread EVIDENCE or control
+/// cell reads 0 as unknown with its bit, and the rest stays exact. A missing
+/// EVIDENCE map remains fatal; missing control maps (Inventory flavors)
+/// contribute nothing without a gap bit.
+pub(crate) fn kernel_evidence_with_gaps(session: &Session) -> Result<KernelEvidence> {
+    let evidence: PerCpuArray<_, u64> =
+        PerCpuArray::try_from(session.ebpf.map("EVIDENCE").context("EVIDENCE map")?)?;
+    let read = |index: u32, bit: u64| -> (u64, u64) {
+        let value = evidence
+            .get(&index, 0)
+            .map(|per_cpu| saturating_total(per_cpu.iter().copied()))
+            .map_err(|_| ());
+        read_legacy_evidence_cell(value, bit)
+    };
+    // Typed control reads with gaps: control_cell returns Ok(None) for map
+    // absence (Inventory flavors, no gap bit) and Err for get failures (gap).
+    let (control, control_unknown) = compose_legacy_controls(
+        control_cell::<ThreadOwnerControl>(session, "OWNER_CTL").map_err(|_| ()),
+        control_cell::<ImageIdentityControl>(session, "COOKIE_CTL").map_err(|_| ()),
+        control_cell::<RootAffiliationControl>(session, "ROOT_CTL").map_err(|_| ()),
+    );
+    let mut unknown = control_unknown;
+    notice_kernel_control(&control);
+    let (ring_loss, bit) = read(EVIDENCE_RING_LOSS, LEGACY_UNKNOWN_RING_LOSS);
+    unknown |= bit;
+    let (start_insert_failures, bit) =
+        read(EVIDENCE_START_INSERT_FAILURES, LEGACY_UNKNOWN_START_INSERT);
+    unknown |= bit;
+    let (unmatched_returns, bit) =
+        read(EVIDENCE_UNMATCHED_RETURNS, LEGACY_UNKNOWN_UNMATCHED_RETURNS);
+    unknown |= bit;
+    let (rv_update_failures, bit) = read(EVIDENCE_RV_UPDATE_FAILURES, LEGACY_UNKNOWN_RV_UPDATES);
+    unknown |= bit;
+    let (cgroup_scope_failures, bit) =
+        read(EVIDENCE_CGROUP_SCOPE_FAILURES, LEGACY_UNKNOWN_CGROUP_SCOPE);
+    unknown |= bit;
+    let (semantic_capture_failures, bit) = read(
+        EVIDENCE_SEMANTIC_CAPTURE_FAILURES,
+        LEGACY_UNKNOWN_SEMANTIC_CAPTURE,
+    );
+    unknown |= bit;
+    let (template_tail_failures, bit) = read(
+        EVIDENCE_TEMPLATE_TAIL_FAILURES,
+        LEGACY_UNKNOWN_TEMPLATE_TAIL,
+    );
+    unknown |= bit;
+    let (unregistered_mechanisms, bit) = read(
+        EVIDENCE_UNREGISTERED_MECHANISMS,
+        LEGACY_UNKNOWN_UNREGISTERED_MECHANISMS,
+    );
+    unknown |= bit;
+    let (abi_refusals, bit) = read(EVIDENCE_ABI_REFUSALS, LEGACY_UNKNOWN_ABI_REFUSALS);
+    unknown |= bit;
+    Ok(KernelEvidence {
+        ring_loss,
+        start_insert_failures,
+        unmatched_returns,
+        rv_update_failures,
+        cgroup_scope_failures,
+        semantic_capture_failures,
+        template_tail_failures,
+        unregistered_mechanisms,
+        abi_refusals,
+        control,
+        unknown_cells: unknown,
     })
 }
 
@@ -556,6 +937,7 @@ mod tests {
             source: "manifest",
             corroborated: false,
             skipped: vec![],
+            admission_class: None,
         }];
         plan
     }
@@ -575,6 +957,7 @@ mod tests {
             source: "manifest",
             corroborated: false,
             skipped: vec![],
+            admission_class: None,
         }
     }
 
@@ -860,6 +1243,7 @@ mod tests {
                 },
                 key,
                 path: "/opt/p11.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
@@ -1062,6 +1446,109 @@ mod tests {
             "an allocated cell with no accepted sole owner is unresolved, \
              never a silent null"
         );
+    }
+
+    fn merge_fixture(
+        name: &str,
+        file_offset: u64,
+        ino: u64,
+        calls: u64,
+        errors: u64,
+        buckets: [u64; LATENCY_BUCKETS],
+    ) -> SlotReport {
+        let mut rv_counts = BTreeMap::new();
+        rv_counts.insert(0u64, calls);
+        SlotReport {
+            names: vec![name.into()],
+            aliased: false,
+            semantic_authorized: false,
+            module: Some(ModuleId(0)),
+            module_ambiguous: false,
+            module_unresolved: false,
+            mode: CounterMode::Latency,
+            calls,
+            errors,
+            in_flight: 0,
+            total_ns: calls * 1000,
+            max_ns: 2000,
+            buckets,
+            rv_counts,
+            file_offset,
+            target_object: Some(crate::plan::TargetObject {
+                dev: (8, 1),
+                ino,
+                sha256: Some("aa".into()),
+            }),
+            ordinals: vec![],
+        }
+    }
+
+    fn buckets_with(first: u64, second: u64) -> [u64; LATENCY_BUCKETS] {
+        let mut buckets = [0u64; LATENCY_BUCKETS];
+        buckets[0] = first;
+        buckets[1] = second;
+        buckets
+    }
+
+    /// Two generations of one owned child count the same function in
+    /// the same file: the aggregate folds them into one row with
+    /// summed counts, buckets and return tallies, never two
+    /// unlabeled rows.
+    #[test]
+    fn merge_slot_reports_folds_same_function_same_file_rows() {
+        let first = merge_fixture(
+            "C_DigestUpdate",
+            0x1234,
+            4242,
+            5625,
+            1,
+            buckets_with(10, 20),
+        );
+        let second = merge_fixture(
+            "C_DigestUpdate",
+            0x1234,
+            4242,
+            1494,
+            2,
+            buckets_with(30, 40),
+        );
+        let merged = merge_slot_reports(vec![first, second]);
+        assert_eq!(merged.len(), 1, "one function reads one row");
+        let row = &merged[0];
+        assert_eq!(row.names, vec!["C_DigestUpdate".to_string()]);
+        assert_eq!(row.calls, 7119);
+        assert_eq!(row.errors, 3);
+        assert_eq!(row.buckets[0], 40);
+        assert_eq!(row.buckets[1], 60);
+        assert_eq!(row.rv_counts.get(&0), Some(&7119));
+        assert_eq!(row.file_offset, 0x1234);
+    }
+
+    /// Sharing a name never merges two modules: the same function in
+    /// different files stays two rows.
+    #[test]
+    fn merge_slot_reports_keeps_different_files_apart() {
+        let left = merge_fixture("C_DigestUpdate", 0x1234, 4242, 10, 0, buckets_with(1, 0));
+        let right = merge_fixture("C_DigestUpdate", 0x1234, 9999, 20, 0, buckets_with(0, 1));
+        let merged = merge_slot_reports(vec![left, right]);
+        assert_eq!(merged.len(), 2, "two files stay two rows");
+        let calls: u64 = merged.iter().map(|row| row.calls).sum();
+        assert_eq!(calls, 30);
+    }
+
+    /// Different counter modes never fold together: a counts row and
+    /// a latency row for the same function stay two rows, since their
+    /// cells measure different things.
+    #[test]
+    fn merge_slot_reports_keeps_different_modes_apart() {
+        let mut counts = merge_fixture("C_DigestUpdate", 0x1234, 4242, 10, 0, buckets_with(1, 0));
+        counts.mode = CounterMode::Counts;
+        let mut latency = merge_fixture("C_DigestUpdate", 0x1234, 4242, 20, 0, buckets_with(0, 1));
+        latency.mode = CounterMode::Latency;
+        let merged = merge_slot_reports(vec![counts, latency]);
+        assert_eq!(merged.len(), 2, "two modes stay two rows");
+        let calls: u64 = merged.iter().map(|row| row.calls).sum();
+        assert_eq!(calls, 30);
     }
 
     #[test]
@@ -1463,6 +1950,324 @@ mod tests {
                 source.contains(&format!("cargo:rerun-if-changed=crates/ebpf/native/{unit}")),
                 "native {unit} edits must invalidate the build cache"
             );
+        }
+    }
+
+    #[test]
+    fn legacy_slot_failure_reports_zero_with_gap_and_rest_exact() {
+        // One STATS slot read fails; that slot reports zero as unknown with
+        // a gap count, while the readable slot stays exact.
+        let plan = exact_plan(vec![slot(0, "C_Sign"), slot(1, "C_Verify")]);
+        let good = SlotStats {
+            entered: 3,
+            returned: 5,
+            errors: 1,
+            total_ns: 50,
+            max_ns: 20,
+            buckets: [0; LATENCY_BUCKETS],
+        };
+        let (reports, gaps) = collect_legacy_reports(
+            &plan,
+            |index| {
+                if index == 0 { Err(()) } else { Ok(vec![good]) }
+            },
+            vec![(
+                RvKey {
+                    slot: 1,
+                    _pad: 0,
+                    rv: 0,
+                },
+                5,
+            )],
+        );
+        assert_eq!(reports.len(), 2);
+        assert_eq!((reports[0].calls, reports[0].errors), (0, 0));
+        assert!(reports[0].rv_counts.is_empty());
+        assert_eq!((reports[1].calls, reports[1].errors), (5, 1));
+        assert_eq!(reports[1].rv_counts.get(&0), Some(&5));
+        assert_eq!(gaps.unread_stats, 1);
+        assert!(!gaps.rv_failed);
+    }
+
+    #[test]
+    fn legacy_rv_failure_keeps_readable_entries_with_gap() {
+        // One RV entry read fails; readable RVs stay exact with an RV gap.
+        let plan = exact_plan(vec![slot(0, "C_Sign")]);
+        let stats = SlotStats {
+            entered: 3,
+            returned: 5,
+            errors: 1,
+            ..SlotStats::ZERO
+        };
+        let entries: Vec<Result<(RvKey, u64), ()>> = vec![
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 0,
+                },
+                3,
+            )),
+            Err(()),
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 1,
+                },
+                2,
+            )),
+        ];
+        let (mut map, rv_failed) = collect_legacy_rvs(entries.clone());
+        assert!(rv_failed);
+        assert_eq!(map.get(&0).unwrap().get(&0), Some(&3));
+        assert_eq!(map.get(&0).unwrap().get(&1), Some(&2));
+        let (reports, gaps) = collect_legacy_reports(
+            &plan,
+            |_| Ok(vec![stats]),
+            map.remove(&0)
+                .unwrap()
+                .into_iter()
+                .map(|(rv, total)| {
+                    (
+                        RvKey {
+                            slot: 0,
+                            _pad: 0,
+                            rv,
+                        },
+                        total,
+                    )
+                })
+                .collect(),
+        );
+        assert_eq!(reports[0].calls, 5);
+        // The RV gap rides the composed collection gaps, not the STATS path.
+        let (composed, composed_gaps) = compose_legacy_read(&plan, |_| Ok(vec![stats]), entries);
+        assert_eq!(composed[0].calls, 5);
+        assert_eq!(composed[0].rv_counts.get(&0), Some(&3));
+        assert_eq!(composed[0].rv_counts.get(&1), Some(&2));
+        assert_eq!(composed_gaps.unread_stats, 0);
+        assert!(
+            composed_gaps.rv_failed,
+            "the composed gaps must carry the RV failure"
+        );
+        assert_eq!(
+            gaps,
+            LegacySlotGaps {
+                unread_stats: 0,
+                rv_failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn compose_legacy_read_combines_unread_stats_and_rv_failure() {
+        // An unread STATS slot and a failed RV entry in one read ride the
+        // same composed gaps: zero as unknown for the unread slot, exact
+        // readable entries, and both gap facts set together.
+        let plan = exact_plan(vec![slot(0, "C_Sign"), slot(1, "C_Verify")]);
+        let stats = SlotStats {
+            entered: 3,
+            returned: 5,
+            errors: 1,
+            ..SlotStats::ZERO
+        };
+        let entries: Vec<Result<(RvKey, u64), ()>> = vec![
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 0,
+                },
+                5,
+            )),
+            Err(()),
+        ];
+        let (reports, gaps) = compose_legacy_read(
+            &plan,
+            |index| {
+                if index == 0 { Ok(vec![stats]) } else { Err(()) }
+            },
+            entries,
+        );
+        assert_eq!(reports.len(), 2);
+        assert_eq!((reports[0].calls, reports[0].errors), (5, 1));
+        assert_eq!(reports[0].rv_counts.get(&0), Some(&5));
+        assert_eq!(
+            (reports[1].calls, reports[1].errors),
+            (0, 0),
+            "unread slot reports zero as unknown"
+        );
+        assert!(reports[1].rv_counts.is_empty());
+        assert_eq!(gaps.unread_stats, 1);
+        assert!(
+            gaps.rv_failed,
+            "the composed gaps must carry the RV failure"
+        );
+    }
+
+    #[test]
+    fn compose_legacy_controls_marks_each_failed_cell_with_its_bit() {
+        // Each failed control read sets exactly its own unknown bit and
+        // contributes nothing; readable cells flow through, and a missing
+        // map (Inventory flavors) contributes nothing without a gap bit.
+        let owner = ThreadOwnerControl {
+            poison: 4,
+            admission_failures: 7,
+            ..Default::default()
+        };
+        let cookie = ImageIdentityControl {
+            unavailable: 3,
+            ..Default::default()
+        };
+        let root = RootAffiliationControl {
+            failure_flags: 9,
+            ..Default::default()
+        };
+        let (control, unknown) =
+            compose_legacy_controls(Ok(Some(owner)), Ok(Some(cookie)), Ok(Some(root)));
+        assert_eq!(unknown, 0);
+        assert_eq!(
+            (
+                control.owner_poison,
+                control.owner_admission_failures,
+                control.identity_unavailable,
+                control.root_failures
+            ),
+            (4, 7, 3, 9),
+            "readable control values flow through"
+        );
+        let (_, unknown) = compose_legacy_controls(Ok(None), Ok(None), Ok(None));
+        assert_eq!(unknown, 0, "missing maps contribute no gap bit");
+        for (name, owner, cookie, root, bit) in [
+            (
+                "owner",
+                Err(()),
+                Ok(Some(cookie)),
+                Ok(Some(root)),
+                LEGACY_UNKNOWN_OWNER,
+            ),
+            (
+                "cookie",
+                Ok(Some(owner)),
+                Err(()),
+                Ok(Some(root)),
+                LEGACY_UNKNOWN_COOKIE,
+            ),
+            (
+                "root",
+                Ok(Some(owner)),
+                Ok(Some(cookie)),
+                Err(()),
+                LEGACY_UNKNOWN_ROOT,
+            ),
+        ] {
+            let (control, unknown) = compose_legacy_controls(owner, cookie, root);
+            assert_eq!(unknown, bit, "{name} failure sets exactly its bit");
+            assert_eq!(
+                (
+                    control.owner_poison,
+                    control.owner_admission_failures,
+                    control.identity_unavailable,
+                    control.root_failures
+                ),
+                match name {
+                    "owner" => (0, 0, 3, 9),
+                    "cookie" => (4, 7, 0, 9),
+                    _ => (4, 7, 3, 0),
+                },
+                "{name} failure contributes nothing else"
+            );
+        }
+        let (_, unknown) = compose_legacy_controls(Err(()), Err(()), Err(()));
+        assert_eq!(
+            unknown,
+            LEGACY_UNKNOWN_OWNER | LEGACY_UNKNOWN_COOKIE | LEGACY_UNKNOWN_ROOT
+        );
+    }
+
+    #[test]
+    fn legacy_slot_success_reports_exact_with_no_gap() {
+        let plan = exact_plan(vec![slot(0, "C_Sign"), slot(1, "C_Verify")]);
+        let stats = SlotStats {
+            entered: 3,
+            returned: 5,
+            errors: 1,
+            total_ns: 50,
+            max_ns: 20,
+            buckets: [0; LATENCY_BUCKETS],
+        };
+        let (reports, gaps) = collect_legacy_reports(
+            &plan,
+            |_| Ok(vec![stats]),
+            vec![
+                (
+                    RvKey {
+                        slot: 0,
+                        _pad: 0,
+                        rv: 0,
+                    },
+                    5,
+                ),
+                (
+                    RvKey {
+                        slot: 1,
+                        _pad: 0,
+                        rv: 0,
+                    },
+                    5,
+                ),
+            ],
+        );
+        assert_eq!(reports.len(), 2);
+        for report in &reports {
+            assert_eq!((report.calls, report.errors), (5, 1));
+            assert_eq!(report.rv_counts.get(&0), Some(&5));
+        }
+        assert_eq!(
+            gaps,
+            LegacySlotGaps {
+                unread_stats: 0,
+                rv_failed: false,
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_rv_success_reports_exact_with_no_gap() {
+        let entries: Vec<Result<(RvKey, u64), ()>> = vec![
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 0,
+                },
+                3,
+            )),
+            Ok((
+                RvKey {
+                    slot: 0,
+                    _pad: 0,
+                    rv: 1,
+                },
+                2,
+            )),
+        ];
+        let (map, rv_failed) = collect_legacy_rvs(entries);
+        assert!(!rv_failed);
+        assert_eq!(map.get(&0).unwrap().get(&0), Some(&3));
+        assert_eq!(map.get(&0).unwrap().get(&1), Some(&2));
+    }
+
+    #[test]
+    fn legacy_evidence_cell_failure_reports_unknown_with_gap() {
+        // Every EVIDENCE and control cell reports 0 as unknown with its bit
+        // when its read fails, while readable cells stay exact.
+        for (cell, bit) in LEGACY_UNKNOWN_CELLS {
+            let (value, unknown) = read_legacy_evidence_cell(Err(()), *bit);
+            assert_eq!((value, unknown), (0, *bit), "{cell} must read unknown");
+            let (value, unknown) = read_legacy_evidence_cell(Ok(7), *bit);
+            assert_eq!((value, unknown), (7, 0), "{cell} readable stays exact");
         }
     }
 

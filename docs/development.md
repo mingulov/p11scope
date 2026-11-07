@@ -81,9 +81,10 @@ test -r /dev/kvm && test -w /dev/kvm
 
 The active lane refuses another or mixed QEMU/qemu-img version. KVM device
 access is host policy; the QEMU packages do not grant it. Current positive guest qualification uses Multi-capable hosts, normally 6.6+
-and working backports. One combined stock pre-Multi refusal guest verifies
-`uprobe-multi-required`, unchanged sinks, an unstarted workload and offline
-command availability; it supplies no positive load or headroom evidence.
+and working backports. One combined stock pre-Multi refusal guest verifies the `live capture ...`
+refusal (`unavailable` or `did not start`), unchanged sinks, an unstarted
+workload and offline command availability; it supplies no positive load or
+headroom evidence.
 Historical 5.15/6.1 results retain their original outcomes.
 
 ## Manual Docker runtime workflow

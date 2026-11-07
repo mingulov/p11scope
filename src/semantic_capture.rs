@@ -1243,6 +1243,20 @@ impl ScanJob {
     }
 }
 
+/// Whether a fault move between two audits came only from hook-miss
+/// raises: the raises counted (each won its own compare-and-swap) moved
+/// the fault by exactly their number. Any other fault in the same window
+/// (a BPF record overflow, a coverage raise) makes it an ordinary era.
+fn moved_only_by_miss_raises(
+    raises_before: u64,
+    raises: u64,
+    fault_before: u64,
+    fault: u64,
+) -> bool {
+    let won = raises.saturating_sub(raises_before);
+    won != 0 && fault.checked_sub(fault_before) == Some(won)
+}
+
 /// Only I/O is substituted in tests; all decisions use the same tick below.
 trait CaptureIo {
     fn domain(&self) -> Option<NativeDomainId>;
@@ -1250,6 +1264,11 @@ trait CaptureIo {
     fn collect(&mut self, limit: usize) -> Collection;
     fn health(&mut self) -> Result<Health, ()>;
     fn raise_fault(&mut self) -> Result<u64, ()>;
+    /// Hook recursion-miss total and the fault raises those misses caused
+    /// (counts only). Read after `health`; fixtures without hooks report none.
+    fn hook_miss_totals(&mut self) -> (u64, u64) {
+        (0, 0)
+    }
     fn retained_attachment(
         &self,
         slot: u32,
@@ -1407,6 +1426,9 @@ impl CaptureIo for SessionIo<'_> {
     fn raise_fault(&mut self) -> Result<u64, ()> {
         self.session.instance_maps().raise_fault().map_err(|_| ())
     }
+    fn hook_miss_totals(&mut self) -> (u64, u64) {
+        self.session.hook_miss_totals()
+    }
     fn retained_attachment(
         &self,
         slot: u32,
@@ -1544,6 +1566,11 @@ pub(crate) struct SemanticCapture {
     pending_discovery_status: CollectionStatus,
     stopped: bool,
     continuity_cuts: u64,
+    /// Hook recursion-miss total and miss-caused fault raises at the last
+    /// audit (counts only): a raise count that moved marks the fault move
+    /// as a hook-miss era for the router's instance carry.
+    hook_misses: u64,
+    miss_raises: u64,
     /// Last tick's scan count and refusals, for the stuck-transaction
     /// diagnostic only. Test-visible; production behavior never reads it.
     #[cfg(test)]
@@ -1651,6 +1678,8 @@ impl SemanticCapture {
             pending_discovery_status: CollectionStatus::Complete,
             stopped: false,
             continuity_cuts: 0,
+            hook_misses: 0,
+            miss_raises: 0,
             #[cfg(test)]
             last_tick_scans_for_test: 0,
             #[cfg(test)]
@@ -2057,8 +2086,48 @@ impl SemanticCapture {
             return Err(Refusal::StreamCut);
         }
         let admission = crate::attach::BirthAdmissionBinding::from_admitted(admitted);
-        let evidence =
-            crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?;
+        // DEMO-4 late attach: an exec-marker birth falls back to
+        // attach-observed at the same cut only when native truth
+        // shows the task predates this closure — no marker row at
+        // all, or a row the exec hook never stamped (generation 0,
+        // unpublished marker). The attach birth proves custody,
+        // image and closure only; pre-cut history stays
+        // first-observed / not attributed. A task stamped under
+        // this (or a later) closure keeps the closed exec refusal:
+        // its stronger exec/absence proof may still land on a
+        // later candidate, and an early attach birth must not
+        // preempt it. Absence births never take this fallback.
+        let mut birth = birth;
+        let evidence = match crate::attach::observe_retained_birth(
+            rows, binding, attachment, &admission, birth,
+        ) {
+            Ok(evidence) => evidence,
+            Err(refusal)
+                if birth == BirthKind::ExecMarker
+                    && matches!(
+                        refusal,
+                        Refusal::RowUnreadable
+                            | Refusal::MarkerNotReady
+                            | Refusal::GenerationMismatch
+                    ) =>
+            {
+                let predates_closure = match rows.read_marker_row() {
+                    Err(_) => true,
+                    Ok(record) => {
+                        record.exec_attach_gen == 0
+                            && p11scope_ebpf_common::journal_marker::read_word(
+                                record.journal_bootstrap,
+                            ) == p11scope_ebpf_common::journal_marker::MarkerRead::Unpublished
+                    }
+                };
+                if !predates_closure {
+                    return Err(refusal);
+                }
+                birth = BirthKind::AttachObserved;
+                crate::attach::observe_retained_birth(rows, binding, attachment, &admission, birth)?
+            }
+            Err(refusal) => return Err(refusal),
+        };
         let authorization = ValidatedH0Birth {
             proof: *proof,
             birth,
@@ -2767,6 +2836,10 @@ impl SemanticCapture {
         }
         Ok(report)
     }
+    /// The hook recursion-miss total at the last audit (counts only).
+    pub(crate) fn hook_misses(&self) -> u64 {
+        self.hook_misses
+    }
     pub(crate) fn tick(
         &mut self,
         session: &mut Session,
@@ -3261,6 +3334,14 @@ impl SemanticCapture {
             self.fail_coverage(io, report);
             return false;
         };
+        let (misses, raises) = io.hook_miss_totals();
+        self.hook_misses = misses;
+        if moved_only_by_miss_raises(self.miss_raises, raises, self.fault, health.fault) {
+            // The fault moved for hook misses only: unchanged loads
+            // re-prove onto their previous instances (continuity uncertain).
+            self.router.note_hook_miss_era();
+        }
+        self.miss_raises = raises;
         self.audit_health(health, report)
     }
     fn audit_health(&mut self, health: Health, report: &mut TickReport) -> bool {

@@ -425,7 +425,8 @@ collect_receipt() {
 
 # wait_attach — hold the go file until discovery is done (marker on the
 # timestamped stderr passthrough) AND the attach session is complete (the
-# "p11scope: capturing: N probe(s) attached" line). readiness means the
+# readiness line: "capturing: N probe"/"N probes attached", or the
+# zero-probe "capturing: waiting for ..." line). readiness means the
 # attach session completed; post-hoc counts prove the window. Returns 2
 # if the observer is terminal and 3 if its identity is unknown.
 wait_attach() {
@@ -436,7 +437,7 @@ wait_attach() {
         case "$owned_live_status" in 0) ;; 1) return 2 ;; *) return 3 ;; esac
         [ "$(date +%s)" -lt "$end" ] || return 1
         if grep -q "p11scope: discovery:" "$1/stderr.txt" 2>/dev/null \
-            && grep -q -E "p11scope: capturing: [0-9]+ probe\(s\) attached" "$1/stderr.txt" 2>/dev/null; then
+            && grep -q -E "p11scope: capturing: ([0-9]+ probes? attached|waiting for .*; stop with Ctrl-C)" "$1/stderr.txt" 2>/dev/null; then
             return 0
         fi
         sleep 0.2
@@ -488,6 +489,10 @@ else
         --loopback-log "$WORK/workload.log" $STUB_ARGS
 fi
 OBS_ARGV_JSON=$(python3 -I -c "import json,sys; print(json.dumps(sys.argv[1:]))" "$@")
+# The attach/discovery markers are concise-mode diagnostics: request them
+# explicitly (after the receipt, so the recorded argv stays real; the stub
+# ignores the variable).
+set -- env P11SCOPE_CAPTURE_DIAGNOSTICS=1 "$@"
 T_SPAWN=$(mono_ns)
 owned_launch "$OBSERVER_PRIVILEGE" - "$WORK/observer.stdout" "$CFIFO" -- "$@"
 SPID=$OWNED_PID; SPID_STARTTIME=$OWNED_STARTTIME

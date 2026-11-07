@@ -402,11 +402,13 @@ def bpftool_dump_timed(map_id, reps=3):
 
 # Attach-complete signal: the observer prints one stderr readiness line once
 # probes are attached and the capture loop starts (capture_ready_line in
-# src/run.rs) — 'p11scope: capturing: N probe(s) attached; stop with
-# Ctrl-C'. The 0801e79c 'p11scope: attached N probe(s)' spelling is dead:
-# merge 79a54f53 dropped it as a duplicate of the capturing line.
+# src/run.rs) — 'p11scope: capturing: N probes attached; stop with Ctrl-C'
+# ('1 probe' singular; a zero-probe session prints 'capturing: waiting
+# for ...; stop with Ctrl-C' instead, which also fires this gate). The
+# 0801e79c 'p11scope: attached N probe(s)' spelling is dead: merge
+# 79a54f53 dropped it as a duplicate of the capturing line.
 _ATTACH_COMPLETE_RE = re.compile(
-    r"p11scope: capturing: [0-9]+ probe\(s\) attached")
+    r"p11scope: capturing: ([0-9]+ probes? attached|waiting for .*; stop with Ctrl-C)")
 
 
 def has_attach_complete_line(stderr_text):
@@ -867,9 +869,11 @@ def run_cell(args):
              "--out", str(cell_dir / "stderr-ts.jsonl"),
              "--passthrough", str(cell_dir / "stderr.txt")],
             stdin=fifo_fd)
-        env_prefix = []
+        # The attach/discovery markers are concise-mode diagnostics:
+        # request them explicitly so wait_attach can key on them.
+        env_prefix = ["P11SCOPE_CAPTURE_DIAGNOSTICS=1"]
         if args.lane == "broad":
-            env_prefix = ["P11SCOPE_BROAD_ADMIT=1"]
+            env_prefix.append("P11SCOPE_BROAD_ADMIT=1")
         observer_argv = (["sudo", "-n", *env_prefix, str(args.binary),
                            "profile", *scope_argv, "--mode", args.mode,
                            "--duration", str(args.duration),

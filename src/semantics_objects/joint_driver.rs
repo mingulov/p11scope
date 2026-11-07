@@ -219,6 +219,19 @@ pub(crate) struct JointCaptureOwner {
     // still alive (transient underaccounting at teardown).
     model: ObjectSemantics,
     adapter: JournalAdapter,
+    // The ingest-break void's own original failure (every pre-break key's
+    // abandonment effects) with the storage it prepaid. The next ingested
+    // audit frame carries it as that frame's raw failure; until then the
+    // lease stays charged. Declared after the adapter: it holds no ledger
+    // charge, only a pool lease and the failure's own buffers.
+    pending_void: Option<PendingVoid>,
+}
+
+/// A void's original failure and the lease that paid for it.
+pub(crate) struct PendingVoid {
+    pub(crate) failure: SealFailure,
+    pub(crate) bytes: usize,
+    pub(crate) lease: ResourceLease,
 }
 
 impl JointCaptureOwner {
@@ -229,7 +242,11 @@ impl JointCaptureOwner {
         adapter: JournalAdapter,
         model: ObjectSemantics,
     ) -> Self {
-        Self { model, adapter }
+        Self {
+            model,
+            adapter,
+            pending_void: None,
+        }
     }
 
     /// Build the capture's owner over the registry's existing pool: the
@@ -241,6 +258,7 @@ impl JointCaptureOwner {
         Self {
             model: ObjectSemantics::new(),
             adapter: JournalAdapter::with_ledger(limits, StagingLedger::with_resources(reserver)),
+            pending_void: None,
         }
     }
 
@@ -309,21 +327,45 @@ impl JointCaptureOwner {
         }
         let bytes = super::joint_audit::raw_disposition_storage_bound(&self.adapter, &self.model)
             .ok_or(RawQuantumRefusal::Capacity)?;
-        let _storage = self
+        let lease = self
             .adapter
             .ledger
             .resource_reserver()
             .ok_or(RawQuantumRefusal::ForeignLedger)?
             .reserve(bytes)
             .map_err(RawQuantumRefusal::Resource)?;
-        let _failure = self.adapter.refuse_disposed_raw(
+        let failure = self.adapter.refuse_disposed_raw(
             &mut self.model,
             std::iter::empty(),
             true,
             INGEST_BREAK_VOID_GAP,
         );
         self.adapter.last_audit_failure = Some(self.adapter.consumed_through);
+        // Keep the abandonment (sessions Uncertain(Loss), views and objects
+        // retired, bootstrap voided) for the next audit frame's consumers.
+        // The next audit frame (ingested or disposed) takes the void in a
+        // slot of its own, and every void needs a re-sync and an ingest
+        // first, so an older void is always delivered before a newer one
+        // can apply. The guard keeps the first should that ever change.
+        if self.pending_void.is_none() {
+            self.pending_void = Some(PendingVoid {
+                failure,
+                bytes,
+                lease,
+            });
+        }
         Ok(true)
+    }
+
+    /// Take the void's failure for an audit frame's raw slot.
+    pub(crate) fn take_pending_void(&mut self) -> Option<PendingVoid> {
+        self.pending_void.take()
+    }
+
+    /// The void failure still awaiting its audit frame.
+    #[cfg(test)]
+    pub(crate) fn pending_void_for_test(&self) -> Option<&SealFailure> {
+        self.pending_void.as_ref().map(|pending| &pending.failure)
     }
 
     /// The capture's one object model, with its retained history (read
@@ -2122,24 +2164,82 @@ impl RawJointQuantum {
             || overflow
             || self.affecting_images().any(|image| image.0 == 0);
         let affecting = self.affecting_images().next().is_some();
+        // Before any journal key exists, no image in a disposed quantum
+        // is provably another caller's (there is no bound caller to
+        // differ from), so the localized refusal must not taint it: the
+        // interval is fenced as loss below instead, and a process that
+        // binds later can still enter Joint above that fence. The one
+        // exception is an image with a BEGIN still open in this
+        // quantum: its terminal can still arrive and would be
+        // unaccountable, so it keeps the localized refusal.
+        let pre_key = !unlocalized && owner.adapter.keys.is_empty();
+        let open_images: std::collections::BTreeSet<(u64, u64)> = if pre_key {
+            self.invocations
+                .iter()
+                .filter(|invocation| !invocation.terminal)
+                .map(|invocation| super::JournalAdapter::image_of_begin(&invocation.begin))
+                .collect()
+        } else {
+            Default::default()
+        };
         let failure = (unlocalized || affecting).then(|| {
             let gap = if overflow {
                 JournalGap::CutExhausted
             } else {
                 self.disposal_gap(&owner.adapter, unlocalized)
             };
-            owner.adapter.refuse_disposed_raw(
-                &mut owner.model,
-                self.affecting_images(),
-                unlocalized,
-                gap,
-            )
+            if pre_key {
+                owner.adapter.refuse_disposed_raw(
+                    &mut owner.model,
+                    self.affecting_images()
+                        .filter(|image| open_images.contains(image)),
+                    false,
+                    gap,
+                )
+            } else {
+                owner.adapter.refuse_disposed_raw(
+                    &mut owner.model,
+                    self.affecting_images(),
+                    unlocalized,
+                    gap,
+                )
+            }
         });
         // Every increment corresponds to this original consumed wire item.
         // There is no H8 dispatch, claim, grant or synthetic terminal. Keep
         // first-affecting sightings monotonic, including fork children.
         for (item, quiet, _) in self.classified_items() {
-            let _ = owner.adapter.note_consumed_item(item, quiet);
+            let item_open = match item {
+                super::JournalIngestItem::Journal(record) => match record {
+                    super::JournalRecord::Begin(begin) => {
+                        open_images.contains(&super::JournalAdapter::image_of_begin(begin))
+                    }
+                    super::JournalRecord::End(end) => open_images.contains(&super::end_image(end)),
+                    super::JournalRecord::Abandon(abandon) => {
+                        open_images.contains(&(abandon.image_cookie(), abandon.image_exec()))
+                    }
+                },
+                super::JournalIngestItem::Ordinary(record) => {
+                    let event = &record.base.event;
+                    open_images.contains(&(event.image.task_cookie, event.image.exec_id))
+                        || open_images
+                            .contains(&(event.child_image.task_cookie, event.child_image.exec_id))
+                }
+            };
+            if pre_key && !item_open {
+                owner.adapter.note_disposed_without_sighting();
+            } else {
+                let _ = owner.adapter.note_consumed_item(item, quiet);
+            }
+        }
+        if pre_key && affecting {
+            // The disposed affecting records are lost history: fence
+            // the whole consumed interval so no later birth or seal
+            // can certify across it.
+            owner.adapter.voided_through = owner
+                .adapter
+                .voided_through
+                .max(owner.adapter.consumed_through);
         }
         if contiguous && !unlocalized {
             owner.adapter.stream_boundary = self.cuts.as_ref().and_then(|cuts| cuts.end.clone());

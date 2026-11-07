@@ -270,9 +270,11 @@ def encoded(value):
 
 def validate_owned_argv(config):
     argv = config.observer_args
-    require(len(argv) == 20, 'owned observer command has unexpected arguments')
-    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[13]), Path(argv[14])
-    require(argv == [argv[0], 'run', '--manifest', str(manifest), '--mode', 'metrics',
+    # The observer runs verbose: the post-exit tier proof needs the live
+    # frame's verbose-only privacy marker. The pin stays exact otherwise.
+    require(len(argv) == 21, 'owned observer command has unexpected arguments')
+    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[14]), Path(argv[15])
+    require(argv == [argv[0], 'run', '-v', '--manifest', str(manifest), '--mode', 'metrics',
                     '--pause', 'never', '--duration', str(OWNED_DURATION_SECONDS),
                     '-o', f'{config.prefix}.output', '--',
                     str(executable), str(provider), 'matrix', str(config.ready),
@@ -495,9 +497,14 @@ class LiveMaps:
                 after_names.append(entry.name)
         require(sorted(names) == sorted(after_names), 'observer fdinfo membership changed')
         ids = dumper.map_ids_from_fdinfo(texts)
-        maps = [dumper.normalize_map_metadata(dumper.one(self._json(
-            ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536)), map_id)
-                for map_id in ids]
+        fetched = [(map_id, dumper.one(self._json(
+            ['bpftool', '-j', 'map', 'show', 'id', str(map_id)], deadline, bound=65536)))
+                   for map_id in ids]
+        kept, _ = partition_identity_maps(
+            [row for _, row in fetched], self.config.workload_origin)
+        held = {id(row) for row in kept}
+        maps = [dumper.normalize_map_metadata(row, map_id)
+                for map_id, row in fetched if id(row) in held]
         validate_inventory(maps, self.config.variant, self.config.privacy)
         group.snapshot(deadline)
         return sorted(maps, key=lambda item: item['name'])
@@ -593,6 +600,55 @@ class LiveMaps:
                 issues.extend(sanitized('close-map', error))
         if issues:
             raise CaptureError(issues) from None
+
+
+# Witness identity session maps (owned runs preload them before spawning
+# the child; see overlay_witness::preload_session). Shapes mirror
+# crates/ebpf/native/vma_identity.c; flags are bpftool-observed (the
+# kernel does not echo BPF_F_WRONLY, so the C ABI value 16 stays
+# accepted wherever the object sets it).
+IDENTITY_MAP_SHAPES = {
+    'anchors': ('hash', 8, 16, 1024, (0, 16)),
+    'anchor_slots': ('array', 4, 8, 1024, (0, 16)),
+    'anchor_observed': ('array', 4, 8, 1024, (0, 16)),
+    'config': ('array', 4, 40, 1, (0,)),
+    'scope_bitmap': ('array', 4, 8, 65536, (1024,)),
+}
+
+
+def partition_identity_maps(rows, origin):
+    """Split raw bpftool map rows into (capture, identity) rows.
+
+    The five witness identity maps are auxiliary (identity iteration),
+    never capture state; the origin gate keeps them out of acquisition
+    without weakening the exact capture inventory: owned lanes must
+    carry all five (the preload is mandatory there), external lanes
+    must carry none (a witness load mid-capture fails loudly).
+    """
+    require(origin in ('owned', 'external'), f'unknown workload origin {origin!r}')
+    matched, capture = {}, []
+    for row in rows:
+        shape = IDENTITY_MAP_SHAPES.get(row.get('name'))
+        if shape is not None and row['name'] in matched:
+            shape = None
+        if shape is not None:
+            if 'flags' in row and 'map_flags' in row and row['flags'] != row['map_flags']:
+                shape = None
+            elif not (row.get('type') == shape[0] and row.get('bytes_key') == shape[1]
+                      and row.get('bytes_value') == shape[2] and row.get('max_entries') == shape[3]
+                      and row.get('flags', row.get('map_flags')) in shape[4]):
+                shape = None
+        if shape is None:
+            capture.append(row)
+        else:
+            matched[row['name']] = row
+    identity = [matched[name] for name in IDENTITY_MAP_SHAPES if name in matched]
+    if origin == 'owned':
+        require(set(matched) == set(IDENTITY_MAP_SHAPES),
+                'owned lane requires the preloaded identity maps')
+    else:
+        require(not matched, 'unexpected identity maps on an external lane')
+    return capture, identity
 
 
 def validate_inventory(maps, variant, privacy='allowlisted'):

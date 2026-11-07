@@ -226,6 +226,7 @@ fn document(
         engine.pinned().provider_changed(),
         true,
         Default::default(),
+        0,
         None,
         initial_tracking_evidence(
             scope,
@@ -298,6 +299,8 @@ fn scenario(
     let scope = Scope::Pid(pid);
     let args = CaptureArgs {
         track_short_lived: false,
+        verbose: false,
+        quiet: false,
         kind,
         modules: vec![stage.join("provider.so")],
         exclude_modules: vec![],

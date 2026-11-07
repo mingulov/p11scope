@@ -134,7 +134,7 @@ pub(crate) use instance::{
 mod cleanup_worker;
 pub mod identity_iter;
 pub use cleanup_worker::CleanupInterrupted;
-pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink, drive_cleanup};
+pub(crate) use cleanup_worker::{CleanupWorker, DetachOrder, OwnedLink};
 #[cfg(test)]
 mod async_value_flags_tests;
 #[cfg(test)]
@@ -1969,11 +1969,12 @@ impl OwnedProducerDetach {
         // notice to captures which owned no native producers.
         let mut quiet = std::io::sink();
         let output: &mut dyn std::io::Write = if had_work { out } else { &mut quiet };
-        let exit = drive_cleanup(
+        let exit = cleanup_worker::drive_cleanup_with_progress(
             worker,
             second_signal,
             output,
             std::time::Duration::from_secs(1),
+            crate::run::capture_diagnostics_on(),
         );
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
         let complete =
@@ -2001,13 +2002,35 @@ impl OwnedProducerDetach {
     /// with every original lease. Only a joined receipt settles, through
     /// the same `settle_cleanup_exit` + `finish_producer_detach` path as
     /// `drive`. Pending polls print the one-shot estimate and the ~1/s
-    /// progress line through `out`, same text as the blocking `drive`.
+    /// progress line through `out`, same text as the blocking `drive`,
+    /// unless the diagnostics switch gates them.
     fn poll(
         &mut self,
         failures: &mut Vec<String>,
         detached: &mut bool,
         wall_ms: &mut u64,
         out: &mut dyn std::io::Write,
+    ) -> Result<ProducerDetachProgress> {
+        self.poll_with_progress(
+            failures,
+            detached,
+            wall_ms,
+            out,
+            crate::run::capture_diagnostics_on(),
+        )
+    }
+
+    /// [`poll`](Self::poll) with an explicit progress switch, so tests
+    /// pin the verbose and the default path without touching the
+    /// process-global verbosity. Production reads the switch from the
+    /// diagnostics gate.
+    fn poll_with_progress(
+        &mut self,
+        failures: &mut Vec<String>,
+        detached: &mut bool,
+        wall_ms: &mut u64,
+        out: &mut dyn std::io::Write,
+        show_progress: bool,
     ) -> Result<ProducerDetachProgress> {
         let Self::Pending {
             worker,
@@ -2029,7 +2052,7 @@ impl OwnedProducerDetach {
         let started = *started;
         let had_work = *had_work;
         let Some(receipt) = worker.try_join() else {
-            progress.poll_pending(worker, had_work, out);
+            progress.poll_pending(worker, had_work, out, show_progress);
             return Ok(ProducerDetachProgress::Pending);
         };
         *wall_ms = record_detach_wall_ms(*wall_ms, had_work, detach_wall_ms_since(started));
@@ -14013,11 +14036,12 @@ mod tests {
         let mut detached = false;
         let mut wall = 0;
         let error = idle
-            .poll(
+            .poll_with_progress(
                 &mut failures,
                 &mut detached,
                 &mut wall,
                 &mut std::io::sink(),
+                true,
             )
             .expect_err("a poll before begin is refused");
         assert_eq!(format!("{error:#}"), "owned producer detach not begun");
@@ -14072,11 +14096,12 @@ mod tests {
         assert!(source.is_none());
         for _ in 0..3 {
             let progress = job
-                .poll(
+                .poll_with_progress(
                     &mut failures,
                     &mut detached,
                     &mut wall,
                     &mut std::io::sink(),
+                    true,
                 )
                 .unwrap();
             assert!(
@@ -14101,11 +14126,12 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let progress = job
-                .poll(
+                .poll_with_progress(
                     &mut failures,
                     &mut detached,
                     &mut wall,
                     &mut std::io::sink(),
+                    true,
                 )
                 .unwrap();
             if matches!(progress, ProducerDetachProgress::Complete) {
@@ -14121,11 +14147,12 @@ mod tests {
         assert!(matches!(job, OwnedProducerDetach::Complete));
         // Completion is idempotent: a settled poll stays settled.
         let progress = job
-            .poll(
+            .poll_with_progress(
                 &mut failures,
                 &mut detached,
                 &mut wall,
                 &mut std::io::sink(),
+                true,
             )
             .unwrap();
         assert!(matches!(progress, ProducerDetachProgress::Complete));
@@ -14135,11 +14162,12 @@ mod tests {
         let mut job = OwnedProducerDetach::Unproved;
         let mut detached = false;
         assert!(
-            job.poll(
+            job.poll_with_progress(
                 &mut failures,
                 &mut detached,
                 &mut wall,
-                &mut std::io::sink()
+                &mut std::io::sink(),
+                true,
             )
             .is_err(),
             "an unproved poll stays a refusal"
@@ -14197,7 +14225,7 @@ mod tests {
         let mut out = Vec::new();
         // The first pending poll prints only the one-shot estimate.
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14211,7 +14239,7 @@ mod tests {
         // Half a second in: still no progress line.
         *now.lock().unwrap() = std::time::Duration::from_millis(500);
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14226,7 +14254,7 @@ mod tests {
         // stays one-shot.
         *now.lock().unwrap() = std::time::Duration::from_secs(2);
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14244,7 +14272,7 @@ mod tests {
         );
         // Same second: no duplicate progress.
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14263,7 +14291,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let progress = job
-                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
                 .unwrap();
             if matches!(progress, ProducerDetachProgress::Complete) {
                 break;
@@ -14297,7 +14325,7 @@ mod tests {
         let mut out = Vec::new();
         // Below the floor and the cadence: silent.
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14308,7 +14336,7 @@ mod tests {
         // Past one second: progress follows, still no estimate.
         *now.lock().unwrap() = std::time::Duration::from_secs(2);
         let progress = job
-            .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+            .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
             .unwrap();
         assert!(
             matches!(progress, ProducerDetachProgress::Pending),
@@ -14328,7 +14356,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
             let progress = job
-                .poll(&mut failures, &mut detached, &mut wall_ms, &mut out)
+                .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, true)
                 .unwrap();
             if matches!(progress, ProducerDetachProgress::Complete) {
                 break;
@@ -14344,6 +14372,56 @@ mod tests {
         assert!(
             !text.contains("probe links one at a time"),
             "no estimate below the 2 s floor: {text:?}"
+        );
+    }
+
+    /// CLI text: default stderr keeps the final completed line only, so a
+    /// pending detach poll without the diagnostics switch stays silent
+    /// even past the estimate floor and the progress cadence.
+    #[test]
+    fn owned_detach_poll_stays_silent_without_progress_switch() {
+        let (mut job, now, release) = gated_detach_job(40);
+        let mut failures = Vec::new();
+        let mut detached = false;
+        let mut wall_ms = 0;
+        let mut out = Vec::new();
+        for now_ms in [0, 500, 2_000] {
+            *now.lock().unwrap() = std::time::Duration::from_millis(now_ms);
+            let progress = job
+                .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, false)
+                .unwrap();
+            assert!(
+                matches!(progress, ProducerDetachProgress::Pending),
+                "a gated close stays pending at {now_ms} ms"
+            );
+        }
+        let text = String::from_utf8(out.clone()).expect("progress lines are UTF-8");
+        assert!(
+            text.is_empty(),
+            "no estimate or progress without the switch: {text:?}"
+        );
+        for _ in 0..40 {
+            release.send(()).unwrap();
+        }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let progress = job
+                .poll_with_progress(&mut failures, &mut detached, &mut wall_ms, &mut out, false)
+                .unwrap();
+            if matches!(progress, ProducerDetachProgress::Complete) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released close must settle"
+            );
+            std::thread::yield_now();
+        }
+        assert!(matches!(job, OwnedProducerDetach::Complete));
+        let text = String::from_utf8(out).expect("progress lines are UTF-8");
+        assert!(
+            text.is_empty(),
+            "settling a polled detach prints nothing by default: {text:?}"
         );
     }
 
@@ -21164,6 +21242,7 @@ mod tests {
                 mount_namespace: view.mount_namespace(),
                 key,
                 path: self.provider.display().to_string(),
+                tables_scan_finished: false,
                 decoder_abi: None,
                 exports: vec![],
                 tables: vec![],

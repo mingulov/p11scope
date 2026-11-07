@@ -13,7 +13,8 @@ use crate::discovery::scan::{
 };
 use crate::inspect_identity::{
     InspectApplicationResult, InspectIdentityUnknown, InspectImageReader, ProcessViewImageReader,
-    application_detail, application_json, application_label, begin_application, finish_application,
+    application_detail, application_executable, application_json, application_label,
+    begin_application, finish_application,
 };
 use crate::process::{ProcessView, ProcessViewId};
 use anyhow::Result;
@@ -54,7 +55,21 @@ const INITIAL_MAPS_REFUSAL: &str = "memory scan refused: initial mapping validat
 
 /// Renders a completed scan. Pure: takes the scan result and the pinned identities,
 /// returns the text — so the layout is unit-testable without a target process.
+/// Renders at the run-scoped verbosity; see [`render_text_with_verbosity`].
 pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> String {
+    render_text_with_verbosity(pid, outcome, pinned, crate::cli::text_verbosity())
+}
+
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle. Concise keeps the header, one line per provider, folded
+/// skips, coverage and the `-v` hint; verbose is the full per-table
+/// listing; quiet keeps the header and coverage only.
+pub fn render_text_with_verbosity(
+    pid: u32,
+    outcome: &ScanOutcome,
+    pinned: &PinnedObjects,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
     render_text_with_application(
         pid,
         outcome,
@@ -62,6 +77,7 @@ pub fn render_text(pid: u32, outcome: &ScanOutcome, pinned: &PinnedObjects) -> S
         &InspectApplicationResult::Unknown(InspectIdentityUnknown::NotExamined),
         &[],
         &[],
+        verbosity,
     )
 }
 
@@ -72,63 +88,106 @@ fn render_text_with_application(
     application: &InspectApplicationResult,
     excluded: &[crate::render::ExcludedOut],
     unmatched: &[String],
+    verbosity: crate::cli::TextVerbosity,
 ) -> String {
+    use crate::cli::TextVerbosity;
+    let verbose = verbosity == TextVerbosity::Verbose;
+    let quiet = verbosity == TextVerbosity::Quiet;
     let modules = outcome.modules();
     let word = if modules.len() == 1 {
-        "module"
+        "provider file"
     } else {
-        "modules"
+        "provider files"
     };
     let mut out = String::new();
     let _ = writeln!(out, "{}", application_label(application, pid));
-    if let Some(detail) = application_detail(application) {
+    // Verbose keeps the full image identity; concise names the executable
+    // only; quiet keeps the header label alone.
+    if verbose && let Some(detail) = application_detail(application) {
         out.push_str(&detail);
+    } else if !quiet && let Some(exe) = application_executable(application) {
+        out.push_str(&exe);
     }
-    let _ = write!(out, "pid {pid} — {} PKCS#11 {word} mapped", modules.len());
+    let _ = write!(out, "pid {pid} — {} {word} mapped", modules.len());
     match outcome {
         ScanOutcome::Scanned { scan_ms, .. } => {
-            let _ = writeln!(out, " (scan {scan_ms}ms)");
+            if verbose {
+                let _ = writeln!(out, " (scan {scan_ms}ms)");
+            } else {
+                out.push('\n');
+            }
         }
         ScanOutcome::Unavailable { reason, .. } => {
             out.push('\n');
-            if *reason == "ptrace" {
-                let _ = writeln!(
-                    out,
-                    "table scan unavailable: /proc/{pid}/mem is not readable (ptrace)."
-                );
-                let _ = writeln!(
-                    out,
-                    "  Same-uid targets need kernel.yama.ptrace_scope=0 or the target to be a \
-                     descendant;"
-                );
-                let _ = writeln!(
-                    out,
-                    "  otherwise CAP_SYS_PTRACE. Modules below come from /proc/{pid}/maps and \
-                     .dynsym only."
-                );
-            } else {
-                let _ = writeln!(
-                    out,
-                    "table scan unavailable: {reason}. Modules below come from /proc/{pid}/maps \
-                     and .dynsym only."
-                );
+            // Concise states the cause once, in the coverage line below;
+            // the full paragraph stays verbose-only.
+            if verbose {
+                if *reason == "ptrace" {
+                    let _ = writeln!(
+                        out,
+                        "table scan unavailable: /proc/{pid}/mem is not readable (ptrace)."
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  Same-uid targets need kernel.yama.ptrace_scope=0 or the target to be a \
+                         descendant;"
+                    );
+                    let _ = writeln!(
+                        out,
+                        "  otherwise CAP_SYS_PTRACE. Provider files below come from /proc/{pid}/maps and \
+                         .dynsym only."
+                    );
+                } else {
+                    let _ = writeln!(
+                        out,
+                        "table scan unavailable: {reason}. Provider files below come from /proc/{pid}/maps \
+                         and .dynsym only."
+                    );
+                }
             }
         }
     }
-    out.push_str("Mapped modules only; activity was not captured by inspect.\n\n");
+    out.push_str("Mapped provider files only; activity was not captured by inspect.\n\n");
 
-    for module in modules {
-        render_module(&mut out, module, pinned);
-        out.push('\n');
+    if verbose {
+        for module in modules {
+            render_module(&mut out, module, pinned);
+            out.push('\n');
+        }
+    } else if !quiet {
+        for module in modules {
+            render_module_summary(&mut out, module);
+        }
+        if !modules.is_empty() {
+            out.push('\n');
+        }
     }
 
-    for skipped in outcome.skipped() {
-        let _ = writeln!(
-            out,
-            "skipped: {} — {}",
-            crate::render::escape_controls(&skipped.subject),
-            crate::render::escape_controls(&skipped.reason)
-        );
+    if verbose {
+        for skipped in outcome.skipped() {
+            let _ = writeln!(
+                out,
+                "skipped: {} — {}",
+                crate::render::escape_controls(&skipped.subject),
+                crate::render::escape_controls(&skipped.reason)
+            );
+        }
+    } else if !quiet {
+        // When the scan itself was refused, its mem skip duplicates the
+        // coverage line; concise states the cause once.
+        let skips: Vec<Skipped> = match outcome {
+            ScanOutcome::Unavailable { .. } => {
+                let mem = format!("/proc/{pid}/mem");
+                outcome
+                    .skipped()
+                    .iter()
+                    .filter(|skip| skip.subject != mem)
+                    .cloned()
+                    .collect()
+            }
+            _ => outcome.skipped().to_vec(),
+        };
+        render_folded_skips(&mut out, &skips);
     }
     if !excluded.is_empty() {
         let _ = writeln!(out, "Excluded by you ({} files):", excluded.len());
@@ -159,7 +218,143 @@ fn render_text_with_application(
                 .join(", ")
         );
     }
+    render_coverage(&mut out, outcome);
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);
+    }
     out
+}
+
+/// One concise line per provider: path plus the walked-function total.
+/// `entries` already excludes NULL slots (`null_entries` are separate
+/// evidence, never entries — see `ScannedTable`), so both verbosities
+/// count `entries.len()`; verbose annotates the NULLs beside the same
+/// total.
+fn render_module_summary(out: &mut String, module: &ScannedModule) {
+    let functions: usize = module.tables.iter().map(|table| table.entries.len()).sum();
+    let tables = module.tables.len();
+    // No walked tables means the module was listed from maps only, never
+    // deep-scanned: say so instead of "0 functions", which reads as
+    // "has no functions".
+    if tables == 0 {
+        let _ = writeln!(
+            out,
+            "module  {} — contents unknown (not deep-scanned)",
+            crate::render::escape_controls(&module.path),
+        );
+        return;
+    }
+    let _ = writeln!(
+        out,
+        "module  {} — {functions} function{} ({} table{})",
+        crate::render::escape_controls(&module.path),
+        if functions == 1 { "" } else { "s" },
+        tables,
+        if tables == 1 { "" } else { "s" },
+    );
+}
+
+/// Concise skips: a lone skip verbatim, repeated reasons folded with a
+/// count; `--json` lists each.
+fn render_folded_skips(out: &mut String, skipped: &[Skipped]) {
+    if skipped.len() == 1 {
+        let _ = writeln!(
+            out,
+            "skipped: {} — {}",
+            crate::render::escape_controls(&skipped[0].subject),
+            crate::render::escape_controls(&skipped[0].reason)
+        );
+        return;
+    }
+    let mut groups: Vec<(&str, usize)> = Vec::new();
+    for skip in skipped {
+        match groups.iter_mut().find(|(reason, _)| *reason == skip.reason) {
+            Some((_, count)) => *count += 1,
+            None => groups.push((skip.reason.as_str(), 1)),
+        }
+    }
+    for (reason, count) in groups {
+        let _ = writeln!(
+            out,
+            "skipped: {count} item{} could not be read — {} (--json lists each)",
+            if count == 1 { "" } else { "s" },
+            crate::render::escape_controls(reason)
+        );
+    }
+}
+
+/// One coverage status line: complete only when the scan finished,
+/// nothing was skipped, and every table was fully walked. A
+/// `known_prefix` walk covered the known legacy functions and says
+/// nothing about newer ones, so it downgrades to partial even with no
+/// skips.
+fn render_coverage(out: &mut String, outcome: &ScanOutcome) {
+    match outcome {
+        ScanOutcome::Unavailable { reason, .. } => {
+            // Concise states the refused-scan cause once, here: the
+            // paragraph and mem skip above stay verbose-only.
+            if *reason == "ptrace" {
+                let _ = writeln!(
+                    out,
+                    "coverage: partial — cannot read process memory without root (sudo); \
+                     providers listed from its memory map only"
+                );
+            } else {
+                let _ = writeln!(
+                    out,
+                    "coverage: partial — target memory unreadable ({}); providers listed \
+                     from its memory map only",
+                    crate::render::escape_controls(reason)
+                );
+            }
+        }
+        ScanOutcome::Scanned {
+            modules, skipped, ..
+        } => {
+            let partial_tables = modules
+                .iter()
+                .flat_map(|module| &module.tables)
+                .filter(|table| table.walk != "full")
+                .count();
+            if skipped.is_empty() && partial_tables == 0 {
+                let _ = writeln!(out, "coverage: complete");
+                return;
+            }
+            let mut parts = Vec::new();
+            if !skipped.is_empty() {
+                parts.push(format!(
+                    "{} item{} skipped",
+                    skipped.len(),
+                    if skipped.len() == 1 { "" } else { "s" },
+                ));
+            }
+            if partial_tables > 0 {
+                parts.push(format!(
+                    "{} table{} only partly walked",
+                    partial_tables,
+                    if partial_tables == 1 { "" } else { "s" },
+                ));
+            }
+            let _ = writeln!(
+                out,
+                "coverage: partial — {} (--json lists each)",
+                parts.join(", "),
+            );
+        }
+    }
+}
+
+/// The table-walk outcome in words, not codes: a full walk covered
+/// every slot, a known-prefix walk covered the known legacy functions
+/// and says nothing about newer ones (JSON keeps `walk` and
+/// `version`). Shared by pid and system inspect.
+pub(crate) fn table_walk_words(walk: &str, count: usize) -> String {
+    let noun = if count == 1 { "function" } else { "functions" };
+    if walk == "full" {
+        format!("{count} {noun} (fully walked)")
+    } else {
+        format!("{count} known {noun} (newer functions unknown)")
+    }
 }
 
 fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObjects) {
@@ -182,15 +377,15 @@ fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObject
 
     let table_lines = module.tables.iter().map(|table| {
         let count = table.entries.len();
-        let entry_word = if count == 1 { "entry" } else { "entries" };
         let nulls = if table.null_entries.is_empty() {
             String::new()
         } else {
             format!("  (NULL: {})", table.null_entries.join(", "))
         };
+        let coverage = table_walk_words(table.walk, count);
         format!(
-            "  table      {}.{}  {}  {count} {entry_word}{nulls}",
-            table.version.0, table.version.1, table.walk
+            "  table      {}.{}, {coverage}{nulls}",
+            table.version.0, table.version.1
         )
     });
     push_collapsed_lines(out, table_lines);
@@ -487,7 +682,17 @@ fn run_with_view(
     out: &mut dyn std::io::Write,
     view: Result<ProcessView, String>,
 ) -> Result<i32> {
-    let view = view.map_err(|reason| unreadable_target_error(pid, &reason))?;
+    let view = match view {
+        Ok(view) => view,
+        Err(reason) => {
+            // A pid with no live process fails with the one operator line;
+            // anything else keeps the cause-naming hard error below.
+            if crate::process::generation_gone(pid) {
+                return Err(crate::process::MissingNamedProcess { pid }.into());
+            }
+            return Err(unreadable_target_error(pid, &reason));
+        }
+    };
     let mut budget = CaptureWorkBudget::default();
     budget.set_excludes(excludes.to_vec());
     let mut context = (ProcessViewImageReader::new(&view), budget);
@@ -588,7 +793,15 @@ fn emit_application_diagnosis(
         write!(
             out,
             "{}",
-            render_text_with_application(pid, &outcome, &pinned, &application, excluded, unmatched)
+            render_text_with_application(
+                pid,
+                &outcome,
+                &pinned,
+                &application,
+                excluded,
+                unmatched,
+                crate::cli::text_verbosity(),
+            )
         )?;
     }
     Ok(0)
@@ -641,7 +854,9 @@ fn failure_json(pid: u32, reason: &str) -> serde_json::Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::scan::{ScannedEntry, ScannedInterface, ScannedModule, ScannedTable};
+    use crate::discovery::scan::{
+        ScannedEntry, ScannedInterface, ScannedModule, ScannedTable, Skipped,
+    };
     use p11scope_manifest::maps::{Device, ObjectKey};
 
     fn key(inode: u64) -> ObjectKey {
@@ -682,7 +897,7 @@ mod tests {
     /// nothing about its modules. That is the documented hard error — one
     /// stderr line naming the cause (and a permission fix when applicable),
     /// empty stdout, exit 1 — never
-    /// "0 PKCS#11 modules mapped" with `scan.status: scanned` and exit 0.
+    /// "0 provider files mapped" with `scan.status: scanned` and exit 0.
     #[test]
     fn unreadable_target_mappings_are_a_hard_error_not_zero_modules() {
         for (reason, permission_guidance) in [
@@ -732,10 +947,14 @@ mod tests {
     #[test]
     fn unreadable_process_namespace_is_a_hard_error_with_guidance() {
         let reason = "cannot identify process mount namespace: Permission denied (os error 13)";
+        // A live pid: the seam simulates a namespace failure after the view
+        // opened, while a pid with no live process takes the missing line.
+        let pid = std::process::id();
+        let sudo = format!("sudo p11scope inspect --pid {pid}");
         for json in [false, true] {
             let mut stdout = Vec::new();
             let error = run_with_view(
-                1379,
+                pid,
                 &[],
                 &[],
                 &HookRegistry::builtin(),
@@ -747,10 +966,7 @@ mod tests {
             .to_string();
             assert!(stdout.is_empty(), "json={json}: {stdout:?}");
             assert!(error.contains(reason), "{error}");
-            assert!(
-                error.contains("sudo p11scope inspect --pid 1379"),
-                "{error}"
-            );
+            assert!(error.contains(&sudo), "{error}");
             assert!(error.contains("unknown, not absent"), "{error}");
             assert!(
                 !error.contains("/maps"),
@@ -933,6 +1149,7 @@ mod tests {
                 },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into(), "C_GetInterfaceList".into()],
                 tables: vec![ScannedTable {
@@ -983,6 +1200,7 @@ mod tests {
             &application,
             &excluded,
             &unmatched,
+            crate::cli::TextVerbosity::Verbose,
         );
         assert!(out.contains("Excluded by you (1 files):"), "{out}");
         assert!(
@@ -1007,14 +1225,16 @@ mod tests {
 
     #[test]
     fn text_names_the_module_version_counts_and_null_entries() {
-        let out = render_text(4242, &sample(), &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(out.contains("pid 4242"), "{out}");
         assert!(out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
         assert!(out.contains("2.40"), "{out}");
-        assert!(
-            out.contains("1 entry") || out.contains("1 entries"),
-            "{out}"
-        );
+        assert!(out.contains("1 function (fully walked)"), "{out}");
         assert!(
             out.contains("C_GetFunctionStatus"),
             "NULL slots are evidence: {out}"
@@ -1045,7 +1265,12 @@ mod tests {
         ];
         modules[0].interfaces.clear();
 
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         let lines: Vec<&str> = out
             .lines()
             .filter(|line| line.trim_start().starts_with("table "))
@@ -1053,9 +1278,9 @@ mod tests {
         assert_eq!(
             lines,
             [
-                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)  (×3 identical)",
-                "  table      3.2  full  1 entry  (NULL: C_GetFunctionStatus)",
-                "  table      2.40  full  1 entry  (NULL: C_GetFunctionStatus)",
+                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)  (×3 identical)",
+                "  table      3.2, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
+                "  table      2.40, 1 function (fully walked)  (NULL: C_GetFunctionStatus)",
             ],
             "{out}"
         );
@@ -1069,7 +1294,12 @@ mod tests {
         };
         modules[0].interfaces[0].name_lossy = Some("quote\"\\\n\r\t\u{1b}".into());
 
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(out.contains(r#""quote\"\\\n\r\t\u{1b}""#), "{out:?}");
         assert!(
             !out.contains("quote\"\\\n"),
@@ -1120,6 +1350,7 @@ mod tests {
                 },
                 key: key(11),
                 path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![],
@@ -1127,15 +1358,39 @@ mod tests {
             }],
             skipped: vec![],
         };
-        let out = render_text(4242, &outcome, &PinnedObjects::empty());
-        assert!(
-            out.contains("libsofthsm2.so"),
-            "modules are known without mem: {out}"
+        // Concise states the refused-scan cause once, in coverage; the
+        // full paragraph stays verbose-only.
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
         );
-        assert!(out.contains("ptrace"), "the reason must be named: {out}");
         assert!(
-            out.contains("CAP_SYS_PTRACE") || out.contains("ptrace_scope"),
-            "say what would fix it: {out}"
+            concise.contains("libsofthsm2.so"),
+            "modules are known without mem: {concise}"
+        );
+        assert!(
+            concise.contains("cannot read process memory without root (sudo)"),
+            "concise names the cause once: {concise}"
+        );
+        assert!(
+            !concise.contains("table scan unavailable"),
+            "concise keeps no paragraph: {concise}"
+        );
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.contains("ptrace"),
+            "the reason must be named: {verbose}"
+        );
+        assert!(
+            verbose.contains("CAP_SYS_PTRACE") || verbose.contains("ptrace_scope"),
+            "say what would fix it: {verbose}"
         );
     }
 
@@ -1495,6 +1750,294 @@ mod tests {
                     .path
                     .unwrap()
             );
+        }
+    }
+
+    /// CLI-1: concise pid-inspect keeps the header, one line per
+    /// provider, folded skips, a coverage line and the `-v` hint.
+    #[test]
+    fn concise_pid_inspect_keeps_providers_coverage_and_hint() {
+        let ScanOutcome::Scanned {
+            modules, scan_ms, ..
+        } = sample()
+        else {
+            panic!("sample is a completed scan");
+        };
+        let outcome = ScanOutcome::Scanned {
+            modules,
+            skipped: vec![
+                Skipped {
+                    subject: "object A".into(),
+                    reason: "gone".into(),
+                },
+                Skipped {
+                    subject: "object B".into(),
+                    reason: "gone".into(),
+                },
+            ],
+            scan_ms,
+        };
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(out.contains("1 provider file mapped"), "{out}");
+        assert!(out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
+        assert!(out.contains("coverage: partial"), "{out}");
+        assert!(!out.contains("identity   sha256"), "{out}");
+        assert!(!out.contains("interface  ["), "{out}");
+        assert!(!out.contains("skipped: object A"), "{out}");
+        assert!(
+            out.contains("skipped: 2 items could not be read — gone (--json lists each)"),
+            "{out}"
+        );
+        assert!(out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: pid-inspect skip groups use the singular for a count of
+    /// one (two skips, two reasons, two "1 item" lines).
+    #[test]
+    fn concise_pid_inspect_skip_groups_use_singular_for_one() {
+        let ScanOutcome::Scanned {
+            modules, scan_ms, ..
+        } = sample()
+        else {
+            panic!("sample is a completed scan");
+        };
+        let outcome = ScanOutcome::Scanned {
+            modules,
+            skipped: vec![
+                Skipped {
+                    subject: "object A".into(),
+                    reason: "gone".into(),
+                },
+                Skipped {
+                    subject: "object B".into(),
+                    reason: "moved".into(),
+                },
+            ],
+            scan_ms,
+        };
+        let out = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            out.contains("skipped: 1 item could not be read — gone (--json lists each)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("skipped: 1 item could not be read — moved (--json lists each)"),
+            "{out}"
+        );
+        assert!(!out.contains("1 items"), "{out}");
+    }
+
+    /// CLI-1: verbose pid-inspect keeps the full per-table listing.
+    #[test]
+    fn verbose_pid_inspect_keeps_full_per_table_detail() {
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(out.contains("identity   sha256"), "{out}");
+        assert!(out.contains("table      2.40"), "{out}");
+        assert!(out.contains("interface  ["), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// CLI-1: quiet pid-inspect is the header and coverage only.
+    #[test]
+    fn quiet_pid_inspect_keeps_header_and_coverage_only() {
+        let out = render_text_with_verbosity(
+            4242,
+            &sample(),
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Quiet,
+        );
+        assert!(out.contains("1 provider file mapped"), "{out}");
+        assert!(out.contains("coverage: complete"), "{out}");
+        assert!(!out.contains("/usr/lib/softhsm/libsofthsm2.so"), "{out}");
+        assert!(!out.contains(crate::cli::VERBOSE_HINT), "{out}");
+    }
+
+    /// F6: concise and verbose agree on function counts (NULL slots are
+    /// evidence, not functions, and `entries` already excludes them —
+    /// see `ScannedTable` docs). Both report 1 function for the sample
+    /// (1 entry + 1 NULL), with the NULL still annotated in verbose.
+    #[test]
+    fn pid_inspect_concise_and_verbose_agree_on_function_counts() {
+        let outcome = sample();
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            concise.contains("1 function (1 table)"),
+            "concise undercounts NULLs twice: {concise}"
+        );
+        assert!(!concise.contains("0 functions"), "{concise}");
+        assert!(verbose.contains("1 function (fully walked)"), "{verbose}");
+        assert!(
+            verbose.contains("(NULL: C_GetFunctionStatus)"),
+            "NULL annotation kept: {verbose}"
+        );
+    }
+
+    /// Item 30: concise shows the executable path but not the image
+    /// identity line; quiet shows neither; verbose shows both.
+    #[test]
+    fn concise_and_quiet_hide_image_identity_line() {
+        let application = InspectApplicationResult::Observed(
+            crate::inspect_identity::validated_for_test("/bin/tool", 47, 9134),
+        );
+        for (verbosity, want_exe, want_image) in [
+            (crate::cli::TextVerbosity::Concise, true, false),
+            (crate::cli::TextVerbosity::Quiet, false, false),
+            (crate::cli::TextVerbosity::Verbose, true, true),
+        ] {
+            let out = render_text_with_application(
+                4242,
+                &sample(),
+                &PinnedObjects::empty(),
+                &application,
+                &[],
+                &[],
+                verbosity,
+            );
+            assert_eq!(
+                out.contains("executable  /bin/tool"),
+                want_exe,
+                "{verbosity:?}: {out}"
+            );
+            assert_eq!(
+                out.contains("image       dev"),
+                want_image,
+                "{verbosity:?}: {out}"
+            );
+            assert_eq!(
+                out.contains("start-time"),
+                want_image,
+                "{verbosity:?}: {out}"
+            );
+        }
+    }
+
+    /// Item 30: concise states an unreadable-memory cause once, in the
+    /// coverage line; verbose keeps the paragraph, the mem skip and
+    /// coverage.
+    #[test]
+    fn concise_unavailable_states_cause_once_in_coverage() {
+        let outcome = ScanOutcome::Unavailable {
+            reason: "ptrace",
+            modules: vec![],
+            skipped: vec![Skipped {
+                subject: "/proc/4242/mem".into(),
+                reason: "Permission denied (os error 13)".into(),
+            }],
+        };
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            concise.contains(
+                "coverage: partial — cannot read process memory without root (sudo); \
+                 providers listed from its memory map only"
+            ),
+            "{concise}"
+        );
+        assert!(!concise.contains("table scan unavailable"), "{concise}");
+        assert!(!concise.contains("skipped: /proc/4242/mem"), "{concise}");
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(verbose.contains("table scan unavailable"), "{verbose}");
+        assert!(verbose.contains("skipped: /proc/4242/mem"), "{verbose}");
+        assert!(verbose.contains("coverage: partial"), "{verbose}");
+    }
+
+    /// Item 30: a module with no walked tables reads as unscanned, not as
+    /// having no functions.
+    #[test]
+    fn concise_module_without_tables_reads_unscanned() {
+        let outcome = ScanOutcome::Unavailable {
+            reason: "ptrace",
+            modules: vec![ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                view: crate::process::ProcessViewId(0),
+                mount_namespace: crate::process::MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key: key(11),
+                path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+                tables_scan_finished: false,
+                decoder_abi: None,
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![],
+                interfaces: vec![],
+            }],
+            skipped: vec![],
+        };
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(!concise.contains("0 functions (0 tables)"), "{concise}");
+        assert!(concise.contains("not deep-scanned"), "{concise}");
+    }
+
+    /// F6: a `known_prefix` walk (newer functions unknown) downgrades
+    /// coverage to partial, even with no skips.
+    #[test]
+    fn pid_inspect_partial_walk_downgrades_coverage_to_partial() {
+        let mut outcome = sample();
+        let ScanOutcome::Scanned { modules, .. } = &mut outcome else {
+            panic!("sample is a completed scan");
+        };
+        modules[0].tables[0].walk = "known_prefix";
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let out =
+                render_text_with_verbosity(4242, &outcome, &PinnedObjects::empty(), verbosity);
+            assert!(
+                out.contains("coverage: partial"),
+                "{verbosity:?} hides a partial walk: {out}"
+            );
+            assert!(
+                out.contains("only partly walked"),
+                "{verbosity:?} names no walk reason: {out}"
+            );
+            assert!(!out.contains("coverage: complete"), "{verbosity:?}: {out}");
         }
     }
 }

@@ -104,7 +104,12 @@ sys.stdout.write(answer.stdout)
                 self.assertEqual(job["name"], identifier)
                 self.assertEqual(job["uses"], "./.github/workflows/" + target + ".yml")
                 self.assertEqual(job["with"], supplied)
-                self.assertEqual(job["permissions"], {"contents": "read", "actions": "read"})
+                # The packages call passes attestation writes through to the
+                # called attest job only; every other delivery stays read-only.
+                expected = {"contents": "read", "actions": "read"}
+                if task == "packages":
+                    expected = {**expected, "id-token": "write", "attestations": "write"}
+                self.assertEqual(job["permissions"], expected)
                 self.assertFalse({"needs", "steps", "runs-on", "secrets"} & job.keys())
 
     def test_reusable_inputs_use_supported_types_and_preserve_direct_dispatch(self):

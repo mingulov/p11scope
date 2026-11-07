@@ -58,6 +58,13 @@ impl MultiHostRefusal {
         Self::at(stage, errno)
     }
 
+    /// Whether sudo can help this refusal: only a `Denied` cause
+    /// (permission/policy) is privilege-shaped. An old kernel or a
+    /// verifier-shaped refusal must never carry sudo advice.
+    pub(crate) fn needs_privilege_hint(&self) -> bool {
+        self.cause == MultiHostCause::Denied
+    }
+
     /// Whether the probe shape proves the kernel itself lacks Multi: the
     /// scratch self-link refusal observed on 6.1, an explicit unsupported
     /// answer at load or link time, or a load refusal for the unknown
@@ -78,44 +85,61 @@ impl MultiHostRefusal {
     }
 }
 
+/// The errno's short name ("Operation not permitted") for one-line
+/// operator text: [`io::Error`]'s own rendering carries a redundant
+/// " (os error N)" suffix, which is dropped when it is there.
+fn errno_name(errno: i32) -> String {
+    let full = io::Error::from_raw_os_error(errno).to_string();
+    full.strip_suffix(&format!(" (os error {errno})"))
+        .unwrap_or(&full)
+        .to_string()
+}
+
 impl std::fmt::Display for MultiHostRefusal {
     fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let stage = match self.stage {
-            MultiHostStage::Anchor => "self-probe anchor",
-            MultiHostStage::ProgramLoad => "scratch program load",
-            MultiHostStage::SelfLink => "scratch self-link",
+        // One plain line, no internal codes: the default text an operator
+        // reads when live capture cannot start.
+        let operation = match self.stage {
+            MultiHostStage::Anchor => "prepare p11scope's self-probe",
+            MultiHostStage::ProgramLoad => "load p11scope's BPF programs",
+            MultiHostStage::SelfLink => "attach p11scope's probes",
         };
-        let cause = match self.cause {
-            MultiHostCause::Unavailable => "Multi capability unavailable",
-            MultiHostCause::Denied => "Multi probe denied by permission or policy",
-            MultiHostCause::Unproven => "Multi capability unproven",
+        let doing = match self.stage {
+            MultiHostStage::Anchor => "preparing p11scope's self-probe",
+            MultiHostStage::ProgramLoad => "loading p11scope's BPF programs",
+            MultiHostStage::SelfLink => "attaching p11scope's probes",
         };
-        write!(out, "uprobe-multi-required: {cause} at {stage}")?;
-        if let Some(errno) = self.errno {
-            write!(
-                out,
-                " (errno {errno}: {})",
-                io::Error::from_raw_os_error(errno)
-            )?;
+        let reason = self.errno.map(errno_name).unwrap_or_default();
+        let reason = if reason.is_empty() {
+            String::new()
+        } else {
+            format!(" ({reason})")
+        };
+        match self.cause {
+            MultiHostCause::Denied => {
+                write!(
+                    out,
+                    "live capture needs root: the kernel refused to {operation}{reason}. \
+                     Run with sudo, or use 'p11scope inspect --pid N' for a scan without capture."
+                )
+            }
+            MultiHostCause::Unavailable => {
+                write!(
+                    out,
+                    "live capture unavailable: {doing} is not supported on this host{reason}; \
+                     run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' \
+                     for a scan without capture."
+                )
+            }
+            MultiHostCause::Unproven => {
+                write!(
+                    out,
+                    "live capture did not start: {doing} failed{reason}; run 'p11scope doctor' \
+                     for host readiness, or use 'p11scope inspect --pid N' for a scan \
+                     without capture."
+                )
+            }
         }
-        if self.cause == MultiHostCause::Denied {
-            let operation = match self.stage {
-                MultiHostStage::Anchor => "prepare p11scope's self-probe anchor",
-                MultiHostStage::ProgramLoad => "load p11scope's BPF programs",
-                MultiHostStage::SelfLink => "attach p11scope's required Multi probe",
-            };
-            write!(
-                out,
-                "; cannot {operation}; live capture requires root or appropriate capabilities \
-                 and a permitting host policy (for example, sudo)"
-            )?;
-        }
-        write!(
-            out,
-            "; run `p11scope doctor` for host readiness or \
-             `p11scope doctor --pid <n>` for target readiness; \
-             `p11scope inspect --pid <n>` lists readable mapped providers without live capture"
-        )
     }
 }
 
@@ -264,8 +288,16 @@ mod tests {
                 (stage, Some(errno), cause)
             );
             let text = error.to_string();
-            assert!(text.starts_with("uprobe-multi-required:"));
+            assert!(
+                text.starts_with("live capture needs root: ")
+                    || text.starts_with("live capture unavailable: ")
+                    || text.starts_with("live capture did not start: "),
+                "{text}"
+            );
+            assert!(!text.contains("uprobe-multi-required"), "{text}");
             assert!(!text.contains("upgrade") && !text.contains("6.6") && !text.contains("/"));
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.len() < 1_024, "{text}");
         }
         let error = probe_with(
             || Err::<(), _>(anyhow::anyhow!("anchor unavailable")),
@@ -306,36 +338,40 @@ mod tests {
     }
 
     #[test]
-    fn denied_guidance_names_the_failed_stage_and_offline_next_steps() {
-        for (stage, errno) in [
-            (MultiHostStage::ProgramLoad, libc::EPERM),
-            (MultiHostStage::SelfLink, libc::EPERM),
-            (MultiHostStage::SelfLink, libc::EACCES),
+    fn denied_refusal_is_one_plain_line_naming_root_and_the_scan_fallback() {
+        // The first-run no-root refusal, byte for byte.
+        assert_eq!(
+            MultiHostRefusal::at(MultiHostStage::ProgramLoad, Some(libc::EPERM)).to_string(),
+            "live capture needs root: the kernel refused to load p11scope's BPF programs \
+             (Operation not permitted). Run with sudo, or use 'p11scope inspect --pid N' \
+             for a scan without capture."
+        );
+        for (stage, errno, operation) in [
+            (
+                MultiHostStage::ProgramLoad,
+                libc::EPERM,
+                "load p11scope's BPF programs",
+            ),
+            (
+                MultiHostStage::SelfLink,
+                libc::EPERM,
+                "attach p11scope's probes",
+            ),
+            (
+                MultiHostStage::SelfLink,
+                libc::EACCES,
+                "attach p11scope's probes",
+            ),
         ] {
             let refusal = MultiHostRefusal::at(stage, Some(errno));
             assert_eq!(refusal.cause, MultiHostCause::Denied);
             let text = refusal.to_string();
-            assert!(text.starts_with("uprobe-multi-required: "), "{text}");
-            assert!(text.contains("requires root"), "{text}");
-            assert!(text.contains("appropriate capabilities"), "{text}");
-            assert!(text.contains("policy") && text.contains("sudo"), "{text}");
-            assert!(
-                text.contains("`p11scope doctor` for host readiness"),
-                "{text}"
-            );
-            assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
-            assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
-            assert!(text.contains("without live capture"), "{text}");
-            assert_eq!(
-                text.contains("cannot load p11scope's BPF programs"),
-                stage == MultiHostStage::ProgramLoad,
-                "{text}"
-            );
-            assert_eq!(
-                text.contains("cannot attach p11scope's required Multi probe"),
-                stage == MultiHostStage::SelfLink,
-                "{text}"
-            );
+            assert!(text.starts_with("live capture needs root: "), "{text}");
+            assert!(text.contains(operation), "{text}");
+            assert!(text.contains("Run with sudo"), "{text}");
+            assert!(text.contains("p11scope inspect --pid N"), "{text}");
+            assert!(text.contains("for a scan without capture"), "{text}");
+            assert!(!text.contains("uprobe-multi-required"), "{text}");
             assert!(!text.contains("--allow-uretprobe-on-confined-target"));
             assert!(!text.contains("seccomp") && !text.contains("trampoline"));
             assert_eq!(text.lines().count(), 1);
@@ -359,17 +395,22 @@ mod tests {
             let refusal = MultiHostRefusal::at(stage, errno);
             assert_ne!(refusal.cause, MultiHostCause::Denied);
             let text = refusal.to_string();
-            assert!(text.starts_with("uprobe-multi-required: "), "{text}");
             assert!(
-                text.contains("`p11scope doctor` for host readiness"),
+                text.starts_with("live capture unavailable: ")
+                    || text.starts_with("live capture did not start: "),
                 "{text}"
             );
-            assert!(text.contains("p11scope doctor --pid <n>"), "{text}");
-            assert!(text.contains("p11scope inspect --pid <n>"), "{text}");
-            assert!(text.contains("without live capture"), "{text}");
+            assert!(
+                text.contains("'p11scope doctor' for host readiness"),
+                "{text}"
+            );
+            assert!(text.contains("p11scope inspect --pid N"), "{text}");
+            assert!(text.contains("for a scan without capture"), "{text}");
             for unsupported_claim in [
+                "needs root",
                 "requires root",
                 "sudo",
+                "uprobe-multi-required",
                 "cannot load p11scope's BPF programs",
                 "upgrade",
                 "6.6",

@@ -480,6 +480,10 @@ struct ScriptedLane {
     /// post-last-pass coverage fixture): popped per service call, so the
     /// first service drains the head entry. Empty: no EXEC records.
     staged_execs: VecDeque<Vec<u32>>,
+    /// EXEC (pid, task ticket) pairs each discovery service returns, in
+    /// service order (the pid-reuse twin of the fixture above): popped
+    /// per service call. Empty: no ticketed EXEC records.
+    staged_ticketed_execs: VecDeque<Vec<(u32, u64)>>,
     /// The DISCOVERY ring-loss counter each read reports, in read order
     /// (the last one repeats; empty: 0).
     ring_loss: VecDeque<u64>,
@@ -539,6 +543,7 @@ impl ScriptedLane {
             service_stamps: Rc::default(),
             records_per_service: 0,
             staged_execs: VecDeque::new(),
+            staged_ticketed_execs: VecDeque::new(),
             ring_loss: VecDeque::new(),
             malformed: VecDeque::new(),
             failed_services: HashSet::new(),
@@ -660,6 +665,18 @@ impl CaptureLane<Pin> for ScriptedLane {
             record.pid_tgid = ((pid as u64) << 32) | (pid as u64);
             record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
             record.hook_ts_ns = self.stamps.next();
+            records.push(record);
+        }
+        // Staged ticketed EXEC hooks: same, with a scripted producer
+        // task ticket (within the identity limit), so pid reuse across
+        // the window carries distinct task identities.
+        for (pid, ticket) in self.staged_ticketed_execs.pop_front().unwrap_or_default() {
+            // SAFETY: as above.
+            let mut record: p11scope_ebpf_common::DiscoveryRecord = unsafe { std::mem::zeroed() };
+            record.pid_tgid = ((pid as u64) << 32) | (pid as u64);
+            record.kind = p11scope_ebpf_common::DISCOVERY_KIND_EXEC;
+            record.hook_ts_ns = self.stamps.next();
+            record.binding_id = ticket;
             records.push(record);
         }
         let mut batch = DiscoveryBatch::scripted(self.domain, records, self.stamps.next());
@@ -855,6 +872,11 @@ struct Scene {
     /// decoded provider tables from scan 2 on. The discarded scan then
     /// holds a never-admitted provider member that is old, not new.
     straggler: Option<(u32, u64)>,
+    /// Forces the straggler's member status in every scan instead of
+    /// the default above. A forced unscanned status carries no decoded
+    /// tables: the discarded scan then holds an unscanned
+    /// never-admitted member for the dropped-coverage mark.
+    straggler_status: Option<crate::inspect_system::MemberStatus>,
     scans: usize,
     /// The first collection waits for this many discovery services (C5.7
     /// threading boundary): it cannot finish unless the loop services the
@@ -898,6 +920,7 @@ impl Scene {
             joiner_maps_matched: false,
             joiner_interfaces: false,
             straggler: None,
+            straggler_status: None,
             scans: 0,
             collect_gate: None,
             staged_lifecycle: Vec::new(),
@@ -979,7 +1002,8 @@ impl Scene {
                 .map(|(pid, _)| {
                     let is_joiner = self.joiner.is_some_and(|joiner| joiner.0 == *pid);
                     let is_straggler = self.straggler.is_some_and(|straggler| straggler.0 == *pid);
-                    let straggler_scanned = is_straggler && self.scans >= 2;
+                    let straggler_scanned =
+                        is_straggler && self.scans >= 2 && self.straggler_status.is_none();
                     crate::inspect_system::Observation {
                         pid: *pid,
                         path: path.clone(),
@@ -1010,7 +1034,11 @@ impl Scene {
         };
         crate::inspect_system::Catalog {
             scan_status: "complete",
-            lowering: Some(crate::inspect_system::CatalogLowering { plan, pins }),
+            lowering: Some(crate::inspect_system::CatalogLowering {
+                plan,
+                pins,
+                modules: Vec::new(),
+            }),
             enumerated: 1,
             selected: 1,
             scanned: 1,
@@ -1035,6 +1063,9 @@ impl Scene {
                         pid: *pid,
                         status: if is_joiner && self.joiner_maps_matched {
                             crate::inspect_system::MemberStatus::MapsMatched
+                        } else if is_straggler && let Some(forced) = self.straggler_status.as_ref()
+                        {
+                            forced.clone()
                         } else if is_straggler && self.scans < 2 {
                             crate::inspect_system::MemberStatus::NotSelected { loss: None }
                         } else {
@@ -1060,6 +1091,7 @@ impl Scene {
                 uncorroborated_candidates: 0,
                 module_ambiguous: 0,
                 admitted: 1,
+                partial: 0,
                 refused: 0,
                 unresolved: 0,
             },
@@ -4520,6 +4552,12 @@ mod publication_progress_tests {
         /// Latch the stop while this 1-based scan's collection runs (the
         /// trailing-discard fixture): earlier scans apply normally.
         stop_on_scan: Option<usize>,
+        /// Pids live at the lane stop (the stop-diff fixture): the
+        /// terminal disclosure diffs these against enumeration memory.
+        stopped_pids: Vec<u32>,
+        /// Stop-time enumeration members that could not be listed (the
+        /// stop-diff loss fixture).
+        stop_lost: usize,
     }
 
     impl Driver {
@@ -4561,6 +4599,8 @@ mod publication_progress_tests {
                 commit_failures: VecDeque::new(),
                 stop_in_collector: false,
                 stop_on_scan: None,
+                stopped_pids: Vec::new(),
+                stop_lost: 0,
             }
         }
 
@@ -4812,7 +4852,9 @@ mod publication_progress_tests {
         }
         fn on_lane_stopped(&mut self) {
             self.lane_stops += 1;
-            self.scene.coordinator.note_post_pass_exec_newcomers();
+            self.scene
+                .coordinator
+                .note_post_pass_newcomers(&self.stopped_pids, self.stop_lost);
         }
     }
 
@@ -7211,14 +7253,25 @@ mod publication_progress_tests {
 
         const POST_PASS_GAP_SUBJECT: &str = "discovery coverage ended before stop";
 
-        fn post_pass_gap_reason(newcomers: usize) -> String {
+        const STOP_DIFF_GAP_SUBJECT: &str = "processes missed by every scan";
+
+        const STOP_ENUMERATION_LOST_SUBJECT: &str = "stop-time enumeration incomplete";
+
+        const DROPPED_COVERAGE_SUBJECT: &str = "dropped collection coverage";
+
+        fn post_pass_gap_reason(pids: &[u32]) -> String {
             format!(
-                "{newcomers} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown"
+                "{} process(es) started after the last completed pass and were not scanned; their provider mappings are unknown (pids {})",
+                pids.len(),
+                pids.iter()
+                    .map(|pid| pid.to_string())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             )
         }
 
-        fn has_post_pass_gap(scene: &Scene, newcomers: usize) -> bool {
-            let reason = post_pass_gap_reason(newcomers);
+        fn has_post_pass_gap(scene: &Scene, pids: &[u32]) -> bool {
+            let reason = post_pass_gap_reason(pids);
             scene
                 .coordinator
                 .registry()
@@ -7505,6 +7558,141 @@ mod publication_progress_tests {
             );
         }
 
+        // An old process that every pass leaves unscanned (`NotSelected`
+        // past the cap, never admitted) and that the discarded pass also
+        // never scans: the drop names its pid, so an in-window process
+        // enumerated only in a discarded collection is never silent.
+        #[test]
+        fn stop_discard_with_unscanned_old_member_names_its_pid() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.source.spawn(9, 900);
+            driver.scene.straggler = Some((9, 900));
+            driver.scene.straggler_status =
+                Some(crate::inspect_system::MemberStatus::NotSelected { loss: None });
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(9).is_none(),
+                "no pass ever admitted the capped-out member"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == DROPPED_COVERAGE_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("an unscanned member dropped at stop must mark its pid");
+            assert!(
+                reason.contains("pids 9"),
+                "the gap must name the unscanned pid, got: {reason}"
+            );
+        }
+
+        // Twin: a selected-but-unreadable member in the discarded pass
+        // is unscanned too — its member gaps drop with the catalog, so
+        // the drop names its pid the same way.
+        #[test]
+        fn stop_discard_with_unreadable_old_member_names_its_pid() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.scene.source.spawn(9, 900);
+            driver.scene.straggler = Some((9, 900));
+            driver.scene.straggler_status = Some(crate::inspect_system::MemberStatus::Unreadable {
+                reason: "pin failed".into(),
+            });
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver.scene.coordinator.adapter().live_id(9).is_none(),
+                "no pass ever admitted the unreadable member"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == DROPPED_COVERAGE_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("an unreadable member dropped at stop must mark its pid");
+            assert!(
+                reason.contains("pids 9"),
+                "the gap must name the unreadable pid, got: {reason}"
+            );
+        }
+
+        // Twin: a discarded pass whose members all scanned or already
+        // admitted leaves no dropped-coverage mark — the disclosure
+        // fires only for unscanned never-admitted members.
+        #[test]
+        fn stop_discard_with_scanned_members_marks_no_dropped_coverage() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != DROPPED_COVERAGE_SUBJECT),
+                "a clean discard must not mark dropped coverage: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Twin: an applied pass records its scanned members' task
+        // identities for next-pass freshness; a discarded scan records
+        // nothing (its outcomes never applied).
+        #[test]
+        fn applied_pass_records_scanned_tasks_for_freshness() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            let freshness: Vec<(u32, Option<u64>)> = driver
+                .scene
+                .coordinator
+                .scan_freshness_for_test()
+                .iter()
+                .copied()
+                .collect();
+            assert_eq!(
+                freshness,
+                vec![(PID, Some(START))],
+                "the applied pass scanned pid 7; the discarded scan adds nothing"
+            );
+        }
+
         // EXEC hooks for never-admitted pids that drain after the last
         // completed pass: two newcomers (one hooks twice) leave one
         // coverage gap naming two unknown processes.
@@ -7529,9 +7717,322 @@ mod publication_progress_tests {
                 "post-pass newcomers are never admitted"
             );
             assert!(
-                has_post_pass_gap(&driver.scene, 2),
+                has_post_pass_gap(&driver.scene, &[9, 10]),
                 "two post-pass EXEC newcomers must mark unknown coverage: {:?}",
                 driver.scene.gap_subjects(),
+            );
+        }
+
+        // The post-pass coverage mark names the unscanned processes,
+        // not just their count: two newcomers (one hooks twice) leave
+        // one gap listing both pids.
+        #[test]
+        fn post_pass_exec_newcomers_name_their_pids() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back(vec![9, 10, 9]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("two post-pass EXEC newcomers must mark unknown coverage");
+            assert!(
+                reason.contains("pids 9, 10"),
+                "the gap must name the unscanned pids, got: {reason}"
+            );
+        }
+
+        // The pid list is bounded: twelve newcomers name ten and count
+        // the rest, so a fork storm cannot flood the report.
+        #[test]
+        fn post_pass_exec_newcomers_bound_a_long_pid_list() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back((20..32).collect::<Vec<u32>>());
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("twelve post-pass EXEC newcomers must mark unknown coverage");
+            assert!(
+                reason.starts_with("12 process(es)"),
+                "the count stays exact, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, and 2 more"),
+                "the list names ten and counts the rest, got: {reason}"
+            );
+        }
+
+        // Twin: the same pid hooking as two tasks (pid reuse: the first
+        // exits, the number is reused) counts twice — the producer task
+        // ticket, not the pid number, is the counted identity.
+        #[test]
+        fn post_pass_exec_reused_pid_counts_each_task() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_ticketed_execs
+                .push_back(vec![(9, 101), (9, 102)]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("two post-pass tasks must mark unknown coverage");
+            assert!(
+                reason.starts_with("2 process(es)"),
+                "each reused task counts, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 9"),
+                "the gap names the reused pid, got: {reason}"
+            );
+        }
+
+        // A process live at stop that no completed pass ever enumerated
+        // is a stop-diff newcomer: the terminal disclosure names it, so
+        // a starter that never execs cannot stay invisible.
+        #[test]
+        fn stop_diff_names_a_never_enumerated_live_process() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID, 99];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert_eq!((driver.scene.scans, driver.applies), (2, 1));
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("a never-enumerated live process must mark unknown coverage");
+            assert!(
+                reason.contains("(pids 99)"),
+                "the gap names exactly the newcomer, got: {reason}"
+            );
+        }
+
+        // An enumerated task live at stop stays silent: the diff reports
+        // only what no completed pass saw.
+        #[test]
+        fn stop_diff_stays_silent_for_enumerated_tasks() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_DIFF_GAP_SUBJECT),
+                "an enumerated task live at stop stays silent: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // A post-pass exec newcomer is named once, by the exec gap: the
+        // stop diff never double-reports a pid the exec set already holds.
+        #[test]
+        fn stop_diff_skips_exec_newcomers() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![9];
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_execs.push_back(vec![9]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            assert!(
+                has_post_pass_gap(&driver.scene, &[9]),
+                "the exec gap names the newcomer: {:?}",
+                driver.scene.gap_subjects(),
+            );
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_DIFF_GAP_SUBJECT),
+                "the stop diff never double-reports an exec newcomer: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // A stop-time enumeration that lost members says so: late
+        // starters among the unlisted are invisible, never silently
+        // covered.
+        #[test]
+        fn stop_diff_reports_lost_enumeration_members() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![PID];
+            driver.stop_lost = 3;
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == STOP_ENUMERATION_LOST_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("lost stop-time enumeration members must mark incomplete coverage");
+            assert!(
+                reason.starts_with("3 /proc member(s)"),
+                "the gap counts the unlisted members, got: {reason}"
+            );
+        }
+
+        // A repeated terminal disclosure stays silent: the stop diff
+        // fires once.
+        #[test]
+        fn stop_diff_fires_once_across_repeated_terminal_calls() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            driver.stopped_pids = vec![99];
+            let outcome = drive(&mut driver, ScriptedLane::new(&log), windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let diff_gaps = || {
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .filter(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                    .count()
+            };
+            let fired = diff_gaps();
+            assert_eq!(fired, 1, "the stop diff fires at the stop");
+            let _ = diff_gaps;
+            // A repeat restates newcomers and loss alike, yet stages
+            // nothing: the latch covers the loss mark too.
+            let restaged = driver.scene.coordinator.note_post_pass_newcomers(&[99], 7);
+            assert!(!restaged, "a repeated terminal call stages nothing");
+            let rerun = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .filter(|gap| gap.subject == STOP_DIFF_GAP_SUBJECT)
+                .count();
+            assert_eq!(rerun, 1, "a repeated terminal call stays silent");
+            assert!(
+                driver
+                    .scene
+                    .coordinator
+                    .registry()
+                    .gaps()
+                    .iter()
+                    .all(|gap| gap.subject != STOP_ENUMERATION_LOST_SUBJECT),
+                "the latch covers the loss mark too: {:?}",
+                driver.scene.gap_subjects(),
+            );
+        }
+
+        // Twin: the same pid hooking twice as one task (a re-exec keeps
+        // its task ticket) counts once — tickets dedupe re-execs while
+        // separating reuse.
+        #[test]
+        fn post_pass_exec_same_ticket_reexec_counts_once() {
+            let log = Log::default();
+            let mut driver = Driver::new(&log, false, &[]);
+            driver.stop_on_emission = false;
+            driver.stop_on_scan = Some(2);
+            let mut lane = ScriptedLane::new(&log);
+            lane.staged_ticketed_execs
+                .push_back(vec![(9, 101), (9, 101)]);
+            let outcome = drive(&mut driver, lane, windows());
+            assert!(
+                outcome.retained.is_none(),
+                "the mid-pass stop discards synchronously"
+            );
+            let reason = driver
+                .scene
+                .coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == POST_PASS_GAP_SUBJECT)
+                .map(|gap| gap.reason.clone())
+                .expect("a re-execing newcomer must mark unknown coverage");
+            assert!(
+                reason.starts_with("1 process(es)"),
+                "one task counts once, got: {reason}"
+            );
+            assert!(
+                reason.contains("pids 9"),
+                "the gap names the pid, got: {reason}"
             );
         }
 
@@ -7581,7 +8082,7 @@ mod publication_progress_tests {
                 "the discarded pass never admits its joiner"
             );
             assert!(
-                has_post_pass_gap(&driver.scene, 1),
+                has_post_pass_gap(&driver.scene, &[8]),
                 "a provider-free post-pass newcomer must mark unknown coverage: {:?}",
                 driver.scene.gap_subjects(),
             );

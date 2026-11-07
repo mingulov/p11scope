@@ -237,7 +237,11 @@ fn joint_raw_disposal_refuses_foreign_and_undelivered_input_without_mutation() {
         negative.validate_owner(other_owner.adapter(), &retained),
         Err(RawQuantumRefusal::ForeignLedger)
     );
-    assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
+    // No journal key existed at this disposal, so the image is not
+    // provably another caller's: the interval is fenced as loss, the
+    // image itself is not refused.
+    assert!(!owner.adapter.is_tainted((COOKIE, EXEC)));
+    assert!(owner.adapter.voids_through_for_test(negative.frontier()));
     assert_eq!(owner.ledger().census(), 0);
 }
 
@@ -284,7 +288,11 @@ fn joint_empty_and_capacity_raw_dispositions_need_no_drain_grant() {
         .dispose_without_ingest(&mut owner, &retained, RawDisposeReason::Capacity)
         .unwrap_or_else(|(_, reason)| panic!("pre-completion capacity disposal: {reason:?}"));
     assert!(capacity.failure().is_some());
+    // The capacity-lost BEGIN is still open in this quantum: its
+    // terminal can still arrive unaccountable, so even pre-key the
+    // image keeps the localized refusal.
     assert!(owner.adapter.is_tainted((COOKIE, EXEC)));
+    assert!(owner.adapter.voids_through_for_test(capacity.frontier()));
     assert_eq!(owner.ledger().census(), 0);
     assert_eq!(owner.adapter.consumed_through_for_test(), 1);
     let capacity_frontier = capacity.frontier();

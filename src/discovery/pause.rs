@@ -36,6 +36,10 @@ const MAX_SETTLE_SAMPLES: u64 = CYCLE_NS / SAMPLE_NS;
 /// the child runs unpaused until the next frame re-arms, and a table still
 /// unpublished then is reported as a gap (`PauseIo::note_unpaused_publication`).
 pub(crate) const MAX_SUCCESSORS_PER_ARM: u8 = 16;
+/// Consecutive engine-incomplete re-arms before the chain retires with a
+/// counted named gap. The run continues (never-stop); only the pause chain
+/// ends, loudly, instead of re-arming once per loader hit without bound.
+const MAX_CONSECUTIVE_ENGINE_INCOMPLETE: u32 = 3;
 const MSG_UNPAUSED_PUBLICATION: &str = "the owned pause chain ended while a provider's function table was still unpublished; calls before its probes attach may be unobserved";
 const MAX_FAILURE_ITEMS: usize = 128;
 const MSG_ARM_FAILED: &str = "owned child generation changed before pause arm";
@@ -53,7 +57,7 @@ const MSG_COALESCED_RECORD_DEADLINE: &str = "coalesced record crossed winner dea
 const MSG_UNSERVICED_AT_CLEANUP: &str = "the capture ended before a pause cycle serviced its stop";
 const MSG_TASK_SET_CHANGED: &str = "task set changed or was not entirely stopped";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum PauseDiagnostic {
     ArmFailedBeforeEpoch,
     PostReleaseRevalidationIncomplete,
@@ -86,6 +90,13 @@ fn render_pause_diagnostic(diagnostic: PauseDiagnostic) -> String {
     format!(
         "p11scope: pause: partial [pause_diag={}]",
         diagnostic.token()
+    )
+}
+
+fn render_pause_incomplete_retirement(consecutive: u64) -> String {
+    format!(
+        "p11scope: pause: partial [pause_diag={}] (retired after {consecutive} consecutive incomplete cycles)",
+        PauseDiagnostic::EngineIncompleteWithinDeadline.token()
     )
 }
 
@@ -480,6 +491,19 @@ pub(crate) struct PauseCoordinator {
     terminal_batch: Option<TerminalBatch>,
     pending_diagnostic: Option<PauseDiagnostic>,
     diagnostic_annotated: bool,
+    /// Consecutive engine-incomplete cycles. Reset on every confirmed
+    /// cycle and on every non-incomplete failure, so "consecutive" stays
+    /// literal; reaching the cap retires the chain with a counted named
+    /// gap instead of re-arming again.
+    consecutive_engine_incomplete: u32,
+    /// Engine-incomplete cap retirements this run. Each is one counted
+    /// partial with a named retirement line, surfaced in JSON as
+    /// `evidence.pause_engine_incomplete_retirements`.
+    engine_incomplete_retirements: u64,
+    /// Per-kind partial-diagnostic emission counts this run. Stderr
+    /// shows each kind once (first occurrence); the retirement count
+    /// above is what JSON consumers read.
+    diagnostic_emit_counts: BTreeMap<PauseDiagnostic, u64>,
     /// Successors this arm may still install (`MAX_SUCCESSORS_PER_ARM`).
     successors_left: u8,
     cleaning: bool,
@@ -595,6 +619,9 @@ impl PauseCoordinator {
             terminal_batch: None,
             pending_diagnostic: None,
             diagnostic_annotated: false,
+            consecutive_engine_incomplete: 0,
+            engine_incomplete_retirements: 0,
+            diagnostic_emit_counts: BTreeMap::new(),
             successors_left: MAX_SUCCESSORS_PER_ARM,
             cleaning: false,
             cleaned: false,
@@ -1204,7 +1231,14 @@ impl PauseCoordinator {
             self.set_diagnostic(diagnostic);
         }
         if !outcome.required_complete {
-            return self.fail_cycle(io, "one or more frozen required attachments failed", false);
+            let engine_incomplete =
+                outcome.diagnostic == Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+            return self.fail_cycle_inner(
+                io,
+                "one or more frozen required attachments failed",
+                false,
+                engine_incomplete,
+            );
         }
         if let Err(error) = io.wait_one_ms() {
             return self.fail_cycle(io, error, true);
@@ -1315,6 +1349,7 @@ impl PauseCoordinator {
             return self.fail_cycle(io, error, true);
         }
         self.counters.confirmed = self.counters.confirmed.saturating_add(1);
+        self.consecutive_engine_incomplete = 0;
         self.attempt_open = false;
         self.active_deadline = None;
         self.failure_deadline = None;
@@ -1763,9 +1798,34 @@ impl PauseCoordinator {
         message: impl Into<String>,
         lifecycle: bool,
     ) -> Result<(), PauseError> {
+        self.fail_cycle_inner(io, message, lifecycle, false)
+    }
+
+    fn fail_cycle_inner(
+        &mut self,
+        io: &mut impl PauseIo,
+        message: impl Into<String>,
+        lifecycle: bool,
+        engine_incomplete: bool,
+    ) -> Result<(), PauseError> {
         self.void_hold();
         let message = message.into();
         self.set_message_diagnostic(&message);
+        // An engine-incomplete cycle under `auto` is a counted named gap,
+        // not the end of the chain: the cleanup below resumes the child,
+        // so a later loader hit arms and is serviced like any other. The
+        // cause arrives typed from the incomplete-apply call site, never
+        // from the sticky first-cause diagnostic (an earlier unowned apply
+        // may have set that for a different failure). Consecutive
+        // incompletes retire after the cap with a counted named gap.
+        let incomplete_candidate =
+            !lifecycle && self.policy == PausePolicy::Auto && engine_incomplete;
+        if !incomplete_candidate {
+            self.consecutive_engine_incomplete = 0;
+        }
+        let rearm_after_incomplete = incomplete_candidate
+            && self.consecutive_engine_incomplete < MAX_CONSECUTIVE_ENGINE_INCOMPLETE;
+        let retire_after_incomplete = incomplete_candidate && !rearm_after_incomplete;
         io.note_unconfirmed_cycle();
         if !lifecycle {
             self.set_diagnostic(PauseDiagnostic::OtherAutoNonconfirmed);
@@ -1875,7 +1935,23 @@ impl PauseCoordinator {
         self.active_deadline = None;
         self.failure_deadline = None;
         self.failure_items = 0;
-        self.finish_nonconfirmed(message)
+        self.rearming_enabled = rearm_after_incomplete;
+        if rearm_after_incomplete {
+            self.consecutive_engine_incomplete =
+                self.consecutive_engine_incomplete.saturating_add(1);
+        }
+        let result = self.finish_nonconfirmed(message);
+        if retire_after_incomplete {
+            self.consecutive_engine_incomplete =
+                self.consecutive_engine_incomplete.saturating_add(1);
+            self.engine_incomplete_retirements =
+                self.engine_incomplete_retirements.saturating_add(1);
+            eprintln!(
+                "{}",
+                render_pause_incomplete_retirement(u64::from(self.consecutive_engine_incomplete))
+            );
+        }
+        result
     }
 
     fn finish_nonconfirmed(&mut self, message: String) -> Result<(), PauseError> {
@@ -2155,6 +2231,14 @@ impl PauseCoordinator {
         self.counters
     }
 
+    /// Engine-incomplete cap retirements this run. Each is one counted
+    /// partial (already in `counters`); the count is a subset
+    /// annotation, not a lattice member. Rendered in JSON as
+    /// `evidence.pause_engine_incomplete_retirements`.
+    pub(crate) fn engine_incomplete_retirements(&self) -> u64 {
+        self.engine_incomplete_retirements
+    }
+
     /// Records one `--pause always` degrade that collected unpaused
     /// instead of aborting (never-stop). The attempt was already counted
     /// by `begin_attempt`; this moves it to `unavailable` (partial).
@@ -2247,8 +2331,12 @@ impl PauseCoordinator {
             .pending_diagnostic
             .take()
             .unwrap_or(PauseDiagnostic::OtherAutoNonconfirmed);
+        let count = self.diagnostic_emit_counts.entry(diagnostic).or_insert(0);
+        *count = count.saturating_add(1);
         let line = render_pause_diagnostic(diagnostic);
-        eprintln!("{line}");
+        if *count == 1 {
+            eprintln!("{line}");
+        }
         line
     }
 
@@ -7117,6 +7205,200 @@ mod tests {
         );
     }
 
+    /// An engine-incomplete cycle is a counted named gap, never the end of
+    /// the pause chain: the child was resumed, so a later loader hit must
+    /// be able to arm and confirm like any other cycle.
+    #[test]
+    fn an_engine_incomplete_cycle_rearms_for_the_next_loader_hit() {
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.required_complete = false;
+        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(coordinator.counters(), PauseCounters::partial(1));
+        assert!(
+            coordinator.rearming_enabled(),
+            "an incomplete cycle must not retire the pause chain"
+        );
+        io.fallback_now = 15;
+        assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+
+        io.required_complete = true;
+        io.apply_outcome_diagnostic = None;
+        io.authorization = Some(PAUSE_REQUESTED);
+        io.queue
+            .push_back(Ok(Some(DiscoveryItem::Record(record(18, 0, false)))));
+        coordinator.service(&mut io).unwrap();
+
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 2,
+                confirmed: 1,
+                partial: 1,
+                unavailable: 0,
+            }
+        );
+        assert_eq!(coordinator.status(), PauseStatus::Partial);
+    }
+
+    /// Consecutive engine-incomplete cycles must retire with a counted
+    /// named gap, never spin unbounded (one per loader hit). Four straight
+    /// incompletes retire the chain; the four partials stay counted.
+    #[test]
+    fn consecutive_engine_incomplete_cycles_retire_with_a_counted_gap() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.arm_for_test();
+        let mut io = successful_io(vec![record(10, 0, false)]);
+        io.required_complete = false;
+        io.apply_outcome_diagnostic = Some(PauseDiagnostic::EngineIncompleteWithinDeadline);
+
+        coordinator.service(&mut io).unwrap();
+        assert_eq!(coordinator.counters().partial, 1);
+        assert!(
+            coordinator.rearming_enabled(),
+            "the first incomplete re-arms"
+        );
+
+        for (cycle, ts, fallback) in [(2u64, 18u64, 15u64), (3, 26, 23), (4, 34, 31)] {
+            io.fallback_now = fallback;
+            assert_eq!(
+                coordinator.arm(&mut io).unwrap(),
+                ArmResult::Armed,
+                "cycle {cycle} arms"
+            );
+            io.authorization = Some(PAUSE_REQUESTED);
+            io.queue
+                .push_back(Ok(Some(DiscoveryItem::Record(record(ts, 0, false)))));
+            io.queue.push_back(Ok(None));
+            io.queue.push_back(Ok(None));
+            coordinator.service(&mut io).unwrap();
+            assert_eq!(
+                coordinator.counters().partial,
+                cycle,
+                "cycle {cycle} stays a counted partial"
+            );
+        }
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "the fourth consecutive incomplete retires the chain"
+        );
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 4,
+                confirmed: 0,
+                partial: 4,
+                unavailable: 0,
+            }
+        );
+        assert_eq!(
+            coordinator.engine_incomplete_retirements(),
+            1,
+            "the retirement is counted for the JSON report"
+        );
+        assert_eq!(
+            coordinator.diagnostic_emit_counts,
+            BTreeMap::from([(PauseDiagnostic::EngineIncompleteWithinDeadline, 4)]),
+            "one stderr line per kind, counted across the streak"
+        );
+        assert_eq!(
+            coordinator.arm(&mut io).unwrap(),
+            ArmResult::Disabled,
+            "a retired chain stays terminal"
+        );
+    }
+
+    /// A sticky unowned EngineIncomplete must not re-arm a later
+    /// non-lifecycle failure with a different cause.
+    #[test]
+    fn an_unowned_engine_incomplete_must_not_rearm_a_later_non_lifecycle_failure() {
+        let mut io = FakeIo {
+            apply_outcome_diagnostic: Some(PauseDiagnostic::EngineIncompleteWithinDeadline),
+            ..FakeIo::default()
+        };
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.pending_records.push(record(1, 0, false));
+        coordinator.apply_unowned(&mut io, Some(100)).unwrap();
+        assert_eq!(
+            coordinator.pending_diagnostic,
+            Some(PauseDiagnostic::EngineIncompleteWithinDeadline),
+            "the unowned apply sets the sticky diagnostic"
+        );
+
+        coordinator
+            .fail_cycle(&mut io, "pause request had no discovery record", false)
+            .unwrap();
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "a different non-lifecycle cause must not re-arm"
+        );
+        assert_eq!(coordinator.counters().partial, 1);
+    }
+
+    /// `--pause always` never re-arms, even with a typed
+    /// EngineIncomplete cause.
+    #[test]
+    fn engine_incomplete_under_always_does_not_rearm() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.begin_attempt();
+
+        let error = coordinator
+            .fail_cycle_inner(
+                &mut io,
+                "one or more frozen required attachments failed",
+                false,
+                true,
+            )
+            .unwrap_err();
+
+        assert!(error.required());
+        assert!(!coordinator.rearming_enabled(), "Always must not re-arm");
+    }
+
+    /// Lifecycle failures never re-arm, even with a typed
+    /// EngineIncomplete cause.
+    #[test]
+    fn engine_incomplete_with_a_lifecycle_failure_does_not_rearm() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+
+        let _ = coordinator
+            .fail_cycle_inner(&mut io, "pause coordination cancelled", true, true)
+            .unwrap_err();
+
+        assert!(
+            !coordinator.rearming_enabled(),
+            "a lifecycle failure must not re-arm"
+        );
+    }
+
+    /// A non-incomplete failure breaks the incomplete streak, so
+    /// "consecutive" stays literal: sparse incompletes never retire the
+    /// chain early.
+    #[test]
+    fn non_incomplete_failure_resets_the_incomplete_streak() {
+        let mut io = FakeIo::default();
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Auto, 41, 9, stopped());
+        coordinator.begin_attempt();
+        coordinator.consecutive_engine_incomplete = 2;
+
+        coordinator
+            .fail_cycle(&mut io, "pause request had no discovery record", false)
+            .unwrap();
+
+        assert_eq!(coordinator.consecutive_engine_incomplete, 0);
+        assert_eq!(coordinator.counters().partial, 1);
+    }
+
     #[test]
     fn post_release_revalidation_remains_owned_by_the_pause_ledger() {
         let mut io = FakeIo {
@@ -8974,6 +9256,15 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_retirement_renders_once_with_a_count() {
+        assert_eq!(
+            render_pause_incomplete_retirement(4),
+            "p11scope: pause: partial [pause_diag=engine_incomplete_within_deadline] \
+             (retired after 4 consecutive incomplete cycles)"
+        );
+    }
+
+    #[test]
     fn pause_diagnostic_message_mapping_is_exact_and_unknown_is_fallback() {
         assert_eq!(
             diagnostic_for_message(MSG_ARM_FAILED),
@@ -9895,7 +10186,7 @@ mod tests {
         std::fs::set_permissions(&tmp, permissions).expect("search bit on campaign TMPDIR");
     }
 
-    /// `run` passes `SOFTHSM2_CONF` through its clean child environment, so
+    /// `run` passes `SOFTHSM2_CONF` through to its child environment, so
     /// the direct oracle needs it in the observer's environment. Restored on
     /// drop; privileged cells run `--exact --test-threads=1`.
     struct WrapperEnvGuard {
@@ -9950,6 +10241,8 @@ mod tests {
     ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
         let args = crate::cli::RunArgs {
             track_short_lived: false,
+            verbose: false,
+            quiet: false,
             kind: crate::cli::Kind::Profile,
             modules: Vec::new(),
             exclude_modules: vec![],
@@ -9970,6 +10263,7 @@ mod tests {
             pause,
             attach_backend: crate::attach::BackendSelection::default(),
             kill_on_timeout: false,
+            user: None,
             command,
         };
         let outcome = crate::run::run_owned(&args).expect("owned run completes");

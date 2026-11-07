@@ -26,6 +26,12 @@ fn text(report: &model::DiffReport) -> String {
     String::from_utf8(output).unwrap()
 }
 
+fn concise(report: &model::DiffReport) -> String {
+    let mut output = Vec::new();
+    super::render::render_concise(report, &mut output).unwrap();
+    String::from_utf8(output).unwrap()
+}
+
 fn counted(value: &mut Value, count: u64, lossy: bool) {
     value["edges"][0]["entries"]["count"] = json!(count);
     value["edges"][0]["entries"]["observation"] = json!("observed");
@@ -63,6 +69,58 @@ fn application_and_module_paths_are_resolved_and_basename_collisions_stay_separa
         assert!(output.contains(expected), "missing {expected:?}: {output}");
     }
     assert!(!output.contains("exe_path_ref"));
+}
+
+/// Item 20: no bare `Top changed applications:` header when the
+/// application section is empty (a module-path-only diff still names
+/// its path line; a content-only diff names its content count).
+#[test]
+fn empty_application_section_omits_the_applications_header() {
+    let before = document();
+    let mut after = before.clone();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let mut path_report = report(&before, &after);
+    assert!(
+        !path_report.module_path_changes.is_empty(),
+        "the fixture flip must move a module path"
+    );
+    path_report.application_changes.clear();
+    let output = concise(&path_report);
+    assert!(
+        !output.contains("Top changed applications:"),
+        "no bare header without rows: {output}"
+    );
+    assert!(
+        output.contains("module path changed (--json lists each)")
+            || output.contains("module paths changed (--json lists each)"),
+        "the path line survives: {output}"
+    );
+
+    // A real content-only diff (edgeless modules, one admission flip)
+    // carries no application section at all.
+    let mut before = document();
+    before["edges"] = json!([]);
+    before["gaps"] = json!([]);
+    let mut after = before.clone();
+    after["modules"][0]["admission"]["endpoints"] = json!(5);
+    let report = report(&before, &after);
+    assert!(report.application_changes.is_empty());
+    assert!(
+        report
+            .module_contents
+            .iter()
+            .any(|row| !row.changes.is_empty()),
+        "the fixture flip must change module content"
+    );
+    let output = concise(&report);
+    assert!(
+        !output.contains("Top changed applications:"),
+        "no bare header without rows: {output}"
+    );
+    assert!(
+        output.contains("1 module content change (--json lists each)"),
+        "the content count replaces the header: {output}"
+    );
 }
 
 #[test]
@@ -301,6 +359,22 @@ impl Write for CountingWriter {
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
     }
+}
+
+#[test]
+fn module_evidence_states_folded_unbound_entries() {
+    let mut before = document();
+    before["modules"][0]["unbound_use"] = json!({
+        "first_ns": 111, "rows": 1,
+        "reasons": {"before_admission": 1}, "entries": 10
+    });
+    let mut after = before.clone();
+    after["modules"][0]["unbound_use"]["entries"] = json!(25);
+    let output = text(&report(&before, &after));
+    assert!(
+        output.contains("Unbound use: 1 rows, 25 entries;"),
+        "module evidence states the folded entries:\n{output}"
+    );
 }
 
 #[test]
@@ -606,6 +680,8 @@ fn args() -> (tempfile::TempDir, InventoryDiffArgs) {
             after,
             json: true,
             out: None,
+            verbose: false,
+            quiet: false,
         },
     )
 }
@@ -707,4 +783,55 @@ fn retained_input_descriptor_detects_alias_after_the_original_path_is_replaced()
     assert_eq!(std::fs::read(&retained).unwrap(), FIXTURE);
     assert_eq!(std::fs::read(&args.before).unwrap(), b"replacement input");
     assert_eq!(std::fs::read(&args.after).unwrap(), FIXTURE);
+}
+
+/// Item 20: concise diff is counts plus top changed applications, without
+/// the per-record flood or raw limitation tokens.
+#[test]
+fn concise_diff_summarizes_counts_and_top_applications() {
+    let before = document();
+    let mut after = document();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let report = report(&before, &after);
+    assert!(report.summary.application_groups_changed > 0);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("application group"), "{text}");
+    assert!(text.contains("changed"), "{text}");
+    assert!(text.contains("run with -v for details"), "{text}");
+    assert!(!text.contains("absence_is_not_removal"), "{text}");
+    assert!(!text.contains("Limitation:"), "{text}");
+    assert!(text.lines().count() < 40, "concise must stay short: {text}");
+}
+
+/// Item 20: concise diff names the top changed applications.
+#[test]
+fn concise_diff_names_top_changed_applications() {
+    let mut before = document();
+    before["callers"][0]["image"]["exe"]["path"] = json!("/opt/one/driver");
+    let mut after = before.clone();
+    after["modules"][0]["paths"] = json!(["/changed/m0.so"]);
+    let report = report(&before, &after);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(text.contains("/opt/one/driver"), "{text}");
+}
+
+/// Item 20: concise unchanged diff says so briefly with the caveats.
+#[test]
+fn concise_unchanged_diff_says_so_briefly() {
+    let value = document();
+    let report = report(&value, &value);
+    let mut output = Vec::new();
+    super::render::render_concise(&report, &mut output).unwrap();
+    let text = String::from_utf8(output).unwrap();
+    assert!(
+        text.contains("No differences in the compared inventory observations"),
+        "{text}"
+    );
+    assert!(text.contains("does not prove removal"), "{text}");
+    assert!(!text.contains("absence_is_not_removal"), "{text}");
+    assert!(text.lines().count() < 30, "concise must stay short: {text}");
 }

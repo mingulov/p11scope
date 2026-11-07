@@ -3448,6 +3448,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             mount_namespace: namespace,
             key,
             path: "/pool.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables,
@@ -3518,6 +3519,7 @@ fn broad_refuses_whole_when_validated_set_exceeds_budget() {
             mount_namespace: namespace,
             key,
             path: "/small.so".into(),
+            tables_scan_finished: false,
             decoder_abi: Some(ElfAbi::Lp64),
             exports: vec!["C_GetFunctionList".into()],
             tables: vec![ScannedTable {

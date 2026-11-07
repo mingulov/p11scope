@@ -824,6 +824,11 @@ pub(crate) enum ObjectEffect {
         label: Option<KeyLabel>,
         /// Whether attribution was valid at the join.
         attribution_valid: bool,
+        /// Whether the view's origin is first-observed (DEMO-4 late
+        /// attach): the object's creation/lookup predates the
+        /// observed window, so an unestablished type stays an honest
+        /// per-key `unknown`, never a dropped row.
+        first_observed: bool,
     },
     Destroyed {
         call: CallToken,

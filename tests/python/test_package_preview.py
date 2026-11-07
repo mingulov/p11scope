@@ -427,7 +427,7 @@ else:
         self.assertEqual(inputs["capture_mode"]["default"], "both")
         self.assertEqual(str(inputs["jobs"]["default"]), "2")
         self.assertEqual(document["permissions"], {"contents": "read", "actions": "read"})
-        self.assertEqual(set(document["jobs"]), {"validate", "package"})
+        self.assertEqual(set(document["jobs"]), {"validate", "package", "attest", "install-test"})
         standard = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         ordinary = set(standard["jobs"]) - {"contracts", "coverage", "privileged-e2e", "release-preview", "quarantine",
                                              "package-delivery", "docker-delivery", "kubernetes-delivery"}
@@ -435,12 +435,47 @@ else:
         ordinary.update(f"coverage ({partition})" for partition in standard["jobs"]["coverage"]["strategy"]["matrix"]["partition"])
         self.assertEqual(ordinary, set(REQUIRED), "new CI gates must update the acceptance helper and its controls")
         pins = {item["uses"] for job in standard["jobs"].values() for item in job.get("steps", ()) if "uses" in item}
-        for job in document["jobs"].values():
+        # The provenance attestation is package-preview-only (ci.yml never
+        # attests); its pin is allowlisted here, pinned by full commit SHA.
+        pins.add("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8")
+        self.assertIn("actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2",
+                      WORKFLOW.read_text(), "the attest pin must carry its version comment")
+        for name, job in document["jobs"].items():
             self.assertEqual(job["runs-on"], "ubuntu-26.04")
             self.assertEqual(job["steps"][0]["with"]["fetch-depth"], 0)
             for item in job["steps"]:
                 if "uses" in item:
-                    self.assertIn(item["uses"], pins)
+                    self.assertIn(item["uses"], pins, f"unreviewed action in {name}")
+        # Attestation writes stay on the attest job only; nothing else gains
+        # id-token or attestations.
+        self.assertEqual(document["jobs"]["attest"]["permissions"],
+                         {"contents": "read", "actions": "read",
+                          "id-token": "write", "attestations": "write"})
+        for name in ("validate", "package", "install-test"):
+            self.assertNotIn("permissions", document["jobs"][name],
+                             f"{name} must inherit the read-only top-level permissions")
+        attest = document["jobs"]["attest"]
+        self.assertEqual(attest["needs"], "package")
+        downloads = [item for item in attest["steps"] if "download-artifact" in item.get("uses", "")]
+        self.assertEqual(len(downloads), 1)
+        # The download must fetch every built mode's artifact (FULL and P0
+        # share the release-preview-public-assets* prefix); a bare name
+        # would drop one mode's files, and merging would mix their trees.
+        self.assertEqual(downloads[0]["with"].get("pattern"), "release-preview-public-assets*")
+        self.assertIs(downloads[0]["with"].get("merge-multiple"), False)
+        self.assertEqual(downloads[0]["with"].get("path"), "./attested")
+        subjects = [item for item in attest["steps"] if "attest-build-provenance" in item.get("uses", "")]
+        self.assertEqual(len(subjects), 1)
+        # The attestation subject must cover every downloaded file; a
+        # narrowed path would leave release files unattested.
+        self.assertEqual(subjects[0]["with"].get("subject-path"), "./attested/**/*")
+        install = document["jobs"]["install-test"]
+        self.assertEqual(install["needs"], "package")
+        bodies = "\n".join(item.get("run", "") for item in install["steps"])
+        for marker in ("apt-get install", "p11scope --version", "p11scope doctor",
+                       "p11scope-discover --version", "apt-get remove",
+                       "fedora:44", "dnf install", "dnf remove"):
+            self.assertIn(marker, bodies, f"install test must {marker}")
 
 
 if __name__ == "__main__":

@@ -192,15 +192,11 @@ fn b2_subcommand_help_is_scoped_to_that_subcommand() {
 }
 
 #[test]
-fn b3_missing_or_unknown_subcommand_names_problem_exit_2() {
-    let missing = run(&[]);
-    assert_eq!(missing.code, Some(2));
-    assert!(
-        missing.stderr.contains("missing subcommand"),
-        "{}",
-        missing.stderr
-    );
-    assert!(missing.stdout.is_empty());
+fn b3_bare_argv_prints_help_and_unknown_names_problem() {
+    let bare = run(&[]);
+    assert_eq!(bare.code, Some(0));
+    assert!(bare.stderr.is_empty(), "{}", bare.stderr);
+    assert!(bare.stdout.contains("Choose a task"), "{}", bare.stdout);
 
     let unknown = run(&["frobnicate"]);
     assert_eq!(unknown.code, Some(2));
@@ -210,13 +206,14 @@ fn b3_missing_or_unknown_subcommand_names_problem_exit_2() {
         unknown.stderr
     );
 
-    // `help <sub>` is not an alias today.
+    // `help <sub>` shows that subcommand's scoped help.
     let help_sub = run(&["help", "profile"]);
-    assert_eq!(help_sub.code, Some(2));
+    assert_eq!(help_sub.code, Some(0));
+    assert!(help_sub.stderr.is_empty(), "{}", help_sub.stderr);
     assert!(
-        help_sub.stderr.contains("unknown subcommand: help"),
+        help_sub.stdout.contains("p11scope profile"),
         "{}",
-        help_sub.stderr
+        help_sub.stdout
     );
 }
 
@@ -229,51 +226,60 @@ fn b4_version_prints_plain_version_exit_0() {
 }
 
 #[test]
-fn b5_unknown_pid_names_pin_failure_exit_1() {
+fn b5_unknown_pid_names_missing_process_exit_1() {
     let profile = run(&["profile", "--pid", "99999999", "--duration", "1"]);
     assert_eq!(profile.code, Some(1));
-    assert!(
-        profile.stderr.contains("cannot pin pid 99999999"),
-        "{}",
-        profile.stderr
+    assert_eq!(
+        profile.stderr,
+        "p11scope: no process with PID 99999999 (it exited, or the PID is mistyped)\n"
     );
+    assert!(profile.stdout.is_empty());
 }
 
 #[test]
 fn b6_doctor_reports_rows_and_verdict() {
-    let doctor = run(&["doctor"]);
+    // Full rows live under -v; the default stays concise.
+    let verbose = run(&["doctor", "-v"]);
     assert!(
-        doctor.stdout.contains("capability tier:"),
+        verbose.stdout.contains("capability tier:"),
         "{}",
-        doctor.stdout
+        verbose.stdout
     );
-    assert!(doctor.stdout.contains("verdict:"), "{}", doctor.stdout);
+    assert!(verbose.stdout.contains("verdict:"), "{}", verbose.stdout);
     assert!(
-        doctor.stdout.contains("BPF map create"),
+        verbose.stdout.contains("BPF map create"),
         "{}",
-        doctor.stdout
+        verbose.stdout
     );
     for row in ["kernel release", "lockdown", "cgroup version"] {
-        assert!(doctor.stdout.contains(row), "{}", doctor.stdout);
+        assert!(verbose.stdout.contains(row), "{}", verbose.stdout);
     }
     // F3 fixed (Task 3): the verdict line ends with `\n`, so the shell
     // prompt no longer lands on the verdict line.
+    assert!(verbose.stdout.ends_with('\n'), "{:?}", verbose.stdout);
+    let doctor = run(&["doctor"]);
+    assert!(doctor.stdout.contains("verdict:"), "{}", doctor.stdout);
+    assert!(doctor.stdout.contains("Next:"), "{}", doctor.stdout);
+    assert!(
+        doctor.stdout.contains("run with -v for details"),
+        "{}",
+        doctor.stdout
+    );
     assert!(doctor.stdout.ends_with('\n'), "{:?}", doctor.stdout);
     if capture_available() {
         eprintln!("P11SCOPE_TEST_BRANCH=positive");
-        assert!(
-            matches!(doctor.code, Some(0) | Some(1)),
-            "{:?}",
-            doctor.code
-        );
+        for (name, code) in [("default", doctor.code), ("verbose", verbose.code)] {
+            assert!(matches!(code, Some(0) | Some(1)), "{name}: {code:?}");
+        }
     } else {
         eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
         require_capture_positive("b6_doctor_reports_rows_and_verdict");
         assert_eq!(doctor.code, Some(1));
+        assert_eq!(verbose.code, Some(1));
         assert!(
-            doctor.stdout.contains("capture unavailable"),
+            verbose.stdout.contains("capture unavailable"),
             "{}",
-            doctor.stdout
+            verbose.stdout
         );
     }
 }
@@ -290,9 +296,14 @@ fn b7_run_refuses_without_capture_lane() {
     if !available && unsafe { libc::geteuid() } != 0 {
         // HIGH-1 (flipped from the F-01 hazard pin): without privilege the
         // uretprobe self-probe cannot load BPF, which is a missing-privilege
-        // fact, not a seccomp hazard. The refusal says so, points at doctor,
-        // and never offers the override — which cannot grant privilege, so
-        // taking it changes nothing.
+        // fact, not a seccomp hazard. The refusal says so and never offers
+        // the override — which cannot grant privilege, so taking it changes
+        // nothing. A permission denial points at sudo and inspect; other
+        // causes point at doctor and inspect.
+        let host_refusal = multi_host::refusal();
+        let denied = host_refusal
+            .as_ref()
+            .is_some_and(|reason| reason.starts_with("live capture needs root"));
         for args in [
             &["run", "--", "/bin/true"][..],
             &[
@@ -304,18 +315,37 @@ fn b7_run_refuses_without_capture_lane() {
         ] {
             let refused = run(args);
             assert_eq!(refused.code, Some(1), "{args:?}");
+            if let Some(reason) = &host_refusal {
+                assert_eq!(refused.stderr, format!("p11scope: {reason}\n"), "{args:?}");
+            }
             assert!(
-                refused
-                    .stderr
-                    .contains("cannot load p11scope's BPF programs"),
+                refused.stderr.contains("live capture "),
                 "{args:?}: {}",
                 refused.stderr
             );
             assert!(
-                refused.stderr.contains("p11scope doctor"),
+                refused.stderr.contains("p11scope inspect --pid"),
                 "{args:?}: {}",
                 refused.stderr
             );
+            if denied {
+                assert!(
+                    refused.stderr.contains("sudo"),
+                    "{args:?}: {}",
+                    refused.stderr
+                );
+                assert!(
+                    !refused.stderr.contains("p11scope doctor"),
+                    "{args:?}: {}",
+                    refused.stderr
+                );
+            } else {
+                assert!(
+                    refused.stderr.contains("p11scope doctor"),
+                    "{args:?}: {}",
+                    refused.stderr
+                );
+            }
             assert!(
                 !refused
                     .stderr
@@ -370,7 +400,7 @@ fn j1_fresh_eyes_learn_one_subcommand() {
 }
 
 #[test]
-fn j2_unprivileged_profile_names_inspect_and_doctor() {
+fn j2_unprivileged_profile_names_inspect_and_next_step() {
     if !capture_available() {
         let target = SleepTarget::spawn();
         let refused = run(&["profile", "--pid", &target.pid(), "--duration", "1"]);
@@ -380,11 +410,22 @@ fn j2_unprivileged_profile_names_inspect_and_doctor() {
             "{}",
             refused.stderr
         );
-        assert!(
-            refused.stderr.contains("doctor --pid"),
-            "{}",
-            refused.stderr
-        );
+        let denied = multi_host::refusal()
+            .is_some_and(|reason| reason.starts_with("live capture needs root"));
+        if denied {
+            assert!(refused.stderr.contains("sudo"), "{}", refused.stderr);
+            assert!(
+                !refused.stderr.contains("p11scope doctor"),
+                "{}",
+                refused.stderr
+            );
+        } else {
+            assert!(
+                refused.stderr.contains("p11scope doctor"),
+                "{}",
+                refused.stderr
+            );
+        }
     }
 }
 
@@ -394,46 +435,46 @@ fn j2_unprivileged_inspect_succeeds_with_guidance() {
     let inspect = run(&["inspect", "--pid", &target.pid()]);
     assert_eq!(inspect.code, Some(0));
     assert!(
-        inspect.stdout.contains("PKCS#11 modules mapped"),
+        inspect.stdout.contains("provider files mapped"),
         "{}",
         inspect.stdout
     );
 }
 
 #[test]
-fn j3_nonexistent_and_exited_pids_no_longer_share_one_pin_message() {
+fn j3_nonexistent_and_exited_pids_share_one_missing_line() {
+    // A typo'd pid and a raced exit read identically modulo the pid: one
+    // line naming the pid, exit 1, empty stdout.
     let missing = run(&["profile", "--pid", "99999999", "--duration", "1"]);
     assert_eq!(missing.code, Some(1));
-    assert!(
-        missing.stderr.contains("cannot pin pid 99999999"),
-        "{}",
-        missing.stderr
+    assert_eq!(
+        missing.stderr,
+        "p11scope: no process with PID 99999999 (it exited, or the PID is mistyped)\n"
     );
+    assert!(missing.stdout.is_empty());
 
     let dead = exited_pid();
     let raced = run(&["profile", "--pid", &dead, "--duration", "1"]);
     assert_eq!(raced.code, Some(1));
-    assert!(
-        raced.stderr.contains(&format!("cannot pin pid {dead}")),
-        "{}",
-        raced.stderr
+    assert_eq!(
+        raced.stderr,
+        format!("p11scope: no process with PID {dead} (it exited, or the PID is mistyped)\n")
     );
+    assert!(raced.stdout.is_empty());
 
-    // F6 fixed (Task 3): a typo'd pid and a raced exit no longer read
-    // identically — each names its own cause and next check.
     let normalize = |text: &str, pid: &str| text.replace(pid, "<pid>");
-    assert_ne!(
+    assert_eq!(
         normalize(&missing.stderr, "99999999"),
         normalize(&raced.stderr, &dead),
     );
 
     let inspect = run(&["inspect", "--pid", "99999999"]);
     assert_eq!(inspect.code, Some(1));
-    assert!(
-        inspect.stderr.contains("cannot pin pid 99999999"),
-        "{}",
-        inspect.stderr
+    assert_eq!(
+        inspect.stderr,
+        "p11scope: no process with PID 99999999 (it exited, or the PID is mistyped)\n"
     );
+    assert!(inspect.stdout.is_empty());
 }
 
 #[test]
@@ -602,41 +643,21 @@ fn t3_f5_mode_error_lists_valid_values_inline() {
 }
 
 #[test]
-fn t3_f6_typo_and_exited_pids_read_differently() {
-    // F6 fixed (Task 3): a pid above the kernel maximum never named a
-    // process (a typo), while an in-range pid with no live process exited
-    // or is an in-range typo — each names its own next check. Exit 1.
-    let missing = run(&["profile", "--pid", "99999999", "--duration", "1"]);
-    assert_eq!(missing.code, Some(1));
-    assert!(
-        missing.stderr.contains("cannot pin pid 99999999"),
-        "{}",
-        missing.stderr
-    );
-    assert!(missing.stderr.contains("no such pid"), "{}", missing.stderr);
-    assert!(missing.stderr.contains("typo"), "{}", missing.stderr);
-
+fn t3_f6_missing_pid_reads_one_line_on_trace_and_inventory() {
+    // The same one line on the other pid-scoped commands: trace shares
+    // the capture entry, inventory refuses before any sink exists.
     let dead = exited_pid();
-    let raced = run(&["profile", "--pid", &dead, "--duration", "1"]);
-    assert_eq!(raced.code, Some(1));
-    assert!(
-        raced.stderr.contains(&format!("cannot pin pid {dead}")),
-        "{}",
-        raced.stderr
-    );
-    assert!(raced.stderr.contains("exited"), "{}", raced.stderr);
-    assert!(
-        raced.stderr.contains(&format!("ps -p {dead}")),
-        "{}",
-        raced.stderr
-    );
-
-    // The two failures no longer read identically.
-    let normalize = |text: &str, pid: &str| text.replace(pid, "<pid>");
-    assert_ne!(
-        normalize(&missing.stderr, "99999999"),
-        normalize(&raced.stderr, &dead),
-    );
+    let expected =
+        format!("p11scope: no process with PID {dead} (it exited, or the PID is mistyped)\n");
+    for args in [
+        vec!["trace", "--pid", &dead, "--duration", "1"],
+        vec!["inventory", "--pid", &dead],
+    ] {
+        let outcome = run(&args);
+        assert_eq!(outcome.code, Some(1), "{args:?}");
+        assert_eq!(outcome.stderr, expected, "{args:?}");
+        assert!(outcome.stdout.is_empty(), "{args:?}");
+    }
 }
 
 #[test]
@@ -661,6 +682,20 @@ fn t3_f7_attach_refusal_points_at_doctor() {
                 "{}",
                 refused.stderr
             );
+            if reason.starts_with("live capture needs root") {
+                assert!(refused.stderr.contains("sudo"), "{}", refused.stderr);
+                assert!(
+                    !refused.stderr.contains("p11scope doctor"),
+                    "{}",
+                    refused.stderr
+                );
+            } else {
+                assert!(
+                    refused.stderr.contains("p11scope doctor"),
+                    "{}",
+                    refused.stderr
+                );
+            }
         } else {
             assert!(
                 refused.stderr.contains("starting attach session"),
@@ -672,12 +707,12 @@ fn t3_f7_attach_refusal_points_at_doctor() {
                 "{}",
                 refused.stderr
             );
+            assert!(
+                refused.stderr.contains("p11scope doctor"),
+                "{}",
+                refused.stderr
+            );
         }
-        assert!(
-            refused.stderr.contains("p11scope doctor"),
-            "{}",
-            refused.stderr
-        );
     }
 }
 
@@ -845,7 +880,7 @@ fn high1_missing_privilege_is_named_and_never_offers_the_override() {
             refused.stderr
         );
         assert!(
-            refused.stderr.contains("requires root") && refused.stderr.contains("sudo"),
+            refused.stderr.contains("needs root") && refused.stderr.contains("sudo"),
             "{args:?}: {}",
             refused.stderr
         );
@@ -854,7 +889,7 @@ fn high1_missing_privilege_is_named_and_never_offers_the_override() {
 
 /// HIGH-2: a target whose mappings cannot be read (pid 1 belongs to root)
 /// is the documented hard error — exit 1, empty stdout, one stderr line
-/// with the cause and the fix — never a clean "0 PKCS#11 modules mapped".
+/// with the cause and the fix — never a clean "0 provider files mapped".
 #[test]
 fn high2_inspect_of_an_unreadable_target_exits_1_with_the_fix() {
     if unsafe { libc::geteuid() } == 0 {
@@ -1266,7 +1301,7 @@ fn b2_huge_duration_is_a_usage_error_not_a_panic() {
 /// dual-outcome test that forgets the call fails here by name.
 ///
 /// Exempt by design, not by omission:
-/// - `j2_unprivileged_profile_names_inspect_and_doctor`,
+/// - `j2_unprivileged_profile_names_inspect_and_next_step`,
 ///   `t3_f7_attach_refusal_points_at_doctor` and
 ///   `high1_missing_privilege_is_named_and_never_offers_the_override` pin
 ///   the unprivileged refusal itself and assert nothing once capture
@@ -1286,7 +1321,7 @@ fn every_capture_branch_names_the_require_guard() {
         "the require guard no longer reads the variable in {path}"
     );
     let exempt = [
-        "j2_unprivileged_profile_names_inspect_and_doctor",
+        "j2_unprivileged_profile_names_inspect_and_next_step",
         "t3_f7_attach_refusal_points_at_doctor",
         "high1_missing_privilege_is_named_and_never_offers_the_override",
         "high4_a_closed_stdout_reader_never_panics",

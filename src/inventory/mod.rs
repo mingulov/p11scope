@@ -745,21 +745,28 @@ pub fn run(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
-    // The opt-in gates before any load: a scan pairing refuses by
-    // name (mirroring the parse refusal for programmatic callers),
-    // and a build without the journal object refuses with the finite
-    // build reason. Never silently ignored.
+    // The opt-in gate before any load: a scan pairing refuses by
+    // name (mirroring the parse refusal for programmatic callers).
+    // A build without the journal object does NOT refuse here
+    // (F-08): `start_semantic_lane` owns that refusal, naming the
+    // finite build reason as a key-operations gap while broad S1
+    // inventory continues. Never silently ignored.
     if key_operations && capture == CaptureMode::Scan {
         anyhow::bail!("--key-operations requires --capture auto or native");
-    }
-    if key_operations {
-        crate::attach::journal::JournalSpec.prepare().map(|_| ())?;
     }
     let scope: crate::cli::ScopeArg = scope.into();
     if identity_backend_explicit && !matches!(scope, crate::cli::ScopeArg::System) {
         anyhow::bail!(
             "--identity-backend cannot be used outside system inventory (use inventory --system)"
         );
+    }
+    // A named pid with no live process fails here with the one operator
+    // line, before budgets, sinks, or scans: there is nothing to observe.
+    // The inner run fns keep their own flows for unit-test seams.
+    if let crate::cli::ScopeArg::Pid(pid) = &scope
+        && crate::process::generation_gone(*pid)
+    {
+        return Err(crate::process::MissingNamedProcess { pid: *pid }.into());
     }
     let endpoint_budget = inventory_endpoint_budget(max_endpoints).map_err(anyhow::Error::msg)?;
     // Past the usage refusals: arm display shaping for the whole run.
@@ -1323,8 +1330,18 @@ fn run_with_terminal_budget(
         Some(pin_inventory_prearm(prearm_modules, scope)?)
     };
     validate_primary_destinations(out, event_log)?;
-    if capture != CaptureMode::Scan {
-        let _host = host()?;
+    if capture != CaptureMode::Scan
+        && let Err(refusal) = host()
+    {
+        // An auto PID capture without root falls back to the scan lane
+        // (never-stop) instead of failing here: the native opening
+        // below records the named fallback gap. Other scopes and modes
+        // keep the fatal host refusal before any sink exists.
+        let pid_auto_fallback =
+            capture == CaptureMode::Auto && matches!(scope, InventoryRunScope::Pid(_));
+        if !pid_auto_fallback {
+            return Err(refusal.into());
+        }
     }
     // D3d: forced-kernel preflight before any sink exists. A refused
     // kernel is a named nonzero error, never a successful empty
@@ -1413,6 +1430,7 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
+    coordinator.set_key_operations_requested(key_operations);
     // Packet 6.13 round-2 (F5): the startup pinning above is retained
     // for the run, its proved offsets lower into the run's attach set
     // before passes, and one interval row per input renders in `prearm[]`.
@@ -1486,6 +1504,7 @@ fn run_with_terminal_budget(
                 &engine_scope,
                 attach_backend,
                 key_operations,
+                false,
             )
         })
     };
@@ -1562,6 +1581,11 @@ fn run_with_terminal_budget(
     let deadline = cgroup
         .as_ref()
         .map_or_else(|| deadline_for_duration(duration), |state| state.deadline);
+    // The deferred scan seal consumes per-pass mint sources the
+    // coordinator only retains when told an attempt will come.
+    if manifests.is_empty() && key_operations && native_available {
+        coordinator.note_scan_mint_requested();
+    }
     let mut driver = ClassicDriver {
         coordinator: &mut coordinator,
         inventory_scope,
@@ -1573,6 +1597,7 @@ fn run_with_terminal_budget(
         attach_backend,
         display: None,
         semantic,
+        scan_seal_pending: manifests.is_empty() && key_operations && native_available,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(request.second_signal),
@@ -1641,11 +1666,21 @@ fn run_with_terminal_budget(
                 ) else {
                     return Ok(());
                 };
-                // Under --quiet the summary head already carries the
-                // coverage totals; the per-pass stderr detail stays silent.
-                if !crate::inventory_present::snapshot_summary_only() {
-                    for line in progress_lines(coordinator, report) {
-                        inventory_diagnostic(&line);
+                // The summary head already carries the coverage
+                // totals; the per-pass stderr detail is verbose-only.
+                // Pass 0's headline stays at every verbosity: it is the
+                // capture-readiness signal scripts match (`p11scope: pass 0:`).
+                // The stage-timings line stays whenever its env opt-in set
+                // it: the benches parse it without -v. The match pins the
+                // pass number, so a hostile event reason cannot forge it.
+                let verbose = crate::cli::text_is_verbose();
+                let timings_prefix = format!("p11scope: pass {}: stage timings: ", report.pass);
+                for (index, line) in progress_lines(coordinator, report).iter().enumerate() {
+                    if verbose
+                        || (report.pass == 0 && index == 0)
+                        || line.starts_with(&timings_prefix)
+                    {
+                        inventory_diagnostic(line);
                     }
                 }
                 // The pass freed its pin batch; hand the peak back before
@@ -1697,23 +1732,31 @@ fn run_with_terminal_budget(
     let running = run_classic_finalizing(&mut driver, lane, &clock, initial_error, &mut publish);
     let (stopped, capture_error, zero_pass) = driver.consume_outcome(running, &clock, &mut publish);
     // Terminal pre-arm close for the scan lane only (no `on_lane_stopped`):
-    // the native lane already closed before its final commit. Uses the
+    // the native lane already closed before its final commit. The scan
+    // tail also discloses post-pass newcomers here (the native lane did
+    // in `on_lane_stopped`): starters no completed pass saw would
+    // otherwise stay invisible in scan mode. The pre-arm close uses the
     // frozen probe result from `on_stop_requested` plus any capture failure,
     // never a re-read past retirement: an operator stop or failure ends
     // `Stop`, a deadline `ScopeEnd`. The guarded lane-aware commit publishes
     // the staged changed-identity gap; runs without pre-arm commit nothing
     // extra, and a pending publication still keeps its prior view.
-    if stopped.is_none() && driver.coordinator.has_prearm() {
-        let stop = driver.prearm_probe_stop.unwrap_or(false)
-            || capture_error.is_some()
-            || driver.coordinator.capture_failed();
-        let cause = if stop {
-            crate::render::PrearmWatchEnd::Stop
-        } else {
-            crate::render::PrearmWatchEnd::ScopeEnd
-        };
-        driver.coordinator.finish_prearm_watches(cause, None);
-        let _ = driver.commit(false);
+    if stopped.is_none() {
+        let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        if driver.coordinator.has_prearm() {
+            let stop = driver.prearm_probe_stop.unwrap_or(false)
+                || capture_error.is_some()
+                || driver.coordinator.capture_failed();
+            let cause = if stop {
+                crate::render::PrearmWatchEnd::Stop
+            } else {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            };
+            driver.coordinator.finish_prearm_watches(cause, None);
+            let _ = driver.commit(false);
+        } else if terminal_newcomers {
+            let _ = driver.commit(false);
+        }
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
@@ -2222,6 +2265,12 @@ struct ClassicDriver<'a> {
     /// attested a subset. Ticks drive H0; commits finalize beside the
     /// physical evidence; the stop path owns its terminal sequence.
     semantic: Option<crate::inventory_semantics::AttestedSemanticLane>,
+    /// DEMO-4 deferred scan seal: with `--key-operations` and no
+    /// manifest, no subset exists before the first discovery pass,
+    /// so the lane start retries after engine-changing passes until
+    /// a scan-derived subset mints (then this clears). Never set
+    /// when a manifest was given.
+    scan_seal_pending: bool,
     /// A lane batch is already staged ahead of the next commit: at most
     /// one ordinary collection quantum is owned at a time, so later
     /// ticks in the same pass stay quiet instead of backpressuring.
@@ -2367,6 +2416,7 @@ pub(crate) fn classic_semantic_ticks_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2437,6 +2487,7 @@ pub(crate) fn classic_semantic_pass_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2620,6 +2671,7 @@ pub(crate) fn classic_semantic_stop_for_test(
         identity: None,
         display: None,
         semantic: Some(lane),
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2716,6 +2768,7 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         identity: None,
         display: Some(display),
         semantic: None,
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2864,6 +2917,9 @@ struct SemanticStopCounts {
     lost: u64,
     bindings: u64,
     refused: u64,
+    hook_misses: u64,
+    eras: u64,
+    instances: u64,
 }
 
 impl SemanticStopCounts {
@@ -2875,6 +2931,7 @@ impl SemanticStopCounts {
         let (collected, joined, shed, refused) = lane.semantic_stop_call_counts();
         let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
+        let (hook_misses, eras, instances) = lane.semantic_era_counts();
         Self {
             refusals,
             collected,
@@ -2883,6 +2940,9 @@ impl SemanticStopCounts {
             lost,
             bindings,
             refused,
+            hook_misses,
+            eras,
+            instances,
         }
     }
 }
@@ -2905,6 +2965,9 @@ fn disclose_semantic_stop(
         counts.lost,
         counts.bindings,
         counts.refused,
+        counts.hook_misses,
+        counts.eras,
+        counts.instances,
     ));
     // Diagnostic-only settlement latency rides the same disclosure:
     // cumulative since enabling, silent unless the toggle enabled it.
@@ -2952,6 +3015,21 @@ impl ClassicDriver<'_> {
         Self::warn_recorded(&mut self.display, warning);
     }
 
+    /// Scan-lane terminal newcomer disclosure, shared by both run tails
+    /// (the native lane discloses in `on_lane_stopped`, which scan mode
+    /// skips): diff the stop-time enumeration against the completed
+    /// passes. True when anything staged, so the tail can publish it;
+    /// silent runs commit nothing extra.
+    fn disclose_scan_terminal_newcomers(&mut self) -> bool {
+        let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
+        let staged = self
+            .coordinator
+            .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
+        // The counted short-lived gap stages beside the named disclosure.
+        let counted = self.coordinator.note_short_lived_never_scanned();
+        staged || counted
+    }
+
     /// One warning through a split display borrow (the stop
     /// disclosure calls this where `warn` cannot borrow `self`):
     /// stderr on the classic path, the log tail under the dashboard.
@@ -2990,6 +3068,49 @@ impl ClassicDriver<'_> {
     /// promoted lane at install. Success makes the lane Joint; refusal
     /// keeps the legacy one-sided path with one disclosure gap.
     /// In v0.5.0 (R-50) the bound machine installs no key-operation feed: the lane stays S1-only with one `joint_journal_unavailable` disclosure.
+    /// DEMO-4 deferred scan seal: the first pass retains the
+    /// scan-discovered tables the startup mint could not see.
+    /// A refused or empty mint keeps the pending flag for the
+    /// next pass, bounded and honest. The attempt is NOT gated
+    /// on the pass report's engine-changed flag: that flag only
+    /// tracks native owner commits, so a system scan-lane pass
+    /// (zero native callers) would never set it and the seal
+    /// would never be attempted (fedora diag1, 2026-11-05).
+    fn attempt_deferred_scan_seal(&mut self, scope: InspectScope) {
+        if self.semantic.is_none() && self.scan_seal_pending {
+            let engine_scope = Scope::from(scope);
+            if let Some(lane) = start_semantic_lane(
+                self.coordinator,
+                &engine_scope,
+                self.attach_backend,
+                true,
+                true,
+            ) {
+                // A refused live start returns the fallback shell:
+                // drop it and keep the seal pending so the next
+                // pass retries (a transient multi-provider moment
+                // must not disable the seal for the whole run,
+                // fedora cr-late-3). Only a lane that did not fail
+                // startup seats and clears the pending flag.
+                if !lane.startup_failed() {
+                    let live = lane.is_live();
+                    self.semantic = Some(lane);
+                    self.scan_seal_pending = false;
+                    if live {
+                        self.coordinator.note_scope_gap(
+                            "semantic subset scan-derived".into(),
+                            "key operations use scan-discovered tables without a manifest; \
+                             table provenance is scan publication evidence (linked, \
+                             live-returned or sole complete tables), not operator attestation"
+                                .into(),
+                        );
+                        self.initialize_joint_lane();
+                    }
+                }
+            }
+        }
+    }
+
     fn initialize_joint_lane(&mut self) {
         let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
         let Some(lane) = semantic.as_mut() else {
@@ -3514,6 +3635,9 @@ impl ClassicDriver<'_> {
         // user-visible name. Outside the counts once-gate: the wedge is
         // new information even past a counts disclosure.
         if let Some(trip) = lane.joint_finish_no_progress_trip() {
+            // Staged calls left unsealed across the trip count
+            // once as `watchdog_no_progress` at publication.
+            coordinator.note_joint_watchdog_trip();
             warn.emit(&format!(
                 "joint finish made no progress for {}s across {} polls; the lane is held for exit",
                 trip.stalled.as_secs(),
@@ -3539,6 +3663,11 @@ impl ClassicDriver<'_> {
         // beside the finish wedge above: the wedge is new
         // information even past a counts disclosure.
         let running_trip = lane.joint_audit_no_progress_trip();
+        if running_trip.is_some() {
+            // Same watchdog count for a running (audit) trip: the
+            // lane stops, so its staged calls never seal.
+            coordinator.note_joint_watchdog_trip();
+        }
         let abandoned = publication_stood && !coordinator.publication_pending();
         if let Some(line) = Self::held_live_publication_line(
             running_trip.map(|trip| trip.stalled.as_secs()),
@@ -5066,8 +5195,14 @@ where
             });
         // No drainer thread: the load runs undrained, exactly as before
         // the startup drain (the ring keeps what it can and counts the
-        // rest).
-        let _ = drainer;
+        // rest). Say so once, so the counted ring loss has a cause.
+        if let Err(error) = drainer {
+            eprintln!(
+                "p11scope: startup lifecycle drain unavailable ({}); \
+                 the semantic start runs undrained",
+                error.kind()
+            );
+        }
         // Released on return and on unwind, so the scope never waits on
         // a drainer whose load panicked.
         let _done = Done(&done);
@@ -5086,6 +5221,7 @@ fn start_semantic_lane(
     scope: &Scope,
     backend: crate::attach::BackendSelection,
     key_operations: bool,
+    scan_subset: bool,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     // The bytes rule before any semantic-lane BPF work: a stale or
     // mismatched embedded object degrades here with the plain mismatch
@@ -5099,14 +5235,24 @@ fn start_semantic_lane(
         inventory_diagnostic(&format!(
             "p11scope: {message}; broad inventory continues without instance semantics"
         ));
-        return fallback_shell(coordinator, scope, backend);
+        return fallback_shell(coordinator, scope, backend, scan_subset);
     }
     if key_operations {
         let spec = crate::attach::journal::JournalSpec;
         // Guard refusals at the mints disclose and end the startup
         // here, exactly as without the flag: only a refused journal
-        // *start* retries ordinary, never a refused subset.
-        let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+        // *start* retries ordinary, never a refused subset. The
+        // subset refusal additionally names its path's remedy (rerun
+        // on the scan path, check-the-manifest when manifests were
+        // supplied), since the flag asked for rows no subset can serve.
+        let (attach_subset, convert_subset) =
+            match seal_mint_start_subsets(coordinator, scan_subset) {
+                Ok(pair) => pair,
+                Err(refusals) => {
+                    note_key_operations_subset_refused(coordinator, &refusals, scan_subset);
+                    return None;
+                }
+            };
         match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
             Ok(lane) => {
                 note_semantic_lane_sealed();
@@ -5120,10 +5266,17 @@ fn start_semantic_lane(
                         "{reason}; broad inventory continues with S1 mechanisms and API results"
                     ),
                 );
+                inventory_diagnostic(&format!(
+                    "p11scope: key operations unavailable: {reason}; broad inventory \
+                     continues with S1 mechanisms and API results"
+                ));
             }
         }
     }
-    let (attach_subset, convert_subset) = seal_mint_start_subsets(coordinator)?;
+    let Ok((attach_subset, convert_subset)) = seal_mint_start_subsets(coordinator, scan_subset)
+    else {
+        return None;
+    };
     match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
         Ok(lane) => {
             note_semantic_lane_sealed();
@@ -5134,34 +5287,41 @@ fn start_semantic_lane(
                 "semantic lane unavailable".into(),
                 format!("{refusal}; broad inventory continues without instance semantics"),
             );
-            fallback_shell(coordinator, scope, backend)
+            fallback_shell(coordinator, scope, backend, scan_subset)
         }
     }
 }
 
 /// Mint the attach + conversion subset pair over the same retained
-/// accepted sources, disclosing subset refusals; `None` when either
-/// mint fails (the retained inputs moved under the startup). The
-/// flag-on ordinary retry re-mints through this after the refused
-/// journal start consumed its subsets.
+/// accepted sources, disclosing subset refusals; `Err` with the
+/// failing mint's codes when either mint fails (the retained inputs
+/// moved under the startup). The flag-on ordinary retry re-mints
+/// through this after the refused journal start consumed its subsets.
 fn seal_mint_start_subsets(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
-) -> Option<(
-    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
-    crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
-)> {
-    let preparation = seal_prepare_subset(coordinator);
+    scan_subset: bool,
+) -> Result<
+    (
+        crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+        crate::discovery::engine::inventory_coordinator::semantics::AttestedSubset,
+    ),
+    Vec<crate::inventory_semantics::SemanticRefusal>,
+> {
+    let preparation = seal_prepare_subset(coordinator, scan_subset);
     for refusal in &preparation.refusals {
         coordinator.note_scope_gap(
             "semantic subset refused".into(),
             format!("{refusal}; broad inventory continues without instance semantics"),
         );
     }
-    let attach_subset = preparation.subset?;
+    let attach_subset = match preparation.subset {
+        Some(subset) => subset,
+        None => return Err(preparation.refusals),
+    };
     // The second mint over the same retained sources stays the lane's
     // conversion envelope; it fails only when the retained inputs
     // moved under the startup.
-    let second = seal_prepare_subset(coordinator);
+    let second = seal_prepare_subset(coordinator, scan_subset);
     let convert_subset = match second.subset {
         Some(subset) => subset,
         None => {
@@ -5171,10 +5331,55 @@ fn seal_mint_start_subsets(
                     format!("{refusal}; broad inventory continues without instance semantics"),
                 );
             }
-            return None;
+            return Err(second.refusals);
         }
     };
-    Some((attach_subset, convert_subset))
+    Ok((attach_subset, convert_subset))
+}
+
+/// `--key-operations` was requested but no semantic subset minted:
+/// disclose the failing mint's codes with its path's remedy, since
+/// the flag asked for rows no subset can serve. The scan path (no
+/// manifests) reruns with `--manifest`; the manifest path (manifests
+/// supplied) checks them, since a rerun clause would lie. Quiet when
+/// the mint refused silently (nothing discovered yet — the scan mint
+/// retries per pass by design). The gap repeats per attempt like its
+/// subset sibling; the stderr line speaks only on its first appearance.
+fn note_key_operations_subset_refused(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    refusals: &[crate::inventory_semantics::SemanticRefusal],
+    scan_subset: bool,
+) {
+    if refusals.is_empty() {
+        return;
+    }
+    let codes = refusals
+        .iter()
+        .map(|refusal| refusal.to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let reason = if scan_subset {
+        format!(
+            "subset refused ({codes}); provider function tables cannot be verified \
+             without operator attestation: rerun with --manifest <manifest.json> \
+             for per-key rows; broad inventory continues with S1 mechanisms and API results"
+        )
+    } else {
+        format!(
+            "subset refused ({codes}); provider function tables cannot be verified \
+             from the supplied --manifest inputs: check the manifest inputs \
+             for per-key rows; broad inventory continues with S1 mechanisms and API results"
+        )
+    };
+    let fresh = !coordinator
+        .registry()
+        .gaps()
+        .iter()
+        .any(|gap| gap.subject == "key operations unavailable" && gap.reason == reason);
+    coordinator.note_scope_gap("key operations unavailable".into(), reason.clone());
+    if fresh {
+        inventory_diagnostic(&format!("p11scope: key operations unavailable: {reason}"));
+    }
 }
 
 /// Finite reason for a refused journal start. The build gate's own
@@ -5191,9 +5396,10 @@ fn key_operations_refusal_reason(refusal: &crate::inventory_semantics::SemanticR
 
 /// Pure verdict behind [`key_operations_refusal_reason`]: a present,
 /// flavor-clean pair names the live refusal's own code; every other
-/// parsed shape names its static cause. (The omitted build never
-/// reaches here — the gate above refused it — so it folds into the
-/// live refusal's code.)
+/// parsed shape names its static cause. (The omitted build reaches
+/// here since F-08 removed the `run` gate; the wrapper above names
+/// its build reason first, so this verdict folds it into the live
+/// refusal's code only as a backstop.)
 fn key_operations_refusal_reason_from(
     preflight: crate::attach::JournalPairPreflight,
     refusal: &crate::inventory_semantics::SemanticRefusal,
@@ -5219,9 +5425,10 @@ fn fallback_shell(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
     scope: &Scope,
     backend: crate::attach::BackendSelection,
+    scan_subset: bool,
 ) -> Option<crate::inventory_semantics::AttestedSemanticLane> {
     use crate::inventory_semantics::AttestedSemanticLane;
-    seal_prepare_subset(coordinator)
+    seal_prepare_subset(coordinator, scan_subset)
         .subset
         .and_then(|subset| AttestedSemanticLane::start(subset, scope, backend).ok())
         .map(|mut shell| {
@@ -5235,12 +5442,17 @@ fn fallback_shell(
 /// through `seal_startup_test::with` instead of attesting manifests.
 fn seal_prepare_subset(
     coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    scan_subset: bool,
 ) -> crate::discovery::engine::inventory_coordinator::semantics::SubsetPreparation {
     #[cfg(test)]
     if let Some(prepared) = seal_startup_test::take_prepared() {
         return prepared;
     }
-    coordinator.prepare_semantic_subset()
+    if scan_subset {
+        coordinator.prepare_scan_semantic_subset()
+    } else {
+        coordinator.prepare_semantic_subset()
+    }
 }
 
 /// The seal boundary of the lane startup (BPF): the live lane start
@@ -5812,6 +6024,7 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         if let Some(warning) = warning {
             self.warn(&warning);
         }
+        self.attempt_deferred_scan_seal(scope);
         if let Some(lane) = self.semantic.as_mut() {
             bind_semantic_callers(self.coordinator, lane);
         }
@@ -6161,9 +6374,16 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
-        // Terminal coverage disclosure first: post-last-pass EXEC
-        // newcomers stage before the final commit publishes them.
-        self.coordinator.note_post_pass_exec_newcomers();
+        // Terminal coverage disclosure first: post-last-pass newcomers
+        // (exec hooks plus the stop-time diff over starters no
+        // completed pass saw) stage before the final commit publishes
+        // them. Unlisted stop-time members count against the diff,
+        // never silently covered.
+        let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
+        self.coordinator
+            .note_post_pass_newcomers(&live_at_stop, stop_lost.len());
+        // The counted short-lived gap stages beside the named disclosure.
+        self.coordinator.note_short_lived_never_scanned();
         // Terminal pre-arm close, staged before the loop's final commit so
         // the staged changed-identity gap publishes with it (no extra plain
         // commit). Uses the frozen probe result and stop boundary from
@@ -6487,7 +6707,9 @@ fn open_native_lane_with(
     if mode == CaptureMode::Scan {
         return Ok(None);
     }
-    let capture_scope = match scope.into() {
+    let scope = scope.into();
+    let pid_scope = matches!(scope, Scope::Pid(_));
+    let capture_scope = match scope {
         Scope::Pid(pid) => match PidPin::open(pid) {
             Ok(pin) => crate::attach::capture::CaptureScope::Pid(pin),
             Err(reason) => return unavailable(coordinator, reason),
@@ -6506,6 +6728,26 @@ fn open_native_lane_with(
                 .downcast_ref::<crate::attach::MultiHostRefusal>()
                 .is_some() =>
         {
+            // A host-wide BPF refusal stays fatal, except that an auto PID
+            // capture without root falls back to the scan lane with a named
+            // gap (never-stop): the scan still answers which providers the
+            // process maps, and the gap names the missing live capture.
+            if mode == CaptureMode::Auto && pid_scope {
+                let summary = crate::attach::summarize_native_preparation_error(&error);
+                // The sudo advice is gated on the typed cause: only a
+                // `Denied` refusal (permission/policy) can sudo fix. An
+                // old kernel or a verifier-shaped refusal points at
+                // doctor through the summary itself.
+                let denied = error
+                    .downcast_ref::<crate::attach::MultiHostRefusal>()
+                    .is_some_and(crate::attach::MultiHostRefusal::needs_privilege_hint);
+                let reason = if denied {
+                    format!("live capture refused ({summary}); run with sudo for full capture")
+                } else {
+                    format!("live capture refused ({summary})")
+                };
+                return unavailable(coordinator, reason);
+            }
             return Err(error);
         }
         Err(error) => {
@@ -7455,6 +7697,7 @@ fn run_dashboard(
         attach_backend,
         display: Some(display),
         semantic,
+        scan_seal_pending: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(second_signal),
@@ -7591,18 +7834,24 @@ fn run_dashboard(
     // Terminal pre-arm close for the scan lane only, as on the classic
     // path (the dashboard quit flag is an operator-initiated end): the
     // native lane already closed before its final commit. Frozen probe
-    // plus failure, never a re-read; guarded lane-aware commit.
-    if stopped.is_none() && driver.coordinator.has_prearm() {
-        let stop = driver.prearm_probe_stop.unwrap_or(false)
-            || capture_error.is_some()
-            || driver.coordinator.capture_failed();
-        let cause = if stop {
-            crate::render::PrearmWatchEnd::Stop
-        } else {
-            crate::render::PrearmWatchEnd::ScopeEnd
-        };
-        driver.coordinator.finish_prearm_watches(cause, None);
-        let _ = driver.commit(false);
+    // plus failure, never a re-read; guarded lane-aware commit. The scan
+    // tail also discloses post-pass newcomers, as on the classic path.
+    if stopped.is_none() {
+        let terminal_newcomers = driver.disclose_scan_terminal_newcomers();
+        if driver.coordinator.has_prearm() {
+            let stop = driver.prearm_probe_stop.unwrap_or(false)
+                || capture_error.is_some()
+                || driver.coordinator.capture_failed();
+            let cause = if stop {
+                crate::render::PrearmWatchEnd::Stop
+            } else {
+                crate::render::PrearmWatchEnd::ScopeEnd
+            };
+            driver.coordinator.finish_prearm_watches(cause, None);
+            let _ = driver.commit(false);
+        } else if terminal_newcomers {
+            let _ = driver.commit(false);
+        }
     }
     let presentation =
         final_view_guarded(&driver, &stream_state, &scope_label, started_ns, now_ns());
@@ -8012,6 +8261,7 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "first_ns": unbound.first_ns,
             "rows": unbound.rows,
             "reasons": unbound.reasons,
+            "entries": unbound.entries,
         })),
     })
 }
@@ -8290,6 +8540,19 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
         &mut document,
         presentation,
     );
+    // Additive (v1): logical vs forwarding-layer entry totals. Provider
+    // edges, plus the layer edges of callers with no entries at any
+    // non-closure module or with a refused backend, are logical;
+    // closure-array edges of provider-active callers without a refused
+    // backend observe those same calls from the forwarding layer and are
+    // never summed into logical.
+    {
+        let (logical, forwarding) = crate::inventory_present::layer_entry_totals(presentation);
+        document["layer_totals"] = serde_json::json!({
+            "logical_entries": logical,
+            "forwarding_entries": forwarding,
+        });
+    }
     document
 }
 
@@ -8446,6 +8709,22 @@ pub(crate) fn render_text<Source: ProcessSource>(
     let presentation =
         Presentation::capture(coordinator, scope_label, started_ns, ended_ns, passes);
     render_snapshot(&presentation)
+}
+
+/// [`render_text`] at an explicit verbosity: the tests' race-free
+/// handle for full-detail text pins.
+#[cfg(test)]
+pub(crate) fn render_text_with_verbosity<Source: ProcessSource>(
+    coordinator: &InventoryCoordinator<Source>,
+    scope_label: &str,
+    started_ns: u64,
+    ended_ns: u64,
+    passes: u64,
+    verbosity: crate::cli::TextVerbosity,
+) -> String {
+    let presentation =
+        Presentation::capture(coordinator, scope_label, started_ns, ended_ns, passes);
+    crate::inventory_present::render_snapshot_with_verbosity(&presentation, verbosity)
 }
 
 #[cfg(test)]
@@ -9382,6 +9661,48 @@ mod tests {
         child.wait().unwrap();
     }
 
+    /// Inventory JSON positive arm: when the engine discloses
+    /// unobserved windows, the `prearm[]` row carries each window with
+    /// its exact bounds and reason. (The scan-lane twins pin the
+    /// absent side; the engine seam pins the windows themselves; the
+    /// attaching lane that joins both needs live BPF.)
+    #[test]
+    fn inventory_prearm_json_carries_unobserved_windows_verbatim() {
+        use crate::discovery::engine::inventory_coordinator::PrearmReportRow;
+        let row = PrearmReportRow {
+            path: "/tmp/libprearm.so".into(),
+            dev: (8, 1),
+            ino: 4242,
+            sha256: Some("row-sha".into()),
+            mapped: true,
+            watch: None,
+            attached_at_ns: Some(900),
+            unobserved_windows: Some(vec![
+                crate::render::UnobservedWindow {
+                    start_ns: 50,
+                    end_ns: 900,
+                    reason: crate::render::UnobservedReason::PreAttach,
+                },
+                crate::render::UnobservedWindow {
+                    start_ns: 900,
+                    end_ns: 950,
+                    reason: crate::render::UnobservedReason::MappedUnattached,
+                },
+            ]),
+        };
+        let value = prearm_json(&row);
+        let windows = value["unobserved_windows"]
+            .as_array()
+            .expect("the windows array: {value}");
+        assert_eq!(windows.len(), 2, "every window: {value}");
+        assert_eq!(windows[0]["start_ns"], 50);
+        assert_eq!(windows[0]["end_ns"], 900);
+        assert_eq!(windows[0]["reason"], "pre_attach");
+        assert_eq!(windows[1]["start_ns"], 900);
+        assert_eq!(windows[1]["end_ns"], 950);
+        assert_eq!(windows[1]["reason"], "mapped_unattached");
+    }
+
     /// Inventory JSON twin: rename-over between pin and capture end
     /// keeps the pinned inode and reports the change — the `changed`
     /// uncertainty bracket, the `object_changed` end, and the
@@ -9601,6 +9922,146 @@ mod tests {
         }
     }
 
+    /// Item 6: an auto PID run passes the host preflight on a host-wide
+    /// BPF refusal (no root) and falls back to the scan lane with a named
+    /// gap instead of failing. System scope stays fatal (see
+    /// `refused_multi_host_precedes_inventory_sinks_and_auto_fallback`).
+    #[test]
+    fn auto_pid_run_passes_preflight_to_scan_on_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            move |_, _, _| Err(refusal.into()),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::Pid(std::process::id()),
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| {
+                        Err(MultiHostRefusal::for_test(
+                            MultiHostStage::ProgramLoad,
+                            Some(libc::EACCES),
+                        ))
+                    },
+                    None,
+                    None,
+                    false,
+                )
+            },
+        )
+        .expect("auto PID run falls back to scan on host refusal");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_scan_fallback(&document);
+    }
+
+    /// Item 6: an auto PID capture whose native preparation hits a
+    /// host-wide BPF refusal (no root) falls back to the scan lane with a
+    /// named gap instead of failing. System scope stays fatal (see the
+    /// test above).
+    #[test]
+    fn auto_pid_capture_falls_back_to_scan_on_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let mut coordinator = coordinator();
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let lane = open_native_lane_with(
+            CaptureMode::Auto,
+            BackendSelection::Auto,
+            Scope::Pid(std::process::id()),
+            &mut coordinator,
+            |_, _, _| Err(refusal.into()),
+        )
+        .expect("auto PID capture falls back to scan on host refusal");
+        assert!(lane.is_none(), "fallback leaves no native lane");
+        coordinator.registry_mut().publish();
+        let gaps: Vec<(String, String)> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+            .collect();
+        let (_, reason) = gaps
+            .iter()
+            .find(|(subject, _)| subject == "native usage feed unavailable")
+            .expect("fallback records a named gap");
+        // ProgramLoad EACCES is `Unproven` (verifier-shaped): sudo cannot
+        // help, so the gap carries no sudo advice.
+        assert!(!reason.contains("sudo"), "{reason}");
+        assert!(
+            reason.starts_with("live capture refused (live capture did not start: "),
+            "{reason}"
+        );
+    }
+
+    /// Item 6: the auto PID fallback advises sudo only when the typed
+    /// host cause is `Denied` (sudo cannot help an old kernel or a
+    /// verifier-shaped refusal).
+    #[test]
+    fn auto_pid_fallback_advises_sudo_only_for_denied() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        for (stage, errno, sudo) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EPERM), true),
+            (MultiHostStage::SelfLink, Some(libc::EACCES), true),
+            (MultiHostStage::ProgramLoad, Some(libc::EACCES), false),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS), false),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL), false),
+            (MultiHostStage::Anchor, None, false),
+        ] {
+            let mut coordinator = coordinator();
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let lane = open_native_lane_with(
+                CaptureMode::Auto,
+                BackendSelection::Auto,
+                Scope::Pid(std::process::id()),
+                &mut coordinator,
+                |_, _, _| Err(refusal.into()),
+            )
+            .expect("auto PID capture falls back to scan on host refusal");
+            assert!(lane.is_none(), "fallback leaves no native lane");
+            coordinator.registry_mut().publish();
+            let gaps: Vec<(String, String)> = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                .collect();
+            let (_, reason) = gaps
+                .iter()
+                .find(|(subject, _)| subject == "native usage feed unavailable")
+                .expect("fallback records a named gap");
+            assert_eq!(
+                reason.contains("sudo"),
+                sudo,
+                "{stage:?}/{errno:?}: {reason}"
+            );
+        }
+    }
+
     /// Extract one top-level function body from this file's source for the
     /// wiring pin below (the uretprobe loader-contract shape).
     fn pin_body<'a>(
@@ -9633,6 +10094,7 @@ mod tests {
             &mut coordinator,
             &Scope::Pid(std::process::id()),
             crate::attach::BackendSelection::Auto,
+            false,
             false,
         );
         assert!(
@@ -9823,7 +10285,7 @@ mod tests {
                     true,
                     None,
                     None,
-                    Some(8193),
+                    Some(131_073),
                     None,
                     Some(&report),
                     dashboard,
@@ -9843,7 +10305,7 @@ mod tests {
                 .unwrap_err();
                 assert!(
                     error.to_string().contains("--max-endpoints")
-                        && error.to_string().contains("1..=8192")
+                        && error.to_string().contains("1–131072")
                 );
                 assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
             }
@@ -10803,14 +11265,12 @@ mod tests {
             }
             if !stopped {
                 if !isolate_progress {
+                    // Scan-stage progress is verbose-only since CLI-1; the
+                    // default path's marker is the pass-0 headline.
                     let text = String::from_utf8_lossy(&bytes);
                     assert!(
-                        text.contains("p11scope: enumerating processes..."),
-                        "default progress disabled: {text}"
-                    );
-                    assert!(
-                        text.contains("p11scope: lowering scan-only admission and rendering..."),
-                        "default lowering progress lost: {text}"
+                        text.contains("p11scope: pass 0:"),
+                        "default pass headline missing: {text}"
                     );
                 }
                 assert!(
@@ -11316,6 +11776,7 @@ mod tests {
             vec![key],
             110,
             crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+            0,
         );
         let mut census = crate::discovery::native_binding::BindingCensus {
             rows: 3,
@@ -11332,7 +11793,7 @@ mod tests {
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
         assert_eq!(
             document["modules"][0]["unbound_use"],
-            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}})
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0})
         );
         assert_eq!(
             document["observation"]["native_witnesses"],
@@ -11350,6 +11811,431 @@ mod tests {
                 .any(|gap| gap["subject"] == "used by an unidentified caller image"),
             "{}",
             document["gaps"]
+        );
+    }
+
+    #[test]
+    fn json_unbound_use_carries_folded_entry_counts() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // A short-lived image used the module 744 times and exited before
+        // any poll could bind it; the row stays unbound (no_live_caller).
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["entries"], 744,
+            "unbound entry counts fold to the module: {}",
+            document["modules"][0]["unbound_use"]
+        );
+    }
+
+    #[test]
+    fn text_module_detail_states_unbound_entry_lower_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // Same short-lived unbound row as the JSON twin above.
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            text.contains("at least 744 entries"),
+            "module detail states the unbound lower bound:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_module_detail_omits_unidentified_use_for_identified_caller_rows() {
+        use crate::discovery::caller_registry::tests::ScriptedSource;
+        let source = ScriptedSource::default();
+        source.spawn(7, 500);
+        source.spawn(8, 600);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let bound = coordinator
+            .adapter_mut()
+            .admit(7, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let mapped = coordinator
+            .adapter_mut()
+            .admit(8, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        // The module registers through the mapped caller only, so the
+        // bound caller's witness row has no mapping edge to it: its
+        // caller is identified and the gap names it.
+        coordinator.registry_mut().note_mapping(
+            mapped,
+            8,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator
+            .registry_mut()
+            .note_bound_witness(bound, vec![key], 110);
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_mapping_edge": 1}),
+            "identified-caller row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        assert_eq!(document["modules"][0]["unbound_use"]["entries"], 0);
+        let text = render_text_with_verbosity(
+            &coordinator,
+            "pid:7",
+            90,
+            130,
+            2,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("/lib/a.so"), "module detail renders:\n{text}");
+        assert!(
+            !text.contains("unidentified use"),
+            "identified-caller rows are not unidentified use:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_module_detail_omits_unidentified_use_for_a_zero_entry_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        // An unbound row that held no entries at drop: the record exists
+        // but its lower bound carries no information.
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            0,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_live_caller": 1}),
+            "unbound row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unidentified use"),
+            "a zero lower bound states nothing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_states_unattributed_use_totals() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        for (ino, sha, path) in [
+            (11u64, "sha0011", "/lib/a.so"),
+            (12u64, "sha0012", "/lib/b.so"),
+        ] {
+            let key = ModuleKey::physical(8, 1, ino, Some(sha.into()), path);
+            coordinator.registry_mut().note_mapping(
+                caller,
+                pid,
+                ModuleInfo {
+                    path: path.into(),
+                    key: key.clone(),
+                    double_loaded: false,
+                    build_id: None,
+                    identity_source: Some("mountinfo".into()),
+                    admission: AdmissionState::Admitted,
+                    admission_class: Some("exact".into()),
+                    admission_endpoints: Some(2),
+                    admission_reasons: Vec::new(),
+                },
+                100,
+            );
+        }
+        let key_a = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        let key_b = ModuleKey::physical(8, 1, 12, Some("sha0012".into()), "/lib/b.so");
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_a],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_b.clone()],
+            111,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key_b],
+            112,
+            crate::discovery::native_binding::UnboundReason::BeforeAdmission,
+            56,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text_with_verbosity(
+            &coordinator,
+            "pid:7",
+            90,
+            130,
+            2,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(text.contains("/lib/a.so"), "both modules render:\n{text}");
+        assert!(text.contains("/lib/b.so"), "both modules render:\n{text}");
+        let line =
+            "unattributed use: at least 900 entries in 3 witness rows never bound to a caller";
+        assert!(text.contains(line), "summary states the totals:\n{text}");
+        let lines: Vec<_> = text.lines().collect();
+        let coverage = lines
+            .iter()
+            .position(|candidate| candidate.starts_with("coverage:"))
+            .expect("coverage line renders");
+        let summary = lines
+            .iter()
+            .position(|candidate| candidate.contains("unattributed use:"))
+            .expect("summary line renders");
+        let details = lines
+            .iter()
+            .position(|candidate| candidate.starts_with("Details:"))
+            .expect("details tail renders");
+        assert!(
+            coverage < summary && summary < details,
+            "the hint sits in the summary head, ahead of the edge list:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_states_a_single_unattributed_row_in_singular() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            744,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            text.contains("unattributed use: at least 744 entries in 1 witness row never bound"),
+            "singular row renders:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_omits_unattributed_use_for_a_zero_entry_bound() {
+        let mut coordinator = coordinator();
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator.registry_mut().note_unbound_witness(
+            vec![key],
+            110,
+            crate::discovery::native_binding::UnboundReason::NoLiveCaller,
+            0,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["rows"], 1,
+            "unbound row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unattributed use:"),
+            "a zero lower bound states nothing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn text_summary_omits_unattributed_use_for_identified_caller_rows() {
+        use crate::discovery::caller_registry::tests::ScriptedSource;
+        let source = ScriptedSource::default();
+        source.spawn(7, 500);
+        source.spawn(8, 600);
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::System,
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            source,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let bound = coordinator
+            .adapter_mut()
+            .admit(7, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let mapped = coordinator
+            .adapter_mut()
+            .admit(8, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            mapped,
+            8,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator
+            .registry_mut()
+            .note_bound_witness(bound, vec![key], 110);
+        coordinator.commit_batch(false).unwrap();
+        let document = render_json(&coordinator, "pid:7", 90, 130, 2);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["reasons"],
+            serde_json::json!({"no_mapping_edge": 1}),
+            "identified-caller row recorded: {}",
+            document["modules"][0]["unbound_use"]
+        );
+        let text = render_text(&coordinator, "pid:7", 90, 130, 2);
+        assert!(
+            !text.contains("unattributed use:"),
+            "identified-caller rows are attributed, never unattributed:\n{text}"
         );
     }
 
@@ -11676,6 +12562,7 @@ mod tests {
             first_ns: 1,
             rows: pairs.iter().map(|(_, n)| n).sum(),
             reasons: pairs.iter().copied().collect(),
+            entries: 0,
         };
         let mut state = StreamState::new();
         let first = [(ModuleId(3), unbound(&[("no_live_caller", 2)]))];
@@ -12314,7 +13201,7 @@ mod tests {
         let coordinator = coordinator();
         let text = render_text(&coordinator, "system", 90, 120, 2);
         assert!(
-            text.starts_with("inventory system (2 passes, 0 callers, 0 modules, 0 edges)"),
+            text.starts_with("inventory system (2 passes, 0 callers, 0 provider files, 0 edges)"),
             "{text}"
         );
     }
@@ -13070,6 +13957,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13167,6 +14055,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13242,6 +14131,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13372,6 +14262,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13510,6 +14401,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: true,
                 seated_summary: None,
                 second_signal: None,
@@ -13604,6 +14496,7 @@ mod tests {
                 identity: None,
                 display: None,
                 semantic: Some(scene.lane),
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -13645,7 +14538,7 @@ mod tests {
             assert_eq!(
                 take_warned_for_test(),
                 vec![crate::inventory_semantics::semantic_stop_line(
-                    0, 0, 3, 7, 1, 0
+                    0, 0, 3, 7, 1, 0, 0, 0, 0
                 )],
                 "the stop line carries loss past the last terminal commit"
             );
@@ -18026,6 +18919,7 @@ mod promotion_driver_tests {
             identity: None,
             display: Some(display),
             semantic: None,
+            scan_seal_pending: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,
@@ -21205,10 +22099,35 @@ mod promotion_driver_tests {
                         if json {
                             assert_eq!(stdout.bytes, bytes, "both sinks agree: {case}");
                         } else {
+                            // Concise text carries the PARTIAL coverage, the
+                            // gap summary (F1: plain subjects with counts),
+                            // and the `-v` hint; per-gap `gap [` lines stay
+                            // verbose-only (the JSON above pins every gap).
+                            // The zero-pass subject is always present here;
+                            // the other two subjects vary by case (refused
+                            // vs clean stop), so only the always-present one
+                            // is pinned in concise.
                             let text = String::from_utf8(stdout.bytes).unwrap();
-                            assert!(text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT));
-                            assert_eq!(text.contains("global native retirement"), refused);
-                            assert_eq!(text.contains("joint finish abandoned for exit"), refused);
+                            assert!(
+                                text.contains("coverage: PARTIAL"),
+                                "concise zero-pass coverage: {case}: {text}"
+                            );
+                            assert!(
+                                text.contains(crate::cli::VERBOSE_HINT),
+                                "concise zero-pass hint: {case}: {text}"
+                            );
+                            assert!(
+                                text.contains("gaps: "),
+                                "concise gap summary present: {case}: {text}"
+                            );
+                            assert!(
+                                text.contains(crate::inventory_capture::ZERO_PASS_GAP_SUBJECT),
+                                "concise gap summary names the zero-pass gap: {case}: {text}"
+                            );
+                            assert!(
+                                !text.contains("gap ["),
+                                "per-gap lines stay verbose-only: {case}: {text}"
+                            );
                         }
                     }
                     // The command combines its primary error AFTER output;
@@ -21266,7 +22185,7 @@ mod promotion_driver_tests {
     /// collected/joined/refused, real shed, no bound callers in the
     /// scene.
     fn expected_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12)
+        crate::inventory_semantics::semantic_stop_line(68, 5, 7, 0, 0, 12, 0, 0, 0)
     }
 
     #[test]
@@ -21283,8 +22202,9 @@ mod promotion_driver_tests {
         assert_eq!(counts.shed, 7, "shed counts drained calls only");
         assert_eq!(counts.lost, 11, "ring loss reads as lost records");
         assert_eq!(
-            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12),
-            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12"
+            crate::inventory_semantics::semantic_stop_line(68, 5, 7, 11, 0, 12, 3, 2, 1),
+            "p11scope: semantic calls: collected 68, joined 5, shed 7, lost 11, bindings 0, refused 12, \
+             hook misses 3, eras 2, instances 1"
         );
     }
 
@@ -21715,7 +22635,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -21745,7 +22665,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the line still prints with zero counts"
         );
@@ -21875,7 +22795,7 @@ mod promotion_driver_tests {
     /// The stop line the final-lane twin expects: its own scripted
     /// collected/joined/refused, its own real shed, no bound callers.
     fn expected_final_stop_line() -> String {
-        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5)
+        crate::inventory_semantics::semantic_stop_line(11, 3, 4, 0, 0, 5, 0, 0, 0)
     }
 
     #[test]
@@ -22427,7 +23347,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                68, 5, 7, 9, 0, 12
+                68, 5, 7, 9, 0, 12, 0, 0, 0
             )],
             "the stop line carries the hold-polled loss"
         );
@@ -22513,12 +23433,15 @@ mod promotion_driver_tests {
             lost: 0,
             bindings: 1,
             refused: 0,
+            hook_misses: 0,
+            eras: 0,
+            instances: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(
             take_warned_for_test(),
             vec![
-                crate::inventory_semantics::semantic_stop_line(5, 5, 0, 0, 1, 0),
+                crate::inventory_semantics::semantic_stop_line(5, 5, 0, 0, 1, 0, 0, 0, 0),
                 "p11scope: settlement latency: samples=0 p50=- p99=- \
                  max=0ms overflow=0 unknown_ts=0 (1ms buckets, entry-based)"
                     .to_string(),
@@ -22901,7 +23824,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                68, 5, 7, 9, 0, 12
+                68, 5, 7, 9, 0, 12, 0, 0, 0
             )],
             "the stop line carries the hold-polled loss"
         );
@@ -22994,6 +23917,55 @@ mod promotion_driver_tests {
             vec![expected_stop_line()],
             "the untripped hold discloses only its stop line"
         );
+    }
+
+    /// The exit hold notes the watchdog trip on the coordinator (so
+    /// staged calls left unsealed count once as
+    /// `watchdog_no_progress`) on each trip arm: the finish wedge,
+    /// the running-audit trip, both, and never without a trip.
+    /// Deleting either hold call site fails its arm here.
+    #[test]
+    fn hold_joint_lane_for_exit_notes_the_watchdog_on_each_trip_arm() {
+        use crate::inventory_semantics::AttestedSemanticLane;
+        struct ClearPosedTrips;
+        impl Drop for ClearPosedTrips {
+            fn drop(&mut self) {
+                AttestedSemanticLane::pose_no_progress_trip_for_test(None);
+                AttestedSemanticLane::pose_audit_no_progress_trip_for_test(None);
+            }
+        }
+        let _clear = ClearPosedTrips;
+        let trip = Some((9, std::time::Duration::from_secs(4)));
+        for (finish, audit, want) in [
+            (false, false, 0),
+            (true, false, 1),
+            (false, true, 1),
+            (true, true, 2),
+        ] {
+            AttestedSemanticLane::pose_no_progress_trip_for_test(finish.then_some(trip).flatten());
+            AttestedSemanticLane::pose_audit_no_progress_trip_for_test(
+                audit.then_some(trip).flatten(),
+            );
+            let mut coordinator = coordinator();
+            let mut display = None;
+            let mut warn = WarnSink {
+                display: &mut display,
+            };
+            let _ = ClassicDriver::hold_joint_lane_for_exit(
+                joint_lane(WindDownIo::completing(), false),
+                &mut coordinator,
+                "watchdog arm",
+                "joint finish abandoned for exit",
+                &mut warn,
+                None,
+            );
+            assert_eq!(
+                coordinator.joint_watchdog_notes_for_test(),
+                want,
+                "finish trip {finish}, audit trip {audit}: watchdog notes"
+            );
+            let _ = take_warned_for_test();
+        }
     }
 
     #[test]
@@ -23239,7 +24211,7 @@ mod promotion_driver_tests {
         assert_eq!(
             take_warned_for_test(),
             vec![crate::inventory_semantics::semantic_stop_line(
-                0, 0, 0, 0, 0, 0
+                0, 0, 0, 0, 0, 0, 0, 0, 0
             )],
             "the wind-down discloses the legacy lane once"
         );
@@ -24713,6 +25685,7 @@ mod promotion_driver_tests {
             identity: None,
             display: None,
             semantic: None,
+            scan_seal_pending: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,
@@ -24778,6 +25751,105 @@ mod seal_readiness_tests {
     /// The exact seal line, pinned as a literal: the wording is the
     /// contract with users and scripts, independent of the builder.
     const SEAL_LINE: &str = "p11scope: semantic lane ready; mechanisms and API results are recorded from now on (key operations: recorded only with --key-operations)";
+
+    /// Scripts for one deferred scan-seal attempt whose live starts
+    /// all refuse: the journal start and the ordinary retry each mint
+    /// the subset pair and refuse, then the fallback shell mints once.
+    fn refused_attempt_preparations() -> Vec<SubsetPreparation> {
+        (0..5).map(|_| some_preparation()).collect()
+    }
+
+    /// DEMO-4 regression (fedora cr-late-3/cr-first-1, 2026-11-05),
+    /// driven through the real `ClassicDriver` attempt: the scan
+    /// subset minted but the live start refused (a transient
+    /// multi-provider moment on a busy host). The startup-failed
+    /// shell must not seat and must keep the pending flag, so the
+    /// next pass retries; that retry seals, seats the lane, clears
+    /// the flag and discloses the scan-derived provenance once.
+    #[test]
+    fn deferred_scan_seal_refused_start_keeps_pending_then_seats_on_retry() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        seal_startup_test::with_start_queue(
+            refused_attempt_preparations(),
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+            ],
+            || driver.attempt_deferred_scan_seal(scope),
+        );
+        assert!(
+            driver.semantic.is_none(),
+            "a startup-failed shell never seats"
+        );
+        assert!(
+            driver.scan_seal_pending,
+            "a refused start keeps the seal pending for the next pass"
+        );
+        assert!(take_sealed_for_test().is_empty(), "no seal line yet");
+
+        seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || driver.attempt_deferred_scan_seal(scope),
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the retry seats the sealed live lane"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE.to_string()],
+            "the retry notes the seal line once"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "semantic subset scan-derived").len(),
+            1,
+            "the seated scan-derived lane discloses its provenance once"
+        );
+    }
+
+    /// The attempt keys on the pending flag alone (no pass-report
+    /// input, so the engine-changed flag cannot gate it: a
+    /// `--system` scan-lane pass with zero native callers must still
+    /// attempt, fedora diag1): without the flag nothing is minted
+    /// or started, and with it the very first attempt runs.
+    #[test]
+    fn deferred_scan_seal_attempts_only_while_pending() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        let scope = InspectScope::Pid(std::process::id());
+        let untouched = seal_startup_test::with(
+            vec![some_preparation()],
+            Some(Err(SemanticRefusal::Unavailable)),
+            || {
+                driver.attempt_deferred_scan_seal(scope);
+                seal_startup_test::take_prepared().is_some()
+                    && seal_startup_test::take_start_verdict().is_some()
+            },
+        );
+        assert!(untouched, "no pending flag: no mint and no start");
+        assert!(driver.semantic.is_none());
+
+        driver.scan_seal_pending = true;
+        seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || driver.attempt_deferred_scan_seal(scope),
+        );
+        assert!(driver.semantic.is_some(), "the pending attempt seals");
+        assert!(!driver.scan_seal_pending);
+        assert_eq!(take_sealed_for_test(), vec![SEAL_LINE.to_string()]);
+    }
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
         InventoryCoordinator::new(
@@ -24858,6 +25930,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -24884,6 +25957,7 @@ mod seal_readiness_tests {
             &mut coordinator,
             &scope,
             crate::attach::BackendSelection::Auto,
+            false,
             false,
         );
         assert!(lane.is_none(), "no subset seats no lane");
@@ -24914,6 +25988,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -24927,6 +26002,45 @@ mod seal_readiness_tests {
             1,
             "the refusal's own disclosure stays"
         );
+    }
+
+    #[test]
+    fn key_operations_gap_present_only_for_flag_on_subset_refusal() {
+        // A refused subset mint with `--key-operations` discloses the
+        // refused request beside the subset gap, so the summary never
+        // reads tracking-off for a wanted-but-refused capture. Without
+        // the flag the subset gap stands alone.
+        for key_operations in [false, true] {
+            let mut coordinator = coordinator();
+            let scope = Scope::Pid(std::process::id());
+            let lane = seal_startup_test::with(
+                vec![SubsetPreparation {
+                    subset: None,
+                    refusals: vec![SemanticRefusal::Unattested],
+                }],
+                None,
+                || {
+                    start_semantic_lane(
+                        &mut coordinator,
+                        &scope,
+                        crate::attach::BackendSelection::Auto,
+                        key_operations,
+                        false,
+                    )
+                },
+            );
+            assert!(lane.is_none(), "a refused mint seats no lane");
+            assert_eq!(
+                gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
+                1,
+                "key_operations={key_operations}: the subset gap stays"
+            );
+            assert_eq!(
+                gaps_for_subject(&mut coordinator, "key operations unavailable").len(),
+                usize::from(key_operations),
+                "key_operations={key_operations}: the request gap follows the flag"
+            );
+        }
     }
 
     #[test]
@@ -24953,6 +26067,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -24965,6 +26080,124 @@ mod seal_readiness_tests {
             gaps_for_subject(&mut coordinator, "semantic subset refused").len(),
             1,
             "the refusal's own disclosure stays"
+        );
+    }
+
+    #[test]
+    fn key_operations_subset_refusal_names_manifest_remedy() {
+        // Flag on, subset refused with codes (the SoftHSM shape:
+        // export-only scan tables refuse `incomplete_provider`):
+        // no lane seats, and beside the subset gap a key-operations
+        // gap names the refusal with the manifest remedy.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::IncompleteProvider],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    true,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the remedy gap is noted once");
+        assert!(
+            gaps[0]
+                .1
+                .starts_with("subset refused (incomplete_provider)"),
+            "the gap names the refusal: {}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0].1.contains("rerun with --manifest"),
+            "the gap names the remedy: {}",
+            gaps[0].1
+        );
+    }
+
+    #[test]
+    fn key_operations_manifest_path_refusal_names_check_remedy() {
+        // Flag on, manifest-path subset refused with codes (manifests
+        // were supplied but the mint still refused): no lane seats,
+        // and the key-operations gap names the refusal with the
+        // check-the-manifest remedy, never the rerun clause.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::IncompleteProvider],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    false,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        let gaps = gaps_for_subject(&mut coordinator, "key operations unavailable");
+        assert_eq!(gaps.len(), 1, "the remedy gap is noted once");
+        assert!(
+            gaps[0]
+                .1
+                .starts_with("subset refused (incomplete_provider)"),
+            "the gap names the refusal: {}",
+            gaps[0].1
+        );
+        assert!(
+            gaps[0].1.contains("check the manifest"),
+            "the gap names the check remedy: {}",
+            gaps[0].1
+        );
+        assert!(
+            !gaps[0].1.contains("rerun with --manifest"),
+            "the manifest path never reruns: {}",
+            gaps[0].1
+        );
+    }
+
+    #[test]
+    fn key_operations_silent_mint_stays_quiet() {
+        // Flag on, subset refused with no codes (nothing discovered
+        // yet — the scan mint retries per pass by design): no lane
+        // seats and no remedy gap is noted; there is nothing to
+        // verify yet, so no manifest advice either.
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    true,
+                    true,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused mint seats no lane");
+        assert!(
+            gaps_for_subject(&mut coordinator, "key operations unavailable").is_empty(),
+            "a silent mint notes no remedy gap"
         );
     }
 
@@ -24987,6 +26220,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     false,
+                    false,
                 )
             },
         );
@@ -25003,49 +26237,16 @@ mod seal_readiness_tests {
         );
     }
 
-    /// The run gates the flag before any load: on a non-journal build
-    /// the refusal names the finite build reason. On a journal build
-    /// the gate passes — the twin proves it with a colliding
-    /// destination pair, which refuses later (pre-lane, no BPF)
-    /// instead of the build reason.
+    /// F-08: a missing journal build must not blank the whole
+    /// inventory at the `run` gate. The refusal belongs to
+    /// `start_semantic_lane`, which keeps broad S1 inventory with a
+    /// named key-operations gap. Proof without BPF: on every build
+    /// the run gets past any journal gate and refuses later on the
+    /// colliding destination pair (pre-lane), never with the build
+    /// reason.
     #[test]
     fn key_operations_run_gates_build_before_any_load() {
         use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
-        if env!("P11SCOPE_JOURNAL_ENABLED") != "1" {
-            let error = super::run(
-                ScopeArg::Pid(std::process::id()),
-                &[],
-                &[],
-                &[],
-                &[],
-                &HookRegistry::builtin(),
-                true,
-                None,
-                None,
-                None,
-                None,
-                None,
-                false,
-                None,
-                None,
-                None,
-                CaptureMode::Auto,
-                crate::attach::BackendSelection::Auto,
-                None,
-                None,
-                IdentityBackendSelection::Auto,
-                false,
-                CallerMetadataMode::None,
-                true,
-                false,
-            )
-            .expect_err("a flag-on run on a non-journal build refuses");
-            assert!(
-                format!("{error:#}").contains("journal-pair-unavailable-in-build"),
-                "the refusal names the build reason: {error:#}"
-            );
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         std::fs::set_permissions(
             dir.path(),
@@ -25159,6 +26360,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             },
         );
@@ -25212,6 +26414,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             },
         );
@@ -25268,6 +26471,7 @@ mod seal_readiness_tests {
                     &scope,
                     crate::attach::BackendSelection::Auto,
                     true,
+                    false,
                 )
             });
             assert!(lane.is_none(), "refused subsets seat no lane");
@@ -25298,6 +26502,7 @@ mod seal_readiness_tests {
                     &mut coordinator,
                     &scope,
                     crate::attach::BackendSelection::Auto,
+                    false,
                     false,
                 )
             },

@@ -830,6 +830,44 @@ impl Engine {
         &self.view_log
     }
 
+    /// Seed one retained scan input holding several scanned
+    /// modules under real scan-style pins (multi-view fixtures).
+    pub(crate) fn seed_scan_input_for_test_multi(
+        &mut self,
+        modules: Vec<crate::discovery::scan::ScannedModule>,
+    ) {
+        let (pins, skipped) = crate::discovery::identity::pin_scanned_objects(
+            std::process::id(),
+            &modules,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        )
+        .expect("scan pinning succeeds");
+        assert!(skipped.is_empty(), "{skipped:?}");
+        self.seed_scan_input_for_test(modules, pins);
+    }
+
+    /// Seed one retained scan input (the per-view scan state passes
+    /// maintain), for tests of consumers that must read current
+    /// scan state rather than the creation-time module snapshot.
+    pub(crate) fn seed_scan_input_for_test(
+        &mut self,
+        modules: Vec<crate::discovery::scan::ScannedModule>,
+        pins: PinnedObjects,
+    ) {
+        let view = modules
+            .first()
+            .map(|module| module.view)
+            .expect("seeded scan input names its view");
+        self.scan_inputs.insert(
+            view,
+            ScanInput {
+                modules,
+                pins,
+                counters: DiscoveryCounters::default(),
+            },
+        );
+    }
+
     fn view_log_owner(&self, view: ProcessViewId) -> ViewLogOwner {
         if self
             .modules
@@ -1056,7 +1094,7 @@ struct CaptureHistory {
     /// Written by `record_object_skips` on suppression and by `merge_current`;
     /// read by both through `scan_gap_key`.
     scan_gap_tombstones: BTreeSet<(String, String)>,
-    refusals: BTreeMap<plan::ModuleId, Skipped>,
+    refusals: BTreeMap<plan::ModuleId, (Skipped, plan::RefusalKind)>,
     fallbacks: BTreeMap<(u32, u32), render::ManifestObjectFallback>,
     corroboration_tombstones: BTreeSet<plan::ModuleId>,
     /// §4.12 outcomes re-derived after attach. Corroboration is a
@@ -2585,7 +2623,7 @@ impl CaptureFacts {
                 history.losses.entry(key).or_insert_with(|| skipped.clone());
             }
         }
-        for (object, refused) in plan.refused_modules() {
+        for (object, refused, refused_kind) in plan.refused_modules_typed() {
             let id = self.module_id_for_object(pinned, object)?;
             // One record per module, a high-water mark like every omission
             // above: a whole refusal stays the capture's record of it and
@@ -2607,10 +2645,10 @@ impl CaptureFacts {
             let known = history
                 .refusals
                 .entry(id)
-                .or_insert_with(|| refused.clone());
+                .or_insert_with(|| (refused.clone(), refused_kind));
             let larger_whole = matches!(
                 (
-                    plan::whole_refusal_needed_count(&known.reason),
+                    plan::whole_refusal_needed_count(&known.0.reason),
                     plan::whole_refusal_needed_count(&refused.reason),
                 ),
                 (Some(known), Some(refused)) if refused > known
@@ -2620,24 +2658,25 @@ impl CaptureFacts {
             // "not attached" while the prefix is counting calls. JK-22a: the
             // same holds for a later provider-prefix record replacing an
             // earlier whole refusal for the same provider module.
-            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.reason)
+            let prefix_replaces_whole = (plan::is_closure_array_refusal(&known.0.reason)
                 && plan::is_closure_array_prefix(&refused.reason))
-                || (plan::whole_refusal_needed_count(&known.reason).is_some()
+                || (plan::whole_refusal_needed_count(&known.0.reason).is_some()
                     && plan::is_provider_prefix(&refused.reason));
             // An awaiting-publication record ranks below any counted capacity
             // refusal for the same module: once its published set names a
             // demand, the earlier "nothing published yet" is stale. Never the
-            // reverse: the counted refusal is the high-water mark.
-            let unpublished_replaced_by_counted =
-                plan::is_closure_awaiting_publication(&known.reason)
-                    && plan::whole_refusal_needed_count(&refused.reason).is_some();
+            // reverse: the counted refusal is the high-water mark. Keyed on
+            // the merge-time kinds, never on the wording.
+            let unpublished_replaced_by_counted = known.1 == plan::RefusalKind::AwaitingPublication
+                && refused_kind == plan::RefusalKind::CapacityWhole;
             if larger_whole
                 || prefix_replaces_whole
                 || unpublished_replaced_by_counted
-                || (plan::is_growth_omission(&known.reason)
-                    && rank(&refused.reason) >= rank(&known.reason))
+                || (plan::is_growth_omission(&known.0.reason)
+                    && rank(&refused.reason) >= rank(&known.0.reason))
             {
-                known.clone_from(refused);
+                known.0.clone_from(refused);
+                known.1 = refused_kind;
             }
         }
         for fallback in current.manifest_object_fallbacks {
@@ -2679,7 +2718,11 @@ impl CaptureFacts {
             .chain(history.losses.values())
             .cloned()
             .collect();
-        plan.modules_skipped = history.refusals.values().cloned().collect();
+        plan.modules_skipped = history
+            .refusals
+            .values()
+            .map(|(skipped, _)| skipped.clone())
+            .collect();
         plan.vendor_interfaces = history.vendor_interfaces;
         if !history.interface_list.is_empty() {
             plan.interface_list.clone_from(&history.interface_list);
@@ -2738,7 +2781,11 @@ impl CaptureFacts {
             uncorroborated_candidates: history
                 .uncorroborated_candidates
                 .max(plan.uncorroborated_candidates),
-            modules_skipped: history.refusals.values().map(skipped_out).collect(),
+            modules_skipped: history
+                .refusals
+                .values()
+                .map(|(skipped, _)| skipped_out(skipped))
+                .collect(),
             manifest_object_fallbacks: history.fallbacks.values().cloned().collect(),
             scan_unavailable: history.scan_unavailable.clone(),
             scan_ms: history.scan_ms,
@@ -2822,9 +2869,16 @@ fn merge_discovered_module(
     }
     // The incoming snapshot's interval state supersedes: a module that lost
     // its pre-arm source is genuinely unwatched, and a live watch's current
-    // state is always fresher than the retained one. Attach keys only move
+    // state is always fresher than the retained one. The deciding admission
+    // class likewise supersedes when present: early evidence may show a
+    // closure array as heuristic/corroborated before all its lookalike
+    // tables decode, and the retained record must end at the deciding
+    // class, never the first impression. Attach keys only move
     // forward into set, never back to unset: assembly runs once at capture
     // end, and a later snapshot must not clobber assembled keys with `None`.
+    if incoming.admission_class.is_some() {
+        retained.admission_class = incoming.admission_class;
+    }
     retained.watch = incoming.watch;
     if incoming.attached_at_ns.is_some() {
         retained.attached_at_ns = incoming.attached_at_ns;
@@ -4109,6 +4163,7 @@ impl ScannedModuleCopy {
                     double_loaded: source.double_loaded,
                     same_file_loads: source.same_file_loads,
                     path: exact_owned_string(&source.path),
+                    tables_scan_finished: false,
                     decoder_abi: source.decoder_abi,
                     exports: Vec::with_capacity(source.exports.len()),
                     tables: Vec::with_capacity(source.tables.len()),
@@ -4972,6 +5027,25 @@ struct CollectedExportWork {
     required_seed_complete: bool,
 }
 
+/// Whether a count-only seed names a proxy closure array awaiting
+/// publication: deliberately unadmitted (0 published tables), so the
+/// seed can hook nothing. Skipping such a seed is benign — the closure
+/// gap already discloses the non-coverage — while failing the batch
+/// over it would kill pause protection for the whole capture (a
+/// short-lived tool then captures 0 calls). Anything else (admitted
+/// providers, unknown objects, non-closure refusals) keeps the exact
+/// owner requirement.
+fn seed_object_is_unadmitted_closure(plan: &plan::AttachPlan, seed: &CountOnlySeedWork) -> bool {
+    !plan
+        .modules
+        .iter()
+        .any(|module| module.object == seed.object)
+        && plan.modules_skipped.iter().any(|skipped| {
+            skipped.subject == seed.object_path
+                && plan::is_closure_awaiting_publication(&skipped.reason)
+        })
+}
+
 /// One queued record envelope: move-only, so each record crosses dispatch
 /// through exactly one owned envelope. The payload (`DiscoveryRecord`, a
 /// frozen `Copy` ABI type) is still read by value for field checks, but a
@@ -5356,6 +5430,8 @@ impl DiscoveryCounters {
     }
 
     /// What discovery ended up with, on stderr, before the capture starts.
+    /// The unreadable-scan warning always prints; the statistics line is
+    /// diagnostics, behind verbose text or the opt-in switch.
     fn report(&self, plan: &plan::AttachPlan) {
         if let Some(reason) = self.scan_unavailable {
             eprintln!(
@@ -5363,15 +5439,17 @@ impl DiscoveryCounters {
                  --manifest offsets are attached uncorroborated"
             );
         }
-        eprintln!(
-            "p11scope: discovery: {} module(s), {} attach slot(s), scan {}ms, \
-             conflicts {}, uncorroborated {}",
-            plan.modules.len(),
-            plan.slots.len(),
-            self.scan_ms,
-            self.conflicts,
-            self.uncorroborated,
-        );
+        if crate::run::capture_diagnostics_on() {
+            eprintln!(
+                "p11scope: discovery: {} module(s), {} attach slot(s), scan {}ms, \
+                 conflicts {}, uncorroborated {}",
+                plan.modules.len(),
+                plan.slots.len(),
+                self.scan_ms,
+                self.conflicts,
+                self.uncorroborated,
+            );
+        }
     }
 }
 
@@ -6135,7 +6213,10 @@ fn broad_fixed_pool_module(
             ),
         );
         // Table 0 may already have been added above; drop it — a pool whose
-        // stride is unverified contributes nothing.
+        // stride is unverified contributes nothing. The probe decoded
+        // something the sweep did not verify, so the sweep's finished
+        // verdict must not survive either.
+        module.tables_scan_finished = false;
         module.tables.retain(|table| table.address != pool);
         return;
     }
@@ -6161,18 +6242,27 @@ fn broad_fixed_pool_module(
         }
     }
     let first_reason = first_reason.unwrap_or_else(|| "unknown".to_string());
-    eprintln!(
-        "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
-         already covered, {refused} refused at {refused_ordinals:?} \
-         (first reason: {first_reason})",
-        module.path, tallies.added, tallies.covered,
-    );
+    if crate::cli::text_is_verbose() {
+        eprintln!(
+            "p11scope: discovery: broad fixed-family: {}: {} table(s) added, {} \
+             already covered, {refused} refused at {refused_ordinals:?} \
+             (first reason: {first_reason})",
+            module.path, tallies.added, tallies.covered,
+        );
+    }
     if refused > 0 {
         counters.notes.push(format!(
             "broad fixed-family: {} refused {refused} pool table(s) at {refused_ordinals:?}; \
              first reason: {first_reason}",
             module.path,
         ));
+    }
+    // Pool augmentation breaks the sweep's finished-ness: added tables mean
+    // the sweep alone did not see the whole surface, and refused pool tables
+    // mean the union is incomplete. Covered-only pools (added and refused
+    // both zero) keep the sweep's verdict.
+    if tallies.added > 0 || refused > 0 {
+        module.tables_scan_finished = false;
     }
 }
 
@@ -6354,7 +6444,9 @@ pub(crate) fn kernel_thread_exclusions(
 /// Deep-scan selection with kernel threads excluded first: threads with
 /// no user address space never consume cap slots. Every excluded pid is
 /// counted on the pass budget's kernel-thread note, and the rest select
-/// by provider rarity. The three selection call sites (capture,
+/// by provider rarity — tiered by freshness when `scanned` is non-empty
+/// (groups holding never-scanned pids first, then all-scanned groups),
+/// pure rarity for an empty set. The three selection call sites (capture,
 /// system inspect, cgroup inventory) share this; the exclusion predicate
 /// above stays separately pinned.
 pub(crate) fn select_excluding_kernel_threads(
@@ -6363,6 +6455,7 @@ pub(crate) fn select_excluding_kernel_threads(
     proc_root: &Path,
     cap: usize,
     budget: &mut CaptureWorkBudget,
+    scanned: &BTreeSet<u32>,
 ) -> Vec<u32> {
     let excluded = kernel_thread_exclusions(sweep, unavailable, proc_root);
     for _ in &excluded {
@@ -6373,7 +6466,11 @@ pub(crate) fn select_excluding_kernel_threads(
         .filter(|(pid, _)| !excluded.contains(pid))
         .cloned()
         .collect();
-    select_deep_scan_candidates(&eligible, cap)
+    if scanned.is_empty() {
+        select_deep_scan_candidates(&eligible, cap)
+    } else {
+        select_fresh_first_candidates(&eligible, cap, scanned)
+    }
 }
 
 /// Rotation's fairness-tiered variant of the selection above: identical
@@ -6438,6 +6535,79 @@ fn select_rotation_candidates(
                 .iter()
                 .copied()
                 .find(|pid| !stale.contains(pid))
+                .unwrap_or(members[0])
+        })
+        .chain(fresh_unmapped)
+        .chain(stale_unmapped)
+        .take(max_pids)
+        .collect()
+}
+
+/// Freshness-tiered deep-scan selection for multi-pass inventory: groups
+/// holding at least one never-scanned pid come first (rarity-ordered),
+/// then all-scanned groups (rarity-ordered), each represented by its
+/// lowest never-scanned member. A newcomer group ranked below the
+/// pure-rarity cut is still selected once earlier passes scanned the
+/// incumbents, so a stable sweep cannot starve it across passes. With
+/// nothing scanned this agrees with rarity selection exactly.
+pub(crate) fn select_fresh_first_candidates(
+    sweep: &[(u32, Vec<MapEntry>)],
+    max_pids: usize,
+    scanned: &BTreeSet<u32>,
+) -> Vec<u32> {
+    if sweep.len() <= max_pids {
+        let mut pids: Vec<u32> = sweep.iter().map(|(pid, _)| *pid).collect();
+        pids.sort_unstable();
+        return pids;
+    }
+    // Same exact-maps grouping and census as rarity selection.
+    let mut groups: BTreeMap<BTreeSet<ObjectKey>, Vec<u32>> = BTreeMap::new();
+    let mut unmapped: Vec<u32> = Vec::new();
+    for (pid, entries) in sweep {
+        let key: BTreeSet<ObjectKey> = entries
+            .iter()
+            .filter(|entry| is_provider_mapping(entry))
+            .map(ObjectKey::of)
+            .collect();
+        if key.is_empty() {
+            unmapped.push(*pid);
+        } else {
+            groups.entry(key).or_default().push(*pid);
+        }
+    }
+    let mut census: BTreeMap<ObjectKey, usize> = BTreeMap::new();
+    for (key, members) in &groups {
+        for file in key {
+            *census.entry(*file).or_default() += members.len();
+        }
+    }
+    let mut ordered: Vec<(BTreeSet<ObjectKey>, Vec<u32>)> = groups.into_iter().collect();
+    for (_, members) in &mut ordered {
+        members.sort_unstable();
+    }
+    ordered.sort_by_key(|(key, members)| {
+        let min_global = key
+            .iter()
+            .map(|file| census[file])
+            .min()
+            .unwrap_or(usize::MAX);
+        (min_global, members.len(), members[0])
+    });
+    unmapped.sort_unstable();
+    // `partition` preserves the sorted order within each tier.
+    let (fresh_unmapped, stale_unmapped): (Vec<u32>, Vec<u32>) =
+        unmapped.into_iter().partition(|pid| !scanned.contains(pid));
+    let (fresh_groups, stale_groups): (Vec<_>, Vec<_>) = ordered
+        .into_iter()
+        .partition(|(_, members)| members.iter().any(|pid| !scanned.contains(pid)));
+    fresh_groups
+        .into_iter()
+        .chain(stale_groups)
+        .map(|(_, members)| {
+            members
+                .iter()
+                .copied()
+                .find(|pid| !scanned.contains(pid))
                 .unwrap_or(members[0])
         })
         .chain(fresh_unmapped)
@@ -6753,6 +6923,8 @@ fn discover_plan(
             Path::new("/proc"),
             max_scan_pids,
             &mut discovered.budget,
+            // Capture refresh keeps its own scheduler; no cross-pass set.
+            &BTreeSet::new(),
         );
         discovered.stage_timings.span(
             crate::timing::StageKind::Scan,
@@ -7024,17 +7196,23 @@ fn discover_plan(
     // Task 3.2 (S1): one categorical summary per noise class instead of one
     // line per skipped view. Cleared here so live accumulation starts fresh
     // and a later rebuild cannot re-merge initial noise.
-    discovered.counters.noise.report();
+    if crate::run::capture_diagnostics_on() {
+        discovered.counters.noise.report();
+    }
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
         input.counters.noise.clear();
     }
-    for refused in &discovered.plan.modules_skipped {
-        eprintln!(
-            "{}",
-            format_module_refusal(&refused.subject, &refused.reason)
-        );
+    // The concise report already names refused providers with the
+    // `--module` remedy; the per-module repeats are diagnostics.
+    if crate::run::capture_diagnostics_on() {
+        for refused in &discovered.plan.modules_skipped {
+            eprintln!(
+                "{}",
+                format_module_refusal(&refused.subject, &refused.reason)
+            );
+        }
     }
     discovered.counters.report(&discovered.plan);
     Ok(discovered)
@@ -7233,6 +7411,9 @@ fn scan_gap_this_capture_attached(modules: &[plan::ModuleSummary], skip: &Skippe
 /// providers it forwards to attach as they load. A capture whose only gaps
 /// are such closures starts, PARTIAL, like one with nothing mapped yet.
 fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
+    // Reads the public gap list, not the merge-time kinds: the start gate
+    // also judges hand-built plans, which carry gaps without refused
+    // records. The pause-seed check beside it decides on types.
     let refused = plan
         .modules_skipped
         .iter()
@@ -7246,6 +7427,103 @@ fn refusal_error(plan: &plan::AttachPlan) -> Option<String> {
             refused.reason
         )
     })
+}
+
+/// Whether a count-only seed with no plan owner is terminal for this
+/// pause cycle. A module admitted only through tables it later publishes
+/// has no plan owner until then, by construction: its gap is already named
+/// in the candidate, and its export hooks still attach below, so a later
+/// return can publish it. Its seed is terminal for this cycle, not
+/// incomplete work. Keyed on the merge-time refusal kind and the exact
+/// object — rewording the gap text cannot change this decision.
+fn seed_without_owner_is_terminal(candidate: &LiveCandidate, seed: &CountOnlySeedWork) -> bool {
+    // Either source proves an awaiting-publication closure: the typed
+    // refusal kind, or the skip record's own subject and reason.
+    candidate.plan.object_awaits_publication(seed.object)
+        || seed_object_is_unadmitted_closure(&candidate.plan, seed)
+}
+
+/// Placement of one count-only seed against the candidate plan: the
+/// loader hook's per-seed verdict, shared by the seed loop so the
+/// terminal-or-partial mapping stays pinned in one place.
+#[derive(Debug, PartialEq, Eq)]
+enum SeedPlacement {
+    /// The seed needs no plan work: an unpublished closure's seed is
+    /// terminal for the cycle.
+    Terminal,
+    /// The seed placed a provisional slot (or needed none).
+    Placed,
+    /// The seed is a counted incompleteness with this cause.
+    Partial(&'static str),
+}
+
+fn place_count_only_seed(candidate: &mut LiveCandidate, seed: &CountOnlySeedWork) -> SeedPlacement {
+    let (first, second) = {
+        let mut owners = candidate
+            .plan
+            .modules
+            .iter()
+            .filter(|module| module.object == seed.object);
+        (
+            owners.next().map(|module| module.id),
+            owners.next().is_some(),
+        )
+    };
+    let Some(module) = first else {
+        if seed_without_owner_is_terminal(candidate, seed) {
+            return SeedPlacement::Terminal;
+        }
+        return SeedPlacement::Partial(
+            "a C_GetFunctionList seed had no unique candidate module owner",
+        );
+    };
+    if second {
+        return SeedPlacement::Partial(
+            "a C_GetFunctionList seed had no unique candidate module owner",
+        );
+    }
+    match candidate
+        .plan
+        .add_provisional_get_function_list(plan::ProvisionalGetFunctionList {
+            module,
+            object: seed.object,
+            object_path: seed.object_path.clone(),
+            file_offset: seed.file_offset,
+        }) {
+        Ok(Some(slot)) => {
+            candidate.delta.new.push(slot);
+            SeedPlacement::Placed
+        }
+        Ok(None) => SeedPlacement::Placed,
+        Err(_) => SeedPlacement::Partial(
+            "a C_GetFunctionList seed could not be added to the candidate plan",
+        ),
+    }
+}
+
+impl Engine {
+    /// Places one loader batch's count-only seeds, folding the cycle's
+    /// required-complete: terminal and placed seeds keep it, a partial
+    /// seed clears it and marks its named gap. The pause-completeness
+    /// twin pins both arms: an unpublished closure alone never poisons
+    /// the cycle, and a solver-selected loss always does.
+    fn place_count_only_seeds(
+        &mut self,
+        candidate: &mut LiveCandidate,
+        seeds: &[CountOnlySeedWork],
+        mut required_complete: bool,
+    ) -> bool {
+        for seed in seeds {
+            match place_count_only_seed(candidate, seed) {
+                SeedPlacement::Terminal | SeedPlacement::Placed => {}
+                SeedPlacement::Partial(why) => {
+                    required_complete = false;
+                    self.mark_partial("live export hook", why);
+                }
+            }
+        }
+        required_complete
+    }
 }
 
 /// The `discovery[]` record: what was found, where it was found, and how well
@@ -7295,6 +7573,7 @@ fn discovery_evidence(
             let identity = summary_of(m.object, &m.path);
             render::DiscoveredModule {
                 id: m.id,
+                admission_class: m.admission_class,
                 dev: identity.dev,
                 ino: identity.ino,
                 sha256: identity.sha256,
@@ -7574,8 +7853,16 @@ fn format_unreadable_member(pid: u32, detail: &str) -> String {
 }
 
 fn format_module_refusal(subject: &str, reason: &str) -> String {
+    // The stderr verdict agrees with the report: a partially covered
+    // module (growth kept, closure prefix, provider prefix) is named
+    // partial, never refused. Whole refusals keep their verb.
+    let verb = if crate::plan::is_partial_coverage(reason) {
+        "module partially covered"
+    } else {
+        "module refused"
+    };
     format!(
-        "p11scope: module refused: {} — {}",
+        "p11scope: {verb}: {} — {}",
         render::escape_controls(subject),
         render::escape_controls(reason)
     )
@@ -8631,13 +8918,27 @@ fn remove_stale_views(discovered: &mut Engine, stale: &[ProcessViewId]) -> Resul
     // Stale removals happen during attach preparation, after the initial
     // report: flush their summaries now so the operator sees them before the
     // capture starts, and live accumulation starts fresh.
-    discovered.counters.noise.report();
+    if crate::run::capture_diagnostics_on() {
+        discovered.counters.noise.report();
+    }
     discovered.counters.noise.clear();
     discovered.base_counters.noise.clear();
     for input in discovered.scan_inputs.values_mut() {
         input.counters.noise.clear();
     }
     Ok(removed)
+}
+
+/// The operator-facing message when a named `--pid` has no retained
+/// process generation at attach time: either the process is gone (it
+/// exited, or the PID never named one), or it is alive but unscannable
+/// and its modules stay unknown rather than absent.
+fn missing_named_process_message(pid: u32) -> String {
+    if crate::process::generation_gone(pid) {
+        crate::process::MissingNamedProcess { pid }.to_string()
+    } else {
+        format!("process with PID {pid} could not be scanned; its modules are unknown, not absent")
+    }
 }
 
 fn start_retained_with<S>(
@@ -8647,7 +8948,20 @@ fn start_retained_with<S>(
     mut start: impl FnMut(&plan::AttachPlan, &PinnedObjects) -> Result<S>,
 ) -> Result<S> {
     if named && discovered.views.len() != 1 {
-        bail!("the named process generation was not retained through discovery");
+        // A named scope always carries its PID; anything else here is a
+        // test fixture, which keeps the internal wording. A pid with no
+        // live process fails typed, so the caller passes the one line
+        // through instead of wrapping it in attach context.
+        if let Scope::Pid(pid) = &discovered.scope
+            && crate::process::generation_gone(*pid)
+        {
+            return Err(crate::process::MissingNamedProcess { pid: *pid }.into());
+        }
+        let message = match &discovered.scope {
+            Scope::Pid(pid) => missing_named_process_message(*pid),
+            _ => "the named process generation was not retained through discovery".to_string(),
+        };
+        bail!("{message}");
     }
     // Before any session exists a stale view costs one plan rebuild, and each
     // pass removes at least one accepted view, so this is bounded by them.
@@ -9086,6 +9400,7 @@ fn publication_module(
         mount_namespace: view.mount_namespace(),
         key,
         path,
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: vec![hook_name.to_string()],
         tables: vec![table],
@@ -9150,6 +9465,13 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
     // sees fewer loads is not fresh evidence of fewer loads.
     existing.double_loaded |= incoming.double_loaded;
     existing.same_file_loads = existing.same_file_loads.max(incoming.same_file_loads);
+    // The finished flag ANDs: both scans must have finished, and the union
+    // must add no new table (a new table means neither scan alone saw the
+    // whole surface). Like the load count, only a complete-scan replacement
+    // re-proves finished-ness, never a union.
+    let finished_before = existing.tables_scan_finished;
+    let tables_before = existing.tables.len();
+    let incoming_finished = incoming.tables_scan_finished;
     for export in incoming.exports.drain(..) {
         if !existing.exports.contains(&export) {
             existing.exports.push(export);
@@ -9201,6 +9523,8 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             }
         });
     }
+    existing.tables_scan_finished =
+        finished_before && incoming_finished && existing.tables.len() == tables_before;
     for mut interface in incoming.interfaces.drain(..) {
         interface.table = interface
             .table
@@ -10346,6 +10670,7 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
         mount_namespace: view.mount_namespace(),
         key: ObjectKey::of(mapping),
         path: path.display().to_string(),
+        tables_scan_finished: false,
         decoder_abi: None,
         exports: Vec::new(),
         tables: Vec::new(),
@@ -15952,6 +16277,7 @@ impl Engine {
                 mount_namespace: view.mount_namespace(),
                 key,
                 path,
+                tables_scan_finished: false,
                 decoder_abi: None,
                 exports: Vec::new(),
                 tables: vec![observed],
@@ -16796,48 +17122,11 @@ impl Engine {
             terminal_owner.is_some(),
             terminal_exports,
         );
-        let mut required_seed_complete = collected.required_seed_complete;
-        for seed in &collected.count_only_seeds {
-            let mut owners = candidate
-                .plan
-                .modules
-                .iter()
-                .filter(|module| module.object == seed.object);
-            let Some(module) = owners.next() else {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            };
-            if owners.next().is_some() {
-                required_seed_complete = false;
-                self.mark_partial(
-                    "live export hook",
-                    "a C_GetFunctionList seed had no unique candidate module owner",
-                );
-                continue;
-            }
-            match candidate.plan.add_provisional_get_function_list(
-                plan::ProvisionalGetFunctionList {
-                    module: module.id,
-                    object: seed.object,
-                    object_path: seed.object_path.clone(),
-                    file_offset: seed.file_offset,
-                },
-            ) {
-                Ok(Some(slot)) => candidate.delta.new.push(slot),
-                Ok(None) => {}
-                Err(_) => {
-                    required_seed_complete = false;
-                    self.mark_partial(
-                        "live export hook",
-                        "a C_GetFunctionList seed could not be added to the candidate plan",
-                    );
-                }
-            }
-        }
+        let required_seed_complete = self.place_count_only_seeds(
+            &mut candidate,
+            &collected.count_only_seeds,
+            collected.required_seed_complete,
+        );
         let outcome = self.apply_candidate(session, candidate, additions_allowed, false, &[])?;
         self.record_apply_timing(&outcome);
         self.queue_apply_outcome(&outcome, pending_views);
@@ -19001,6 +19290,7 @@ impl Engine {
             mount_namespace: self.views[position].mount_namespace(),
             key: loader_identity,
             path: prepared_executable.interpreter().display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: Vec::new(),
             tables: Vec::new(),
@@ -30091,6 +30381,26 @@ impl Engine {
     }
 
     /// Batch-tail publications executed vs skipped as provably redundant.
+    /// Current scan-discovered modules reconciled against the
+    /// aggregated per-view pins (DEMO-4 scan mint). `self.modules`
+    /// is the creation-time snapshot `rebuild_discovered` froze;
+    /// in a live `--system` capture it stays empty while passes
+    /// maintain `scan_inputs`, so consumers that need *current*
+    /// scanned tables read them here, through the same
+    /// aggregation + overlay canonicalization + binding steps
+    /// `rebuild_discovered` uses.
+    pub(crate) fn scan_reconciled_snapshot(&self) -> (Vec<ReconciledModule>, PinnedObjects) {
+        let mut scan_modules = Vec::new();
+        for input in self.scan_inputs.values() {
+            scan_modules.extend(input.modules.clone());
+        }
+        let (mut pinned, _aggregation_skips) =
+            PinnedObjects::aggregate_views(self.scan_inputs.values().map(|input| &input.pins));
+        let _ = canonicalize_scanned_overlays(&mut pinned);
+        let (modules, _binding_skips) = bind_scanned_modules(&scan_modules, &mut pinned);
+        (modules, pinned)
+    }
+
     pub(crate) fn tail_stats(&self) -> (u64, u64) {
         (self.tail_publishes, self.tail_skips)
     }
@@ -30106,8 +30416,11 @@ impl Engine {
     /// Task 3.2 (S1): flush live-accumulated discovery noise as per-class
     /// summaries. Called once at capture end; initial noise was already
     /// reported and cleared by `discover_plan`, so this covers live only.
+    /// Diagnostics: default stderr keeps readiness and warnings only.
     pub fn report_discovery_noise(&mut self) {
-        self.counters.noise.report();
+        if crate::run::capture_diagnostics_on() {
+            self.counters.noise.report();
+        }
         self.counters.noise.clear();
     }
 
@@ -30301,9 +30614,14 @@ impl Engine {
         ) {
             return Ok(());
         }
-        self.plan = self
-            .plan
-            .with_counters_policy(budget)
+        // Rebuilds lower Detailed plans, so a manifest-authorized
+        // slot would refuse the Counters policy below. The shared
+        // helper sheds that authority counters never use, keeping
+        // every slot's identity and names; the budget refuses
+        // before any mutation, so a refusal leaves the plan
+        // untouched.
+        self.plan
+            .admit_counters_under_budget(budget)
             .map_err(|refusal| anyhow!("{refusal}"))?;
         self.plan_rebuild_stable = false;
         Ok(())
@@ -30486,9 +30804,14 @@ impl Engine {
                 .counter_mode()
                 .expect("counter spec implies counter policy");
             let budget = Self::counter_start_budget(mode, self.counter_preflight_cpus())?;
-            self.plan = self
-                .plan
-                .with_counters_policy(budget)
+            // Discovery lowers a Detailed plan, so manifest inputs
+            // arrive with argument-read authority the Counters
+            // policy refuses. The shared helper sheds that
+            // authority counters never use, keeping identities and
+            // names; the budget refuses before any mutation, so a
+            // refusal leaves the plan untouched.
+            self.plan
+                .admit_counters_under_budget(budget)
                 .map_err(|refusal| anyhow!("{refusal}"))?;
             self.plan_rebuild_stable = false;
             Some(budget)
@@ -32164,5 +32487,28 @@ mod view_log_tests {
             .map(|entry| entry.ordinal)
             .collect();
         assert_eq!(ordinals, vec![1, 2, 3, 4]);
+    }
+}
+
+#[cfg(test)]
+mod missing_named_process_tests {
+    use super::missing_named_process_message;
+
+    #[test]
+    fn gone_pid_names_a_missing_process_while_a_live_pid_stays_unknown() {
+        // A PID above any host ceiling never named a process.
+        assert_eq!(
+            missing_named_process_message(99_999_999),
+            "no process with PID 99999999 (it exited, or the PID is mistyped)"
+        );
+        // This test process is alive: a missing view for it must never
+        // read as a missing process.
+        assert_eq!(
+            missing_named_process_message(std::process::id()),
+            format!(
+                "process with PID {} could not be scanned; its modules are unknown, not absent",
+                std::process::id()
+            )
+        );
     }
 }

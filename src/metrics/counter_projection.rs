@@ -2,10 +2,10 @@
 //! Charged cumulative presentation from the existing complete counter collector.
 
 use super::counter_collector::{
-    CounterCellDelta, CounterCollector, CounterHealth, CounterIssue, CounterLimits,
+    CounterCellDelta, CounterCollector, CounterGaps, CounterHealth, CounterIssue, CounterLimits,
     CounterObservation, CounterRead, ReadReservation, ReadStage, ReadWindow, tree_bytes,
 };
-use super::{KernelEvidence, SlotReport};
+use super::{KernelEvidence, LegacyReadGaps, SlotReport};
 use crate::discovery::identity::PinnedObjects;
 use crate::plan::{AttachKey, AttachPlan, SlotOrdinal};
 use crate::semantics_edge::resources::{
@@ -39,6 +39,7 @@ pub(super) struct CounterSnapshot {
     failure: Option<CounterFailure>,
     attempted_kernel: Option<KernelEvidence>,
     discontinuity: bool,
+    bank_gaps: CounterGaps,
 }
 
 impl CounterSnapshot {
@@ -84,8 +85,14 @@ impl CounterSnapshot {
     }
 
     pub(super) fn health(&self) -> Option<CounterHealth> {
-        self.is_fresh()
-            .then(|| self.data.as_ref().unwrap().source.view().health)
+        if !self.is_fresh() || self.bank_gaps.health_failed {
+            return None;
+        }
+        Some(self.data.as_ref().unwrap().source.view().health)
+    }
+
+    pub(super) fn bank_gaps(&self) -> CounterGaps {
+        self.bank_gaps
     }
 
     pub(super) fn deltas(&self) -> Option<&[CounterCellDelta]> {
@@ -171,7 +178,7 @@ impl CounterCaptureInputs {
 
 #[derive(Debug, Clone)]
 enum CaptureData {
-    Legacy(Vec<SlotReport>, KernelEvidence),
+    Legacy(Vec<SlotReport>, KernelEvidence, LegacyReadGaps),
     Counter(CounterSnapshot),
 }
 
@@ -217,14 +224,14 @@ impl CaptureSnapshot {
 
     pub(crate) fn reports(&self) -> &[SlotReport] {
         match &self.data {
-            CaptureData::Legacy(reports, _) => reports,
+            CaptureData::Legacy(reports, _, _) => reports,
             CaptureData::Counter(snapshot) => snapshot.reports(),
         }
     }
 
     pub(crate) fn kernel_evidence(&self) -> KernelEvidence {
         match &self.data {
-            CaptureData::Legacy(_, kernel) => *kernel,
+            CaptureData::Legacy(_, kernel, _) => *kernel,
             CaptureData::Counter(snapshot) => snapshot
                 .kernel_evidence()
                 .expect("a presented counter snapshot retains actual kernel evidence"),
@@ -232,17 +239,45 @@ impl CaptureSnapshot {
     }
 
     pub(crate) fn has_counter_gap(&self) -> bool {
-        self.counter()
-            .is_some_and(|snapshot| !snapshot.is_fresh() || snapshot.discontinuity())
+        self.counter().is_some_and(|snapshot| {
+            !snapshot.is_fresh() || snapshot.discontinuity() || !snapshot.bank_gaps().is_clean()
+        })
+    }
+
+    fn legacy_gaps(&self) -> Option<&LegacyReadGaps> {
+        match &self.data {
+            CaptureData::Legacy(_, _, gaps) => Some(gaps),
+            CaptureData::Counter(_) => None,
+        }
+    }
+
+    pub(crate) fn has_legacy_gap(&self) -> bool {
+        self.legacy_gaps().is_some_and(|gaps| !gaps.is_clean())
+    }
+
+    /// Optional legacy gap object for the evidence document: counts and
+    /// finite reason names only. Omitted when the legacy read was exact.
+    pub(crate) fn legacy_collection(&self) -> Option<serde_json::Value> {
+        let gaps = self.legacy_gaps()?;
+        if gaps.is_clean() {
+            return None;
+        }
+        Some(serde_json::json!({
+            "unread_stats": gaps.slots.unread_stats,
+            "rv_failed": gaps.slots.rv_failed,
+            "unknown_evidence": gaps.unknown_names(),
+        }))
     }
 
     /// Metadata can only be obtained from this accepted protected snapshot.
     /// A failed new attempt never substitutes its mode/generation/window.
+    /// Per-bank gaps appear only when the acquisition was partial; exact
+    /// reads omit `bank_gaps` so the full-coverage shape is unchanged.
     pub(crate) fn counter_collection(&self) -> Option<serde_json::Value> {
         let snapshot = self.counter()?;
         let mode = snapshot.mode()?;
         let generation = snapshot.generation()?;
-        Some(serde_json::json!({
+        let mut value = serde_json::json!({
             "mode": mode.name(),
             "generation": generation,
             "read_window": snapshot.window().map(|window| serde_json::json!({
@@ -254,7 +289,22 @@ impl CaptureSnapshot {
             })),
             "discontinuity": snapshot.discontinuity(),
             "failure": snapshot.failure().map(CounterFailure::name),
-        }))
+        });
+        let bank_gaps = snapshot.bank_gaps();
+        if !bank_gaps.is_clean() {
+            value
+                .as_object_mut()
+                .expect("counter collection is an object")
+                .insert(
+                    "bank_gaps".into(),
+                    serde_json::json!({
+                        "failed_slots": bank_gaps.failed_slots,
+                        "health_failed": bank_gaps.health_failed,
+                        "kernel_failed": bank_gaps.kernel_failed,
+                    }),
+                );
+        }
+        Some(value)
     }
 
     pub(crate) fn counter_summary(&self) -> Option<String> {
@@ -276,18 +326,6 @@ impl CaptureSnapshot {
                 ""
             },
         ))
-    }
-
-    fn require_terminal(self) -> anyhow::Result<Self> {
-        if !self.new_acquisition || self.counter().is_some_and(|snapshot| !snapshot.is_fresh()) {
-            anyhow::bail!(
-                "terminal counter collection unavailable ({})",
-                self.counter()
-                    .and_then(CounterSnapshot::failure)
-                    .map_or("new_observation_required", CounterFailure::name)
-            );
-        }
-        Ok(self)
     }
 }
 
@@ -334,14 +372,24 @@ impl CaptureCollection {
     ) -> anyhow::Result<CaptureSnapshot> {
         // A new scoped, opaque binding comes only from actual preparation.
         let binding = session.counter_reader_binding();
-        let legacy = || {
+        let legacy = || -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)> {
             // Preserve the existing order of ordinary live/terminal reads.
             if terminal {
-                let reports = super::read(session, plan)?;
-                Ok((reports, super::kernel_evidence(session)?))
+                let (reports, slots) = super::read_with_gaps(session, plan)?;
+                let kernel = super::kernel_evidence_with_gaps(session)?;
+                let gaps = LegacyReadGaps {
+                    slots,
+                    unknown_evidence: kernel.unknown_cells,
+                };
+                Ok((reports, kernel, gaps))
             } else {
-                let kernel = super::kernel_evidence(session)?;
-                Ok((super::read(session, plan)?, kernel))
+                let kernel = super::kernel_evidence_with_gaps(session)?;
+                let (reports, slots) = super::read_with_gaps(session, plan)?;
+                let gaps = LegacyReadGaps {
+                    slots,
+                    unknown_evidence: kernel.unknown_cells,
+                };
+                Ok((reports, kernel, gaps))
             }
         };
         if terminal {
@@ -388,7 +436,7 @@ impl CaptureCollection {
             CounterLimits,
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
-        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)>,
         generation: NonZeroU64,
         kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
@@ -397,12 +445,14 @@ impl CaptureCollection {
                 if self.counter.is_some() {
                     anyhow::bail!("counter collection requires its prepared Session binding");
                 }
-                let (reports, mut kernel) = legacy()?;
+                let (reports, mut kernel, mut gaps) = legacy()?;
                 if !profile {
                     kernel.ring_loss = 0;
+                    kernel.unknown_cells &= !super::LEGACY_UNKNOWN_RING_LOSS;
+                    gaps.unknown_evidence = kernel.unknown_cells;
                 }
                 Ok(CaptureSnapshot {
-                    data: CaptureData::Legacy(reports, kernel),
+                    data: CaptureData::Legacy(reports, kernel, gaps),
                     new_acquisition: true,
                 })
             }
@@ -464,6 +514,7 @@ impl CaptureCollection {
                         failure: None,
                         attempted_kernel: Some(kernel),
                         discontinuity,
+                        bank_gaps: CounterGaps::default(),
                     };
                     return CaptureSnapshot::from_counter(snapshot);
                 }
@@ -496,16 +547,16 @@ impl CaptureCollection {
             CounterLimits,
             &SemanticResourceReserver,
         ) -> Result<CounterRead, ReadStage>,
-        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence)>,
+        legacy: impl FnOnce() -> anyhow::Result<(Vec<SlotReport>, KernelEvidence, LegacyReadGaps)>,
         generation: NonZeroU64,
         kernel: impl FnOnce() -> anyhow::Result<KernelEvidence>,
     ) -> anyhow::Result<CaptureSnapshot> {
-        // Always acquire, observe and project again. An Ok read with a folded
-        // row issue, health refusal or collector failure is not a settled read.
+        // Always acquire, observe and project again. A failed terminal read
+        // publishes the last good snapshot as stale with its failure name;
+        // only a capture that never acquired a snapshot fails.
         self.fresh_with(
             plan, pins, profile, binding, acquire, legacy, generation, kernel,
-        )?
-        .require_terminal()
+        )
     }
 }
 
@@ -535,12 +586,18 @@ impl CounterCapture {
         }
     }
 
-    fn failed(&self, failure: CounterFailure, kernel: Option<KernelEvidence>) -> CounterSnapshot {
+    fn failed(
+        &self,
+        failure: CounterFailure,
+        kernel: Option<KernelEvidence>,
+        gaps: CounterGaps,
+    ) -> CounterSnapshot {
         CounterSnapshot {
             data: self.last.clone(),
             failure: Some(failure),
             attempted_kernel: kernel,
             discontinuity: self.discontinuity,
+            bank_gaps: gaps,
         }
     }
 
@@ -561,11 +618,12 @@ impl CounterCapture {
             Ok(read) => read,
             Err(stage) => {
                 let _ = self.collector.observe(Err(stage));
-                return self.failed(CounterFailure::Read(stage), None);
+                return self.failed(CounterFailure::Read(stage), None, CounterGaps::default());
             }
         };
         let kernel = read.view().kernel;
         let health = read.view().health;
+        let gaps = read.view().gaps;
         // Reserve and copy before observe can advance the baseline. Both the
         // acquisition's owned rows and the old displayed view remain charged.
         let (reports, storage) =
@@ -580,10 +638,10 @@ impl CounterCapture {
                         CounterObservation::ReadFailed(stage) => CounterFailure::Read(stage),
                         _ => unreachable!("invalid folded rows cannot establish a baseline"),
                     };
-                    return self.failed(failure.with_observed_health(health), Some(kernel));
+                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
                 }
                 Err(failure) => {
-                    return self.failed(failure.with_observed_health(health), Some(kernel));
+                    return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
                 }
             };
         let observation = self.collector.observe(Ok(read));
@@ -593,7 +651,7 @@ impl CounterCapture {
             _ => None,
         };
         if let Some(failure) = failure {
-            return self.failed(failure.with_observed_health(health), Some(kernel));
+            return self.failed(failure.with_observed_health(health), Some(kernel), gaps);
         }
         self.discontinuity |= matches!(observation, CounterObservation::GenerationChanged { .. });
         let source = self
@@ -613,6 +671,7 @@ impl CounterCapture {
             failure: None,
             attempted_kernel: Some(kernel),
             discontinuity: self.discontinuity,
+            bank_gaps: gaps,
         }
     }
 }
@@ -694,6 +753,8 @@ fn stage_projection(
         charge(tree_bytes::<u64, u64>(row.rv_counts.len()).ok_or_else(budget)?)?;
     }
     let storage = reserve.reserve(bytes).map_err(|_| budget())?;
+    // Fold exec-generation duplicates like the legacy reader: two slots
+    // for one function (retired plus armed) report once, summed.
     let mut reports = Vec::with_capacity(rows.len());
     for raw in rows {
         let row = raw.view();
@@ -725,7 +786,7 @@ fn stage_projection(
             ordinals,
         });
     }
-    Ok((reports, storage))
+    Ok((crate::metrics::merge_slot_reports(reports), storage))
 }
 
 #[cfg(test)]
@@ -735,11 +796,11 @@ pub(super) mod tests {
     };
     use crate::discovery::identity::{PinnedObjects, ReconciledModule};
     use crate::discovery::scan::{ScannedEntry, ScannedModule, ScannedTable};
-    use crate::metrics::KernelEvidence;
     use crate::metrics::counter_collector::{
-        CounterCell, CounterHealth, CounterIssue, CounterLimits, CounterRead, CounterRow,
-        ReadReservation, ReadStage, ReadWindow,
+        CounterCell, CounterGaps, CounterHealth, CounterIssue, CounterLimits, CounterRead,
+        CounterRow, ReadReservation, ReadStage, ReadWindow,
     };
+    use crate::metrics::{KernelEvidence, LegacyReadGaps};
     use crate::plan::{AdmissionPolicy, AttachPlan};
     use crate::process::{MountNamespaceId, ProcessViewId};
     use crate::semantics_edge::resources::{SemanticResourcePool, SemanticResourceReserver};
@@ -789,6 +850,7 @@ pub(super) mod tests {
                 },
                 key,
                 path: path.into(),
+                tables_scan_finished: false,
                 decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {
@@ -936,6 +998,8 @@ pub(super) mod tests {
         Saturated,
         Contended,
         KernelLoss,
+        BankGaps,
+        BankQuarantined,
     }
 
     /// The run-loop tests replace I/O only: every successful acquisition still
@@ -959,7 +1023,13 @@ pub(super) mod tests {
                     profile,
                     Ok(None::<()>),
                     |(), _, _, _, _| panic!("ordinary snapshot cannot acquire counters"),
-                    || Ok((Vec::new(), KernelEvidence::default())),
+                    || {
+                        Ok((
+                            Vec::new(),
+                            KernelEvidence::default(),
+                            LegacyReadGaps::default(),
+                        ))
+                    },
                     std::num::NonZeroU64::new(1).unwrap(),
                     || Ok(KernelEvidence::default()),
                 )
@@ -1026,6 +1096,32 @@ pub(super) mod tests {
                 native_reads.set(native_reads.get() + 1);
                 match fault {
                     Some(ConsumerFault::ReadRvs) => Err(ReadStage::Rvs),
+                    Some(ConsumerFault::BankGaps) => {
+                        let mut read = read_with_health(
+                            plan,
+                            mode,
+                            generation,
+                            returned,
+                            CounterHealth::default(),
+                            KernelEvidence::default(),
+                            reserve,
+                        );
+                        read.set_gaps(CounterGaps {
+                            failed_slots: 1,
+                            health_failed: false,
+                            kernel_failed: false,
+                        });
+                        Ok(read)
+                    }
+                    Some(ConsumerFault::BankQuarantined) => CounterRead::new(
+                        std::num::NonZeroU64::new(generation).unwrap(),
+                        mode,
+                        ReadWindow::new(Some(30), Some(40)),
+                        Err(CounterIssue::BankQuarantined),
+                        CounterHealth::default(),
+                        KernelEvidence::default(),
+                        ReadReservation::reserve(0, 0, reserve).unwrap(),
+                    ),
                     Some(
                         ConsumerFault::RowTopology
                         | ConsumerFault::RowTopologySaturated
@@ -1115,6 +1211,54 @@ pub(super) mod tests {
         }
     }
 
+    /// Two exec generations of one function fold to one aggregate row
+    /// in counter projections too, not just the legacy reader: same
+    /// names, file and offset sum their counters instead of printing
+    /// twice.
+    #[test]
+    fn projection_folds_duplicate_function_rows_across_generations() {
+        let (_file, plan, pins) = fixture();
+        let pool = SemanticResourcePool::reference_limit(32 * 1024 * 1024);
+        let reserve = pool.reserver();
+        let slot = &plan.slots[0];
+        let row = |returned: u64| {
+            CounterRow::fold(
+                slot,
+                CounterMode::Counts,
+                [CounterCell::Counts(&CountStats {
+                    entered: returned + 1,
+                    returned,
+                    errors: 1,
+                })],
+                [(
+                    RvKey {
+                        slot: slot.index,
+                        _pad: 0,
+                        rv: 0,
+                    },
+                    returned,
+                )],
+                LIMITS,
+            )
+            .unwrap()
+        };
+        let rows = vec![row(10), row(20)];
+        let reservation = ReadReservation::reserve(2, 2, &reserve).unwrap();
+        let read = CounterRead::new(
+            std::num::NonZeroU64::new(1).unwrap(),
+            CounterMode::Counts,
+            ReadWindow::new(Some(10), Some(20)),
+            Ok(rows),
+            CounterHealth::default(),
+            KernelEvidence::default(),
+            reservation,
+        )
+        .unwrap();
+        let (reports, _lease) = super::stage_projection(&plan, &pins, &read, &reserve).unwrap();
+        assert_eq!(reports.len(), 1, "two generations fold to one row");
+        assert_eq!(reports[0].calls, 30);
+    }
+
     #[test]
     fn consumer_selection_uses_prepared_presence_and_never_falls_back_on_refusal() {
         use crate::attach::counter_banks::{BankRefusal, BankShapeCause};
@@ -1196,6 +1340,7 @@ pub(super) mod tests {
                                 unmatched_returns: 3,
                                 ..Default::default()
                             },
+                            LegacyReadGaps::default(),
                         ))
                     },
                     std::num::NonZeroU64::new(1).unwrap(),
@@ -1209,6 +1354,178 @@ pub(super) mod tests {
             );
             assert_eq!(snapshot.kernel_evidence().unmatched_returns, 3);
         }
+    }
+
+    #[test]
+    fn legacy_gaps_publish_partial_with_named_reasons() {
+        use crate::metrics::{LEGACY_UNKNOWN_OWNER, LEGACY_UNKNOWN_RING_LOSS};
+        let (_file, plan, pins) = fixture();
+        let mut collection = CaptureCollection::new(None);
+        let snapshot = collection
+            .fresh_with(
+                &plan,
+                &pins,
+                true,
+                Ok(None::<()>),
+                |(), _, _, _, _| panic!("ordinary Session must not use counter reader"),
+                || {
+                    Ok((
+                        Vec::new(),
+                        KernelEvidence {
+                            unknown_cells: LEGACY_UNKNOWN_RING_LOSS | LEGACY_UNKNOWN_OWNER,
+                            ..Default::default()
+                        },
+                        LegacyReadGaps {
+                            slots: crate::metrics::LegacySlotGaps {
+                                unread_stats: 2,
+                                rv_failed: true,
+                            },
+                            unknown_evidence: LEGACY_UNKNOWN_RING_LOSS | LEGACY_UNKNOWN_OWNER,
+                        },
+                    ))
+                },
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
+            )
+            .unwrap();
+        assert!(snapshot.has_legacy_gap());
+        assert!(!snapshot.has_counter_gap());
+        assert!(snapshot.counter_collection().is_none());
+        let gaps = snapshot.legacy_collection().unwrap();
+        assert_eq!(gaps["unread_stats"], 2);
+        assert_eq!(gaps["rv_failed"], true);
+        assert_eq!(
+            gaps["unknown_evidence"],
+            serde_json::json!(["ring_loss", "owner"])
+        );
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE");
+        crate::render::apply_legacy_gaps(&mut evidence, &snapshot);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"legacy_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+        let document =
+            crate::render::with_legacy_snapshot(serde_json::json!({"evidence": {}}), &snapshot);
+        assert_eq!(document["evidence"]["legacy_collection"], gaps);
+    }
+
+    #[test]
+    fn legacy_exact_omits_gaps_and_stays_complete() {
+        let (_file, plan, pins) = fixture();
+        let mut collection = CaptureCollection::new(None);
+        let snapshot = collection
+            .fresh_with(
+                &plan,
+                &pins,
+                true,
+                Ok(None::<()>),
+                |(), _, _, _, _| panic!("ordinary Session must not use counter reader"),
+                || {
+                    Ok((
+                        Vec::new(),
+                        KernelEvidence::default(),
+                        LegacyReadGaps::default(),
+                    ))
+                },
+                std::num::NonZeroU64::new(1).unwrap(),
+                || Ok(KernelEvidence::default()),
+            )
+            .unwrap();
+        assert!(!snapshot.has_legacy_gap());
+        assert!(snapshot.legacy_collection().is_none());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_legacy_gaps(&mut evidence, &snapshot);
+        assert_eq!(evidence.completeness, "COMPLETE");
+        assert!(
+            !evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"legacy_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+        let document =
+            crate::render::with_legacy_snapshot(serde_json::json!({"evidence": {}}), &snapshot);
+        assert!(document["evidence"].get("legacy_collection").is_none());
+    }
+
+    #[test]
+    fn counter_bank_gaps_publish_partial_with_named_counts() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let stale = fixture
+            .fresh(CounterMode::Counts, 1, 9, Some(ConsumerFault::BankGaps))
+            .expect("bank gaps must publish stale with named counts");
+        assert_eq!(stale.reports()[0].calls, 5);
+        assert!(stale.has_counter_gap());
+        let gaps = stale.counter_collection().unwrap();
+        assert_eq!(gaps["status"], "stale");
+        assert_eq!(gaps["failure"], "topology");
+        assert_eq!(gaps["bank_gaps"]["failed_slots"], 1);
+        assert_eq!(gaps["bank_gaps"]["health_failed"], false);
+        assert_eq!(gaps["bank_gaps"]["kernel_failed"], false);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &stale);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn quarantined_bank_publishes_last_good_stale_with_named_failure() {
+        // A quarantined or misrouted bank voids every bank: quarantine is
+        // a directory-global integrity refusal with no per-bank surface,
+        // so the capture publishes last-good stale with the named
+        // failure instead of blanking. Per-bank quarantine partition
+        // needs the bank-authority surface and stays deferred.
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let stale = fixture
+            .fresh(
+                CounterMode::Counts,
+                1,
+                9,
+                Some(ConsumerFault::BankQuarantined),
+            )
+            .expect("a quarantined bank must publish stale, never blank");
+        assert_eq!(stale.reports()[0].calls, 5);
+        assert!(stale.has_counter_gap());
+        let collection = stale.counter_collection().unwrap();
+        assert_eq!(collection["status"], "stale");
+        assert_eq!(collection["failure"], "bank_quarantined");
+        assert!(collection.get("bank_gaps").is_none());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &stale);
+        assert_eq!(evidence.completeness, "PARTIAL");
+    }
+
+    #[test]
+    fn counter_exact_omits_bank_gaps_and_stays_complete() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        let fresh = fixture
+            .fresh(CounterMode::Counts, 1, 5, None)
+            .expect("exact reads stay exact");
+        assert!(!fresh.has_counter_gap());
+        let gaps = fresh.counter_collection().unwrap();
+        assert_eq!(gaps["status"], "fresh");
+        assert!(gaps.get("bank_gaps").is_none());
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &fresh);
+        assert_eq!(evidence.completeness, "COMPLETE");
     }
 
     #[test]
@@ -1763,6 +2080,83 @@ pub(super) mod tests {
             evidence.verdict();
             assert_eq!(evidence.completeness, "PARTIAL");
         }
+    }
+
+    #[test]
+    fn terminal_failure_publishes_last_good_stale_with_gap() {
+        use p11scope_ebpf_common::CounterMode;
+        // Never-acquired terminal still fails: no snapshot exists to publish.
+        {
+            let mut fresh = ConsumerFixture::new();
+            let error = fresh
+                .terminal(CounterMode::Counts, 1, 5, Some(ConsumerFault::ReadRvs))
+                .expect_err("a terminal without any prior snapshot must fail");
+            assert!(
+                format!("{error:#}").contains("counter collection unavailable"),
+                "{error:#}"
+            );
+        }
+        // A terminal read failure after a good snapshot publishes the last
+        // good rows as stale with a named failure and a PARTIAL gap.
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let terminal = fixture
+            .terminal(CounterMode::Counts, 1, 9, Some(ConsumerFault::ReadRvs))
+            .expect("terminal must publish the last good snapshot as stale");
+        assert_eq!(terminal.reports()[0].calls, 5);
+        assert!(terminal.has_counter_gap());
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], "read_rvs");
+        assert_eq!(metadata["mode"], "counts");
+        assert_eq!(metadata["generation"], 1);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        assert_eq!(evidence.completeness, "COMPLETE");
+        crate::render::apply_counter_snapshot(&mut evidence, &terminal);
+        assert_eq!(evidence.completeness, "PARTIAL");
+        assert!(
+            evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"counter_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
+    }
+
+    #[test]
+    fn terminal_success_after_good_snapshot_stays_fresh() {
+        use p11scope_ebpf_common::CounterMode;
+        let mut fixture = ConsumerFixture::new();
+        fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+        let terminal = fixture
+            .terminal(CounterMode::Counts, 1, 8, None)
+            .expect("a clean terminal read stays fresh");
+        assert_eq!(terminal.reports()[0].calls, 8);
+        assert!(!terminal.has_counter_gap());
+        assert!(ConsumerFixture::terminal_eligible(&terminal));
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "fresh");
+        assert!(metadata["failure"].is_null());
+        assert_eq!(metadata["mode"], "counts");
+        assert_eq!(metadata["generation"], 1);
+        assert_eq!(metadata["health"]["saturated"], false);
+        assert_eq!(metadata["health"]["contended"], false);
+        let mut evidence = crate::render::tests::evidence();
+        evidence.verdict();
+        crate::render::apply_counter_snapshot(&mut evidence, &terminal);
+        assert_eq!(evidence.completeness, "COMPLETE");
+        assert!(
+            !evidence
+                .gap_classes
+                .observation
+                .causes
+                .contains(&"counter_collection"),
+            "{:?}",
+            evidence.gap_classes.observation.causes
+        );
     }
 
     #[test]

@@ -100,7 +100,7 @@ fn profile_counter_cached_ticks_make_zero_native_calls() {
 }
 
 #[test]
-fn profile_counter_terminal_requires_a_new_successful_observation() {
+fn profile_counter_terminal_publishes_last_good_on_failure() {
     use metrics::ConsumerFault;
     use p11scope_ebpf_common::CounterMode;
     for (fault, cause) in [
@@ -128,10 +128,15 @@ fn profile_counter_terminal_requires_a_new_successful_observation() {
         assert_eq!(metadata["failure"], cause);
         assert!(metadata["health"].is_null());
         assert!(!metrics::ConsumerFixture::terminal_eligible(&stale));
-        let error = fixture
+        let terminal = fixture
             .terminal(CounterMode::Counts, 1, 9, Some(fault))
-            .unwrap_err();
-        assert!(error.to_string().contains(cause), "{error:#}");
+            .expect("terminal publishes the last good snapshot as stale");
+        assert_eq!(terminal.reports()[0].calls, 5);
+        assert!(terminal.has_counter_gap());
+        let metadata = terminal.counter_collection().unwrap();
+        assert_eq!(metadata["status"], "stale");
+        assert_eq!(metadata["failure"], cause);
+        assert!(!metrics::ConsumerFixture::terminal_eligible(&terminal));
         assert_eq!(fixture.reads(), (3, 0));
     }
 }
@@ -1117,7 +1122,11 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
         .unwrap();
         assert_eq!(snapshot, 0);
     }
-    assert!(String::from_utf8_lossy(&context.stdout).contains("[semantics unverified]"));
+    // The downgraded slot's line names the function with no per-line
+    // marker; the header note covers unverified slots once.
+    let stdout = String::from_utf8_lossy(&context.stdout);
+    assert!(stdout.contains(" C_OpenSession "), "{stdout}");
+    assert!(!stdout.contains("[semantics unverified]"), "{stdout}");
 }
 
 struct TickContext {
@@ -1204,7 +1213,9 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
         }
         assert_eq!(state.sessions().opened, 1);
         if trace_mode {
-            assert!(String::from_utf8_lossy(&context.stdout).contains(" C_OpenSession "));
+            let stdout = String::from_utf8_lossy(&context.stdout);
+            assert!(stdout.contains(" C_OpenSession "), "{stdout}");
+            assert!(stdout.contains("sess#"), "{stdout}");
         }
 
         context.plan.slots[0].descriptor_index = 0;
@@ -1251,9 +1262,14 @@ fn capture_tick_syncs_new_and_downgraded_slots_before_reduction() {
             "COUNT_ONLY must not add a semantic open"
         );
         if trace_mode {
+            // No per-line marker anymore: a downgraded (COUNT_ONLY) slot
+            // renders the bare name with no session pseudonym, so the
+            // missing `sess#` proves the tracer synced the downgrade.
+            let stdout = String::from_utf8_lossy(&context.stdout);
+            assert!(stdout.contains(" C_OpenSession "), "{stdout}");
             assert!(
-                String::from_utf8_lossy(&context.stdout).contains("[semantics unverified]"),
-                "trace metadata must be synchronized with the downgrade"
+                !stdout.contains("sess#"),
+                "trace metadata must be synchronized with the downgrade: {stdout}"
             );
         }
     }
@@ -2786,6 +2802,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             "bootstrap_unavailable",
         ),
         prearm: Vec::new(),
+        key_operations_requested: false,
+        manifests_present: false,
         budgets: BudgetView {
             callers_limit: 8,
             callers_occupied: 1,

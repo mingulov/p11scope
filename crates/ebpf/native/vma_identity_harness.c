@@ -629,6 +629,40 @@ static void scenario_zeroed_target_keeps_leader_gate(void)
 
 /* Anchor program fed a nonleader task installs nothing and emits
  * nothing: the leader gate holds even under direct TID iteration. */
+/* Observer binding: a zero `observer_tgid` skips the match (the
+ * pidfd-bound iterator already walks exactly one task), while a
+ * nonzero observer skips any other tgid. The observed tgid is 4242
+ * (never the suite's usual 100) so a hardcoded 100 cannot pass.
+ */
+static void scenario_observer_tgid_gate_and_wildcard(void)
+{
+    const u64 base = 0x7F0000000000ULL;
+    const u64 stride = P11_IDENT_ANCHOR_STRIDE;
+    const u64 page = P11_IDENT_PAGE;
+    const u64 x = 0xFFFF888000001000ULL;
+    const struct p11_anchor_entry *found;
+    /* Wildcard: any tgid installs. */
+    host_reset(7, base, 2 * stride, 2, 0);
+    host_observe(base, base + page, x, 4242);
+    HOST_CHECK(host_capture_n == 1 && host_capture[0].verdict == P11_IDENT_ANCHOR_OK &&
+                   host_capture[0].a == 0,
+               "wildcard_installs_non100_tgid");
+    found = host_anchor_find(x);
+    HOST_CHECK(found != (void *)0 && found->slot == 0 && found->gen == 7,
+               "wildcard_installs_entry");
+    /* Mismatch: a nonzero observer skips any other tgid. */
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 4242);
+    HOST_CHECK(host_capture_n == 0, "mismatch_emits_nothing");
+    HOST_CHECK(host_anchors_used() == 0, "mismatch_installs_nothing");
+    /* Match: the observer itself still installs. */
+    host_reset(7, base, 2 * stride, 2, 100);
+    host_observe(base, base + page, x, 100);
+    HOST_CHECK(host_capture_n == 1 && host_capture[0].verdict == P11_IDENT_ANCHOR_OK &&
+                   host_capture[0].a == 0,
+               "match_installs_observer");
+}
+
 static void scenario_nonleader_anchor_installs_nothing(void)
 {
     const u64 base = 0x7F0000000000ULL;
@@ -689,6 +723,7 @@ static const struct {
     {"member-run-accepts-exact-survivor", scenario_member_run_accepts_exact_survivor},
     {"member-run-skips-non-targets", scenario_member_run_skips_non_targets},
     {"zeroed-target-keeps-leader-gate", scenario_zeroed_target_keeps_leader_gate},
+    {"observer-tgid-gate-and-wildcard", scenario_observer_tgid_gate_and_wildcard},
     {"nonleader-anchor-installs-nothing", scenario_nonleader_anchor_installs_nothing},
     {"target-config-replay-is-stable", scenario_target_config_replay_is_stable},
 };

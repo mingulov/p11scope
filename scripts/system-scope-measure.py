@@ -346,7 +346,20 @@ TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+    "Calls on unverified functions are not decoded (names only).",
 ))
+TRACE_TOTALS_RE = re.compile(
+    r"^\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.$")
+TRACE_TAIL_HINT = "run with -v for details"
+
+
+def _is_trace_tail_line(line):
+    """Whether a line past EVIDENCE is the validated human summary tail."""
+    return (
+        line == TRACE_TAIL_HINT
+        or line.startswith("coverage: ")
+        or TRACE_TOTALS_RE.match(line) is not None
+    )
 LOST_LINE_RE = re.compile(r"^LOST (\d+) events$")
 TRUNCATED_LINE_RE = re.compile(r"^TRUNCATED at \d+ events")
 
@@ -358,8 +371,10 @@ def parse_trace_stream(lines):
     optional exact fixed context lines for unknown executable identity,
     timestamped completed-call lines, cumulative `LOST n events` reports
     (the kernel counter value, not a delta), at most one TRUNCATED line,
-    then COUNT_EVIDENCE and EVIDENCE JSON records last. Anything else
-    fails closed: an oracle that silently skips lines invents shares.
+    then COUNT_EVIDENCE and EVIDENCE JSON records, then the validated
+    human summary tail (totals, one coverage line, the detail hint).
+    Anything else fails closed: an oracle that silently skips lines
+    invents shares.
     """
     capture_seen = 0
     truncated = False
@@ -374,8 +389,14 @@ def parse_trace_stream(lines):
     content = [line for line in content if line != ""]
     if not content or not content[0].startswith("CAPTURE "):
         raise ValueError("trace stream must open with the CAPTURE header")
-    if not content[-1].startswith("EVIDENCE "):
-        raise ValueError("trace stream must close with the EVIDENCE record")
+    evidence_at = [index for index, line in enumerate(content)
+                   if line.startswith("EVIDENCE ")]
+    if len(evidence_at) != 1:
+        raise ValueError("trace stream must carry exactly one EVIDENCE record")
+    for tail in content[evidence_at[0] + 1:]:
+        if not _is_trace_tail_line(tail):
+            raise ValueError(f"unrecognized trace tail line: {tail!r}")
+    content = content[:evidence_at[0] + 1]
     for line in content:
         if line in TRACE_CONTEXT_LINES:
             continue

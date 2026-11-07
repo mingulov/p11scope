@@ -62,6 +62,7 @@ fn evidence() -> Evidence {
         pause_confirmed: 0,
         pause_partial: 0,
         pause_unavailable: 0,
+        pause_engine_incomplete_retirements: 0,
         child_still_running: None,
         discovery_ring_loss: 0,
         discovery_state_failures: 0,
@@ -175,12 +176,18 @@ fn aggregate_scope_has_no_application_allocation() {
         text.contains("Aggregate across the selected scope; counts are not per application"),
         "{text}"
     );
+    assert!(text.contains("names unconfirmed"), "{text}");
+    let aliased = text
+        .lines()
+        .find(|line| line.contains("C_Sign|C_Encrypt"))
+        .unwrap();
     assert!(
-        text.contains("7 completed calls have ambiguous module ownership"),
+        aliased.contains("two providers") && aliased.contains('7'),
         "{text}"
     );
+    let unowned = text.lines().find(|line| line.contains("unknown")).unwrap();
     assert!(
-        text.contains("5 completed calls have unresolved module ownership"),
+        unowned.contains("C_Sign") && unowned.contains('5'),
         "{text}"
     );
 }
@@ -217,6 +224,8 @@ fn completed_entries_and_returns_are_distinct() {
 }
 
 // Catch treating ring-buffer loss as erased or allocated map counts.
+// F2: the human text shows coverage once (the `call records lost`
+// fragment), without the duplicate event-detail sentence.
 #[test]
 fn loss_does_not_erase_map_counts() {
     let reports = [report(12, 1, 0)];
@@ -234,9 +243,10 @@ fn loss_does_not_erase_map_counts() {
     assert_eq!(trace::lost_line(4).as_deref(), Some("LOST 4 events"));
     let text = human(&reports, &ev);
     assert!(text.contains("12 completed calls"), "{text}");
-    assert!(text.contains("event detail was lost"), "{text}");
+    assert!(text.contains("4 call records lost"), "{text}");
+    assert!(!text.contains("event detail was lost"), "{text}");
     assert!(
-        text.contains("Aggregate counts use the counter maps"),
+        !text.contains("Aggregate counts use the counter maps"),
         "{text}"
     );
 }
@@ -337,13 +347,18 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
         let header = text.lines().next().unwrap();
         let scope = header.find(&format!("{label} scope")).unwrap();
         let duration = header.find("up 00:00:30").unwrap();
-        let counts = text.find("4 completed calls; 1 returned errors").unwrap();
+        let counts = text.find("4 completed calls; 1 returned error;").unwrap();
         let table = text.find("FUNCTION").unwrap();
         assert!(
             scope < duration && duration < counts && counts < table,
             "{text}"
         );
-        assert!(text.contains(&format!("Scope: {label} scope")), "{text}");
+        // The header carries the validated kind; the body keeps no Scope: line.
+        assert!(
+            header.starts_with(&format!("p11scope — {label} scope — ")),
+            "{text}"
+        );
+        assert!(!text.contains("Scope: "), "{text}");
         assert_eq!(
             render::json(&reports, &ev, &capture(kind))["capture"]["scope"],
             kind
@@ -353,7 +368,12 @@ fn scoped_renderer_uses_only_scope_kinds_and_keeps_legacy_consumer_valid() {
     assert!(legacy.contains("selected scope"), "{legacy}");
     for invalid in ["/proc/4242", "4242", "system\n\u{1b}[2J"] {
         let summary = render::scope_summary(invalid, &reports, &ev);
-        assert!(summary.starts_with("Scope: selected scope\n"), "{summary}");
+        assert!(
+            summary.starts_with(
+                "Aggregate across the selected scope; counts are not per application.\n"
+            ),
+            "{summary}"
+        );
         assert!(!summary.contains(invalid), "{summary}");
     }
     assert!(trace::identity_note().contains("completed call events in arrival order"));
@@ -380,6 +400,48 @@ fn actual_trace_formatter_is_accepted_by_canary_privacy_consumer() {
         "{}\n{}\n{line}\n",
         trace::capture_line(CapturePolicy::Allowlisted),
         trace::identity_note()
+    );
+    let script =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-canary-evidence.py");
+    let mut child = Command::new("python3").args(["-I", "-c",
+        "import runpy,sys; n=runpy.run_path(sys.argv[1]); rest=n['trace_scannable']('renderer',sys.stdin.read()); n['assert_no_loader_pause_identity']('renderer',rest)"])
+        .arg(script).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(text.as_bytes())
+        .unwrap();
+    let result = child.wait_with_output().unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+// The header note plus the human tail (with singular totals) must pass
+// the same privacy consumer: every line is a frozen shape.
+#[test]
+fn singular_trace_tail_is_accepted_by_canary_privacy_consumer() {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let event = Event {
+        pid_tgid: (111u64 << 32) | 112,
+        duration_ns: 12000,
+        ..Event::default()
+    };
+    let line = trace::format_line(&event, 0, "C_Sign", None);
+    // The singular totals line the producer emits for (1, 0, 1) (pinned
+    // by `totals_line_singularizes_one`); the consumer must accept it.
+    let text = format!(
+        "{}\n{}\n{}\n{line}\nCOUNT_EVIDENCE {{\"stats_entered\": 1}}\nEVIDENCE \
+         {{\"privacy_mode\": \"allowlisted\"}}\n1 completed call; 0 returned errors; 1 entry \
+         without an observed return.\ncoverage: partial — nothing known was \
+         lost\nrun with -v for details\n",
+        trace::capture_line(CapturePolicy::Allowlisted),
+        trace::identity_note(),
+        trace::unverified_note(),
     );
     let script =
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/check-canary-evidence.py");

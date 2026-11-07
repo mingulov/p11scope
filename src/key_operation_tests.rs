@@ -4336,6 +4336,167 @@ fn key_operation_unknown_key_and_requested_only() {
     assert_eq!((row.completed, row.active), (1, 0));
 }
 
+/// DEMO-4 late attach: a key first observed through FIND (its lookup
+/// and any session/login happened before attach) that signs after
+/// attach must keep a per-key row even though its type/size were
+/// never established: the row carries the object id with metadata
+/// `unknown`, i.e. type unknown (not established while observed),
+/// never a guessed label and never a dropped row. A sibling key whose type
+/// is later established by an already-observed
+/// `C_GetAttributeValue` keeps its exact label in the same capture.
+#[test]
+fn key_operation_first_observed_key_rows_with_unknown_metadata() {
+    const FIND_A: u64 = 0xC1C1_C1C1_C1C1_C1C1;
+    const FIND_B: u64 = 0xC2C2_C2C2_C2C2_C2C2;
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut joint = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Initialize", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsInit", CkRv::OK.0, 0, 0),
+    );
+    let mut find = ShapedS1::shaped("C_FindObjects", CkRv::OK.0, 0, 0);
+    find.find_handles = Some((vec![FIND_A, FIND_B], false));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &find,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_FindObjectsFinal", CkRv::OK.0, 0, 0),
+    );
+    // Sign with the never-queried found key (the late-attach key).
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((FIND_B, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    // The sibling's type is established by an observed attribute
+    // call, then it signs with its exact label.
+    let mut get = ShapedS1 {
+        getattr_cells: vec![(1u8, 1u8, 3u16), (2u8, 1u8, 0u16), (5u8, 1u8, 2048u16)],
+        ..ShapedS1::shaped("C_GetAttributeValue", CkRv::OK.0, 0, 0)
+    };
+    get.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &get,
+    );
+    let mut sign_init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    sign_init.input0 = Some((FIND_A, 1));
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &sign_init,
+    );
+    drive_quantum(
+        &mut scene,
+        &mut staging,
+        &mut joint,
+        &mut keyuse,
+        &mut sink,
+        &ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture()),
+    );
+    assert_eq!((joint.started(), joint.completed()), (2, 2));
+    let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    let unknown_row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .expect("first-observed key keeps a per-key row with unknown metadata");
+    assert_eq!(
+        (
+            unknown_row.started,
+            unknown_row.completed,
+            unknown_row.active
+        ),
+        (1, 1, 0)
+    );
+    let object = committed
+        .objects
+        .iter()
+        .find(|row| row.object == unknown_row.object)
+        .expect("the row's object stands");
+    assert_eq!(object.origin, "first_observed");
+    assert_eq!(object.label, None, "no type is guessed");
+    let labelled = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.metadata_at_use == "rsa_2048")
+        .expect("established sibling keeps its exact label");
+    assert_eq!((labelled.started, labelled.completed), (1, 1));
+    assert_ne!(labelled.object, unknown_row.object);
+    assert!(
+        committed
+            .unknown_key_operations
+            .iter()
+            .all(|row| !(row.category == "sign" && row.reason == "metadata_unknown")),
+        "the attributed sign is not double-counted in the unknown bucket"
+    );
+    // The JSON section carries the new label under its new version.
+    let json = crate::key_operation_projection::object_observations_json(&committed);
+    assert_eq!(json["version"], 4, "unknown metadata rows stamp v4");
+    assert!(
+        json["key_operations"]
+            .as_array()
+            .expect("rows")
+            .iter()
+            .any(|row| row["metadata_at_use"] == "unknown"),
+        "JSON row carries the unknown metadata label"
+    );
+}
+
 /// N2: metadata freezes in the positional model receipt at the
 /// join: a receipt assembled after routing delay (the model learned
 /// an RSA label after the Init settled) carries no label — delay
@@ -5322,10 +5483,10 @@ fn reconstruct(lines: &[serde_json::Value]) -> Reconstructed {
             .get("version")
             .map_or(1, |v| v.as_u64().unwrap_or(u64::MAX));
         assert!(
-            version == 1 || version == 2,
+            (1..=4).contains(&version),
             "H9 row version {version} refused"
         );
-        let (roles, creations): (&[&str], &[&str]) = if version == 2 {
+        let (roles, creations): (&[&str], &[&str]) = if version >= 2 {
             (&ROLE_LABELS_V2[..], &CREATION_LABELS_V2[..])
         } else {
             (&ROLE_LABELS[..], &CREATION_LABELS[..])
@@ -5753,12 +5914,12 @@ fn key_operation_one_projection_three_consumers() {
     assert_eq!(wide.len(), 24, "frames fill the viewport");
     let line = wide
         .iter()
-        .find(|line| line.starts_with("objects/keys"))
+        .find(|line| line.starts_with("keys revision"))
         .expect("projection line");
     assert_eq!(
         line,
         &format!(
-            "objects/keys rev 1 populated | sess 1 obj 3 krows {} urows {} refused 0+0 | {}",
+            "keys revision 1 populated | 1 sessions 3 keys {} per-key rows {} unattributed rows 0 refused | {}",
             r1.key_operations.len(),
             r1.unknown_key_operations.len(),
             "encapsulate 1/0/0 operations, generate_key 1/0/0 operations, sign 1/0/2 operations, verify 1/1/0 operations, wrap 1/0/0 operations",
@@ -5773,10 +5934,10 @@ fn key_operation_one_projection_three_consumers() {
     let narrow = dashboard_text(&presentation, 80, 24);
     let short = narrow
         .iter()
-        .find(|line| line.starts_with("objects/keys"))
+        .find(|line| line.starts_with("keys revision"))
         .expect("narrow line");
     assert!(
-        short.starts_with("objects/keys rev 1 populated | sess 1 obj 3 krows "),
+        short.starts_with("keys revision 1 populated | 1 sessions 3 keys "),
         "{short}"
     );
 
@@ -7785,7 +7946,7 @@ fn key_operation_g29_creator_close_vs_accessor_view() {
     let creator = committed
         .key_operations
         .iter()
-        .find(|row| row.category == "sign")
+        .find(|row| row.category == "sign" && row.metadata_at_use != "unknown")
         .expect("the creator use stands");
     assert_eq!(
         (creator.active, creator.key_join_lost),
@@ -7799,11 +7960,20 @@ fn key_operation_g29_creator_close_vs_accessor_view() {
         .expect("the cancelled terminal routes once");
     assert_eq!(routed.cancelled, 1);
     let accessor = committed
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("the accessor use stands");
-    assert_eq!(accessor.active, 1, "accessor session stays live");
+    // DEMO-4: the accessor's first-observed view rows per-key, so
+    // its retirement closes the join exactly like a labelled key
+    // (key_join_lost); its S1 machine stays live (asserted above).
+    // Previously the use sat in the metadata_unknown summary, whose
+    // associations keep their S1 active until the terminal.
+    assert_eq!(
+        (accessor.active, accessor.key_join_lost),
+        (0, 1),
+        "accessor view retirement closes its join"
+    );
 }
 
 /// G29 (N1b): delivery/equivalence matrix through the registry.
@@ -8707,6 +8877,7 @@ fn key_operation_schema_contract() {
             },
             label,
             attribution_valid,
+            first_observed: false,
             lost: false,
         };
         let mut start_sink = Vec::new();
@@ -8833,7 +9004,9 @@ fn key_operation_schema_contract() {
         &fall_scene.model.project(),
         &fall_keyuse,
     );
-    assert_eq!(fell.status, ObsStatus::Unavailable);
+    // Joint never stops as a whole: the fallback's preserved rows
+    // publish as partial, its replayed calls counted unattributed.
+    assert_eq!(fell.status, ObsStatus::Partial);
     assert_eq!(fell.reason, "proof_refused_fallback");
     assert!(fell.objects.is_empty(), "fallback invents no object facts");
     assert!(
@@ -8882,7 +9055,9 @@ fn key_operation_schema_contract() {
         &loss_scene.model.project(),
         &loss_keyuse,
     );
-    assert_eq!(lost.status, ObsStatus::Unavailable);
+    // The disposed call is counted, so the section is partial with
+    // its reason named, never a whole-capture unavailability.
+    assert_eq!(lost.status, ObsStatus::Partial);
     assert_eq!(lost.reason, "authority_lost");
 
     // Full budget: the commit surface reports PARTIAL with exact
@@ -11289,12 +11464,22 @@ fn key_operation_kem_retired_input_stays_unavailable() {
     let receipts = direct_receipts(&sink);
     assert_eq!(receipts.len(), 1);
     let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
+    // DEMO-4: the fresh first-observed input rows per-key under the
+    // `unknown` metadata label (never the retired object); nothing
+    // lands in the capture-wide metadata_unknown bucket.
     let unknown: Vec<_> = committed
         .unknown_key_operations
         .iter()
         .map(|row| (row.category, row.reason, row.completed))
         .collect();
-    assert_eq!(unknown, vec![("encapsulate", "metadata_unknown", 1)]);
+    assert_eq!(unknown, Vec::<(&str, &str, u64)>::new());
+    let row = committed
+        .key_operations
+        .iter()
+        .find(|row| row.category == "encapsulate" && row.metadata_at_use == "unknown")
+        .expect("the first-observed input rows per-key");
+    assert_eq!(row.completed, 1);
+    assert_ne!(row.object, retired_id.as_u64());
 }
 
 /// Item 18: later qualification is forward-only. A KEM output's
@@ -12410,13 +12595,15 @@ fn key_operation_kem_jsonl_version_dispatch() {
     assert_reconstructed_eq_json(&reconstruct(&spun), &section, false);
 }
 
-/// The unknown-version refusal names its version.
+/// The unknown-version refusal names its version. (Versions 3 and
+/// 4 are real section versions since JK-22/DEMO-4; the sentinel is
+/// a version no producer emits.)
 #[test]
-#[should_panic(expected = "H9 row version 3 refused")]
+#[should_panic(expected = "H9 row version 99 refused")]
 fn key_operation_kem_jsonl_unknown_version_refused() {
     let lines = [serde_json::json!({
         "kind": "object_observed",
-        "event": {"revision": 1, "version": 3, "row": {}},
+        "event": {"revision": 1, "version": 99, "row": {}},
     })];
     let _ = reconstruct(&lines);
 }
@@ -14776,6 +14963,26 @@ impl GuardedScene {
         )
     }
 
+    /// Drive one proved-irrelevant info call direct for `key`:
+    /// manual facts on a fixture-minted ordinal (info calls are
+    /// not attested shapes), then publish without a ledger.
+    fn drive_info_direct(&mut self, key: &InstanceKey, name: &str) {
+        let position = self.scene.fixture.admit_function("C_SignInit").h0_ordinal();
+        let facts = SemanticCall {
+            function: name.into(),
+            session: SESSION,
+            capture: op_capture(),
+            ts_ns: 999,
+            rv: CkRv::OK.0,
+            authorized: true,
+            unambiguous: true,
+            attributable: true,
+            ..SemanticCall::default()
+        };
+        self.observe(key, position, facts);
+        self.registry.publish();
+    }
+
     /// Drive one S1Only-direct call for `key`: admit, observe,
     /// publish (no ledger). Effects tee while Joint evidence exists.
     fn drive_s1only(&mut self, key: &InstanceKey, shape: &ShapedS1) {
@@ -15064,6 +15271,124 @@ fn key_operation_joint_seal_delivery_replays_and_populates_capture() {
 /// N1: failure delivery disposes retained staging, degrades the feed
 /// to S1Only, releases the guard — and still retains the H8
 /// projection for capture.
+/// No-projection loss arm, the loss-before-first-delivery twin of
+/// `key_operation_joint_failure_delivery_retains_projection`: semantic
+/// loss lands on a Joint feed holding one staged call before any
+/// delivery, so no projection exists. The section names the loss as
+/// partial with the disposed call counted once, never bootstrap
+/// silence and never a guessed row.
+#[test]
+fn key_operation_loss_before_first_delivery_names_authority_lost() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    assert_eq!(g.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+    assert_eq!(
+        g.registry.joint_observations(1).status,
+        ObsStatus::Unavailable,
+        "nothing delivered or lost yet"
+    );
+    let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
+    g.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(key.clone()),
+        position(g.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    let after = g.registry.joint_observations(2);
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "{:?}",
+        after.unattributed
+    );
+    assert_eq!(
+        after
+            .unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        vec![("record_lost", 1)],
+        "the staged call counts once"
+    );
+    assert!(after.key_operations.is_empty(), "no row is guessed");
+}
+
+/// Projection-path twin of the pre-delivery loss pin: after one
+/// delivered seal, semantic loss disposes the next staged call while
+/// the feed stays Joint. The delivered row stays, the disposed call
+/// counts as `record_lost`, and the section is partial under lost
+/// authority, never `populated` beside a counted loss.
+#[test]
+fn key_operation_loss_after_delivery_keeps_rows_partial() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    let (facts, pos) = g.admit_shape(&init);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    ingest_call(&mut g.scene, &init, pos);
+    let seal = g.scene.seal().expect("healthy call seals");
+    assert_eq!(
+        g.registry.deliver_joint_algorithm_seal_for_test(
+            id,
+            &seal,
+            &g.scene.model,
+            g.scene.adapter.ledger_mut()
+        ),
+        SealApplyOutcome::ReplayedOne
+    );
+    let delivered = g.registry.joint_observations(1);
+    assert_eq!(
+        (delivered.status, delivered.reason),
+        (ObsStatus::Populated, "none")
+    );
+    let (facts, pos) = g.admit_shape(&sign);
+    g.observe(&key, pos, facts);
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.scene.adapter.ledger().staged(), 1);
+    let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
+    g.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(key.clone()),
+        position(g.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    g.registry.publish_with_ledger(g.scene.adapter.ledger_mut());
+    assert_eq!(g.registry.feed_mode_for_test(id), Some(FeedMode::Joint));
+    let after = g.registry.joint_observations(2);
+    assert_eq!(
+        after
+            .unattributed
+            .iter()
+            .map(|row| (row.reason, row.count))
+            .collect::<Vec<_>>(),
+        vec![("record_lost", 1)],
+        "the disposed call counts once"
+    );
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "a counted loss is never populated"
+    );
+}
+
 #[test]
 fn key_operation_joint_failure_delivery_retains_projection() {
     let mut guarded = GuardedScene::new();
@@ -15108,10 +15433,11 @@ fn key_operation_joint_failure_delivery_retains_projection() {
     );
 
     // Capture still commits from the retained projection: the
-    // section names the loss, never bootstrap silence.
+    // section names the loss as partial with the disposed call
+    // counted, never bootstrap silence or a whole-section ending.
     let observations = guarded.registry.joint_observations(42);
     assert_eq!(observations.revision, 42);
-    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.status, ObsStatus::Partial);
     assert_eq!(observations.reason, "authority_lost");
 
     // Unknown instances ignore without effect.
@@ -15129,10 +15455,11 @@ fn key_operation_joint_failure_delivery_retains_projection() {
 }
 
 /// N1 guard: with no install anywhere the registry reduces S1Only
-/// and capture stays unavailable exactly as before — the N1 path
-/// cuts no production scope.
+/// — the N1 path cuts no production scope. On a linked lane the
+/// observed key call is not silently dropped: it counts once as
+/// `started_before_attach` in a partial section, with no row.
 #[test]
-fn key_operation_s1only_capture_stays_unavailable() {
+fn key_operation_s1only_capture_counts_calls_without_rows() {
     let mut guarded = GuardedScene::new();
     let (key, id) = guarded.register(1);
     assert_eq!(
@@ -15147,8 +15474,15 @@ fn key_operation_s1only_capture_stays_unavailable() {
     assert_eq!(guarded.registry.joint_feeds(), 0);
     let observations = guarded.registry.joint_observations(7);
     assert_eq!(observations.revision, 7);
-    assert_eq!(observations.status, ObsStatus::Unavailable);
+    assert_eq!(observations.status, ObsStatus::Partial);
     assert_eq!(observations.reason, "bootstrap_unavailable");
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 1,
+        }]
+    );
     assert!(observations.key_operations.is_empty());
     assert!(guarded.registry.keyuse_for_test().open().is_empty());
     assert!(
@@ -15602,7 +15936,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
     assert_eq!(g.registry.keyuse_for_test().open().len(), 2);
     assert_eq!(
         g.registry.joint_observations(1).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
     if invalidate {
         let barrier = g.scene.fixture.admit_function("C_Sign").h0_ordinal();
@@ -15657,7 +15991,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
     );
     assert_eq!(
         g.registry.joint_observations(2).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
     assert_eq!(
         g.scene.adapter.ledger().census(),
@@ -15679,7 +16013,7 @@ fn first_fallback_accounting(capacity: bool, invalidate: bool, retire: bool) {
         assert!(g.registry.keyuse_for_test().open().is_empty());
         assert_eq!(
             g.registry.joint_observations(3).reason,
-            "bootstrap_unavailable",
+            "proof_refused_fallback",
             "inert late delivery creates no object authority"
         );
     }
@@ -15730,7 +16064,7 @@ fn key_operation_n15_first_unsealable_fallback_keeps_accounting() {
     );
     assert_eq!(
         g.registry.joint_observations(1).reason,
-        "bootstrap_unavailable"
+        "proof_refused_fallback"
     );
 }
 
@@ -16435,14 +16769,14 @@ fn key_operation_c5_loss_tees_terminals_and_spares_siblings() {
         .registry
         .publish_with_ledger(guarded.scene.adapter.ledger_mut());
     // A's live machine ended Unknown; its open closed (teed); B live.
-    // (A's Joint uses carry receipts without established metadata, so
-    // they aggregate metadata_unknown; B's receipt-less direct use is
-    // unbound.)
+    // (A's Joint uses carry receipts without established metadata on
+    // a first-observed key, so they row per-key under the `unknown`
+    // metadata label; B's receipt-less direct use is unbound.)
     let observations = guarded.registry.joint_observations(13);
     let proved = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("Joint evidence retained");
     assert_eq!(
         (proved.completed, proved.unknown, proved.active),
@@ -16591,9 +16925,9 @@ fn key_operation_c5_above_barrier_survives_and_retirement_disposes() {
     );
     let observations = guarded.registry.joint_observations(15);
     let row = observations
-        .unknown_key_operations
+        .key_operations
         .iter()
-        .find(|row| row.category == "sign" && row.reason == "metadata_unknown")
+        .find(|row| row.category == "sign" && row.metadata_at_use == "unknown")
         .expect("Joint evidence retained");
     assert_eq!(
         (row.unknown, row.active),
@@ -17176,15 +17510,18 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         0,
         "the duplicate 1025th init opens nothing and refuses nothing"
     );
-    assert_eq!(
+    // The fallback invents no object facts, but its replayed calls
+    // are counted, not dropped: the section turns partial under the
+    // fallback reason with every replayed call in one count.
+    assert_fallback_counts_only(
         main.coordinator.registry().joint_observations(7),
-        observations_before,
-        "the old publication survives the fallback intact"
+        &observations_before,
+        1025,
     );
-    assert_eq!(
+    assert_no_birth_counts_only(
         twin.coordinator.registry().joint_observations(7),
-        observations_before,
-        "the twin never invents object facts either"
+        &observations_before,
+        1025,
     );
     println!(
         "H3_MEM_1024_1025 {{\"staged_bytes_1024\": {bytes_1024}, \
@@ -17610,15 +17947,15 @@ fn joint_capture_owner_commit_batch_below_prepay_refuses_full_gracefully() {
         1,
         "the refused assoc lands exactly one refused row"
     );
-    assert_eq!(
+    assert_fallback_counts_only(
         refusal.coordinator.registry().joint_observations(7),
-        r_observations_before,
-        "the fallback invents no object facts"
+        &r_observations_before,
+        1,
     );
-    assert_eq!(
+    assert_no_birth_counts_only(
         s1.coordinator.registry().joint_observations(7),
-        s1_observations_before,
-        "the direct twin invents no object facts either"
+        &s1_observations_before,
+        1,
     );
     for pipeline in [healthy, s1, refusal] {
         let registry = pipeline.coordinator.registry();
@@ -18554,6 +18891,7 @@ fn key_operation_joint_async_pending_mints_deferred_origin() {
                 metadata: _,
                 label,
                 attribution_valid,
+                first_observed: _,
             } => Some((*call, *key_use, *input, *label, *attribution_valid)),
             _ => None,
         })
@@ -20360,4 +20698,1602 @@ fn key_operation_joint_ordered_fallback_names_its_cause() {
         )],
         "the unsealable fallback is named once, for its caller"
     );
+}
+
+/// Joint never stops as a whole for an info call: a staged call, then
+/// a proved-irrelevant info call (`C_GetSlotInfo`) before the seal,
+/// then sign. The info call touches nothing the proof relies on
+/// (its endpoint class says so), so it must not force the ordered
+/// fallback: the feed stays Joint, the staged init and the sign
+/// settle through their seals, and no fallback ending is named.
+#[test]
+fn key_operation_info_call_before_seal_keeps_joint_feed() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+
+    // Stage the init; it stays queued (no seal yet).
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let (init_facts, init_pos) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, init_pos, init_facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+
+    // The info call arrives before the seal. It rides a
+    // fixture-minted H0 ordinal (info calls are not attested
+    // shapes); its S1 facts mirror the async carve-out fixture.
+    let info_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(
+        info_pos > init_pos,
+        "non-vacuous: info call after the queue"
+    );
+    let info_facts = SemanticCall {
+        function: "C_GetSlotInfo".into(),
+        session: SESSION,
+        capture: op_capture(),
+        ts_ns: 999,
+        rv: CkRv::OK.0,
+        authorized: true,
+        unambiguous: true,
+        attributable: true,
+        ..SemanticCall::default()
+    };
+    guarded.observe(&joint_key, info_pos, info_facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint),
+        "a proved-irrelevant info call never ends the Joint feed"
+    );
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        1,
+        "the queued init stays staged for its seal"
+    );
+
+    // The init and the sign settle through their seals as usual.
+    ingest_call(&mut guarded.scene, &init, init_pos);
+    let seal = guarded.scene.seal().expect("init quantum seals");
+    assert_eq!(
+        guarded.registry.deliver_joint_algorithm_seal_for_test(
+            joint_id,
+            &seal,
+            &guarded.scene.model,
+            guarded.scene.adapter.ledger_mut(),
+        ),
+        SealApplyOutcome::ReplayedOne
+    );
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    let observations = guarded.registry.joint_observations(21);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(observations.reason, "none");
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(
+        completed + proved,
+        1,
+        "the sign completes exactly once through the Joint path"
+    );
+}
+
+/// Joint never stops as a whole at publication: a feed that fell
+/// back or lost authority keeps its already-attributed and
+/// S1-preserved rows under `partial`, with the unattributed calls
+/// counted per named reason beside them. The healthy twin stays
+/// populated with zero unattributed and byte-stable v1 JSON.
+#[test]
+fn key_operation_partial_publication_counts_unattributed() {
+    let instance = RegistryInstanceId::from_raw(3);
+
+    // Healthy twin: everything seals, nothing is unattributed.
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+    }
+    let healthy = commit(31, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(healthy.status, ObsStatus::Populated);
+    assert_eq!(healthy.reason, "none");
+    assert!(
+        healthy.unattributed.is_empty(),
+        "a fully sealed flow attributes everything"
+    );
+    let healthy_json = object_observations_json(&healthy);
+    assert_eq!(healthy_json["version"], 1, "healthy output stays v1");
+    assert!(
+        healthy_json.get("unattributed").is_none(),
+        "no unattributed key while every count is zero"
+    );
+
+    // Proof-only fallback: replayed S1 rows stay visible as partial,
+    // and the three replayed calls count as not attributed.
+    let mut fall_scene = JointScene::new();
+    let fall_bootstrap = fall_scene.bootstrap();
+    let mut fall_staging = JointStaging::select_joint(Some(&fall_bootstrap));
+    let mut fall_edge = EdgeSemantics::default();
+    let mut fall_keyuse = KeyUseReducer::new();
+    let mut fall_sink = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut fall_scene, &mut fall_staging, call);
+    }
+    let failure = fall_scene.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &fall_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = fall_staging.apply_algorithm_failure_for_test(
+        &failure,
+        &mut h3,
+        &fall_scene.model,
+        fall_scene.adapter.ledger_mut(),
+        &mut fall_edge,
+        &mut fall_keyuse,
+        instance,
+        &mut fall_sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    let fell = commit(
+        32,
+        &[&fall_staging],
+        &fall_scene.model.project(),
+        &fall_keyuse,
+    );
+    assert_eq!(
+        fell.status,
+        ObsStatus::Partial,
+        "fallback keeps its rows visible instead of ending the section"
+    );
+    assert_eq!(fell.reason, "proof_refused_fallback");
+    assert!(
+        !fell.unknown_key_operations.is_empty(),
+        "fallback preserves replayed S1"
+    );
+    assert_eq!(
+        fell.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: 3,
+        }],
+        "the replayed calls count once as not attributed"
+    );
+    let fell_json = object_observations_json(&fell);
+    assert_eq!(fell_json["version"], 3);
+    assert_eq!(
+        fell_json["unattributed"],
+        serde_json::json!([{"reason": "proof_refused_fallback", "count": 3}])
+    );
+
+    // Real loss: the disposed call counts as record_lost; the
+    // section is partial, never a whole-capture unavailability.
+    let mut loss_scene = JointScene::new();
+    let loss_bootstrap = loss_scene.bootstrap();
+    let mut loss_staging = JointStaging::select_joint(Some(&loss_bootstrap));
+    let mut loss_edge = EdgeSemantics::default();
+    let mut loss_keyuse = KeyUseReducer::new();
+    let mut loss_sink = Vec::new();
+    prepare_call(
+        &mut loss_scene,
+        &mut loss_staging,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let loss_failure = loss_scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &loss_bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut loss_h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome, _) = loss_staging.apply_algorithm_failure_for_test(
+        &loss_failure,
+        &mut loss_h3,
+        &loss_scene.model,
+        loss_scene.adapter.ledger_mut(),
+        &mut loss_edge,
+        &mut loss_keyuse,
+        instance,
+        &mut loss_sink,
+        None,
+    );
+    assert!(matches!(
+        outcome,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    let lost = commit(
+        33,
+        &[&loss_staging],
+        &loss_scene.model.project(),
+        &loss_keyuse,
+    );
+    assert_eq!(lost.status, ObsStatus::Partial);
+    assert_eq!(lost.reason, "authority_lost");
+    assert_eq!(
+        lost.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 1,
+        }]
+    );
+}
+
+/// F2 (round 3): staged calls left unsealed when the no-progress
+/// watchdog trips count once as `watchdog_no_progress` at
+/// publication — they are enumerable in the staging at the trip.
+/// The trip note is idempotent: a second note never recounts.
+#[test]
+fn key_operation_watchdog_unsealed_staged_calls_count() {
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let keyuse = KeyUseReducer::new();
+    // Two modeled calls stage; no seal ever settles them.
+    for call in sign_flow()[1..3].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    assert_eq!(staging.staged_len(), 2, "both calls stay staged");
+
+    staging.note_watchdog_trip();
+    staging.note_watchdog_trip();
+    assert_eq!(
+        staging.watchdog_unsealed(),
+        2,
+        "the trip snapshots the staged calls exactly once"
+    );
+    let observations = commit(71, &[&staging], &scene.model.project(), &keyuse);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 2,
+        }],
+        "unsealed staged calls count under the watchdog reason: {:?}",
+        observations.unattributed
+    );
+    // Conservation for this feed: 2 observed key calls, 0
+    // attributed, 2 unattributed.
+    assert_eq!(staging.reduced(), 0, "nothing replayed or attributed");
+}
+
+/// Watchdog conservation: after the trip the staged calls leave
+/// exactly once (as `watchdog_no_progress`) and nothing can count
+/// them again — a later seal attributes nothing, a later loss
+/// disposes nothing, and a later call can no longer stage but
+/// counts once under the watchdog reason as a direct reduction.
+/// attributed + unattributed == observed.
+#[test]
+fn key_operation_watchdog_trip_conserves_across_later_loss_seal_and_stage() {
+    let instance =
+        crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
+    let mut scene = JointScene::new();
+    let bootstrap = scene.bootstrap();
+    let mut staging = JointStaging::select_joint(Some(&bootstrap));
+    let mut edge = EdgeSemantics::default();
+    let mut keyuse = KeyUseReducer::new();
+    let mut sink = Vec::new();
+    let flow = sign_flow();
+    // Three calls seal and attribute.
+    for call in flow[0..3].iter() {
+        drive_quantum(
+            &mut scene,
+            &mut staging,
+            &mut edge,
+            &mut keyuse,
+            &mut sink,
+            call,
+        );
+    }
+    assert_eq!(staging.reduced(), 3);
+    // Two calls stage; their seal has not been applied yet.
+    for call in flow[3..5].iter() {
+        prepare_call(&mut scene, &mut staging, call);
+    }
+    assert_eq!(staging.staged_len(), 2);
+    staging.note_watchdog_trip();
+    staging.note_watchdog_trip();
+    assert_eq!(staging.watchdog_unsealed(), 2, "the trip counts both once");
+    assert_eq!(staging.staged_len(), 0, "the trip takes the staged calls");
+    // A seal arriving after the trip attributes nothing.
+    if let Ok(success) = scene.seal() {
+        let _ = staging.apply_seal(
+            &success,
+            &scene.model,
+            scene.adapter.ledger_mut(),
+            &mut edge,
+            &mut keyuse,
+            instance,
+            &mut sink,
+            None,
+        );
+    }
+    assert_eq!(staging.reduced(), 3, "no post-trip seal replays");
+    // A loss after the trip disposes nothing again.
+    assert_eq!(
+        staging.dispose_below_barrier(None, Some(scene.adapter.ledger_mut())),
+        0
+    );
+    // A later call cannot stage; the driver reduces it direct and
+    // it counts once under the watchdog reason.
+    let admitted = admit_call_input(&mut scene, &flow[5]);
+    let facts = admitted.s1_facts().clone();
+    let origin = EffectOrigin::from(&facts);
+    assert!(
+        staging
+            .stage(
+                facts.clone(),
+                origin,
+                admitted.h0_ordinal(),
+                scene.adapter.ledger_mut()
+            )
+            .is_err(),
+        "no stage after the trip"
+    );
+    staging.note_direct_reduction(&facts.function);
+    assert!(!staging.resume_joint(), "a tripped feed never resumes");
+
+    let observations = commit(72, &[&staging], &scene.model.project(), &keyuse);
+    let unattributed: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 3,
+        }],
+        "{:?}",
+        observations.unattributed
+    );
+    let observed = 6u64;
+    assert_eq!(
+        staging.reduced() + unattributed,
+        observed,
+        "conservation: attributed + unattributed = observed"
+    );
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost"),
+        "a tripped lane is partial, its exact rows kept"
+    );
+}
+
+/// Conservation across every staging-derived reason (round 3):
+/// sealed, fallback-replayed, degraded-window (both endings),
+/// history-disposed, pre-attach, unmodelled and watchdog counts
+/// partition the hand-constructed observed total exactly once.
+/// The registry-derived `foreign_or_unproven_caller` reason is
+/// covered by the registry conservation twin above.
+#[test]
+fn key_operation_unattributed_conservation_across_all_staging_reasons() {
+    let instance = RegistryInstanceId::from_raw(3);
+    let _ = instance;
+
+    // A: three calls sealed and replayed (attributed).
+    let mut scene_a = JointScene::new();
+    let bootstrap_a = scene_a.bootstrap();
+    let mut staging_a = JointStaging::select_joint(Some(&bootstrap_a));
+    let mut edge_a = EdgeSemantics::default();
+    let mut keyuse_a = KeyUseReducer::new();
+    let mut sink_a = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        drive_quantum(
+            &mut scene_a,
+            &mut staging_a,
+            &mut edge_a,
+            &mut keyuse_a,
+            &mut sink_a,
+            call,
+        );
+    }
+
+    // B: three staged calls replayed by a proof-only fallback,
+    // then two modeled directs in the degraded window.
+    let mut scene_b = JointScene::new();
+    let bootstrap_b = scene_b.bootstrap();
+    let mut staging_b = JointStaging::select_joint(Some(&bootstrap_b));
+    let mut edge_b = EdgeSemantics::default();
+    let mut keyuse_b = KeyUseReducer::new();
+    let mut sink_b = Vec::new();
+    for call in sign_flow()[0..3].iter() {
+        prepare_call(&mut scene_b, &mut staging_b, call);
+    }
+    let failure_b = scene_b.adapter.scripted_failure(
+        JournalGap::BootstrapMismatch,
+        &bootstrap_b,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3_b = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome_b, _) = staging_b.apply_algorithm_failure_for_test(
+        &failure_b,
+        &mut h3_b,
+        &scene_b.model,
+        scene_b.adapter.ledger_mut(),
+        &mut edge_b,
+        &mut keyuse_b,
+        RegistryInstanceId::from_raw(3),
+        &mut sink_b,
+        None,
+    );
+    assert!(matches!(
+        outcome_b,
+        crate::semantics_key_use::FailureApplyOutcome::FellBack { replayed: 3 }
+    ));
+    staging_b.note_direct_reduction("C_Sign");
+    staging_b.note_direct_reduction("C_Sign");
+    staging_b.note_direct_reduction("C_GetSlotInfo");
+
+    // C: one staged call disposed by real loss, then one modeled
+    // direct in the degraded window.
+    let mut scene_c = JointScene::new();
+    let bootstrap_c = scene_c.bootstrap();
+    let mut staging_c = JointStaging::select_joint(Some(&bootstrap_c));
+    let mut edge_c = EdgeSemantics::default();
+    let mut keyuse_c = KeyUseReducer::new();
+    let mut sink_c = Vec::new();
+    prepare_call(
+        &mut scene_c,
+        &mut staging_c,
+        &ShapedS1::shaped("C_CreateObject", CkRv::OK.0, 0, 0),
+    );
+    let failure_c = scene_c.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap_c,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3_c = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let (outcome_c, _) = staging_c.apply_algorithm_failure_for_test(
+        &failure_c,
+        &mut h3_c,
+        &scene_c.model,
+        scene_c.adapter.ledger_mut(),
+        &mut edge_c,
+        &mut keyuse_c,
+        RegistryInstanceId::from_raw(3),
+        &mut sink_c,
+        None,
+    );
+    assert!(matches!(
+        outcome_c,
+        crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+    ));
+    staging_c.note_direct_reduction("C_Sign");
+    staging_c.note_direct_reduction("C_GetTokenInfo");
+
+    // D: a feed without a witnessed birth: two key operations
+    // count started-before-attach; an info call counts nothing.
+    let mut staging_d = JointStaging::select_s1_only();
+    staging_d.note_direct_reduction("C_SignInit");
+    staging_d.note_direct_reduction("C_Sign");
+    staging_d.note_direct_reduction("C_GetMechanismInfo");
+
+    // E: one affecting unsealable call, counted unmodelled.
+    let mut scene_e = JointScene::new();
+    let bootstrap_e = scene_e.bootstrap();
+    let mut staging_e = JointStaging::select_joint(Some(&bootstrap_e));
+    let unsealable = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    let origin_e = EffectOrigin::from(&unsealable);
+    assert_eq!(
+        staging_e.stage(unsealable, origin_e, 1, scene_e.adapter.ledger_mut()),
+        Err(crate::semantics_key_use::StagingRefusal::Unsealable)
+    );
+
+    // F: two staged calls left unsealed across a watchdog trip.
+    let mut scene_f = JointScene::new();
+    let bootstrap_f = scene_f.bootstrap();
+    let mut staging_f = JointStaging::select_joint(Some(&bootstrap_f));
+    for call in sign_flow()[1..3].iter() {
+        prepare_call(&mut scene_f, &mut staging_f, call);
+    }
+    staging_f.note_watchdog_trip();
+
+    let stagings: [&JointStaging; 6] = [
+        &staging_a, &staging_b, &staging_c, &staging_d, &staging_e, &staging_f,
+    ];
+    // Per-feed partition, from the retained counters themselves:
+    // sealed replay (attributed) + every unattributed bucket +
+    // staged calls no reason claims must equal the observed total.
+    let mut attributed = 0u64;
+    let mut counter_unattributed = 0u64;
+    let mut unclaimed_staged = 0u64;
+    for staging in stagings.iter() {
+        let sealed = staging
+            .reduced()
+            .saturating_sub(staging.fallback_replayed());
+        attributed += sealed;
+        counter_unattributed += staging.pre_attach_direct()
+            + staging.history_disposed()
+            + staging.degraded_loss_direct()
+            + staging.watchdog_unsealed()
+            + staging.unsealable_direct()
+            + staging.fallback_replayed()
+            + staging.degraded_fallback_direct();
+        unclaimed_staged +=
+            (staging.staged_len() as u64).saturating_sub(staging.watchdog_unsealed());
+    }
+    assert_eq!(unclaimed_staged, 0, "no staged call is left uncounted");
+    // Hand-constructed observed key calls: A3 + B(3+2) + C(1+1)
+    // + D2 + E1 + F2 = 15.
+    assert_eq!(attributed, 3, "only the sealed calls attribute");
+    assert_eq!(counter_unattributed, 12);
+    assert_eq!(
+        attributed + counter_unattributed,
+        15,
+        "conservation across all staging reasons"
+    );
+
+    let observations = commit(72, &stagings, &scene_a.model.project(), &keyuse_a);
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "started_before_attach",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "record_lost",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "watchdog_no_progress",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 5,
+            },
+        ],
+        "publication sums match the retained counters: {:?}",
+        observations.unattributed
+    );
+    let published_total: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    assert_eq!(attributed + published_total, 15);
+}
+
+/// Damage stays local and attribution resumes: after an ordered
+/// fallback ends a feed's Joint segment, the next operation init
+/// is a clean point — the feed stages again, its seals replay, and
+/// later signs attribute exactly. The fallback segment stays
+/// counted as not attributed; nothing is re-attributed by guess.
+#[test]
+fn key_operation_joint_resumes_at_next_clean_point() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // One exact Joint sign.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // An affecting unsealable completion behind a queued call
+    // forces the ordered fallback: this segment ends.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fallback ends only the current segment"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+
+    // The next init is a clean point: staging and seals resume.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne,
+        "the clean point re-enters Joint instead of reducing direct forever"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(41);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum::<u64>()
+        + observations
+            .key_operations
+            .iter()
+            .filter(|row| row.category == "sign")
+            .map(|row| row.completed)
+            .sum::<u64>();
+    assert_eq!(completed, 2, "both exact signs complete once");
+    assert!(
+        observations
+            .unattributed
+            .iter()
+            .any(|row| row.reason == "proof_refused_fallback" && row.count >= 1),
+        "the fallback segment stays counted: {:?}",
+        observations.unattributed
+    );
+}
+
+/// F1 (round 3): calls reduced direct in the degraded window —
+/// after a fallback ended the segment, before the next clean point —
+/// are counted under that segment's reason, never nowhere. Proved-
+/// irrelevant info calls in the same window count nothing (F4).
+/// The clean point then resumes exact attribution.
+#[test]
+fn key_operation_degraded_window_calls_count_under_fallback_reason() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // One exact Joint sign.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // An affecting unsealable completion behind a queued call
+    // forces the ordered fallback: this segment ends.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fallback ends only the current segment"
+    );
+
+    // Degraded window: two modeled calls reduce direct. They are
+    // not attributed, so they must count under the ended segment's
+    // reason. Four proved-irrelevant calls in the same window are
+    // not key operations and must count nowhere.
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    for name in [
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_GetMechanismInfo",
+        "C_GetSessionInfo",
+    ] {
+        guarded.drive_info_direct(&joint_key, name);
+    }
+
+    // The next init is a clean point: attribution resumes exactly.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(61);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 3,
+            },
+        ],
+        "one replayed + two degraded-window calls under the segment reason; \
+         the info calls count nowhere: {:?}",
+        observations.unattributed
+    );
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved, 2, "both clean-segment signs attribute exactly");
+}
+
+/// F1 (round 3), loss arm: direct calls in the degraded window
+/// after real loss count as `record_lost` beside the disposed
+/// staged call; info calls count nothing; the clean point resumes.
+#[test]
+fn key_operation_degraded_window_calls_count_under_loss_reason() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // Stage one more init, then real loss ends the segment.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::H3Loss,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut h3 = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut h3,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert!(
+        matches!(
+            outcome,
+            crate::semantics_key_use::FailureApplyOutcome::Degraded { disposed: 1 }
+        ),
+        "the staged call disposes as history: {outcome:?}"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only)
+    );
+
+    // Degraded window: two modeled directs count as record_lost;
+    // proved-irrelevant calls count nothing.
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    for name in ["C_GetSlotInfo", "C_GetTokenInfo"] {
+        guarded.drive_info_direct(&joint_key, name);
+    }
+
+    // Clean point: exact attribution resumes.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(62);
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "authority_lost");
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "record_lost",
+            count: 3,
+        }],
+        "one disposed + two degraded-window calls; info calls nowhere: {:?}",
+        observations.unattributed
+    );
+    let proved: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved, 2, "both clean-segment signs attribute exactly");
+}
+
+/// F4 (round 3): `started_before_attach` counts key operations
+/// only. Proved-irrelevant info/session-state calls on a feed
+/// registered without a witnessed birth are not key operations
+/// and never inflate the count. Pins all three brief-named info
+/// calls plus one non-info table entry, so the carve-out is the
+/// frozen table, not a name list.
+#[test]
+fn key_operation_started_before_attach_excludes_proved_irrelevant_calls() {
+    let mut guarded = GuardedScene::new();
+    let (late_key, _) = guarded.register(1);
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(2);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    for name in [
+        "C_GetSlotInfo",
+        "C_GetTokenInfo",
+        "C_GetMechanismInfo",
+        "C_GetSessionInfo",
+    ] {
+        guarded.drive_info_direct(&late_key, name);
+    }
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(63);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 2,
+        }],
+        "only the two key operations count; the four proved-irrelevant \
+         calls count nowhere: {:?}",
+        observations.unattributed
+    );
+}
+
+/// Conservation (round 3): in one capture, every observed key
+/// call is either attributed through a seal or counted in exactly
+/// one named unattributed reason. The totals are constructed by
+/// hand from the driven calls; proved-irrelevant calls are not
+/// key operations and enter neither side.
+#[test]
+fn key_operation_conservation_attributed_plus_unattributed_equals_observed() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (late_key, _) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // Joint, segment 1: init + sign sealed (2 attributed calls).
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Fallback: one staged init replays (proof_refused_fallback),
+    // its unsealable trigger counts unmodelled_call_shape.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let mut complete = SemanticCall {
+        function: "C_AsyncComplete".into(),
+        session: SESSION,
+        target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+        capture: op_capture(),
+        ts_ns: 999,
+        ..SemanticCall::default()
+    };
+    complete.rv = CkRv::OK.0;
+    complete.authorized = true;
+    complete.unambiguous = true;
+    complete.attributable = true;
+    let complete_pos = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    guarded.observe(&joint_key, complete_pos, complete);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    // Degraded window: two modeled directs (proof_refused_fallback).
+    guarded.drive_s1only(&joint_key, &sign);
+    guarded.drive_s1only(&joint_key, &sign);
+    // Joint, segment 2: init + sign sealed (2 more attributed).
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Late instance: init + sign (started_before_attach); three
+    // proved-irrelevant calls enter neither side of the equation.
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    for name in ["C_GetSlotInfo", "C_GetTokenInfo", "C_GetMechanismInfo"] {
+        guarded.drive_info_direct(&late_key, name);
+    }
+    // One foreign call, refused before application.
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            joint_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+
+    let observations = guarded.registry.joint_observations(64);
+    let unattributed_total: u64 = observations.unattributed.iter().map(|row| row.count).sum();
+    // Hand-constructed: attributed sealed calls = 4 (two inits +
+    // two signs across the two clean segments).
+    let attributed_calls = 4u64;
+    // Hand-constructed observed key calls: 4 attributed + 1
+    // replayed + 1 unmodelled trigger + 2 degraded + 2 pre-attach
+    // + 1 foreign = 11.
+    let observed_key_calls = 11u64;
+    assert_eq!(
+        unattributed_total, 7,
+        "every unattributed call in exactly one reason: {:?}",
+        observations.unattributed
+    );
+    assert_eq!(
+        attributed_calls + unattributed_total,
+        observed_key_calls,
+        "conservation: attributed + unattributed = observed"
+    );
+    let proved_signs: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved_signs, 2, "the two clean signs attribute once each");
+}
+
+/// Registry level of the exit-hold watchdog note: calls a Joint
+/// feed staged but never saw sealed count once as
+/// `watchdog_no_progress` after the trip (noted twice: once), and
+/// nothing counts before the trip.
+#[test]
+fn key_operation_registry_watchdog_trip_counts_staged_joint_calls() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    // Two more calls stage; no seal ever arrives for them.
+    for shape in [&init, &sign] {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    }
+    let before = guarded.registry.joint_observations(80);
+    assert!(
+        before
+            .unattributed
+            .iter()
+            .all(|row| row.reason != "watchdog_no_progress"),
+        "no watchdog count before the trip: {:?}",
+        before.unattributed
+    );
+    guarded.registry.note_joint_watchdog_trip();
+    guarded.registry.note_joint_watchdog_trip();
+    let after = guarded.registry.joint_observations(81);
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "watchdog_no_progress",
+            count: 2,
+        }],
+        "the two unsealed staged calls count once each: {:?}",
+        after.unattributed
+    );
+    let proved_signs: u64 = after
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(proved_signs, 1, "the sealed sign keeps its row");
+}
+
+/// Observer-first live shape (fedora DEMO-4 Chromium): the journal
+/// is linked but no feed ever reached Joint (no birth landed), while
+/// the browser's key calls still reached the registry. The section
+/// must publish `partial` with every such call counted under a named
+/// reason, never a silent `unavailable` with the presented signs
+/// unaccounted. A capture that observed nothing stays unavailable.
+#[test]
+fn key_operation_linked_without_birth_publishes_partial_with_counted_calls() {
+    let mut guarded = GuardedScene::new();
+    guarded.registry.note_journal_linked(true);
+    let (late_key, _) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            late_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    let observations = guarded.registry.joint_observations(90);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "bootstrap_unavailable"),
+        "counted calls make the no-birth section partial"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "started_before_attach",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "foreign_or_unproven_caller",
+                count: 1,
+            },
+        ],
+        "every observed key call counts once: {:?}",
+        observations.unattributed
+    );
+    assert!(observations.key_operations.is_empty(), "no row is guessed");
+
+    let mut quiet = GuardedScene::new();
+    quiet.registry.note_journal_linked(true);
+    let _ = quiet.register(1);
+    let observations = quiet.registry.joint_observations(91);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Unavailable, "bootstrap_unavailable"),
+        "nothing observed stays unavailable"
+    );
+    assert!(observations.unattributed.is_empty());
+}
+
+/// A never-Joint direct twin on a linked lane: no session, object or
+/// key row is invented, and its direct key calls count once as
+/// `started_before_attach` in a partial section.
+fn assert_no_birth_counts_only(
+    after: crate::key_operation_projection::ObjectObservations,
+    before: &crate::key_operation_projection::ObjectObservations,
+    direct: u64,
+) {
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "bootstrap_unavailable"),
+        "counted direct calls make the no-birth section partial"
+    );
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: direct,
+        }],
+        "every direct key call counts once"
+    );
+    assert_eq!(after.sessions, before.sessions, "no session invented");
+    assert_eq!(after.objects, before.objects, "no object invented");
+    assert_eq!(
+        after.key_operations, before.key_operations,
+        "no key row invented"
+    );
+    assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
+}
+
+/// A fallback before any Joint delivery: no session, object or key
+/// row appears beyond the earlier publication, and the replayed
+/// calls count once under `proof_refused_fallback` in a partial
+/// section (never a silent unavailable).
+fn assert_fallback_counts_only(
+    after: crate::key_operation_projection::ObjectObservations,
+    before: &crate::key_operation_projection::ObjectObservations,
+    replayed: u64,
+) {
+    assert_eq!(
+        (after.status, after.reason),
+        (ObsStatus::Partial, "proof_refused_fallback"),
+        "the counted fallback names itself"
+    );
+    assert_eq!(
+        after.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "proof_refused_fallback",
+            count: replayed,
+        }],
+        "every replayed call counts once"
+    );
+    assert_eq!(after.sessions, before.sessions, "no session invented");
+    assert_eq!(after.objects, before.objects, "no object invented");
+    assert_eq!(
+        after.key_operations, before.key_operations,
+        "no key row invented"
+    );
+    assert_eq!(after.unknown_key_operations, before.unknown_key_operations);
+}
+
+/// Late attach: an instance registered without a witnessed birth
+/// keeps its S1 counts and counts its calls as
+/// `started_before_attach`, while a Joint sibling that started
+/// cleanly attributes exactly. One capture, partial honesty.
+#[test]
+fn key_operation_late_attach_counts_and_joint_sibling_attributes() {
+    let mut guarded = GuardedScene::new();
+    let (late_key, _) = guarded.register(1);
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(2);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    guarded.drive_s1only(&late_key, &init);
+    guarded.drive_s1only(&late_key, &sign);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    let observations = guarded.registry.joint_observations(51);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert_eq!(
+        observations.unattributed,
+        vec![crate::key_operation_projection::UnattributedRow {
+            reason: "started_before_attach",
+            count: 2,
+        }],
+        "the pre-attach instance's two calls count once each"
+    );
+    // The clean Joint sign attributes to its first-observed key:
+    // a per-key row under the `unknown` metadata label (DEMO-4),
+    // not the capture-wide metadata_unknown bucket.
+    let joint_completed: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(joint_completed, 1, "the clean Joint sign attributes");
+    let late_completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.reason == "unbound")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(late_completed, 1, "the late sign keeps its S1 count");
+}
+
+/// A foreign (unbound) caller mid-capture is refused and counted;
+/// the proven caller's Joint rows are untouched.
+#[test]
+fn key_operation_foreign_caller_counts_without_ending_joint() {
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // One call from a caller the instance is not bound to.
+    let (facts, position) = guarded.admit_shape(&sign);
+    guarded
+        .registry
+        .observe_instance_semantic(AdmittedInstanceCall::scripted(
+            joint_key.clone(),
+            CallerId(99),
+            position,
+            facts,
+        ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+
+    // The proven caller continues exactly.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    let observations = guarded.registry.joint_observations(52);
+    assert_eq!(observations.status, ObsStatus::Populated);
+    assert!(
+        observations
+            .unattributed
+            .iter()
+            .any(|row| { row.reason == "foreign_or_unproven_caller" && row.count == 1 }),
+        "the foreign call counts once: {:?}",
+        observations.unattributed
+    );
+    let completed: u64 = observations
+        .unknown_key_operations
+        .iter()
+        .filter(|row| row.category == "sign")
+        .map(|row| row.completed)
+        .sum::<u64>()
+        + observations
+            .key_operations
+            .iter()
+            .filter(|row| row.category == "sign")
+            .map(|row| row.completed)
+            .sum::<u64>();
+    assert_eq!(completed, 1, "only the proven sign completes");
+}
+
+/// A lost staged record disposes as counted history; the same feed
+/// above the barrier and a sibling instance keep attributing.
+#[test]
+fn key_operation_lost_record_counts_and_siblings_continue() {
+    use crate::discovery::caller_registry::instance_input::{
+        InstanceReason, Scope, loss, position,
+    };
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let (sibling_key, _) = guarded.register(2);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // Stage one more init, then lose it below a barrier.
+    let (facts, staged_at) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, staged_at, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    let barrier = guarded
+        .scene
+        .fixture
+        .admit_function("C_SignInit")
+        .h0_ordinal();
+    assert!(barrier > staged_at, "non-vacuous: barrier above the queue");
+    guarded.registry.note_instance_semantic_loss(loss(
+        Scope::Exact(joint_key.clone()),
+        position(guarded.domain, barrier),
+        InstanceReason::SemanticLoss,
+    ));
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 0);
+
+    // Above the barrier the feed attributes again; the sibling
+    // was never touched.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    guarded.drive_s1only(&sibling_key, &init);
+    guarded.drive_s1only(&sibling_key, &sign);
+
+    let observations = guarded.registry.joint_observations(53);
+    assert!(
+        observations
+            .unattributed
+            .iter()
+            .any(|row| row.reason == "record_lost" && row.count == 1),
+        "the disposed record counts once: {:?}",
+        observations.unattributed
+    );
+    let joint_completed: u64 = observations
+        .key_operations
+        .iter()
+        .filter(|row| row.category == "sign" && row.metadata_at_use == "unknown")
+        .map(|row| row.completed)
+        .sum();
+    assert_eq!(joint_completed, 2, "both Joint signs attribute");
+}
+
+/// The v3 schema file mirrors the frozen contract tables: section
+/// keys, the unattributed row keys, the reason enum, and the
+/// version constant cannot drift from the renderer.
+#[test]
+fn key_operation_schema_v3_pins_unattributed_contract() {
+    use crate::key_operation_projection::contract::{SECTION_KEYS_V3, UNATTRIBUTED_ROW_KEYS};
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v3.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 3);
+    assert_eq!(
+        required("/required"),
+        sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/unattributed_row/required"),
+        sorted(
+            UNATTRIBUTED_ROW_KEYS
+                .iter()
+                .map(|key| key.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(
+        required("/$defs/unattributed_row/properties/reason/enum"),
+        sorted(
+            crate::key_operation_projection::UNATTRIBUTED_REASONS
+                .iter()
+                .map(|reason| reason.to_string())
+                .collect()
+        )
+    );
+}
+
+/// The v4 schema file mirrors the frozen contract tables: same
+/// section keys as v3 (unattributed required, possibly empty), the
+/// version constant 4, and the metadata enum extended by exactly
+/// the `unknown` first-observed label.
+#[test]
+fn key_operation_schema_v4_pins_unknown_metadata_contract() {
+    use crate::key_operation_projection::contract::{
+        METADATA_LABELS, METADATA_LABELS_V4, SECTION_KEYS_V3,
+    };
+    let root = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let schema: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(
+            root.join("docs/schema/inventory-v1-object-observations-v4.schema.json"),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let sorted = |values: Vec<String>| -> Vec<String> {
+        let mut owned = values;
+        owned.sort();
+        owned
+    };
+    let required = |pointer: &str| -> Vec<String> {
+        sorted(
+            schema
+                .pointer(pointer)
+                .expect("pointer present")
+                .as_array()
+                .expect("array")
+                .iter()
+                .map(|key| key.as_str().unwrap().to_string())
+                .collect(),
+        )
+    };
+    assert_eq!(schema["properties"]["version"]["const"], 4);
+    // `unattributed` is always present in v4 and may be empty: a v4
+    // section with exact rows and nothing unattributed is valid.
+    assert_eq!(
+        schema["properties"]["unattributed"]["minItems"], 0,
+        "an empty unattributed list is a valid v4 section"
+    );
+    assert_eq!(
+        required("/required"),
+        sorted(SECTION_KEYS_V3.iter().map(|key| key.to_string()).collect())
+    );
+    assert_eq!(
+        required("/$defs/metadata_label/enum"),
+        sorted(
+            METADATA_LABELS_V4
+                .iter()
+                .map(|label| label.to_string())
+                .collect()
+        )
+    );
+    assert_eq!(METADATA_LABELS_V4.len(), METADATA_LABELS.len() + 1);
+    assert_eq!(METADATA_LABELS_V4[12], "unknown");
 }

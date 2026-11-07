@@ -319,6 +319,21 @@ COUNTER_COLLECTION_FAILURES = {
     "mode", "generation_rollback", "limits", "saturated", "contended",
     "kernel_evidence", "fold_overflow", "regressed", "projection",
 }
+# The additive per-bank gap object inside `counter_collection`: counts and
+# finite flags only. Present only when the acquisition was partial.
+BANK_GAPS_KEYS = {"failed_slots", "health_failed", "kernel_failed"}
+# The additive legacy gap object beside `counter_collection`: counts and
+# finite cell names only. Present only when the legacy read was partial.
+LEGACY_COLLECTION_KEYS = {"unread_stats", "rv_failed", "unknown_evidence"}
+# Legacy unknown-evidence cell names in bit order, mirroring
+# metrics::LEGACY_UNKNOWN_CELLS (the producer authority).
+LEGACY_UNKNOWN_CELLS = (
+    "ring_loss", "start_insert_failures", "unmatched_returns",
+    "rv_update_failures", "cgroup_scope_failures",
+    "semantic_capture_failures", "template_tail_failures",
+    "unregistered_mechanisms", "abi_refusals",
+    "owner", "cookie", "root",
+)
 # 6.15 endpoint selection: the additive `selected_detail` envelope the
 # metrics composer adds beside --select-endpoint captures
 # (src/metrics/selected_detail_driver.rs is the producer authority).
@@ -433,7 +448,11 @@ BASE_EVIDENCE_KEYS = set(COUNTERS) | {
     "attached_probes",
     "attach_failures", "aliased", "skipped", "in_flight_at_end", "surfaces",
     "vendor_interfaces", "interface_list", "attach_gap_ms", "pause",
-    *PAUSE_COUNTERS, "loader_discovery", "templates_truncated", "provider_changed",
+    *PAUSE_COUNTERS,
+    # Subset annotation, not a lattice member: each retirement is already
+    # one counted pause_partial. Kept out of PAUSE_COUNTERS on purpose.
+    "pause_engine_incomplete_retirements",
+    "loader_discovery", "templates_truncated", "provider_changed",
     "scheduling",
     "completeness",
     *RESIDUAL_EVIDENCE_KEYS,
@@ -1018,6 +1037,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "unmatched_excludes" in evidence:
         wanted.add("unmatched_excludes")
         exact_unmatched_excludes(evidence["unmatched_excludes"])
+    if not historical and not terminal and "legacy_collection" in evidence:
+        wanted.add("legacy_collection")
+        exact_legacy_collection(evidence["legacy_collection"])
     actual = set(evidence)
     if child:
         wanted.add("child_still_running")
@@ -1052,9 +1074,42 @@ def exact_unmatched_excludes(value):
             f"unmatched_excludes must be a string array: {value!r}")
 
 
+def exact_counter_bank_gaps(gaps):
+    """The additive per-bank gap object: counts and finite flags only,
+    present only when the acquisition was partial."""
+    exact_keys(gaps, BANK_GAPS_KEYS, "counter bank_gaps")
+    require(u64(gaps["failed_slots"]),
+            f"invalid counter bank_gaps.failed_slots: {gaps!r}")
+    for flag in ("health_failed", "kernel_failed"):
+        require(type(gaps[flag]) is bool,
+                f"invalid counter bank_gaps.{flag}: {gaps!r}")
+    require(gaps["failed_slots"] > 0 or gaps["health_failed"] or gaps["kernel_failed"],
+            f"a clean counter bank_gaps object must be omitted: {gaps!r}")
+
+
+def exact_legacy_collection(legacy):
+    """The additive legacy gap object: counts and finite cell names only,
+    present only when the legacy read was partial."""
+    exact_keys(legacy, LEGACY_COLLECTION_KEYS, "legacy_collection")
+    require(u64(legacy["unread_stats"]),
+            f"invalid legacy_collection.unread_stats: {legacy!r}")
+    require(type(legacy["rv_failed"]) is bool,
+            f"invalid legacy_collection.rv_failed: {legacy!r}")
+    names = legacy["unknown_evidence"]
+    require(isinstance(names, list) and all(isinstance(name, str) for name in names)
+            and len(names) == len(set(names)) and set(names) <= set(LEGACY_UNKNOWN_CELLS),
+            f"invalid legacy_collection.unknown_evidence: {legacy!r}")
+    require(names == [name for name in LEGACY_UNKNOWN_CELLS if name in set(names)],
+            f"legacy_collection.unknown_evidence must be in bit order: {legacy!r}")
+    require(legacy["unread_stats"] > 0 or legacy["rv_failed"] or names,
+            f"a clean legacy_collection gap object must be omitted: {legacy!r}")
+
+
 def exact_counter_collection(collection):
     """Derived availability of the accepted cumulative snapshot, not intent."""
-    exact_keys(collection, COUNTER_COLLECTION_KEYS, "counter_collection")
+    require(isinstance(collection, dict)
+            and COUNTER_COLLECTION_KEYS <= set(collection) <= COUNTER_COLLECTION_KEYS | {"bank_gaps"},
+            f"counter_collection key set: {collection!r}")
     require(collection["mode"] in ("counts", "timestamps", "latency"),
             f"invalid counter mode: {collection!r}")
     require(u64(collection["generation"]) and collection["generation"] > 0,
@@ -1077,9 +1132,19 @@ def exact_counter_collection(collection):
         exact_keys(health, {"saturated", "contended"}, "counter health")
         require(all(type(value) is bool for value in health.values()),
                 f"invalid counter health: {health!r}")
+    gaps = collection.get("bank_gaps")
+    if gaps is not None:
+        exact_counter_bank_gaps(gaps)
     if collection["status"] == "fresh":
-        require(failure is None and health == {"saturated": False, "contended": False},
-                f"fresh counter collection must have accepted healthy rows: {collection!r}")
+        if gaps is None:
+            require(failure is None and health == {"saturated": False, "contended": False},
+                    f"fresh counter collection must have accepted healthy rows: {collection!r}")
+        elif gaps["health_failed"]:
+            require(failure is None and health is None,
+                    f"fresh counter collection with a health gap must report unknown health: {collection!r}")
+        else:
+            require(failure is None and health == {"saturated": False, "contended": False},
+                    f"fresh counter collection with gaps must have accepted healthy rows: {collection!r}")
     else:
         require(failure is not None and health is None,
                 f"stale counter collection must retain a failure and unknown attempt health: {collection!r}")
@@ -1835,8 +1900,11 @@ def expected_gap_classes(evidence):
     collection = evidence.get("counter_collection")
     if collection is not None:
         gates["observation"].append((
-            "counter_collection", collection["status"] == "stale" or collection["discontinuity"],
+            "counter_collection", collection["status"] == "stale" or collection["discontinuity"]
+            or "bank_gaps" in collection,
         ))
+    if evidence.get("legacy_collection") is not None:
+        gates["observation"].append(("legacy_collection", True))
     causes = {name: [cause for cause, hit in gate if hit] for name, gate in gates.items()}
     if causes["semantics"]:
         semantics = "degraded"
@@ -2591,6 +2659,7 @@ PUBLISHED_LOADER_PAUSE_FIELDS = {
     # run lane and to `child_still_running`.
     "handoff_child_pid",
     *PAUSE_COUNTERS,
+    "pause_engine_incomplete_retirements",
 }
 
 
@@ -2716,6 +2785,12 @@ def exact_live_discovery_evidence(evidence, *, run=False):
     require(
         confirmed + partial + unavailable == attempts,
         f"pause counters do not add up: {attempts} != {confirmed} + {partial} + {unavailable}",
+    )
+    retirements = evidence["pause_engine_incomplete_retirements"]
+    require(u64(retirements), f"pause_engine_incomplete_retirements: {retirements!r}")
+    require(
+        retirements <= partial,
+        f"retirements are counted partials: {retirements} > {partial}",
     )
     # The published value is exactly the lattice, never an independent label.
     wanted = (
@@ -3709,8 +3784,9 @@ def validate_canary(lane, document, target_bits=64):
             require(
                 (evidence["pause"], evidence["pause_attempts"],
                  evidence["pause_confirmed"], evidence["pause_partial"],
-                 evidence["pause_unavailable"])
-                == ("none", 0, 0, 0, 0),
+                 evidence["pause_unavailable"],
+                 evidence["pause_engine_incomplete_retirements"])
+                == ("none", 0, 0, 0, 0, 0),
                 "owned metrics requires exact never-pause evidence",
             )
     elif policy == "object":
@@ -3739,12 +3815,13 @@ def validate_object_canary_functions(document):
     for row in rows:
         exact_keys(row, {"names", "aliased", "target", "ordinals", "module", "module_ambiguous",
                          "module_unresolved", "calls", "errors", "pending_returns", "in_flight",
-                         "latency_ns", "rv_counts"}, "object function")
+                         "latency_ns", "rv_counts", "forwarding_layer"}, "object function")
         names = row["names"]
         require(isinstance(names, list) and len(names) == 1 and isinstance(names[0], str),
                 "object function requires one unaliased name")
         name = names[0]
         require(name not in seen_names and row["aliased"] is False, "duplicate/aliased object function")
+        require(row["forwarding_layer"] is False, "object function must not be a forwarding layer")
         seen_names.add(name)
         target = json.dumps(row["target"], sort_keys=True, separators=(",", ":"))
         require(target not in seen_targets, "duplicate object function target")
@@ -4095,6 +4172,7 @@ def evidence_fixture(surfaces, sources=("scan",), discovery_skipped=0):
         "attach_gap_ms": None,
         "pause": "none",
         **{name: 0 for name in PAUSE_COUNTERS},
+        "pause_engine_incomplete_retirements": 0,
         "loader_discovery": loader_discovery_fixture(),
         **{name: 0 for name in COUNTERS},
         # A fixture is self-consistent: a module only the manifest described is
@@ -5219,7 +5297,8 @@ def self_test():
         objects["functions"] = function_items(pairs)
         for row in objects["functions"]:
             get = row["names"] == ["C_GetAttributeValue"]
-            row.update(errors=5 if get else 0, pending_returns=0, in_flight=0,
+            row.update(forwarding_layer=False,
+                       errors=5 if get else 0, pending_returns=0, in_flight=0,
                        latency_ns={"approximate": True, "p50": 1 if row["calls"] else None,
                                    "p95": 1 if row["calls"] else None,
                                    "p99": 1 if row["calls"] else None,
@@ -5242,6 +5321,8 @@ def self_test():
             lambda d: d["functions"][0].update(names=["C_Initialize"]),
             lambda d: d["functions"][0].update(calls=True),
             lambda d: d["functions"][0].update(pointer=0x1234),
+            lambda d: d["functions"][0].update(forwarding_layer=True),
+            lambda d: d["functions"][0].pop("forwarding_layer"),
             lambda d: d["functions"][0]["ordinals"][0].update(ordinal=21),
             lambda d: d["functions"][1]["target"].update(file_offset=0x1000),
             lambda d: d["functions"][4]["rv_counts"].pop("0x0000000000000011"),

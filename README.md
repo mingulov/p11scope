@@ -18,8 +18,9 @@ snapshots support offline comparison; detailed profiles support investigation.
 > counts (`inventory --key-operations`), a counter capture can promote
 > one endpoint to full detail (`--select-endpoint`), repeatable
 > `--exclude-module` skips named providers, more provider tables prove
-> complete instead of reading PARTIAL, and live capture resolves newer
-> kernels (7.3, 7.4-rc1). Read the
+> complete instead of reading PARTIAL, text output is concise by default
+> with `-v` for details, and live capture resolves 7.3 while the
+> Detailed object loads on 7.4-rc1. Read the
 > [known limitations](CHANGELOG.md#known-limitations) and
 > [docs/known-limitations.md](docs/known-limitations.md) before relying on a
 > capture. `--system` selects whole-machine scope;
@@ -29,7 +30,7 @@ snapshots support offline comparison; detailed profiles support investigation.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -66,8 +67,14 @@ sudo p11scope inventory --system --duration 30s
 sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 
-Inventory has 4,096 physical endpoint IDs by default, configurable from 1 to
-8,192 with `--max-endpoints`. An endpoint is a provider object plus function
+Terminal text is concise by default — main results, one coverage line, and a
+hint. Add `-v` / `--verbose` for full detail (every gap and reason, evidence,
+timing) or `--quiet` for the summary head; `--json` and `-o` are always
+complete. See [output verbosity](docs/usage.md#text-output-concise-by-default--v-for-detail).
+
+Inventory holds up to 131,072 physical endpoint IDs with
+`--max-endpoints`; `inventory --system` on hosts with uprobe_multi defaults
+to 32,768. An endpoint is a provider object plus function
 offset, not a process. Detailed per-call capture has a separate 512-slot limit
 in release builds. These are different modes and budgets; unloading does not
 refund Inventory IDs during a capture.
@@ -104,10 +111,11 @@ observations by recorded application path and module content; `--json` and
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
 
-Two newer capture flags: `--track-short-lived` (profile and run,
+Two newer capture flags: `--track-short-lived` (profile,
 default off) is extensive mode: the kernel records exec-time executable identity
 so unmatched exits gain bounded static-linkage hints, arming only on Detailed
 profile `--cgroup`/`--system` captures and refused beside `--counter-mode`
+and beside `run`
 ([options](docs/usage.md#more-capture-options)). `--prearm-module
 <provider.so>` (profile, trace, run, inventory; repeatable) pins a provider file
 before any mapping and pre-arms its proved offsets; under inventory the inputs
@@ -117,7 +125,7 @@ are pinned and retained while Detailed-subset activation still follows
 Development inventory also accepts `--cgroup /sys/fs/cgroup/owned.scope`, including
 descendants, across scan/auto/native and the existing output modes. Discovery
 retains the selected root, requires initial PID numbering with matching procfs,
-and reports bounded partial work explicitly. Quiet cgroup usage remains unknown;
+and reports bounded partial work explicitly. Idle cgroup usage remains unknown;
 endpoint membership samples do not prove continuous residency. Scoped native
 owner admission runs on `--cgroup` with `--capture auto` or `native`: while the
 native lane stays active, each completed cgroup transaction commits at most one
@@ -180,10 +188,11 @@ with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
 The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
 provides a static x86-64 Linux observer bundle, optional glibc and musl discovery
-helper bundles, and a source export. The examples below install **v0.6.0**.
-Download `SHA256SUMS` with the bundle you
+helper bundles, DEB and RPM system packages, and a source export. The examples
+below install **v0.6.0**. Download `SHA256SUMS` with the bundle you
 choose. The release also provides `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
+Every release file carries a GitHub build-provenance attestation.
 Older bundles remain under their release tags. To build current source
 instead, see [Build locally from source](#build-locally-from-source).
 GitHub's automatic source archive still needs the dependency inputs
@@ -194,6 +203,8 @@ described above.
 | `p11scope-0.6.0-x86_64-linux-musl.tar.gz` | Static observer, with the eBPF object embedded; needed for capture. |
 | `p11scope-discover-0.6.0-x86_64-linux-gnu.tar.gz` | Optional helper for 64-bit glibc providers. |
 | `p11scope-discover-0.6.0-x86_64-linux-musl.tar.gz` | Optional helper for 64-bit musl providers. |
+| `p11scope_0.6.0_amd64.deb` | System package for Debian/Ubuntu: observer plus glibc helper. |
+| `p11scope-0.6.0-1.x86_64.rpm` | System package for Fedora/RHEL: observer plus glibc helper. |
 
 For example, download the observer and `SHA256SUMS` into a private directory,
 then verify the archive before extraction:
@@ -212,6 +223,38 @@ sudo p11scope doctor
 
 Keep the extracted bundle with its licenses, notices and `RELEASE.json` as
 the record of the binary you installed.
+
+### System packages (DEB/RPM)
+
+The system packages install the same static observer binary plus the glibc
+discovery helper (same bytes as the tarballs, no rebuild) to `/usr/bin`,
+with licenses and provenance under `/usr/share/doc/p11scope`. They carry
+no file capabilities, set-id bits, services or maintainer scripts. The musl
+helper stays tarball-only for musl systems. The packages are
+install-tested on Ubuntu 26.04 and Fedora 44. The bundled helper needs
+glibc 2.34 or newer, so it does not run on older distributions. Download
+the package and
+`SHA256SUMS`, verify the checksum and the build attestation, then install
+the file (Debian/Ubuntu shown; Fedora/RHEL uses `dnf install` with the
+`.rpm` file):
+
+```sh
+download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
+cd "$download_dir"
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope_0.6.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+sha256sum --check --ignore-missing SHA256SUMS
+gh attestation verify p11scope_0.6.0_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.6.0_amd64.deb
+p11scope --version
+sudo p11scope doctor
+p11scope-discover --version
+```
+
+On Fedora/RHEL, replace the download with
+`p11scope-0.6.0-1.x86_64.rpm`, verify it with
+`gh attestation verify p11scope-0.6.0-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.6.0-1.x86_64.rpm`.
 
 To use attested semantic capture, download and verify the helper bundle for
 the provider's C library, then extract and install its `p11scope-discover`
@@ -474,36 +517,46 @@ report format.
   still refuse capture.
   No `CAP_LEASE`, no `fs.suid_dumpable=0`, no root-owned trusted exec dir
   ([measured matrix](docs/usage.md#privileges-per-environment)).
-  Live host capability is tested, with `uprobe-multi-required` on failure;
+  Live host capability is tested, with a one-line refusal on failure;
   other unsupported configurations fail with a
   named cause and a hint, never a panic or a raw verifier dump
   (`docs/notes/phase5-unsupported.md`).
 - `inspect` shows every provider-shaped module mapped by the target; an
   optional `--module` only narrows that set. A target whose memory maps it
   cannot read is an error (exit 1), never an empty module list. On the
-  measured p11-kit stack, p11-kit's fixed closure array exceeds the 512-slot
-  ceiling and is refused whole, while the later-fitting SoftHSM2 backend
-  attaches; the report is explicitly `PARTIAL`, not a claim that the proxy
-  layer was captured.
+  measured p11-kit stack, the one-shot `inspect` verdict leaves p11-kit's
+  closure array unattached by design — only its published tables would
+  attach, and none of the lookalike tables is published yet — while the
+  later-fitting SoftHSM2 backend attaches; the report is explicitly
+  `PARTIAL`, not a claim that the proxy layer was captured. A live capture
+  instead admits the forwarding layer by what it publishes (below), with
+  an unpublished layer staying a named gap while the capture continues.
 - Detailed per-call capture has 512 attach slots in release builds; this is
-  separate from Inventory's 4,096 default / 8,192 maximum physical endpoints
-  and the explicit aggregate counter modes. Detailed `--pid`, `run`, and any capture aimed with
-  `--module` admit providers in discovery order. A recognized proxy closure
-  array is decided after every provider: whole when it fits (late-start,
-  reserve-capped), otherwise a reserve-capped leading-templates prefix with
-  a named partial gap only when the capture's first plan held the closure
-  beside a non-closure provider, or when its opened file matches an
-  operator-named `--module` path, and its published tables only when
-  unnamed (mapped mid-capture, or alone in the first plan) — refused
-  whole when none of those admit. The prefix leaves at least the reserve (128 of 512 slots) free, so one
-  later standard function list (at most 104 entries) always fits; a second
-  later provider may not fit and is then refused by name with the
-  `--exclude-module` remedy. A `--cgroup` or `--system`
-  capture without `--module` admits each provider whole or not at all, by
-  value — `--manifest` providers first, then providers whose function table
-  is corroborated, then heuristic finds, proxy closure arrays last (closures:
-  whole, or their published tables when the heuristic set is refused — never
-  a heuristic prefix). Heuristic finds and closure arrays may not use the last
+  separate from Inventory's endpoint budget (32,768 by default on
+  `inventory --system` with uprobe_multi, up to 131,072 with
+  `--max-endpoints`) and the explicit aggregate counter modes. Detailed
+  `--pid`, `run`, and any capture aimed with `--module` admit providers in
+  discovery order. A recognized forwarding layer (such as the p11-kit proxy
+  closure array) is decided after every provider and admitted by what it
+  publishes: only tables the application actually received attach, taking
+  no heuristic slots, so the layer can never crowd out a real provider.
+  Calls it forwards are counted at the attached backend providers, named
+  with counts on the gap line; calls the layer answered itself, including
+  its errors, appear only on the separate forwarding line, and one layer
+  call that reaches several providers counts at each. An operator-named
+  layer (`--module <path>`) is the sole exception: it keeps a
+  reserve-capped leading-templates prefix, because a remote client's
+  tables are handed out before any export probe can observe the return.
+  The prefix leaves at least the reserve (128 of 512 slots) free, so one
+  later standard function list (at most 104 entries) always fits. Under
+  inventory, counter and broad admission a closure array that does not
+  fit whole is refused whole with its demand stated. A `--cgroup` or `--system`
+  capture without `--module` admits each provider by value —
+  `--manifest` providers first, then providers whose function table
+  is corroborated, then heuristic finds, forwarding layers last. An
+  ordinary provider that does not fit is admitted on the leading prefix
+  that fits with a named partial gap; operator-attested (`--manifest`)
+  modules stay whole-only. Heuristic finds may not use the last
   128 slots (25%), which stay free for corroborated providers found later in
   the capture. A refusal names what holds the slots; in such a shared capture
   it also names the reserve and suggests `--module`. The terminal report names
@@ -540,10 +593,11 @@ report format.
   default `allowlisted` policy this holds against hostile pointer placement,
   not merely trusted ABI-valid callers.
 - **Privacy-first 1.0 boundary.** The default release reports bounded function,
-  registered-mechanism, return-code, latency, and lifecycle evidence. It does
-  not correlate object handles and does not promise symbolic `CKA_CLASS` or
-  `CKA_KEY_TYPE` output. The existing unsafe diagnostic build does not enlarge
-  the default allowlist.
+  registered-mechanism, return-code, latency, and lifecycle evidence. By
+  default it does not correlate object handles (the opt-in `inventory
+  --key-operations` adds per-key rows) and does not promise symbolic
+  `CKA_CLASS` or `CKA_KEY_TYPE` output. The existing unsafe diagnostic build
+  does not enlarge the default allowlist.
 - A trace is evidence about the observed window only; the profile includes an
   explicit evidence-quality/completeness section (attach failures, aliased
   functions, event loss) — `COMPLETE`/`PARTIAL`, never silently confident.
@@ -577,8 +631,8 @@ provider file and are within the capture scope, one attachment can observe
 their calls after the probes are installed, including calls from later pods.
 Separate overlay instances and copy-up need additional identity handling;
 they do not inherit that guarantee. A process retaining a pre-copy-up mapping
-can currently be attributed to the new file and have calls missed without a
-runtime marker, on both identity backends. See the
+reads `unknown` with the `original_file_unproven` gap, and its later calls
+past the copy-up are missed, on both identity backends. See the
 [copy-up limitation and restart workaround](docs/known-limitations.md#overlay-xinocopy-up-identity-divergences-d-c7-2d-c7-3).
 
 The v0.5.0 Knative warm capture observed 1,200/1,200 calls. Its cold first
@@ -628,16 +682,22 @@ object, offset, and canonical function name. `p11scope run` never
 implicitly releases a root child: a non-root observer keeps its UID/GID while
 losing capabilities, and a sudo-root observer requires valid non-root
 `SUDO_UID`/`SUDO_GID` values naming one existing non-root account and drops to
-them before the release barrier. Root without that explicit target and set-id
-invocations are refused; those environment values select the target account
-but do not authenticate that the launcher was `sudo`. The child also receives
-`no_new_privs`, no capabilities, a small environment allowlist, and no
-unrelated inherited file descriptors. Its executable is opened before fork
-and executed by descriptor; scripts must be invoked through an explicit ELF
-interpreter such as `/bin/sh script`.
-For now, the sudo path clears supplementary groups, so workloads needing an
-HSM/device group should use an already-running target until explicit run-as
-group selection is implemented.
+them before the release barrier. Root without that explicit target (or
+`--user`) and set-id invocations are refused; those environment values
+select the target account but do not authenticate that the launcher was
+`sudo`. The child also receives `no_new_privs`, no capabilities, the
+observer's environment unchanged
+except `SUDO_*`/`P11SCOPE_*` control variables (named on stderr under -v when
+withheld), and no unrelated inherited file descriptors. Its executable is opened
+by the observer (root under sudo) before fork and executed by descriptor, so
+the target account needs no directory search permission on its path; scripts
+must be invoked through an explicit ELF interpreter such as `/bin/sh script`.
+The sudo path restores the invoker's supplementary groups from the account
+database (glibc may return only the primary group) and home environment
+(`HOME`/`USER`/`LOGNAME`/`SHELL` from the passwd entry, `XDG_RUNTIME_DIR`
+when `/run/user/<uid>` is the invoker's own, otherwise unset), so
+HSM/device-group workloads run as if launched directly; `-v` prints the
+restored identity.
 
 The [v0.3.0 GitHub release notes](https://github.com/mingulov/p11scope/releases/tag/v0.3.0)
 identify final tagged-artifact qualification and hosted CI. The

@@ -161,6 +161,8 @@ jobs:
     permissions:
       contents: read
       actions: read
+      id-token: write
+      attestations: write
     uses: ./.github/workflows/package-preview.yml
     with:
       accepted_ci_run_id: ${{ inputs.accepted_ci_run_id }}
@@ -849,7 +851,7 @@ jobs:
       - run: mkdir -m 700 "$RUNNER_TEMP/private-tmp" && echo "TMPDIR=$RUNNER_TEMP/private-tmp" >>"$GITHUB_ENV"
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 python3-yaml shellcheck softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm python3 python3-yaml rpm shellcheck softhsm2
       # Cache keys (see the header): the runner image, and the apt C toolchain
       # that build scripts invoke.
       - name: Cache keys
@@ -1167,7 +1169,7 @@ jobs:
             set -euo pipefail
             binary="$PWD/target/release/p11scope"
             doctor_status=0
-            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
+            sudo -n env TMPDIR="$TMPDIR" "$binary" doctor -v >"$TMPDIR/hosted-doctor.txt" 2>&1 || doctor_status=$?
             printf "%s\n" "$doctor_status" >"$TMPDIR/hosted-doctor-status.txt"
             python3 -I - "$TMPDIR/hosted-doctor.txt" "$doctor_status" << "PY"
           import re
@@ -1285,7 +1287,7 @@ jobs:
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
       - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml softhsm2
+      - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc gcc-multilib jq libseccomp-dev llvm musl-tools python3 python3-yaml rpm softhsm2
       # Ubuntu 26 packages bpftool separately; older images use a versioned
       # linux-tools executable. Select the package-owned binary, not the
       # common wrapper that dispatches by the runner's Azure kernel name.

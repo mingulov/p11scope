@@ -679,7 +679,7 @@ class ObservedRsaTests(unittest.TestCase):
             with self.assertRaises(ORACLE.OracleRefusal):
                 ORACLE.check_section(downgraded)
         with self.subTest("unknown versions refused"):
-            for version in (0, 3, 99):
+            for version in (0, 99):
                 mutated = copy.deepcopy(section)
                 mutated["version"] = version
                 with self.assertRaises(ORACLE.OracleRefusal):

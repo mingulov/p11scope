@@ -246,7 +246,8 @@ const UPROBE_MULTI_ROW: &str = "uprobe-multi attach (own libc)";
 /// without uprobe-multi. Live capture refuses there before loading any
 /// capture program, so test-loading them would only cost verifier time
 /// (minutes on 6.1) and could not change the verdict.
-const SKIPPED_WITHOUT_MULTI: &str = "skipped: uprobe-multi-required (live capture needs uprobe-multi; this check loads capture programs)";
+const SKIPPED_WITHOUT_MULTI: &str =
+    "skipped: this check loads capture programs, which need uprobe-multi";
 
 /// Whether doctor test-loads the capture objects. A proven Multi host
 /// loads them, and so does any refused probe except a known pre-Multi
@@ -320,7 +321,7 @@ fn journal_pair_check(preflight: crate::attach::JournalPairPreflight) -> Check {
     let status = match preflight {
         JournalPairPreflight::Available => Status::Ok("available".into()),
         JournalPairPreflight::UnavailableInBuild => {
-            Status::Warn(JOURNAL_UNAVAILABLE_IN_BUILD.into())
+            Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into())
         }
         JournalPairPreflight::PairMissing(reason) => {
             Status::Warn(format!("unavailable: pair missing ({reason})"))
@@ -831,8 +832,12 @@ fn format_operation_error(error: &(dyn std::error::Error + 'static)) -> String {
     format_operation_error_with(error, None, false, false)
 }
 
-/// The object-capture row's by-design warning in P0 (stub) builds.
+/// The object-capture row's by-design detail in P0 (stub) builds.
 const OBJECT_CAPTURE_P0: &str = "not enabled in this P0 build";
+
+/// The detail every by-design build-limit row carries: the row reads
+/// `n/a` because this build cannot assess it on any host.
+const BUILD_LIMIT_NOT_IN_BUILD: &str = "not in this build";
 
 /// Byte scope, identical on every host, read from the embedded object:
 /// FULL bytes wire capture, P0 (stub) bytes warn by design (a
@@ -854,28 +859,33 @@ fn object_capture_check() -> Check {
         },
         Ok(_) => Check {
             name: "object-attribute capture".into(),
-            status: Status::Warn(OBJECT_CAPTURE_P0.into()),
+            status: Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into()),
         },
     }
 }
 
 fn capabilities_check() -> Check {
-    // A read/parse failure is reported, never coerced into "(none)" — an
-    // unmeasured mask must not read the same as a genuinely empty one.
-    let status = match read_cap_eff() {
-        Ok(mask) => {
-            let names = decode_caps(mask);
-            Status::Ok(if names.is_empty() {
-                "(none)".to_string()
-            } else {
-                names.join(" ")
-            })
-        }
-        Err(e) => Status::Warn(e),
-    };
     Check {
         name: "effective capabilities".to_string(),
-        status,
+        status: capabilities_status(read_cap_eff()),
+    }
+}
+
+/// The capabilities row for one mask read: a read/parse failure is
+/// reported, never coerced into "none" — an unmeasured mask must not read
+/// the same as a genuinely empty one. A genuinely empty mask warns: live
+/// capture needs privilege.
+fn capabilities_status(read: Result<u64, String>) -> Status {
+    match read {
+        Ok(mask) => {
+            let names = decode_caps(mask);
+            if names.is_empty() {
+                Status::Warn("none — live capture needs root".into())
+            } else {
+                Status::Ok(names.join(" "))
+            }
+        }
+        Err(e) => Status::Warn(e),
     }
 }
 
@@ -1085,10 +1095,10 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
             Status::Warn(no.to_string())
         }
     };
-    // The compiled-in timing catalog is exactly empty (D3 amendment §3), so a
-    // bound debug-state context is `unproven` and everything else is `none`.
-    // No context can reach `qualified_pre_constructor`/`known_pre_relocation`.
-    let timing = || Status::Warn(if hook { "unproven" } else { "none" }.to_string());
+    // The compiled-in timing catalog is exactly empty (D3 amendment §3),
+    // so no context can reach `qualified_pre_constructor`/
+    // `known_pre_relocation`: both timing rows read as build limits.
+    let timing = || Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into());
     vec![
         Check {
             name: "target loader build".into(),
@@ -1120,7 +1130,7 @@ fn live_discovery_checks(pid: Option<u32>, capture_lane: bool) -> Vec<Check> {
             // Never eligible while the catalog is empty: attach-first closure
             // cannot prove the observed event was the first relevant one.
             name: "run initial-set capture".into(),
-            status: Status::Warn("none".into()),
+            status: Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into()),
         },
         Check {
             name: "pause".into(),
@@ -1602,13 +1612,18 @@ fn verdict_line(checks: &[Check]) -> String {
     }
     if let Some(check) = checks.iter().find(|c| is_run_capture_row(&c.name)) {
         match &check.status {
+            // The probe reads n/a while the timing catalog is empty
+            // ("never eligible"): that is not availability — but `run`
+            // itself still works. What the limit removes is the proof that
+            // the child's initial provider set was captured from its first
+            // constructor, which keeps every `run` report PARTIAL (HIGH-5).
+            Status::NotApplicable(detail) if detail == BUILD_LIMIT_NOT_IN_BUILD => {
+                parts.push(format!(
+                    "run initial-set capture {detail} (run reports stay PARTIAL; run itself works)"
+                ));
+            }
             Status::NotApplicable(_) => {}
             Status::Fail(detail) => parts.push(format!("run capture unavailable ({detail})")),
-            // The probe reports Warn("none") while the timing catalog is
-            // empty ("never eligible"): that is not availability — but `run`
-            // itself still works. What `none` limits is the proof that the
-            // child's initial provider set was captured from its first
-            // constructor, which keeps every `run` report PARTIAL (HIGH-5).
             Status::Warn(detail) => parts.push(format!(
                 "run initial-set capture {detail} (run reports stay PARTIAL; run itself works)"
             )),
@@ -1643,10 +1658,22 @@ fn summary_with_host(
     extra_strict: bool,
     host: Option<crate::attach::MultiHostVerdict>,
 ) -> String {
+    let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, extra_strict));
+    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
+    let target = lane_assessment(checks, "target readability");
+    let scope = scope_assessment(checks);
+    let _ = writeln!(out, "Target: {target}.\nScope: {scope}.");
+    out.push_str(&next_line(checks, extra_strict, host));
+    out
+}
+
+/// The summary's headline conclusion, shared by every render so all
+/// verbosity levels agree on the verdict.
+fn doctor_conclusion(checks: &[Check], extra_strict: bool) -> &'static str {
     let assessed = checks.iter().any(|check| {
         is_requested_lane(&check.name) && !matches!(check.status, Status::NotApplicable(_))
     });
-    let conclusion = if extra_strict && verdict_extra_strict(checks) != 0 {
+    if extra_strict && verdict_extra_strict(checks) != 0 {
         "extra-strict qualification refused"
     } else if !assessed {
         "no requested lanes assessed"
@@ -1656,10 +1683,13 @@ fn summary_with_host(
         "requested-lane checks passed"
     } else {
         "requested lane unavailable"
-    };
-    let mut out = format!("Doctor: {conclusion}.\n");
-    let _ = writeln!(out, "{}", capability_tier_line(capability_tier(checks)));
-    let assessment = |name: &str| match checks
+    }
+}
+
+/// One lane's assessed state for the summary: available, unavailable, or
+/// unassessed when nobody requested it.
+fn lane_assessment(checks: &[Check], name: &str) -> &'static str {
+    match checks
         .iter()
         .find(|check| check.name == name)
         .map(|check| &check.status)
@@ -1667,20 +1697,33 @@ fn summary_with_host(
         Some(Status::Ok(_)) => "available",
         Some(Status::Warn(_) | Status::Fail(_)) => "unavailable",
         Some(Status::NotApplicable(_)) | None => "unassessed",
-    };
-    let target = assessment("target readability");
-    let scope = if checks
+    }
+}
+
+/// The assessed scope state for the summary: a PID-namespace refusal or
+/// an unreadable cgroup path reads unavailable, otherwise the scope
+/// preflight's own state.
+fn scope_assessment(checks: &[Check]) -> &'static str {
+    if checks
         .iter()
         .any(|check| is_pid_namespace_row(&check.name) && matches!(check.status, Status::Fail(_)))
     {
         "unavailable"
     } else {
-        match assessment("cgroup path") {
+        match lane_assessment(checks, "cgroup path") {
             "unavailable" => "unavailable",
-            _ => assessment("scope preflight"),
+            _ => lane_assessment(checks, "scope preflight"),
         }
-    };
-    let _ = writeln!(out, "Target: {target}.\nScope: {scope}.");
+    }
+}
+
+/// The summary's `Next:` line, shared by the full and concise renders so
+/// both point at the same step.
+fn next_line(
+    checks: &[Check],
+    extra_strict: bool,
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
     let problem = if extra_strict {
         extra_strict_violations(checks).first().copied()
     } else {
@@ -1693,21 +1736,42 @@ fn summary_with_host(
                     .find(|check| matches!(check.status, Status::Warn(_)) && !is_build_limit(check))
             })
     };
+    let scope = scope_assessment(checks);
+    let privileged = process_is_privileged();
     let next = match problem {
-        Some(check) => next_step_with_host(check, host),
+        Some(check) if matches!(check.status, Status::Fail(_)) || extra_strict => {
+            next_step_with_host(check, host, privileged)
+        }
+        // No requested lane failed: point at the capture to run next,
+        // not at the warning rows below.
+        Some(_) => ACTIONABLE_NEXT.into(),
         None if scope == "unassessed" =>
             "choose --pid <PID> or --cgroup <PATH> to assess a target scope".into(),
         None => "choose a capture mode with p11scope profile --help; these checks do not prove provider activity".into(),
     };
-    let _ = writeln!(out, "Next: {}.", crate::render::escape_controls(&next));
-    out
+    format!("Next: {}.\n", crate::render::escape_controls(&next))
+}
+
+/// The Next step when every requested lane passed: the capture to run.
+const ACTIONABLE_NEXT: &str =
+    "sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target)";
+
+/// Whether this process runs as uid 0. Only used to pick operator
+/// guidance, never to prove capability.
+fn process_is_privileged() -> bool {
+    // SAFETY: geteuid takes no arguments and always succeeds.
+    (unsafe { libc::geteuid() }) == 0
 }
 
 /// The Next step with the typed host verdict. Only a probe refusal that
 /// proves the kernel itself lacks Multi names a Multi host; every other
 /// Multi refusal falls through to the generic guidance below, and the
 /// loads that ran ahead of it keep their own rows.
-fn next_step_with_host(check: &Check, host: Option<crate::attach::MultiHostVerdict>) -> String {
+fn next_step_with_host(
+    check: &Check,
+    host: Option<crate::attach::MultiHostVerdict>,
+    privileged: bool,
+) -> String {
     if check.name == UPROBE_MULTI_ROW
         && matches!(host, Some(Err(refusal)) if refusal.is_premulti_kernel())
     {
@@ -1715,10 +1779,10 @@ fn next_step_with_host(check: &Check, host: Option<crate::attach::MultiHostVerdi
                 p11scope inspect --pid <PID> works here without live capture"
             .into();
     }
-    next_step(check)
+    next_step_for(check, privileged)
 }
 
-fn next_step(check: &Check) -> String {
+fn next_step_for(check: &Check, privileged: bool) -> String {
     let detail = status_detail(&check.status);
     // These suffixes come from the existing independent EPERM classifier.
     // Seccomp mode or CapEff alone must never select a causal recommendation.
@@ -1747,7 +1811,10 @@ fn next_step(check: &Check) -> String {
         return "check access to the target's maps, memory, root and provider files; rerun p11scope doctor --pid <PID>".into();
     }
     if detail.contains("EPERM") || detail.contains("Operation not permitted") {
-        return "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges".into();
+        if privileged {
+            return "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges".into();
+        }
+        return "run as root: sudo p11scope doctor".into();
     }
     if is_capture_row(&check.name)
         && ["unsupported", "not supported", "ENOSYS", "EOPNOTSUPP"]
@@ -1787,23 +1854,59 @@ fn render_with_mode_and_host(
 ) -> String {
     let mut out = summary_with_host(checks, extra_strict, host);
     for check in checks {
-        let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
-        let word = status_word(&check.status);
-        let detail = status_detail(&check.status);
-        // Details carry target-controlled bytes (paths, errors): a newline
-        // must never let one check forge a second output line (SYSPLAN
-        // residual F-59). The same escape the capture renderers use.
-        let flattened = detail.replace('\n', "\\n");
-        let detail = crate::render::escape_controls(&flattened);
-        let _ = write!(out, "{} {} {word}", check.name, ".".repeat(dots));
-        if !detail.is_empty() {
-            let pad = STATUS_WIDTH.saturating_sub(word.len());
-            let _ = write!(out, "{}{detail}", " ".repeat(pad));
-        }
-        out.push('\n');
+        render_row(&mut out, check);
     }
     let _ = writeln!(out, "{}", verdict_line(checks));
     out
+}
+
+/// One dotted diagnostic row. Details carry target-controlled bytes
+/// (paths, errors): a newline must never let one check forge a second
+/// output line (SYSPLAN residual F-59). The same escape the capture
+/// renderers use.
+fn render_row(out: &mut String, check: &Check) {
+    let dots = NAME_WIDTH.saturating_sub(check.name.chars().count());
+    let word = status_word(&check.status);
+    let detail = status_detail(&check.status);
+    let flattened = detail.replace('\n', "\\n");
+    let detail = crate::render::escape_controls(&flattened);
+    let _ = write!(out, "{} {} {word}", check.name, ".".repeat(dots));
+    if !detail.is_empty() {
+        let pad = STATUS_WIDTH.saturating_sub(word.len());
+        let _ = write!(out, "{}{detail}", " ".repeat(pad));
+    }
+    out.push('\n');
+}
+
+/// The concise default: the verdict, the failing and warning rows, the
+/// next step, and the `-v` hint. Passing and not-applicable rows stay in
+/// the verbose render. Pure like [`render`].
+pub fn render_concise(checks: &[Check]) -> String {
+    render_concise_with_host(checks, None)
+}
+
+fn render_concise_with_host(
+    checks: &[Check],
+    host: Option<crate::attach::MultiHostVerdict>,
+) -> String {
+    let mut out = format!("Doctor: {}.\n", doctor_conclusion(checks, false));
+    let _ = writeln!(out, "{}", verdict_line(checks));
+    for check in checks
+        .iter()
+        .filter(|check| matches!(check.status, Status::Fail(_) | Status::Warn(_)))
+    {
+        render_row(&mut out, check);
+    }
+    out.push_str(&next_line(checks, false, host));
+    out.push_str(crate::cli::VERBOSE_HINT);
+    out.push('\n');
+    out
+}
+
+/// The `--quiet` render for scripts: the headline conclusion only. The
+/// exit code carries the verdict.
+pub fn render_quiet(checks: &[Check]) -> String {
+    format!("Doctor: {}.\n", doctor_conclusion(checks, false))
 }
 
 /// Exit code: 0 when no requested lane reports `Fail` (capture, target,
@@ -1824,14 +1927,14 @@ pub fn verdict(checks: &[Check]) -> i32 {
     if gated { 1 } else { 0 }
 }
 
-/// Rows whose warning is a limit of this build, identical on every host:
-/// the compiled-in loader timing catalog is exactly empty (D3 amendment §3),
-/// so the two timing rows can be no better than `unproven`/`none` and an
-/// owned `run` can never prove it captured its child's initial provider set
-/// (`run initial-set capture: none`, which keeps `run` reports `PARTIAL`).
-/// No host can clear them, so `--extra-strict` — a host qualification —
-/// lists them without counting them (HIGH-5). Only these exact by-design
-/// values are exempt: any other value (a future catalog) counts as usual.
+/// Rows that are a limit of this build, identical on every host: the
+/// compiled-in loader timing catalog is exactly empty (D3 amendment §3),
+/// so the two timing rows and `run initial-set capture` read `n/a`, and
+/// an owned `run` can never prove it captured its child's initial
+/// provider set (which keeps `run` reports `PARTIAL`). No host can clear
+/// them, so `--extra-strict` — a host qualification — lists them without
+/// counting them (HIGH-5). Only these exact by-design values are exempt:
+/// any other value (a future catalog) counts as usual.
 const BUILD_LIMIT_ROWS: [(&str, &[&str]); 5] = [
     ("loader timing (initial_set)", &["unproven", "none"]),
     ("loader timing (dlopen)", &["unproven", "none"]),
@@ -1843,13 +1946,19 @@ const BUILD_LIMIT_ROWS: [(&str, &[&str]); 5] = [
     (JOURNAL_PAIR_ROW, &[JOURNAL_UNAVAILABLE_IN_BUILD]),
 ];
 
+/// Whether a row is a by-design build limit: today's `n/a` shape, or the
+/// legacy warning shapes the same rows used to carry (kept exempt so
+/// synthetic checks and older harnesses keep their meaning).
 fn is_build_limit(check: &Check) -> bool {
-    let Status::Warn(detail) = &check.status else {
-        return false;
-    };
-    BUILD_LIMIT_ROWS
-        .iter()
-        .any(|(name, values)| check.name == *name && values.contains(&detail.as_str()))
+    match &check.status {
+        Status::NotApplicable(detail) if detail == BUILD_LIMIT_NOT_IN_BUILD => {
+            BUILD_LIMIT_ROWS.iter().any(|(name, _)| check.name == *name)
+        }
+        Status::Warn(detail) => BUILD_LIMIT_ROWS
+            .iter()
+            .any(|(name, values)| check.name == *name && values.contains(&detail.as_str())),
+        _ => false,
+    }
 }
 
 /// Extra-strict qualification (T2): every `Warn` or `Fail` row is a
@@ -2015,22 +2124,35 @@ fn counter_modes_for_host(
 pub fn run(pid: Option<u32>, cgroup: Option<&Path>, extra_strict: bool) -> Result<i32> {
     let host = crate::attach::require_multi_capable_host();
     let checks = probe_with_host(pid, cgroup, host);
+    let verbosity = crate::cli::text_verbosity();
     let (mut text, code) = if extra_strict {
         (
             render_extra_strict_with_host(&checks, Some(host)),
             verdict_extra_strict(&checks),
         )
     } else {
-        (render_with_host(&checks, host), verdict(&checks))
+        match verbosity {
+            crate::cli::TextVerbosity::Quiet => (render_quiet(&checks), verdict(&checks)),
+            crate::cli::TextVerbosity::Concise => (
+                render_concise_with_host(&checks, Some(host)),
+                verdict(&checks),
+            ),
+            crate::cli::TextVerbosity::Verbose => {
+                (render_with_host(&checks, host), verdict(&checks))
+            }
+        }
     };
     // The preflight loads each counter object and releases it without
     // attaching; only a proven bpf_loop host can answer, and omitted
-    // builds refuse at the probe sentence.
-    text.push_str(&counter_modes_for_host(
-        host,
-        crate::attach::kernel_bpf_loop_probe,
-        crate::attach::counter_banks::counter_object_preflight,
-    ));
+    // builds refuse at the probe sentence. Full detail only: the concise
+    // and quiet renders stay short.
+    if extra_strict || matches!(verbosity, crate::cli::TextVerbosity::Verbose) {
+        text.push_str(&counter_modes_for_host(
+            host,
+            crate::attach::kernel_bpf_loop_probe,
+            crate::attach::counter_banks::counter_object_preflight,
+        ));
+    }
     write_report(&mut std::io::stdout().lock(), &text)?;
     Ok(code)
 }
@@ -2180,37 +2302,36 @@ mod tests {
     #[test]
     fn doctor_skips_capture_loads_on_known_premulti_shapes_and_stays_not_ready() {
         use crate::attach::{MultiHostRefusal, MultiHostStage};
-        for (stage, errno, cause) in [
+        for (stage, errno, errno_name, cause) in [
             (
                 MultiHostStage::SelfLink,
                 Some(libc::EINVAL),
-                "Multi capability unproven",
+                Some("Invalid argument"),
+                "unproven",
             ),
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::EINVAL),
-                "Multi capability unproven",
+                Some("Invalid argument"),
+                "unproven",
             ),
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::EOPNOTSUPP),
-                "Multi capability unavailable",
+                Some("Operation not supported"),
+                "unavailable",
             ),
             (
                 MultiHostStage::SelfLink,
                 Some(libc::EOPNOTSUPP),
-                "Multi capability unavailable",
+                Some("Operation not supported"),
+                "unavailable",
             ),
         ] {
             let refusal = MultiHostRefusal::for_test(stage, errno);
             assert!(refusal.is_premulti_kernel(), "{refusal}");
             assert!(!capture_loads_assessed(Err(refusal)), "{refusal}");
-            let stage_word = match stage {
-                MultiHostStage::Anchor => "self-probe anchor",
-                MultiHostStage::ProgramLoad => "scratch program load",
-                MultiHostStage::SelfLink => "scratch self-link",
-            };
-            let multi_detail = expected_multi_detail(stage_word, cause, errno, None);
+            let multi_detail = expected_multi_detail(stage, errno_name, cause);
             let bpf = premulti_bpf_checks(Err(refusal));
             let healthy = bpf_checks_with_seccomp(
                 Ok(()),
@@ -2250,7 +2371,11 @@ mod tests {
                         let Status::NotApplicable(detail) = &check.status else {
                             panic!("{} must be skipped: {:?}", check.name, check.status)
                         };
-                        assert!(detail.contains("uprobe-multi-required"), "{detail}");
+                        assert!(
+                            detail.contains("loads capture programs, which need uprobe-multi"),
+                            "{detail}"
+                        );
+                        assert!(!detail.contains("uprobe-multi-required"), "{detail}");
                     }
                 }
             }
@@ -2302,33 +2427,51 @@ mod tests {
         }
     }
 
-    /// The exact Multi-row detail for one probe shape: cause and stage
-    /// words plus the libc errno text, the Denied operation sentence when
-    /// present, and the shared offline-pointer tail.
+    /// The exact Multi-row detail for one probe shape: the plain
+    /// one-line refusal for its cause, with the errno name spelled out
+    /// (independent of the libc rendering the producer uses).
     fn expected_multi_detail(
-        stage: &str,
+        stage: crate::attach::MultiHostStage,
+        errno_name: Option<&str>,
         cause: &str,
-        errno: Option<i32>,
-        operation: Option<&str>,
     ) -> String {
-        let mut detail = format!("uprobe-multi-required: {cause} at {stage}");
-        if let Some(errno) = errno {
-            detail.push_str(&format!(
-                " (errno {errno}: {})",
-                std::io::Error::from_raw_os_error(errno)
-            ));
+        use crate::attach::MultiHostStage;
+        let operation = match stage {
+            MultiHostStage::Anchor => "prepare p11scope's self-probe",
+            MultiHostStage::ProgramLoad => "load p11scope's BPF programs",
+            MultiHostStage::SelfLink => "attach p11scope's probes",
+        };
+        let doing = match stage {
+            MultiHostStage::Anchor => "preparing p11scope's self-probe",
+            MultiHostStage::ProgramLoad => "loading p11scope's BPF programs",
+            MultiHostStage::SelfLink => "attaching p11scope's probes",
+        };
+        let reason = errno_name
+            .map(|name| format!(" ({name})"))
+            .unwrap_or_default();
+        let scan = "use 'p11scope inspect --pid N' for a scan without capture.";
+        match cause {
+            "denied" => format!(
+                "live capture needs root: the kernel refused to {operation}{reason}. \
+                 Run with sudo, or {scan}"
+            ),
+            "unavailable" => format!(
+                "live capture unavailable: {doing} is not supported on this host{reason}; \
+                 run 'p11scope doctor' for host readiness, or {scan}"
+            ),
+            _ => format!(
+                "live capture did not start: {doing} failed{reason}; run 'p11scope doctor' \
+                 for host readiness, or {scan}"
+            ),
         }
-        if let Some(operation) = operation {
-            detail.push_str(&format!("; cannot {operation}; live capture requires root or appropriate capabilities and a permitting host policy (for example, sudo)"));
-        }
-        detail.push_str("; run `p11scope doctor` for host readiness or `p11scope doctor --pid <n>` for target readiness; `p11scope inspect --pid <n>` lists readable mapped providers without live capture");
-        detail
     }
 
     /// The Next step for a Multi row that carries no kernel-age claim.
     const GENERIC_MULTI_NEXT: &str = "review uprobe-multi attach (own libc) in the checks below before retrying qualification or capture";
     /// The Next step for a Multi row whose errno names a permission failure.
     const UNCLASSIFIED_DENIAL_NEXT: &str = "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges";
+    /// The Next step for the same failure without privilege: escalate first.
+    const RUN_AS_ROOT_NEXT: &str = "run as root: sudo p11scope doctor";
     /// The Next step for a probe refusal that proves a pre-Multi kernel.
     const PREMULTI_KERNEL_NEXT: &str = "use a host with uprobe-multi (normally Linux 6.6+) for live capture; p11scope inspect --pid <PID> works here without live capture";
 
@@ -2339,82 +2482,82 @@ mod tests {
     fn doctor_runs_capture_loads_unless_the_kernel_itself_lacks_multi() {
         use crate::attach::{MultiCapableHost, MultiHostRefusal, MultiHostStage};
         assert!(capture_loads_assessed(Ok(MultiCapableHost::for_test())));
-        for (stage, errno, cause, operation, next) in [
+        for (stage, errno, errno_name, cause, next) in [
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::EACCES),
-                "Multi capability unproven",
-                None,
+                Some("Permission denied"),
+                "unproven",
                 GENERIC_MULTI_NEXT,
             ),
             (
                 MultiHostStage::Anchor,
                 Some(libc::EPERM),
-                "Multi capability unproven",
-                None,
-                UNCLASSIFIED_DENIAL_NEXT,
+                Some("Operation not permitted"),
+                "unproven",
+                RUN_AS_ROOT_NEXT,
             ),
             (
                 MultiHostStage::Anchor,
                 Some(libc::EACCES),
-                "Multi capability unproven",
-                None,
+                Some("Permission denied"),
+                "unproven",
                 GENERIC_MULTI_NEXT,
             ),
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::EPERM),
-                "Multi probe denied by permission or policy",
-                Some("load p11scope's BPF programs"),
-                UNCLASSIFIED_DENIAL_NEXT,
+                Some("Operation not permitted"),
+                "denied",
+                RUN_AS_ROOT_NEXT,
             ),
             (
                 MultiHostStage::SelfLink,
                 Some(libc::EPERM),
-                "Multi probe denied by permission or policy",
-                Some("attach p11scope's required Multi probe"),
-                UNCLASSIFIED_DENIAL_NEXT,
+                Some("Operation not permitted"),
+                "denied",
+                RUN_AS_ROOT_NEXT,
             ),
             (
                 MultiHostStage::SelfLink,
                 Some(libc::EACCES),
-                "Multi probe denied by permission or policy",
-                Some("attach p11scope's required Multi probe"),
+                Some("Permission denied"),
+                "denied",
                 GENERIC_MULTI_NEXT,
             ),
             (
                 MultiHostStage::SelfLink,
                 Some(libc::EMFILE),
-                "Multi capability unproven",
-                None,
+                Some("Too many open files"),
+                "unproven",
                 GENERIC_MULTI_NEXT,
             ),
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::ENOMEM),
-                "Multi capability unproven",
-                None,
+                Some("Cannot allocate memory"),
+                "unproven",
                 GENERIC_MULTI_NEXT,
             ),
             (
                 MultiHostStage::ProgramLoad,
                 Some(libc::ENOSYS),
-                "Multi capability unavailable",
-                None,
-                GENERIC_MULTI_NEXT,
+                Some("Function not implemented"),
+                "unavailable",
+                "use a host with the required BPF/uprobe support; check the failed feature below",
             ),
             (
                 MultiHostStage::SelfLink,
                 Some(libc::ENOSYS),
-                "Multi capability unavailable",
-                None,
-                GENERIC_MULTI_NEXT,
+                Some("Function not implemented"),
+                "unavailable",
+                "use a host with the required BPF/uprobe support; check the failed feature below",
             ),
             (
                 MultiHostStage::Anchor,
                 None,
-                "Multi capability unproven",
                 None,
+                "unproven",
                 GENERIC_MULTI_NEXT,
             ),
         ] {
@@ -2423,23 +2566,30 @@ mod tests {
             assert!(capture_loads_assessed(Err(refusal)), "{refusal}");
             let multi = uprobe_multi_check(Err(refusal));
             assert_eq!(multi.name, UPROBE_MULTI_ROW);
-            let stage_word = match stage {
-                MultiHostStage::Anchor => "self-probe anchor",
-                MultiHostStage::ProgramLoad => "scratch program load",
-                MultiHostStage::SelfLink => "scratch self-link",
-            };
             assert_eq!(
                 multi.status,
-                Status::Fail(expected_multi_detail(stage_word, cause, errno, operation)),
+                Status::Fail(expected_multi_detail(stage, errno_name, cause)),
                 "{refusal}"
             );
+            // Privilege is explicit, never read from the test runner's
+            // own uid: the same assertions hold as root and as a user.
             assert_eq!(
-                next_step_with_host(&multi, Some(Err(refusal))),
+                next_step_with_host(&multi, Some(Err(refusal)), false),
                 next,
                 "{refusal}"
             );
+            let privileged_next = if next == RUN_AS_ROOT_NEXT {
+                UNCLASSIFIED_DENIAL_NEXT
+            } else {
+                next
+            };
+            assert_eq!(
+                next_step_with_host(&multi, Some(Err(refusal)), true),
+                privileged_next,
+                "{refusal}"
+            );
             assert!(
-                !next_step(&multi).contains("Linux 6.6"),
+                !next_step_for(&multi, process_is_privileged()).contains("Linux 6.6"),
                 "untyped Next must not claim a kernel age: {refusal}"
             );
         }
@@ -3011,8 +3161,8 @@ mod tests {
     }
 
     /// The doctor names the build's object-capture scope: enabled in
-    /// FULL builds, a by-design warning in P0 (stub) builds that
-    /// extra-strict qualification excuses (no host can clear it).
+    /// FULL builds, a by-design `n/a` build limit in P0 (stub) builds
+    /// that extra-strict qualification excuses (no host can clear it).
     /// OD33/R-50: v0.5.0 reads attributes but reports key operations
     /// only from 0.6.0, so the OK detail says so.
     #[test]
@@ -3029,7 +3179,11 @@ mod tests {
                 "{check:?}"
             ),
             false => {
-                assert!(matches!(check.status, Status::Warn(_)), "{check:?}");
+                assert_eq!(
+                    check.status,
+                    Status::NotApplicable(BUILD_LIMIT_NOT_IN_BUILD.into()),
+                    "{check:?}"
+                );
                 assert!(is_build_limit(&check), "{check:?}");
                 let checks = vec![check];
                 assert!(extra_strict_violations(&checks).is_empty());
@@ -3103,7 +3257,10 @@ mod tests {
         }
         let check = object_capture_check();
         assert!(
-            matches!(check.status, Status::Ok(_) | Status::Warn(_)),
+            matches!(
+                check.status,
+                Status::Ok(_) | Status::Warn(_) | Status::NotApplicable(_)
+            ),
             "{check:?}"
         );
         assert_eq!(verdict(&[check]), 0);
@@ -3353,11 +3510,14 @@ mod tests {
         }
         let check = journal_pair_check(JournalPairPreflight::Available);
         assert_eq!(check.status, Status::Ok("available".into()));
-        // A build that omits the production journal object reports the
-        // one build-limit token: identical on every host, so it never
-        // becomes an extra-strict qualification violation.
+        // A build that omits the production journal object reads n/a:
+        // identical on every host, so it never becomes an extra-strict
+        // qualification violation.
         let check = journal_pair_check(JournalPairPreflight::UnavailableInBuild);
-        assert_eq!(check.status, Status::Warn("unavailable-in-build".into()));
+        assert_eq!(
+            check.status,
+            Status::NotApplicable("not in this build".into())
+        );
         assert!(
             extra_strict_violations(std::slice::from_ref(&check)).is_empty(),
             "the omitted-build row is a build limit, not a host defect"
@@ -3584,8 +3744,7 @@ mod tests {
             &[
                 "qualified_pre_constructor",
                 "known_pre_relocation",
-                "unproven",
-                "none",
+                "not in this build",
             ],
         ),
         (
@@ -3593,13 +3752,15 @@ mod tests {
             &[
                 "qualified_pre_constructor",
                 "known_pre_relocation",
-                "unproven",
-                "none",
+                "not in this build",
             ],
         ),
         ("loader-state live read", &["available", "unavailable"]),
         ("live export reads", &["available", "unavailable"]),
-        ("run initial-set capture", &["eligible", "none"]),
+        (
+            "run initial-set capture",
+            &["eligible", "not in this build"],
+        ),
     ];
 
     #[test]
@@ -3614,6 +3775,23 @@ mod tests {
             assert!(
                 allowed.contains(&detail),
                 "{name} classified itself as {detail:?}, outside {allowed:?}"
+            );
+        }
+        // Build limits read n/a in this build, never warn: no host can
+        // clear them, so they must not look like host problems.
+        for name in [
+            "loader timing (initial_set)",
+            "loader timing (dlopen)",
+            "run initial-set capture",
+        ] {
+            let check = checks
+                .iter()
+                .find(|c| c.name == name)
+                .unwrap_or_else(|| panic!("{name} row is missing: {checks:?}"));
+            assert_eq!(
+                check.status,
+                Status::NotApplicable("not in this build".into()),
+                "{name}"
             );
         }
         // Pause: the default is stated, and an explicit policy's armability is
@@ -3678,8 +3856,8 @@ mod tests {
             "verdict text hides the lane: {line}"
         );
 
-        // Fable: the probe always emits Warn("none") ("never eligible while
-        // the catalog is empty"), so Warn must not render as "available".
+        // Fable: the legacy Warn("none") shape ("never eligible while
+        // the catalog is empty") must not render as "available".
         // HIGH-5: nor as "run capture not eligible" — `run` itself works on
         // a capable host; what `none` limits is its initial-set proof, which
         // keeps its reports PARTIAL.
@@ -3696,6 +3874,22 @@ mod tests {
             "verdict text misstates an ineligible lane: {line}"
         );
         assert!(!line.contains("not eligible"), "{line}");
+        assert!(!line.contains("run capture available"), "{line}");
+
+        // The same lane as a build-limit n/a keeps the PARTIAL note:
+        // `run` itself works, only its initial-set proof is missing.
+        let limited = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::NotApplicable("not in this build".into()),
+        }];
+        assert_eq!(verdict(&limited), 0);
+        let line = verdict_line(&limited);
+        assert!(
+            line.contains(
+                "run initial-set capture not in this build (run reports stay PARTIAL; run itself works)"
+            ),
+            "{line}"
+        );
         assert!(!line.contains("run capture available"), "{line}");
     }
 
@@ -3807,11 +4001,11 @@ mod tests {
         .collect()
     }
 
-    /// HIGH-5: the loader timing rows and `run initial-set capture` warn on
-    /// every host because this build's timing catalog is empty. They are
-    /// limits of the build, not of the host, so a host whose every other
-    /// row is clean must pass `--extra-strict` — and the refusal/pass line
-    /// still names them, so nothing is hidden.
+    /// HIGH-5: the loader timing rows and `run initial-set capture` read
+    /// n/a on every host because this build's timing catalog is empty. They
+    /// are limits of the build, not of the host, so a host whose every
+    /// other row is clean must pass `--extra-strict` — and the refusal/pass
+    /// line still names them, so nothing is hidden.
     #[test]
     fn extra_strict_passes_a_capable_host_whatever_this_build_cannot_prove() {
         use crate::fixture_guard::DieWithParent as _;
@@ -4395,6 +4589,207 @@ mod tests {
         assert_eq!(
             counter_modes_footer_with_preflight(&BpfLoopVerdict::Available, None),
             counter_modes_footer(&BpfLoopVerdict::Available)
+        );
+    }
+
+    fn concise_checks() -> Vec<Check> {
+        // The failure detail deliberately names no errno: the EPERM Next
+        // step depends on privilege (see next_step_for), which the test
+        // runner's own uid must not decide.
+        vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Fail("out of memory".into()),
+            },
+            Check {
+                name: "kernel release".into(),
+                status: Status::Ok("7.0.0 (informational)".into()),
+            },
+            Check {
+                name: "kernel.yama.ptrace_scope".into(),
+                status: Status::Warn("1 — needs CAP_SYS_PTRACE".into()),
+            },
+            Check {
+                name: "run initial-set capture".into(),
+                status: Status::NotApplicable("not in this build".into()),
+            },
+            Check {
+                name: "target readability".into(),
+                status: Status::NotApplicable("no --pid".into()),
+            },
+        ]
+    }
+
+    #[test]
+    fn concise_default_shows_verdict_failures_warnings_next_and_hint() {
+        let text = render_concise(&concise_checks());
+        let first = text.lines().next().unwrap();
+        assert_eq!(first, "Doctor: requested lane unavailable.", "{text}");
+        assert!(text.contains("verdict: capture unavailable"), "{text}");
+        assert!(text.contains("BPF map create"), "{text}");
+        assert!(text.contains("FAIL"), "{text}");
+        assert!(text.contains("kernel.yama.ptrace_scope"), "{text}");
+        assert!(!text.contains("kernel release"), "{text}");
+        assert!(!text.contains("capability tier:"), "{text}");
+        assert!(!text.contains("Target:"), "{text}");
+        assert!(!text.contains("n/a"), "{text}");
+        assert!(!text.contains("target readability"), "{text}");
+        assert!(
+            text.contains("Next: review BPF map create in the checks below"),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!("{}\n", crate::cli::VERBOSE_HINT)),
+            "{text}"
+        );
+        assert!(!text.as_bytes().contains(&0x1b), "{text}");
+    }
+
+    #[test]
+    fn concise_healthy_points_at_the_capture() {
+        let checks = vec![
+            Check {
+                name: "BPF map create".into(),
+                status: Status::Ok("created".into()),
+            },
+            Check {
+                name: "target loader build".into(),
+                status: Status::Warn("unbound".into()),
+            },
+            Check {
+                name: "run initial-set capture".into(),
+                status: Status::NotApplicable("not in this build".into()),
+            },
+        ];
+        let text = render_concise(&checks);
+        assert!(
+            text.starts_with("Doctor: requested-lane checks passed.\n"),
+            "{text}"
+        );
+        assert!(text.contains("target loader build"), "{text}");
+        assert!(
+            text.contains(&format!("Next: {ACTIONABLE_NEXT}.")),
+            "{text}"
+        );
+        assert!(
+            text.ends_with(&format!("{}\n", crate::cli::VERBOSE_HINT)),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn verbose_render_keeps_every_row_and_quiet_keeps_only_doctor() {
+        let checks = concise_checks();
+        let verbose = render(&checks);
+        assert!(verbose.contains("capability tier:"), "{verbose}");
+        assert!(verbose.contains("kernel release"), "{verbose}");
+        assert!(verbose.contains("run initial-set capture"), "{verbose}");
+        assert!(verbose.contains("target readability"), "{verbose}");
+        assert!(!verbose.contains(crate::cli::VERBOSE_HINT), "{verbose}");
+        // The concise and verbose Next lines agree.
+        let next = |text: &str| {
+            text.lines()
+                .find(|line| line.starts_with("Next: "))
+                .unwrap()
+                .to_string()
+        };
+        assert_eq!(
+            next(&render_concise(&checks)),
+            next(&verbose),
+            "concise and verbose disagree"
+        );
+        assert_eq!(
+            render_quiet(&checks),
+            "Doctor: requested lane unavailable.\n"
+        );
+    }
+
+    #[test]
+    fn empty_capabilities_warn_while_a_read_failure_stays_distinct() {
+        assert_eq!(
+            capabilities_status(Ok(0)),
+            Status::Warn("none — live capture needs root".into())
+        );
+        assert_eq!(
+            capabilities_status(Err("cannot read".into())),
+            Status::Warn("cannot read".into())
+        );
+        assert!(matches!(
+            capabilities_status(Ok((1u64 << 2) | (1u64 << 19) | (1u64 << 39))),
+            Status::Ok(_)
+        ));
+    }
+
+    #[test]
+    fn build_limit_rows_read_na_and_stay_exempt_in_extra_strict() {
+        for (name, status) in [
+            (
+                "loader timing (initial_set)",
+                Status::NotApplicable("not in this build".into()),
+            ),
+            (
+                "loader timing (dlopen)",
+                Status::NotApplicable("not in this build".into()),
+            ),
+            (
+                "run initial-set capture",
+                Status::NotApplicable("not in this build".into()),
+            ),
+            (
+                "object-attribute capture",
+                Status::NotApplicable("not in this build".into()),
+            ),
+            (
+                JOURNAL_PAIR_ROW,
+                Status::NotApplicable("not in this build".into()),
+            ),
+            // The legacy warning shapes stay exempt too.
+            ("loader timing (dlopen)", Status::Warn("unproven".into())),
+            ("run initial-set capture", Status::Warn("none".into())),
+            (
+                "object-attribute capture",
+                Status::Warn(OBJECT_CAPTURE_P0.into()),
+            ),
+            (
+                JOURNAL_PAIR_ROW,
+                Status::Warn(JOURNAL_UNAVAILABLE_IN_BUILD.into()),
+            ),
+        ] {
+            let check = Check {
+                name: name.into(),
+                status,
+            };
+            assert!(is_build_limit(&check), "{check:?}");
+            assert!(
+                extra_strict_violations(std::slice::from_ref(&check)).is_empty(),
+                "{check:?}"
+            );
+        }
+        // Any other value on those rows counts as usual.
+        let future = Check {
+            name: "run initial-set capture".into(),
+            status: Status::Warn("degraded".into()),
+        };
+        assert!(!is_build_limit(&future));
+        assert_eq!(
+            extra_strict_violations(std::slice::from_ref(&future)).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn unclassified_denial_points_unprivileged_operators_at_sudo() {
+        let denied = Check {
+            name: "BPF map create".into(),
+            status: Status::Fail("Operation not permitted".into()),
+        };
+        assert_eq!(
+            next_step_for(&denied, false),
+            "run as root: sudo p11scope doctor"
+        );
+        assert_eq!(
+            next_step_for(&denied, true),
+            "denial cause is unclassified; inspect the failed operation and launcher policy before changing privileges"
         );
     }
 }

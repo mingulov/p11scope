@@ -34,6 +34,20 @@ def fail(message):
     return ERROR
 
 
+TRACE_TOTALS_RE = re.compile(
+    r"^\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.$")
+TRACE_TAIL_HINT = "run with -v for details"
+
+
+def _is_trace_tail_line(line):
+    """Whether a line past EVIDENCE is the validated human summary tail."""
+    return (
+        line == TRACE_TAIL_HINT
+        or line.startswith("coverage: ")
+        or TRACE_TOTALS_RE.match(line) is not None
+    )
+
+
 def check_profile(path, expected):
     try:
         with open(path, encoding="utf-8") as handle:
@@ -87,8 +101,14 @@ def check_trace(path, expected):
     lines = [line for line in lines if line != ""]
     if not lines or not lines[0].startswith("CAPTURE "):
         return fail(f"trace stream must open with the CAPTURE header: {path}")
-    if not lines[-1].startswith("EVIDENCE "):
-        return fail(f"trace stream must close with the EVIDENCE record: {path}")
+    evidence_at = [index for index, line in enumerate(lines)
+                   if line.startswith("EVIDENCE ")]
+    if len(evidence_at) != 1:
+        return fail(f"trace stream must carry exactly one EVIDENCE record: {path}")
+    for tail in lines[evidence_at[0] + 1:]:
+        if not _is_trace_tail_line(tail):
+            return fail(f"unrecognized trace tail line {tail!r}: {path}")
+    lines = lines[:evidence_at[0] + 1]
     count_evidence = None
     evidence = None
     for line in lines:
@@ -174,7 +194,7 @@ def self_test():
         }
 
     def trace_text(*, returned, probes=136, truncated=False, with_counts=True,
-                   with_capture=True, with_evidence=True):
+                   with_capture=True, with_evidence=True, tail=()):
         lines = []
         if with_capture:
             lines.append("CAPTURE privacy=allowlisted")
@@ -185,6 +205,7 @@ def self_test():
             lines.append(f"COUNT_EVIDENCE {json.dumps({'stats_entered': returned, 'stats_returned': returned, 'raw_calls': 1})}")
         if with_evidence:
             lines.append(f"EVIDENCE {json.dumps({'attached_probes': probes, 'completeness': 'PARTIAL', 'trace_truncated': truncated})}")
+        lines.extend(tail)
         return "\n".join(lines) + "\n"
 
     cases.append(("profile valid", "profile", json.dumps(profile_doc(calls_rows=[(["C_Initialize"], 1), (["C_GenerateRandom"], 1000)])), ["1000"], VALID))
@@ -202,6 +223,10 @@ def self_test():
     cases.append(("trace missing evidence fails", "trace", trace_text(returned=1005, with_evidence=False), ["1005"], ERROR))
     cases.append(("trace truncated fails", "trace", trace_text(returned=1005, truncated=True), ["1005"], ERROR))
     cases.append(("trace zero probes fails", "trace", trace_text(returned=1005, probes=0), ["1005"], ERROR))
+    tail = ("coverage: partial — 1 entry without an observed return", "run with -v for details")
+    cases.append(("trace human tail valid", "trace", trace_text(returned=1005, tail=("1005 completed calls; 0 returned errors; 0 entries without an observed return.", *tail)), ["1005"], VALID))
+    cases.append(("trace singular tail valid", "trace", trace_text(returned=1, tail=("1 completed call; 0 returned errors; 1 entry without an observed return.", *tail)), ["1"], VALID))
+    cases.append(("trace garbage tail fails", "trace", trace_text(returned=1005, tail=("smuggled line",)), ["1005"], ERROR))
     cases.append(("hammer two-phase valid", "hammer", "hammer OK: 1000 C_GenerateRandom calls\nhammer warm-up: 100 C_GenerateRandom calls\n", ["1000", "100"], VALID))
     cases.append(("hammer single-phase valid", "hammer", "hammer OK: 1000 C_GenerateRandom calls\n", ["1000", "0"], VALID))
     cases.append(("hammer wrong main fails", "hammer", "hammer OK: 999 C_GenerateRandom calls\n", ["1000", "0"], ERROR))

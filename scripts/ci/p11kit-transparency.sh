@@ -538,6 +538,31 @@ PY
     --layer "client:$OUT/client.pin:workload:offset" --target-identity "$OUT/client.pin" \
     --forbid "$OUT/owned.pin" --exact-only client "$LOOP_FUNCS" --forbid-unknown
   local crc=$JUDGE_RC; local c_detail="$JUDGE_DETAIL"
+  # The client is the only observation point, so its calls stay
+  # logical: the logical split must equal the client total with
+  # nothing split out. A hard gate on a trusted report only — when
+  # the client report itself failed the oracle the composite below
+  # already fails the cell.
+  if [ "$crc" = 0 ]; then
+    if ! python3 - "$cell.client.json" <<'PY'; then
+import json, sys
+doc = json.load(open(sys.argv[1]))
+rows = doc.get("functions", [])
+total = sum(row.get("calls", 0) for row in rows)
+layers = doc.get("layer_totals", {})
+logical = layers.get("logical", {}).get("calls", 0)
+forwarding = layers.get("forwarding", {}).get("calls", 0)
+marked = [row for row in rows if row.get("forwarding_layer")]
+assert forwarding == 0, "forwarding split %r, want 0" % (forwarding,)
+assert not marked, "%d rows marked forwarding_layer" % len(marked)
+assert logical == total, "logical %r != client total %r" % (logical, total)
+print("client layer split: logical %d == client total, forwarding 0" % logical)
+PY
+      terminate "$server" 2>/dev/null; rm -f -- "$sock"
+      result "$cell" 0 'client layer split broken: logical != client total or forwarding != 0' failed
+      return 1
+    fi
+  fi
 
   # Phase 2: server side. The server predates the capture, so every
   # server-side call the ledger names is post-attach and must be exact.
@@ -741,6 +766,87 @@ PY
   judge_composite "$cell" "inventory(rc=$irc): $i_detail || profile(rc=$prc): $p_detail" "$irc" "$prc"
 }
 
+# --- T9: passive inventory counts short callers at the backend (isolated) ---
+# A silent premap holder anchors the owned backend (mapping only, zero
+# calls: sleep under the premap wrapper); T9_SHORTS short ungated
+# proxy-through runs (settle 0, a fraction of a second each) are never
+# admitted, but their calls fold to module-level use. The oracle checks
+# the two exact module-use equations (entries/spy/bindings, spy pids)
+# plus drop-detection against the summed ledger and admission whole.
+# Short lives are far below the inventory pass cadence; the exact
+# equations hold or fail loud, never vacuous.
+T9_SHORTS=${T9_SHORTS:-6}
+t9() {
+  local cell=p11kit-moduleuse-system-isolated
+  rm -f -- "$cell.json" "$cell.stderr" "$cell.stdout" "$cell.spy.log" "$cell.ledger" "$cell".short*.wl
+  : > "$OUT/$cell.spy.log" && chown "$RUNUID:$RUNGID" "$OUT/$cell.spy.log" && chmod 644 "$OUT/$cell.spy.log"
+  local holder='' pp='' capturing=0 observer_rc=125
+  LD_PRELOAD=$PREMAP_SO P11KIT_PREMAPPED=$OWNED_COPY \
+    XDG_CELL=$OUT/xdg-isolated SPYLOG=$OUT/$cell.spy.log \
+    asuser sleep 90 & holder=$!; register "$holder" \
+    || { result "$cell" 0 'holder did not start' failed; return 1; }
+  sleep 2
+  "$P" inventory --system --duration 45 -o "$OUT/$cell.json" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+  # Pass 1, not lane activation: the pre-pass scan links no uprobes yet, so
+  # calls made before the first pass completes are kernel-invisible (the
+  # spy still sees them). Shorts must run with the links live.
+  if waitfor_quiet "$cell.stderr" 'pass 1:' "$pp" "$READY_TICKS" && alive "$holder"; then
+    capturing=1
+    local i=0 ok=0
+    while [ "$i" -lt "$T9_SHORTS" ]; do
+      i=$((i+1))
+      # Subshell: asuser execs, so a foreground call would replace this shell.
+      ( XDG_CELL=$OUT/xdg-isolated SPYLOG=$OUT/$cell.spy.log \
+        asuser "$WORKLOAD" "$PROXY" "$ITERS" 0 0 - > "$cell.short$i.wl" 2>&1 ) \
+        && ok=$((ok+1))
+    done
+    if [ "$ok" != "$T9_SHORTS" ]; then
+      result "$cell" 0 "short runs: $ok/$T9_SHORTS succeeded" failed
+      terminate "$holder"; terminate "$pp"; return 1
+    fi
+  fi
+  if [ "$capturing" = 1 ]; then
+    if finish_quiet "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+  else
+    terminate "$holder"; [ -n "$pp" ] && terminate "$pp"
+    result "$cell" 0 'observer never captured' failed; return 1
+  fi
+  terminate "$holder"
+  if [ "$observer_rc" != 0 ]; then
+    result "$cell" 0 "observer exit $observer_rc" failed; return 1
+  fi
+  python3 - "$cell" "$T9_SHORTS" > "$cell.ledger" <<'PY' \
+    || { result "$cell" 0 'ledger sum failed (harness)' failed; return 1; }
+import json,sys
+cell, n = sys.argv[1], int(sys.argv[2])
+ledgers = []
+for i in range(1, n + 1):
+    lines = open('%s.short%d.wl' % (cell, i)).read().splitlines()
+    ready = [line for line in lines if line.startswith('READY pid=')]
+    payloads = [json.loads(line[7:]) for line in lines if line.startswith('LEDGER ')]
+    assert len(ready) == 1 and len(payloads) == 1, 'short %d lacks READY/LEDGER' % i
+    assert payloads[0].get('complete') is True, 'short %d ledger incomplete' % i
+    assert payloads[0].get('pid') == int(ready[0][10:]), 'short %d pid mismatch' % i
+    ledgers.append((int(ready[0][10:]), payloads[0]['functions']))
+first = ledgers[0][0]
+total = {}
+for _, funcs in ledgers:
+    for func in funcs:
+        assert func['attempts'] == func['successful'] > 0, 'short had failed calls'
+        total[func['name']] = total.get(func['name'], 0) + func['successful']
+print('READY pid=%d' % first)
+print('LEDGER ' + json.dumps({'schema': 'p11scope/p11kit-ledger/v1', 'pid': first,
+      'complete': True, 'functions': [{'name': name, 'attempts': count, 'successful': count}
+      for name, count in sorted(total.items())]}))
+PY
+  judge_inventory_capture "$cell" "$cell.json" -- \
+    --expect-admitted "$OUT/owned.pin:$T6_OWNED_ENDPOINTS" \
+    --expect-module-use "$OUT/owned.pin" \
+    --ledger "$cell.ledger" --spy "$OUT/$cell.spy.log" \
+    --bindings "$T9_SHORTS"
+  judge_composite "$cell" "$JUDGE_DETAIL" "$JUDGE_RC"
+}
+
 # --- T4: run --pause auto through the proxy, isolated config ---
 t4() {
   local cell=p11kit-proxy-run
@@ -777,7 +883,7 @@ t4() {
 # and no table is decoded), so the spy is exact-or-covered whole. The layer
 # still fails on phantom spy counts or an exact claim over missing spy calls.
 
-ALL_CELLS=(p11kit-proxy-pid-isolated p11kit-proxy-pid-isolated-metrics p11kit-proxy-system-isolated p11kit-proxy-run p11kit-proxy-pid-merge p11kit-real-trust p11kit-proxy-system-merge p11kit-prearm p11kit-remote)
+ALL_CELLS=(p11kit-proxy-pid-isolated p11kit-proxy-pid-isolated-metrics p11kit-proxy-system-isolated p11kit-proxy-run p11kit-proxy-pid-merge p11kit-real-trust p11kit-proxy-system-merge p11kit-moduleuse-system-isolated p11kit-prearm p11kit-remote)
 CELL_OK=0; CELL_FAIL=0
 run_cell() {
   local cell=$1 fn=${2:-$1}
@@ -796,6 +902,7 @@ run_cell p11kit-proxy-run t4
 run_cell p11kit-proxy-pid-merge t5
 run_cell p11kit-real-trust t5b
 run_cell p11kit-proxy-system-merge t6
+run_cell p11kit-moduleuse-system-isolated t9
 run_cell p11kit-prearm t8
 run_cell p11kit-remote t7
 summary() {

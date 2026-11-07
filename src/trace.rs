@@ -204,6 +204,44 @@ pub(crate) fn format_line_with_executable(
     line
 }
 
+/// One trace line labeled with the owned run's command: the resolved
+/// spawn path p11scope executed itself, in the same quoted shape as a
+/// verified label. Used only when the identity proof has no path and
+/// the event is the child's own.
+fn format_line_with_owned(
+    ev: &Event,
+    wall_ns: u128,
+    function: &str,
+    session: Option<u64>,
+    path: &str,
+) -> String {
+    let (pid, tid) = pid_tid(ev.pid_tgid);
+    let basename = path
+        .rsplit('/')
+        .find(|part| !part.is_empty())
+        .unwrap_or(path);
+    let mut line = format!(
+        "{} {} (PID {pid}, TID {tid}) exe={}",
+        fmt_wall_time(wall_ns),
+        quote_executable(basename),
+        quote_executable(path),
+    );
+    if let Some(n) = session {
+        line.push_str(&format!(" sess#{n}"));
+    }
+    line.push_str(&format!(" {}", render::escape_controls(function)));
+    if ev.capture & capture::MECHANISM_MASK == capture::MECHANISM_VALUE {
+        line.push(' ');
+        line.push_str(&render_mechanism(ev));
+    }
+    line.push_str(&format!(
+        " \u{2192} {} {}",
+        rv_name(ev.rv),
+        render::fmt_ns(Some(ev.duration_ns))
+    ));
+    line
+}
+
 /// `LOST n events` when the ring buffer dropped anything — mandatory
 /// whenever `n > 0`; a trace that lost events must never end silently.
 /// `None` when nothing was lost, so a caller can skip printing rather
@@ -232,6 +270,42 @@ pub fn capture_line(policy: CapturePolicy) -> String {
 /// This header is human text; terminal EVIDENCE and count records stay intact.
 pub fn identity_note() -> &'static str {
     "Trace — completed call events in arrival order\nExecutable labels use verified observed paths; event PID/TID remain diagnostic identifiers."
+}
+
+/// The header note printed once, instead of a per-line marker, when the
+/// capture watches functions whose semantics are not authorized: those
+/// calls show names without decoded parameters.
+pub fn unverified_note() -> &'static str {
+    "Calls on unverified functions are not decoded (names only)."
+}
+
+/// True when the trace header must say once that unverified calls are
+/// not decoded: the plan watches an unauthorized function, or it is
+/// still empty — an owned run discovers its provider after release,
+/// and scan-found slots are never authorized, so the note errs toward
+/// disclosure.
+pub(crate) fn watches_unverified(plan: &AttachPlan) -> bool {
+    plan.slots.is_empty() || plan.slots.iter().any(|slot| !slot.semantic_authorized)
+}
+
+/// The human tail a trace ends with, after the machine-readable
+/// terminal records: totals in the profile wording, one coverage
+/// line, and the `-v` hint in default text only.
+pub(crate) fn terminal_summary(
+    calls: u64,
+    errors: u64,
+    open: u64,
+    ev: &render::Evidence,
+    verbosity: crate::cli::TextVerbosity,
+) -> Vec<String> {
+    let mut lines = vec![
+        render::totals_line(calls, errors, open),
+        render::coverage_line(ev, verbosity == crate::cli::TextVerbosity::Verbose),
+    ];
+    if verbosity == crate::cli::TextVerbosity::Concise {
+        lines.push(crate::cli::VERBOSE_HINT.to_string());
+    }
+    lines
 }
 
 /// Final machine-readable evidence record for a normally stopped trace.
@@ -315,7 +389,6 @@ struct TraceSlot {
     /// `plan::presented_label`: names, or `unknown#<ordinal>` when unnamed.
     label: String,
     semantics: p11scope_ebpf_common::SlotSemantics,
-    semantic_authorized: bool,
 }
 
 fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
@@ -328,7 +401,6 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
         slots[index] = Some(TraceSlot {
             label: plan.label_of(slot),
             semantics: plan.effective_semantics(slot),
-            semantic_authorized: slot.semantic_authorized,
         });
     }
     slots
@@ -343,6 +415,10 @@ pub struct Tracer {
     /// the kernel clock exactly; only the anchor itself carries the
     /// small, constant "poll processing lag" of the first event.
     anchor: Option<(u64, u128)>,
+    /// The owned run's child pid and resolved spawn path, naming lines
+    /// the identity proof cannot resolve. Set for owned runs only, and
+    /// applied to the child's own pid only — never to another process.
+    owned: Option<(u32, String)>,
 }
 
 impl Tracer {
@@ -351,7 +427,16 @@ impl Tracer {
             slots: trace_slots(plan),
             raw_calls: 0,
             anchor: None,
+            owned: None,
         }
+    }
+
+    /// Names the owned run's command on lines the identity proof
+    /// cannot resolve. `path` is the canonical spawn path p11scope
+    /// resolved and executed itself — first-hand, never observed —
+    /// and only the child's own pid is labeled with it.
+    pub fn set_owned_command(&mut self, pid: u32, path: String) {
+        self.owned = Some((pid, path));
     }
 
     /// Replaces the minimal display metadata from the same plan snapshot that
@@ -401,20 +486,28 @@ impl Tracer {
         let mut raw = *ev;
         raw.capture = 0;
         let wall = self.wall_ns_for(ev.ts_ns);
-        format_line(&raw, wall, &self.qualified_function(ev.slot), None)
+        let function = self.qualified_function(ev.slot);
+        if let Some(path) = self.owned_label(ev) {
+            return format_line_with_owned(&raw, wall, &function, None, path);
+        }
+        format_line(&raw, wall, &function, None)
     }
 
     fn qualified_function(&self, index: u32) -> String {
-        let mut function = function_name(&self.slots, index);
-        if self
-            .slots
-            .get(index as usize)
-            .and_then(Option::as_ref)
-            .is_some_and(|slot| !slot.semantic_authorized)
-        {
-            function.push_str(" [semantics unverified]");
-        }
-        function
+        // No per-line marker: the header note says once that unverified
+        // calls are not decoded, and the terminal evidence counts them.
+        function_name(&self.slots, index)
+    }
+
+    /// The owned command's spawn path for this event, when the run is
+    /// owned and the event is the child's own — otherwise `None`, and
+    /// the line stays unknown rather than mislabeled.
+    fn owned_label(&self, ev: &Event) -> Option<&str> {
+        let (pid, _) = pid_tid(ev.pid_tgid);
+        self.owned
+            .as_ref()
+            .filter(|(owned_pid, _)| *owned_pid == pid)
+            .map(|(_, path)| path.as_str())
     }
 
     pub fn on_event_process(
@@ -462,6 +555,11 @@ impl Tracer {
         let mut rendered = *ev;
         if !semantic {
             rendered.capture = 0;
+        }
+        if executable.path().is_none()
+            && let Some(path) = self.owned_label(ev)
+        {
+            return format_line_with_owned(&rendered, wall_ns, &function, session, path);
         }
         format_line_with_executable(&rendered, wall_ns, &function, session, executable)
     }
@@ -968,6 +1066,7 @@ mod tests {
             pause_confirmed: 0,
             pause_partial: 0,
             pause_unavailable: 0,
+            pause_engine_incomplete_retirements: 0,
             child_still_running: None,
             discovery_ring_loss: 0,
             discovery_state_failures: 0,
@@ -1281,7 +1380,7 @@ mod tests {
 
         assert_eq!(
             line,
-            "00:00:00.000000 Unknown executable (PID 100, TID 1) C_OpenSession [semantics unverified] → CKR_OK 18.0µs"
+            "00:00:00.000000 Unknown executable (PID 100, TID 1) C_OpenSession → CKR_OK 18.0µs"
         );
         for forbidden in [
             "sess#",
@@ -1420,5 +1519,77 @@ mod tests {
             explicit.contains("--max-events 5"),
             "explicit cap must cite the flag: {explicit:?}"
         );
+    }
+
+    /// CLI text: an owned run names its command on lines the identity
+    /// proof cannot resolve, with the resolved spawn path; any other
+    /// process stays unknown rather than mislabeled.
+    #[test]
+    fn owned_command_names_unknown_executable_lines() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.anchor = Some((0, 0));
+        tracer.set_owned_command(100, "/usr/bin/pkcs11-tool".to_string());
+        let line = tracer.on_event(&open_event(100, 0xdead_beef), &mut state);
+        assert!(
+            line.contains("\"pkcs11-tool\" (PID 100, TID 1) exe=\"/usr/bin/pkcs11-tool\""),
+            "{line}"
+        );
+        assert!(!line.contains("Unknown executable"), "{line}");
+        let foreign = tracer.on_event(&open_event(200, 0xdead_beef), &mut state);
+        assert!(foreign.contains("Unknown executable"), "{foreign}");
+    }
+
+    /// CLI text: no per-line semantics marker; the header note says
+    /// once that unverified calls are not decoded.
+    #[test]
+    fn trace_lines_carry_no_per_line_semantics_marker() {
+        let mut plan = test_plan();
+        plan.slots[0].semantic_authorized = false;
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.anchor = Some((0, 0));
+        let line = tracer.on_event(&open_event(100, 0xdead_beef), &mut state);
+        assert!(line.contains("C_OpenSession"), "{line}");
+        assert!(!line.contains("[semantics unverified]"), "{line}");
+        assert!(
+            unverified_note().contains("not decoded"),
+            "{}",
+            unverified_note()
+        );
+        assert!(watches_unverified(&plan));
+        assert!(!watches_unverified(&test_plan()));
+        assert!(watches_unverified(&AttachPlan::from_slots(vec![])));
+    }
+
+    /// CLI text: the trace tail reports totals, one coverage line, and
+    /// the `-v` hint in default text; verbose pairs machine names and
+    /// drops the hint, quiet drops the hint.
+    #[test]
+    fn terminal_summary_reports_totals_coverage_and_hint() {
+        let mut ev = crate::render::tests::evidence();
+        ev.event_loss = 1;
+        ev.verdict();
+        let concise = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise);
+        assert_eq!(
+            concise,
+            vec![
+                "19 completed calls; 0 returned errors; 0 entries without an observed return."
+                    .to_string(),
+                "coverage: partial — calls may be missing (1 call record lost)".to_string(),
+                crate::cli::VERBOSE_HINT.to_string(),
+            ]
+        );
+        let verbose = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose);
+        assert_eq!(verbose.len(), 2);
+        assert!(verbose[1].contains("(event_loss)"), "{verbose:?}");
+        assert!(
+            !verbose.iter().any(|line| line.contains("-v")),
+            "{verbose:?}"
+        );
+        let quiet = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet);
+        assert_eq!(quiet.len(), 2);
+        assert!(!quiet[1].contains("event_loss"), "{quiet:?}");
     }
 }

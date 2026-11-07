@@ -1482,6 +1482,7 @@ pub(crate) mod tests {
                 },
                 key,
                 path,
+                tables_scan_finished: false,
                 decoder_abi: Some(ElfAbi::Lp64),
                 exports: vec!["C_GetFunctionList".into()],
                 tables: vec![ScannedTable {

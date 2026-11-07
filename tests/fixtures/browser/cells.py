@@ -240,12 +240,16 @@ def wait_for_mapping(pid: int, needles: tuple[str, ...], timeout_seconds: float 
 
 
 def _parse_capture_ready(line: str) -> int | None:
-    """Parse ``p11scope: capturing: N probe(s) attached``; None otherwise."""
+    """Parse ``p11scope: capturing: N probe`` / ``N probes attached``; None otherwise."""
     prefix = "p11scope: capturing: "
     if not line.startswith(prefix):
         return None
+    head = line[len(prefix):].split(" attached", 1)[0]
+    count_text, space, unit = head.rpartition(" ")
+    if not space or unit not in ("probe", "probes"):
+        return None
     try:
-        return int(line[len(prefix):].split(" probe(s) attached", 1)[0])
+        return int(count_text)
     except ValueError:
         return None
 
@@ -438,12 +442,18 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
                            extra_browser_args: tuple[str, ...] = (),
                            extra_prefs: dict | None = None,
                            flow_url: str = "",
-                           auto_select_cert: bool = True):
+                           auto_select_cert: bool = True,
+                           nss_credential=None,
+                           nss_nickname: str = "g33-nss-client"):
     """Launch a persistent Playwright context on a fresh profile.
 
     Returns ``(context, match, profile_path)``: the context, the
     command-line match resolving the main browser PID, and the fresh
     Firefox profile (or Chromium HOME) carrying the registration.
+    ``nss_credential`` (a ``softhsm.ClientCredential``) seeds the
+    browser's own empty-password NSS database with a usable client
+    key before launch (DEMO-4), so the browser signs with its own
+    softokn token and no PIN prompt can stall the handshake.
     """
     if browser == "firefox":
         ff_prefs = {"security.default_personal_cert": "Select Automatically"}
@@ -451,6 +461,10 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         profile = FirefoxProfile.create(
             workdir / "ffprofile", module_lib=register_module,
             prefs=ff_prefs)
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                profile.path, nss_credential, nss_nickname)
         # Explicit environment: the Playwright driver keeps the environment
         # it inherited at startup, so anything set afterwards (notably the
         # fresh Chromium HOME below) must ride `env=` to reach the browser.
@@ -460,11 +474,32 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         return context, str(profile.path), profile.path
     elif browser == "chromium":
         home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
+        if nss_credential is not None:
+            from profiles import seed_nss_client_credential
+            seed_nss_client_credential(
+                home / ".pki" / "nssdb", nss_credential, nss_nickname)
         browser_env = dict(os.environ)
         browser_env["HOME"] = str(home)
         cr_args = list(extra_browser_args)
         if auto_select_cert:
-            cr_args.append(f"--auto-select-certificate-for-urls={flow_url}")
+            # Chrome for Testing 156 removed the
+            # --auto-select-certificate-for-urls switch; cert
+            # auto-selection comes only from the managed policy
+            # under /etc/opt/chrome_for_testing/policies (fedora
+            # certprobe15/16). Install it for this launch and
+            # register its removal at process exit.
+            import atexit
+
+            from profiles import (
+                chrome_auto_select_patterns,
+                install_chrome_auto_select_policy,
+                remove_chrome_auto_select_policy,
+            )
+            installed = install_chrome_auto_select_policy(
+                chrome_auto_select_patterns(flow_url),
+                f"g33-{os.getpid()}",
+                workdir)
+            atexit.register(remove_chrome_auto_select_policy, installed)
         context = pw.chromium.launch_persistent_context(
             str(workdir / "crprofile"), channel="chromium",
             headless=True, ignore_https_errors=True,

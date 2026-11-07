@@ -2918,7 +2918,7 @@ fn k1_production_guard_retry(
     key: ObjectKey,
     maps: &dyn Fn() -> Vec<MapEntry>,
 ) -> Result<(Result<(), String>, u64, u32), String> {
-    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
     let mut total = 0u64;
     for attempt in 1..=3u32 {
         let live = maps();
@@ -2933,7 +2933,7 @@ fn k1_production_guard_retry(
             ));
         }
         let retry =
-            matches!(&result, Err(reason) if reason == GAP_WITNESS_UNAVAILABLE) && attempt < 3;
+            matches!(&result, Err(reason) if witness_unavailable_refusal(reason)) && attempt < 3;
         if retry {
             eprintln!("K1_DEEP_SCAN {label} attempt {attempt}: transient unavailable, retrying");
             continue;
@@ -3120,7 +3120,7 @@ fn privileged_k1_deep_scan_fresh_upper_joins() {
 /// One fresh-upper row over a fresh fixture.
 fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Result<(), String> {
     use crate::discovery::overlay_witness::{
-        GAP_WITNESS_UNAVAILABLE, original_file_witness_required,
+        original_file_witness_required, witness_unavailable_refusal,
     };
     eprintln!("K1_DEEP_SCAN start mode={mode:?} row=fresh-upper lane={lane:?}");
     let fixture = OverlayFixture::mount(work, mode)?;
@@ -3202,7 +3202,7 @@ fn k1_fresh_row(work: &std::path::Path, mode: XinoMode, lane: OverlayLane) -> Re
                 "k1 fresh: guard refused the fresh upper: {reason:?}"
             ));
         }
-        (false, Err(reason)) if reason == GAP_WITNESS_UNAVAILABLE => {}
+        (false, Err(reason)) if witness_unavailable_refusal(&reason) => {}
         (false, other) => {
             return Err(format!(
                 "k1 fresh without the kernel proof must refuse unavailable: {other:?}"
@@ -3340,7 +3340,7 @@ fn privileged_k1_same_key_twice_proves() {
 /// steps over the same key, each with the fresh scan state a later
 /// pass would carry.
 fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), String> {
-    use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+    use crate::discovery::overlay_witness::witness_unavailable_refusal;
     eprintln!("K1_DEEP_SCAN start mode={mode:?} row=same-key-twice");
     let fixture = OverlayFixture::mount(work, mode)?;
     std::fs::write(fixture.lower_path("lib.so"), vec![0xE2u8; 8192])
@@ -3386,7 +3386,7 @@ fn k1_same_key_twice_row(work: &std::path::Path, mode: XinoMode) -> Result<(), S
                     "k1 twice pass {pass}: guard refused the fresh upper: {reason:?}"
                 ));
             }
-            (false, Err(reason)) if reason == GAP_WITNESS_UNAVAILABLE => {}
+            (false, Err(reason)) if witness_unavailable_refusal(&reason) => {}
             (false, other) => {
                 return Err(format!(
                     "k1 twice pass {pass} without the kernel proof must refuse unavailable: {other:?}"
@@ -3557,6 +3557,225 @@ fn privileged_k1_sweep_witness_fresh_joins_stale_refuses() {
     eprintln!(
         "K1_SWEEP_WITNESS lane={lane:?} modes=on,off,same-fs verdict=join-fresh-refuse-stale"
     );
+}
+
+/// R1 no-route collect cell (privileged): over real loop-overlay
+/// fixtures with SoftHSM as the provider, `collect_system_with_identity`
+/// (Auto + scripted no-kernel checks) runs twice plus one single-shot
+/// `collect()`. The fresh-upper child joins, the stale-lower child
+/// refuses, and the shared witness window advances by the spent sweep
+/// queries. Lane B asserts the sweep witness ran (spent>0); lane A
+/// takes the legacy stale refusal without one.
+#[test]
+#[ignore = "root: loop overlay mounts drive the no-route collect cell"]
+fn privileged_k1_no_route_collect_system_witness() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    crate::attach::identity_iter::ensure_kernel_identity_btf()
+        .expect("required kernel identity capability; refusal cannot qualify");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        k1_no_route_collect_row(work.path(), mode, lane)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "K1_NO_ROUTE_COLLECT lane={lane:?} modes=on,off,same-fs verdict=join-fresh-refuse-stale"
+    );
+}
+
+/// One no-route collect row over a fresh fixture.
+fn k1_no_route_collect_row(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+) -> Result<(), String> {
+    use crate::discovery::overlay_witness::witness_stats_for_test;
+    eprintln!("K1_NO_ROUTE_COLLECT start mode={mode:?} lane={lane:?}");
+    let fixture = OverlayFixture::mount(work, mode)?;
+    let provider = k1_no_route_provider_path()?;
+    std::fs::copy(&provider, fixture.lower_path("lib.so"))
+        .map_err(|error| format!("k1 no-route provider copy: {error}"))?;
+    let _xino = fixture.xino_verdict("lib.so")?;
+    let merged = fixture.merged_path("lib.so");
+    // Stale maps before the copy-up and keeps running the lower file.
+    let stale = SwapChild::spawn(&merged);
+    let stale_pid = stale.pid as u32;
+    k1_no_route_copy_up_append(&merged, &fixture.upper_path("lib.so"))?;
+    // Fresh maps the current upper file after the copy-up.
+    let fresh = SwapChild::spawn(&merged);
+    let fresh_pid = fresh.pid as u32;
+    // Auto with scripted no-kernel checks: cheap numbering refusal, so
+    // every pass with proof demand takes the no-route witness path and
+    // never attempts a session load.
+    let checks = crate::inspect_system::ScriptedIdentityChecks::refuse(
+        crate::inspect_system::IdentityUnavailable::NumberingMismatch,
+    );
+    let shared = std::sync::Arc::new(std::sync::Mutex::new(
+        crate::inspect_system::IdentityRunShared::new(
+            crate::cli::IdentityBackendSelection::Auto,
+            Box::new(checks),
+        ),
+    ));
+    let policy = crate::plan::AdmissionPolicy::inventory(
+        crate::capacity::InventoryBudget::new(4096, 4096 * 8)
+            .map_err(|error| format!("k1 no-route inventory budget: {error:?}"))?,
+    );
+    let hooks = crate::discovery::hooks::HookRegistry::builtin();
+    // Fresh-first selection with every pid except fresh already
+    // scanned: the fixture group (holding the only never-scanned pid)
+    // is picked first, and its representative is fresh (stale counts
+    // as scanned). Fresh deep-scans (pinning the provider), stale
+    // sweeps (needing the witness on lane B). Rebuilt per pass from a
+    // live enumeration so pid churn cannot strand the selection.
+    let scanned_for_fresh = || {
+        let (pids, _) = crate::discovery::engine::scope_pids(&crate::attach::Scope::System);
+        pids.into_iter().filter(|pid| *pid != fresh_pid).collect()
+    };
+    let window_of = || {
+        shared
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .witness_window_for_test()
+    };
+    assert_eq!(window_of(), (0, 0));
+    let catalog_of = |pid: u32, catalog: &crate::inspect_system::Catalog| {
+        catalog
+            .processes
+            .iter()
+            .find(|process| process.pid == pid)
+            .map(|process| (process.objects.len(), format!("{:?}", process.status)))
+    };
+    for pass in [1, 2] {
+        let (queries_before, _) = witness_stats_for_test();
+        let scanned: BTreeSet<u32> = scanned_for_fresh();
+        let catalog = crate::inspect_system::collect_system_with_identity(
+            &[],
+            &hooks,
+            Some(1),
+            policy,
+            shared.clone(),
+            crate::discovery::scan::CaptureWorkBudget::default(),
+            &scanned,
+            &[],
+            0,
+            0,
+        )
+        .map_err(|error| format!("k1 no-route collect_system pass {pass}: {error:#}"))?;
+        let (queries_after, _) = witness_stats_for_test();
+        let (fresh_objects, fresh_status) = catalog_of(fresh_pid, &catalog)
+            .ok_or_else(|| format!("k1 no-route pass {pass}: fresh pid missing"))?;
+        let (stale_objects, stale_status) = catalog_of(stale_pid, &catalog)
+            .ok_or_else(|| format!("k1 no-route pass {pass}: stale pid missing"))?;
+        if fresh_objects == 0 {
+            return Err(format!(
+                "k1 no-route pass {pass}: fresh-upper must join, got {fresh_status}"
+            ));
+        }
+        if stale_objects != 0 {
+            return Err(format!(
+                "k1 no-route pass {pass}: stale-lower must refuse, got {stale_status}"
+            ));
+        }
+        if lane == OverlayLane::B {
+            if queries_after <= queries_before {
+                return Err(format!(
+                    "k1 no-route pass {pass}: witness must run on lane B"
+                ));
+            }
+            let (start, denominator) = window_of();
+            if start != pass as u64 || denominator != 1 {
+                return Err(format!(
+                    "k1 no-route pass {pass}: window must advance by spent, got ({start}, {denominator})"
+                ));
+            }
+        }
+        eprintln!(
+            "K1_NO_ROUTE_COLLECT mode={mode:?} pass={pass} fresh-objects={fresh_objects} \
+             stale-objects={stale_objects} queries={} window={:?}",
+            queries_after - queries_before,
+            window_of(),
+        );
+    }
+    // Single-shot collect() proves its sweep overlays through the same
+    // no-route witness budget.
+    let (single_before, _) = witness_stats_for_test();
+    let single_scanned: BTreeSet<u32> = scanned_for_fresh();
+    let single = crate::inspect_system::collect(&[], &[], &hooks, Some(1), policy, &single_scanned)
+        .map_err(|error| format!("k1 no-route single-shot collect: {error:#}"))?;
+    let (single_after, _) = witness_stats_for_test();
+    let (fresh_objects, fresh_status) =
+        catalog_of(fresh_pid, &single).ok_or("k1 no-route single-shot: fresh pid missing")?;
+    let (stale_objects, stale_status) =
+        catalog_of(stale_pid, &single).ok_or("k1 no-route single-shot: stale pid missing")?;
+    if fresh_objects == 0 {
+        return Err(format!(
+            "k1 no-route single-shot: fresh-upper must join, got {fresh_status}"
+        ));
+    }
+    if stale_objects != 0 {
+        return Err(format!(
+            "k1 no-route single-shot: stale-lower must refuse, got {stale_status}"
+        ));
+    }
+    if lane == OverlayLane::B && single_after - single_before < 2 {
+        return Err(
+            "k1 no-route single-shot: deep-scan and sweep witnesses must run on lane B".into(),
+        );
+    }
+    eprintln!(
+        "K1_NO_ROUTE_COLLECT mode={mode:?} single-shot fresh-objects={fresh_objects} \
+         stale-objects={stale_objects} queries={}",
+        single_after - single_before,
+    );
+    Ok(())
+}
+
+/// SoftHSM provider bytes for the no-route collect fixture, probed
+/// across distributions (never hard-coded to one path).
+fn k1_no_route_provider_path() -> Result<String, String> {
+    for candidate in [
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+    ] {
+        if std::path::Path::new(candidate).exists() {
+            return Ok(candidate.to_string());
+        }
+    }
+    Err("k1 no-route: SoftHSM2 provider is missing (tried Debian, Ubuntu and Fedora paths)".into())
+}
+
+/// Trigger a copy-up by appending one byte to the merged file. The
+/// provider stays a valid ELF (trailing bytes are ignored), unlike an
+/// in-place overwrite of the header.
+fn k1_no_route_copy_up_append(
+    merged: &std::path::Path,
+    upper: &std::path::Path,
+) -> Result<(), String> {
+    use std::io::Write as _;
+    let before =
+        std::fs::read(merged).map_err(|error| format!("k1 no-route copy-up read: {error}"))?;
+    {
+        let mut writer = std::fs::OpenOptions::new()
+            .append(true)
+            .open(merged)
+            .map_err(|error| format!("k1 no-route copy-up open: {error}"))?;
+        writer
+            .write_all(b"X")
+            .map_err(|error| format!("k1 no-route copy-up write: {error}"))?;
+    }
+    if !upper.exists() {
+        return Err(format!(
+            "k1 no-route copy-up did not materialize {}",
+            upper.display()
+        ));
+    }
+    let after =
+        std::fs::read(merged).map_err(|error| format!("k1 no-route copy-up reread: {error}"))?;
+    if after.len() != before.len() + 1 || after[..before.len()] != before[..] {
+        return Err("k1 no-route copy-up did not append exactly one byte".into());
+    }
+    Ok(())
 }
 
 /// One install-and-sweep round over the witnessed fixture: admit the held

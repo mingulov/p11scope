@@ -441,6 +441,29 @@ class TraceParseTests(unittest.TestCase):
         self.assertTrue(any("mystery" in error for error in parsed["errors"]),
                         parsed["errors"])
 
+    def test_header_note_and_human_tail_are_accepted(self):
+        sweep = require_sweep(self)
+        for totals in ("2 completed calls; 0 returned errors; 0 entries without an observed return.",
+                       "1 completed call; 1 returned error; 1 entry without an observed return."):
+            with self.subTest(totals=totals):
+                text = (TRACE_HEAD
+                        + "Calls on unverified functions are not decoded (names only).\n"
+                        + trace_row() + trace_tail()
+                        + totals + "\n"
+                        + "coverage: partial — 1 entry without an observed return\n"
+                        + "run with -v for details\n")
+                parsed = sweep.parse_trace(text)
+                self.assertEqual(parsed["errors"], [])
+
+    def test_trailing_garbage_after_evidence_is_still_an_error(self):
+        sweep = require_sweep(self)
+        text = (healthy_trace()
+                + "2 completed calls; 0 returned errors; 0 entries without an observed return.\n"
+                + "smuggled line\n")
+        parsed = sweep.parse_trace(text)
+        self.assertTrue(any("smuggled" in error for error in parsed["errors"]),
+                        parsed["errors"])
+
     def test_lost_and_truncated_lines_are_errors(self):
         sweep = require_sweep(self)
         parsed = sweep.parse_trace(TRACE_HEAD + "LOST 2 events\n"

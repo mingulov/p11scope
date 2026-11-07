@@ -779,11 +779,13 @@ fn man1_e2e_inner(workload: &E2eWorkload, module: &str, observer: &Path) -> Resu
 // Scale cell: --system --manifest over 4,097+ endpoints, finite S1 stop.
 // ---------------------------------------------------------------------------
 
-/// Scale target: one endpoint past the default 4,096 inventory budget,
-/// so the run must carry `--max-endpoints` and the admission is real.
-/// `P11SCOPE_SCALE2_TARGET` overrides it up to the 8,192 inventory
-/// ceiling for the controller's full-scale run; anything below the
-/// default or above the ceiling is refused.
+/// Scale target: an explicit-budget 4,097-endpoint scale cell (the run
+/// carries `--max-endpoints`, so the admission is real). Under the raised
+/// inventory budget this is no longer past the product default;
+/// `P11SCOPE_SCALE2_TARGET` overrides the target up to the 8,192 helper
+/// cap for the controller's full-scale run. That cap is a fixture-cost
+/// cap (`SCALE_MAX_COPIES=140`, about 9.5K endpoints max), not the
+/// 131,072 product ceiling; anything outside 4,097..=8,192 is refused.
 const SCALE_TARGET_ENDPOINTS: u64 = 4097;
 const SCALE_MAX_TARGET: u64 = 8192;
 

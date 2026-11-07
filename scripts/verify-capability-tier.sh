@@ -300,9 +300,9 @@ run_row() {
             printf 'uid_gid='; id
             printf 'capabilities='; grep '^Cap' /proc/self/status
             printf 'capsh='; capsh --print
-            printf 'command=%s\\n' '$BIN doctor --pid $TARGET_PID'
+            printf 'command=%s\\n' '$BIN doctor -v --pid $TARGET_PID'
         } >> '$meta'
-        exec '$BIN' doctor --pid '$TARGET_PID'" >"$out" 2>"$stderr"
+        exec '$BIN' doctor -v --pid '$TARGET_PID'" >"$out" 2>"$stderr"
     status=$?
     set -e
     row_metadata "$label" "exit_status=$status"

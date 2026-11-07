@@ -2070,3 +2070,20 @@ fn preview_reuses_worker_proof_ranges() {
     assert!(out.members.len() > 10, "the confirm arm must run: {out:?}");
     assert_eq!(recomputes, 0, "preview must reuse worker proof ranges");
 }
+
+#[test]
+fn witness_window_covers_its_budget() {
+    // RED: the per-pass witness window covers one budget of
+    // consecutive refused candidates, whatever the budget is.
+    for index in 0..300usize {
+        assert!(
+            super::witness_window_member(index, 0, 300, 1024),
+            "a no-route budget covers every refused candidate: {index}"
+        );
+        assert_eq!(
+            super::witness_window_member(index, 0, 300, 8),
+            index < 8,
+            "the kernel-pass budget still covers exactly eight: {index}"
+        );
+    }
+}

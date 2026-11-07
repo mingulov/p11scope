@@ -117,6 +117,23 @@ def doc_template(doc, name_part):
     return None
 
 
+def doc_layers(doc):
+    layers = doc.get("layer_totals", {})
+    logical = layers.get("logical", {}).get("calls", 0)
+    forwarding = layers.get("forwarding", {}).get("calls", 0)
+    return logical, forwarding
+
+
+def check_remote_layers(doc, total):
+    # The remote client is the only observation point, so its calls
+    # stay logical: the logical split must equal the client total
+    # with nothing split out.
+    logical, forwarding = doc_layers(doc)
+    require(logical == total and forwarding == 0,
+            "remote layer split %r/%r != client total %d"
+            % (logical, forwarding, total))
+
+
 def self_test():
     doc = {
         "functions": [
@@ -140,6 +157,12 @@ def self_test():
     require(multi == [1, 3, 39], "multiset %r" % (multi,))
     require(doc_template(doc, "p11-kit-client.so") == (4, 66), "template parse")
     require(doc_template(doc, "libnope.so") is None, "template miss")
+    layered = dict(
+        doc,
+        layer_totals={"logical": {"calls": 43}, "forwarding": {"calls": 0}},
+    )
+    require(doc_layers(layered) == (43, 0), "layer parse")
+    check_remote_layers(layered, 43)
     # The oracle relation: remote is direct minus exactly one singleton.
     direct = [1, 1, 2, 3, 39]
     remote = [1, 2, 3, 39]
@@ -298,6 +321,9 @@ def main(binary, work, keep):
                 % (direct_multi, remote_multi))
         print("remote is direct minus C_GetFunctionList: the client entry point "
               "is served from its own code, never a closure slot")
+        check_remote_layers(remote_doc, remote_total)
+        print("remote layer split: logical %d == client total, forwarding 0"
+              % remote_total)
 
         # Twin 1: provider + closure array together. The closure shape is
         # recorded, not pinned: a `run` capture maps the closure

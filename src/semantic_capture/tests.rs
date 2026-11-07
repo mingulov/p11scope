@@ -1978,6 +1978,102 @@ fn joint_raw_negative_preserves_sealed_domain_loss_effects() {
     assert_eq!(owner.ledger().census(), settled_census);
 }
 
+/// A raw quantum disposed before any journal key exists (the process's
+/// own calls arriving while it is still unbound, as with a browser
+/// launched right after the observer) must not refuse that process's
+/// image forever: nothing is provably another caller's against an empty
+/// binding set. The disposed interval is still lost (a named failure
+/// rides the disposition), but the image itself is not tainted, so the
+/// binding that arrives later can still enter Joint above the fence.
+#[test]
+fn joint_pre_key_raw_disposal_does_not_taint_the_callers_own_image() {
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawDisposeReason};
+
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (_report, admitted) = harness.route(&mut raw);
+    let image = (
+        harness.io.current_image.task_cookie,
+        harness.io.current_image.exec_id,
+    );
+    let mut owner = JointCaptureOwner::from_existing_parts_for_test(
+        harness.adapter,
+        crate::semantics_objects::ObjectSemantics::new(),
+    );
+    let negative = raw
+        .dispose_without_ingest(
+            &mut owner,
+            &harness.producers,
+            RawDisposeReason::NoAdmission,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("pre-key disposition: {reason:?}"));
+    assert!(
+        negative.failure().is_some(),
+        "the disposed affecting original is still a named loss, never hidden"
+    );
+    assert!(
+        owner.adapter().voids_through_for_test(negative.frontier()),
+        "the disposed interval is fenced: no later seal can certify across it"
+    );
+    assert!(
+        !owner.adapter().image_tainted_for_test(image),
+        "no binding existed to prove this image another caller's"
+    );
+    assert!(
+        !owner.adapter().image_sighted_for_test(image),
+        "records disposed before any key existed are fenced loss, not a \
+         sighting the later exec birth must answer for"
+    );
+    assert!(
+        owner.adapter_mut().bind_admitted_key(&admitted).is_ok(),
+        "the later binding of the same process is not refused"
+    );
+}
+
+/// Twin: once a journal key exists, a NoAdmission disposal keeps its
+/// localized loss semantics — the disposed image is tainted and a later
+/// bind of it refuses. The pre-key fence above must not broaden into
+/// forgiving disposed affecting records under a live binding set.
+#[test]
+fn joint_raw_disposal_with_a_bound_key_still_taints_the_disposed_image() {
+    use crate::semantics_objects::journal::AttestationRefusal;
+    use crate::semantics_objects::journal::joint_driver::{JointCaptureOwner, RawDisposeReason};
+
+    let mut harness = JointBirthHarness::new();
+    harness.push_create(1);
+    let mut raw = harness.collect();
+    let (_report, admitted) = harness.route(&mut raw);
+    let (_collection, _proof) = harness.ingest(raw, &admitted);
+    harness.push_create(2);
+    let mut raw = harness.collect();
+    let (_report, next_admitted) = harness.route(&mut raw);
+    let image = (
+        harness.io.current_image.task_cookie,
+        harness.io.current_image.exec_id,
+    );
+    let mut owner = JointCaptureOwner::from_existing_parts_for_test(
+        harness.adapter,
+        crate::semantics_objects::ObjectSemantics::new(),
+    );
+    let negative = raw
+        .dispose_without_ingest(
+            &mut owner,
+            &harness.producers,
+            RawDisposeReason::NoAdmission,
+        )
+        .unwrap_or_else(|(_, reason)| panic!("bound disposition: {reason:?}"));
+    assert!(negative.failure().is_some(), "the loss stays named");
+    assert!(
+        owner.adapter().image_tainted_for_test(image),
+        "a live binding set keeps the localized refusal"
+    );
+    assert_eq!(
+        owner.adapter_mut().bind_admitted_key(&next_admitted),
+        Err(AttestationRefusal::ImageTainted)
+    );
+}
+
 #[test]
 fn joint_unlocalized_raw_loss_retains_all_sealed_domains_and_effects() {
     use crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild;
@@ -2200,8 +2296,9 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
     );
     // This already-present provider has no committed absence or later
     // appearance. The native probe can return freshness evidence only.
+    // Generation 0: the task predates the closure.
     let publisher = NativePublisher::build();
-    let (row, control, _) = publisher.publish(&["0", "0", "0", "0", "1"]);
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "0", "0", "1"], 0);
     let mut rows = NativeBirthRows { row, control };
     let binding = crate::attach::BirthAdmissionBinding::from_admitted(&admitted);
     crate::attach::observe_retained_birth(
@@ -2232,12 +2329,16 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
         &harness.adapter,
         &mut rows,
     );
-    assert!(
-        matches!(
-            birth,
-            Err(crate::attach::BirthObservationRefusal::MarkerNotReady)
-        ),
-        "native freshness and a quiet stream cut cannot replace a committed absence and actual new appearance"
+    // DEMO-4 contract change: freshness still cannot authorize an
+    // absence (or exec) birth — the already-present provider instead
+    // births as attach-observed, which claims nothing before its
+    // cut. (Previously this refused MarkerNotReady and the feed
+    // stayed S1Only for the whole capture.)
+    let birth = birth.expect("attach-observed birth for the already-present provider");
+    assert_eq!(
+        birth.receipt().birth(),
+        BirthKind::AttachObserved,
+        "native freshness and a quiet stream cut authorize no absence or exec claim"
     );
     harness.push_ordinary(ImageIdentity::default());
     let mut quiet = harness.collect();
@@ -2254,6 +2355,56 @@ fn joint_native_freshness_alone_cannot_authorize_absence_birth() {
     );
     quiet.classify_ordinary(&admitted).unwrap();
     harness.ingest(quiet, &admitted);
+}
+
+/// DEMO-4 late attach at the H0 seam: the same already-present
+/// provider whose exec-marker birth refuses above (unpublished
+/// marker, no committed absence) births as attach-observed from
+/// its first New candidate — the witness proves custody, image
+/// and cut under the live closure, and claims nothing before the
+/// cut. ExecMarker observation itself still refuses closed (the
+/// twins around this test pin that).
+#[test]
+fn joint_attach_birth_for_already_present_provider() {
+    use crate::semantics_objects::journal::tests::{NativeBirthRows, NativePublisher};
+    let mut harness = JointBirthHarness::new();
+    harness.push_ordinary(ImageIdentity::default());
+    let mut quiet = harness.collect();
+    let (mut report, admitted) = harness.route(&mut quiet);
+    quiet.classify_ordinary(&admitted).unwrap();
+    let (_, proof) = harness.ingest(quiet, &admitted);
+    let publisher = NativePublisher::build();
+    // Generation 0: the exec hook never stamped this task — it
+    // predates the closure (the already-running browser).
+    let (row, control, _) = publisher.publish_stamped(&["0", "0", "0", "0", "1"], 0);
+    let mut rows = NativeBirthRows { row, control };
+    let candidate = report
+        .take_current()
+        .pop()
+        .unwrap()
+        .into_birth_candidate()
+        .unwrap_or_else(|_| panic!("actual first H0 New candidate"));
+    harness
+        .capture
+        .validate_birth_candidate(&mut harness.io, &candidate, false)
+        .unwrap();
+    let witness = harness
+        .capture
+        .finish_birth(
+            candidate,
+            None,
+            &admitted,
+            harness.fixture.binding(),
+            harness.fixture.attachment(),
+            &proof,
+            &harness.adapter,
+            &mut rows,
+        )
+        .expect("an already-present provider births as attach-observed");
+    assert_eq!(
+        witness.receipt().birth(),
+        crate::semantics_objects::journal::BirthKind::AttachObserved
+    );
 }
 
 #[test]
@@ -7439,6 +7590,7 @@ mod b17_wire_projection {
             false,
             true,
             Default::default(),
+            0,
             None,
             false,
             scheduling,
@@ -7706,4 +7858,21 @@ mod b17_wire_projection {
             shed_gaps[1].1
         );
     }
+}
+
+/// A miss era needs the fault to move by exactly the raises the misses
+/// won: another fault in the same audit window (a BPF record overflow,
+/// a coverage raise) or a raise lost to another raiser makes it an
+/// ordinary era, which never carries observations.
+#[test]
+fn a_miss_era_is_named_only_when_won_miss_raises_moved_the_fault() {
+    use super::moved_only_by_miss_raises as miss_era;
+    assert!(miss_era(3, 4, 10, 11), "one won raise, fault +1");
+    assert!(miss_era(3, 5, 10, 12), "two won raises, fault +2");
+    assert!(
+        !miss_era(3, 4, 10, 12),
+        "an extra non-miss fault in the window"
+    );
+    assert!(!miss_era(3, 3, 10, 11), "no won raise: an ordinary era");
+    assert!(!miss_era(3, 4, 10, 10), "no fault move");
 }

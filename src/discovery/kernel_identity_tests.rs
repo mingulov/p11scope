@@ -190,6 +190,76 @@ fn d3b_owned_installation_reads_only_while_custody_is_live() {
     assert!(!session.scope.ready());
 }
 
+/// A nested install runs only the anchor program, which never reads the
+/// scope bitmap, and every nested target run re-establishes the
+/// permissive bitmap before reading: the install must skip the
+/// selective write (a full clear plus refill, ~131k bpf syscalls,
+/// inside the witness deadline) while still authorizing the anchor run.
+#[test]
+fn nested_install_skips_the_selective_scope_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "held.so");
+    let mut custody = custody(1, BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, file));
+    let pins = PinnedObjects::empty();
+    let pass = AnchorPass::prepare(&pins, [], custody);
+    let mut session = fixture_session();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let (ready, words) =
+        crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+            let installed = session
+                .install_anchors(pass, 1, deadline)
+                .expect("a nested install authorizes its anchor run");
+            let ready = installed.session.scope.ready();
+            let words = match &installed.session.object {
+                SessionObject::Fixture { scope_words, .. } => scope_words.borrow().clone(),
+                SessionObject::Kernel(_) => panic!("a fixture session lost its object"),
+            };
+            drop(installed);
+            (ready, words)
+        });
+    assert!(
+        ready,
+        "a write-less install must still authorize the anchor run"
+    );
+    assert!(words.is_empty(), "a nested install wrote scope: {words:?}");
+}
+
+/// The agreed-numbering twin: a non-nested install still installs the
+/// selective observer scope the target runs narrow from.
+#[test]
+fn agreed_install_writes_the_selective_observer_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let (file, examined) = opened(dir.path(), "held.so");
+    let mut custody = custody(1, BTreeMap::new());
+    let scan = custody.begin_scan();
+    assert!(custody.offer_for_test(scan, examined, file));
+    let pins = PinnedObjects::empty();
+    let pass = AnchorPass::prepare(&pins, [], custody);
+    let mut session = fixture_session();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let installed = session
+        .install_anchors(pass, 1, deadline)
+        .expect("an agreed install authorizes its anchor run");
+    assert!(
+        installed.session.scope.ready(),
+        "an agreed install authorizes its runs"
+    );
+    match &installed.session.object {
+        SessionObject::Fixture { scope_words, .. } => {
+            let words = scope_words.borrow();
+            assert_eq!(
+                words.len(),
+                1,
+                "an agreed install writes exactly the observer word: {words:?}"
+            );
+        }
+        SessionObject::Kernel(_) => panic!("a fixture session lost its object"),
+    }
+    drop(installed);
+}
+
 fn mapped(address: u64) -> bool {
     let mut residency = 0u8;
     // SAFETY: mincore observes one aligned page and does not dereference it.
@@ -3282,6 +3352,474 @@ fn d3c_phase_d_borrows_original_pidfd() {
     drop(installed);
 }
 
+/// A packet I/O that can withhold its borrowed pidfd: `offer_pidfd`
+/// decides whether the charged single-Confirm batch promotes. Every
+/// other call delegates to the shared segment world untouched.
+struct TogglePidfdIo<'w> {
+    inner: SegmentIo<'w>,
+    offer_pidfd: bool,
+}
+
+impl ConfirmIo for TogglePidfdIo<'_> {
+    type Pin = SegmentPin;
+
+    fn borrowed_pidfd<'a>(&self, pin: &'a Self::Pin) -> Option<std::os::fd::BorrowedFd<'a>> {
+        if self.offer_pidfd {
+            self.inner.borrowed_pidfd(pin)
+        } else {
+            None
+        }
+    }
+
+    fn mapped_file(&mut self, pid: u32, start: u64, end: u64) -> Result<FileIdentity, String> {
+        self.inner.mapped_file(pid, start, end)
+    }
+
+    fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+        self.inner.open(pid)
+    }
+
+    fn start_time(&self, pin: &Self::Pin) -> Option<u64> {
+        self.inner.start_time(pin)
+    }
+
+    fn still_the_same(&self, pin: &Self::Pin) -> bool {
+        self.inner.still_the_same(pin)
+    }
+
+    fn exe(&self, pid: u32) -> Option<crate::discovery::caller_registry::ExeIdentity> {
+        self.inner.exe(pid)
+    }
+
+    fn maps(&mut self, pid: u32, budget: &mut CaptureWorkBudget) -> Result<Vec<MapEntry>, String> {
+        self.inner.maps(pid, budget)
+    }
+
+    fn gone(&self, pid: u32) -> bool {
+        self.inner.gone(pid)
+    }
+}
+
+struct NestedPidfdObservation {
+    confirmation: Confirmation,
+    attempts: u32,
+    failed_target: Option<RunFailure>,
+    scopes: Vec<BTreeSet<u32>>,
+    concrete_runs: usize,
+    outcomes: usize,
+    per_pid: BTreeMap<u32, KernelFallbackReason>,
+    totals: KernelFallbackTotals,
+    fallback: Vec<(u32, u64, u64)>,
+}
+
+/// One scalar confirm through the production prepare → prove → finish
+/// path under the given pidfd/numbering shape. The scripted target
+/// emits the request pid numerically, so a cross-domain numeric join
+/// would prove by kernel: only the fail-closed gate refuses the run.
+fn nested_pidfd_cell(offer_pidfd: bool, nested: bool) -> NestedPidfdObservation {
+    let numbering = if nested {
+        crate::pidns::test_seam::nested()
+    } else {
+        crate::pidns::PidNumbering::agreeing()
+    };
+    numbered_pidfd_cell(offer_pidfd, numbering)
+}
+
+/// [`nested_pidfd_cell`] under an explicit numbering (foreign-/proc
+/// shapes cannot be named by a bool).
+fn numbered_pidfd_cell(
+    offer_pidfd: bool,
+    numbering: crate::pidns::PidNumbering,
+) -> NestedPidfdObservation {
+    const PID: u32 = 6100;
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(&world, &[(PID, vec![0])]);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            1,
+            &[(PID, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, refused) = d3c_index(&world);
+    assert!(refused.is_empty());
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let resources = pass.owner.batch();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let mut packet = TogglePidfdIo {
+        inner: SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        offer_pidfd,
+    };
+    let confirmation = crate::pidns::test_seam::with_numbering(numbering, || {
+        let prepared = super::super::sweep_attribution::prepare_confirmation(
+            &mut packet,
+            PID,
+            &prove_set,
+            &mut budget,
+            Some(&resources),
+        )
+        .expect("the scalar request prepares");
+        super::super::confirm_shards::prove_and_finish_prepared(
+            &mut packet,
+            PID,
+            prepared,
+            probe.segment_proof(),
+            &resources,
+            &mut budget,
+        )
+    });
+    let trace = pass.runs.lock().unwrap();
+    let scopes = trace.scopes.clone();
+    let concrete_runs = trace.concrete_runs;
+    let outcomes = trace.outcomes.len();
+    drop(trace);
+    drop(probe);
+    let attempts = installed.target_attempts;
+    let failed_target = installed.failed_target;
+    let per_pid = installed
+        .session
+        .fallback
+        .current
+        .as_ref()
+        .map(|pass| pass.per_pid.clone())
+        .unwrap_or_default();
+    drop(installed);
+    let totals = session.fallback_totals();
+    let fallback = events.lock().unwrap().fallback.clone();
+    NestedPidfdObservation {
+        confirmation,
+        attempts,
+        failed_target,
+        scopes,
+        concrete_runs,
+        outcomes,
+        per_pid,
+        totals,
+        fallback,
+    }
+}
+
+#[test]
+fn nested_confirm_without_pidfd_fails_closed_without_target_run() {
+    // The pidfd-less nested confirm (exhaustion, seccomp, denial) must
+    // not run: a whole-system walk over a permissive bitmap would
+    // attribute by cross-domain numeric pid lookup. The witness
+    // refuses userspace proof by construction, so this honest gap —
+    // never a numeric join on the colliding scripted tgid — is the
+    // only exact answer.
+    let out = nested_pidfd_cell(false, true);
+    assert_userspace_mapped(&out.confirmation);
+    assert_eq!(
+        out.fallback,
+        [(6100, segment_range(0).0, segment_range(0).1)],
+        "the refused request falls back inside its original pin"
+    );
+    assert!(
+        out.scopes.is_empty(),
+        "a refused nested confirm wrote scope: {:?}",
+        out.scopes
+    );
+    assert_eq!(
+        out.concrete_runs, 0,
+        "a refused nested confirm ran the iterator"
+    );
+    assert_eq!(out.outcomes, 0, "a refused nested confirm recorded a run");
+    assert_eq!(
+        out.attempts, 0,
+        "a refused nested confirm counted an attempt"
+    );
+    assert!(out.failed_target.is_none(), "a refusal demoted the pass");
+    assert_eq!(
+        out.per_pid.get(&6100),
+        Some(&KernelFallbackReason::Scope),
+        "the refusal names its cause per request: {:?}",
+        out.per_pid
+    );
+    assert_eq!(
+        out.totals,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Scope),
+        }
+    );
+}
+
+#[test]
+fn nested_confirm_with_pidfd_still_promotes_by_kernel() {
+    // Healthy twin: the pidfd-bound nested promotion proves the sole
+    // emitter by construction, so the fail-closed gate must not touch
+    // it. The same colliding scripted tgid proves by kernel here.
+    let out = nested_pidfd_cell(true, true);
+    assert_kernel_slot(&out.confirmation, Slot(0));
+    assert_eq!(out.attempts, 1, "the promotion did not run exactly once");
+    assert_eq!(out.concrete_runs, 1, "the promotion ran no iterator");
+    assert_eq!(out.scopes.len(), 1, "the promotion recorded no run");
+    assert!(out.failed_target.is_none());
+    assert!(
+        out.fallback.is_empty(),
+        "the promotion fell back: {:?}",
+        out.fallback
+    );
+    assert_eq!(
+        out.totals,
+        KernelFallbackTotals {
+            passes: 0,
+            pids: 0,
+            keys: 0,
+            first_reason: None,
+        }
+    );
+}
+
+/// pidfd_open resolves in the observer's namespace while request pids
+/// come from the mounted /proc: with a foreign /proc (allowed for
+/// --system scans) the pidfd could bind the wrong task, so even a
+/// pidfd-carrying confirm must fail closed without a target run.
+#[test]
+fn foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
+    let numbering = crate::pidns::PidNumbering {
+        observer: crate::pidns::ObserverPidNs::Initial,
+        proc_view: crate::pidns::ProcView::Foreign("test foreign /proc".into()),
+    };
+    let out = numbered_pidfd_cell(true, numbering);
+    assert_userspace_mapped(&out.confirmation);
+    assert_eq!(
+        out.fallback,
+        [(6100, segment_range(0).0, segment_range(0).1)],
+        "the refused request falls back inside its original pin"
+    );
+    assert!(
+        out.scopes.is_empty(),
+        "a refused foreign-/proc confirm wrote scope: {:?}",
+        out.scopes
+    );
+    assert_eq!(
+        out.concrete_runs, 0,
+        "a refused foreign-/proc confirm ran the iterator"
+    );
+    assert_eq!(
+        out.outcomes, 0,
+        "a refused foreign-/proc confirm recorded a run"
+    );
+    assert_eq!(
+        out.attempts, 0,
+        "a refused foreign-/proc confirm counted an attempt"
+    );
+    assert!(out.failed_target.is_none(), "a refusal demoted the pass");
+    assert_eq!(
+        out.per_pid.get(&6100),
+        Some(&KernelFallbackReason::Scope),
+        "the refusal names its cause per request: {:?}",
+        out.per_pid
+    );
+    assert_eq!(
+        out.totals,
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 1,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Scope),
+        }
+    );
+}
+
+/// The nested-observer twin: a foreign /proc voids the pidfd binding
+/// whichever namespace the observer runs in.
+#[test]
+fn nested_foreign_proc_confirm_with_pidfd_fails_closed_without_target_run() {
+    let numbering = crate::pidns::PidNumbering {
+        observer: crate::pidns::ObserverPidNs::Nested,
+        proc_view: crate::pidns::ProcView::Foreign("test foreign /proc".into()),
+    };
+    let out = numbered_pidfd_cell(true, numbering);
+    assert_userspace_mapped(&out.confirmation);
+    assert!(
+        out.scopes.is_empty(),
+        "a refused nested foreign-/proc confirm wrote scope: {:?}",
+        out.scopes
+    );
+    assert_eq!(
+        out.concrete_runs, 0,
+        "a refused nested foreign-/proc confirm ran the iterator"
+    );
+    assert_eq!(
+        out.attempts, 0,
+        "a refused nested foreign-/proc confirm counted an attempt"
+    );
+    assert!(out.failed_target.is_none(), "a refusal demoted the pass");
+    assert_eq!(
+        out.per_pid.get(&6100),
+        Some(&KernelFallbackReason::Scope),
+        "the refusal names its cause per request: {:?}",
+        out.per_pid
+    );
+}
+
+#[test]
+fn agreed_confirm_without_pidfd_still_runs_whole_system() {
+    // Numbering twin: without a nested observer the numeric lookup is
+    // same-domain, so a pidfd-less confirm still runs whole-system and
+    // proves by kernel. The gate is nested-only.
+    let out = nested_pidfd_cell(false, false);
+    assert_kernel_slot(&out.confirmation, Slot(0));
+    assert_eq!(out.attempts, 1, "the whole-system run did not count");
+    assert_eq!(out.concrete_runs, 1);
+    assert_eq!(out.scopes.len(), 1);
+    assert!(
+        out.fallback.is_empty(),
+        "the whole-system run fell back: {:?}",
+        out.fallback
+    );
+}
+
+#[test]
+fn nested_multi_confirm_without_pidfd_fails_closed_without_target_run() {
+    // The multi-request shape never promotes either, so the same gate
+    // refuses it before any whole-system walk.
+    use super::super::confirm_shards::SegmentProof as _;
+    const FIRST: u32 = 6200;
+    const SECOND: u32 = 6201;
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let (world_map, identities) = d3c_world_map(&world, &[(FIRST, vec![0]), (SECOND, vec![0])]);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        1,
+        16,
+        2,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            1,
+            &[(FIRST, segment_range(0), 0), (SECOND, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, refused) = d3c_index(&world);
+    assert!(refused.is_empty());
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let resources = pass.owner.batch();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let mut io = TogglePidfdIo {
+        inner: SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        offer_pidfd: false,
+    };
+    let first = super::super::sweep_attribution::prepare_confirmation(
+        &mut io,
+        FIRST,
+        &prove_set,
+        &mut budget,
+        Some(&resources),
+    )
+    .expect("the first request prepares");
+    let second = super::super::sweep_attribution::prepare_confirmation(
+        &mut io,
+        SECOND,
+        &prove_set,
+        &mut budget,
+        Some(&resources),
+    )
+    .expect("the second request prepares");
+    let plans = [(FIRST, first), (SECOND, second)];
+    let batch = super::super::confirm_shards::accepted_batch_for_test(&plans);
+    assert!(
+        batch
+            .requests()
+            .iter()
+            .all(|request| request.pidfd().is_none()),
+        "the multi-request batch carries no pidfd to promote"
+    );
+    let decision =
+        crate::pidns::test_seam::with_numbering(crate::pidns::test_seam::nested(), || {
+            probe.segment_proof().prove(&batch, &mut budget, &resources)
+        });
+    assert!(
+        matches!(decision, ProofDecision::Userspace(RunFailure::Scope)),
+        "a nested multi-request batch ran instead of refusing"
+    );
+    drop(decision);
+    drop(batch);
+    drop(probe);
+    assert_eq!(installed.target_attempts, 0);
+    assert!(installed.failed_target.is_none());
+    drop(installed);
+    let trace = pass.runs.lock().unwrap();
+    assert!(
+        trace.scopes.is_empty(),
+        "a refused batch wrote scope: {:?}",
+        trace.scopes
+    );
+    assert_eq!(trace.concrete_runs, 0);
+    assert!(trace.outcomes.is_empty());
+    drop(trace);
+    assert_eq!(
+        session.fallback_totals(),
+        KernelFallbackTotals {
+            passes: 1,
+            pids: 2,
+            keys: 1,
+            first_reason: Some(KernelFallbackReason::Scope),
+        }
+    );
+}
+
 #[test]
 fn d3c_wrong_batch_or_pass_cannot_reuse_verdict() {
     // Batch 2 must not serve batch 1's verdicts: its PID is unvisited, so
@@ -3688,6 +4226,144 @@ fn d3c_three_attempted_deadlines_become_sticky() {
             first_reason: Some(KernelFallbackReason::Deadline),
         }
     );
+}
+
+#[test]
+fn witness_reset_clears_deadlines_but_not_stream_invalid() {
+    // Each witness query resets its deadline streak first: a Deadlines
+    // stick clears, a StreamInvalid stick survives, and the counter
+    // always clears.
+    let mut session = fixture_session();
+    session.consecutive_deadlines = 2;
+    session.sticky = Some(KernelSticky::Deadlines);
+    session.reset_witness_deadline_streak();
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, None);
+    session.consecutive_deadlines = 5;
+    session.sticky = Some(KernelSticky::StreamInvalid);
+    session.reset_witness_deadline_streak();
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, Some(KernelSticky::StreamInvalid));
+}
+
+#[test]
+fn witness_three_overdue_then_proves() {
+    // Twin to the sticky sweep test: three overdue witness queries
+    // (each reset first, like the witness path) never stick, so the
+    // fourth query with valid bytes runs and proves instead of
+    // blacking out.
+    let world = d3c_world();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut session = fixture_session();
+    let pids: Vec<(u32, Vec<usize>)> = (0..4).map(|i| (5210 + i, vec![0])).collect();
+    let (world_map, identities) = d3c_world_map(&world, &pids);
+    let events = Arc::new(std::sync::Mutex::new(SegmentEvents::default()));
+    for (pass_no, pid) in [5210, 5211, 5212].into_iter().enumerate() {
+        session.reset_witness_deadline_streak();
+        let generation = pass_no as u64 + 1;
+        let (mut installed, pass) = d3c_install(
+            &world,
+            &mut session,
+            generation,
+            16,
+            1,
+            &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+            vec![FixtureTarget::Deadline(gen_target(
+                generation,
+                &[(pid, segment_range(0), 0)],
+            ))],
+            deadline,
+        );
+        let (mut index, _) = d3c_index(&world);
+        let prove_set = index.map_files_keys();
+        let mut budget = CaptureWorkBudget::default();
+        let mut probe = KernelMemberProbe::new(
+            &mut installed,
+            SegmentIo {
+                world: &world_map,
+                identities: &identities,
+                events: events.clone(),
+                runs: pass.runs.clone(),
+                owner: pass.owner.clone(),
+                exe_reads: Cell::new(0),
+                imm_base: pass.owner.state_for_test().0[3],
+            },
+            deadline,
+        );
+        probe.install_expectations(&mut index).unwrap();
+        let late = d3c_packet(
+            probe.segment_proof(),
+            &world_map,
+            &identities,
+            &events,
+            &pass.runs,
+            &pass.owner,
+            &prove_set,
+            pid,
+            &mut budget,
+        );
+        assert_userspace_mapped(&late);
+        drop(probe);
+        assert_eq!(installed.failed_target, Some(RunFailure::Deadline));
+        drop(installed);
+        assert_eq!(session.consecutive_deadlines, 1);
+        assert_eq!(session.sticky, None);
+    }
+    // The fourth query resets like the others, then runs and proves.
+    session.reset_witness_deadline_streak();
+    let (mut installed, pass) = d3c_install(
+        &world,
+        &mut session,
+        4,
+        16,
+        1,
+        &[(0, ANCHOR_OK, 0), (1, ANCHOR_OK, 0)],
+        vec![FixtureTarget::Bytes(gen_target(
+            4,
+            &[(5213, segment_range(0), 0)],
+        ))],
+        deadline,
+    );
+    let (mut index, _) = d3c_index(&world);
+    let prove_set = index.map_files_keys();
+    let mut budget = CaptureWorkBudget::default();
+    let mut probe = KernelMemberProbe::new(
+        &mut installed,
+        SegmentIo {
+            world: &world_map,
+            identities: &identities,
+            events: events.clone(),
+            runs: pass.runs.clone(),
+            owner: pass.owner.clone(),
+            exe_reads: Cell::new(0),
+            imm_base: pass.owner.state_for_test().0[3],
+        },
+        deadline,
+    );
+    probe.install_expectations(&mut index).unwrap();
+    let proved = d3c_packet(
+        probe.segment_proof(),
+        &world_map,
+        &identities,
+        &events,
+        &pass.runs,
+        &pass.owner,
+        &prove_set,
+        5213,
+        &mut budget,
+    );
+    assert_kernel_slot(&proved, Slot(0));
+    drop(probe);
+    assert_eq!(installed.failed_target, None);
+    assert_eq!(installed.target_attempts, 1);
+    drop(installed);
+    assert_eq!(
+        pass.runs.lock().unwrap().scopes.len(),
+        4,
+        "the fourth witness query must run after three overdue"
+    );
+    assert_eq!(session.consecutive_deadlines, 0);
+    assert_eq!(session.sticky, None);
 }
 
 #[test]
@@ -6995,6 +7671,10 @@ mod sweep_witness_mixed {
             self.used += 1;
             self.calls.lock().unwrap().push((pid, key, ranges.to_vec()));
             self.verdict
+        }
+
+        fn queries_per_pass(&self) -> u32 {
+            self.limit
         }
     }
 

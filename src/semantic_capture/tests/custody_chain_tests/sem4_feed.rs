@@ -322,7 +322,7 @@ fn retention_overflow_sheds_with_named_capacity_reason() {
 
 #[test]
 fn withheld_edge_with_claimed_children_names_the_children() {
-    use crate::inventory_present::{Presentation, render_snapshot};
+    use crate::inventory_present::{Presentation, render_snapshot_with_verbosity};
     // Bind first so the burst joins without retention (post-registration
     // calls join on the contracted path): the edge keeps no per-edge
     // state while its instance child holds mechanism claims, the live
@@ -344,7 +344,8 @@ fn withheld_edge_with_claimed_children_names_the_children() {
         "the fixture holds mechanism claims in its instance child"
     );
     let presentation = Presentation::capture(&scene.scene.coordinator, "system", 0, now_ns(), 2);
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let module = scene
         .scene
         .coordinator

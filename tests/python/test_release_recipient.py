@@ -136,6 +136,8 @@ def diff(arguments):
             want_json = True
         elif word == "-o":
             destination = rest.pop(0)
+        elif word in ("-v", "--verbose"):
+            pass
         else:
             positionals.append(word)
     if len(positionals) != 2:

@@ -441,6 +441,12 @@ pub(crate) struct InstalledAnchorPass<'s, 'p> {
 }
 
 impl InstalledAnchorPass<'_, '_> {
+    /// This pass's terminal target-run failure, if its run was attempted
+    /// and failed. The witness reads it to stage an overdue run.
+    pub(crate) fn failed_target(&self) -> Option<RunFailure> {
+        self.failed_target
+    }
+
     /// A raw target read without a charged batch: custody probing only, not
     /// a proof attempt, so it never consumes the per-pass attempt budget.
     pub(crate) fn read_target(
@@ -510,6 +516,34 @@ impl InstalledAnchorPass<'_, '_> {
                     scope_words.borrow_mut().insert(word, bits);
                 })
                 .map_err(|_| RunFailure::Scope),
+        };
+        if result.is_err() {
+            self.session.binding = None;
+            self.session.scope.invalidate();
+        }
+        result
+    }
+
+    /// Make the scope permissive for nested pidfd-bound runs (the
+    /// bound task's initial-namespace tgid is unknowable, so no
+    /// selective bitmap can name it). Same binding discipline as
+    /// [`Self::replace_target_scope`].
+    fn replace_permissive(&mut self) -> Result<(), RunFailure> {
+        let pass = self.pass.as_ref().expect("installed guard owns its pass");
+        if !pass.owns_installation(self.session) {
+            return Err(RunFailure::Scope);
+        }
+        let result = match &mut self.session.object {
+            SessionObject::Kernel(loaded) => self
+                .session
+                .scope
+                .replace_permissive(&mut loaded.ebpf)
+                .map_err(|_| RunFailure::Scope),
+            #[cfg(test)]
+            SessionObject::Fixture { .. } => {
+                self.session.scope.replace_permissive_fixture();
+                Ok(())
+            }
         };
         if result.is_err() {
             self.session.binding = None;
@@ -1140,6 +1174,28 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
             Err(reason) => return self.userspace(batch, reason),
         };
         let mut work = TargetWorkDeadline { deadline, steps: 0 };
+        // Under a nested observer (the witness's private session; sweep
+        // sessions never run here) the emitted initial-namespace tgids
+        // are unknowable, so target runs bind by pidfd with a permissive
+        // bitmap and match the sole emitter instead of numbered pids.
+        // pidfd_open resolves in the observer's own namespace while
+        // request pids come from the mounted /proc, so the pidfd path
+        // is sound only when /proc is our own namespace's /proc (a
+        // foreign /proc is allowed for --system scans, but its pids
+        // must never bind a pidfd or key a sole-emitter match).
+        let numbering = crate::pidns::numbering();
+        let nested = !numbering.agrees();
+        let own_proc = numbering.proc_view == crate::pidns::ProcView::Own;
+        // A nested pidfd-bound promotion matches its single emitter
+        // without numbers. The pidfd pins the task against reuse, but
+        // exactness is not by construction alone: the target may exec
+        // between preparation and the run, so the confirm finish path
+        // re-proves liveness after the run (`still_the_same`, plus the
+        // exe-identity re-read). Mirrors the promotion below (single
+        // Confirm with a pidfd).
+        let nested_per_pid = nested
+            && matches!(batch.requests(), [only]
+            if matches!(only.kind(), AcceptedKind::Confirm) && only.pidfd().is_some());
         // A zombie-group member request runs only alone, as a TID run
         // over its survivor; anywhere else it keeps its own name.
         let singleton_member = matches!(batch.requests(), [only] if only.member().is_some());
@@ -1230,7 +1286,11 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
         // derived selector; a dead selector skips the run entirely (not
         // an attempt) and the answers name it. Anything else takes the
         // ordinary scope-and-promotion path.
-        let selector = if singleton_member {
+        // A nested selector names observer-numbered tasks the BPF
+        // program (initial numbering) can never match, so member runs
+        // stay dead there: the answers name the request per-request,
+        // like no selector at all.
+        let selector = if singleton_member && !nested {
             batch
                 .requests()
                 .first()
@@ -1321,6 +1381,10 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                                     generation,
                                     slots,
                                     scope: &BTreeSet::from([only_pid]),
+                                    // Member runs stay dead nested (no
+                                    // selector), so the scope always
+                                    // enforces here.
+                                    enforce_scope: true,
                                     mode: RunMode::PerPid,
                                     run: RunKind::Target,
                                 },
@@ -1340,10 +1404,28 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 None => crate::attach::identity_iter::Run::default(),
             }
         } else {
-            if let Err(reason) = self
-                .installed
-                .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
-            {
+            // A nested run without pidfd promotion cannot attribute:
+            // emitted initial-namespace tgids are unknowable, so the
+            // numeric lookup below would compare across PID-numbering
+            // domains and could join another process's verdicts. A
+            // foreign /proc voids the promotion itself: its pids name
+            // another namespace's tasks, so the pidfd could bind the
+            // wrong task. Fail closed before the scope write; the
+            // witness refuses userspace proof by construction and
+            // reports the gap.
+            if nested && (!nested_per_pid || !own_proc) {
+                return self.userspace(batch, RunFailure::Scope);
+            }
+            // Nested runs bind by pidfd (below): the bitmap goes
+            // permissive, since no selective set can name the bound
+            // task's unknowable initial-namespace tgid.
+            let scope_result = if nested {
+                self.installed.replace_permissive()
+            } else {
+                self.installed
+                    .replace_target_scope(&scope.iter().copied().collect::<Vec<_>>())
+            };
+            if let Err(reason) = scope_result {
                 return self.userspace(batch, reason);
             }
             if let Err(reason) = work.check(budget) {
@@ -1389,6 +1471,7 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                     generation,
                     slots,
                     scope: &scope,
+                    enforce_scope: !nested,
                     mode,
                     run: RunKind::Target,
                 },
@@ -1427,9 +1510,27 @@ impl SegmentProof for KernelPassProof<'_, '_, '_> {
                 answers.push(self.unproven_answer(request));
                 continue;
             }
-            let demoted = run.demoted_pids.contains(&request.pid());
+            // Nested pidfd-bound runs match the sole emitter (the
+            // pidfd already bound the request's task, and the finish
+            // path re-proves liveness after the run); anywhere else the
+            // numbered pid keys the run. A nested run without promotion
+            // (no pidfd) or without our own /proc never reaches this
+            // match: it fails closed to userspace above, since the
+            // numbered lookup would compare across PID-numbering
+            // domains and the pidfd could bind the wrong task.
+            let demoted = if nested_per_pid {
+                !run.demoted_pids.is_empty()
+            } else {
+                run.demoted_pids.contains(&request.pid())
+            };
             let records = eligible
-                .then(|| run.by_pid.get(&request.pid()))
+                .then(|| {
+                    if nested_per_pid {
+                        crate::attach::identity_iter::sole_target_records(&run)
+                    } else {
+                        run.by_pid.get(&request.pid())
+                    }
+                })
                 .flatten()
                 .filter(|_| !demoted);
             let Some(records) = records else {
@@ -1788,7 +1889,10 @@ impl<'p> AnchorPass<'p> {
                 slots: self.arena.as_ref().map_or(0, |arena| {
                     (arena.len() / crate::attach::identity_iter::ANCHOR_STRIDE) as u32
                 }),
+                // Anchor records carry slots, not tgids, so the parser
+                // never consults the scope for this run.
                 scope: &BTreeSet::from([std::process::id()]),
+                enforce_scope: true,
                 mode: RunMode::PerPid,
                 run: RunKind::Anchor,
             },
@@ -1976,13 +2080,34 @@ impl FixtureRunTrace {
 
 fn probe_succeeded(report: &crate::attach::identity_iter::FunctionalProbeReport) -> bool {
     use crate::attach::identity_iter::{AnchorOutcome, TargetVerdict};
+    // The emitter check is numbering-aware: the pidfd-bound nested run
+    // proves the single emitter is the child by construction, while its
+    // initial-namespace tgid is unknowable to compare by number.
+    let single_emitter = if crate::pidns::numbering().agrees() {
+        report.pids_seen == [report.child_pid]
+    } else {
+        report.pids_seen.len() == 1
+    };
     report.anchor_outcomes == [(0, AnchorOutcome::Ok), (1, AnchorOutcome::Ok)]
         && report.hardlink_verdict == TargetVerdict::Slot(0)
         && report.second_verdict == TargetVerdict::Slot(1)
         && report.copy_verdict == TargetVerdict::Unmatched
-        && report.pids_seen == [report.child_pid]
+        && single_emitter
         && report.demoted_pids.is_empty()
         && report.stale_unmatched
+}
+
+/// Why the witness session failed to load, with the underlying
+/// error. [`IdentitySession::probe_and_load`] collapses these to its
+/// two static strings; the overlay witness maps them to stages instead.
+#[derive(Debug)]
+pub(crate) enum IdentityLoadFailure {
+    /// The strict object load failed.
+    ObjectLoad(crate::attach::identity_iter::LoadError),
+    /// The functional probe failed at its stage.
+    ProbeFailed(crate::attach::identity_iter::ProbeError),
+    /// The functional probe ran but its report failed the checks.
+    ProbeMismatch,
 }
 
 impl IdentitySession {
@@ -2000,18 +2125,30 @@ impl IdentitySession {
         btf: &aya::Btf,
         dir: &std::path::Path,
     ) -> Result<Self, &'static str> {
+        Self::probe_and_load_detailed(btf, dir).map_err(|failure| match failure {
+            IdentityLoadFailure::ObjectLoad(_) => "identity object load failed",
+            IdentityLoadFailure::ProbeFailed(_) | IdentityLoadFailure::ProbeMismatch => {
+                "identity functional probe failed"
+            }
+        })
+    }
+
+    pub(crate) fn probe_and_load_detailed(
+        btf: &aya::Btf,
+        dir: &std::path::Path,
+    ) -> Result<Self, IdentityLoadFailure> {
         let loaded = probe_then_fresh(
             || {
                 crate::attach::identity_iter::load_identity_object_strict(btf)
-                    .map_err(|_| "identity object load failed")
+                    .map_err(IdentityLoadFailure::ObjectLoad)
             },
             |loaded| {
                 let report = crate::attach::identity_iter::run_functional_probe(dir, loaded, 1)
-                    .map_err(|_| "identity functional probe failed")?;
+                    .map_err(IdentityLoadFailure::ProbeFailed)?;
                 if probe_succeeded(&report) {
                     Ok(())
                 } else {
-                    Err("identity functional probe failed")
+                    Err(IdentityLoadFailure::ProbeMismatch)
                 }
             },
         )?;
@@ -2244,6 +2381,19 @@ impl IdentitySession {
         self.fallback.totals()
     }
 
+    /// Reset the deadline streak before one witness query. The witness
+    /// session is process-wide, so three consecutive overdue runs would
+    /// otherwise stick `Deadlines` for the rest of a long inventory — a
+    /// load spike blacking out every later query. Each query starts
+    /// fresh; only the deadline streak resets, never a `StreamInvalid`
+    /// stick (a corrupt stream stays stuck).
+    pub(crate) fn reset_witness_deadline_streak(&mut self) {
+        self.consecutive_deadlines = 0;
+        if self.sticky == Some(KernelSticky::Deadlines) {
+            self.sticky = None;
+        }
+    }
+
     /// Install only this pass's observer anchors. Target-range proof belongs
     /// to D3c. A generation is spent before I/O so a failed pass cannot reuse it.
     pub(crate) fn install_anchors<'s, 'p>(
@@ -2296,8 +2446,22 @@ impl IdentitySession {
             return Err("identity anchor arena is unavailable");
         };
         let slots = (arena.len() / crate::attach::identity_iter::ANCHOR_STRIDE) as u32;
-        let config = arena.config(generation, slots, std::process::id());
-        self.replace_scope(&[std::process::id()])?;
+        let config = arena.config(
+            generation,
+            slots,
+            crate::attach::identity_iter::observer_tgid_for_config(),
+        );
+        // The anchor program never reads the scope bitmap (see
+        // `p11_anchor_vma`), and every nested target run re-establishes
+        // the permissive bitmap before reading: a nested install skips
+        // the selective write, saving a full clear plus refill (~131k
+        // bpf syscalls) per pass inside the witness deadline. The ready
+        // latch still authorizes the anchor run below.
+        if !crate::pidns::numbering().agrees() {
+            self.scope.mark_ready_without_write();
+        } else {
+            self.replace_scope(&[std::process::id()])?;
+        }
         self.configure(config)?;
         let binding = PassBinding {
             session: self.token.clone(),

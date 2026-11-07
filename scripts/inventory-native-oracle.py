@@ -6733,8 +6733,8 @@ def capacity_prepare(directory, population, demand=8192, custody=None):
                                       "offsets": trust_offsets, "implementation": "p11-kit-trust"})
         compile_fixture("ledger", "tests/fixtures/public-cli/inventory-ledger.c", ["-O1", "-ldl", "-lpthread"])
     else:
-        if population in ("boundary", "refusal") and demand not in (4097, 6531, 8192):
-            raise ValueError("boundary demand must be4097,6531,8192")
+        if population in ("boundary", "refusal") and demand not in (4097, 6531, 8192, 32769):
+            raise ValueError("boundary demand must be4097,6531,8192,32769")
         if population not in ("boundary", "growth", "owners", "refusal"):
             raise ValueError("unknown capacity population")
         full_unique = 1 if population == "owners" else 68
@@ -7368,7 +7368,7 @@ def capacity_oracle(directory):
         raise ValueError("unsupported capacity manifest")
     lane = manifest["expect_lane"]
     limit = manifest["limit"]
-    if lane not in ("scan", "native") or type(limit) is not int or not 1 <= limit <= 8192:
+    if lane not in ("scan", "native") or type(limit) is not int or not 1 <= limit <= 131072:
         raise ValueError("invalid capacity lane or selected limit")
     population = manifest["population"]
     if population not in ("boundary", "growth", "owners", "real", "refusal"):
@@ -7390,13 +7390,13 @@ def capacity_oracle(directory):
               f"independent physical union={len(union)}, declared={manifest['demand']}")
     if population == "refusal":
         result.ok("capacity", "*", "CAPACITY-REFUSAL-PAIR",
-                  len(union) in (4097, 6531, 8192) and len(union) == manifest["demand"] == limit + 1,
+                  len(union) in (4097, 6531, 8192, 32769) and len(union) == manifest["demand"] == limit + 1,
                   f"refusal demand must be exactly one past the selected limit: "
                   f"union={len(union)} demand={manifest['demand']} limit={limit}")
     else:
         if population == "boundary":
-            result.ok("capacity", "*", "CAPACITY-BOUNDARY", len(union) in (4097, 6531, 8192),
-                      f"exact boundary must be4097,6531,8192; got{len(union)}")
+            result.ok("capacity", "*", "CAPACITY-BOUNDARY", len(union) in (4097, 6531, 8192, 32769),
+                      f"exact boundary must be4097,6531,8192,32769; got{len(union)}")
         elif population in ("growth", "real"):
             result.ok("capacity", "*", "CAPACITY-WIDE", len(union) > 6530,
                       f"wide workload has only{len(union)} physical endpoints")

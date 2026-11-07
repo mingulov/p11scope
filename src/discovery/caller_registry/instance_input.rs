@@ -2356,8 +2356,23 @@ impl CallerRegistry {
         revision: u64,
     ) -> crate::key_operation_projection::ObjectObservations {
         let linked = self.journal_linked();
+        let stagings: Vec<&JointStaging> = self
+            .instance_state
+            .semantics
+            .values()
+            .map(|record| &record.feed)
+            .collect();
+        // Calls refused before application for an unproven or
+        // unbound caller never reach a feed: count them as not
+        // attributed, beside the rows of every proven caller.
+        let refused = self
+            .instance_state
+            .instance_calls_refused
+            .values()
+            .fold(0u64, |total, count| total.saturating_add(*count))
+            .saturating_add(self.foreign_unrouted_calls);
         let Some(projection) = self.key_projection.as_ref() else {
-            return crate::key_operation_projection::ObjectObservations::unavailable(
+            let mut observations = crate::key_operation_projection::ObjectObservations::unavailable(
                 revision,
                 if linked {
                     "bootstrap_unavailable"
@@ -2365,14 +2380,37 @@ impl CallerRegistry {
                     "journal_unavailable"
                 },
             );
+            // Linked, but no feed ever reached Joint (no birth
+            // landed): the key calls the feeds and the refusal path
+            // did see still count under their named reasons, and
+            // the section is partial, never a silent unavailable
+            // (observer-first Chromium on fedora).
+            if linked {
+                for row in crate::key_operation_projection::producer::unattributed(&stagings) {
+                    observations.add_unattributed(row.reason, row.count);
+                }
+                observations.add_unattributed("foreign_or_unproven_caller", refused);
+                if !observations.unattributed.is_empty() {
+                    // Same reason precedence as the producer: a
+                    // counted loss or fallback names itself.
+                    observations.status = crate::key_operation_projection::ObsStatus::Partial;
+                    // Semantic loss before any delivery disposes staged
+                    // history while the feed stays Joint: the disposed
+                    // count is itself the loss.
+                    if stagings.iter().any(|staging| {
+                        staging.degraded_loss()
+                            || staging.watchdog_tripped()
+                            || staging.history_disposed() > 0
+                    }) {
+                        observations.reason = "authority_lost";
+                    } else if stagings.iter().any(|staging| staging.fell_back()) {
+                        observations.reason = "proof_refused_fallback";
+                    }
+                }
+            }
+            return observations;
         };
-        let stagings: Vec<&JointStaging> = self
-            .instance_state
-            .semantics
-            .values()
-            .map(|record| &record.feed)
-            .collect();
-        if linked {
+        let mut observations = if linked {
             crate::key_operation_projection::producer::commit(
                 revision,
                 &stagings,
@@ -2390,6 +2428,19 @@ impl CallerRegistry {
                 &self.joint_keyuse,
                 linked,
             )
+        };
+        observations.add_unattributed("foreign_or_unproven_caller", refused);
+        observations
+    }
+
+    /// Note the no-progress watchdog trip on every retained feed:
+    /// staged calls no seal will now settle count once as
+    /// `watchdog_no_progress` at publication. Idempotent per feed.
+    pub(crate) fn note_joint_watchdog_trip(&mut self) {
+        for record in self.instance_state.semantics.values_mut() {
+            if record.feed.note_watchdog_trip() {
+                self.joint_feeds = self.joint_feeds.saturating_sub(1);
+            }
         }
     }
     pub(crate) fn observe_instance_semantic(&mut self, input: AdmittedInstanceCall) {
@@ -2794,6 +2845,7 @@ impl CallerRegistry {
         // ordered fallback before the first seal/failure delivery.
         // The latch carries no object or publication authority.
         let joint_path = self.joint_accounting;
+        let linked = self.journal_linked();
         let refused = if joint_path {
             self.reduce_with_joint_path(id, &input, ledger.as_deref_mut())
         } else {
@@ -2802,6 +2854,15 @@ impl CallerRegistry {
                 .semantics
                 .get_mut(&id)
                 .expect("retained edge");
+            // A linked Joint lane whose feeds never reached Joint (no
+            // birth landed yet) still counts each direct key call
+            // once, under the reason that kept it from attribution
+            // (`started_before_attach` for a feed without a witnessed
+            // birth): without this the whole section read
+            // `unavailable` with the observed calls unaccounted.
+            if linked {
+                state.feed.note_direct_reduction(&input.facts.function);
+            }
             state
                 .semantics
                 .as_mut()
@@ -2847,7 +2908,7 @@ impl CallerRegistry {
         input: &AdmittedInstanceCall,
         mut ledger: Option<&mut crate::semantics_objects::journal::StagingLedger>,
     ) -> Result<u64, crate::semantics_edge::resources::SemanticResourceRefusal> {
-        let joint = self
+        let mut joint = self
             .instance_state
             .semantics
             .get(&id)
@@ -2855,7 +2916,31 @@ impl CallerRegistry {
             .feed
             .mode()
             == FeedMode::Joint;
+        if !joint
+            && ledger.is_some()
+            && crate::semantics_key_use::is_clean_point(&input.facts.function)
+        {
+            // Clean point after a closed segment: a feed that fell
+            // back or lost authority resumes Joint for the segment
+            // this call opens; the closed segment stays counted.
+            let resumed = self
+                .instance_state
+                .semantics
+                .get_mut(&id)
+                .expect("retained edge")
+                .feed
+                .resume_joint();
+            if resumed {
+                joint = true;
+                self.joint_feeds = self.joint_feeds.saturating_add(1);
+            }
+        }
         let mut fallback_refused = 0u64;
+        // True when staging already counted this call (the
+        // unsealable shape that triggered an ordered fallback
+        // counts once as `unmodelled_call_shape` at stage time):
+        // the direct reduction below must not count it again.
+        let mut direct_counted_in_stage = false;
         if joint {
             if let Some(ledger) = ledger.as_deref_mut() {
                 let origin = EffectOrigin::from(&input.facts);
@@ -2884,14 +2969,28 @@ impl CallerRegistry {
                     ) {
                         Ok(()) => StageAction::Staged,
                         // By-design carve-out, but ordered (C4): with
-                        // queued calls the completion must not
+                        // queued calls an affecting completion must not
                         // overtake its original — fall back in order
-                        // first, then reduce direct below.
+                        // first, then reduce direct below. A
+                        // proved-irrelevant call (the frozen endpoint
+                        // table: info and session-state reads) touches
+                        // nothing the proof relies on and completes no
+                        // operation, so it can neither overtake nor
+                        // orphan a queued call: it reduces direct and
+                        // the feed stays Joint, queued calls still
+                        // waiting for their seals. Anything else
+                        // unsealable (negative-only, unlisted, unknown)
+                        // stays fail-closed on the ordered fallback.
                         Err(StagingRefusal::Unsealable) => {
-                            if state.feed.staged_len() > 0 {
-                                StageAction::FallbackUncounted
-                            } else {
+                            let irrelevant = crate::kinds::function_id(&input.facts.function)
+                                .and_then(crate::semantics_objects::journal::endpoint_class)
+                                == Some(
+                                    crate::semantics_objects::journal::EndpointClass::ProvedIrrelevant,
+                                );
+                            if irrelevant || state.feed.staged_len() == 0 {
                                 StageAction::CarveOut
+                            } else {
+                                StageAction::FallbackUncounted
                             }
                         }
                         Err(StagingRefusal::Full) => StageAction::FallbackCounted,
@@ -2908,6 +3007,7 @@ impl CallerRegistry {
                     StageAction::Staged => return Ok(0),
                     StageAction::CarveOut => {}
                     StageAction::FallbackUncounted => {
+                        direct_counted_in_stage = true;
                         fallback_refused = self.fallback_joint_for_order(
                             id,
                             input.caller,
@@ -2958,6 +3058,14 @@ impl CallerRegistry {
             .semantics
             .get_mut(&id)
             .expect("retained edge");
+        // Count the direct reduction once, under the one reason
+        // that kept it from attribution (no witnessed birth, or
+        // the ended segment's reason in the degraded window);
+        // proved-irrelevant calls never count, and a call staging
+        // already counted is never counted twice.
+        if !direct_counted_in_stage {
+            state.feed.note_direct_reduction(&input.facts.function);
+        }
         let reducer = state.semantics.as_mut().expect("materialized above");
         let mut outer = NoSink;
         let mut tee = KeyUseTee::new(

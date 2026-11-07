@@ -221,7 +221,7 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
             condition.mkdir()
             (condition / "stderr.txt").write_text(
                 "p11scope: discovery:\n"
-                "p11scope: capturing: 136 probe(s) attached; stop with "
+                "p11scope: capturing: 136 probes attached; stop with "
                 "Ctrl-C\n", encoding="utf-8")
             (condition / "observer.stdout").write_text(
                 "probes attached\n", encoding="utf-8")
@@ -507,6 +507,14 @@ class SystemScopeMeasureLaunchTests(unittest.TestCase):
                         case.mkdir()
                         privilege, command = self.capture_observer_launch(
                             case, scope, mode, binary)
+                        # The launch requests concise-mode diagnostics via
+                        # an env prefix (the recorded argv stays the real
+                        # command); strip it before the shape asserts.
+                        self.assertEqual(
+                            command[:2],
+                            ["env", "P11SCOPE_CAPTURE_DIAGNOSTICS=1"],
+                            command)
+                        command = command[2:]
                         require_root_observer_launch(privilege)
                         calls, observed = self.run_owned_command(
                             case, privilege, command)
@@ -543,9 +551,9 @@ class PrivilegedAttachGateTests(unittest.TestCase):
     # Exact spellings pinned by the product test
     # capture_ready_line_names_probes_and_how_to_stop (src/run.rs).
     ATTACH_SPELLINGS = (
-        "p11scope: capturing: 0 probe(s) attached; stop with Ctrl-C",
-        "p11scope: capturing: 1 probe(s) attached; stop with Ctrl-C",
-        "p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C",
+        "p11scope: capturing: waiting for a provider to load; stop with Ctrl-C",
+        "p11scope: capturing: 1 probe attached; stop with Ctrl-C",
+        "p11scope: capturing: 136 probes attached; stop with Ctrl-C",
     )
     DISCOVERY = ("p11scope: discovery: 1 module(s), 68 attach slot(s), "
                  "scan 8ms, conflicts 0, uncorroborated 0")

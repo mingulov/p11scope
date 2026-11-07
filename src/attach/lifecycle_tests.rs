@@ -156,6 +156,7 @@ impl Fixture {
             mount_namespace: view.mount_namespace(),
             key,
             path: self.provider.display().to_string(),
+            tables_scan_finished: false,
             decoder_abi: None,
             exports: vec![],
             tables: vec![],

@@ -3,7 +3,7 @@
 
 // parse_snapshot and reduced-limit entry points are retained reader test seams.
 #[allow(dead_code)]
-mod input;
+pub(crate) mod input;
 
 mod compare;
 mod model;
@@ -115,8 +115,10 @@ fn run_inner(
     if args.json {
         serde_json::to_writer(&mut bytes, &report).context("rendering JSON stdout")?;
         bytes.push(b'\n');
-    } else {
+    } else if crate::cli::text_verbosity() == crate::cli::TextVerbosity::Verbose {
         render::render_text(&report, &mut bytes).context("rendering inventory diff")?;
+    } else {
+        render::render_concise(&report, &mut bytes).context("rendering inventory diff")?;
     }
     match stdout(&bytes) {
         Ok(()) => Ok(0),

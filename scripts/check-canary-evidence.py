@@ -239,7 +239,8 @@ def assert_no_loader_pause_identity(label, data, values=None):
 # identity the capture document may not carry, wherever it appears.
 PUBLISHED_LOADER_PAUSE_FIELDS = {
     "attach_gap_ms", "pause", "pause_attempts", "pause_confirmed",
-    "pause_partial", "pause_unavailable", "loader_discovery",
+    "pause_partial", "pause_unavailable", "pause_engine_incomplete_retirements",
+    "loader_discovery",
     "child_still_running",
     # SYSPLAN residual F-15: the run lane's own child, handed back alive.
     # The operator started this process; naming it leaks no target identity
@@ -272,6 +273,12 @@ TRACE_CONTEXT_LINES = frozenset((
     "Trace — completed call events in arrival order",
     "Executable identity unavailable; event PID/TID remain diagnostic identifiers.",
     "Executable labels use verified observed paths; event PID/TID remain diagnostic identifiers.",
+    "Calls on unverified functions are not decoded (names only).",
+))
+TRACE_TOTALS = re.compile(
+    r"\d+ completed calls?; \d+ returned errors?; \d+ entr(?:y|ies) without an observed return\.")
+TRACE_TAIL_LINES = frozenset((
+    "run with -v for details",
 ))
 
 
@@ -319,6 +326,12 @@ def trace_scannable(label, text):
         if not line or line.startswith((
             "CAPTURE ", "COUNT_EVIDENCE ", "EVIDENCE ", "LOST "
         )):
+            kept.append(line)
+            continue
+        if line in TRACE_TAIL_LINES or line.startswith("coverage: "):
+            kept.append(line)
+            continue
+        if TRACE_TOTALS.fullmatch(line):
             kept.append(line)
             continue
         event = TRACE_EVENT.match(line)
@@ -588,7 +601,7 @@ def assert_unsafe_trace(text):
 
 
 def _assert_aggregate_metrics(doc, expected_calls):
-    assert set(doc) == {"schema", "lane", "capture", "evidence", "functions"}, doc
+    assert set(doc) == {"schema", "lane", "capture", "evidence", "functions", "layer_totals"}, doc
     assert doc["schema"] == "p11scope/observed-profile/v3-metrics"
     assert doc["lane"] == "metrics", doc
     assert doc["capture"]["mode"] == "metrics"
@@ -596,6 +609,12 @@ def _assert_aggregate_metrics(doc, expected_calls):
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
     profile_terminal(doc, "p11scope/observed-profile/v3-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == expected_calls, doc["functions"]
+    # Single-layer canary captures never forward: logical carries the
+    # whole ledger, forwarding stays zero.
+    assert doc["layer_totals"] == {
+        "logical": {"calls": expected_calls, "errors": 0, "in_flight": 0},
+        "forwarding": {"calls": 0, "errors": 0, "in_flight": 0},
+    }, doc["layer_totals"]
 
 
 def assert_aggregate_metrics(doc):
@@ -2762,16 +2781,33 @@ def main(argv=None):
                 "vendor_interfaces": 0, "interface_list": "ok",
             },
             "functions": [{"calls": 28}],
+            "layer_totals": {
+                "logical": {"calls": 28, "errors": 0, "in_flight": 0},
+                "forwarding": {"calls": 0, "errors": 0, "in_flight": 0},
+            },
         }
         assert_aggregate_metrics(aggregate)
         owned_aggregate = json.loads(json.dumps(aggregate))
         owned_aggregate["functions"][0]["calls"] = 30
+        owned_aggregate["layer_totals"]["logical"]["calls"] = 30
         assert_owned_aggregate_metrics(owned_aggregate)
         for calls in (28, 29, 31):
             bad_owned = json.loads(json.dumps(owned_aggregate))
             bad_owned["functions"][0]["calls"] = calls
+            bad_owned["layer_totals"]["logical"]["calls"] = calls
             reject(f"owned metrics call count {calls}",
                    lambda bad_owned=bad_owned: assert_owned_aggregate_metrics(bad_owned))
+        for label, mutate in (
+            ("logical calls", lambda d: d["layer_totals"]["logical"].update(calls=29)),
+            ("logical errors", lambda d: d["layer_totals"]["logical"].update(errors=1)),
+            ("logical in_flight", lambda d: d["layer_totals"]["logical"].update(in_flight=1)),
+            ("forwarding calls", lambda d: d["layer_totals"]["forwarding"].update(calls=1)),
+            ("missing totals", lambda d: d.pop("layer_totals")),
+        ):
+            bad_totals = json.loads(json.dumps(owned_aggregate))
+            mutate(bad_totals)
+            reject(f"owned metrics {label}",
+                   lambda bad_totals=bad_totals: assert_owned_aggregate_metrics(bad_totals))
         extra_metrics = json.loads(json.dumps(aggregate))
         extra_metrics["evidence"]["secret_selection_payload"] = "CANARY"
         reject("metrics extra evidence field", lambda: assert_aggregate_metrics(extra_metrics))

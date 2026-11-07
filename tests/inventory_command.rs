@@ -506,7 +506,7 @@ fn edge_observed_replay_equals_the_snapshot_edges_over_a_reload_run() {
     let text_path = dir.join("edges.txt");
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
-        .args(["--capture", "scan"])
+        .args(["--capture", "scan", "-v"])
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "reload")
         .env("INV_PROV", &prov)
@@ -715,7 +715,7 @@ fn inventory_snapshot_names_the_observed_executable_and_module() {
     // preserving parent custody of its single owned fixture under Yama.
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
-        .args(["--capture", "scan", "--duration", "2s", "-o"])
+        .args(["--capture", "scan", "-v", "--duration", "2s", "-o"])
         .arg(&file)
         .env("INV_DRIVER", &driver)
         .env("INV_MODE", "plain")
@@ -856,7 +856,7 @@ fn out_file_matches_stdout_document() {
 /// The NSS-softokn-shaped fixture publishes 8 interface-linked tables of 68
 /// distinct entry targets each (`catalog-nss/provider.c`): 544 endpoints,
 /// past the 512-slot Detailed ceiling `inspect` judges by, inside the
-/// 4096-endpoint Inventory budget the inventory command instruments under.
+/// 32768-endpoint Inventory budget the inventory command instruments under.
 /// Its verdict must be the Inventory one.
 #[test]
 fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
@@ -934,16 +934,16 @@ fn admission_verdict_uses_the_inventory_budget_not_the_detailed_slot_ceiling() {
     assert_scan_only_entries(edges[0], "driver -> ic-nss.so");
     // The first verdict stood: no admission change history.
     assert_eq!(module["admission"]["history"], serde_json::json!([]));
-    // The run's attach set holds the module's 544 endpoints of 4096.
+    // The run's attach set holds the module's 544 endpoints of 32768.
     assert_eq!(
         doc["budgets"]["inventory_endpoints"],
-        serde_json::json!({"limit": 4096, "occupied": 8 * 68, "refused": 0}),
+        serde_json::json!({"limit": 32768, "occupied": 8 * 68, "refused": 0}),
         "budgets: {}",
         doc["budgets"]
     );
     assert_eq!(
         doc["budgets"]["inventory_attach_modules"],
-        serde_json::json!({"limit": 4096, "occupied": 1, "refused": 0}),
+        serde_json::json!({"limit": 32768, "occupied": 1, "refused": 0}),
     );
     assert_eq!(doc["observation"]["usage_feed"], false);
     drop(guard);
@@ -1206,12 +1206,12 @@ fn s1_command_json_carries_semantic_schema_with_honest_unknowns() {
 #[test]
 fn s1_command_degraded_run_keeps_stderr_honest() {
     // A refused run (dashboard forced onto a pipe) degrades with an
-    // honest stderr notice; the snapshot it emits instead carries the
-    // S1 semantic budget line and withheld columns.
+    // honest stderr notice; the full snapshot it emits under -v
+    // carries the S1 semantic budget line and withheld columns.
     let _guard = serial_guard();
     let dir = tmp("inventory-command-s1-degrade");
     let driver = LiveDriver::spawn(&dir, "s1d", &["s1d-p1.so"]);
-    let output = observe(driver.pid, &["--capture", "scan", "--dashboard"]);
+    let output = observe(driver.pid, &["--capture", "scan", "--dashboard", "-v"]);
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "degraded run exits 0: {stderr}");
     assert!(
@@ -1359,7 +1359,7 @@ fn capture_native_without_privilege_is_an_error_naming_why() {
 }
 
 #[test]
-fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
+fn capture_auto_without_privilege_falls_back_to_scan_for_pid() {
     if running_as_root() {
         eprintln!("skipped: root runs the native lane under auto");
         return;
@@ -1367,22 +1367,11 @@ fn capture_auto_without_privilege_requires_multi_before_scan_fallback() {
     let _guard = serial_guard();
     let dir = tmp("inventory-command-auto-fallback");
     let driver = LiveDriver::spawn(&dir, "af", &["af-p1.so"]);
-    let host_refusal = multi_host::refusal();
+    // PID scope always falls back to the scan lane with a named gap,
+    // whether the host preflight or the native opening refuses.
     for args in [vec!["--json"], vec!["--capture", "auto", "--json"]] {
         let output = observe(driver.pid, &args);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if let Some(reason) = &host_refusal {
-            assert_eq!(output.status.code(), Some(1), "{args:?}: {stderr}");
-            assert_eq!(
-                stderr,
-                format!("p11scope: inventory --pid {}: {reason}\n", driver.pid)
-            );
-            assert!(
-                output.stdout.is_empty(),
-                "no scan fallback on an ineligible host"
-            );
-            continue;
-        }
         assert!(output.status.success(), "{args:?}: {stderr}");
         assert!(
             stderr.contains("native usage feed unavailable, continuing with the scan lane"),

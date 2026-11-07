@@ -384,6 +384,9 @@ fn attempt_observe(
     let _ = std::fs::remove_file(&out_file);
     let report = report_dir.join(format!("report-{attempt}.json"));
     let mut args: Vec<String> = observer_args.to_vec();
+    // Progress lines are verbose-only since CLI-1, and the selected-pid
+    // proof below reads them: full detail is this helper's precondition.
+    args.push("-v".to_string());
     args.push("--json".to_string());
     args.push("-o".to_string());
     args.push(report.to_str().unwrap().to_string());

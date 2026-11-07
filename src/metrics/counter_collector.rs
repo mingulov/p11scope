@@ -313,6 +313,23 @@ const _: () = {
     assert!(align_of::<AttachKey>() <= 8);
 };
 
+/// Per-bank gaps from one counter acquisition: slots whose bank cell could
+/// not be folded (their counts are unknown, not exact) and whether the
+/// health or kernel evidence read failed (evidence degraded, not exact).
+/// All zeros/false when the acquisition was exact.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct CounterGaps {
+    pub failed_slots: u64,
+    pub health_failed: bool,
+    pub kernel_failed: bool,
+}
+
+impl CounterGaps {
+    pub(super) fn is_clean(&self) -> bool {
+        self.failed_slots == 0 && !self.health_failed && !self.kernel_failed
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct CounterRead {
     generation: NonZeroU64,
@@ -321,6 +338,7 @@ pub(super) struct CounterRead {
     rows: Result<Arc<CounterRows>, CounterIssue>,
     health: CounterHealth,
     kernel: KernelEvidence,
+    gaps: CounterGaps,
 }
 
 #[derive(Clone, Copy)]
@@ -331,6 +349,7 @@ pub(super) struct CounterReadView<'a> {
     pub(super) rows: Result<&'a [CounterRow], CounterIssue>,
     pub(super) health: CounterHealth,
     pub(super) kernel: KernelEvidence,
+    pub(super) gaps: CounterGaps,
 }
 
 impl CounterRead {
@@ -346,7 +365,14 @@ impl CounterRead {
                 .map_err(|&issue| issue),
             health: self.health,
             kernel: self.kernel,
+            gaps: self.gaps,
         }
+    }
+
+    /// Attach per-bank gaps to an acquisition that folded partial rows.
+    /// Exact acquisitions keep the default clean gaps.
+    pub(super) fn set_gaps(&mut self, gaps: CounterGaps) {
+        self.gaps = gaps;
     }
 
     /// A known-generation fold/limit failure is an explicit loss input. An
@@ -384,6 +410,7 @@ impl CounterRead {
             rows,
             health,
             kernel,
+            gaps: CounterGaps::default(),
         })
     }
 
@@ -596,6 +623,20 @@ impl CounterCollector {
             Err(CollectionFailure::Budget) => {
                 return CounterObservation::ReadFailed(ReadStage::Budget);
             }
+        }
+        if same_generation && !read.view().gaps.is_clean() {
+            // Per-bank gaps with an existing baseline preserve the complete
+            // baseline and report stale with named counts; only a first read
+            // (no baseline) installs a partial baseline with gaps. Gaps are
+            // transient (no sticky latch) so a later exact read can still
+            // telescope from the preserved baseline.
+            let gaps = read.view().gaps;
+            let issue = if gaps.failed_slots > 0 {
+                CounterIssue::Topology
+            } else {
+                CounterIssue::KernelEvidence
+            };
+            return CounterObservation::Unavailable(issue);
         }
         let observation = if same_generation {
             // A successful first read installs a baseline. An unsuccessful

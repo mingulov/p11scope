@@ -152,6 +152,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   `before_admission`). It never names a pid. At most 256 entries are
   listed; the rows of the rest are summed in `unbound_rows_truncated`
   (0 when nothing was cut). A scan-lane run always reads `[]` and 0.
+  `modules[].unbound_use.entries` is snapshot-only: the stream carries
+  row deltas per (module, reason), and per-reason entry deltas would
+  need a new map.
   Every `pass_committed` also carries `edge_events` (the `edge_observed`
   records the commit wrote just before it) and `edge_events_deferred`
   (changed edges still waiting past the per-pass cap; see
@@ -425,8 +428,8 @@ from it.
 {"schema": "p11scope/inventory-events/v1", "seq": 0, "at_ns": 100, "kind": "started",
  "event": {"scope": "pid:4242", "clock": {"basis": "CLOCK_MONOTONIC", "unit": "ns"},
            "started_ns": 100, "limits": {"callers": 4096, "modules": 4096, "edges": 32768,
-           "endpoints": 1048576, "inventory_endpoints": 4096,
-           "inventory_attach_modules": 4096, "semantic_state": 32768,
+           "endpoints": 1048576, "inventory_endpoints": 32768,
+           "inventory_attach_modules": 32768, "semantic_state": 32768,
            "retained_history": 1024}}}
 {"schema": "p11scope/inventory-events/v1", "seq": 1, "at_ns": 110, "kind": "caller_event",
  "event": {"event": "admitted", "caller": "c0"}}

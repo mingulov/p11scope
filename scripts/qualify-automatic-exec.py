@@ -4181,15 +4181,19 @@ def build_manifest(discover_pin, module_path, out_path, env, uid, gid):
 
 
 LIVE_PREFIX = "\x1b[2J\x1b[H"
-LIVE_TOTALS = re.compile(r"(\d+) completed calls; (\d+) returned errors; (\d+) entries without an observed return\.")
+LIVE_TOTALS = re.compile(r"(\d+) completed calls?; (\d+) returned errors?; (\d+) entr(?:y|ies) without an observed return\.")
 LIVE_ROW = re.compile(r"(\S+)\s+(\d+)\s+(\d+)\s+\S+\s+\S+\s+\S+\s+(\d+)")
+
+
+VERBOSE_HINT = "run with -v for details"
 
 
 def parse_live_frames(text, final=True):
     """Parse complete public LiveDisplay snapshots, never sum redraws.
 
     Cursors are character offsets in the captured stream, not rendered wall
-    clocks. A frame commits only at its terminating Evidence line/newline.
+    clocks. A frame commits only at its terminating line/newline: the
+    Evidence line under -v, the verbose hint in concise text.
     """
     if len(text.encode("utf-8")) > 8 * 1024 * 1024:
         raise ValueError("owned PTY output exceeds bounded byte limit")
@@ -4210,7 +4214,14 @@ def parse_live_frames(text, final=True):
         if len(frame.encode("utf-8")) > 65536:
             raise ValueError("public live frame exceeds bounded size")
         lines = frame.splitlines(keepends=True)
-        terminated = bool(lines and lines[-1].startswith("Evidence: ") and lines[-1].endswith("\n"))
+        terminated = bool(
+            lines
+            and lines[-1].endswith("\n")
+            and (
+                lines[-1].startswith("Evidence: ")
+                or lines[-1].strip() == VERBOSE_HINT
+            )
+        )
         if not terminated:
             if final or next_frame >= 0:
                 raise ValueError("incomplete public live frame")

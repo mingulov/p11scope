@@ -169,7 +169,7 @@ class Journey:
         changed = copy.deepcopy(value)
         changed["modules"][0]["identity"]["sha256"] = "b" * 64
         write_input(after, changed)
-        readable(success(self.diff(before, after)), (
+        readable(success(self.diff(before, after, "-v")), (
             "1 application group changed", "/bin/driver", "m0.so", "/scale/m0.so",
             "Different module content observed at this path"))
         summary_counts(self.parity(before, after), application_groups_changed=1,
@@ -177,7 +177,7 @@ class Journey:
         self.cells.append("fixture-known-content-change-and-json-file-parity")
 
         write_input(after, value)
-        readable(success(self.diff(before, after)), (
+        readable(success(self.diff(before, after, "-v")), (
             "No differences in the compared inventory observations", "scope completeness",
             "unknown", "fixture coverage unknown"))
         summary_counts(self.parity(before, after), application_groups_changed=0,
@@ -198,7 +198,7 @@ class Journey:
         escaped["callers"][0]["image"]["exe"]["path"] = "/bin/app\n\x1b[31m"
         escaped["modules"][0]["paths"] = ["/lib/module\t\r.so"]
         write_input(after, escaped)
-        readable(success(self.diff(before, after)), (
+        readable(success(self.diff(before, after, "-v")), (
             "/bin/app\\n\\u{1b}[31m", "/lib/module\\t\\r.so"))
         report = self.parity(before, after)
         require("/bin/app\n\x1b[31m" in report["comparison"]["application_paths"],
@@ -230,7 +230,7 @@ class Journey:
             require(document.get("callers") and document.get("modules") and document.get("edges"),
                     f"saved input lacks caller/module/edge population: {path}")
         report = self.parity(before, after)
-        text = readable(success(self.diff(before, after)))
+        text = readable(success(self.diff(before, after, "-v")))
         require(report["summary"]["application_groups_compared"] > 0,
                 "saved-input acceptance has no application groups")
         dictionary = report["comparison"]["application_paths"]

@@ -2358,7 +2358,10 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
     let edges_json = document["edges"].as_array().unwrap();
     assert_eq!(edge_events.len(), edges_json.len());
 
-    let snapshot = crate::inventory_present::render_snapshot(&presentation);
+    let snapshot = crate::inventory_present::render_snapshot_with_verbosity(
+        &presentation,
+        crate::cli::TextVerbosity::Verbose,
+    );
     let frame = frame_for(&presentation);
     let viewport = Viewport {
         width: 200,
@@ -2384,7 +2387,8 @@ fn mixed_coverage_renders_identically_in_json_jsonl_and_dashboard() {
         assert_eq!(coverage["state"], edge.coverage.state(), "{name}");
         // Snapshot and dashboard: one label, one compact count, one
         // activity — each derived from the same view.
-        let label = crate::inventory_present::coverage_label(&edge.coverage);
+        let label =
+            crate::inventory_present::coverage_label_at(&edge.coverage, presentation.ended_ns);
         let line = snapshot
             .lines()
             .find(|line| {
@@ -2785,7 +2789,7 @@ fn assert_compact_log_drop_accounting_with_large_counters(width: usize) {
         );
         assert!(
             text.contains(&truncate_cell(
-                &crate::inventory_present::observation_label(edge),
+                &crate::inventory_present::observation_label_at(edge, presentation.ended_ns),
                 width
             )),
             "complete observation row: {text}"
@@ -4480,7 +4484,9 @@ fn f7_renderers_indexed_and_linear_bytes_match() {
     // Catch dropped/reordered facts or changed frame bytes when the optional
     // cache is present versus refused/defaulted. Include the real 4097 cap twin.
     use crate::discovery::caller_registry::instance_input::InstanceLifecycle;
-    use crate::inventory_present::{GapView, PresentationRenderIndex, render_snapshot};
+    use crate::inventory_present::{
+        GapView, PresentationRenderIndex, render_snapshot_with_verbosity,
+    };
 
     for children in [0, 1, 8, 9, 4096, 4097] {
         let mut presentation = f7_render_fixture(2, children);
@@ -4524,8 +4530,12 @@ fn f7_renderers_indexed_and_linear_bytes_match() {
         }
         let mut linear = presentation.clone();
         linear.render_index = Default::default();
-        let snapshot = render_snapshot(&presentation);
-        assert_eq!(snapshot, render_snapshot(&linear));
+        let snapshot =
+            render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+        assert_eq!(
+            snapshot,
+            render_snapshot_with_verbosity(&linear, crate::cli::TextVerbosity::Verbose)
+        );
         assert_eq!(snapshot.matches("  instance ").count(), children);
         assert!(snapshot.contains("Unknown executable"));
         assert!(snapshot.contains("Unknown module"));
@@ -4643,7 +4653,7 @@ fn f7_hot_edge_redraw_allocation_is_independent_of_hidden_children() {
 #[test]
 fn f7_large_counts_and_unknowns_survive_indexed_rendering() {
     // Catch narrowing/float conversions or rendering an unknown as zero.
-    use crate::inventory_present::{PresentationRenderIndex, render_snapshot};
+    use crate::inventory_present::{PresentationRenderIndex, render_snapshot_with_verbosity};
     let mut presentation = f7_render_fixture(1, 2);
     presentation.edges[0].entry_count = u64::MAX - 1;
     presentation.edges[0].semantics = observed_presentation().edges[0].semantics.clone();
@@ -4678,7 +4688,8 @@ fn f7_large_counts_and_unknowns_survive_indexed_rendering() {
         Some(9_007_199_254_740_993)
     );
     assert!(json["semantic_edges"][1]["api_returns"]["count"].is_null());
-    let snapshot = render_snapshot(&presentation);
+    let snapshot =
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(snapshot.contains("9007199254740993"));
     assert!(snapshot.contains("18446744073709551614"));
     assert!(snapshot.contains("api_returns=unknown"));
@@ -4693,7 +4704,10 @@ fn f7_large_counts_and_unknowns_survive_indexed_rendering() {
     assert!(text.contains("api_returns=unknown"), "{text}");
     let mut linear = presentation;
     linear.render_index = Default::default();
-    assert_eq!(snapshot, render_snapshot(&linear));
+    assert_eq!(
+        snapshot,
+        render_snapshot_with_verbosity(&linear, crate::cli::TextVerbosity::Verbose)
+    );
     assert_eq!(
         frame,
         render_frame(&frame_for(&linear), viewport, &DashboardState::new())

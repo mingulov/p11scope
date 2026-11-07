@@ -420,12 +420,24 @@ impl super::Session {
     /// A failed audit is permanent for this Session; ordinary fault resets
     /// never clear the image failure cell.
     pub(crate) fn audit_image_continuity(&self) -> Result<(), ImageQueryRefusal> {
+        self.audit_image_continuity_raised().map(|_| ())
+    }
+
+    /// [`Self::audit_image_continuity`], reporting whether this audit raised
+    /// the fault era for new hook misses: a scan bracket closed by a raising
+    /// audit read its epochs before the raise and must retry.
+    pub(crate) fn audit_image_continuity_raised(&self) -> Result<bool, ImageQueryRefusal> {
         if !self.policy.wants_instance_hooks() {
             return Err(ImageQueryRefusal::Policy);
         }
         self.instance
             .audit(&self.ebpf, &self.image_coverage)
             .map_err(|_| ImageQueryRefusal::Coverage)
+    }
+
+    /// Hook recursion-miss total and miss-caused fault raises (counts only).
+    pub(crate) fn hook_miss_totals(&self) -> (u64, u64) {
+        self.instance.miss_totals()
     }
 
     pub(crate) fn query_images(
@@ -541,7 +553,7 @@ impl<F: Fn() -> u64> ScanSource for LiveImageScan<'_, F> {
     fn budget(&self) -> Result<(), ImageQueryRefusal> {
         check_deadline(self.window.deadline())
     }
-    fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+    fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
         self.budget()?;
         if !self
             .watched
@@ -550,8 +562,9 @@ impl<F: Fn() -> u64> ScanSource for LiveImageScan<'_, F> {
         {
             return Err(ImageQueryRefusal::Custody);
         }
-        self.session.audit_image_continuity()?;
-        self.budget()
+        let raised = self.session.audit_image_continuity_raised()?;
+        self.budget()?;
+        Ok(raised)
     }
     fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
         let batch = self.session.query_images(&[self.pin], self.window)?;
@@ -1171,7 +1184,9 @@ impl ImageAbsenceProof {
 
 trait ScanSource {
     fn budget(&self) -> Result<(), ImageQueryRefusal>;
-    fn audit(&mut self) -> Result<(), ImageQueryRefusal>;
+    /// Audits continuity; `true` when this audit raised the fault era (a
+    /// closing audit that raised invalidates the bracket's epoch reads).
+    fn audit(&mut self) -> Result<bool, ImageQueryRefusal>;
     fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal>;
     fn epochs(&mut self) -> Result<CompleteEpochs, ImageQueryRefusal>;
     fn ranges(&mut self) -> Result<Vec<MapRange>, ImageQueryRefusal>;
@@ -1213,12 +1228,14 @@ fn scan_with(
         let mut ranges = source.ranges()?;
         let after_epochs = source.epochs()?;
         let after_image = source.query()?;
-        source.audit()?;
+        // A closing audit that raised the fault era (new hook misses)
+        // means the epochs above predate the raise: retry the bracket.
+        let raised = source.audit()?;
         source.budget()?;
         if !source.fence(fence) {
             return Err(ImageQueryRefusal::Fence);
         }
-        if image != after_image || epochs != after_epochs {
+        if raised || image != after_image || epochs != after_epochs {
             continue;
         }
         if epochs.sticky != 0
@@ -1282,12 +1299,14 @@ fn prove_absence_with(
         let attach_generation = source.attach_generation()?;
         let after_epochs = source.epochs()?;
         let after_image = source.query()?;
-        source.audit()?;
+        // A closing audit that raised the fault era (new hook misses)
+        // means the epochs above predate the raise: retry the bracket.
+        let raised = source.audit()?;
         source.budget()?;
         if !source.fence(fence) {
             return Err(ImageQueryRefusal::Fence);
         }
-        if image != after_image || epochs != after_epochs {
+        if raised || image != after_image || epochs != after_epochs {
             continue;
         }
         if epochs.sticky != 0
@@ -1354,12 +1373,12 @@ fn prove_absence_with(
         // refuses on generation.)
         let verify_epochs = source.epochs()?;
         let verify_image = source.query()?;
-        source.audit()?;
+        let raised = source.audit()?;
         source.budget()?;
         if !source.fence(fence) {
             return Err(ImageQueryRefusal::Fence);
         }
-        if image != verify_image || epochs != verify_epochs {
+        if raised || image != verify_image || epochs != verify_epochs {
             continue;
         }
         return Ok(ImageAbsenceProof {
@@ -1397,8 +1416,8 @@ pub(crate) fn acquire_test_scan(
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             Ok(())
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
-            Ok(())
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
+            Ok(false)
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
             Ok(self.image)
@@ -1473,8 +1492,8 @@ pub(crate) fn acquire_test_absence(
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             Ok(())
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
-            Ok(())
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
+            Ok(false)
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
             Ok(self.image)
@@ -1784,7 +1803,7 @@ mod tests {
         epoch_changes: VecDeque<CompleteEpochs>,
         empty_ranges: bool,
         expire_on_ranges: bool,
-        audit_reader: Option<Box<dyn FnMut() -> Result<(), ImageQueryRefusal>>>,
+        audit_reader: Option<Box<dyn FnMut() -> Result<bool, ImageQueryRefusal>>>,
     }
     impl ScanSource for Script {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
@@ -1794,15 +1813,16 @@ mod tests {
                 Ok(())
             }
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
             self.audits += 1;
+            let mut raised = false;
             if let Some(read) = &mut self.audit_reader {
-                read()?;
+                raised = read()?;
             }
             if Some(self.audits) == self.audit_failure {
                 return Err(ImageQueryRefusal::Coverage);
             }
-            Ok(())
+            Ok(raised)
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
             self.images.pop_front().ok_or(ImageQueryRefusal::Unstable)
@@ -2255,7 +2275,7 @@ mod tests {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             self.script.budget()
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
             self.script.audit()
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
@@ -2385,7 +2405,7 @@ mod tests {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             self.script.budget()
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
             self.script.audit()
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
@@ -2467,6 +2487,43 @@ mod tests {
         // Three audits per sealed attempt: opening, closing, and the
         // post-confirmation bracket (N14).
         assert_eq!(source.script.audits, 3);
+    }
+
+    /// A closing audit that raised the fault era (new hook misses) ends
+    /// the bracket: its epochs were read before the raise, so the seal
+    /// retries instead of carrying the pre-raise fault value.
+    #[test]
+    fn a_raising_closing_audit_retries_both_seals() {
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 0,
+        };
+        let raise_at = |at: usize| {
+            let mut calls = 0;
+            Some(Box::new(move || {
+                calls += 1;
+                Ok(calls == at)
+            })
+                as Box<dyn FnMut() -> Result<bool, ImageQueryRefusal>>)
+        };
+        let mut positive = script(0);
+        positive.images = VecDeque::from(vec![image; 4]);
+        positive.audit_reader = raise_at(2);
+        assert!(scan_with(&mut positive, domain(), 0, 4).is_ok());
+        assert_eq!(positive.audits, 4, "the raised attempt is retried");
+        // Raised at the closing audit (2): that attempt stops before its
+        // verification audit; raised at the verification audit (3): the
+        // whole attempt reruns. Three audits per sealed attempt.
+        for (at, audits) in [(2, 5), (3, 6)] {
+            let mut absence = absence_script();
+            absence.script.images = VecDeque::from(vec![image; 6]);
+            absence.script.audit_reader = raise_at(at);
+            assert!(prove_absence_with(&mut absence, domain(), 3, 4).is_ok());
+            assert_eq!(
+                absence.script.audits, audits,
+                "audit {at} raised: the attempt is retried"
+            );
+        }
     }
 
     #[test]
@@ -2607,8 +2664,8 @@ mod tests {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             Ok(())
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
-            Ok(())
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
+            Ok(false)
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
             Ok(self.image)
@@ -2775,8 +2832,8 @@ mod tests {
         fn budget(&self) -> Result<(), ImageQueryRefusal> {
             Ok(())
         }
-        fn audit(&mut self) -> Result<(), ImageQueryRefusal> {
-            Ok(())
+        fn audit(&mut self) -> Result<bool, ImageQueryRefusal> {
+            Ok(false)
         }
         fn query(&mut self) -> Result<ImageIdentity, ImageQueryRefusal> {
             Ok(self.image)

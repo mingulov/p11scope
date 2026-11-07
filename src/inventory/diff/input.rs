@@ -207,6 +207,7 @@ pub(super) struct UnboundUse {
     pub first_ns: u64,
     pub rows: u64,
     pub reasons: BTreeMap<String, u64>,
+    pub entries: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Module {
@@ -334,6 +335,14 @@ pub(super) struct Gap {
     pub repeats: u64,
 }
 
+/// Default per-input bounds, also published in the diff help text: the
+/// help line is built from these constants, never a hard-coded copy.
+pub(crate) const DEFAULT_INPUT_BYTES: usize = 67_108_864;
+pub(crate) const DEFAULT_INPUT_ROWS: usize = 250_000;
+pub(crate) const DEFAULT_INPUT_STRING_BYTES: usize = 16_384;
+pub(crate) const DEFAULT_INPUT_DEPTH: usize = 64;
+pub(crate) const DEFAULT_INPUT_NODES: usize = 2_000_000;
+
 #[derive(Debug, Clone, Copy)]
 pub(super) struct InputLimits {
     pub bytes: usize,
@@ -345,11 +354,11 @@ pub(super) struct InputLimits {
 impl Default for InputLimits {
     fn default() -> Self {
         Self {
-            bytes: 67_108_864,
-            rows: 250_000,
-            string_bytes: 16_384,
-            depth: 64,
-            nodes: 2_000_000,
+            bytes: DEFAULT_INPUT_BYTES,
+            rows: DEFAULT_INPUT_ROWS,
+            string_bytes: DEFAULT_INPUT_STRING_BYTES,
+            depth: DEFAULT_INPUT_DEPTH,
+            nodes: DEFAULT_INPUT_NODES,
         }
     }
 }
@@ -914,10 +923,18 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
     let unbound_use = o
         .optional_object("unbound_use", true)?
         .map(|u| {
+            // Captures that predate folded entry counts carry no
+            // `entries` key; they read as zero, never as a refusal.
+            let entries = if u.fields.contains_key("entries") {
+                u.uint("entries")?
+            } else {
+                0
+            };
             Ok::<_, anyhow::Error>(UnboundUse {
                 first_ns: u.uint("first_ns")?,
                 rows: u.uint("rows")?,
                 reasons: u.u64_map("reasons")?,
+                entries,
             })
         })
         .transpose()?;

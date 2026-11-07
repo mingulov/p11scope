@@ -1288,6 +1288,27 @@ fn pin_failure(pid: u32) -> String {
     }
 }
 
+/// A named `--pid` with no live process behind it. Every command reports
+/// it as one complete stderr line with exit 1 and no added context.
+/// Typed so each boundary (`run`, `inspect`, `inventory`, `main`) can
+/// pass it through instead of wrapping it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MissingNamedProcess {
+    pub pid: u32,
+}
+
+impl std::fmt::Display for MissingNamedProcess {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "no process with PID {} (it exited, or the PID is mistyped)",
+            self.pid
+        )
+    }
+}
+
+impl std::error::Error for MissingNamedProcess {}
+
 impl PidPin {
     pub fn open(pid: u32) -> Result<Self, String> {
         let start_time = process_start_time(pid).ok();
@@ -1679,7 +1700,6 @@ mod tests {
     use crate::fixture_guard::DieWithParent as _;
     use std::cell::{Cell, RefCell};
     use std::collections::VecDeque;
-    use std::os::unix::process::CommandExt as _;
     use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
     use std::time::{Duration, Instant};
@@ -2497,16 +2517,29 @@ int main(int argc, char **argv) {
     #[test]
     fn stat_fields_survive_a_comm_with_parens_spaces_and_a_fake_state() {
         let dir = tempfile::tempdir().unwrap();
-        // `comm` is the basename the exec was given (at most 15 bytes);
-        // argv[0] stays `sleep` for multi-call coreutils.
+        // Hermetic sleeper: this host's `/bin/sleep` is a uutils multicall
+        // shim dispatching on AT_EXECFN (see run.rs `build_sleeper`), so it
+        // exits 1 under a renamed link while GNU sleep survives. `comm` is
+        // the basename the exec was given (at most 15 bytes).
+        let source = dir.path().join("sleeper.c");
+        let sleeper = dir.path().join("sleeper");
+        std::fs::write(
+            &source,
+            "#include <unistd.h>\nint main(void) { for (;;) sleep(60); return 0; }\n",
+        )
+        .unwrap();
+        assert!(
+            Command::new("gcc")
+                .args(["-O0", "-o"])
+                .arg(&sleeper)
+                .arg(&source)
+                .status()
+                .unwrap()
+                .success()
+        );
         let link = dir.path().join("a) Z 1 (b");
-        std::os::unix::fs::symlink("/bin/sleep", &link).unwrap();
-        let mut child = Command::new(&link)
-            .arg0("sleep")
-            .arg("30")
-            .die_with_parent()
-            .spawn()
-            .unwrap();
+        std::os::unix::fs::symlink(&sleeper, &link).unwrap();
+        let mut child = Command::new(&link).die_with_parent().spawn().unwrap();
         let pid = child.id();
         let deadline = Instant::now() + Duration::from_secs(5);
         let stat = loop {

@@ -118,7 +118,8 @@ def refusal_case(limit=4096):
 
     Sixty full 68-endpoint copies plus a 17-endpoint tail make 4,097; the
     tail is refused whole with the lowering wording observed on a real N+1
-    run, and the admitted 4,080 endpoints keep exact native counts.
+    run, and the admitted 4,080 endpoints keep exact native counts. With
+    limit=32768 this makes 481 full copies plus a 61-endpoint tail (32769).
     """
     demand = limit + 1
     full, tail = divmod(demand, 68)
@@ -348,8 +349,8 @@ class CapacityOracleTests(unittest.TestCase):
                     row["phase"] = "late"
         self.run_case(skipped, 1, "CAPACITY-GROWTH")
 
-    def run_refusal_case(self, mutate=None, want=0, check=None):
-        manifest, ledger, late = refusal_case()
+    def run_refusal_case(self, mutate=None, want=0, check=None, limit=4096):
+        manifest, ledger, late = refusal_case(limit)
         if mutate:
             mutate(manifest, ledger, late)
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
@@ -365,6 +366,9 @@ class CapacityOracleTests(unittest.TestCase):
 
     def test_refusal_pair_accepts_named_whole_refusal(self):
         self.run_refusal_case()
+
+    def test_refusal_pair_accepts_the_raised_default_limit(self):
+        self.run_refusal_case(limit=32768)
 
     def test_refusal_scan_pinned_with_disclosure_passes_authority(self):
         def scan_lane(_manifest, _ledger, late):
@@ -505,6 +509,9 @@ class CapacityOracleTests(unittest.TestCase):
             manifest["expect_lane"] = "scan"
             late["observation"]["lane"] = "scan"
         self.run_refusal_case(scan, 2, "CAPACITY-NATIVE")
+
+    def test_capacity_check_rejects_limit_above_the_ceiling(self):
+        self.run_case(lambda m, _l, _a, _b: m.update(limit=131073), 1, "CAPACITY-INPUT")
 
 
 class CapacityFixtureTests(unittest.TestCase):
@@ -670,11 +677,20 @@ class CapacityFixtureTests(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-usage-") as temporary:
             output = Path(temporary) / "must-not-exist"
             result = subprocess.run(["bash", str(SHELL), sys.executable, "--base", str(output),
-                                     "--capacity", "boundary", "--max-endpoints", "8193"],
+                                     "--capacity", "boundary", "--max-endpoints", "131073"],
                                     capture_output=True, text=True, timeout=5)
             self.assertEqual(result.returncode, 64, result.stdout + result.stderr)
-            self.assertIn("1..8192", result.stderr)
+            self.assertIn("1..131072", result.stderr)
             self.assertFalse(output.exists())
+
+    def test_runner_accepts_selections_above_the_old_ceiling(self):
+        for selected in ("8193", "32768", "131072"):
+            with self.subTest(selected=selected):
+                result = subprocess.run(["bash", str(SHELL), sys.executable,
+                                         "--capacity", "boundary", "--max-endpoints", selected],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertEqual(result.returncode, 70, result.stdout + result.stderr)
+                self.assertIn("must run as root", result.stderr)
 
     def test_capacity_population_requires_explicit_endpoint_selection(self):
         result = subprocess.run(["bash", str(SHELL), sys.executable, "--capacity", "boundary"],
@@ -684,7 +700,7 @@ class CapacityFixtureTests(unittest.TestCase):
 
     def test_prepared_boundary_demands_come_from_distinct_mapped_objects(self):
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-boundaries-") as temporary:
-            for demand in (4097, 6531, 8192):
+            for demand in (4097, 6531, 8192, 32769):
                 directory = Path(temporary) / str(demand)
                 result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-prepare",
                                          str(directory), "boundary", str(demand)],
@@ -698,7 +714,7 @@ class CapacityFixtureTests(unittest.TestCase):
 
     def test_prepared_refusal_demands_are_exactly_one_past_their_limits(self):
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-refusal-") as temporary:
-            for limit, demand in ((4096, 4097), (6530, 6531), (8191, 8192)):
+            for limit, demand in ((4096, 4097), (6530, 6531), (8191, 8192), (32768, 32769)):
                 directory = Path(temporary) / str(demand)
                 result = subprocess.run([sys.executable, "-I", str(ORACLE), "capacity-prepare",
                                          str(directory), "refusal", str(demand)],
@@ -755,6 +771,16 @@ class CapacityFixtureTests(unittest.TestCase):
                                     capture_output=True, text=True, timeout=5)
         self.assertEqual(mismatched.returncode, 64, mismatched.stdout + mismatched.stderr)
         self.assertIn("exactly one above", mismatched.stderr)
+        new_pair = subprocess.run(["bash", str(SHELL), sys.executable,
+                                 "--capacity", "refusal", "--max-endpoints", "32768", "--demand", "32769"],
+                                capture_output=True, text=True, timeout=5)
+        self.assertEqual(new_pair.returncode, 70, new_pair.stdout + new_pair.stderr)
+        self.assertIn("must run as root", new_pair.stderr)
+        new_mismatch = subprocess.run(["bash", str(SHELL), sys.executable,
+                                     "--capacity", "refusal", "--max-endpoints", "32768", "--demand", "6531"],
+                                    capture_output=True, text=True, timeout=5)
+        self.assertEqual(new_mismatch.returncode, 64, new_mismatch.stdout + new_mismatch.stderr)
+        self.assertIn("exactly one above", new_mismatch.stderr)
 
     def test_alias_surface_and_bounded_control_calls(self):
         with tempfile.TemporaryDirectory(prefix="inventory-capacity-fixture-") as temporary:

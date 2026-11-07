@@ -10,7 +10,8 @@ entries under Prior releases retain their historical context.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses with `live capture unavailable` or `live capture did not
+start` before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -25,40 +26,38 @@ Readiness bounds are disclosed harness parameters, never a cold-start SLA.
 
 ## Known limitations in 0.6.0
 
-The following limits apply to the v0.6.0 release. Entries marked
-"verify at candidate" rest on the current integration tip and the final
-integration may still move them; the candidate pass confirms the numbers.
+The following limits apply to the v0.6.0 release. Rate, latency and
+start-up figures below were measured on the pre-freeze integration
+lane; the [Qualification record](../CHANGELOG.md#qualification-of-this-release)
+names the source SHA behind each check the release rounds re-measured.
 
 - Key operations sustain 6,250 calls/s for 60 s with exact per-key rows
   and no capture loss in every measured run at that rate; plain call
   counts stay exact at 10,000 calls/s for 60 s. Above 6,250 calls/s the
   16 MiB event ring can overflow between reads and key-operation
   tracking ends with a named gap. Sustained 10,000 calls/s for key
-  operations is planned for 0.7.0. (verify at candidate: the final
-  integration re-runs the rate campaign)
+  operations is planned for 0.7.0.
 - Key-operation rows lag their calls: p99 from call return to visible
   row is about 1.6-1.9 s in quiet runs (1,624 ms and 1,895 ms in two
   qualified 60 s runs), against the 1.5 s target; under host load it
-  rises toward about 4 s. (verify at candidate)
+  rises toward about 4 s.
 - Key-operation tracking may not start at all in about 1 in 4 runs (3
   of 12 measured cells, at every call rate): no birth is offered for
   the tracked process, reported as `joint_birth_unoffered` with "Joint
   birth unavailable; retained S1". Plain call counts stay exact in
-  those runs. (verify at candidate: a diagnosis lane is still working
-  this startup race)
+  those runs; re-running the capture is the workaround.
 - On busy hosts the kernel can skip re-entrant runs of the mapping
   hooks; each skip raises a new fault era. Calls across the skip are
   shed with exact counts and a named cause, affected instance rows read
-  `uncertain`, and key-operation tracking ends with its own named gap
-  (`joint_seal_fault_changed_history_loss`) while plain counting
-  continues. (verify at candidate: the final integration adds an
-  explicit "continuity uncertain" flag on merged rows plus hook-miss
-  totals on the stop line)
+  `uncertain`, and key operations the observer cannot attribute with
+  certainty are counted in named `not attributed` reasons while exact
+  rows continue for the rest.
 - A call from an untracked process that is still in progress when key
-  operations are sealed cannot be accounted for, so tracking ends
-  after about 6 s with a `joint audit made no progress` gap instead
-  of waiting for the run deadline. This ends tracking; it never
-  hangs, and the plain per-call counts are unaffected.
+  operations are sealed cannot be accounted for, so it is counted in
+  named `not attributed` reasons instead of waiting for the run
+  deadline. Exact per-key rows continue for operations the observer can
+  attribute with certainty, and the plain per-call counts are
+  unaffected.
 - The memory of refused processes holds 16,448 entries. Past that,
   every new untracked caller keeps the plain per-call view with the
   same `joint_image_refused` reason; processes refused earlier stay
@@ -69,47 +68,89 @@ integration may still move them; the candidate pass confirms the numbers.
   for the whole run, so the child runs unwatched. Those runs report
   PARTIAL (incomplete) with the named cause "loader BPF delivery
   failure suspected"; no run reports a wrong count. No miss was seen on
-  quiet hosts (0/120 on Fedora). (verify at candidate)
+  quiet hosts (0/120 on Fedora).
 - A child process can use a provider before it is watched: calls made
   before the watch starts are missed, and the affected watch reads
   `unknown` with reason `use_before_admission`; the JSON also carries a
   `before_semantic_boundary` gap ("physical provider use preceded first
   observed semantic registration") and the late provider's unwatched
   window. Affected runs read PARTIAL. Hold the child with `run --pause
-  auto` or keep it alive past attach. (verify at candidate: confirm the
-  exact incomplete marking)
+  auto` or keep it alive past attach.
+- `run` (and `profile --pid`) observe exactly the started (named)
+  process, never its descendants: a fork/exec child, `subprocess`
+  worker, or `multiprocessing` spawn child that loads a provider gets
+  no probes and its calls are entirely absent, however long it lives.
+  When only descendants touch PKCS#11 the run reports 0 probes with
+  `newcomer queue: admitted 0` and honest PARTIAL coverage. This is the
+  exact-PID scope (`run` is a PID scope over its own child; discovery
+  sweeps only the named PID and probes bind to that process alone), not
+  a timing race. Multi-process workloads such as `pkcs11-check test`
+  with default crash isolation are affected: every test runs in a
+  subprocess, so `run` sees none of it. Capture such workloads with
+  `inventory --system` (or `--cgroup`), which admits short-lived
+  processes, or run the leaf command that loads the provider directly
+  under `run`.
 - Container providers carry named unproven cases: the container checks
   use one kind node, and multi-node clusters, CRI-O and the cgroupfs
   driver are not exercised. Docker shared image layers and copy-up, the
   kind DaemonSet, attach into a pod, a pre-attached provider in a new
   pod, a Knative pod scaled from zero, and a node-wide late provider (a
-  reported boundary) are the exercised shapes. A process that loaded a
-  provider before a copy-up is still attributed to the copied-up file
-  and its later calls are missed; restart such processes. (verify at
-  candidate: the final integration may add an overlay-identity witness
-  with its own named loss)
-- If the overlay-identity witness lands, each pass proves a different
-  8 refused callers: with more than 8, every caller alternates
-  between joined and the named loss across passes. While a caller
-  waits for its turn, its edge reads uncertain and its in-flight
-  operations end as unknown. (verify at candidate: the witness may
-  not land; without it the named loss stands every pass)
+  reported boundary) were the exercised shapes in the v0.5.0 campaign;
+  the 0.6.0 re-proof is a candidate gate. A process that loaded a
+  provider before a copy-up reads `unknown` with the
+  `original_file_unproven` gap and its later calls are missed; restart
+  such processes.
+- The overlay-identity witness proves up to 8 refused callers per
+  deep scan and per kernel-route sweep pass, and up to 1024
+  refused callers per no-route sweep pass (single-shot
+  inspect/inventory sweeps prove through the same witness under the
+  1024 budget): past each route's budget, callers take turns across
+  passes while the rest keep the named loss (`original_file_unproven`
+  for deep scans, `overlay_kernel_unavailable` for sweeps). While a
+  caller waits for its turn, its edge reads uncertain and its in-flight
+  operations end as unknown.
 - Strict speed claims apply only on kernels with working uprobe_multi,
   normally 6.6 and newer: the rate and latency numbers above were
   measured there. Older kernels stay correct with a finite stop but are
-  not speed-qualified; live capture refuses there with
-  `uprobe-multi-required`. (verify at candidate)
-- Per-key rows need p11scope to see the process start, or the provider
-  load, after capture begins. With `--pid` on an already-running
-  process whose provider is already loaded (for example a running
-  Firefox), object observations read `bootstrap_unavailable` and no
-  per-key rows are produced; call counts, mechanisms and the rest of
-  the inventory still work. To see key operations for an application,
-  start the observer first (`--system`, or a cgroup scope), then
-  launch the application (for Firefox: start the capture, then start
-  Firefox); an already-running process gives plain counts only. A
-  design that learns key facts from handles seen after capture start
-  is v0.7.0 work.
+  not speed-qualified; live capture refuses there with a `live capture ...`
+  refusal (`unavailable` or `did not start`).
+- Per-key rows cover operations that start after the attach.
+  Attaching to an already-running process (for example a running
+  Firefox or Chromium) works: operations that start after the attach
+  get rows, earlier operations are counted in named gaps, and a key
+  first seen before the attach reads `type unknown (not established
+  while observed)`, never dropped. Starting the observer first
+  (`--system`, or
+  a cgroup scope) and then launching the application also works; no
+  restart is needed either way. Call counts, mechanisms and the rest
+  of the inventory still work in every case.
+- Inventory accepts `--max-endpoints` from 1 through 131072, with a
+  32768 default, so a host with several p11-kit copies (about 20K
+  endpoints) is covered by `inventory --system` with no flag. This is
+  a finite, capture-lifetime physical endpoint budget; unloading does
+  not refund IDs. The values are measured on uprobe_multi hosts (the
+  only hosts where live capture runs): the endpoint maps cost 8 bytes
+  per endpoint of payload, attach costs about 256 bytes of kernel
+  memory per attached endpoint, and per-hit cost does not grow with
+  the endpoint count. Detailed per-call capture keeps its separate
+  512-slot budget (2112 in the wide build) and counter modes keep
+  their 8192 planner ceiling, because their per-CPU maps scale with
+  slot count times CPU count and are not equally cheap to raise.
+  Caller-pair, discovery-owner and work limits stay separate, and
+  selecting a larger endpoint budget does not increase them.
+- Counts seen through the p11-kit proxy can include the backend's
+  own internal calls, and can miss calls made before the observer
+  attached. Direct providers are exact. For exact counts, point the
+  capture at the backend provider directly.
+- The key-operations section reason can latch `authority_lost`,
+  rendered "per-key tracking stopped", after a watchdog trip or
+  disposed staged history, even while exact per-key rows continue
+  beside counted loss. The latch names the loss, not a stopped view:
+  read the rows and the `not attributed` counts.
+- `inventory --pid` leaves a one-shot caller's use unattributed: a
+  caller that uses a provider and exits between two passes shows no
+  edge entries while its calls fold to the module as unattributed
+  use. Use `profile --pid` for one-shot flows (full entry below).
 
 Under a saturating multi-threaded flood (twelve threads spinning PKCS#11
 calls for 5 s, about 190,000 calls/s), the userspace drain can lose ring
@@ -131,32 +172,48 @@ banks grow with
 the host possible-CPU count and refuse with `counter-memory-limit`
 past the per-capture kernel-map memory cap on hosts with many CPUs.
 Counter banks share one 65,536-entry return-value pool, and
-saturation is reported in the collection health. Per-call
+saturation is reported in the collection health. One bank's unreadable cell
+gaps only its slots with a `bank_gaps` count, and a health or kernel read
+failure degrades the evidence with a named flag. A gap read publishes the
+last good values (stale) until the next exact read telescopes, except the
+first read of a generation, which publishes its current rows with zeros as
+unknown for the failed slots; either way the report reads PARTIAL.
+A legacy aggregate read
+that cannot read one slot's counters reports zero for that slot as unknown
+with a `legacy_collection` gap, and one unread kernel-evidence cell reads 0
+as unknown with its name; the rest stays exact and the report reads PARTIAL.
+Per-call
 profile/trace capture stays fixed at 512 attach slots (2,112 only in
-the WIDE source build). A recognized proxy closure array (p11-kit's fixed
-wrapper tables) is decided after all providers in every scope: whole when
-it fits (late-start, reserve-capped), otherwise a reserve-capped
-leading-templates prefix with a named partial gap only when the capture's
-first plan held the closure beside a non-closure provider, or when its
-opened file matches an operator-named `--module` path, and its published
-tables only when unnamed (mapped mid-capture, or alone in the first plan)
-— refused whole when none of those admit. Shared scope (`--system`,
-`--cgroup`) admits the same reserve-capped prefix with the same named
-`closure_prefix` partial gap. Its 6,530+
-endpoints exceed every current ceiling, so the proxy layer itself is only
-ever covered by that prefix (late-start beside a provider, or
-operator-named) or its published tables (mid-capture, or alone in the first
-plan) while the backends behind it attach (costs of covering
-it are
-measured in `docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`).
+the WIDE source build). A recognized forwarding layer (such as
+p11-kit's proxy closure array, about 6,530 endpoints per copy) is
+decided after all providers in every scope and admitted by what it
+publishes: only tables with publication evidence (a live
+`C_GetFunctionList` / `C_GetInterface(List)` return, interface linkage,
+a manifest, or export agreement) attach, taking no heuristic slots, so
+the layer can never crowd out a real provider. Calls it forwards are
+counted at the attached backend providers, named with counts on the
+gap line; calls the layer answered itself, including its errors,
+appear only on the separate forwarding line, and one layer call that
+reaches several providers counts at each. When nothing is published
+yet, a named gap says so and the capture continues. An operator-named
+layer (`--module
+<path>`) is the sole exception: it keeps a reserve-capped
+leading-templates prefix, because a remote client's tables are handed
+out before any export probe can observe the return (costs of covering
+the layer are measured in
+`docs/notes/2026-11-01-p11kit-proxy-layer-measurement.md`). Under
+inventory, counter and broad admission a closure array that does not
+fit whole is refused whole with its demand stated.
 An ordinary provider that does not fit whole in a shared-scope Detailed
-capture is likewise admitted on the leading-tables prefix that fits,
+capture is admitted on the leading-tables prefix that fits,
 with a named `provider_prefix` partial gap stating attached versus
 needed endpoints; it is refused whole only when not even its strongest
 table fits within its reserve-aware budget, or when its corroborated
 (published) tables together do not fit — published tables stay atomic,
 since spilling one as uncorroborated would mislabel corroborated
-evidence. Inventory, counter and broad admission keep their
+evidence. Inventory admits whole within its endpoint budget (32,768 by
+default on `inventory --system` with uprobe_multi, up to 131,072 with
+`--max-endpoints`), and counter and broad admission keep their
 complete-union whole rule.
 
 Endpoint selection (`--select-endpoint` with `--mode metrics` and
@@ -208,7 +265,10 @@ for them is still planned.
 Short-lived processes missed at system scale are counted only as gaps
 (`pid_descendant_gaps`); their calls through attached providers still
 count. A process whose main thread had already exited when the capture
-first met it is not admitted, and its calls are not counted.
+first met it is not admitted, and its calls are not counted. The
+`short-lived processes never scanned` inventory gap counts only captures
+with the native EXEC lane; scan-only captures cannot count inter-pass
+deaths, and processes already gone at first contact are never admitted.
 Every process admitted after the initial membership sweep — a fork child,
 an ambient fork, any newcomer — and every leader exit that matches no
 admitted generation counts `pid_descendant_gaps` and keeps the observation
@@ -241,9 +301,12 @@ v0.6.0 reports key operations when opted in with `inventory
 counts completions per operation category, and the JSON report carries
 the rows under `object_observations`. Without the opt-in, or on a build
 without the journal object, the line reads `not reported (per-key
-tracking is off)`. A
-linked capture whose tracking never starts reads `unavailable
-(bootstrap_unavailable)`. Mechanisms and API results are reported as
+tracking is off)`. With `--key-operations` but a refused subset, the
+line names the rerun or check remedy; when the journal start itself is
+refused, it names the request and the cause (`requested, but per-key
+tracking did not start (<cause>)`). A linked capture whose tracking
+never starts reads `not available — per-key tracking never started, so
+no key can be named yet`. Mechanisms and API results are reported as
 before. An ordinary native-retirement refusal during a `--manifest`
 capture ends the first stop with an incomplete report and a nonzero
 exit. Uncertain native ownership stays retained and replacement
@@ -254,11 +317,12 @@ In v0.6.0 release builds, key operations use the per-key-tracking opt-in
 with the following birth-marker limits. If any watched call of a program is
 not fully captured — the call ran outside the selected scope, its binary
 interface was refused, or the call was dropped (a lost identity, start record
-or ring slot, or a thread killed in the middle of the call) — that program
-gets no key-operation rows for the rest of the capture. The program's call
-counts and per-function summaries continue; only its key-operation rows stay
-absent. For scope misses, widen the scope (`--cgroup` or `--system`);
-otherwise re-run the capture.
+or ring slot, or a thread killed in the middle of the call) — the operations
+the observer cannot attribute with certainty are counted in named `not
+attributed` reasons, and rows resume at the next clean point. The program's
+call counts and per-function summaries continue throughout. For scope
+misses, widen the scope (`--cgroup` or `--system`); otherwise re-run the
+capture.
 
 Each recording can newly cover only a fixed number of programs (about 16.8
 million). Once that budget is spent, programs already in the report keep their
@@ -312,6 +376,36 @@ capture-wide queue of 1,024 calls: past it, later calls are shed even
 while their caller is still waiting to be admitted, and are reported in
 the same gap (`pending_capacity=N`). Every other
 `semantic admission refused` reason still marks a loss.
+
+Under `--key-operations`, such a shed call ends a caller's key-operation
+tracking (`joint_seal_h3_loss_history_loss`) only when p11scope cannot prove
+it came from a different process. A call whose kernel-assigned process
+identity differs from every caller being tracked is reported under its own
+`semantic calls unrouted from other callers` gap (attributed to that caller
+when exactly one live caller made them) and still counts in the stop line's
+shed count, but it no longer ends tracking for the other callers. A call
+without that identity, or from a tracked caller (including after its exec),
+still ends tracking as before. Calls shed before any caller is tracked are
+reported at once in the `semantic calls unrouted` gap (`with 0 bindings`),
+and their effect is held (up to 1,024 distinct processes) until the first
+caller is tracked. If every one of them came from another process, a
+`pre-binding unrouted calls resolved to other callers` note says so and
+tracking continues; one from the tracked caller itself, one without an
+identity, a full hold, or a stop before any caller is tracked still counts
+as the loss that ends tracking. A process whose calls were reported as
+another caller's is excluded from key-operation tracking for the rest of
+the run: if it later becomes a tracked caller, it keeps the plain
+per-call view and a `Joint birth unavailable; retained S1` gap names
+`joint_image_refused`. A call from an untracked process that is still in
+progress when key operations are sealed cannot be accounted for; tracking
+then ends after about 6 s with a `joint audit made no progress` gap
+instead of waiting for the run deadline. This ends tracking; it never
+hangs, and the plain per-call counts are unaffected.
+The memory of refused processes holds 16,448 entries. Past that, every
+new untracked caller keeps the plain per-call view with the same
+`joint_image_refused` reason; processes refused earlier stay refused and
+tracked callers are unaffected. At one new foreign client every 3 seconds
+that is about 14 hours of capture.
 
 In containers, a process that loaded a provider before the file was
 copied up is attributed to the copied-up file and its later calls are
@@ -487,16 +581,18 @@ With `--key-operations`, the v0.6.0 measurements in
 older lane numbers: key operations sustain 6,250 calls/s for 60 s with
 exact rows (plain counts stay exact at 10,000 calls/s), and
 key-operation rows lag their calls by about 1.6-1.9 s p99 in quiet
-runs. The older 1,000 calls/s ceiling and mid-run `authority_lost`
-stall describe the pre-integration lane, not this release. (verify at
-candidate: the final integration re-runs the rate campaign)
+runs. The older 1,000 calls/s ceiling describes the pre-integration
+lane, not this release. The `authority_lost` reason is still live: it
+latches after a watchdog trip or disposed staged history and renders
+"per-key tracking stopped" even while exact rows continue beside
+counted loss (see
+[Known limitations in 0.6.0](#known-limitations-in-060)).
 
 In long system-wide runs, a live publication can rarely stop making
-progress. After 6 seconds without progress, p11scope abandons that
-publication with a named gap and keeps running, and the report marks
-coverage as partial. The capture does not hang, and nothing is
-silently dropped. Fixing the underlying stall is planned for a later
-release.
+progress for one session or operation. The affected operations are
+counted in named `not attributed` reasons while exact rows continue
+for the rest, and the report marks coverage as partial. The capture
+does not hang, and nothing is silently dropped.
 
 `--prearm-module` pins the named provider before any mapping and watches
 its proved offsets (`watch` on the discovery record, with `attached_at_ns`
@@ -584,6 +680,9 @@ detail during a counter capture (`--select-endpoint`).
   further cut the short-run void rate.
 - Tracking short-lived processes that exit before their first binding
   (exit-time mapping verdicts shipped; full call attribution still planned).
+- Following the started command's process tree under `run`
+  (descendant admission and per-descendant probes, scoped to that tree
+  only).
 - Parallel BPF program loading for faster startup.
 - File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
   `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).
@@ -657,9 +756,13 @@ instance; per-caller call totals are unaffected. Finalizing and
 re-initializing inside one load (a `C_Finalize`/`C_Initialize` cycle)
 is also one instance.
 
-This version reports no key operations, so the `key operations:`
-line always reads `not reported by this version (planned for 0.6.0)`;
-mechanisms and API results are reported as before. An ordinary native-retirement
+Per-key tracking is opt-in: without `inventory --key-operations`
+(needs `--capture auto` or `native`) the `key operations:` line reads
+`not reported (per-key tracking is off)`; mechanisms and API results
+are reported as before. Rows need p11scope to see the process start,
+or the provider load, after capture begins, may lag their calls, and
+tracking may not start at all; plain counts are unaffected and a named
+gap says so. An ordinary native-retirement
 refusal during a `--manifest` capture ends the first stop with an incomplete
 report and a nonzero exit. Uncertain native ownership stays retained and
 replacement admission stays blocked; the refusal is not proof of clean detach.
@@ -1404,6 +1507,32 @@ The old bounds are measurements, not a product startup SLA.
   exec/s and beyond any loss stays explicit, with its demotion rate
   published.
 
+### Busy hosts: skipped mapping hooks start new coverage eras (v0.6.0)
+
+- What the user sees: on a busy host the kernel can skip p11scope's
+  mapping hooks (a preempted hook counts a recursion miss). Each skip
+  starts a new coverage era: calls in flight are counted as unattributed
+  (`fault_era`), and key-operation tracking ends for keys that existed
+  before the skip, with a named gap. Each running program's load is
+  proven again; a load whose mapping is unchanged keeps its instance
+  row (and ID). In an inventory report that row reads `uncertain` /
+  `semantic_loss`, as any row crossing a coverage era does: a
+  same-address reload hidden by the skip would merge into it. The stop
+  line's `eras` count tells these runs apart from runs without skips. A
+  changed load gets a new row. Call totals stay exact.
+- Measured: under deliberate CPU contention (5 busy loops on a 5-vCPU
+  VM, 1,000 calls/s, 60 s) about 1,700-2,800 map and 5,400-5,900 unmap
+  misses; 91-93% of calls were joined and the rest were counted as
+  unattributed. Before v0.6.0 the first miss ended attribution for the
+  rest of the capture.
+- Disclosure: the stderr stop line ends with `hook misses N, eras N,
+  instances N`; the `semantic calls unrouted` gap counts `fault_era`
+  calls; the Joint gap names `joint_seal_fault_changed_history_loss`.
+- Workaround: a quieter host, or fewer competing CPU-bound jobs during
+  the capture.
+- Planned: moving the mapping hooks off preemptible trampolines
+  (v0.7.0 list).
+
 ### Data-only mappers are not callers; copied code is not inventoried (A6)
 
 - What the user sees: since v0.3.0 (unreleased), a process is a caller of a
@@ -1497,28 +1626,24 @@ The old bounds are measurements, not a product startup SLA.
 
 ### Leader-exit and exec-chain callers under `--system` stay unattributed (DR-05)
 
-- 2026-10-26 cold admission (qualified at the discovery seams): an
-  already-zombie thread-group leader with exactly one live survivor
-  admits as a caller with the survivor-served image and the leader
-  birth, and both identity backends then attribute its held mappings
-  exactly like the warm path. In a live capture today this reaches
-  only groups the observer already held a view of (their scans now
-  read the survivor's maps); a group first met after its leader died
-  is still not admitted. Two or more live survivors are refused
+- 2026-10-26 cold admission (qualified at the discovery seams, with a
+  live cell): an already-zombie thread-group leader with exactly one
+  live survivor admits as a caller with the survivor-served image and
+  the leader birth — including a group first met after its leader
+  died — and both identity backends then attribute its held mappings
+  exactly like the warm path. Two or more live survivors are refused
   (admission names the ambiguity; a live scan reports such a group
   like an exited one); a fully dead group keeps the generic gone
   refusal. Cold callers make no native-use claim (they stay unproven
-  for native binding). Live-capture enumeration of a group first met
-  after its leader died still needs its follow-up.
+  for native binding).
 - Development checkpoint: discovery can classify a zombie-leader group as
   exited even while a surviving thread runs, and omit that group from its
   membership result. An absent group does not
   prove that its provider use or surviving threads have ended. Complete
   live-group inventory is not supported by this checkpoint.
 - What the user sees: a process whose thread-group leader has exited while
-  other threads keep running (a zombie leader), and that the capture never
-  observed before the exit, or left with two or more running threads,
-  is still not admitted as a caller: it has no
+  other threads keep running (a zombie leader), and that was left with
+  two or more running threads, is still not admitted as a caller: it has no
   `callers[]` record and no edge, and its provider use appears at most as
   module-level `modules[].unbound_use` (only when another process got the
   provider attached, with the `used by an unidentified caller image` gap);
@@ -1578,10 +1703,17 @@ The old bounds are measurements, not a product startup SLA.
   overlay provider (attach-set exclusion, for example a provider
   inside a container) proves through a private witness session with no
   exclusions, one query per watched (pid, key) under a per-pass budget
-  of 8 queries; each pass starts past the queries the previous pass
-  spent, so with more than 8 refused callers every pass proves a
-  different 8 and each caller alternates between joined and the named
-  loss. A same-file verdict joins, anything else (another file,
+  of 8 queries on kernel-route passes; each pass starts past the
+  queries the previous pass spent, so with more than 8 refused callers
+  every pass proves a different 8 and each caller alternates between
+  joined and the named loss. Passes with no kernel route at all (auto
+  fell back: a nested observer's numbering mismatch, missing BTF) prove
+  every refused overlay candidate through the same private session under
+  a per-pass budget of 1024 queries, rotating past them exactly like the
+  kernel-pass window, so turn-taking starts past 1024 there. Single-shot
+  sweeps (`inspect --system` and inventory collection, which run no
+  kernel run at all) prove through the same witness under the 1024
+  budget. A same-file verdict joins, anything else (another file,
   failure, budget exhaustion) keeps the named loss, never a userspace
   join. While a caller waits for its turn, its edge reads uncertain
   and its in-flight operations end as unknown. The witness also
@@ -1636,12 +1768,16 @@ The old bounds are measurements, not a product startup SLA.
   A stale copy-up mapping surfaces as an `original_file_unproven` gap
   under the provider path, with one of four fixed causes (the witness
   proved another file, the witness query budget was exhausted, the
-  witness was unavailable, the anchor binding failed). A swept overlay
-  caller with no covering kernel proof surfaces as an
+  witness was unavailable, the anchor binding failed). The unavailable
+  cause appends the failed stage in plain words after the fixed
+  `original_file_unproven: kernel witness unavailable` prefix. A swept overlay
+  caller with no covering kernel proof surfaces as the bare
   `overlay_kernel_unavailable` maps-attribution loss (`inventory
   --system` with the kernel identity backend first tries the private
-  witness session, 8 queries per pass; exhaustion keeps the same
-  loss).
+  witness session, 8 queries per kernel-route pass and 1024 per
+  no-route pass; exhaustion keeps the same loss); only the deep-scan
+  gap carries the failed stage, and a failed sweep query's stage is
+  visible only in the `P11SCOPE_STAGE_TIMINGS=1` stderr line.
 - Workaround: restart processes that loaded a provider before the file
   changed inside the container (for example by chmod, touch or an
   in-place write) to get exact attribution for their later calls.
@@ -1713,6 +1849,29 @@ The old bounds are measurements, not a product startup SLA.
   min(custody instant, last clean read), coverage `unknown`.
 - Workaround: restart the capture on the new pid.
 - Planned: v0.3.0 (C5/C5b re-attach policy or a documented boundary).
+
+### `inventory --pid` leaves a one-shot caller's use unattributed
+
+- What the user sees: a one-shot `pkcs11-tool --sign` (or any caller that
+  uses and exits between two ~1 Hz inventory passes) shows its edge with
+  no entries (`entries.count=0`, coverage `use_before_admission`,
+  `mechanisms=null`) while the module carries the folded calls as
+  `unbound_use` with reason `no_live_caller`. The same flow under
+  `profile --pid` binds (the identical 7-call sign shows `C_Sign` there).
+- Kernels/conditions: all kernels; `--pid` with a caller that exits before
+  the next witness drain. Reproduced with and without an exec during
+  capture and with and without a manifest (SoftHSM stable shape:
+  1 caller retired `exited`, 1 edge, `unbound_use.entries=7`).
+- Disclosure: `modules[].unbound_use` (`rows`, `reasons`, `entries`),
+  `observation.native_witnesses` (`rows`/`bound`/`unbound`), the edge's
+  `use_before_admission` coverage, and the `used by an unidentified
+  caller image` gap. No false join is made: the use stays module-level.
+- Workaround: `profile --pid` for one-shot flows; long-lived callers
+  (alive across at least two passes) for inventory edge counts.
+- Planned: bind PID-scope rows to the retained scope incarnation when the
+  kernel pid filter proves the generation, or cache the ticket while the
+  caller lives. Either needs a design that keeps pid-reuse safety
+  (a pid number alone never selects the exited generation).
 
 ### Per-call overhead on attested endpoints unmeasured (DR-12)
 
@@ -1966,7 +2125,8 @@ a silent drop.
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing
-capability refuses with `uprobe-multi-required` before capture, output changes
+capability refuses with `live capture unavailable` or `live capture did not
+start` before capture, output changes
 or a user workload starts, including explicit `--attach-backend singles`.
 Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
@@ -1977,16 +2137,24 @@ release commitment is made.
 BTF, permissions, scope, identity/ABI and required feature checks still apply.
 Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
 
-### `run` under `sudo` clears supplementary groups (DR-56)
+### `run` under `sudo` restores groups and home (DR-56, fixed in v0.6.0)
 
-- What the user sees: a workload that needs an HSM/device group fails under
-  `sudo p11scope run`; interpreters and `/proc/self/fd` edges behave as
-  documented.
+- What the user sees: `sudo p11scope run -- tool` starts `tool` as the
+  invoking user with the invoker's supplementary groups, so HSM and
+  device-group providers (opencryptoki, group-owned SoftHSM token
+  directories, pcscd) keep working; `HOME`/`USER`/`LOGNAME`/`SHELL`
+  come from the invoker's passwd entry and `XDG_RUNTIME_DIR` from
+  `/run/user/<uid>` when that directory exists and is owned by the
+  invoker. Interpreters and `/proc/self/fd` edges behave as documented.
+  An account the observer cannot resolve refuses with a plain message
+  before anything starts.
 - Kernels/conditions: sudo launches.
 - Disclosure: usage `run` safety boundary.
-- Workaround: `profile`/`trace` against an already-running target, or a
-  capability-carrying observer (`setcap ...`, groups intact).
-- Planned: v0.3.0 docs review (keep documented or preserve groups).
+- Status: shipped fixed in v0.6.0. The child keeps `no_new_privs` with
+  clear capabilities; `-v`/`--verbose` prints the restored identity as
+  `running <cmd> as <user> (uid <uid>) (groups and home restored)`.
+  The old workaround (`profile`/`trace` against an already-running target,
+  or a capability-carrying observer) is no longer needed for this.
 
 ### One observer per target assumed (DR-52)
 

@@ -47,6 +47,7 @@ impl<'a> ObservedDriver<'a> {
                 attach_backend: crate::attach::BackendSelection::Auto,
                 display: None,
                 semantic: None,
+                scan_seal_pending: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -853,6 +854,8 @@ fn cgroup_public_scan_produces_nonempty_json_events_and_finite_scope_label() {
             after: report,
             json: true,
             out: None,
+            verbose: false,
+            quiet: false,
         },
         &mut diff_bytes,
     );

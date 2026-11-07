@@ -20,7 +20,7 @@ pub(crate) use joint::{
 };
 #[cfg(test)]
 pub(crate) use joint::{
-    JointMachineIo, JointNativeIo, LiveJointMachine, StagingDetail,
+    JointMachineIo, JointNativeIo, LiveJointMachine, MAX_UNPAID_VOID_YIELDS, StagingDetail,
     bind_collected_semantic_callers, with_joint_commit_io_for_births_test,
     with_joint_commit_io_for_test,
 };
@@ -1521,7 +1521,10 @@ pub(crate) fn scan_refusals_gap_reason(counts: &[u64; 12]) -> Option<String> {
 /// refused call counts. Collected covers drained records only, so
 /// collected == joined + shed holds with any loss; kernel ring loss
 /// rides the separate `lost` term in records, never folded into
-/// shed. Counts only; no identities, paths or payloads.
+/// shed. The tail carries the busy-host cost: kernel hook recursion
+/// misses, fault eras (each re-proves every live instance) and instance
+/// IDs minted. Counts only; no identities, paths or payloads.
+#[allow(clippy::too_many_arguments)] // One flat counts-only line.
 pub(crate) fn semantic_stop_line(
     collected: u64,
     joined: u64,
@@ -1529,10 +1532,14 @@ pub(crate) fn semantic_stop_line(
     lost: u64,
     bindings: u64,
     refused: u64,
+    hook_misses: u64,
+    eras: u64,
+    instances: u64,
 ) -> String {
     format!(
         "p11scope: semantic calls: collected {collected}, joined {joined}, \
-         shed {shed}, lost {lost}, bindings {bindings}, refused {refused}"
+         shed {shed}, lost {lost}, bindings {bindings}, refused {refused}, \
+         hook misses {hook_misses}, eras {eras}, instances {instances}"
     )
 }
 
@@ -1935,6 +1942,12 @@ impl AttestedSemanticLane {
         self.startup_failed = true;
     }
 
+    /// Whether this lane is a startup-failed shell (see
+    /// [`Self::mark_startup_failed`]).
+    pub(crate) fn startup_failed(&self) -> bool {
+        self.startup_failed
+    }
+
     pub(crate) fn subset(&self) -> &AttestedSubset {
         &self.subset
     }
@@ -2117,6 +2130,18 @@ impl AttestedSemanticLane {
             )
         });
         (collected, joined, self.disclosed_calls_shed, refused)
+    }
+
+    /// Lifetime hook recursion misses, fault eras and instance IDs minted
+    /// (zeros without a live lane), for the stop line. Counts only.
+    pub(crate) fn semantic_era_counts(&self) -> (u64, u64, u64) {
+        self.live.as_ref().map_or((0, 0, 0), |live| {
+            (
+                live.capture.hook_misses(),
+                live.capture.router().counters().eras,
+                live.capture.router().instances_minted() as u64,
+            )
+        })
     }
 
     /// Lifetime per-reason scan-refusal counts (zeros without a live

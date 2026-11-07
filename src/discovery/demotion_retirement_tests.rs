@@ -130,6 +130,7 @@ fn members_catalog_paths(
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     catalog
 }
@@ -295,6 +296,7 @@ fn demotion_retirement_round2_membership_change_with_present_owner_keeps_fence()
                 ),
             ),
             pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+            modules: Vec::new(),
         });
         catalog
     };
@@ -475,6 +477,7 @@ fn demotion_retirement_round2_settled_fence_survives_unrelated_revision() {
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     scene.apply(catalog, 400);
     assert!(scene.native.scene.coordinator.attach_set.count_revision() != original_revision);
@@ -889,6 +892,7 @@ impl Scene {
                 ),
             ),
             pins: fx::pass_pins(&[(&self.a, "sha-a"), (&self.b, "sha-b")]),
+            modules: Vec::new(),
         });
         catalog
     }
@@ -1028,6 +1032,7 @@ fn demotion_retirement_another_endpoint_of_same_object_keeps_ownership_shared() 
                 ),
             ),
             pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b"), (&c, "sha-c")]),
+            modules: Vec::new(),
         });
         scene.apply(catalog, at);
     }
@@ -1644,6 +1649,7 @@ fn demotion_retirement_aba_uses_a_new_fence_and_retains_both_histories() {
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     scene.apply(catalog, at);
     scene.count(11);
@@ -1730,6 +1736,7 @@ fn demotion_retirement_historical_and_current_owners_are_separate_per_caller() {
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     scene.apply(catalog, 300);
     scene.native.counts_read(Vec::new(), vec![(51, 1, 0, 7)]);
@@ -2045,6 +2052,7 @@ fn demotion_retirement_round3_early_candidate_waits_for_real_binding_and_keeps_e
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     scene.apply(catalog, 400);
     assert!(scene.native.scene.coordinator.attach_set.count_revision() != revision);
@@ -2541,6 +2549,7 @@ fn round4_noncompeting_b_catalog(scene: &Scene, at: u64) -> crate::inspect_syste
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     catalog
 }
@@ -2694,6 +2703,7 @@ fn round4_queued_catalog(
             ),
         ),
         pins: fx::pass_pins(&inputs),
+        modules: Vec::new(),
     });
     catalog
 }
@@ -3905,6 +3915,7 @@ fn demotion_retirement_round3_placed_predecessor_resumes_unchanged_carrier_growt
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     scene.apply(catalog, 200);
     scene.native.counts_read(Vec::new(), vec![(41, 1, 0, 7)]);
@@ -4636,6 +4647,7 @@ fn round3_long_unrelated_catalog(
             ),
         ),
         pins: fx::pass_pins(&[(&scene.a, "sha-a"), (&scene.b, "sha-b")]),
+        modules: Vec::new(),
     });
     catalog
 }
@@ -5038,6 +5050,7 @@ impl Cnt1Steady {
                 ),
             ),
             pins: fx::pass_pins(&[(&self.a, "sha-a")]),
+            modules: Vec::new(),
         });
         catalog
     }
@@ -5735,6 +5748,7 @@ impl LiveOrder {
                 ),
             ),
             pins: fx::pass_pins(&[(&self.a, "sha-a")]),
+            modules: Vec::new(),
         });
         catalog
     }

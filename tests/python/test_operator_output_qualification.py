@@ -1078,6 +1078,31 @@ class ReadinessGateTests(unittest.TestCase):
                             os.close(fd)
 
 
+class ReadinessPatternTests(unittest.TestCase):
+    def test_readiness_matches_pluralized_probe_counts(self):
+        readiness = HARNESS.get("READINESS_RE")
+        self.assertIsNotNone(readiness, "the oracle exposes its readiness pattern")
+        for text in (b"p11scope: capturing: 136 probes attached; stop with Ctrl-C\n",
+                     b"p11scope: capturing: 1 probe attached; stop with Ctrl-C\n"):
+            self.assertIsNotNone(readiness.search(text), text)
+        self.assertIsNone(
+            readiness.search(b"p11scope: capturing: 136 probe(s) attached; stop with Ctrl-C\n"))
+        self.assertIsNone(
+            readiness.search(b"p11scope: capturing: waiting for the command to load a provider; "
+                             b"stop with Ctrl-C\n"))
+
+    def test_observer_spawn_restores_diagnostics_on_a_copied_env(self):
+        text = (ROOT / "scripts/qualify-operator-output.py").read_text(encoding="utf-8")
+        self.assertIn("observer_env = dict(env)", text)
+        self.assertIn("env=observer_env", text)
+        self.assertIn("text=True, env=env", text)
+        assigns = [line.strip() for line in text.splitlines()
+                   if "P11SCOPE_CAPTURE_DIAGNOSTICS" in line and "=" in line
+                   and not line.strip().startswith("#")]
+        self.assertEqual(assigns, ["observer_env['P11SCOPE_CAPTURE_DIAGNOSTICS'] = '1'"])
+        self.assertNotIn("os.environ", text)
+
+
 class InventorySavedCaptureTests(unittest.TestCase):
     def test_only_committed_owned_positive_milestones_release_calls(self):
         module = runpy.run_path(str(ROOT / 'tests/fixtures/operator-output/capture_inventory_pair.py'))

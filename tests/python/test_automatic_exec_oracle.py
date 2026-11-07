@@ -1686,6 +1686,14 @@ class LiveFrameTest(unittest.TestCase):
         self.assertEqual(frames[-1]["functions"]["C_GetInfo"]["calls"], 2)
         self.assertEqual(frames[-1]["totals"], [2, 0, 0])
 
+    def test_singular_totals_frame_parses(self):
+        text = live_frame([("C_GetInfo", 1, 1, 1)]).replace(
+            "1 completed calls; 1 returned errors; 1 entries without an observed return.",
+            "1 completed call; 1 returned error; 1 entry without an observed return.")
+        frames = self.parse(text)
+        self.assertEqual(len(frames), 1)
+        self.assertEqual(frames[-1]["totals"], [1, 1, 1])
+
     def test_captured_multi_retained_current_slot_rows_aggregate_within_frame(self):
         # Second complete frame from installed836b Multi/profile: SlotReports
         # retain two C_GetInfo rows with different latency buckets.

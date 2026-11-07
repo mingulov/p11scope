@@ -137,15 +137,19 @@ attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_ia
 attach::async_value_flags_tests::privileged_async_join_reads_id_and_completes_lp64
 # W3-2 kernel-identity gates: WRONLY EPERM, the section 6.5 functional
 # probe (hardlink-match vs copy-NONE plus the stale-generation phase),
-# the whole-system shape cell, and the anchor-handle validator.
+# its nested-pidns twin (kind observers run nested), the whole-system
+# shape cell, and the anchor-handle validator.
 attach::identity_iter::tests::anchor_maps_validate_real_handles
 attach::identity_iter::tests::functional_probe_proves_hardlink_match_and_copy_none
+attach::identity_iter::tests::functional_probe_passes_in_nested_pid_namespace
 attach::identity_iter::tests::whole_system_run_covers_all_children
 attach::identity_iter::tests::wronly_anchor_fds_refuse_reads_with_eperm
 # 5.15 identity-denial cell: real BTF named-fix refusal through the
 # production sink with zero bpf() syscalls; dual-outcome by running
 # kernel (denied on 5.15, eligible elsewhere), lane-classified.
 inspect_system::privileged_tests::privileged_identity_515_denial_is_disclosed
+inspect_system::tests::probe_dir_created_dir_exec_maps
+inspect_system::tests::probe_dir_falls_back_when_temp_is_noexec
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_ia32
 attach::instance_tests::privileged_full_image_native_multi_query_and_scan_lp64
 attach::instance_tests::privileged_semantic_capture_multi_reload_and_rebound_successor
@@ -353,6 +357,11 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_sweep_witne
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_witness_budget_exhaustion_refuses
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_same_key_twice_proves
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k2_sweep_overlay_no_fallback
+# R1 no-route collect cell (own loop overlays per mode, SoftHSM
+# provider): collect_system_with_identity twice (Auto, scripted
+# no-kernel checks) plus one single-shot collect; fresh-upper joins,
+# stale-lower refuses, the shared witness window advances by spent.
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness
 discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4
 discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4
 events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains
@@ -531,6 +540,13 @@ attach::prearm_witness::tests::privileged_cgroup_id_matches_kernfs_id
 attach::prearm_witness::tests::privileged_start_activates_on_host
 attach::prearm_witness::tests::privileged_finalize_clears_clean_start
 attach::prearm_witness::tests::privileged_finalize_settles_under_churn
+# sudo -o ownership: reports created in an invoker-owned directory are
+# handed to SUDO_UID:SUDO_GID (0600); elsewhere they stay root-owned.
+output::tests::privileged_sudo_output_reports_are_owned_by_the_invoker
+# Owned-child home restoration: a sudo-shaped drop to nobody carries the
+# passwd HOME/USER into the exec'd environment (needs only root and the
+# nobody account, no BPF).
+run::tests::privileged_spawned_child_home_matches_the_target_passwd_row
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the
@@ -587,6 +603,7 @@ attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6530_l
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n6531_lp64
 attach::inventory::activation::privileged_tests::privileged_t7_inventory_n8192_boundary_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8192_prefix_lp64
+attach::inventory::activation::privileged_tests::privileged_inventory_multi_n20480_default_lp64
 attach::inventory::activation::privileged_tests::privileged_inventory_multi_n8193_refuses_lp64
 # G21 default-ring wrap needs 658 changing observed passes per paired run
 # (~22 min total) and the controller-verified prebuilt32-body fixture.

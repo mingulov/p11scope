@@ -863,13 +863,23 @@ fn pid_reuse_leaves_the_retained_row_unbound() {
 fn unproven_retained_identity_leaves_the_row_unbound_in_both_modes() {
     // Every identity check rejects on its own, in NoLiveCaller mode (no
     // live incarnation) and in CallerExited mode (the live pin dies
-    // during the query): no start time, no exe, exe without an observed
-    // exec detector, unknown lifecycle, exec-retired lifecycle. The
-    // lifecycle rows pin the filter exhaustively (a live mirror carries
-    // Mapped in production); the row keeps its live-miss gap.
-    let cases: [(&str, Option<u64>, bool, bool, CallerLifecycle); 5] = [
+    // during the query): no start time, no exe, no exe with an observed
+    // detector, exe without an observed exec detector, unknown
+    // lifecycle, exec-retired lifecycle. The no-exe-with-detector row
+    // isolates `exe_present` (a commit path records the detector
+    // without an exe baseline); the lifecycle rows pin the filter
+    // exhaustively (a live mirror carries Mapped in production); the
+    // row keeps its live-miss gap.
+    let cases: [(&str, Option<u64>, bool, bool, CallerLifecycle); 6] = [
         ("no start time", None, true, true, CallerLifecycle::Exited),
         ("no exe", Some(100), false, false, CallerLifecycle::Exited),
+        (
+            "no exe with an observed detector",
+            Some(100),
+            false,
+            true,
+            CallerLifecycle::Exited,
+        ),
         (
             "exe without an observed exec detector",
             Some(100),

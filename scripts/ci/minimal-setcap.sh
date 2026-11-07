@@ -458,10 +458,26 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
       [ "$rc" -ne 0 ] || pass=0
       ;;
     CAP_CHECKPOINT_RESTORE)
-      # Degraded proof only: counts stay complete for an in-scan-cap
-      # target, and the coverage line must say so (no silent success).
+      # Degraded proof only: the capture still counts calls, and the
+      # coverage line must say how complete it is (no silent success):
+      # counts complete, or a partial naming only discovery gaps (the
+      # map_files proof is what this capability gates; seen once on a
+      # 6.12 guest at paranoid 2). Any other partial fails the row.
       [ "$rc" -eq 0 ] || pass=0
-      grep -q "counts complete" "$out" || pass=0
+      grep -qE "^[1-9][0-9]* completed calls" "$out" || pass=0
+      cov=$(grep -m1 "^coverage:" "$out")
+      case $cov in
+        "coverage: counts complete"*) ;;
+        "coverage: partial — calls may be missing ("*)
+          gaps=${cov#*calls may be missing (}
+          gaps=${gaps%%)*}
+          if printf "%s" "$gaps" | tr ',' '\n' | sed 's/^ *//' \
+              | grep -vqE "^[0-9]+ discovery (step|steps) unavailable$|^[0-9]+ discovery (update|updates) failed$"; then
+            pass=0
+          fi
+          ;;
+        *) pass=0 ;;
+      esac
       ;;
     CAP_DAC_READ_SEARCH)
       # No target read: the coverage line must disclose the partial

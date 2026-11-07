@@ -352,11 +352,14 @@ impl DiscoveryScheduler {
 
     /// Newcomer order with event-driven priority (Lane-A P2a): pids holding
     /// queued refresh requests first, then rotation candidates, each class
-    /// rotated after the cursor. Ordinary ticks serve event-driven work
+    /// rotated after the cursor. Test-only: scarce windows order pending
+    /// backlog and rotation as separate classes; this helper pins the
+    /// pending-first order. Ordinary ticks serve event-driven work
     /// before exploratory rotation by design; without the priority, freed
     /// view slots refill with ascending ambient candidates while pending
     /// newcomers starve. The pending class drains, so rotation is delayed,
     /// never starved. `pids` must be sorted ascending.
+    #[cfg(test)]
     pub(crate) fn new_view_order_pending_first(
         &self,
         pids: &[u32],

@@ -65671,7 +65671,7 @@ fn opus_r4_b4_owed_lead_never_hands_the_freed_slot_to_rotation() {
     for waiter in &waiters {
         // Advance to the pass before a reconcile (B4's parity rule).
         let mut guard = 0;
-        while engine.scheduler.over_cap_passes() % 2 == 0 {
+        while engine.scheduler.over_cap_passes().is_multiple_of(2) {
             refresh_inventory_once(&mut engine);
             guard += 1;
             assert!(guard < 8);

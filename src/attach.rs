@@ -11025,29 +11025,78 @@ impl Session {
         self.dynamic_attach_evidence.multi_successful()
     }
 
-    /// Shed the transient startup grant once attach is complete: a
-    /// multi session whose dynamic probes link drops `CAP_SYS_ADMIN` (no
-    /// `perf_event_open` remains past attach — measured lane F15:
-    /// dynamic links need `CAP_BPF`+`CAP_PERFMON`, never sysadmin); a
-    /// singles session, or a multi session whose dynamics stay on perf
-    /// (an unproven pid filter), keeps it for dynamic perf re-attach.
-    /// The effective set comes from `capget`, never `/proc` (a broken
-    /// `/proc` must not zero the shed). The shed is per-thread, so the
-    /// pre-spawned cleanup worker sheds to the same keep. Fail-closed
-    /// like the startup drop. Callers invoke this after their session
-    /// starts, before the capture loop.
+    /// Shed the transient startup grant once attach is complete; see
+    /// [`drop_post_setup_capabilities_for`]. Callers invoke this after
+    /// their session starts, before the capture loop.
     pub(crate) fn drop_post_setup_capabilities(&self) -> std::io::Result<()> {
-        let multi = self.backend == AttachBackend::Multi;
-        if !multi || !self.dynamic_multi {
-            return Ok(());
-        }
-        let effective = crate::caps::read_effective_via_capget()?;
-        let keep = crate::caps::post_setup_keep(multi, self.dynamic_multi, effective);
-        crate::caps::drop_to_keep(keep)?;
-        if let Some(worker) = self.cleanup_worker.as_ref() {
-            worker.shed_to(keep)?;
-        }
-        Ok(())
+        drop_post_setup_capabilities_for(
+            self.backend,
+            self.dynamic_multi,
+            self.cleanup_worker.as_ref(),
+        )
+    }
+}
+
+/// Shed the transient startup grant once attach is complete: a multi
+/// session whose dynamic probes link drops `CAP_SYS_ADMIN` (no
+/// `perf_event_open` remains past attach — measured lane F15: dynamic
+/// links need `CAP_BPF`+`CAP_PERFMON`, never sysadmin); a singles
+/// session, or a multi session whose dynamics stay on perf (an unproven
+/// pid filter), keeps it for dynamic perf re-attach. The sets come from
+/// `capget`, never `/proc` (a broken `/proc` must not zero the shed).
+/// The shed is per-thread, so the pre-spawned cleanup worker sheds to
+/// the same keep. Sets already at keep skip the drop entirely (no
+/// `capset`, no worker shed), so a post-shed hook fires only for a
+/// capture that actually shed. Fail-closed like the startup drop.
+pub(crate) fn drop_post_setup_capabilities_for(
+    backend: AttachBackend,
+    dynamic_multi: bool,
+    worker: Option<&CleanupWorker>,
+) -> std::io::Result<()> {
+    let multi = backend == AttachBackend::Multi;
+    if !multi || !dynamic_multi {
+        return Ok(());
+    }
+    let sets = crate::caps::read_sets_via_capget()?;
+    let keep = crate::caps::post_setup_keep(multi, dynamic_multi, sets.effective);
+    if !crate::caps::post_setup_shed_needed(keep, sets) {
+        return Ok(());
+    }
+    crate::caps::drop_to_keep(keep)?;
+    if let Some(worker) = worker {
+        worker.shed_to(keep)?;
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod post_setup_shed_tests {
+    use super::AttachBackend;
+    use super::CleanupWorker;
+    use super::drop_post_setup_capabilities_for;
+    use std::sync::{Arc, Mutex};
+
+    /// A multi session whose sets already equal the post-setup keep (the
+    /// unprivileged minimal set holds no `CAP_SYS_ADMIN` to shed) must
+    /// skip the shed entirely, including the worker drop: no `capset`
+    /// runs and no post-shed hook fires for a capture that never shed.
+    /// Fails while the shed runs unconditionally.
+    #[test]
+    fn post_setup_shed_skips_the_worker_drop_when_sets_are_already_at_keep() {
+        // Test threads hold no capabilities, so keep equals effective
+        // (both zero) and the shed is a no-op by construction.
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let worker = CleanupWorker::pre_start_with_drop_fn(Arc::new(move |keep: u64| {
+            seen_clone.lock().unwrap().push(keep);
+            Ok(())
+        }));
+        drop_post_setup_capabilities_for(AttachBackend::Multi, true, Some(&worker))
+            .expect("a no-op shed succeeds");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the worker drop must not run when the shed changes nothing"
+        );
     }
 }
 

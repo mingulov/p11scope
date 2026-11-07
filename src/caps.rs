@@ -230,24 +230,19 @@ pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) 
     }
 }
 
-/// This process's effective capabilities, from `/proc/self/status`
-/// `CapEff`; `None` when unreadable or unparsable.
-pub fn read_effective() -> Option<u64> {
-    let status = std::fs::read_to_string("/proc/self/status").ok()?;
-    parse_cap_eff(&status)
+/// This thread's effective, permitted and inheritable sets from one
+/// `capget` read (the low 64 bits cover every Linux capability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CapSets {
+    pub effective: u64,
+    pub permitted: u64,
+    pub inheritable: u64,
 }
 
-fn parse_cap_eff(status: &str) -> Option<u64> {
-    let hex = status
-        .lines()
-        .find_map(|line| line.strip_prefix("CapEff:"))?;
-    u64::from_str_radix(hex.trim(), 16).ok()
-}
-
-/// This thread's effective capabilities via `capget` (no `/proc` read,
-/// so a broken `/proc` cannot zero the set the shed computes from).
-/// Fails closed on syscall error; callers propagate instead of guessing.
-pub(crate) fn read_effective_via_capget() -> io::Result<u64> {
+/// This thread's capability sets via `capget` (no `/proc` read, so a
+/// broken `/proc` cannot zero the sets a shed computes from). Fails
+/// closed on syscall error; callers propagate instead of guessing.
+pub(crate) fn read_sets_via_capget() -> io::Result<CapSets> {
     let mut header = CapHeader {
         version: 0x2008_0522,
         pid: 0,
@@ -262,7 +257,43 @@ pub(crate) fn read_effective_via_capget() -> io::Result<u64> {
     if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
         return Err(io::Error::last_os_error());
     }
-    Ok((data[0].effective as u64) | ((data[1].effective as u64) << 32))
+    let join = |low: u32, high: u32| (low as u64) | ((high as u64) << 32);
+    Ok(CapSets {
+        effective: join(data[0].effective, data[1].effective),
+        permitted: join(data[0].permitted, data[1].permitted),
+        inheritable: join(data[0].inheritable, data[1].inheritable),
+    })
+}
+
+/// Whether the post-setup shed must run `drop_to_keep(keep)`: `keep`
+/// (from [`post_setup_keep`]) differs from effective, a
+/// permitted/inheritable surplus must be cleared, or effective is not
+/// inside permitted (then the drop still narrows it). When every set is
+/// already at `keep` the drop would change nothing, so the shed skips
+/// it: the shed stays observable-only-when-real, and a post-shed hook
+/// fires only for a capture that actually shed. Ambient is not compared:
+/// the startup drop cleared it on this thread, the worker inherited it
+/// clear, and nothing raises it before the post-setup shed (only
+/// `PR_CAP_AMBIENT_CLEAR_ALL` exists in tree).
+pub(crate) fn post_setup_shed_needed(keep: u64, sets: CapSets) -> bool {
+    keep != sets.effective
+        || sets.permitted & !keep != 0
+        || sets.inheritable & !keep != 0
+        || sets.effective & !sets.permitted != 0
+}
+
+/// This process's effective capabilities, from `/proc/self/status`
+/// `CapEff`; `None` when unreadable or unparsable.
+pub fn read_effective() -> Option<u64> {
+    let status = std::fs::read_to_string("/proc/self/status").ok()?;
+    parse_cap_eff(&status)
+}
+
+fn parse_cap_eff(status: &str) -> Option<u64> {
+    let hex = status
+        .lines()
+        .find_map(|line| line.strip_prefix("CapEff:"))?;
+    u64::from_str_radix(hex.trim(), 16).ok()
 }
 
 /// The invoking effective set `main` records before the startup drop
@@ -668,6 +699,49 @@ mod tests {
         assert_eq!(post_setup_keep(true, true, daemonset), daemonset);
     }
 
+    /// The post-setup shed runs exactly when `drop_to_keep` would change
+    /// a set: a transient effective grant, a permitted/inheritable
+    /// surplus, or effective outside permitted. Sets already at `keep`
+    /// (the unprivileged minimal set, the kept DaemonSet grant, the zeroed
+    /// test thread) skip.
+    #[test]
+    fn post_setup_shed_needed_skips_only_sets_already_at_keep() {
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        let live = minimal_live_mask();
+        let sets = |effective: u64, permitted: u64, inheritable: u64| CapSets {
+            effective,
+            permitted,
+            inheritable,
+        };
+        // The transient grant sheds.
+        assert!(post_setup_shed_needed(
+            live,
+            sets(live | sys_admin, live | sys_admin, 0)
+        ));
+        // Already at keep in every set: skip.
+        assert!(!post_setup_shed_needed(live, sets(live, live, 0)));
+        assert!(!post_setup_shed_needed(0, sets(0, 0, 0)));
+        let daemonset =
+            sys_admin | (1u64 << CAP_SYS_PTRACE_BIT) | (1u64 << CAP_DAC_READ_SEARCH_BIT);
+        assert!(!post_setup_shed_needed(
+            daemonset,
+            sets(daemonset, daemonset, 0)
+        ));
+        // A permitted or inheritable surplus still drops, even with
+        // effective already at keep.
+        assert!(post_setup_shed_needed(
+            live,
+            sets(live, live | sys_admin, 0)
+        ));
+        assert!(post_setup_shed_needed(live, sets(live, live, sys_admin)));
+        assert!(post_setup_shed_needed(0, sets(0, live, 0)));
+        // Effective outside permitted still drops (the drop narrows it).
+        assert!(post_setup_shed_needed(
+            live,
+            sets(live, 1u64 << CAP_BPF_BIT, 0)
+        ));
+    }
+
     fn parse(argv: &[&str]) -> crate::cli::Command {
         crate::cli::parse(argv.iter().map(std::ffi::OsString::from)).expect("test argv parses")
     }
@@ -1006,7 +1080,7 @@ mod tests {
         // The capget read agrees with `/proc` (no silent divergence
         // between the shed's input and the observable set).
         assert_eq!(
-            read_effective_via_capget().ok(),
+            read_sets_via_capget().map(|sets| sets.effective).ok(),
             read_effective(),
             "capget and /proc must report the same effective set"
         );

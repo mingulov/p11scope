@@ -6784,15 +6784,19 @@ fn open_native_lane_with(
             // past attach), a singles lane keeps it for dynamic perf
             // re-attach. The native lane has no perf-dynamic case (a PID
             // scope with an unproven pid filter falls back to singles
-            // before this point), so multi alone decides. The effective
-            // set comes from `capget`, never `/proc`. Fail-closed like
-            // the startup drop.
+            // before this point), so multi alone decides. The sets come
+            // from `capget`, never `/proc`. Sets already at keep skip
+            // the drop, like the session shed. Fail-closed like the
+            // startup drop.
             let multi = backend.backend == crate::attach::AttachBackend::Multi;
             if multi {
-                let effective = crate::caps::read_effective_via_capget()
+                let sets = crate::caps::read_sets_via_capget()
                     .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
-                crate::caps::drop_to_keep(crate::caps::post_setup_keep(multi, true, effective))
-                    .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
+                let keep = crate::caps::post_setup_keep(multi, true, sets.effective);
+                if crate::caps::post_setup_shed_needed(keep, sets) {
+                    crate::caps::drop_to_keep(keep)
+                        .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
+                }
             }
             inventory_diagnostic(&lane_active_line(&backend));
             Ok(Some(lane))
@@ -9966,6 +9970,19 @@ mod tests {
         assert!(
             body.contains("AttachBackend::Multi") || body.contains("backend.backend"),
             "the shed must use the lane's actual backend (multi sheds, singles keeps)"
+        );
+    }
+
+    /// The native lane skips its post-setup drop when the sets are
+    /// already at keep, like the session shed: a no-op shed must not
+    /// fire post-shed hooks for a capture that never shed.
+    #[test]
+    fn inventory_native_lane_skips_the_drop_when_sets_are_already_at_keep() {
+        let body = pin_body(include_str!("mod.rs"), "fn open_native_lane_with(", "\n}\n")
+            .expect("open_native_lane_with body");
+        assert!(
+            body.contains("post_setup_shed_needed"),
+            "the native lane must skip a no-op post-setup shed"
         );
     }
 

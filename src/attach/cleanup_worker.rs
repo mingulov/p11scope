@@ -666,7 +666,7 @@ type PoolStarter = Arc<
 /// How the worker thread drops its own capabilities on `Shed`:
 /// production calls `caps::drop_to_keep`, tests record the thread and
 /// the mask.
-type ShedDropFn = Arc<dyn Fn(u64) -> std::io::Result<()> + Send + Sync>;
+pub(crate) type ShedDropFn = Arc<dyn Fn(u64) -> std::io::Result<()> + Send + Sync>;
 
 /// Pre-started background worker that closes submitted links in
 /// [`DetachOrder`] while the foreground prints progress.
@@ -771,6 +771,26 @@ impl CleanupWorker {
             shutdown_sent: false,
             unsubmitted: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Test seam: a worker whose shed drop the caller injects (the
+    /// post-setup shed test counts drops through it). Production pool
+    /// starter, spawn and clock; only the drop is injected. Crate-visible
+    /// so shed tests outside this module can use it without seeing the
+    /// private closer-helper types.
+    #[cfg(test)]
+    pub(crate) fn pre_start_with_drop_fn(drop_fn: ShedDropFn) -> Self {
+        Self::pre_start_with_hooks(
+            Box::new(|_, _| Ok(())),
+            Arc::new(|| Duration::ZERO),
+            |task| {
+                std::thread::Builder::new()
+                    .name("p11scope-cleanup".to_string())
+                    .spawn(task)
+            },
+            Arc::new(|operation| ClosePool::start(operation)),
+            drop_fn,
+        )
     }
 
     #[cfg(test)]

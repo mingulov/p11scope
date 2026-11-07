@@ -396,6 +396,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut births = BorrowedBirths(births);
         let fault = BorrowedFault(fault);
+        // TEMP F9 DIAGNOSTIC (revert before freeze): seal-loop ms.
+        let diag = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some();
+        let diag_start = std::time::Instant::now();
         while *remaining != 0 {
             let before = *remaining;
             {
@@ -415,6 +418,18 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
             if *remaining == before {
                 break; // Same-frontier retry or real future-input dependency.
+            }
+        }
+        if diag {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SN: AtomicU64 = AtomicU64::new(0);
+            let sn = SN.fetch_add(1, Ordering::Relaxed);
+            if sn % 20 == 0 {
+                eprintln!(
+                    "seal-loop-tick sn={sn} ms={} t_mono={}",
+                    diag_start.elapsed().as_millis(),
+                    crate::attach::monotonic_ns().unwrap_or(0),
+                );
             }
         }
         Ok(JointCommitProgress::Pending)

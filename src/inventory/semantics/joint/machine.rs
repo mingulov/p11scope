@@ -2841,6 +2841,8 @@ impl LiveJointMachine {
                         );
                     }
                 }
+                // TEMP F9 DIAGNOSTIC (revert before freeze): collect elapsed.
+                let collect_start = std::time::Instant::now();
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
                         lane,
@@ -2858,6 +2860,7 @@ impl LiveJointMachine {
                         work,
                     ),
                 };
+                let collect_ms = collect_start.elapsed().as_millis();
                 let (raw, poll) = retain_on_refusal!(Phase::Idle, collected);
                 let poll = poll.expect("positive initial work actually polls the original cursor");
                 // TEMP F9 DIAGNOSTIC (revert before freeze): collect cadence.
@@ -2872,7 +2875,7 @@ impl LiveJointMachine {
                         && (n < 5 || n % 20 == 0)
                     {
                         eprintln!(
-                            "m-collect n={n} attempted={} rows_total={rows} t_mono={} work={work}",
+                            "m-collect n={n} attempted={} rows_total={rows} t_mono={} work={work} collect_ms={collect_ms}",
                             poll.attempted,
                             crate::attach::monotonic_ns().unwrap_or(0),
                         );

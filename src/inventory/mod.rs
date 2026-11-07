@@ -6516,6 +6516,8 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 deadline: Instant::now() + RUNNING_HOOK_DEADLINE,
             };
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
+            // TEMP F9 DIAGNOSTIC (revert before freeze): hook rate/duration.
+            let hook_start = Instant::now();
             if let Some(lane) = semantic.as_mut() {
                 Self::service_linked_joint_hook(
                     lane,
@@ -6524,6 +6526,19 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     reborrow_acquisition(&mut acquisition),
                     &mut self.joint_tick_refusal,
                 );
+            }
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static HN: AtomicU64 = AtomicU64::new(0);
+                let hn = HN.fetch_add(1, Ordering::Relaxed);
+                if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && hn % 100 == 0 {
+                    eprintln!(
+                        "hook-tick hn={hn} hook_ms={} spent={} t_mono={}",
+                        hook_start.elapsed().as_millis(),
+                        RUNNING_HOOK_ACTIONS.saturating_sub(budget.remaining_actions),
+                        crate::attach::monotonic_ns().unwrap_or(0),
+                    );
+                }
             }
             return;
         }

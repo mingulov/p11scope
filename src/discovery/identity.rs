@@ -10532,6 +10532,57 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_snapshot_twins_with_same_mapping_pin_and_digest_do_not_merge() {
+        // The Btrfs snapshot shape: one mount, one shared mount-table
+        // device, a kept inode number, size, change time and content —
+        // so the same MappingFileKey, Pin and digest — but two kernel
+        // files on two subvolumes. Every identity join must refuse;
+        // merging would attach probes to one copy while the other copy's
+        // callers stay unseen. (RED: all five sites merge before the
+        // held-fd device separates them.)
+        let key = ObjectKey {
+            device: Device { major: 0, minor: 23 },
+            inode: 257,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &backing_file(&dir, "first.so"));
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &backing_file(&dir, "second.so"));
+
+        let first_id = first.pinned().next().unwrap().id;
+        let second_id = second.pinned().next().unwrap().id;
+        let mut merged = Vec::new();
+        if first.exactly_matches(first_id, &second, second_id) {
+            merged.push("exactly_matches");
+        }
+        let retained = RetainedInventoryTarget {
+            entry: first.by_id.get(&first_id).unwrap().clone(),
+            changed: std::cell::Cell::new(false),
+        };
+        if retained.same_object_as(&second, second_id) {
+            merged.push("same_object_as");
+        }
+        if first.owned_timing_key(first_id) == second.owned_timing_key(second_id) {
+            merged.push("owned_timing_key");
+        }
+        let first_targets = BTreeSet::from([(first_id, 0u64)]);
+        let second_targets = BTreeSet::from([(second_id, 0u64)]);
+        if first.exactly_same_targets(&first_targets, &second, &second_targets) {
+            merged.push("exactly_same_targets");
+        }
+        let skipped = first.absorb(second);
+        if first.pinned().count() != 0 || skipped.len() != 1 {
+            merged.push("absorb");
+        }
+        assert!(
+            merged.is_empty(),
+            "snapshot twins merged at: {}",
+            merged.join(", ")
+        );
+    }
+
+    #[test]
     fn absorbing_same_key_unavailable_digest_still_rejects() {
         // One kernel file both sides — but one side never hashed, so the bytes
         // are unproven and the group still rejects.

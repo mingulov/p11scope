@@ -1248,3 +1248,85 @@ fn isolation_output_directory_holding_only_the_target_is_accepted() {
     );
     assert_eq!(litter(&out), Vec::<String>::new());
 }
+
+/// N1: the target-name exception holds only for a single-link regular
+/// file. A directory at the target name refuses before provider load:
+/// no constructor marker, the victim beneath it keeps its bytes, and no
+/// manifest or planted file appears.
+#[test]
+fn isolation_target_name_holding_a_directory_is_refused() {
+    let dir = scratch("isolation-target-dir");
+    let provider = build_isolation_probe(&dir);
+    let out = dir.join("out");
+    let target = out.join("manifest.json");
+    std::fs::create_dir_all(&target).unwrap();
+    let victim = target.join("victim");
+    std::fs::write(&victim, b"keep").unwrap();
+    let refused = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&target)
+        .env("ISOLATION_SUBTREE_PATH", &victim)
+        .env("ISOLATION_NOTRUNC_PATH", &victim)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("not empty; use a dedicated directory"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the output refusal: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&victim).unwrap(),
+        b"keep",
+        "a refusal must not let the provider near the victim"
+    );
+    assert!(
+        std::fs::read_dir(&target).unwrap().count() == 1,
+        "a refusal must plant nothing beneath the target"
+    );
+}
+
+/// N1: a hard link at the target name refuses before provider load: the
+/// outside inode keeps its bytes (the fence would otherwise grant the
+/// shared inode through the writable subtree).
+#[test]
+fn isolation_target_name_holding_a_hard_link_is_refused() {
+    let dir = scratch("isolation-target-nlink");
+    let provider = build_isolation_probe(&dir);
+    let out = dir.join("out");
+    std::fs::create_dir_all(&out).unwrap();
+    let outside = dir.join("outside.txt");
+    std::fs::write(&outside, b"outside-keep").unwrap();
+    let target = out.join("manifest.json");
+    std::fs::hard_link(&outside, &target).unwrap();
+    let refused = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .args(["-o"])
+        .arg(&target)
+        .env("ISOLATION_SUBTREE_PATH", &target)
+        .env("ISOLATION_NOTRUNC_PATH", &target)
+        .output()
+        .unwrap();
+    assert_eq!(refused.status.code(), Some(1), "{refused:?}");
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        stderr.contains("not empty; use a dedicated directory"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("ISOLATION_"),
+        "provider ran before the output refusal: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read(&outside).unwrap(),
+        b"outside-keep",
+        "a refusal must not let the provider near the linked inode"
+    );
+}

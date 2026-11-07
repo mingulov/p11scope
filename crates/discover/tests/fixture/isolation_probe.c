@@ -3,9 +3,10 @@
  * overwrite of a test-owned sibling) and reports each as a stderr marker,
  * plus the review-PoC probes: io_uring setup, AF_UNIX connect to a
  * test-owned listener, execve of /bin/true in a child, chmod of a
- * test-owned path outside the output, and overwrite beneath the -o
- * directory. The ISOLATION_*_PATH environment variables name test-owned
- * scratch paths only; without them the matching probe reports unknown.
+ * test-owned path outside the output, overwrite beneath the -o
+ * directory, and in-place overwrite without O_TRUNC. The ISOLATION_*_PATH
+ * environment variables name test-owned scratch paths only; without them
+ * the matching probe reports unknown.
  * The provider itself is healthy: a
  * sparse 2.40 legacy table, one all-NULL "PKCS 11" interface, and a lazily
  * dlopen'd backend (never DT_NEEDED; link with -Wl,-rpath,$ORIGIN).
@@ -189,6 +190,30 @@ __attribute__((constructor)) static void ctor(void) {
                 fprintf(stderr, "ISOLATION_SUBTREE=unknown(no target file)\n");
             } else {
                 fprintf(stderr, "ISOLATION_SUBTREE=denied(errno=%d)\n", errno);
+            }
+        }
+    }
+    /* In-place overwrite without O_TRUNC: WRITE_FILE alone suffices,
+     * so a writable subtree lets this clobber a victim even though
+     * TRUNCATE is never granted (N1 hard-link/dir-target escape). */
+    {
+        const char *target = getenv("ISOLATION_NOTRUNC_PATH");
+        if (!target) {
+            fprintf(stderr, "ISOLATION_NOTRUNC=unknown(no target)\n");
+        } else {
+            int nfd = open(target, O_WRONLY);
+            if (nfd >= 0) {
+                ssize_t written = pwrite(nfd, "PWNED", 5, 0);
+                close(nfd);
+                if (written == 5) {
+                    fprintf(stderr, "ISOLATION_NOTRUNC=allowed\n");
+                } else {
+                    fprintf(stderr, "ISOLATION_NOTRUNC=unknown(short write)\n");
+                }
+            } else if (errno == ENOENT) {
+                fprintf(stderr, "ISOLATION_NOTRUNC=unknown(no target file)\n");
+            } else {
+                fprintf(stderr, "ISOLATION_NOTRUNC=denied(errno=%d)\n", errno);
             }
         }
     }

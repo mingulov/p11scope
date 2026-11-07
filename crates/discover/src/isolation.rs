@@ -848,6 +848,58 @@ mod tests {
     }
 
     #[test]
+    fn target_name_exception_rejects_a_directory() {
+        let target = std::ffi::OsStr::new("manifest.json");
+        let dir = std::env::temp_dir().join(format!("isolation-target-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(out.join("manifest.json")).unwrap();
+        std::fs::write(out.join("manifest.json").join("victim"), b"keep").unwrap();
+        let error = open_output_dir(&out, target).unwrap_err();
+        assert!(
+            error.contains("not empty; use a dedicated directory"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn target_name_exception_rejects_a_hard_link() {
+        let target = std::ffi::OsStr::new("manifest.json");
+        let dir = std::env::temp_dir().join(format!("isolation-target-nlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"outside-keep").unwrap();
+        std::fs::hard_link(&outside, out.join("manifest.json")).unwrap();
+        let error = open_output_dir(&out, target).unwrap_err();
+        assert!(
+            error.contains("not empty; use a dedicated directory"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn target_name_exception_rejects_a_symlink() {
+        let target = std::ffi::OsStr::new("manifest.json");
+        let dir = std::env::temp_dir().join(format!("isolation-target-symlink-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let out = dir.join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        let outside = dir.join("outside.txt");
+        std::fs::write(&outside, b"outside-keep").unwrap();
+        std::os::unix::fs::symlink(&outside, out.join("manifest.json")).unwrap();
+        let error = open_output_dir(&out, target).unwrap_err();
+        assert!(
+            error.contains("not empty; use a dedicated directory"),
+            "{error}"
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn arch_gate_runs_before_any_fence_syscall() {
         use std::cell::Cell;
         let landlock_called = Cell::new(false);

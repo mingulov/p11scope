@@ -632,16 +632,32 @@ pub struct Engine {
     stage_timings: crate::timing::StageTimings,
     /// First-seen arrival marks for diff-discovered newcomers, keyed by pid.
     /// Marked eagerly at diff time (arrival is the first diff); removed on
-    /// admission; pruned to the enumerated scope every inventory tick.
+    /// admission; otherwise kept until the pid leaves the enumerated scope
+    /// (one mark per process generation, even after its exit drained).
     /// Bounded by `MAX_NEWCOMER_MARKS`, overflow counted, never silent.
     newcomer_first_seen: crate::timing::NewcomerMarks,
-    /// Births already counted as descendant gaps when their newcomer mark
-    /// pruned before admission: a short-lived descendant whose exit record
-    /// never drains (e.g. past the terminal drain) still gaps exactly
-    /// once, and a later exit for the same birth never double-counts.
-    /// Keyed by (pid, first-seen) so PID reuse counts each generation;
-    /// removed on exit match, range-queried by time.
-    newcomer_gap_pids: BTreeSet<(u32, Option<u64>)>,
+    /// Marked generations whose descendant gap is already counted: by a
+    /// drained exit (the generation is gone, no longer pending) or by the
+    /// end-of-run sweep. Same keys as a subset of `newcomer_first_seen`.
+    newcomer_counted: BTreeMap<u32, NewcomerGapCount>,
+    /// Pruned generations already counted as descendant gaps, as
+    /// `(pid, lower bound, upper bound)`: a short-lived descendant whose
+    /// exit record never drains (e.g. past the terminal drain) still gaps
+    /// exactly once, and a late exit inside the bounds never double-counts.
+    /// The lower bound is the start of the last scope walk that did not list
+    /// the pid, the upper bound the end of the walk that pruned it; a reused
+    /// pid is a later generation outside them. Removed on exit match;
+    /// bounded by `MAX_NEWCOMER_MARKS`, overflow latched PARTIAL.
+    newcomer_gap_pids: BTreeSet<(u32, u64, u64)>,
+    /// Latched once the pruned-generation ledger above overflowed.
+    newcomer_gap_overflow: bool,
+    /// Every pid the last complete scope walk listed (cgroup and system
+    /// scope), with the start of the last walk that did not list it, or 0
+    /// (capture start) for a pid listed since the first walk: the lower
+    /// bound of that pid's current generation.
+    scope_listed_since: BTreeMap<u32, u64>,
+    /// Start and end of the last scope walk.
+    last_scope_walk: Option<(Option<u64>, Option<u64>)>,
     /// Cumulative newcomer queue-age evidence (admissions and drops sample
     /// here; pending counts fill in at snapshot time).
     newcomer_ages: crate::timing::NewcomerStats,
@@ -5429,6 +5445,15 @@ struct BoundFallbackProof {
 /// `/proc` inventory overhead for cgroups containing thousands of processes.
 /// Shared with `inspect --system` as the default `--max-scan-pids`.
 pub(crate) const MAX_SCAN_PIDS: usize = 256;
+
+/// How a marked newcomer generation's descendant gap was counted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NewcomerGapCount {
+    /// Its drained exit counted it (or matched an exit that did).
+    Exit,
+    /// The end-of-run sweep counted it while it was still pending.
+    Finish,
+}
 
 /// What the discovery pass learned besides the plan itself — everything
 /// `discovery_evidence` needs that the plan does not already carry.
@@ -10872,7 +10897,11 @@ impl Engine {
             continuity_deferred: false,
             stage_timings: crate::timing::StageTimings::new(),
             newcomer_first_seen: BTreeMap::new(),
+            newcomer_counted: BTreeMap::new(),
             newcomer_gap_pids: BTreeSet::new(),
+            newcomer_gap_overflow: false,
+            scope_listed_since: BTreeMap::new(),
+            last_scope_walk: None,
             newcomer_ages: crate::timing::NewcomerStats::new(),
             // A fresh engine owes its first tail publication: the revision
             // starts dirty so the first batch tail publishes unconditionally,
@@ -12212,16 +12241,6 @@ impl Engine {
             self.exit_map.drop_exec_for_pid(pid);
             return;
         }
-        // Fail-closed births already counted this birth when its newcomer
-        // mark pruned before admission: a later exit for the same birth
-        // stays single-counted (the ledger still records the exit). The
-        // gap set is keyed by (pid, first-seen), so only births at or
-        // before this exit match — a newer reuse never does.
-        let birth_already_counted = self
-            .newcomer_gap_pids
-            .range((pid, None)..=(pid, Some(record.hook_ts_ns)))
-            .next()
-            .is_some();
         if self.unmatched_leader_exit_events.len() >= MAX_SCAN_PIDS {
             if !self.cgroup_ingress_overflow {
                 self.cgroup_ingress_overflow = true;
@@ -12239,25 +12258,12 @@ impl Engine {
             return;
         }
         self.unmatched_leader_exit_events.insert(key);
-        if birth_already_counted {
-            let matched: Vec<(u32, Option<u64>)> = self
-                .newcomer_gap_pids
-                .range((pid, None)..=(pid, Some(record.hook_ts_ns)))
-                .copied()
-                .collect();
-            for gap in matched {
-                self.newcomer_gap_pids.remove(&gap);
-            }
-        } else {
+        // One gap per process generation: an exit whose marked or pruned
+        // generation already counted (by its exit, the end-of-run sweep or
+        // its fail-closed prune) stays single-counted; the ledger still
+        // records the exit.
+        if !self.match_newcomer_exit(pid, record.hook_ts_ns) {
             self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
-        }
-        // The exit matches the pending mark for this birth, if any: remove
-        // it so a later PID reuse marks its own generation. An exit from
-        // before the mark (an older generation) never removes it.
-        if let Some(first_seen) = self.newcomer_first_seen.get(&pid).copied()
-            && first_seen.is_none_or(|seen| record.hook_ts_ns >= seen)
-        {
-            self.newcomer_first_seen.remove(&pid);
         }
         // 6.14 Option B: exactly one static hint per novel unmatched
         // exit in extensive mode. The gap count above never depends
@@ -13530,6 +13536,53 @@ impl Engine {
             return;
         }
         self.newcomer_first_seen.insert(pid, now_ns);
+        // An exit drained before the mark, inside this generation's bound
+        // (e.g. between the walk that listed the pid and this stamp), is
+        // this generation's exit: it already counted the gap.
+        let bound = self.newcomer_generation_bound(pid);
+        if self
+            .unmatched_leader_exit_events
+            .range((pid, bound)..=(pid, u64::MAX))
+            .next()
+            .is_some()
+        {
+            self.newcomer_counted.insert(pid, NewcomerGapCount::Exit);
+        }
+    }
+
+    /// Lower bound of the live generation of `pid`: the start of the last
+    /// scope walk that did not list it, or 0 (capture start) when it was
+    /// listed from the first walk on.
+    fn newcomer_generation_bound(&self, pid: u32) -> u64 {
+        self.scope_listed_since.get(&pid).copied().unwrap_or(0)
+    }
+
+    /// Matches one drained unmatched exit for `pid` at `hook_ts` to a
+    /// newcomer generation. A live mark matches when the exit is at or
+    /// after its generation bound: the first such exit flags it exit
+    /// matched (no longer pending); `true` when its gap was already counted.
+    /// Otherwise a pruned generation whose bounds contain the exit matches
+    /// and retires (`true`: counted at prune). `false`: no counted
+    /// generation, so the exit gaps on its own.
+    fn match_newcomer_exit(&mut self, pid: u32, hook_ts: u64) -> bool {
+        if self.newcomer_first_seen.contains_key(&pid)
+            && self.newcomer_generation_bound(pid) <= hook_ts
+        {
+            return self
+                .newcomer_counted
+                .insert(pid, NewcomerGapCount::Exit)
+                .is_some();
+        }
+        let pruned = self
+            .newcomer_gap_pids
+            .range((pid, 0, 0)..=(pid, hook_ts, u64::MAX))
+            .find(|(_, _, upper)| hook_ts <= *upper)
+            .copied();
+        if let Some(entry) = pruned {
+            self.newcomer_gap_pids.remove(&entry);
+            return true;
+        }
+        false
     }
 
     /// Samples one newcomer admission age: first-observed-ready minus
@@ -13552,24 +13605,7 @@ impl Engine {
         self.newcomer_ages
             .note_admitted(newcomer_age_ms(seen, now_ns));
         self.newcomer_first_seen.remove(&pid);
-        if let Some(first_seen) = mark {
-            self.newcomer_gap_pids.remove(&(pid, first_seen));
-        }
-    }
-
-    /// Whether a drained unmatched exit matches the birth marked at
-    /// `first_seen`: an exit at or after the arrival, via a bounded range
-    /// lookup. An exit from before the mark (an older generation) never
-    /// matches. A clock-unknown mark matches any exit for its pid.
-    fn newcomer_exit_matches(
-        exits: &BTreeSet<(u32, u64)>,
-        pid: u32,
-        first_seen: Option<u64>,
-    ) -> bool {
-        match first_seen {
-            Some(seen) => exits.range((pid, seen)..=(pid, u64::MAX)).next().is_some(),
-            None => exits.range((pid, 0)..=(pid, u64::MAX)).next().is_some(),
-        }
+        self.newcomer_counted.remove(&pid);
     }
 
     /// Newcomer bookkeeping for one complete scope walk that started at
@@ -13578,69 +13614,103 @@ impl Engine {
     /// mark is arrival evidence for a generation that can never arrive.
     /// Fail-closed first: an unadmitted departed birth gaps here, so a
     /// short-lived descendant whose exit lands past the terminal drain
-    /// still gaps instead of vanishing silently.
+    /// still gaps instead of vanishing silently. Then every newly listed
+    /// pid takes the start of the previous walk (which did not list it) as
+    /// its generation bound, or 0 on the first walk.
     fn note_scope_walk(
         &mut self,
         live: &BTreeSet<u32>,
-        _walk_start: Option<u64>,
-        _walk_end: Option<u64>,
+        walk_start: Option<u64>,
+        walk_end: Option<u64>,
     ) {
+        let previous_start = self.last_scope_walk.and_then(|(start, _)| start);
+        self.last_scope_walk = Some((walk_start, walk_end));
         self.close_pruned_newcomer_gaps(live);
         self.newcomer_first_seen.retain(|pid, _| live.contains(pid));
+        self.newcomer_counted.retain(|pid, _| live.contains(pid));
+        if !self.admits_generations() {
+            return;
+        }
+        let bound = previous_start.unwrap_or(0);
+        self.scope_listed_since.retain(|pid, _| live.contains(pid));
+        for pid in live {
+            self.scope_listed_since.entry(*pid).or_insert(bound);
+        }
     }
 
     /// Fail-closed births: every diff-discovered newcomer mark for a pid
-    /// no longer live that was never admitted and never matched to a
-    /// drained exit counts one descendant gap. A short-lived descendant
-    /// whose exit record lands past the terminal drain still gaps here,
-    /// so an unprearmed fork workload with missing calls can never read
-    /// COMPLETE. Births already exit-matched stay single-counted, and a
-    /// repeated sweep never recounts. Gaps are keyed by (pid, first-seen)
-    /// so PID reuse counts each generation. PID scope never admits
-    /// generations and counts nothing.
+    /// no longer live whose generation never admitted and never counted
+    /// (by a drained exit or the end-of-run sweep) counts one descendant
+    /// gap. A short-lived descendant whose exit record lands past the
+    /// terminal drain still gaps here, so an unprearmed fork workload with
+    /// missing calls can never read COMPLETE. The pruned marks are
+    /// forgotten, so a repeated sweep never recounts; a generation counted
+    /// here or at finish is remembered with its bounds, so its late exit
+    /// stays single-counted while a reused pid counts its own generation.
+    /// PID scope never admits generations and counts nothing.
     fn close_pruned_newcomer_gaps(&mut self, live: &BTreeSet<u32>) {
         if !self.admits_generations() {
             return;
         }
-        let pruned: Vec<(u32, Option<u64>)> = self
+        let upper = self
+            .last_scope_walk
+            .and_then(|(_, end)| end)
+            .unwrap_or(u64::MAX);
+        let pruned: Vec<u32> = self
             .newcomer_first_seen
-            .iter()
-            .filter(|(pid, _)| !live.contains(pid))
-            .map(|(pid, first_seen)| (*pid, *first_seen))
+            .keys()
+            .filter(|pid| !live.contains(pid))
+            .copied()
             .collect();
-        for (pid, first_seen) in pruned {
-            if self.newcomer_gap_pids.contains(&(pid, first_seen)) {
+        for pid in pruned {
+            self.newcomer_first_seen.remove(&pid);
+            let counted = self.newcomer_counted.remove(&pid);
+            if counted == Some(NewcomerGapCount::Exit) {
                 continue;
             }
-            if Self::newcomer_exit_matches(&self.unmatched_leader_exit_events, pid, first_seen) {
-                continue;
+            let bound = self.newcomer_generation_bound(pid);
+            self.remember_pruned_newcomer_gap(pid, bound, upper);
+            if counted.is_none() {
+                self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
             }
-            self.newcomer_gap_pids.insert((pid, first_seen));
-            self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
         }
     }
 
-    /// End-of-run sweep: every remaining never-admitted, never-exit-matched
-    /// newcomer counts one descendant gap, so a capture that ends with a
-    /// pending birth reads PARTIAL with the named gap instead of COMPLETE.
-    /// Idempotent via the gap set; PID scope counts nothing.
+    /// Records one counted pruned generation for late-exit matching. Past
+    /// the bound the entry is not kept: a late exit for it may then count
+    /// its birth a second time, so the overflow latches PARTIAL once.
+    fn remember_pruned_newcomer_gap(&mut self, pid: u32, bound: u64, upper: u64) {
+        if self.newcomer_gap_pids.len() >= crate::timing::MAX_NEWCOMER_MARKS {
+            if !self.newcomer_gap_overflow {
+                self.newcomer_gap_overflow = true;
+                let subject = self.ingress_subject();
+                self.mark_partial(
+                    subject,
+                    "the bounded newcomer gap ledger overflowed; a late exit may count its birth twice",
+                );
+            }
+            return;
+        }
+        self.newcomer_gap_pids.insert((pid, bound, upper));
+    }
+
+    /// End-of-run sweep: every remaining newcomer generation that never
+    /// admitted and never counted (no drained exit) counts one descendant
+    /// gap, so a capture that ends with a pending birth reads PARTIAL with
+    /// the named gap instead of COMPLETE. Idempotent; PID scope counts
+    /// nothing.
     fn close_remaining_newcomer_gaps_at_finish(&mut self) {
         if !self.admits_generations() {
             return;
         }
-        let remaining: Vec<(u32, Option<u64>)> = self
+        let remaining: Vec<u32> = self
             .newcomer_first_seen
-            .iter()
-            .map(|(pid, first_seen)| (*pid, *first_seen))
+            .keys()
+            .filter(|pid| !self.newcomer_counted.contains_key(pid))
+            .copied()
             .collect();
-        for (pid, first_seen) in remaining {
-            if self.newcomer_gap_pids.contains(&(pid, first_seen)) {
-                continue;
-            }
-            if Self::newcomer_exit_matches(&self.unmatched_leader_exit_events, pid, first_seen) {
-                continue;
-            }
-            self.newcomer_gap_pids.insert((pid, first_seen));
+        for pid in remaining {
+            self.newcomer_counted.insert(pid, NewcomerGapCount::Finish);
             self.pid_descendant_gaps = self.pid_descendant_gaps.saturating_add(1);
         }
     }
@@ -24085,6 +24155,7 @@ impl Engine {
                         }
                         if provider_free {
                             self.newcomer_first_seen.remove(&pid);
+                            self.newcomer_counted.remove(&pid);
                             self.probationary_completions =
                                 self.probationary_completions.saturating_add(1);
                             continue;
@@ -30808,9 +30879,17 @@ impl Engine {
         let mut stats = self.newcomer_ages.clone();
         // Pending is the union of the two queues: a diff newcomer with a
         // queued refresh waits once, not twice.
-        let mut pending = self.newcomer_first_seen.len() as u64;
+        // A mark whose exit already drained is a gone generation, kept only
+        // until its pid leaves the scope: it is not pending.
+        let pending_mark =
+            |pid: &u32| self.newcomer_counted.get(pid) != Some(&NewcomerGapCount::Exit);
+        let mut pending = self
+            .newcomer_first_seen
+            .keys()
+            .filter(|pid| pending_mark(pid))
+            .count() as u64;
         for pid in self.refresh_requested.keys() {
-            if !self.newcomer_first_seen.contains_key(pid) {
+            if !(self.newcomer_first_seen.contains_key(pid) && pending_mark(pid)) {
                 pending = pending.saturating_add(1);
             }
         }
@@ -30820,7 +30899,12 @@ impl Engine {
             .refresh_requested
             .values()
             .map(|request| request.first_seen_ns)
-            .chain(self.newcomer_first_seen.values().copied())
+            .chain(
+                self.newcomer_first_seen
+                    .iter()
+                    .filter(|(pid, _)| pending_mark(pid))
+                    .map(|(_, seen)| *seen),
+            )
             .flatten()
         {
             let age = newcomer_age_ms(Some(seen), now_ns);

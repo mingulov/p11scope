@@ -601,7 +601,7 @@ def assert_unsafe_trace(text):
 
 
 def _assert_aggregate_metrics(doc, expected_calls):
-    assert set(doc) == {"schema", "lane", "capture", "evidence", "functions"}, doc
+    assert set(doc) == {"schema", "lane", "capture", "evidence", "functions", "layer_totals"}, doc
     assert doc["schema"] == "p11scope/observed-profile/v3-metrics"
     assert doc["lane"] == "metrics", doc
     assert doc["capture"]["mode"] == "metrics"
@@ -609,6 +609,12 @@ def _assert_aggregate_metrics(doc, expected_calls):
     assert "secret_selection_payload" not in doc["evidence"], doc["evidence"]
     profile_terminal(doc, "p11scope/observed-profile/v3-metrics")
     assert sum(item["calls"] for item in doc["functions"]) == expected_calls, doc["functions"]
+    # Single-layer canary captures never forward: logical carries the
+    # whole ledger, forwarding stays zero.
+    assert doc["layer_totals"] == {
+        "logical": {"calls": expected_calls, "errors": 0, "in_flight": 0},
+        "forwarding": {"calls": 0, "errors": 0, "in_flight": 0},
+    }, doc["layer_totals"]
 
 
 def assert_aggregate_metrics(doc):
@@ -2775,16 +2781,33 @@ def main(argv=None):
                 "vendor_interfaces": 0, "interface_list": "ok",
             },
             "functions": [{"calls": 28}],
+            "layer_totals": {
+                "logical": {"calls": 28, "errors": 0, "in_flight": 0},
+                "forwarding": {"calls": 0, "errors": 0, "in_flight": 0},
+            },
         }
         assert_aggregate_metrics(aggregate)
         owned_aggregate = json.loads(json.dumps(aggregate))
         owned_aggregate["functions"][0]["calls"] = 30
+        owned_aggregate["layer_totals"]["logical"]["calls"] = 30
         assert_owned_aggregate_metrics(owned_aggregate)
         for calls in (28, 29, 31):
             bad_owned = json.loads(json.dumps(owned_aggregate))
             bad_owned["functions"][0]["calls"] = calls
+            bad_owned["layer_totals"]["logical"]["calls"] = calls
             reject(f"owned metrics call count {calls}",
                    lambda bad_owned=bad_owned: assert_owned_aggregate_metrics(bad_owned))
+        for label, mutate in (
+            ("logical calls", lambda d: d["layer_totals"]["logical"].update(calls=29)),
+            ("logical errors", lambda d: d["layer_totals"]["logical"].update(errors=1)),
+            ("logical in_flight", lambda d: d["layer_totals"]["logical"].update(in_flight=1)),
+            ("forwarding calls", lambda d: d["layer_totals"]["forwarding"].update(calls=1)),
+            ("missing totals", lambda d: d.pop("layer_totals")),
+        ):
+            bad_totals = json.loads(json.dumps(owned_aggregate))
+            mutate(bad_totals)
+            reject(f"owned metrics {label}",
+                   lambda bad_totals=bad_totals: assert_owned_aggregate_metrics(bad_totals))
         extra_metrics = json.loads(json.dumps(aggregate))
         extra_metrics["evidence"]["secret_selection_payload"] = "CANARY"
         reject("metrics extra evidence field", lambda: assert_aggregate_metrics(extra_metrics))

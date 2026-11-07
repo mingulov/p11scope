@@ -872,6 +872,28 @@ class BrowserCells(unittest.TestCase):
         with patch.object(oracle, "sha256_of", return_value=sha):
             self.check_report(result, store, {"C_FindObjects": 1}, attached=True)
 
+    def test_run_tree_descendant_gap_allowed_for_never_mapped_run(self):
+        """Run-tree twin: a never-mapped run report whose owned browser
+        retired short-lived descendants between admission passes keeps
+        its zero: the honest pid_descendant_gaps cause is allowed for
+        the run-mode never-mapped cells."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        evidence = self._twin_evidence(
+            attached_probes=0,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {
+                "status": "lossy",
+                "causes": ["discovery", "slots", "skipped",
+                           "pid_descendant_gaps"],
+            }},
+        )
+        result = self._twin_result("TWIN-NEVER-MAPPED-RUN", [], evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            self.check_report(result, store, zero=True, attached=False,
+                              allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                              allowed_verdicts=_VERDICTS_NEVER_MAPPED)
+
     def test_oracle_rejects_halted_capture(self):
         """P2-3 twin: a halted capture fails even when floors are met."""
         sha = "0" * 64

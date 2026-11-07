@@ -64550,6 +64550,57 @@ fn owned_run_under_cgroup_scope_arms_pid_consumer_for_direct_child() {
     assert_eq!(engine.target_exec_hints().unwrap().total(), 1);
 }
 
+// 7.10b run-tree: an owned run under cgroup scope classifies only
+// its direct child's EXECs. A second admitted live view's EXEC is a
+// descendant's: the owned-pid guard drops it before validation, so
+// the target total is unchanged and the disarmed gap consumer seeds
+// nothing. Deleting the guard classifies the descendant's image.
+#[test]
+fn owned_run_under_cgroup_scope_ignores_descendant_exec() {
+    let owned = std::process::id();
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let descendant = sleeper.id();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[owned, descendant]);
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), owned).unwrap());
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), descendant).unwrap());
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, Some(owned));
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let ts = u64::MAX;
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(owned, ts, dev, ino, 0),
+        &mut pending,
+    );
+    let hints = engine.target_exec_hints().expect("armed target split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.total(), 1);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(descendant, ts, dev, ino, 0),
+        &mut pending,
+    );
+    assert_eq!(
+        engine.target_exec_hints().expect("armed target split").total(),
+        1
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    sleeper.kill().unwrap();
+    sleeper.wait().unwrap();
+}
+
 // 7.10b: a validated target EXEC under exact-PID scope classifies
 // exactly one target-exec hint; the gap subpopulation stays empty.
 // PID-scope EXEC records carry no kernel ticket, so validation comes
@@ -64871,6 +64922,72 @@ fn matched_exit_drops_exec_timing_so_reused_pid_reads_late_watch() {
     let reused = exit_mappings_record(pid, admitted + 30);
     engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
+// B1 residual: an admission-covered unmatched exit drops its PID's
+// exe-identity stash entry and exec timing, exactly like a matched
+// exit. The view was removed by a scan/apply before the ring EXIT
+// arrived, so the exit takes the no-view branch and is covered by
+// the still-open admission: without the drop, a later reused-PID
+// gap consumes the dead image (a wrong-process hint with no loss
+// and no PARTIAL), and a reused-PID kind-7 exit reads timely on the
+// dead EXEC. Removing either drop re-arms the stale read.
+#[test]
+fn covered_unmatched_exit_drops_stash_and_exec_timing_for_reused_pid() {
+    let first = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 10, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    // A scan/apply retires the view before the ring EXIT arrives;
+    // the admission stays open past the exit timestamp.
+    engine.close_cgroup_admission(ProcessViewId(0), admitted + 25);
+    engine.views.retain(|view| view.id() != ProcessViewId(0));
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(pid, admitted + 20),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(pid, admitted + 30),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 0);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+    // The exec timing died with the covered exit too: a reused-PID
+    // kind-7 exit reads late-watch, never timely on the dead EXEC.
+    let reused = exit_mappings_record(pid, admitted + 40);
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 2);
     assert_eq!(
         engine
             .gap_exit_mappings()

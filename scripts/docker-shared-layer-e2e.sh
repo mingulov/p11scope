@@ -6,14 +6,17 @@
 # reused verbatim: pinned ubuntu:26.04 base, SoftHSM2, ledgered `gated` client),
 # so both map the provider through overlay lower layers. Pre-copy-up both
 # identity backends collapse B onto A's module (same lower file, honest).
-# Two inventory captures then span a same-bytes copy-up in B only (OQ5):
-# a second process in B maps the upper copy, and on BOTH backends B's first
-# process keeps an ended edge to the old module plus a mapped edge to the new
-# one (the known issue copy-up-stale-caller: it still runs the lower file)
-# while the second mapper is attributed to the upper copy with no loss.
+# Two inventory captures plus a cgroup profile then span a same-bytes
+# copy-up in B only (OQ5): a second process in B maps the upper copy and
+# ledgers one round, and on BOTH backends B's first process keeps its
+# mapped edge to the old module (D1-extended: the kernel witness proves
+# it still runs the lower file — the stale join) while the second mapper
+# is attributed to the upper copy with its round counted and no loss.
 # A second pre-copy-up mapper (the round-2 twin) ledgers after the copy-up
-# inside the span; the oracle asserts the new edge claims none of its calls.
-# After B restarts, fresh captures open their anchor from the upper copy and
+# inside the span; the oracle asserts its ledger counts on the old edge
+# where scanned and is honestly gapped where not. The span profile shows
+# both module rows with the pre_copy_up marker on the lower one. After B
+# restarts, fresh captures open their anchor from the upper copy and
 # attribute B exactly. The observer is the host release binary run through
 # `sudo -n` in the initial PID namespace.
 #
@@ -31,6 +34,7 @@ HOLDER_BASE=ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7
 PROVIDER_PATH=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 ITERS_A_DEFAULT=400
 ITERS_B_DEFAULT=250
+B2_ITERS=1
 DURATION_DEFAULT=30
 SPAN_DEFAULT=60
 # The second mapper in B: the ledgered client on the image's own token, held
@@ -48,11 +52,12 @@ usage: scripts/docker-shared-layer-e2e.sh --host dev|fedora-private --observer B
        scripts/docker-shared-layer-e2e.sh --bundle OUTDIR [--image NAME] [--token TOKEN]
        scripts/docker-shared-layer-e2e.sh --self-test | --help
 
-  Cell D1 driver. Run modes share one flow: build (or load) the holder image,
-  start containers A and B, capture pre-copy-up evidence, start two
-  inventory captures that span B's same-bytes copy-up, a held round-2 gate
-  released after it, and a second mapper of the upper copy, restart B,
-  capture fresh evidence, and check it with
+  Cell D1 driver (D1-extended: the stale join). Run modes share one flow:
+  build (or load) the holder image, start containers A and B, capture
+  pre-copy-up evidence, start two inventory captures plus a cgroup
+  profile that span B's same-bytes copy-up, a held round-2 gate released
+  after it, and a second mapper of the upper copy that ledgers one
+  round, restart B, capture fresh evidence, and check it with
   scripts/container-cells-oracle.py copy-up.
 
   --host dev            use the local docker daemon (dev host)
@@ -182,8 +187,16 @@ self_test() {
         || { echo "oracle call lost --b-pre-round2-calls" >&2; exit 1; }
     grep -q -- '--b-pre-round2-pid "\$PID_B[3]"' "$0" \
         || { echo "oracle call lost --b-pre-round2-pid" >&2; exit 1; }
+    grep -q -- '--span-profile "\$WORK/d1-span-b.jso[n]"' "$0" \
+        || { echo "oracle call lost --span-profile" >&2; exit 1; }
+    grep -q -- '--b2-calls "\$((6' "$0" \
+        || { echo "oracle call lost --b2-calls" >&2; exit 1; }
     grep -q 'release_gate "\$PID_B3" "\$B3_GAT[E]"' "$0" \
         || { echo "round-2 twin gate is not released from the host" >&2; exit 1; }
+    grep -q 'release_gate "\$PID_B2" "\$B2_GAT[E]"' "$0" \
+        || { echo "second mapper gate is not released from the host" >&2; exit 1; }
+    grep -q 'lower-stack-b=\$LOWER_STACK_[B]' "$0" \
+        || { echo "facts lost the lower-stack-b depth" >&2; exit 1; }
     grep -q 'round2-passes-at-ma[p]=' "$0" \
         || { echo "the copy-up no longer waits for the spans to scan the round-2 twin" >&2; exit 1; }
     d1_help_self_test
@@ -391,6 +404,14 @@ LEDGER one" PRIVATE=0 PATH="$stub:$PATH" wait_docker_log_count c '^LEDGER ' 2 1 
             exit 1
         fi
     done
+    # Lower-layer stack depth: the root mount's lowerdir entry count.
+    got=$(D1_MOUNTINFO_FILE=$stub/mi-overlay lower_stack_of_pid 1234) \
+        || { echo "overlay lower stack refused" >&2; exit 1; }
+    [ "$got" = "2" ] || { echo "lower stack resolved to $got" >&2; exit 1; }
+    if D1_MOUNTINFO_FILE=$stub/mi-btrfs lower_stack_of_pid 1234 >/dev/null 2>&1; then
+        echo "lower stack accepted from btrfs" >&2
+        exit 1
+    fi
     # Timed-inventory passes: pass summary lines only, never progress lines.
     WORK=$stub
     printf '%s\n' 'p11scope: sweeping 440 process maps (cap 256)...' \
@@ -628,6 +649,29 @@ upper_of_pid() {
     printf '%s\n' "$up"
 }
 
+lower_stack_of_pid() {
+    if [ -n "${D1_MOUNTINFO_FILE-}" ]; then
+        info=$(cat "$D1_MOUNTINFO_FILE") || return 1
+    else
+        info=$(sudo -n cat "/proc/$1/mountinfo") || return 1
+    fi
+    depth=$(printf '%s\n' "$info" | awk '
+        $5 == "/" {
+            for (i = 7; i <= NF && $i != "-"; i++) ;
+            if ($(i + 1) != "overlay") { exit }
+            n = split($(i + 3), opt, ",")
+            for (j = 1; j <= n; j++) {
+                if (opt[j] ~ /^lowerdir=\//) {
+                    stack = substr(opt[j], 10)
+                    print gsub(/:/, ":", stack) + 1
+                    exit
+                }
+            }
+        }')
+    [ -n "$depth" ] || { echo "no overlay lowerdir on the root mount of pid $1" >&2; return 1; }
+    printf '%s\n' "$depth"
+}
+
 upper_has() {
     sudo -n test -e "$1$PROVIDER_PATH"
 }
@@ -751,16 +795,19 @@ wait_file_line() {
 }
 
 # A second process in B maps the provider after the copy-up, so it maps the
-# upper copy while B's first process keeps the lower one.
+# upper copy while B's first process keeps the lower one. The driver
+# releases its gate after both spanning legs admit it, so its one
+# ledgered round counts fresh calls on the upper edge.
 start_second_mapper() {
-    dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH 1 200 $B2_GATE" \
+    dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH $B2_ITERS 200 $B2_GATE" \
         >"$WORK/b2.log" 2>&1 &
     CAPTURE_PIDS="${CAPTURE_PIDS-} $!"
 }
 
 # A second pre-copy-up mapper in B: it maps the lower copy (like B's first
 # process) and holds at its own gate until the driver releases it from the
-# host after the copy-up, so its in-span round measures the false zero.
+# host after the copy-up, so its in-span round measures the stale ledger:
+# counted on the old edge where scanned, honestly gapped where not.
 start_round2_mapper() {
     dcli exec "$D1_B" sh -c "SOFTHSM2_CONF=/tmp/softhsm2.conf exec $GATED $PROVIDER_PATH $ITERS_B 200 $B3_GATE" \
         >"$WORK/b3.log" 2>&1 &
@@ -1005,7 +1052,8 @@ SHA_A_PRE=$(prov_sha "$PID_A") || fail_cell "cannot hash A provider"
 SHA_B_PRE=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider"
 [ -n "$SHA_A_PRE" ] && [ -n "$SHA_B_PRE" ] || fail_cell "empty provider hash"
 fact "stat-a-pre=$STAT_A_PRE sha-a-pre=$SHA_A_PRE"
-fact "stat-b-pre=$STAT_B_PRE sha-b-pre=$SHA_B_PRE"
+LOWER_STACK_B=$(lower_stack_of_pid "$PID_B_PRE") || fail_cell "no lower stack for $D1_B"
+fact "stat-b-pre=$STAT_B_PRE sha-b-pre=$SHA_B_PRE lower-stack-b=$LOWER_STACK_B"
 [ "$SHA_A_PRE" = "$SHA_B_PRE" ] || fail_cell "A and B provider bytes differ pre-copy-up"
 UPPER_A=$(upper_of_pid "$PID_A") || fail_cell "no overlay upper layer for $D1_A"
 UPPER_B=$(upper_of_pid "$PID_B_PRE") || fail_cell "no overlay upper layer for $D1_B"
@@ -1067,6 +1115,11 @@ wait_passes span-kernel "$PID_SPAN_K" "$((R2M_K0 + 2))" \
 wait_passes span-userspace "$PID_SPAN_U" "$((R2M_U0 + 2))" \
     || fail_cell "spanning userspace capture ran fewer than two passes after the round-2 twin mapped"
 
+say "=== cgroup profile of B spanning the copy-up ==="
+start_profile d1-span-b "$CG_B" "$SPAN"
+PID_SPAN_P=$!
+wait_ready span-profile-b "$PID_SPAN_P" || fail_cell "span profile of B never became ready"
+
 say "=== same-bytes copy-up in B only (OQ5) ==="
 STAT_B_COPY_PRE=$(prov_stat "$PID_B_PRE") || fail_cell "cannot re-stat B provider"
 dcli exec "$D1_B" sh -c 'p=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so; cp "$p" /tmp/p && cat /tmp/p > "$p" && rm /tmp/p' \
@@ -1101,10 +1154,17 @@ wait_passes span-kernel "$PID_SPAN_K" "$((SPAN_K0 + 2))" \
     || fail_cell "spanning kernel capture ran fewer than two passes after the second mapper"
 wait_passes span-userspace "$PID_SPAN_U" "$((SPAN_U0 + 2))" \
     || fail_cell "spanning userspace capture ran fewer than two passes after the second mapper"
+say "=== release the second mapper's gate (one fresh round on the upper edge) ==="
+release_gate "$PID_B2" "$B2_GATE" || fail_cell "gate release failed for the second mapper"
+wait_file_line "$WORK/b2.log" '^LEDGER ' 60 || fail_cell "second mapper ledger never completed"
+ledger_is "$WORK/b2.log" "$B2_ITERS" || fail_cell "second mapper ledger is not 6x$B2_ITERS"
+grep -h '^LEDGER ' "$WORK/b2.log" >>"$FACTS"
+kill -0 "$PID_SPAN_P" 2>/dev/null || fail_cell "span profile of B ended before the second mapper ledgered"
 say "=== round-2 twin ledger completes inside the span ==="
 wait_file_line "$WORK/b3.log" '^LEDGER ' 60 || fail_cell "round-2 twin ledger never completed"
 ledger_is "$WORK/b3.log" "$ITERS_B" || fail_cell "round-2 twin ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/b3.log" >>"$FACTS"
+kill -0 "$PID_SPAN_P" 2>/dev/null || fail_cell "span profile of B ended before the round-2 twin ledgered"
 R2_K0=$(pass_count span-kernel)
 R2_U0=$(pass_count span-userspace)
 fact "round2-passes-at-ledger=$R2_K0,$R2_U0"
@@ -1117,7 +1177,8 @@ if ! maps_provider "$PID_B2" || ! maps_provider "$PID_B_PRE" || ! maps_provider 
 fi
 wait "$PID_SPAN_K" || fail_cell "spanning kernel capture failed"
 wait "$PID_SPAN_U" || fail_cell "spanning userspace capture failed"
-for span in d1-span-kernel d1-span-userspace; do
+wait "$PID_SPAN_P" || fail_cell "span profile of B failed"
+for span in d1-span-kernel d1-span-userspace d1-span-b; do
     reclaim_root_output "$WORK/$span.json" || fail_cell "cannot reclaim $span"
     python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$WORK/$span.json" \
         || fail_cell "$span is not valid JSON"
@@ -1160,7 +1221,7 @@ awk '/^READY /{n++} n>=2' "$WORK/logs-b-post.txt" >"$WORK/logs-b-post-run.txt"
 ledger_is "$WORK/logs-b-post-run.txt" "$ITERS_B" || fail_cell "restarted B ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/logs-b-post.txt" >>"$FACTS"
 
-printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process is attributed to the upper copy on both identity backends (known issue, disclosed). The second mapper in B is attributed to the upper copy on both backends. No named identity loss is expected on any leg. The second mapper's span entries coverage is a per-capture observation that may honestly differ across backends (watched_no_use vs unknown/use_before_admission) while its mapping, count, and module keys agree." >"$WORK/dc73-note.txt"
+printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process keeps its mapped edge to the shared lower module on both identity backends (the kernel witness proves it still runs the lower file: never ended, never gapped, never edged to the new module). The second mapper in B is attributed to the new upper module with its ledgered round counted on both backends. The round-2 twin is gap-only where never deep-scanned and keeps its mapped old edge with its ledger counted where scanned. The span profile of B shows both module rows with the pre_copy_up marker on the lower one. No named identity loss is expected on any leg." >"$WORK/dc73-note.txt"
 fact "dc73-note=$(cat "$WORK/dc73-note.txt")"
 
 say "=== oracle ==="
@@ -1174,9 +1235,11 @@ if python3 -I "$ORACLE" copy-up --lane "$LANE" \
         --pre-profile-a "$WORK/d1-pre-a.json" \
         --pre-profile-b "$WORK/d1-pre-b.json" \
         --post-profile-b "$WORK/d1-post-b.json" \
+        --span-profile "$WORK/d1-span-b.json" \
         --pid-a "$PID_A" --pid-b-pre "$PID_B_PRE" --pid-b-span "$PID_B2" \
         --pid-b-post "$PID_B_POST" \
         --iters-a "$ITERS_A" --iters-b "$ITERS_B" \
+        --b2-calls "$((6 * B2_ITERS))" \
         --dc73-note "$WORK/dc73-note.txt" \
         --facts-log "$FACTS" \
         --b-pre-round2-calls "$((6 * ITERS_B))" --b-pre-round2-pid "$PID_B3" \

@@ -435,11 +435,13 @@ fn open_rule_path(path: &Path) -> Result<File, String> {
 /// no later reopen can resolve anywhere else.
 ///
 /// A Landlock path rule grants a whole subtree, so the parent must be a
-/// dedicated directory: empty, or holding only `target` (the rename-over
-/// case). A parent that *is* the filesystem root — by device and inode,
-/// which also catches a bind mount of `/` — refuses with the root
-/// wording. Anything else unusable refuses as
-/// `isolated profile: output directory <dir> is unusable: <reason>`.
+/// dedicated directory: empty, or holding only `target` as a single-link
+/// regular file (the rename-over case). Any other type or a hard link
+/// would grant the shared subtree or inode through the writable rule, so
+/// it refuses with the not-empty wording. A parent that *is* the
+/// filesystem root — by device and inode, which also catches a bind mount
+/// of `/` — refuses with the root wording. Anything else unusable refuses
+/// as `isolated profile: output directory <dir> is unusable: <reason>`.
 fn open_output_dir(dir: &Path, target: &std::ffi::OsStr) -> Result<File, String> {
     use std::ffi::CString;
     use std::os::unix::fs::MetadataExt as _;
@@ -494,11 +496,48 @@ fn open_output_dir(dir: &Path, target: &std::ffi::OsStr) -> Result<File, String>
     // names the same open file description), so it cannot race a rename.
     let listing = std::fs::read_dir(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|error| unusable(format!("cannot list {}: {error}", dir.display())))?;
+    let mut seen_target = false;
     for entry in listing {
         let entry =
             entry.map_err(|error| unusable(format!("cannot list {}: {error}", dir.display())))?;
         let name = entry.file_name();
-        if name != "." && name != ".." && name != target {
+        if name == target {
+            seen_target = true;
+            continue;
+        }
+        if name != "." && name != ".." {
+            return Err(unusable("not empty; use a dedicated directory".into()));
+        }
+    }
+    // The rename-over exception holds only for a single-link regular
+    // file: a directory would grant its subtree, a hard link the shared
+    // inode, and any other type a writer the fence must not grant.
+    // Checked on the same held descriptor, never a reopened path.
+    if seen_target {
+        let target_raw = match CString::new(target.as_bytes()) {
+            Ok(raw) => raw,
+            Err(_) => {
+                return Err(unusable("not empty; use a dedicated directory".into()));
+            }
+        };
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        if unsafe {
+            libc::fstatat(
+                file.as_raw_fd(),
+                target_raw.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } != 0
+        {
+            return Err(unusable(format!(
+                "cannot stat {}: {}",
+                dir.display(),
+                std::io::Error::last_os_error()
+            )));
+        }
+        let stat = unsafe { stat.assume_init() };
+        if stat.st_mode & libc::S_IFMT != libc::S_IFREG || stat.st_nlink != 1 {
             return Err(unusable("not empty; use a dedicated directory".into()));
         }
     }

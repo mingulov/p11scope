@@ -16,10 +16,14 @@
 # attach endpoints and the semantic lane never seals. The seed idles
 # (no calls) and stays live through the stop, so the oracle ignores
 # it. Rows:
-#   shortlived-shaped  vacuity and shape: fixture callers
-#                  discovered, all retired, the miss path hit
+#   shortlived-shaped  shape and conservation: fixture callers
+#                  discovered, all retired, every one either rowed
+#                  or counted in a named gap (no miss required, so
+#                  a future admission fix passes this row)
 #   shortlived-counted gap conservation: each published gap
-#                  count within [fixture, fixture+ambient]
+#                  count within [fixture, fixture+ambient], with
+#                  the never-admitted and refused gaps conserved
+#                  as one union the oracle cannot split per caller
 #
 # Usage: flock "$LOCK" scripts/ci/key-operations-shortlived.sh P11SCOPE OUTDIR
 # OUTDIR receives results.jsonl plus per-run evidence. Exit codes: 0

@@ -6,25 +6,30 @@ scripts/ci/key-operations-shortlived.sh runs N short-lived SoftHSM
 signers under `inventory --system --key-operations` and judges two
 rows from the observer JSON:
 
-* shortlived-shaped: the cell exercised the miss path (fixture
-  callers discovered, all retired, at least one missed its rows).
-* shortlived-counted: the two terminal gaps conserve the recomputed
-  miss counts within ambient headroom.
+* shortlived-shaped: fixture callers discovered, all retired, and
+  every one either rowed or counted in a named gap (conservation;
+  no miss is required, so a future admission fix passes this row).
+* shortlived-counted: the terminal gaps conserve the recomputed
+  miss counts within ambient headroom, with the never-admitted and
+  refused gaps conserved as one union.
 
 The oracle recomputes the expected counts from the published
 callers/edges/instances/semantic_edges records, independently of the
 observer implementation: a fixture record the observer missed must
-appear in exactly one of the two terminal gaps, and ambient
+appear in exactly one of the terminal gaps, and ambient
 (non-fixture) subset records bound how far the published counts may
-legitimately exceed the fixture recomputation. No privilege, no
-SoftHSM, no observer: pure functions over a parsed doc. Suite:
-tests/python/test_key_operations_shortlived.py.
+legitimately exceed the fixture recomputation. The oracle cannot
+split the never-admitted and refused gaps per caller (the refusal
+mark is internal), so the counted row conserves their union. No
+privilege, no SoftHSM, no observer: pure functions over a parsed
+doc. Suite: tests/python/test_key_operations_shortlived.py.
 """
 import json
 import re
 
 NEVER_ADMITTED_SUBJECT = "callers never admitted"
 WITHOUT_JOINS_SUBJECT = "admitted callers with no joined calls"
+REFUSED_SUBJECT = "callers refused admission"
 
 _COUNT_PREFIX = re.compile(r"\s*(\d+)\b")
 
@@ -65,9 +70,10 @@ def expectations(doc, fixture_path, provider_path):
 
     Returns a dict with D (fixture records discovered), D_retired,
     E1/E2 (fixture never-admitted/without-joins expectations), A1/A2
-    (ambient headroom for each gap) and G1/G2 (published gap counts,
-    None when the gap row is absent). Raises ValueError when the doc
-    is missing or unparsable.
+    (ambient headroom for each gap), G1/G2/G3 (published gap counts,
+    None when the gap row is absent) and unaccounted (retired fixture
+    caller ids neither rowed nor in E1/E2 shape, in doc order).
+    Raises ValueError when the doc is missing or unparsable.
     """
     if not isinstance(doc, dict):
         raise ValueError("missing or unparsable observer doc")
@@ -116,6 +122,8 @@ def expectations(doc, fixture_path, provider_path):
     exp = {"D": 0, "D_retired": 0, "E1": 0, "E2": 0, "A1": 0, "A2": 0,
            "G1": gap_count(doc, NEVER_ADMITTED_SUBJECT),
            "G2": gap_count(doc, WITHOUT_JOINS_SUBJECT),
+           "G3": gap_count(doc, REFUSED_SUBJECT),
+           "unaccounted": [],
            "suppressed": suppressed}
     for cid, record in callers.items():
         if record["fixture"]:
@@ -129,14 +137,19 @@ def expectations(doc, fixture_path, provider_path):
         if record["fixture"]:
             exp["E1"] += e1
             exp["E2"] += e2
+            if not e1 and not e2 and cid not in joined:
+                exp["unaccounted"].append(cid)
         else:
             exp["A1"] += e1
             exp["A2"] += e2
     return exp
 
 
-def check_shaped(exp, floor=1):
-    """Vacuity and shape: discovered, all retired, miss path hit."""
+def check_shaped(exp):
+    """Shape and conservation: discovered, all retired, every fixture
+    caller either rowed or counted in a named gap. No miss is
+    required: a future admission fix that rows every caller passes.
+    """
     if exp["suppressed"] > 0:
         return False, (
             f"gap suppression active ({exp['suppressed']} dropped): "
@@ -146,34 +159,50 @@ def check_shaped(exp, floor=1):
     if exp["D_retired"] != exp["D"]:
         return False, (
             f"fixture shape incomplete: {exp['D_retired']}/{exp['D']} retired")
-    missed = exp["E1"] + exp["E2"]
-    if missed < floor:
+    unaccounted = exp.get("unaccounted") or []
+    if unaccounted:
+        names = ", ".join(str(cid) for cid in unaccounted)
         return False, (
-            f"miss path not exercised: {missed} missed fixture caller(s), "
-            f"floor {floor} (every short-lived caller rowed)")
+            f"conservation violated: {len(unaccounted)} fixture caller(s) "
+            f"neither shown nor counted in a named gap: {names}")
     return True, (
         f"D={exp['D']} retired, E1={exp['E1']} never-admitted, "
         f"E2={exp['E2']} without-joins")
 
 
 def check_counted(exp):
-    """Gap conservation within ambient headroom (absent reads as 0)."""
+    """Gap conservation within ambient headroom (absent reads as 0).
+
+    The never-admitted and refused gaps partition the retired
+    edged-but-uninstanced callers, which the oracle cannot split per
+    caller, so their union conserves E1 within ambient headroom.
+    """
     problems = []
-    for name, gkey, ekey, akey in (
-            ("never-admitted", "G1", "E1", "A1"),
-            ("without-joins", "G2", "E2", "A2")):
-        published = exp[gkey] if exp[gkey] is not None else 0
-        low, high = exp[ekey], exp[ekey] + exp[akey]
-        if published < low:
-            problems.append(
-                f"{name}: published {published} below fixture {low}")
-        elif published > high:
-            problems.append(
-                f"{name}: published {published} above fixture+ambient {high}")
+    g1 = exp["G1"] if exp["G1"] is not None else 0
+    g3 = exp.get("G3") if exp.get("G3") is not None else 0
+    union, low, high = g1 + g3, exp["E1"], exp["E1"] + exp["A1"]
+    if union < low:
+        problems.append(
+            f"never-admitted+refused: published {union} below fixture {low}")
+    elif union > high:
+        problems.append(
+            f"never-admitted+refused: published {union} "
+            f"above fixture+ambient {high}")
+    g2 = exp["G2"] if exp["G2"] is not None else 0
+    low2, high2 = exp["E2"], exp["E2"] + exp["A2"]
+    if g2 < low2:
+        problems.append(
+            f"without-joins: published {g2} below fixture {low2}")
+    elif g2 > high2:
+        problems.append(
+            f"without-joins: published {g2} above fixture+ambient {high2}")
     if problems:
         return False, "; ".join(problems)
-    g1 = exp["G1"] if exp["G1"] is not None else 0
-    g2 = exp["G2"] if exp["G2"] is not None else 0
+    if g3:
+        return True, (
+            f"G1+G3={union} in [{exp['E1']}, {exp['E1'] + exp['A1']}] "
+            f"(G1={g1} never-admitted, G3={g3} refused), "
+            f"G2={g2} in [{exp['E2']}, {exp['E2'] + exp['A2']}]")
     return True, (
         f"G1={g1} in [{exp['E1']}, {exp['E1'] + exp['A1']}], "
         f"G2={g2} in [{exp['E2']}, {exp['E2'] + exp['A2']}]")

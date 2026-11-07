@@ -5,11 +5,11 @@
 Runs scripts/ci/key-operations-shortlived.sh end to end with a
 self-stopping fake observer (canned docs per KEYOPS_SL_SELFTEST_SCENARIO),
 a fake signer/keygen pair, and asserts the shortlived-shaped and
-shortlived-counted rows for every scenario: clean, miss-path vacuity,
-gap under/over counts, ambient headroom, suppression, a corrupt doc,
-signer failure and observer exit. Also unit-tests
-scripts/ci/key_operations_shortlived_checks.py. No SoftHSM, no
-privilege, no real observer. Run as a script:
+shortlived-counted rows for every scenario: clean, no-miss,
+unaccounted, refused-split, gap under/over counts, ambient headroom,
+suppression, a corrupt doc, signer failure and observer exit. Also
+unit-tests scripts/ci/key_operations_shortlived_checks.py. No
+SoftHSM, no privilege, no real observer. Run as a script:
 
     python3 -I tests/python/test_key_operations_shortlived.py -v
 """
@@ -30,8 +30,9 @@ import key_operations_shortlived_checks as checks  # noqa: E402
 
 FAKE_OBSERVER = """#!/bin/sh
 # Fake observer: seal line, self-stop after FAKE_OBSERVE_S, canned doc.
-# KEYOPS_SL_SELFTEST_SCENARIO: clean | no-miss | undercount | ambient |
-# overcount | suppressed | garbage-doc (each but garbage-doc writes a
+# KEYOPS_SL_SELFTEST_SCENARIO: clean | no-miss | unaccounted |
+# refused-split | undercount | ambient | overcount | suppressed |
+# garbage-doc (each but garbage-doc writes a
 # doc naming $FAKE_SIGNER as the fixture and $FAKE_PROVIDER as the
 # subset provider, then exits $FAKE_OBS_EXIT).
 out=""
@@ -68,6 +69,20 @@ case $scenario in
         insts='[{"caller": "c0", "module": "m0"}]'
         sedges='[{"caller": "c0", "module": "m0", "api_returns": {"count": 4}}]'
         gaps='[]'
+        supp=0 ;;
+    unaccounted)
+        callers="$(caller c0 true "$fixture")"
+        edges='[]'
+        insts='[]'
+        sedges='[]'
+        gaps='[]'
+        supp=0 ;;
+    refused-split)
+        callers="$(caller c0 true "$fixture"),$(caller c1 true "$fixture")"
+        edges='[{"caller": "c0", "module": "m0"}, {"caller": "c1", "module": "m0"}]'
+        insts='[]'
+        sedges='[]'
+        gaps='[{"subject": "callers never admitted", "reason": "1 caller(s) with provider edges exited before semantic admission; their way"}, {"subject": "callers refused admission", "reason": "1 caller(s) with provider edges were refused semantic admission; their way"}]'
         supp=0 ;;
     undercount)
         callers="$(caller c0 true "$fixture"),$(caller c1 true "$fixture")"
@@ -188,15 +203,39 @@ class ShortlivedScriptTests(unittest.TestCase):
         self.assertTrue((outdir / "out.json").exists())
         self.assertTrue((outdir / "signers.log").exists())
 
-    def test_no_miss_is_vacuous_shaped_failure(self):
+    def test_no_miss_passes_shaped_when_all_rowed(self):
+        # No miss is required: a future admission fix that rows every
+        # short-lived caller passes the shaped row.
         proc, outdir, rows = self.run_script("no-miss")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual((rows["shortlived-shaped"]["pass"],
+                          rows["shortlived-shaped"]["qualification"]),
+                         (True, "qualified"))
+        self.assertEqual(rows["shortlived-counted"]["qualification"],
+                         "qualified")
+
+    def test_unaccounted_fails_shaped(self):
+        proc, outdir, rows = self.run_script("unaccounted")
         self.assertEqual(proc.returncode, 1)
         row = rows["shortlived-shaped"]
         self.assertEqual((row["pass"], row["qualification"]),
                          (False, "failed"))
-        self.assertIn("miss path not exercised", row["detail"])
+        self.assertIn("neither shown nor counted", row["detail"])
+        self.assertIn("c0", row["detail"])
         self.assertEqual(rows["shortlived-counted"]["qualification"],
                          "qualified")
+
+    def test_refused_split_passes(self):
+        proc, outdir, rows = self.run_script("refused-split")
+        self.assertEqual(proc.returncode, 0, proc.stderr[-2000:])
+        self.assertEqual((rows["shortlived-shaped"]["pass"],
+                          rows["shortlived-shaped"]["qualification"]),
+                         (True, "qualified"))
+        self.assertEqual((rows["shortlived-counted"]["pass"],
+                          rows["shortlived-counted"]["qualification"]),
+                         (True, "qualified"))
+        self.assertIn("G1+G3=2 in [2, 2]",
+                      rows["shortlived-counted"]["detail"])
 
     def test_undercount_fails(self):
         proc, outdir, rows = self.run_script("undercount")
@@ -364,12 +403,18 @@ class CheckHelperTests(unittest.TestCase):
         ok, detail = checks.check_shaped({**base, "D_retired": 1})
         self.assertFalse(ok)
         self.assertIn("1/2 retired", detail)
+        # No miss is required: every caller rowed is the admission-fixed
+        # shape, and it passes.
         ok, detail = checks.check_shaped({**base, "E1": 0, "E2": 0})
-        self.assertFalse(ok)
-        self.assertIn("miss path not exercised", detail)
+        self.assertTrue(ok, detail)
         ok, detail = checks.check_shaped({**base, "suppressed": 5})
         self.assertFalse(ok)
         self.assertIn("suppression active", detail)
+        ok, detail = checks.check_shaped(
+            {**base, "E1": 0, "E2": 0, "unaccounted": ["c7"]})
+        self.assertFalse(ok)
+        self.assertIn("neither shown nor counted", detail)
+        self.assertIn("c7", detail)
 
     def test_counted_bounds(self):
         base = {"D": 2, "D_retired": 2, "E1": 1, "E2": 1,
@@ -386,6 +431,39 @@ class CheckHelperTests(unittest.TestCase):
         self.assertIn("above fixture+ambient", detail)
         ok, _ = checks.check_counted({**base, "G1": None, "E1": 0, "A1": 0})
         self.assertTrue(ok)
+
+    def test_counted_refused_union(self):
+        # The never-admitted and refused gaps partition the
+        # edged-but-uninstanced callers, so their union conserves E1.
+        base = {"D": 2, "D_retired": 2, "E1": 2, "E2": 0,
+                "A1": 0, "A2": 0, "G1": 1, "G2": None, "G3": 1,
+                "suppressed": 0}
+        ok, detail = checks.check_counted(dict(base))
+        self.assertTrue(ok, detail)
+        self.assertIn("G1+G3=2 in [2, 2]", detail)
+        ok, _ = checks.check_counted({**base, "G1": 0, "G3": 2})
+        self.assertTrue(ok)
+        ok, detail = checks.check_counted({**base, "G1": 0, "G3": 0})
+        self.assertFalse(ok)
+        self.assertIn("below fixture", detail)
+        ok, detail = checks.check_counted({**base, "G1": 2, "G3": 1})
+        self.assertFalse(ok)
+        self.assertIn("above fixture+ambient", detail)
+
+    def test_expectations_unaccounted_and_refused(self):
+        # c0: edged, uninstanced -> E1. c1: retired fixture with no
+        # edge and no joins -> unaccounted. The refused gap reads G3.
+        doc = self.doc(
+            callers=(self.caller("c0", "/f/signer"),
+                     self.caller("c1", "/f/signer")),
+            edges=({"caller": "c0", "module": "m0"},),
+            gaps=({"subject": "callers refused admission",
+                   "reason": "1 caller(s) were refused"},))
+        exp = checks.expectations(doc, "/f/signer", "/p/provider.so")
+        self.assertEqual(
+            (exp["D"], exp["D_retired"], exp["E1"], exp["E2"],
+             exp["G1"], exp["G3"], exp["unaccounted"]),
+            (2, 2, 1, 0, None, 1, ["c1"]))
 
 
 if __name__ == "__main__":

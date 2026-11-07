@@ -27892,8 +27892,8 @@ mod maps_skip_memory_tests {
         );
     }
 
-    /// An applied pass records its pinned-object mappers so the next
-    /// collection re-decodes every member that feeds a watch; the
+    /// An applied pass groups its watch-feeding mappers by object so
+    /// the next collection re-decodes one representative per group; the
     /// backstop sheds mapper memory with the digests. RED: the memory
     /// does not exist yet.
     #[test]
@@ -27915,18 +27915,105 @@ mod maps_skip_memory_tests {
         coordinator.note_applied_scan_tasks(&catalog);
         coordinator.passes = 0;
         assert_eq!(
-            coordinator.priors_for_collection().mappers,
-            BTreeSet::from([12]),
-            "the mapper must re-decode next pass (pid 11 maps nothing)"
+            coordinator.priors_for_collection().mapper_groups,
+            [(12usize, BTreeSet::from([12]))].into_iter().collect(),
+            "a dangling mapper must re-decode next pass (pid 11 maps nothing)"
         );
         coordinator.passes = 3;
         assert!(
-            coordinator.priors_for_collection().mappers.is_empty(),
+            coordinator
+                .priors_for_collection()
+                .mapper_groups
+                .is_empty(),
             "the backstop sheds mapper memory with the digests"
         );
     }
 
-    /// Only mappers of watch-feeding objects never skip: a member
+    /// Co-mappers of one watch-feeding object share a group: next pass
+    /// one of them re-decodes and the rest skip. Dangling indices never
+    /// group (each dangling mapper re-decodes alone). RED: grouping
+    /// does not exist yet.
+    #[test]
+    fn applied_pass_groups_co_mappers_of_one_object_together() {
+        use crate::inspect_system::{AdmissionRecord, CatalogObject, MemberStatus, ProcessRecord};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let mut coordinator = skip_coordinator();
+        let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        catalog.objects = vec![CatalogObject {
+            path: "/admitted.so".into(),
+            key: ObjectKey {
+                device: Device { major: 8, minor: 1 },
+                inode: 1,
+            },
+            sha256: None,
+            build_id: None,
+            identity_source: None,
+            note: None,
+            mappings: Vec::new(),
+            observations: Vec::new(),
+            admission: AdmissionRecord::Admitted {
+                class: "exact",
+                endpoints: 3,
+            },
+        }];
+        let record = |pid| ProcessRecord {
+            pid,
+            status: MemberStatus::Scanned,
+            objects: vec![0],
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: true,
+        };
+        catalog.processes.push(record(12));
+        catalog.processes.push(record(13));
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.passes = 0;
+        assert_eq!(
+            coordinator.priors_for_collection().mapper_groups,
+            [(0usize, BTreeSet::from([12, 13]))].into_iter().collect(),
+            "co-mappers of one admitted object must share a group"
+        );
+    }
+
+    /// Two mappers of one dangling index never share a group: each
+    /// re-decodes alone (fail toward never-skip). RED: grouping does
+    /// not exist yet.
+    #[test]
+    fn dangling_mappers_never_share_a_group() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = skip_coordinator();
+        let mut catalog = catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        let record = |pid| ProcessRecord {
+            pid,
+            status: MemberStatus::Scanned,
+            objects: vec![0],
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: true,
+        };
+        catalog.processes.push(record(12));
+        catalog.processes.push(record(13));
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.passes = 0;
+        assert_eq!(
+            coordinator.priors_for_collection().mapper_groups,
+            [
+                (12usize, BTreeSet::from([12])),
+                (13usize, BTreeSet::from([13])),
+            ]
+            .into_iter()
+            .collect(),
+            "dangling indices must fail toward never-skip, never toward grouping"
+        );
+    }
+
+    /// Only mappers of watch-feeding objects join groups: a member
     /// mapping solely refused objects skips like any examined member
     /// (nothing to flap: refused modules carry no watch and render
     /// refused whatever the mapping state). RED: the memory is
@@ -27987,8 +28074,8 @@ mod maps_skip_memory_tests {
         coordinator.note_applied_scan_tasks(&catalog);
         coordinator.passes = 0;
         assert_eq!(
-            coordinator.priors_for_collection().mappers,
-            BTreeSet::from([12]),
+            coordinator.priors_for_collection().mapper_groups,
+            [(0usize, BTreeSet::from([12]))].into_iter().collect(),
             "the refused-only mapper must skip (its modules carry no watch)"
         );
     }

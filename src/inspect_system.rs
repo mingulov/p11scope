@@ -10806,7 +10806,23 @@ mod maps_skip_tests {
                 .iter()
                 .map(|(pid, generation, digest)| (*pid, (*generation, *digest)))
                 .collect(),
-            mappers: BTreeSet::new(),
+            mapper_groups: BTreeMap::new(),
+        }
+    }
+
+    fn grouped_priors(
+        entries: &[(u32, Option<u64>, u64)],
+        groups: &[(usize, &[u32])],
+    ) -> ScanPriors {
+        ScanPriors {
+            digests: entries
+                .iter()
+                .map(|(pid, generation, digest)| (*pid, (*generation, *digest)))
+                .collect(),
+            mapper_groups: groups
+                .iter()
+                .map(|(id, pids)| (*id, pids.iter().copied().collect()))
+                .collect(),
         }
     }
 
@@ -10930,13 +10946,98 @@ mod maps_skip_tests {
     fn members_mapping_pinned_providers_are_never_skipped() {
         let digest = digest_maps_snapshot(&snapshot());
         let sweep = vec![(4242, snapshot()), (4243, snapshot())];
-        let mut prior = priors(&[(4242, Some(77), digest), (4243, Some(78), digest)]);
-        prior.mappers = BTreeSet::from([4242]);
+        let prior = grouped_priors(
+            &[(4242, Some(77), digest), (4243, Some(78), digest)],
+            &[(0, &[4242])],
+        );
         let live = |pid: u32| if pid == 4242 { Some(77) } else { Some(78) };
         assert_eq!(
             unchanged_skip_set(&sweep, &prior, live),
             BTreeSet::from([4243]),
-            "a member feeding a watch must re-decode every pass it is selected"
+            "a lone representative must re-decode every pass it is selected"
+        );
+    }
+
+    #[test]
+    fn peers_of_a_representative_skip_while_it_redecodes() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot()), (4243, snapshot()), (4244, snapshot())];
+        let prior = grouped_priors(
+            &[
+                (4242, Some(77), digest),
+                (4243, Some(78), digest),
+                (4244, Some(79), digest),
+            ],
+            &[(0, &[4242, 4243, 4244])],
+        );
+        let live = |pid: u32| match pid {
+            4242 => Some(77),
+            4243 => Some(78),
+            _ => Some(79),
+        };
+        assert_eq!(
+            unchanged_skip_set(&sweep, &prior, live),
+            BTreeSet::from([4243, 4244]),
+            "one representative re-decodes per watch-feeding object; stable peers skip"
+        );
+    }
+
+    #[test]
+    fn distinct_objects_keep_distinct_representatives() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot()), (4243, snapshot())];
+        let prior = grouped_priors(
+            &[(4242, Some(77), digest), (4243, Some(78), digest)],
+            &[(0, &[4242]), (1, &[4243])],
+        );
+        let live = |pid: u32| if pid == 4242 { Some(77) } else { Some(78) };
+        assert!(
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
+            "each watch-feeding object keeps its own decoder"
+        );
+    }
+
+    #[test]
+    fn exited_representative_promotes_a_live_peer() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4243, snapshot())];
+        let prior = grouped_priors(&[(4243, Some(78), digest)], &[(0, &[4242, 4243])]);
+        let live = |_: u32| Some(78);
+        assert!(
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
+            "the last live stable mapper must re-decode (its exit peer proves nothing)"
+        );
+    }
+
+    #[test]
+    fn changed_maps_member_yields_its_group_to_a_stable_peer() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let mut changed = snapshot();
+        changed.push(entry(0x3000, 33, "/usr/lib/softhsm/libsofthsm2.so"));
+        let sweep = vec![(4242, changed), (4243, snapshot())];
+        let prior = grouped_priors(
+            &[(4242, Some(77), digest), (4243, Some(78), digest)],
+            &[(0, &[4242, 4243])],
+        );
+        let live = |pid: u32| if pid == 4242 { Some(77) } else { Some(78) };
+        assert!(
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
+            "a remapped member scans; the stable peer represents the object"
+        );
+    }
+
+    #[test]
+    fn reused_pid_never_represents_its_group() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot()), (4243, snapshot())];
+        let prior = grouped_priors(
+            &[(4242, Some(77), digest), (4243, Some(78), digest)],
+            &[(0, &[4242, 4243])],
+        );
+        let live = |pid: u32| if pid == 4242 { Some(777) } else { Some(78) };
+        assert!(
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
+            "pid reuse scans; the stable peer represents the object"
         );
     }
 
@@ -11000,7 +11101,7 @@ mod maps_skip_tests {
                     (*pid, (generation, *digest))
                 })
                 .collect::<BTreeMap<_, _>>(),
-            mappers: BTreeSet::new(),
+            mapper_groups: BTreeMap::new(),
         };
         let second = run(&priors);
         let live = |pid: u32| crate::process::process_start_time(pid).ok();

@@ -11,6 +11,8 @@
 # Apt prerequisites: binutils gcc libcap2-bin procps python3 softhsm2
 # util-linux.
 # Must run as root (setcap, sysctl, runuser); restores paranoid on exit.
+# It changes the host-wide perf_event_paranoid sysctl while it runs, so
+# serialize with any other paranoid changer (the privileged lock).
 # Exit 0 means every row passed, 1 means a cell failed, 2 means a
 # harness error, 77 means a prerequisite is missing.
 set -u

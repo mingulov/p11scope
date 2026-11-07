@@ -511,10 +511,11 @@ pub(crate) fn tmpfs_nonunique_kind(super_options: Option<&str>) -> Option<&'stat
     // 32-bit counter wraps and two live files can share a number. An
     // unreadable mount table fails closed. The option is matched as a
     // whole comma-separated token, never a substring. A tmpfs line
-    // showing neither token (a kernel built without the inode64
-    // option) counts as unique: refusing it would drop every tmpfs
-    // object on such kernels, while the collision it risks needs
-    // billions of allocations plus an exact pin match.
+    // showing neither token (a kernel built without CONFIG_TMPFS_INODE64,
+    // where tmpfs uses 32-bit inode numbers) counts as unique: refusing
+    // it would drop every tmpfs object on such kernels, while the
+    // collision it risks needs billions of allocations plus an exact
+    // pin match.
     match super_options {
         None => Some("tmpfs-unresolved"),
         Some(options) if options.split(',').any(|token| token == "inode32") => {
@@ -6355,7 +6356,7 @@ mod conservative_copy {
 }
 
 const AMBIGUOUS_SUBJECT: &str = "discovery subject";
-const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal or unavailable full opened-file identities; the collision group was not attached";
+const AMBIGUOUS_REASON: &str = "physical identity is ambiguous: equal mapping keys had unequal, unavailable, or unproven (inode numbers not unique) full opened-file identities; the collision group was not attached";
 
 fn ambiguous_identity_skip() -> Skipped {
     Skipped {
@@ -12102,9 +12103,10 @@ mod tests {
     #[test]
     fn unique_inode_decision_treats_neither_token_tmpfs_as_unique() {
         // Pins the disclosed fallback in `inodes_name_one_file`: a tmpfs
-        // line showing neither `inode32` nor `inode64` counts as unique,
-        // because refusing it would drop every tmpfs object on kernels
-        // without the option display. The residual (two live files
+        // line showing neither `inode32` nor `inode64` (a kernel built
+        // without CONFIG_TMPFS_INODE64, where tmpfs uses 32-bit inode
+        // numbers) counts as unique, because refusing it would drop every
+        // tmpfs object on such kernels. The residual (two live files
         // sharing a number plus an exact whole-pin and digest match) must
         // be named in the release known issues; flipping this leg is a
         // behaviour choice for the release line, not a silent edit.

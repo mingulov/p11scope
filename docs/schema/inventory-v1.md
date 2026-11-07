@@ -319,7 +319,8 @@ non-null values needs a new allowlist row.
   from a maps match reads `uncertain`. A maps match never comes from a
   ` (deleted)` mapping, an overlay-collapsed or aliased key, a rejected
   key, or a filesystem whose inode numbers are not unique (FUSE,
-  network filesystems). `entries` is usage
+  network filesystems, tmpfs mounted `inode32` or whose mount cannot be
+  resolved). `entries` is usage
   evidence from observed entries only: cumulative `count` plus
   first/last seen, an in-flight flag, and `observation` —
   `observed`, `unknown (not admitted)`, `unknown (usage observation

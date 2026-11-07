@@ -462,33 +462,48 @@ rather than reading `[]`. Both are fail-closed disclosures; the
 structural merge, evidence union and exact observation hold.
 
 File identity on some filesystems has known edge cases, found by a
-dedicated test study on 2026-11-03 (Linux 7.0) and not yet covered by
-automated tests:
+dedicated test study on 2026-11-03 (Linux 7.0). Since 0.7.0 the inspection
+cache key and the pin-merge joins carry the held file's own device, so two
+Btrfs subvolume files (39 of 40 back-to-back pairs matched on maps device,
+inode, size and change time) and snapshot twins (which keep inode number,
+size, change time and content) no longer share inspections or merge; each
+case is covered by an automated privileged cell. What remains:
 
-- Btrfs: p11scope caches what it learned from inspecting a provider file,
-  keyed by the device and inode number shown in /proc maps, file size and
-  change time. That key does not include the Btrfs subvolume. Two different
-  files in two subvolumes created back to back matched on the whole key in
-  39 of 40 tries, so a later scan could reuse one file's inspection results
-  for another. This was reproduced at the file level only, not yet through a
-  full p11scope capture.
-- Btrfs snapshots keep the inode number, size, change time and content, and
-  a deleted subvolume's device number is reused at once by the next
+- A provider on a filesystem without unique inode numbers is not attached
+  once two processes map it or it is rescanned: the second observation
+  refuses the whole collision group (drops it, with an ambiguity gap)
+  rather than attaching either copy. This covers FUSE (virtiofs, AppImage,
+  sshfs, fuse-overlayfs), NFS, SMB/CIFS/SMB2, 9p, Ceph, AFS, Coda, tmpfs
+  mounted `inode32`, and tmpfs whose mount cannot be resolved (including a
+  container tmpfs seen through the observer's mount table, which is
+  classified at pin time from the observer's table).
+- On kernels built without CONFIG_TMPFS_INODE64, tmpfs uses 32-bit inode
+  numbers that can repeat after about 4 billion files on one mount;
+  p11scope treats them as unique there.
+- A file reached through overlayfs is classified by the overlay mount,
+  not by its lower layer: overlay over a non-unique lower still counts
+  as unique. Filesystems not on the non-unique list are allowed by
+  default, including Lustre, GPFS, BeeGFS, OrangeFS, vboxsf, ramfs and
+  hugetlbfs.
+- Four checks still compare `(st_dev, st_ino)` without refusing on
+  non-unique filesystems: the deep-scan mapped-file guard, the
+  same-object mapping short-circuit, retained-kernel-file comparison,
+  and `--exclude-path` matching. A detail toggle on such a filesystem
+  reports `Foreign` instead of `Changed` when the pin changed.
+- The inspection cache is never cleared within a capture: a device number
+  reused after a Btrfs subvolume delete plus snapshot, or a squashfs image
+  re-attached on a reused loop device, can hand one file's cached digest
+  to another file with an equal key. A future release will key the cache
+  by `STATX_MNT_ID_UNIQUE` or `name_to_handle_at`.
+- A deleted subvolume's device number is reused at once by the next
   subvolume or by an unrelated tmpfs or FUSE mount. An identity kept after
   its file is released can therefore name a different file.
-- FUSE filesystems, and tmpfs mounted with `inode32`, can show two live
-  files with different content under identical identity values, including
-  the `/proc/<pid>/map_files` identity. File sweeps refuse FUSE, but other
-  identity checks do not yet, and none of them treat `inode32` tmpfs as
-  non-unique.
 - The overlay copy-up case described above also reproduces on Linux 7.0.
-- XFS, EROFS, squashfs, FUSE, `inode32` tmpfs, Btrfs snapshots, device
-  number reuse and same-path files in different mount namespaces are not
-  exercised by automated tests yet.
+- XFS, EROFS, squashfs, FUSE mounts, device number reuse and same-path
+  files in different mount namespaces are not exercised by automated
+  tests yet.
 
-These are edge cases for typical desktop and server systems. A fix for the
-Btrfs cache key, a non-unique-inode refusal on every identity check, and a
-filesystem test matrix in CI are planned for 0.7.0.
+These are edge cases for typical desktop and server systems.
 
 Provider function tables can contain NULLs, unusable entries or fewer readable
 words than their version label suggests. Discovery retains usable targets
@@ -684,8 +699,11 @@ detail during a counter capture (`--select-endpoint`).
   (descendant admission and per-descendant probes, scoped to that tree
   only).
 - Parallel BPF program loading for faster startup.
-- File identity edge cases on Btrfs subvolumes and snapshots, FUSE and
-  `inode32` tmpfs, with a filesystem test matrix in CI (0.7.0).
+- File identity hardening past 0.7.0 (subvolume/snapshot joins, `inode32`
+  refusal and their privileged cells shipped in 0.7.0): refusal on the
+  remaining unrefused checks, pin-time classification from each view's
+  mount table, a `STATX_MNT_ID_UNIQUE` cache key, and a wider filesystem
+  test matrix in CI.
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

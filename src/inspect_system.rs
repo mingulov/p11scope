@@ -10795,7 +10795,7 @@ mod maps_skip_tests {
         let prior = priors(&[(4242, Some(77), digest)]);
         let live = |pid: u32| if pid == 4242 { Some(77) } else { None };
         assert_eq!(
-            unchanged_skip_set(&sweep, &prior, &live),
+            unchanged_skip_set(&sweep, &prior, live),
             BTreeSet::from([4242]),
             "only the proven-unchanged member skips"
         );
@@ -10810,7 +10810,7 @@ mod maps_skip_tests {
         let prior = priors(&[(4242, Some(77), digest)]);
         let live = |_: u32| Some(77);
         assert!(
-            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "a dlopen must rescan even with matching generation"
         );
     }
@@ -10822,7 +10822,7 @@ mod maps_skip_tests {
         let prior = priors(&[(4242, Some(77), digest)]);
         let live = |_: u32| Some(78);
         assert!(
-            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "pid reuse must rescan even with identical maps"
         );
     }
@@ -10834,7 +10834,7 @@ mod maps_skip_tests {
         let prior = priors(&[(4242, Some(77), digest)]);
         let live = |_: u32| None;
         assert!(
-            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "an unverifiable generation must rescan"
         );
     }
@@ -10844,12 +10844,12 @@ mod maps_skip_tests {
         let sweep = vec![(4242, snapshot())];
         let live = |_: u32| Some(77);
         assert!(
-            unchanged_skip_set(&sweep, &ScanPriors::empty(), &live).is_empty(),
+            unchanged_skip_set(&sweep, &ScanPriors::empty(), live).is_empty(),
             "first passes scan everything"
         );
         let prior = priors(&[(1111, Some(77), digest_maps_snapshot(&snapshot()))]);
         assert!(
-            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "a newcomer pid must scan"
         );
     }
@@ -10861,7 +10861,7 @@ mod maps_skip_tests {
         let prior = priors(&[(4242, None, digest)]);
         let live = |_: u32| Some(77);
         assert!(
-            unchanged_skip_set(&sweep, &prior, &live).is_empty(),
+            unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "a prior pass that never read the generation proves nothing"
         );
     }
@@ -10929,7 +10929,7 @@ mod maps_skip_tests {
         };
         let second = run(&priors);
         let live = |pid: u32| crate::process::process_start_time(pid).ok();
-        let skip = unchanged_skip_set(&second.sweep_for_test(), &priors, &live);
+        let skip = unchanged_skip_set(second.sweep_for_test(), &priors, live);
         assert!(
             !skip.is_empty(),
             "stable system pids must skip; sweep sizes {} -> {}",
@@ -10942,8 +10942,8 @@ mod maps_skip_tests {
             "no proven-unchanged member may consume a deep-scan slot"
         );
         let full = select_for_test(
-            &second.sweep_for_test(),
-            &second.sweep_unavailable_for_test(),
+            second.sweep_for_test(),
+            second.sweep_unavailable_for_test(),
             1,
             &scanned,
         );

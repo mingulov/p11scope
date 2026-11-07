@@ -3158,18 +3158,20 @@ fn scope_metadata_for(path: &str) -> crate::caller_metadata::presentation::Calle
 }
 
 /// F10: the concise per-caller scope line names a Docker container with
-/// its 12-hex prefix and per-caller entry total.
+/// its 12-hex prefix and per-caller entry total, marked as a hint.
 #[test]
 fn concise_caller_scope_line_names_docker_container() {
     let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
     assert_eq!(
         concise_caller_scope_line("pkcs11-tool", 4242, 17, Some(metadata)).as_deref(),
-        Some("caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker)")
+        Some(
+            "caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker, cgroup hint)"
+        )
     );
 }
 
 /// F10: the concise per-caller scope line names a Kubernetes pod with
-/// 8-hex pod and 12-hex container prefixes.
+/// 8-hex pod and 12-hex container prefixes, marked as a hint.
 #[test]
 fn concise_caller_scope_line_names_pod_and_container() {
     let metadata = scope_metadata_for(&format!(
@@ -3177,7 +3179,9 @@ fn concise_caller_scope_line_names_pod_and_container() {
     ));
     assert_eq!(
         concise_caller_scope_line("gated", 7, 1, Some(metadata)).as_deref(),
-        Some("caller gated pid 7: 1 entry observed, pod 12345678 / container 0123456789ab")
+        Some(
+            "caller gated pid 7: 1 entry observed, pod 12345678 / container 0123456789ab (cgroup hint)"
+        )
     );
 }
 
@@ -3229,57 +3233,69 @@ fn concise_unavailable_metadata_prints_no_scope_lines() {
 
 /// F10: an enabled frame with labeled rows prints one exact concise
 /// scope line per caller with edges, and the verbose Details caller
-/// line carries the full-ID suffix.
+/// line carries the full-ID suffix. Entry totals are fixed fixture
+/// constants (17 and 1), never recomputed with the product's sum, so a
+/// forwarding double-count fails this test; the forwarding shape itself
+/// is pinned by `concise_scope_totals_skip_forwarding_edges`.
 #[test]
 fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
-    use std::collections::BTreeMap;
+    use std::collections::BTreeSet;
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     let docker = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
     let pod = scope_metadata_for(&format!(
         "kubepods/burstable/pod{SCOPE_POD_UID}/{SCOPE_DOCKER_ID}"
     ));
-    let mut totals: BTreeMap<CallerId, u64> = BTreeMap::new();
-    for edge in &presentation.edges {
-        let total = totals.entry(edge.caller).or_default();
-        *total = total.saturating_add(edge.entry_count);
-    }
-    let mut labeled: Vec<(CallerId, &str)> = Vec::new();
+    let with_edges: BTreeSet<CallerId> =
+        presentation.edges.iter().map(|edge| edge.caller).collect();
+    let mut labeled: Vec<(CallerId, &str, u64)> = Vec::new();
     for caller in &presentation.callers {
-        if !totals.contains_key(&caller.id) {
+        if !with_edges.contains(&caller.id) {
             continue;
         }
-        let short = if labeled.is_empty() {
-            "container 0123456789ab (docker)"
+        let (short, total) = if labeled.is_empty() {
+            ("container 0123456789ab (docker, cgroup hint)", 17u64)
         } else {
-            "pod 12345678 / container 0123456789ab"
+            ("pod 12345678 / container 0123456789ab (cgroup hint)", 1u64)
         };
-        labeled.push((caller.id, short));
+        labeled.push((caller.id, short, total));
         if labeled.len() == 2 {
             break;
         }
     }
     assert_eq!(labeled.len(), 2, "fixture must give two callers with edges");
+    // Fixed counts: every edge starts at zero, then one edge per labeled
+    // caller carries its exact total. No product-sum mirror.
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    for (id, _, total) in &labeled {
+        presentation
+            .edges
+            .iter_mut()
+            .find(|edge| edge.caller == *id)
+            .expect("a labeled edge")
+            .entry_count = *total;
+    }
     let rows: Vec<(
         CallerId,
         crate::caller_metadata::presentation::CallerMetadata,
     )> = labeled
         .iter()
         .enumerate()
-        .map(|(index, (id, _))| (*id, if index == 0 { docker } else { pod }))
+        .map(|(index, (id, _, _))| (*id, if index == 0 { docker } else { pod }))
         .collect();
     presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
     assert!(presentation.caller_metadata.summary.enabled);
     let expected: Vec<String> = labeled
         .iter()
-        .map(|(id, short)| {
+        .map(|(id, short, total)| {
             let caller = presentation
                 .callers
                 .iter()
                 .find(|caller| caller.id == *id)
                 .unwrap();
-            let total = totals[&caller.id];
-            let noun = if total == 1 { "entry" } else { "entries" };
+            let noun = if *total == 1 { "entry" } else { "entries" };
             format!(
                 "caller {} pid {}: {total} {noun} observed, {short}",
                 application_label(&presentation, caller.id),
@@ -3293,6 +3309,20 @@ fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
         .filter(|line| line.starts_with("caller "))
         .collect();
     assert_eq!(scope_lines, expected, "{out}");
+    // The concise count line names the labeled rows and the unlabeled
+    // callers with edges (pending by default); sampled host rows would
+    // stay silent, but this fixture labels the first two and leaves the
+    // rest pending.
+    let pending = with_edges.len().saturating_sub(labeled.len());
+    let expected_context = if pending > 0 {
+        format!("caller context: 2 labeled, {pending} pending (-v for details)")
+    } else {
+        "caller context: 2 labeled (-v for details)".to_string()
+    };
+    assert!(
+        out.lines().any(|line| line == expected_context),
+        "missing concise count line {expected_context:?}\n{out}"
+    );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     for caller in &presentation.callers {
         let exe = caller
@@ -3308,11 +3338,11 @@ fn concise_enabled_frame_prints_scope_lines_and_verbose_suffix() {
             caller.lifecycle.label(),
             escape_controls(exe),
         );
-        if labeled.iter().any(|(id, _)| *id == caller.id) {
+        if labeled.iter().any(|(id, _, _)| *id == caller.id) {
             let suffix = if caller.id == labeled[0].0 {
-                format!("container {SCOPE_DOCKER_ID} (docker)")
+                format!("container {SCOPE_DOCKER_ID} (docker, cgroup hint)")
             } else {
-                format!("pod {SCOPE_POD_UID} / container {SCOPE_DOCKER_ID}")
+                format!("pod {SCOPE_POD_UID} / container {SCOPE_DOCKER_ID} (cgroup hint)")
             };
             expected_line.push_str(", ");
             expected_line.push_str(&suffix);
@@ -3354,4 +3384,268 @@ fn concise_disabled_frame_with_rows_prints_no_scope_lines() {
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(!verbose.contains(", container "), "{verbose}");
     assert!(!verbose.contains(", pod "), "{verbose}");
+}
+
+/// F10: per-caller scope totals skip forwarding-layer edges. The caller
+/// has a 500-entry forwarding edge plus a 744-entry provider edge; the
+/// scope line must read 744 (logical), never 1244 (double-count).
+#[test]
+fn concise_scope_totals_skip_forwarding_edges() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    for module in &mut presentation.modules {
+        if module.admission == AdmissionState::Refused {
+            module.admission = AdmissionState::Admitted;
+        }
+    }
+    assert!(
+        presentation.modules.len() >= 2,
+        "the twin needs two modules"
+    );
+    presentation.modules[0].paths = vec!["/opt/libforward.so".into()];
+    presentation.modules[0].admission_class = Some("closure_array".into());
+    presentation.modules[1].paths = vec!["/opt/libbackend.so".into()];
+    presentation.modules[1].admission_class = Some("exact".into());
+    let fwd_id = presentation.modules[0].id;
+    let prov_id = presentation.modules[1].id;
+    let caller = presentation
+        .edges
+        .iter()
+        .filter(|edge| edge.module == fwd_id)
+        .map(|edge| edge.caller)
+        .find(|caller| {
+            presentation
+                .edges
+                .iter()
+                .any(|edge| edge.module == prov_id && edge.caller == *caller)
+        })
+        .expect("a caller at both layers");
+    for edge in &mut presentation.edges {
+        edge.entry_count = 0;
+    }
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == fwd_id && edge.caller == caller)
+        .expect("a forwarding edge")
+        .entry_count = 500;
+    presentation
+        .edges
+        .iter_mut()
+        .find(|edge| edge.module == prov_id && edge.caller == caller)
+        .expect("a provider edge")
+        .entry_count = 744;
+    let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    presentation.caller_metadata =
+        crate::caller_metadata::runtime::MetadataFrame::for_test(&[(caller, metadata)]);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let line = out
+        .lines()
+        .find(|line| line.starts_with("caller "))
+        .expect("one scope line for the labeled caller");
+    assert!(
+        line.contains("744 entries observed"),
+        "logical total only: {line}"
+    );
+    assert!(!line.contains("1244"), "no forwarding double-count: {line}");
+    assert!(
+        line.contains("container 0123456789ab (docker, cgroup hint)"),
+        "hint-marked label: {line}"
+    );
+}
+
+/// F10: the concise count line names labeled, unknown and pending
+/// callers with edges (nonzero parts only); unknown/pending rows print
+/// no scope line but never vanish silently.
+#[test]
+fn concise_count_line_names_unknown_and_pending() {
+    use std::collections::BTreeSet;
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let with_edges: BTreeSet<CallerId> =
+        presentation.edges.iter().map(|edge| edge.caller).collect();
+    assert!(
+        with_edges.len() >= 3,
+        "fixture must give three callers with edges: {}",
+        with_edges.len()
+    );
+    let ids: Vec<CallerId> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .filter(|id| with_edges.contains(id))
+        .collect();
+    let labeled = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let unknown = crate::caller_metadata::presentation::CallerMetadata::unknown(
+        crate::caller_metadata::presentation::MetadataReason::ReadFailed,
+        2,
+    );
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&[
+        (ids[0], labeled),
+        (ids[1], unknown),
+    ]);
+    // ids[2..] have edges but no row, so they read pending.
+    let pending = with_edges.len() - 2;
+    assert!(pending >= 1, "fixture must leave a pending caller");
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("caller "))
+        .collect();
+    assert_eq!(
+        scope_lines.len(),
+        1,
+        "only the labeled caller prints: {out}"
+    );
+    let expected =
+        format!("caller context: 1 labeled, 1 unknown, {pending} pending (-v for details)");
+    assert!(
+        out.lines().any(|line| line == expected),
+        "missing count line {expected:?}\n{out}"
+    );
+}
+
+/// F10: stale and historical rows keep their hints in concise scope
+/// lines but never print as current: stale appends `, stale` and
+/// retired rows append `, exited`.
+#[test]
+fn concise_stale_and_historical_scope_lines_mark_status() {
+    use std::collections::BTreeSet;
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let with_edges: BTreeSet<CallerId> =
+        presentation.edges.iter().map(|edge| edge.caller).collect();
+    let ids: Vec<CallerId> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .filter(|id| with_edges.contains(id))
+        .collect();
+    assert!(ids.len() >= 2, "fixture must give two callers with edges");
+    let healthy = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&[
+        (ids[0], healthy.to_stale()),
+        (ids[1], healthy.to_historical()),
+    ]);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("caller "))
+        .collect();
+    assert_eq!(scope_lines.len(), 2, "{out}");
+    assert!(
+        scope_lines[0].contains("(docker, cgroup hint, stale)"),
+        "stale marked: {}",
+        scope_lines[0]
+    );
+    assert!(
+        scope_lines[1].contains("(docker, cgroup hint, exited)"),
+        "retired marked: {}",
+        scope_lines[1]
+    );
+}
+
+/// F10: concise scope lines cap at eight; the overflow names its count
+/// while the count line still reports the full labeled total.
+#[test]
+fn concise_scope_lines_cap_at_eight() {
+    let mut harness = harness();
+    harness.stage_scale(&ScaleSpec {
+        name: "f10-cap",
+        callers: 10,
+        modules: 2,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 80_000,
+    });
+    harness.commit();
+    let mut presentation = Presentation::capture(harness.coordinator(), "f10-cap", 1, 2, 1);
+    assert_eq!(presentation.edges.len(), 10, "one edge per caller");
+    let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = presentation
+        .callers
+        .iter()
+        .map(|caller| (caller.id, metadata))
+        .collect();
+    assert_eq!(rows.len(), 10, "ten callers to label");
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let scope_lines: Vec<&str> = out
+        .lines()
+        .filter(|line| line.starts_with("caller "))
+        .collect();
+    assert_eq!(scope_lines.len(), 8, "eight printed scope lines: {out}");
+    assert!(
+        out.lines()
+            .any(|line| line == "and 2 more labeled callers (-v or --json)"),
+        "overflow line names its count: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line == "caller context: 10 labeled (-v for details)"),
+        "count line reports the full total: {out}"
+    );
+}
+
+/// F10: quiet output with labeled rows prints no scope lines and no
+/// caller-context count line: concise-only content stays out of quiet.
+#[test]
+fn quiet_with_labeled_rows_prints_no_scope_lines() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = presentation
+        .callers
+        .iter()
+        .map(|caller| (caller.id, metadata))
+        .collect();
+    assert!(!rows.is_empty(), "fixture must give callers to label");
+    presentation.caller_metadata = crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    assert!(presentation.caller_metadata.summary.enabled);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Quiet);
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller ")),
+        "quiet carries no scope lines: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller context:")),
+        "quiet carries no count line: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("and ")),
+        "quiet carries no overflow line: {out}"
+    );
+}
+
+/// F10: a labeled caller without edges prints no scope line; the view
+/// degrades to the provider lines plus the labeled count of zero.
+#[test]
+fn concise_edge_less_labeled_caller_prints_no_scope_line() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.edges.clear();
+    let metadata = scope_metadata_for(&format!("system.slice/docker-{SCOPE_DOCKER_ID}.scope"));
+    let ids: Vec<CallerId> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .collect();
+    assert!(!ids.is_empty(), "fixture must give callers to label");
+    presentation.caller_metadata =
+        crate::caller_metadata::runtime::MetadataFrame::for_test(&[(ids[0], metadata)]);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller ")),
+        "edge-less labeled caller stays silent: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller context:")),
+        "no callers with edges means no count line: {out}"
+    );
 }

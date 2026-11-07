@@ -1227,11 +1227,14 @@ mod tests {
         let m = committed_for(&format!("system.slice/docker-{DOCKER_ID}.scope"));
         assert_eq!(
             concise_scope_label(&m, false).as_deref(),
-            Some(&*format!("container {} (docker)", &DOCKER_ID[..12]))
+            Some(&*format!(
+                "container {} (docker, cgroup hint)",
+                &DOCKER_ID[..12]
+            ))
         );
         assert_eq!(
             concise_scope_label(&m, true).as_deref(),
-            Some(&*format!("container {DOCKER_ID} (docker)"))
+            Some(&*format!("container {DOCKER_ID} (docker, cgroup hint)"))
         );
     }
 
@@ -1241,7 +1244,7 @@ mod tests {
         assert_eq!(
             concise_scope_label(&m, false).as_deref(),
             Some(&*format!(
-                "pod {} / container {}",
+                "pod {} / container {} (cgroup hint)",
                 &POD_UID[..8],
                 &DOCKER_ID[..12]
             ))
@@ -1287,7 +1290,9 @@ mod tests {
         let m = committed_for(&format!("kubepods/burstable/pod{POD_UID}/{DOCKER_ID}"));
         assert_eq!(
             concise_scope_label(&m, true).as_deref(),
-            Some(&*format!("pod {POD_UID} / container {DOCKER_ID}"))
+            Some(&*format!(
+                "pod {POD_UID} / container {DOCKER_ID} (cgroup hint)"
+            ))
         );
     }
 
@@ -1296,12 +1301,18 @@ mod tests {
         let containerd = committed_for(&format!("system.slice/cri-containerd-{DOCKER_ID}.scope"));
         assert_eq!(
             concise_scope_label(&containerd, false).as_deref(),
-            Some(&*format!("container {} (containerd)", &DOCKER_ID[..12]))
+            Some(&*format!(
+                "container {} (containerd, cgroup hint)",
+                &DOCKER_ID[..12]
+            ))
         );
         let crio = committed_for(&format!("system.slice/crio-{DOCKER_ID}.scope"));
         assert_eq!(
             concise_scope_label(&crio, false).as_deref(),
-            Some(&*format!("container {} (cri_o)", &DOCKER_ID[..12]))
+            Some(&*format!(
+                "container {} (cri_o, cgroup hint)",
+                &DOCKER_ID[..12]
+            ))
         );
         // A container hint without a recognized runtime keeps the uniform
         // shape with the canonical "unknown" label.
@@ -1309,14 +1320,17 @@ mod tests {
         unknown.container.runtime = Some(crate::caller_metadata::RuntimeHint::Unknown);
         assert_eq!(
             concise_scope_label(&unknown, false).as_deref(),
-            Some(&*format!("container {} (unknown)", &DOCKER_ID[..12]))
+            Some(&*format!(
+                "container {} (unknown, cgroup hint)",
+                &DOCKER_ID[..12]
+            ))
         );
         // A missing runtime claim (never produced by the parser) renders
-        // the bare ID rather than asserting a runtime.
+        // the ID with the hint marker but no runtime assertion.
         unknown.container.runtime = None;
         assert_eq!(
             concise_scope_label(&unknown, false).as_deref(),
-            Some(&*format!("container {}", &DOCKER_ID[..12]))
+            Some(&*format!("container {} (cgroup hint)", &DOCKER_ID[..12]))
         );
     }
 
@@ -1345,14 +1359,39 @@ mod tests {
     #[test]
     fn concise_label_stale_and_historical_keep_hints() {
         let healthy = committed_for(&format!("docker/{DOCKER_ID}"));
-        let expected = format!("container {} (docker)", &DOCKER_ID[..12]);
+        let stale = format!(
+            "container {} (docker, cgroup hint, stale)",
+            &DOCKER_ID[..12]
+        );
+        let exited = format!(
+            "container {} (docker, cgroup hint, exited)",
+            &DOCKER_ID[..12]
+        );
         assert_eq!(
             concise_scope_label(&healthy.to_stale(), false).as_deref(),
-            Some(expected.as_str())
+            Some(stale.as_str())
         );
         assert_eq!(
             concise_scope_label(&healthy.to_historical(), false).as_deref(),
-            Some(expected.as_str())
+            Some(exited.as_str())
+        );
+        // Pod pairs mark staleness the same way, after the hint marker.
+        let pod = committed_for(&format!("kubepods/burstable/pod{POD_UID}/{DOCKER_ID}"));
+        assert_eq!(
+            concise_scope_label(&pod.to_stale(), false).as_deref(),
+            Some(&*format!(
+                "pod {} / container {} (cgroup hint, stale)",
+                &POD_UID[..8],
+                &DOCKER_ID[..12]
+            ))
+        );
+        assert_eq!(
+            concise_scope_label(&pod.to_historical(), false).as_deref(),
+            Some(&*format!(
+                "pod {} / container {} (cgroup hint, exited)",
+                &POD_UID[..8],
+                &DOCKER_ID[..12]
+            ))
         );
     }
 
@@ -1364,7 +1403,51 @@ mod tests {
         m.container.id = None;
         assert_eq!(
             concise_scope_label(&m, false).as_deref(),
-            Some(&*format!("pod {}", &POD_UID[..8]))
+            Some(&*format!("pod {} (cgroup hint)", &POD_UID[..8]))
+        );
+    }
+
+    #[test]
+    fn concise_label_delegated_subtree_hint_stays_marked() {
+        // Anyone who can create cgroups can produce these shapes: a
+        // user-delegated subtree containing kubepods components still
+        // parses (innermost selection), so the label must carry the
+        // hint marker, never a bare authoritative ID.
+        let m = committed_for(&format!(
+            "user@1000.service/app.slice/x.scope/kubepods/besteffort/pod{POD_UID}/{DOCKER_ID}"
+        ));
+        assert_eq!(
+            concise_scope_label(&m, false).as_deref(),
+            Some(&*format!(
+                "pod {} / container {} (cgroup hint)",
+                &POD_UID[..8],
+                &DOCKER_ID[..12]
+            ))
+        );
+    }
+
+    #[test]
+    fn concise_label_pending_and_unknown_with_ids_mark_status() {
+        // Defensive: production pending/unknown rows carry no IDs, but a
+        // value that somehow has IDs must not print as current.
+        let healthy = committed_for(&format!("docker/{DOCKER_ID}"));
+        let mut pending = healthy;
+        pending.status = MetadataStatus::Pending;
+        assert_eq!(
+            concise_scope_label(&pending, false).as_deref(),
+            Some(&*format!(
+                "container {} (docker, cgroup hint, pending)",
+                &DOCKER_ID[..12]
+            ))
+        );
+        let mut unknown = healthy;
+        unknown.status = MetadataStatus::Unknown;
+        assert_eq!(
+            concise_scope_label(&unknown, false).as_deref(),
+            Some(&*format!(
+                "container {} (docker, cgroup hint, unknown)",
+                &DOCKER_ID[..12]
+            ))
         );
     }
 

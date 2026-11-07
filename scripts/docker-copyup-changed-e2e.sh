@@ -761,7 +761,9 @@ maps_provider "$PID_B_PRE" || fail_cell "B's first process no longer maps the pr
 STAT_B_POST=$(prov_stat "$PID_B_PRE") || fail_cell "cannot stat B provider after the patch"
 SHA_B_POST=$(prov_sha "$PID_B_PRE") || fail_cell "cannot hash B provider after the patch"
 fact "stat-b-post=$STAT_B_POST sha-b-post=$SHA_B_POST"
-[ "$STAT_B_POST" != "$STAT_B_PRE" ] || fail_cell "patch changed no inode (no copy-up)"
+# The overlay merge view keeps the origin inode across copy-up (same as
+# D1: stat-b-post == stat-b-pre); the copy-up proof is the changed
+# bytes plus the new upper file below, not a merge-inode change.
 [ "$SHA_B_POST" != "$SHA_B_PRE" ] || fail_cell "patch changed no bytes (not different-bytes)"
 upper_has "$UPPER_B" || fail_cell "copy-up left no provider in B's upper layer"
 UPPER_STAT_B=$(upper_stat "$UPPER_B") || fail_cell "cannot stat B upper provider"

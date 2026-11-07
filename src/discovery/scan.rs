@@ -11282,15 +11282,11 @@ mod tests {
         // the ELF inspection pin above.
         let lines: Vec<&str> = include_str!("scan.rs").lines().map(str::trim).collect();
         assert!(
-            lines.contains(
-                &"match provider_facts_for(&proof.file, lower_key, &wanted, budget) {"
-            ),
+            lines.contains(&"match provider_facts_for(&proof.file, lower_key, &wanted, budget) {"),
             "lower facts keyed by the lower file's mapping key"
         );
         assert!(
-            !lines.contains(
-                &"match provider_facts_for(&proof.file, key, &wanted, budget) {"
-            ),
+            !lines.contains(&"match provider_facts_for(&proof.file, key, &wanted, budget) {"),
             "lower facts never cached under the upper's maps key"
         );
     }

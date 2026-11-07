@@ -23,7 +23,7 @@ import tempfile
 
 sys.dont_write_bytecode = True
 ARTIFACTS = ("p11scope", "p11scope-discover", "p11scope-discover-glibc", "p11scope-discover-musl")
-LICENSES = ("LICENSE", "LICENSES/GPL-2.0-only.txt", "LICENSES/GPL-2.0-or-later.txt")
+LICENSES = ("LICENSE", "COPYRIGHT", "LICENSES/GPL-2.0-only.txt", "LICENSES/GPL-2.0-or-later.txt")
 # The trusted build-release.sh receipt covers one official selection per capture mode.
 OFFICIAL_P11SCOPE_FEATURES = {
     "full": (),

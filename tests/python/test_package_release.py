@@ -38,6 +38,7 @@ class PackageReleaseTests(unittest.TestCase):
             "Cargo.toml": b'[package]\nname="p11scope"\nversion="0.1.0"\n',
             "crates/discover/Cargo.toml": b'[package]\nname="p11scope-discover"\nversion="0.1.0"\n',
             "LICENSE": b"project license\n",
+            "COPYRIGHT": b"project copyright notice\n",
             "LICENSES/GPL-2.0-only.txt": b"BPF license\n",
             "LICENSES/GPL-2.0-or-later.txt": b"shared code license\n",
             "third-party/sources.json": json.dumps({"packages": [{
@@ -216,6 +217,7 @@ class PackageReleaseTests(unittest.TestCase):
                             "p11scope-discover-glibc" if "discover" in name else "p11scope")
                 self.assertEqual(archive.extractfile(binary).read(), (self.dist / artifact).read_bytes())
                 self.assertTrue(any(m.name.endswith("/LICENSE") for m in archive))
+                self.assertTrue(any(m.name.endswith("/COPYRIGHT") for m in archive))
                 self.assertTrue(any(m.name.endswith("/notices/NOTICES.md") for m in archive))
                 for member in archive:
                     if member.isfile():

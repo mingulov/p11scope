@@ -10450,6 +10450,11 @@ mod tests {
             outcome.evidence.pause_attempts,
             "pause counters do not add up"
         );
+        assert!(
+            outcome.evidence.pause_partial <= 1,
+            "at most one stop goes partial: {}",
+            outcome.evidence.pause_partial
+        );
         assert_eq!(
             outcome.evidence.unprotected_live_windows, 0,
             "every live window was protected by a confirmed stop"

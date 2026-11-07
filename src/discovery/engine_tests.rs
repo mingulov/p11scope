@@ -26031,6 +26031,7 @@ fn split_manifest_join_fixture() -> (
     PinnedObjects,
     p11scope_manifest::maps::ObjectKey,
     p11scope_manifest::maps::ObjectKey,
+    std::sync::Arc<std::fs::File>,
 ) {
     use crate::discovery::identity::test_fixture::{
         PATH as PROVIDER_PATH, manifest_pin, split_scan_pin,
@@ -26049,7 +26050,7 @@ fn split_manifest_join_fixture() -> (
     manifest.provenance_objects[0].device_major = maps_key.device.major;
     manifest.provenance_objects[0].device_minor = maps_key.device.minor;
     manifest.provenance_objects[0].inode = maps_key.inode;
-    (dir, manifest, pinned, maps_key, fd_key)
+    (dir, manifest, pinned, maps_key, fd_key, file)
 }
 
 fn refile_recorded_aliases(
@@ -26071,7 +26072,7 @@ fn refile_recorded_aliases(
 #[test]
 fn manifest_join_refiles_a_pre68_overlay_split_onto_its_scan_pin() {
     use crate::discovery::identity::test_fixture::{FakeSelfMappingProbe, PATH as PROVIDER_PATH};
-    let (_dir, manifest, mut pinned, maps_key, _fd_key) = split_manifest_join_fixture();
+    let (_dir, manifest, mut pinned, maps_key, _fd_key, _file) = split_manifest_join_fixture();
     assert_eq!(
         manifest_module_object(&manifest, &pinned),
         None,
@@ -26105,7 +26106,7 @@ fn manifest_join_refiles_a_pre68_overlay_split_onto_its_scan_pin() {
 #[test]
 fn manifest_join_keeps_the_miss_when_the_probe_refuses_the_split() {
     use crate::discovery::identity::test_fixture::{FakeSelfMappingProbe, PATH as PROVIDER_PATH};
-    let (_dir, manifest, mut pinned, _maps_key, fd_key) = split_manifest_join_fixture();
+    let (_dir, manifest, mut pinned, _maps_key, fd_key, _file) = split_manifest_join_fixture();
     assert_eq!(manifest_module_object(&manifest, &pinned), None);
     let manifest_before = pinned.id_for_path(PROVIDER_PATH);
     assert!(manifest_before.is_some());
@@ -26421,8 +26422,11 @@ fn prearm_and_manifest_aliases_share_one_scan_pin_after_split_refiling() {
     use crate::discovery::identity::test_fixture::{
         FakeSelfMappingProbe, PATH as PROVIDER_PATH, split_prearm_pin,
     };
-    let (_dir, manifest, mut pinned, maps_key, fd_key) = split_manifest_join_fixture();
-    let prearm = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
+    let (_dir, manifest, mut pinned, maps_key, fd_key, file) = split_manifest_join_fixture();
+    let mut prearm = split_prearm_pin(fd_key, maps_key, OVERLAY_SHA, 1);
+    // The pre-arm half is the same file as the scan/manifest halves, so it
+    // shares their backing file (and pin-time device), as in production.
+    overlay_reback(&mut prearm, &file);
     assert!(pinned.absorb(prearm).is_empty());
     let manifest_object = pinned
         .id_for_manifest(fd_key, PROVIDER_PATH)

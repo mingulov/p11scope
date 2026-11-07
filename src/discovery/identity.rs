@@ -127,7 +127,7 @@ struct RawObjectInstance {
     /// view retirement, they never come from maps), but they file
     /// separately so `sources` can report the `"prearm"` label. The marker
     /// never participates in identity merges (`ordinary_identity_equal`
-    /// compares mapping, pin and digest only).
+    /// compares mapping, held-fd device, pin and digest only).
     prearm: bool,
 }
 
@@ -192,6 +192,11 @@ pub fn target_paths_equal(left: &str, right: &str) -> bool {
 struct Entry {
     raw: RawObjectInstance,
     mapping: MappingFileKey,
+    /// The held fd's own `st_dev` at pin time. The mapping device is the
+    /// mount-table device (one per Btrfs mount for every subvolume), while
+    /// this is the subvolume's anonymous device: snapshot twins share the
+    /// mapping, pin and digest but never this.
+    fd_dev: u64,
     file: Arc<std::fs::File>,
     pin: Pin,
     /// Last `CLOCK_MONOTONIC` instant a held-fd check proved this object
@@ -393,7 +398,7 @@ impl RetainedInventoryTarget {
             !self.entry.sha256.is_empty()
                 && self.entry.sha256 == current.sha256
                 && self.entry.pin == current.pin
-                && (self.entry.mapping == current.mapping
+                && ((self.entry.mapping == current.mapping && self.entry.fd_dev == current.fd_dev)
                     || same_kernel_file(&self.entry.file, &current.file))
         })
     }
@@ -442,6 +447,7 @@ pub(crate) struct PinnedContentKey {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PinnedTimingKey {
     mapping: MappingFileKey,
+    fd_dev: u64,
     pin: Pin,
     sha256: String,
 }
@@ -1004,6 +1010,12 @@ impl Entry {
         mapped: Option<MappedFile>,
         verified_ns: Option<u64>,
     ) -> Result<Self, String> {
+        #[cfg(test)]
+        provider_metadata_read_test::metadata_read();
+        let fd_dev = file
+            .metadata()
+            .map_err(|error| format!("fstat failed: {error}"))?
+            .dev();
         Ok(Self {
             overlay: on_overlayfs(file.as_raw_fd())?,
             collapsed: false,
@@ -1011,6 +1023,7 @@ impl Entry {
             probed_maps_key: None,
             raw,
             mapping,
+            fd_dev,
             file: Arc::new(file),
             pin,
             last_ok_ns: std::cell::Cell::new(verified_ns),
@@ -2170,6 +2183,7 @@ impl PinnedObjects {
         let entry = self.by_id.get(&id)?;
         (!entry.sha256.is_empty()).then(|| PinnedTimingKey {
             mapping: entry.mapping,
+            fd_dev: entry.fd_dev,
             pin: entry.pin,
             sha256: entry.sha256.clone(),
         })
@@ -2189,8 +2203,15 @@ impl PinnedObjects {
                 .iter()
                 .map(|(id, offset)| {
                     let entry = pinned.by_id.get(id)?;
-                    (!entry.sha256.is_empty())
-                        .then(|| (entry.mapping, entry.pin, entry.sha256.clone(), *offset))
+                    (!entry.sha256.is_empty()).then(|| {
+                        (
+                            entry.mapping,
+                            entry.fd_dev,
+                            entry.pin,
+                            entry.sha256.clone(),
+                            *offset,
+                        )
+                    })
                 })
                 .collect();
             keys.filter(|keys| keys.len() == targets.len())
@@ -2720,6 +2741,7 @@ mod conservative_copy {
                         prearm: old.raw.prearm,
                     },
                     mapping: old.mapping,
+                    fd_dev: old.fd_dev,
                     file: old.file.clone(),
                     pin: old.pin,
                     mapped: old.mapped,
@@ -6330,6 +6352,7 @@ fn ambiguous_identity_skip() -> Skipped {
 
 fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
     if left.mapping == right.mapping
+        && left.fd_dev == right.fd_dev
         && left.pin == right.pin
         && !left.sha256.is_empty()
         && left.sha256 == right.sha256
@@ -8263,6 +8286,7 @@ pub(crate) mod test_fixture {
         let key = key.unwrap_or(fd_key);
         let path = path.to_str().unwrap();
         let raw = RawObjectInstance::scanned(&module(key), key, path).unwrap();
+        let fd_dev = metadata.dev();
         let entry = Entry {
             mapping: MappingFileKey {
                 mount_id,
@@ -8271,6 +8295,7 @@ pub(crate) mod test_fixture {
                 inode: fd_key.inode,
             },
             raw,
+            fd_dev,
             pin: pin_of(&file).unwrap(),
             file: Arc::new(file),
             mapped: None,
@@ -8380,6 +8405,8 @@ pub(crate) mod test_fixture {
         overlay: bool,
     ) -> PinnedObjects {
         let raw = RawObjectInstance::scanned(module, module.key, &module.path).unwrap();
+        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
                 mount_id: mapping_mount_id,
@@ -8388,7 +8415,8 @@ pub(crate) mod test_fixture {
                 inode: module.key.inode,
             },
             raw,
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            fd_dev,
+            file,
             mapped: None,
             pin: Pin {
                 ino: module.key.inode,
@@ -8427,10 +8455,13 @@ pub(crate) mod test_fixture {
     /// Re-backs every entry in `pins` with `file`, keeping the forged
     /// pin/mapping/sha. Fixtures sharing `/dev/null` are one kernel file; tests
     /// forging a genuine collision or a distinct overlay instance must re-back
-    /// with distinct real files instead.
+    /// with distinct real files instead. The pin-time device follows the new
+    /// backing file, as `Entry::new` would record it.
     pub(crate) fn reback(pins: &mut PinnedObjects, file: &Arc<std::fs::File>) {
+        let fd_dev = file.metadata().unwrap().dev();
         for entry in pins.by_id.values_mut() {
             entry.file = Arc::clone(file);
+            entry.fd_dev = fd_dev;
         }
     }
 
@@ -8575,6 +8606,8 @@ pub(crate) mod test_fixture {
     ) -> PinnedObjects {
         let modelled = module(maps_key);
         let raw = RawObjectInstance::scanned(&modelled, modelled.key, &modelled.path).unwrap();
+        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
                 mount_id: SPLIT_MOUNT_ID,
@@ -8583,7 +8616,8 @@ pub(crate) mod test_fixture {
                 inode: fd_key.inode,
             },
             raw,
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            fd_dev,
+            file,
             mapped: None,
             pin: Pin {
                 ino: INODE,
@@ -8614,6 +8648,8 @@ pub(crate) mod test_fixture {
     /// fd's key, with the same mapping, pin and digest as its scan pin.
     pub(crate) fn manifest_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
         let raw = RawObjectInstance::manifest(fd_key, PATH.to_string()).unwrap();
+        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
                 mount_id: SPLIT_MOUNT_ID,
@@ -8622,7 +8658,8 @@ pub(crate) mod test_fixture {
                 inode: fd_key.inode,
             },
             raw,
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            fd_dev,
+            file,
             mapped: None,
             pin: Pin {
                 ino: INODE,
@@ -8654,6 +8691,8 @@ pub(crate) mod test_fixture {
     /// pin's inode is the key's, as a real pin's always is.
     pub(crate) fn prearm_pin(fd_key: ObjectKey, sha256: &str, ctime: i64) -> PinnedObjects {
         let raw = RawObjectInstance::prearm(fd_key, PATH.to_string()).unwrap();
+        let file = Arc::new(std::fs::File::open("/dev/null").unwrap());
+        let fd_dev = file.metadata().unwrap().dev();
         let entry = Entry {
             mapping: MappingFileKey {
                 mount_id: SPLIT_MOUNT_ID,
@@ -8662,7 +8701,8 @@ pub(crate) mod test_fixture {
                 inode: fd_key.inode,
             },
             raw,
-            file: Arc::new(std::fs::File::open("/dev/null").unwrap()),
+            fd_dev,
+            file,
             mapped: None,
             pin: Pin {
                 ino: fd_key.inode,
@@ -10538,10 +10578,14 @@ mod tests {
         // so the same MappingFileKey, Pin and digest — but two kernel
         // files on two subvolumes. Every identity join must refuse;
         // merging would attach probes to one copy while the other copy's
-        // callers stay unseen. (RED: all five sites merge before the
-        // held-fd device separates them.)
+        // callers stay unseen. The subvolume devices are forged: the host
+        // filesystem gives both backing files one device, while on Btrfs
+        // each subvolume has its own anonymous device from fstat.
         let key = ObjectKey {
-            device: Device { major: 0, minor: 23 },
+            device: Device {
+                major: 0,
+                minor: 23,
+            },
             inode: 257,
         };
         let dir = tempfile::tempdir().unwrap();
@@ -10549,6 +10593,8 @@ mod tests {
         reback(&mut first, &backing_file(&dir, "first.so"));
         let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
         reback(&mut second, &backing_file(&dir, "second.so"));
+        first.by_id.values_mut().next().unwrap().fd_dev = 0x51;
+        second.by_id.values_mut().next().unwrap().fd_dev = 0x52;
 
         let first_id = first.pinned().next().unwrap().id;
         let second_id = second.pinned().next().unwrap().id;
@@ -10580,6 +10626,45 @@ mod tests {
             "snapshot twins merged at: {}",
             merged.join(", ")
         );
+    }
+
+    #[test]
+    fn same_file_opened_twice_with_same_device_still_merges() {
+        // Healthy twin of the snapshot test above: the same file seen
+        // twice carries one mapping, one pin-time device, one pin and one
+        // digest, so every identity join still merges.
+        let key = ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 23,
+            },
+            inode: 257,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &file);
+        let mut second = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut second, &file);
+
+        let first_id = first.pinned().next().unwrap().id;
+        let second_id = second.pinned().next().unwrap().id;
+        assert!(first.exactly_matches(first_id, &second, second_id));
+        let retained = RetainedInventoryTarget {
+            entry: first.by_id.get(&first_id).unwrap().clone(),
+            changed: std::cell::Cell::new(false),
+        };
+        assert!(retained.same_object_as(&second, second_id));
+        assert_eq!(
+            first.owned_timing_key(first_id),
+            second.owned_timing_key(second_id)
+        );
+        let first_targets = BTreeSet::from([(first_id, 0u64)]);
+        let second_targets = BTreeSet::from([(second_id, 0u64)]);
+        assert!(first.exactly_same_targets(&first_targets, &second, &second_targets));
+        let skipped = first.absorb(second);
+        assert!(skipped.is_empty(), "{skipped:?}");
+        assert_eq!(first.pinned().count(), 1);
     }
 
     #[test]
@@ -11078,9 +11163,14 @@ mod tests {
         // The peer from another mount table is another file; the same file
         // would merge instead of exercising the mixed-group reject.
         let dir = tempfile::tempdir().unwrap();
+        let candidate = backing_file(&dir, "candidate.so");
         let mut pinned = pins(&[(key, SHA, 1)]);
-        reback(&mut pinned, &backing_file(&dir, "candidate.so"));
-        assert!(pinned.absorb(manifest_pins(key, SHA, 1)).is_empty());
+        reback(&mut pinned, &candidate);
+        // The scan and manifest halves are one file, so they share one
+        // backing file (and pin-time device), as in production.
+        let mut manifest = manifest_pins(key, SHA, 1);
+        reback(&mut manifest, &candidate);
+        assert!(pinned.absorb(manifest).is_empty());
         let id = pinned
             .id_for_scanned(&module(key), key, PATH)
             .expect("exact scan alias");

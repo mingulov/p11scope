@@ -7078,16 +7078,16 @@ fn first_pos_of(seal: &SealSuccess) -> u64 {
 fn key_operation_n1c_shared_owner_unsettled_census() {
     // N1(c): H8 open begins, staged H9 payloads, model pending calls
     // and prospective key associations share ONE reservation owner:
-    // 1,020 opens + 1 staged + 3 assocs fill the 1,024 census, and
+    // 4,092 opens + 1 staged + 3 assocs fill the 4,096 census, and
     // the next charge in ANY population refuses even though no
     // per-population cap is reached.
     let mut scene = JointScene::new();
     let create = function_id("C_CreateObject");
-    for sequence in 1..=1_020u64 {
+    for sequence in 1..=4_092u64 {
         let begin = begin_bytes(1, sequence, create, 0);
         assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
     }
-    assert_eq!(scene.adapter.ledger().census(), 1_020);
+    assert_eq!(scene.adapter.ledger().census(), 4_092);
     let bootstrap = scene.bootstrap();
     let mut staging = JointStaging::select_joint(Some(&bootstrap));
     let call = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
@@ -7105,8 +7105,8 @@ fn key_operation_n1c_shared_owner_unsettled_census() {
     let position = admitted.h0_ordinal();
     staging
         .stage(facts, origin, position, scene.adapter.ledger_mut())
-        .expect("stages at census 1,020");
-    assert_eq!(scene.adapter.ledger().census(), 1_021);
+        .expect("stages at census 4,092");
+    assert_eq!(scene.adapter.ledger().census(), 4_093);
     // Three prospective associations against the same owner: one
     // S1Only-direct start fanned over distinct instances.
     let mut edge = EdgeSemantics::default();
@@ -7129,11 +7129,11 @@ fn key_operation_n1c_shared_owner_unsettled_census() {
         );
     }
     assert_eq!(keyuse.open().len(), 3);
-    assert_eq!(scene.adapter.ledger().census(), 1_024);
+    assert_eq!(scene.adapter.ledger().census(), 4_096);
     // The next charge in every population refuses: the shared
     // ceiling binds, not the per-population caps.
     assert_eq!(
-        scene.ingest(&begin_bytes(1, 1_021, create, 0)),
+        scene.ingest(&begin_bytes(1, 4_093, create, 0)),
         JournalDisposition::BeginRefusedCapacity
     );
     let call2 = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
@@ -13633,13 +13633,13 @@ fn key_operation_kem_actual_row_and_publication_pressure() {
     let pool_after_first = pool.snapshot().charged_bytes;
     let table_prepay = pool_after_first - base - (8 + OWNED_ALLOCATION_PADDING);
     assert!(table_prepay > 0, "the first charge prepays the table");
-    for ordinal in 1..1000 {
+    for ordinal in 1..4072 {
         owner
             .ledger_mut()
             .charge_h8open(ordinal, 8)
             .expect("H8Open charges");
     }
-    assert_eq!(owner.ledger().census(), 1000);
+    assert_eq!(owner.ledger().census(), 4072);
     let mut staged_origins = Vec::new();
     for sequence in 1..=24u64 {
         let pool_before_quantum = pool.snapshot().charged_bytes;
@@ -13698,8 +13698,8 @@ fn key_operation_kem_actual_row_and_publication_pressure() {
     }
     assert_eq!(
         owner.ledger().census(),
-        1024,
-        "1000 H8Open plus 24 joined KEM raw operations fill the census"
+        4096,
+        "4072 H8Open plus 24 joined KEM raw operations fill the census"
     );
     assert_eq!(owner.ledger().staged(), 24);
     let (ticket, source) = &staged_origins[0];
@@ -13707,7 +13707,7 @@ fn key_operation_kem_actual_row_and_publication_pressure() {
         .ledger_mut()
         .mint_keyassoc_from_stage(24, Some(source))
         .expect("at-capacity N15 mint joins through the owner");
-    assert_eq!(owner.ledger().census(), 1024, "the join keeps census flat");
+    assert_eq!(owner.ledger().census(), 4096, "the join keeps census flat");
     owner
         .ledger_mut()
         .release_collected(producers.native_domain(), *ticket);
@@ -13723,7 +13723,7 @@ fn key_operation_kem_actual_row_and_publication_pressure() {
     assert!(!peak.incomplete);
     assert_eq!((peak.live_bytes, peak.peak_bytes), (0, 0));
     assert_eq!((allocs, requested), (0, 0));
-    assert_eq!(owner.ledger().census(), 1024);
+    assert_eq!(owner.ledger().census(), 4096);
     assert_eq!(owner.ledger().charged_bytes(), bytes_before_refusal);
     assert_eq!(
         pool.snapshot().charged_bytes,
@@ -18515,17 +18515,17 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
     let pool_after_first = pool.snapshot().charged_bytes;
     let table_prepay = pool_after_first - base - (8 + OWNED_ALLOCATION_PADDING);
     assert!(table_prepay > 0, "the first charge prepays the table");
-    for ordinal in 1..1000 {
+    for ordinal in 1..4072 {
         owner
             .ledger_mut()
             .charge_h8open(ordinal, 8)
             .expect("H8Open charges");
     }
-    assert_eq!(owner.ledger().census(), 1000);
+    assert_eq!(owner.ledger().census(), 4072);
     let pool_after_h8 = pool.snapshot().charged_bytes;
     assert_eq!(
         pool_after_h8 - pool_after_first,
-        999 * (8 + OWNED_ALLOCATION_PADDING),
+        4071 * (8 + OWNED_ALLOCATION_PADDING),
         "each further H8Open adds exactly its pool lease"
     );
     let mut staged_origins = Vec::new();
@@ -18580,11 +18580,11 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
     );
     assert_eq!(
         owner.ledger().census(),
-        1024,
-        "1000 H8Open plus 24 joined raw operations fill the census"
+        4096,
+        "4072 H8Open plus 24 joined raw operations fill the census"
     );
     assert_eq!(owner.ledger().staged(), 24);
-    let mixed_bytes = 1000 * 8 + 24 * 300;
+    let mixed_bytes = 4072 * 8 + 24 * 300;
     assert_eq!(owner.ledger().charged_bytes(), mixed_bytes);
     // N15 at capacity: the sourced assoc mint joins its staged
     // operation (no new slot), crediting the staged bytes it will
@@ -18594,7 +18594,7 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
         .ledger_mut()
         .mint_keyassoc_from_stage(24, Some(source))
         .expect("at-capacity N15 mint joins through the owner");
-    assert_eq!(owner.ledger().census(), 1024, "the join keeps census flat");
+    assert_eq!(owner.ledger().census(), 4096, "the join keeps census flat");
     assert_eq!(
         pool.snapshot().charged_bytes - mixed_pool,
         24 + OWNED_ALLOCATION_PADDING,
@@ -18606,13 +18606,13 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
     assert_eq!(owner.ledger().staged(), 23);
     assert_eq!(
         owner.ledger().census(),
-        1024,
+        4096,
         "the assoc holds its operation"
     );
     owner.ledger_mut().release_keyassoc(assoc);
     assert_eq!(
         owner.ledger().census(),
-        1024,
+        4096,
         "the raw role still holds its operation"
     );
     // Sourceless mint at capacity refuses Full allocating nothing.
@@ -18627,7 +18627,7 @@ fn joint_capture_owner_mixed_census_with_n15_at_capacity() {
     assert!(!peak.incomplete);
     assert_eq!((peak.live_bytes, peak.peak_bytes), (0, 0));
     assert_eq!((allocs, requested), (0, 0));
-    assert_eq!(owner.ledger().census(), 1024);
+    assert_eq!(owner.ledger().census(), 4096);
     assert_eq!(owner.ledger().charged_bytes(), bytes_before_refusal);
     assert_eq!(
         pool.snapshot().charged_bytes,

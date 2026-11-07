@@ -67,12 +67,8 @@ use std::time::{Duration, Instant};
 
 const DOC_ID: &str = "p11scope/inventory/v1";
 
-/// Rescan interval inside a `--duration` observation window. At
-/// 250 ms the pass-driven settlement, revision and row-publication
-/// cadence keeps 10k calls/s row lag under the 1.5 s publication
-/// target (1 s polls held rows ~3.5 s); the 4,096 staging ceiling
-/// holds a full 250 ms quantum (2,500 calls) with burst margin.
-const POLL_INTERVAL: Duration = Duration::from_millis(250);
+/// Rescan interval inside a `--duration` observation window.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 // G21's explicit engine pilot can accelerate scans without changing the
 // production cadence, clock, native lane, coordinator, or recorder capacities.

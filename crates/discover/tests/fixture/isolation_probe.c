@@ -4,9 +4,10 @@
  * plus the review-PoC probes: io_uring setup, AF_UNIX connect to a
  * test-owned listener, execve of /bin/true in a child, chmod of a
  * test-owned path outside the output, overwrite beneath the -o
- * directory, and in-place overwrite without O_TRUNC. The ISOLATION_*_PATH
- * environment variables name test-owned scratch paths only; without them
- * the matching probe reports unknown.
+ * directory, in-place overwrite without O_TRUNC, and inode-attribute
+ * change via FS_IOC_SETFLAGS. The ISOLATION_*_PATH environment variables
+ * name test-owned scratch paths only; without them the matching probe
+ * reports unknown.
  * The provider itself is healthy: a
  * sparse 2.40 legacy table, one all-NULL "PKCS 11" interface, and a lazily
  * dlopen'd backend (never DT_NEEDED; link with -Wl,-rpath,$ORIGIN).
@@ -18,6 +19,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/fs.h>
 #include <linux/io_uring.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -214,6 +216,34 @@ __attribute__((constructor)) static void ctor(void) {
                 fprintf(stderr, "ISOLATION_NOTRUNC=unknown(no target file)\n");
             } else {
                 fprintf(stderr, "ISOLATION_NOTRUNC=denied(errno=%d)\n", errno);
+            }
+        }
+    }
+    /* Inode-attribute change outside the output: FS_IOC_SETFLAGS from
+     * an O_RDONLY fd would set FS_NODUMP_FL on a test-owned file.
+     * Landlock's IOCTL_DEV does not mediate regular files, so the
+     * seccomp filter must deny it. */
+    {
+        const char *target = getenv("ISOLATION_SETFLAGS_PATH");
+        if (!target) {
+            fprintf(stderr, "ISOLATION_SETFLAGS=unknown(no target)\n");
+        } else {
+            int ffd = open(target, O_RDONLY);
+            if (ffd < 0) {
+                fprintf(stderr, "ISOLATION_SETFLAGS=unknown(open errno=%d)\n", errno);
+            } else {
+                int flags = 0;
+                if (ioctl(ffd, FS_IOC_GETFLAGS, &flags) != 0) {
+                    fprintf(stderr, "ISOLATION_SETFLAGS=unknown(getflags errno=%d)\n", errno);
+                } else {
+                    flags |= FS_NODUMP_FL;
+                    if (ioctl(ffd, FS_IOC_SETFLAGS, &flags) == 0) {
+                        fprintf(stderr, "ISOLATION_SETFLAGS=allowed\n");
+                    } else {
+                        fprintf(stderr, "ISOLATION_SETFLAGS=denied(errno=%d)\n", errno);
+                    }
+                }
+                close(ffd);
             }
         }
     }

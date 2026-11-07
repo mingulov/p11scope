@@ -1280,6 +1280,56 @@ mod tests {
     }
 
     #[test]
+    fn inode_attribute_ioctls_evaluate_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // Inode mutators reachable from an O_RDONLY fd (Landlock's
+        // IOCTL_DEV does not mediate regular files): each must deny.
+        // Numbers from linux/fs.h, linux/fsverity.h and linux/fscrypt.h;
+        // the 32-bit SETFLAGS is _IOW('f', 2, int).
+        let cmds: &[(u32, &str)] = &[
+            (0x4008_6602, "FS_IOC_SETFLAGS"),
+            (0x4004_6602, "FS_IOC_SETFLAGS32"),
+            (0x401c_5820, "FS_IOC_FSSETXATTR"),
+            (0x4080_6685, "FS_IOC_ENABLE_VERITY"),
+            (0x800c_6613, "FS_IOC_SET_ENCRYPTION_POLICY"),
+            (0x4008_7602, "FS_IOC_SETVERSION"),
+        ];
+        for (cmd, name) in cmds {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, *cmd),
+                denied,
+                "{name} ({cmd:#x}) escapes the fence"
+            );
+        }
+        assert_eq!(
+            eval_filter(
+                &insns,
+                AUDIT_ARCH_X86_64,
+                SYS_IOCTL,
+                0,
+                0x5401 /* TCGETS */
+            ),
+            SECCOMP_RET_ALLOW,
+            "ordinary ioctls must stay allowed"
+        );
+    }
+
+    #[test]
+    fn file_setattr_evaluates_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // file_setattr(469) postdates libc 0.2.189; the number is from
+        // asm/unistd_64.h. It mutates inode flags Landlock cannot
+        // restrict, like the SETFLAGS ioctl above.
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, 469, 0, 0),
+            denied,
+            "file_setattr escapes the fence"
+        );
+    }
+
+    #[test]
     fn x32_syscall_numbers_get_enosys() {
         let insns = FilterBuilder::new().build().unwrap();
         let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;

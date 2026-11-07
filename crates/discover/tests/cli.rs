@@ -1330,3 +1330,77 @@ fn isolation_target_name_holding_a_hard_link_is_refused() {
         "a refusal must not let the provider near the linked inode"
     );
 }
+
+/// Read the inode flags of a test-owned file via FS_IOC_GETFLAGS.
+fn inode_flags(path: &Path) -> i32 {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt as _;
+    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let fd = unsafe { libc::open(raw.as_ptr(), libc::O_RDONLY) };
+    assert!(fd >= 0, "cannot open {} for flags", path.display());
+    let mut flags: i32 = 0;
+    let ret = unsafe { libc::ioctl(fd, FS_IOC_GETFLAGS, &mut flags) };
+    unsafe { libc::close(fd) };
+    assert_eq!(ret, 0, "FS_IOC_GETFLAGS failed on {}", path.display());
+    flags
+}
+
+/// N2: inode-attribute change outside -o is denied. The constructor's
+/// FS_IOC_SETFLAGS from an O_RDONLY fd sets FS_NODUMP_FL when trusted
+/// (twin proves the probe applies) and fails with EACCES under the fence
+/// with the flags and bytes untouched.
+#[test]
+fn isolation_setflags_outside_the_output_is_denied() {
+    const FS_NODUMP_FL: i32 = 0x40;
+    let dir = scratch("isolation-setflags");
+    let provider = build_isolation_probe(&dir);
+    let trusted_target = dir.join("setflags-trusted.tmp");
+    let isolated_target = dir.join("setflags-isolated.tmp");
+    std::fs::write(&trusted_target, b"setflags probe").unwrap();
+    std::fs::write(&isolated_target, b"setflags probe").unwrap();
+    assert_eq!(
+        inode_flags(&trusted_target) & FS_NODUMP_FL,
+        0,
+        "fresh files must start without NODUMP"
+    );
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .env("ISOLATION_SETFLAGS_PATH", &trusted_target)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_SETFLAGS=allowed"),
+        "trusted must set the flag: {stderr}"
+    );
+    assert_ne!(
+        inode_flags(&trusted_target) & FS_NODUMP_FL,
+        0,
+        "the trusted probe must apply FS_NODUMP_FL"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .env("ISOLATION_SETFLAGS_PATH", &isolated_target)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_SETFLAGS=denied(errno=13)"),
+        "SETFLAGS was not fenced: {stderr}"
+    );
+    assert_eq!(
+        inode_flags(&isolated_target) & FS_NODUMP_FL,
+        0,
+        "the fenced probe must not change the flags"
+    );
+    assert_eq!(
+        std::fs::read(&isolated_target).unwrap(),
+        b"setflags probe",
+        "the fenced probe must not modify the scratch file"
+    );
+}

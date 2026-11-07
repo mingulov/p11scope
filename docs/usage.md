@@ -1317,6 +1317,7 @@ Limits that matter in pods:
   `--cgroup` still selects scope independently. Recognized Docker/containerd/
   CRI-O and Kubernetes cgroup patterns can yield canonical container IDs and
   pod UIDs, labeled as lexical hints. They do not prove orchestrator ownership.
+  Anyone who can create cgroups can produce these shapes.
   Kubernetes systemd patterns include the exact `kubepods.slice` and
   `kubelet.slice/kubelet-kubepods.slice` stems, with matching QoS/pod units.
   No runtime/Kubernetes API, network, credentials, environment or command line
@@ -1329,13 +1330,15 @@ Limits that matter in pods:
   becomes stale, and failures clear current hints. Text/dashboard detail shows
   sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
   intervening migration. Concise text prints one scope line per labeled caller,
-  e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker)`;
-  verbose text and JSON show the full 64-hex ID. Installed two-container,
-  synthetic-pod and host-view real-kind-pod qualification passed on Fedora 7.2
-  in v0.7.0; in-node kind (observer inside the node) remains open
-  (nested-PID-namespace binding limitation: `--cgroup` refuses
-  pid-namespace-mismatch and `--system` binds nothing across 39 passes
-  with pid_namespace gaps; tracked separately).
+  e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker, cgroup hint)`;
+  stale rows append `, stale`, retired rows `, exited`, and a `caller context:`
+  line counts labeled, unknown and pending callers. Verbose text and JSON show
+  the full 64-hex ID. Installed two-container, synthetic-pod and host-view
+  real-kind-pod qualification passed on Fedora 7.2 in v0.7.0; in-node kind
+  (observer inside the node) remains open (nested-PID-namespace binding
+  limitation: `--cgroup` refuses pid-namespace-mismatch and `--system` binds
+  no callers, leaving witness rows unbound with pid_namespace gaps; tracked
+  separately).
 
   `--capture auto|scan|native` selects the usage lane. `scan` reads
   `/proc` without loading usage BPF: every edge's usage coverage

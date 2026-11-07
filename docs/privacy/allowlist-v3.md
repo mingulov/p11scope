@@ -19,7 +19,7 @@ which describes its reviewed development implementation with installed gates
 still open,
 and [inventory diagnostics](#inventory-diagnostics-v04), which defines the
 optional userspace decision export without additional target reads,
-and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification passed on Fedora 7.2 with Docker, synthetic pod cgroups and real kind pods watched from the host in v0.7.0 (in-node kind cells blocked: nested-observer cgroup refusal and unbound system passes; tracked separately),
+and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification passed on Fedora 7.2 with Docker, synthetic pod cgroups and real kind pods watched from the host in v0.7.0 (in-node kind cells blocked: nested-observer cgroup refusal and unbound system passes; migration acceptance remains open; tracked separately),
 and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-14),
 which implements the reviewed finite producer below with no public
 object projection,
@@ -1380,8 +1380,8 @@ stems) and real kind pods watched from the host (two-pod labels with
 kubectl-matched IDs and counted calls) in v0.7.0. In-node kind
 qualification (observer inside the node, nested PID namespace) remains
 blocked (nested observer: `--cgroup` refuses pid-namespace-mismatch
-and `--system` binds nothing across 39 passes with pid_namespace
-gaps).** This
+and `--system` binds no callers, leaving witness rows unbound with
+pid_namespace gaps).** This
 subsection permits only the finite Inventory context below.
 Every other section keeps its own status; v1/v2 bytes and exclusions are
 unchanged, and there is no global v3 activation. Real two-container,
@@ -1434,7 +1434,7 @@ actual old/new immutable frame overlap and retained job/completion ownership.
 Cancellation cannot preempt a blocked kernel operation; its owned job retains
 original custody and reservations until it actually returns and joins.
 
-Concise inventory text shows a 12-hex container prefix (8-hex pod prefix) on one scope line per labeled caller, while verbose text and JSON carry the full canonical IDs; the prefixes are a display projection of the allowlisted IDs above, not a new captured field.
+Concise inventory text (never `--quiet`) shows one scope line per labeled caller with edges, naming the executable basename and PID (both new to concise text), the caller's logical entry total with forwarding-layer observations excluded, and the scope label: `container <12-hex> (<runtime>, cgroup hint)` for a lone container — `<runtime>` is the canonical `docker`/`containerd`/`cri_o`/`unknown` label, omitted when the parser claims no runtime — or `pod <8-hex> / container <12-hex> (cgroup hint)` for a pod pair. Stale rows append `, stale` and retired rows `, exited` inside the parentheses. At most eight scope lines print, then `and M more labeled callers (-v or --json)`; a `caller context:` line counts labeled, unknown and pending callers with edges (nonzero parts only). Verbose text and JSON carry the full canonical IDs. The prefixes and status words are a display projection of the allowlisted IDs and statuses above, not new captured fields; no separate derived row is needed.
 
 ## Extensive-mode executable dependency hints (6.14 Option B, D-transitive)
 

@@ -27861,6 +27861,41 @@ mod maps_skip_memory_tests {
             "the first pass scans everything"
         );
     }
+
+    /// An applied pass records its pinned-object mappers so the next
+    /// collection re-decodes every member that feeds a watch; the
+    /// backstop sheds mapper memory with the digests. RED: the memory
+    /// does not exist yet.
+    #[test]
+    fn applied_pass_records_pinned_mappers_and_backstop_sheds_them() {
+        use crate::inspect_system::{MemberStatus, ProcessRecord};
+        let mut coordinator = skip_coordinator();
+        let mut catalog =
+            catalog_with_digests([(11, (Some(110), 1))].into_iter().collect());
+        catalog.processes.push(ProcessRecord {
+            pid: 12,
+            status: MemberStatus::Scanned,
+            objects: vec![0],
+            generation: generation(Some(120)),
+            complete_scan: None,
+            application: crate::inspect_identity::InspectApplicationResult::Unknown(
+                crate::inspect_identity::InspectIdentityUnknown::NotExamined,
+            ),
+            hints_examined: true,
+        });
+        coordinator.note_applied_scan_tasks(&catalog);
+        coordinator.passes = 0;
+        assert_eq!(
+            coordinator.priors_for_collection().mappers,
+            BTreeSet::from([12]),
+            "the mapper must re-decode next pass (pid 11 maps nothing)"
+        );
+        coordinator.passes = 3;
+        assert!(
+            coordinator.priors_for_collection().mappers.is_empty(),
+            "the backstop sheds mapper memory with the digests"
+        );
+    }
 }
 
 #[cfg(test)]

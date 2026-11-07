@@ -10785,6 +10785,7 @@ mod maps_skip_tests {
                 .iter()
                 .map(|(pid, generation, digest)| (*pid, (*generation, *digest)))
                 .collect(),
+            mappers: BTreeSet::new(),
         }
     }
 
@@ -10863,6 +10864,20 @@ mod maps_skip_tests {
         assert!(
             unchanged_skip_set(&sweep, &prior, live).is_empty(),
             "a prior pass that never read the generation proves nothing"
+        );
+    }
+
+    #[test]
+    fn members_mapping_pinned_providers_are_never_skipped() {
+        let digest = digest_maps_snapshot(&snapshot());
+        let sweep = vec![(4242, snapshot()), (4243, snapshot())];
+        let mut prior = priors(&[(4242, Some(77), digest), (4243, Some(78), digest)]);
+        prior.mappers = BTreeSet::from([4242]);
+        let live = |pid: u32| if pid == 4242 { Some(77) } else { Some(78) };
+        assert_eq!(
+            unchanged_skip_set(&sweep, &prior, live),
+            BTreeSet::from([4243]),
+            "a member feeding a watch must re-decode every pass it is selected"
         );
     }
 

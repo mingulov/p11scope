@@ -2843,7 +2843,7 @@ impl LiveJointMachine {
                 }
                 // TEMP F9 DIAGNOSTIC (revert before merge): collect timing.
                 let diag_collect =
-                    std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
+                    std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1");
                 let diag_collect_start = std::time::Instant::now();
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
@@ -4713,7 +4713,7 @@ impl AttestedSemanticLane {
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
         // TEMP F9 DIAGNOSTIC (revert before merge): hook totals.
-        let timing = std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
+        let timing = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1");
         let start = std::time::Instant::now();
         let actions_before = budget.remaining_actions;
         let out = self.service_joint_with_acquisition(coordinator, mode, budget, None);

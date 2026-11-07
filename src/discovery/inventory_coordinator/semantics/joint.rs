@@ -397,7 +397,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut births = BorrowedBirths(births);
         let fault = BorrowedFault(fault);
         // TEMP F9 DIAGNOSTIC (revert before merge): slow seal-loop log.
-        let diag = std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
+        let diag = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1");
         let diag_start = std::time::Instant::now();
         let diag_rem_before = *remaining;
         while *remaining != 0 {

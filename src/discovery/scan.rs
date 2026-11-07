@@ -4459,12 +4459,59 @@ fn witness_refusal(outcome: &WitnessOutcome) -> Option<String> {
     }
 }
 
+/// One lower candidate the copy-up fallback refused: its index in the
+/// mount-table candidate list and the finite refusal stage. Indexes,
+/// never paths: candidate paths stay transient (design section 3e).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LowerSkip {
+    index: usize,
+    stage: LowerSkipStage,
+}
+
+/// Why one lower candidate did not prove: the finite vocabulary behind
+/// the per-candidate refusal notes. Notes name no pids, paths,
+/// addresses or run detail.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LowerSkipStage {
+    /// The candidate could not be opened in the observer namespace.
+    OpenFailed,
+    /// The opened candidate had no readable held identity.
+    HeldIdentityUnreadable,
+    /// The witness proved the trigger range is another file.
+    OtherFile,
+    /// The candidate query could not run, with its diagnosis, if any.
+    Unavailable(Option<WitnessDiagnosis>),
+    /// The candidate could not be installed as the witness anchor.
+    AnchorBindingFailed,
+    /// The witness budget spent on this candidate: the search stops.
+    BudgetExhausted,
+    /// The candidate index does not fit the proof's u32 carrier.
+    IndexOverflow,
+}
+
+impl LowerSkipStage {
+    /// The plain-words note for the terminal gap reason.
+    fn note(self) -> String {
+        match self {
+            LowerSkipStage::OpenFailed => "could not be opened".to_string(),
+            LowerSkipStage::HeldIdentityUnreadable => "held identity unreadable".to_string(),
+            LowerSkipStage::OtherFile => "the kernel witness proved another file".to_string(),
+            LowerSkipStage::Unavailable(None) => "kernel witness unavailable".to_string(),
+            LowerSkipStage::Unavailable(Some(diagnosis)) => {
+                format!("kernel witness unavailable: {}", diagnosis.note())
+            }
+            LowerSkipStage::AnchorBindingFailed => "witness anchor binding failed".to_string(),
+            LowerSkipStage::BudgetExhausted => "witness query budget exhausted".to_string(),
+            LowerSkipStage::IndexOverflow => "candidate index unrepresentable".to_string(),
+        }
+    }
+}
+
 /// Prove the trigger range against the mount-table lower candidates in
 /// kernel stack order: the first same-file verdict wins and stops the
-/// search — the proof, not the path, selects the file. Unopenable
-/// candidates and candidates without a readable held identity are
-/// skipped silently (bounded opens are cheap); a spent witness budget
-/// stops the search. `None` keeps today's gap.
+/// search — the proof, not the path, selects the file — with every
+/// refusal collected alongside. A spent witness budget stops the
+/// search. `None` keeps today's gap, naming each refusal.
 fn prove_lower_candidates(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4472,43 +4519,105 @@ fn prove_lower_candidates(
     range: (u64, u64),
     merged: &Path,
     budget: &mut CaptureWorkBudget,
-) -> Option<LowerProof> {
+) -> (Option<LowerProof>, Vec<LowerSkip>) {
+    let mut skips = Vec::new();
     for (index, candidate) in io
         .lower_candidates(view, merged, budget)
         .into_iter()
         .enumerate()
     {
         let Ok(candidate_index) = u32::try_from(index) else {
+            skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::IndexOverflow,
+            });
             continue;
         };
         let Ok(file) = io.open_lower_candidate(view, &candidate, budget) else {
+            skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::OpenFailed,
+            });
             continue;
         };
         let Some(mapped) = io.held_identity(&file) else {
+            skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::HeldIdentityUnreadable,
+            });
             continue;
         };
         let outcome = io.prove_original_file_diagnosed(view, &file, &mapped, key, range, budget);
         match outcome.verdict {
             WitnessVerdict::SameFile => {
-                return Some(LowerProof {
-                    file,
-                    mapped,
-                    candidate: candidate_index,
-                });
+                return (
+                    Some(LowerProof {
+                        file,
+                        mapped,
+                        candidate: candidate_index,
+                    }),
+                    skips,
+                );
             }
-            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted) => return None,
-            WitnessVerdict::OtherFile | WitnessVerdict::Failed(_) => {}
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted) => {
+                skips.push(LowerSkip {
+                    index,
+                    stage: LowerSkipStage::BudgetExhausted,
+                });
+                return (None, skips);
+            }
+            WitnessVerdict::OtherFile => skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::OtherFile,
+            }),
+            WitnessVerdict::Failed(WitnessFailure::Unavailable) => skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::Unavailable(outcome.diagnosis),
+            }),
+            WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed) => skips.push(LowerSkip {
+                index,
+                stage: LowerSkipStage::AnchorBindingFailed,
+            }),
         }
     }
-    None
+    (None, skips)
+}
+
+/// The terminal gap reason for a fallback search that proved no lower
+/// file: the held query's reason plus the bounded per-candidate refusal
+/// diagnostic. No skips (no candidates) keeps the held reason
+/// byte-identical; otherwise each refusal is named by candidate index
+/// with its finite stage (never the path), the first eight in full and
+/// any rest counted. The held prefix is untouched, so family matchers
+/// keep working.
+fn with_lower_skips(held: &str, skips: &[LowerSkip]) -> String {
+    const LISTED: usize = 8;
+    if skips.is_empty() {
+        return held.to_string();
+    }
+    let mut parts: Vec<String> = skips
+        .iter()
+        .take(LISTED)
+        .map(|skip| format!("index {}: {}", skip.index, skip.stage.note()))
+        .collect();
+    if skips.len() > LISTED {
+        parts.push(format!("and {} more", skips.len() - LISTED));
+    }
+    format!(
+        "{}; lower candidates refused: {} ({})",
+        held,
+        skips.len(),
+        parts.join("; ")
+    )
 }
 
 /// Prove one witness-requiring provider file, falling back to the
 /// pre-copy-up lower file on an other-file verdict: `Ok` joins (held
 /// or proven lower), `Err` refuses with the gap reason. The fallback
 /// spends from the same per-scan witness budget as the held query; a
-/// held verdict other than other-file refuses without a fallback, and
-/// no proven lower keeps the held query's reason byte-identical.
+/// held verdict other than other-file refuses without a fallback. No
+/// proven lower keeps the held query's reason and appends the
+/// per-candidate refusals (no candidates keeps it byte-identical).
 #[allow(clippy::too_many_arguments)] // The join's inputs are already separate bindings at both call sites.
 pub(crate) fn witness_join_with_copyup(
     io: &mut impl ScanIo,
@@ -4524,10 +4633,13 @@ pub(crate) fn witness_join_with_copyup(
     if outcome.verdict == WitnessVerdict::SameFile {
         return Ok(CopyUpJoin::Held);
     }
-    if outcome.verdict == WitnessVerdict::OtherFile
-        && let Some(proof) = prove_lower_candidates(io, view, key, range, merged, budget)
-    {
-        return Ok(CopyUpJoin::LowerProven(proof));
+    if outcome.verdict == WitnessVerdict::OtherFile {
+        let (proof, skips) = prove_lower_candidates(io, view, key, range, merged, budget);
+        if let Some(proof) = proof {
+            return Ok(CopyUpJoin::LowerProven(proof));
+        }
+        let held = witness_refusal(&outcome).expect("a non-join verdict refuses");
+        return Err(with_lower_skips(&held, &skips));
     }
     Err(witness_refusal(&outcome).expect("a non-join verdict refuses"))
 }

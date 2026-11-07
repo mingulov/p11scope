@@ -1071,6 +1071,11 @@
               "outcome": {"enum": ["ok", "already_initialized", "error", "mixed"]},
               "potential_provider": {"const": true}
             }
+          },
+          "rv_names": {
+            "description": "V3-additive CKR_* names for the rv_counts keys that have a registered name, keyed by the same 16-digit hex strings. Unregistered (vendor) codes are absent; their rv_counts hex key is the verbatim rendering. Render-time presentation of already-captured return codes; rv_counts is unchanged.",
+            "type": "object",
+            "additionalProperties": {"type": "string", "minLength": 1}
           }
         }
       }

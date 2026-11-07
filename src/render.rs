@@ -2850,6 +2850,64 @@ pub fn scope_summary_with_verbosity(
     text
 }
 
+/// Concise text shows at most this many failure reasons per function;
+/// verbose lists every distinct code.
+const CONCISE_REASONS_PER_FUNCTION: usize = 3;
+
+/// One `TABLE-NAME: reason xN, …` line per function row with errors, in
+/// table order. Verbose lists every distinct failure code; concise
+/// keeps the top three by count plus an `and N more` tail. Success
+/// (`CKR_OK`) and pending returns are never reasons. Names come from
+/// the shared `CKR_*` lookup; unregistered (vendor) codes render as
+/// verbatim hex, never guessed. A row with errors but no error
+/// breakdown in `rv_counts` — the return-value table read failed —
+/// names that gap instead of stopping the view.
+fn error_reason_lines(rendered: &[(String, &SlotReport)], verbose: bool) -> Vec<String> {
+    let mut lines = Vec::new();
+    for (name, r) in rendered {
+        if r.errors == 0 {
+            continue;
+        }
+        let mut reasons: Vec<(u64, u64)> = r
+            .rv_counts
+            .iter()
+            .filter_map(|(&rv, &count)| {
+                (count > 0 && rv != pkcs11_types::CkRv::OK.0 && rv != pkcs11_types::CkRv::PENDING.0)
+                    .then_some((rv, count))
+            })
+            .collect();
+        // Count descending, then code ascending: the concise top-N is
+        // deterministic, and ties read in numeric order.
+        reasons.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        if reasons.is_empty() {
+            let noun = if r.errors == 1 { "error" } else { "errors" };
+            lines.push(format!(
+                "{name}: {} {noun} (return-code breakdown unavailable)",
+                r.errors
+            ));
+            continue;
+        }
+        let shown = if verbose {
+            reasons.len()
+        } else {
+            reasons.len().min(CONCISE_REASONS_PER_FUNCTION)
+        };
+        let mut line = format!("{name}: ");
+        for (i, &(rv, count)) in reasons[..shown].iter().enumerate() {
+            if i > 0 {
+                line.push_str(", ");
+            }
+            let reason = crate::semantics_edge::rv_name(rv).unwrap_or_else(|| format!("0x{rv:x}"));
+            line.push_str(&format!("{reason} x{count}"));
+        }
+        if shown < reasons.len() {
+            line.push_str(&format!(", and {} more", reasons.len() - shown));
+        }
+        lines.push(line);
+    }
+    lines
+}
+
 /// One refreshing screen for consumers without a retained scope kind.
 /// Rows with no activity are omitted; the evidence line renders under
 /// `-v` only. Mechanism rows are never shown here; `live_scoped`
@@ -3057,7 +3115,7 @@ pub fn live_scoped_with_verbosity(
             "IN-FLIGHT",
             w = width
         ));
-        for (name, r) in rendered {
+        for (name, r) in &rendered {
             let percentiles = if r.mode.has_histogram() {
                 [
                     percentile_ns(&r.buckets, 0.50),
@@ -3079,6 +3137,17 @@ pub fn live_scoped_with_verbosity(
                 r.in_flight,
                 w = width
             ));
+        }
+        // Why the calls failed, per function: the `CKR_*` breakdown
+        // behind each row's ERR count. Absent without failures.
+        let reason_lines =
+            error_reason_lines(&rendered, verbosity == crate::cli::TextVerbosity::Verbose);
+        if !reason_lines.is_empty() {
+            s.push_str("ERROR REASONS:\n");
+            for line in reason_lines {
+                s.push_str(&line);
+                s.push('\n');
+            }
         }
     }
     if !mechanisms.is_empty() {
@@ -3783,6 +3852,12 @@ struct FunctionOut {
     in_flight: u64,
     latency_ns: Option<LatencyOut>,
     rv_counts: std::collections::BTreeMap<String, u64>,
+    /// `CKR_*` names for the `rv_counts` keys that have a registered
+    /// name, keyed by the same 16-digit hex strings. Unregistered
+    /// (vendor) codes are absent — their hex key is the verbatim
+    /// rendering. Render-time presentation of already-captured values
+    /// through the shared lookup; no new capture.
+    rv_names: std::collections::BTreeMap<String, String>,
     /// The Initialize claim, present only on rows that name `C_Initialize`
     /// with at least one positively counted return; absent otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3966,6 +4041,13 @@ fn functions_out(
                 .rv_counts
                 .iter()
                 .map(|(rv, n)| (format!("0x{rv:016x}"), *n))
+                .collect(),
+            rv_names: r
+                .rv_counts
+                .keys()
+                .filter_map(|rv| {
+                    crate::semantics_edge::rv_name(*rv).map(|name| (format!("0x{rv:016x}"), name))
+                })
                 .collect(),
             initialization: initialization_out(&r.names, &r.rv_counts),
         })

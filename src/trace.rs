@@ -116,11 +116,10 @@ fn render_mechanism(ev: &Event) -> String {
 }
 
 fn rv_name(rv: u64) -> String {
-    // Reuses pkcs11-types' CKR_* name table (`CkRv`'s `Display`) rather than
-    // a second one; its format is "CKR_OK (0x00000000)" — only the name
-    // is wanted here, the trace line carries the outcome, not the code.
-    let s = pkcs11_types::CkRv(rv).to_string();
-    s.split(" (").next().unwrap_or(&s).to_string()
+    // One source of truth: the shared `CKR_*` lookup. Trace keeps its
+    // historical `CKR_UNKNOWN` rendering for unregistered codes; profile
+    // renders those as verbatim hex instead (see `render`).
+    crate::semantics_edge::rv_name(rv).unwrap_or_else(|| "CKR_UNKNOWN".to_string())
 }
 
 fn fmt_wall_time(wall_ns: u128) -> String {

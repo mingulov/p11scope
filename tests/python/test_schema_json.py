@@ -1442,5 +1442,28 @@ class InitializationRowAgreement(unittest.TestCase):
         )
 
 
+class RvNamesRowAgreement(unittest.TestCase):
+    """functions[].rv_names: the v3-additive CKR name map.
+
+    Like initialization above, the oracle closes only the object-canary
+    row keys, so this pins the machine schema's additive shape instead:
+    a hex-keyed object of nonempty name strings, never required (older
+    v3 documents predate it and must stay valid).
+    """
+
+    def row_schema(self):
+        return SCHEMA["properties"]["functions"]["items"]
+
+    def test_rv_names_is_an_optional_hex_to_name_map(self):
+        row = self.row_schema()
+        self.assertIn("rv_names", row["properties"])
+        self.assertNotIn("rv_names", row["required"])
+        names = row["properties"]["rv_names"]
+        self.assertEqual(names["type"], "object")
+        self.assertEqual(
+            names["additionalProperties"], {"type": "string", "minLength": 1}
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

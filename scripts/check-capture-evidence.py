@@ -3883,6 +3883,15 @@ OBJECT_CANARY_ORDINALS = {
     "C_VerifySignatureInit": 94,
 }
 
+# The return codes the object-canary workload produces, with the registered
+# CKR_* names the renderer publishes in functions[].rv_names — the same
+# pkcs11-types table the producer reads, fixed here so the ledger pins it.
+OBJECT_CANARY_RV_NAMES = {
+    0: "CKR_OK", 1: "CKR_CANCEL", 5: "CKR_GENERAL_ERROR",
+    17: "CKR_ATTRIBUTE_SENSITIVE", 18: "CKR_ATTRIBUTE_TYPE_INVALID",
+    336: "CKR_BUFFER_TOO_SMALL",
+}
+
 
 def validate_object_canary_functions(document):
     """Exact independent aggregate ledger beside the retained raw-map oracle."""
@@ -3893,7 +3902,7 @@ def validate_object_canary_functions(document):
     for row in rows:
         exact_keys(row, {"names", "aliased", "target", "ordinals", "module", "module_ambiguous",
                          "module_unresolved", "calls", "errors", "pending_returns", "in_flight",
-                         "latency_ns", "rv_counts", "forwarding_layer"}, "object function")
+                         "latency_ns", "rv_counts", "rv_names", "forwarding_layer"}, "object function")
         names = row["names"]
         require(isinstance(names, list) and len(names) == 1 and isinstance(names[0], str),
                 "object function requires one unaliased name")
@@ -3920,6 +3929,11 @@ def validate_object_canary_functions(document):
         rvs = row["rv_counts"]
         require(isinstance(rvs, dict) and all(u64(count, positive=True) for count in rvs.values())
                 and rvs == expected_rvs, "object function full-width RV counts differ from actual ledger")
+        expected_names = ({f"0x{rv:016x}": OBJECT_CANARY_RV_NAMES[rv] for rv in (0, 17, 18, 336, 5, 1)}
+                        if name == "C_GetAttributeValue" else {"0x0000000000000000": "CKR_OK"} if calls else {})
+        rv_names = row["rv_names"]
+        require(isinstance(rv_names, dict) and all(isinstance(label, str) for label in rv_names.values())
+                and rv_names == expected_names, "object function CKR names differ from the registered table")
         latency = row["latency_ns"]
         exact_keys(latency, {"approximate", "p50", "p95", "p99", "total", "max"}, "object function latency")
         require(latency["approximate"] is True and u64(latency["total"]) and u64(latency["max"])
@@ -5375,14 +5389,15 @@ def self_test():
         objects["functions"] = function_items(pairs)
         for row in objects["functions"]:
             get = row["names"] == ["C_GetAttributeValue"]
+            rvs = (0, 17, 18, 336, 5, 1) if get else (0,) if row["calls"] else ()
             row.update(forwarding_layer=False,
                        errors=5 if get else 0, pending_returns=0, in_flight=0,
                        latency_ns={"approximate": True, "p50": 1 if row["calls"] else None,
                                    "p95": 1 if row["calls"] else None,
                                    "p99": 1 if row["calls"] else None,
                                    "total": row["calls"], "max": int(row["calls"] > 0)},
-                       rv_counts=({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)} if get
-                                  else {"0x0000000000000000": 1} if row["calls"] else {}))
+                       rv_counts={f"0x{rv:016x}": 1 for rv in rvs},
+                       rv_names={f"0x{rv:016x}": OBJECT_CANARY_RV_NAMES[rv] for rv in rvs})
             if row["names"][0] in object_ordinals:
                 row["ordinals"] = [{"table_file_offset": None,
                                      "ordinal": object_ordinals[row["names"][0]]}]
@@ -5404,6 +5419,8 @@ def self_test():
             lambda d: d["functions"][0]["ordinals"][0].update(ordinal=21),
             lambda d: d["functions"][1]["target"].update(file_offset=0x1000),
             lambda d: d["functions"][4]["rv_counts"].pop("0x0000000000000011"),
+            lambda d: d["functions"][4]["rv_names"].pop("0x0000000000000011"),
+            lambda d: d["functions"][4]["rv_names"].update({"0x0000000000000011": "CKR_OK"}),
             lambda d: d["functions"][4].update(errors=4),
             lambda d: d["functions"][4].update(pending_returns=1),
             lambda d: d["functions"][4]["rv_counts"].update({"0x11": 1}),

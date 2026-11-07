@@ -6790,9 +6790,7 @@ fn open_native_lane_with(
             let multi = backend.backend == crate::attach::AttachBackend::Multi;
             if multi {
                 let effective = crate::caps::read_effective_via_capget()
-                    .map_err(|error| {
-                        anyhow::anyhow!("post-setup capability drop: {error}")
-                    })?;
+                    .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
                 crate::caps::drop_to_keep(crate::caps::post_setup_keep(multi, true, effective))
                     .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
             }

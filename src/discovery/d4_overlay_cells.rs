@@ -5473,6 +5473,83 @@ fn privileged_copyup_second_lower_candidate_wins() {
 
 /// In-place upper rewrite after copy-up (privileged): the upper file is
 /// rewritten through the upperdir (same inode, new bytes) while the
+/// Lower candidates open in the observer's mount namespace (privileged):
+/// a container's lowerdir paths are host paths, invisible under the
+/// target's `/proc/<pid>/root`. The covered leaf proves the split: its
+/// own root lacks the host file, yet the candidate open still succeeds
+/// and serves the host file's bytes.
+#[test]
+#[ignore = "root: mount namespace with a tmpfs cover drives the candidate open"]
+fn privileged_copyup_candidate_opens_in_observer_namespace() {
+    use crate::discovery::scan::{CaptureWorkBudget, ProcScanIo, ScanIo};
+    use crate::process::{ProcessView, ProcessViewId};
+    let work = tempfile::tempdir().unwrap();
+    let host_file = work.path().join("lower.so");
+    std::fs::write(&host_file, vec![0xE4u8; 8192]).unwrap();
+    let side = tempfile::tempdir().unwrap();
+    let pidfile = side.path().join("leaf.pid");
+    // The leaf privatizes its namespace copy (so the cover never
+    // propagates to the host), covers the work dir, reports its pid,
+    // and sleeps. A failed mount aborts the chain before the cover.
+    let leaf = std::process::Command::new("unshare")
+        .args([
+            "-m",
+            "sh",
+            "-c",
+            &format!(
+                "mount --make-rprivate / && mount -t tmpfs tmpfs '{}' && echo $$ > '{}' && exec sleep 600",
+                work.path().display(),
+                pidfile.display()
+            ),
+        ])
+        .spawn()
+        .expect("unshare -m runs the covered leaf");
+    let leaf_pid: u32 = {
+        let mut pid = None;
+        for _ in 0..100 {
+            if let Ok(text) = std::fs::read_to_string(&pidfile)
+                && let Ok(number) = text.trim().parse::<u32>()
+            {
+                pid = Some(number);
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        pid.expect("the covered leaf reports its pid")
+    };
+    struct Reap(u32, std::process::Child);
+    impl Drop for Reap {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(self.0 as i32, libc::SIGKILL);
+            }
+            let _ = self.1.wait();
+        }
+    }
+    let _reap = Reap(leaf_pid, leaf);
+    // The split is real: the target's own root no longer shows the file.
+    let target_path = format!("/proc/{leaf_pid}/root{}", host_file.display());
+    assert!(
+        std::fs::File::open(&target_path).is_err(),
+        "the tmpfs cover must hide the host file from the target, opened {target_path}"
+    );
+    let view = ProcessView::open(ProcessViewId(leaf_pid), leaf_pid).expect("the leaf view opens");
+    let mut budget = CaptureWorkBudget::default();
+    let mut io = ProcScanIo::new();
+    let mut file = io
+        .open_lower_candidate(&view, &host_file, &mut budget)
+        .unwrap_or_else(|error| {
+            panic!("the candidate must open in the observer namespace: {error}")
+        });
+    let mut bytes = [0u8; 8192];
+    use std::io::Read as _;
+    file.read_exact(&mut bytes).unwrap();
+    assert!(
+        bytes.iter().all(|byte| *byte == 0xE4),
+        "the open must serve the host file's bytes"
+    );
+}
+
 /// stale mapper still runs the lower file. The stale ranges must still
 /// join the proven lower file — upper churn must never capture stale
 /// attribution — and a mapper started after the rewrite tracks the

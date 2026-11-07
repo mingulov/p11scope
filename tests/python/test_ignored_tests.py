@@ -249,6 +249,7 @@ OVERLAY_EXPECTED = [
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_metacopy_stale_mapper_joins_lower",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_second_lower_candidate_wins",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_upper_rewrite_keeps_stale_on_lower",
+    "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_candidate_opens_in_observer_namespace",
 ]
 
 # The R57 future positive: an unprivileged expected-RED cell that stays in
@@ -1615,13 +1616,13 @@ class IgnoredTestsTests(unittest.TestCase):
         # exactly one), so the default section shows 224 + 2.
         self.assertIn("default (226)", result.stdout)
         self.assertIn("btrfs (17, --include-btrfs only)", result.stdout)
-        self.assertIn("overlay (9, --include-overlay only)", result.stdout)
+        self.assertIn("overlay (10, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (295 tests)",
+        self.assertIn("verify: curation matches the binary (296 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):
@@ -1821,7 +1822,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
             "BTRFS_TESTS=17",
-            "OVERLAY_TESTS=9",
+            "OVERLAY_TESTS=10",
             "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",
             "COUNTER_FIXTURE_TESTS=27",

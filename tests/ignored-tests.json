@@ -792,6 +792,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_candidate_opens_in_observer_namespace",
+      "reason": "root: mount namespace with a tmpfs cover; lower candidates resolve in the observer namespace (host paths, invisible under the target root), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_population_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",

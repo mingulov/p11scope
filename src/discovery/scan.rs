@@ -5356,7 +5356,8 @@ pub(crate) trait ScanIo {
         let _ = (view, merged, budget);
         Vec::new()
     }
-    /// Open one lower candidate as the target sees it. The default
+    /// Open one lower candidate in the observer's mount namespace (the
+    /// mounter's: a container cannot see its own lowerdirs). The default
     /// refuses, so scripted scans keep the named gap.
     fn open_lower_candidate(
         &mut self,
@@ -5528,8 +5529,10 @@ impl ScanIo for ProcScanIo {
         budget: &mut CaptureWorkBudget,
     ) -> Vec<PathBuf> {
         // The target's own table through the retained view (never the
-        // observer's): a container's lowerdirs resolve in its mount
-        // namespace. Any read or normalization failure names nothing.
+        // observer's): the mountpoints match the merged path there. The
+        // lowerdir paths the table names resolve in the mounter's
+        // namespace instead (see `open_lower_candidate`). Any read or
+        // normalization failure names nothing.
         let mut mounts = MountTableCache::default();
         let table = view.open_then_cached_mountinfo(|_| Ok(()), &mut mounts, budget);
         let ((), text) = match table {
@@ -5551,9 +5554,12 @@ impl ScanIo for ProcScanIo {
         candidate: &Path,
         budget: &mut CaptureWorkBudget,
     ) -> Result<File, String> {
-        view.with_filesystem(budget, |filesystem, _| {
-            filesystem.open_rooted_object(candidate)
-        })
+        // Lowerdir paths are recorded at mount time in the mounter's
+        // namespace — the observer's for every container runtime, shared
+        // for loop mounts — so they open here, never under the target's
+        // root (a container cannot see its own lowerdirs).
+        let _ = (view, budget);
+        open_object(candidate)
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {

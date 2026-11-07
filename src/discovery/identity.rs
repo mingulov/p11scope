@@ -8252,17 +8252,31 @@ fn pin_scanned_object(
     } else {
         None
     };
-    // The target's own filesystem view: a container's object is never copied out.
-    let (file, mountinfo) = view.open_then_cached_mountinfo(
-        |filesystem| match &pre_path {
-            Some(candidate) => filesystem.open_rooted_object(candidate),
-            None => filesystem.open_rooted_object(Path::new(&raw.path)),
-        },
-        mounts,
-        budget,
-    )?;
-    let first = identity_of_in_mountinfo(&file, mountinfo);
-    let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
+    // A merged path opens through the target's own filesystem view: a
+    // container's object is never copied out. A lower candidate instead
+    // opens in the observer's mount namespace — lowerdir paths are
+    // recorded at mount time in the mounter's namespace, which a
+    // container cannot see under its own root — and resolves through
+    // the observer's table to match (a host fd's mount id is absent
+    // from the target's table by construction).
+    let (file, found) = match &pre_path {
+        Some(candidate) => {
+            let file = open_object(candidate)?;
+            let found = mapping_file_key(&file)
+                .map_err(|error| format!("mapping identity unavailable: {error}"))?;
+            (file, found)
+        }
+        None => {
+            let (file, mountinfo) = view.open_then_cached_mountinfo(
+                |filesystem| filesystem.open_rooted_object(Path::new(&raw.path)),
+                mounts,
+                budget,
+            )?;
+            let first = identity_of_in_mountinfo(&file, mountinfo);
+            let found = identity_in_cached_table(view, &file, first, mounts, budget)?;
+            (file, found)
+        }
+    };
     // On pre-6.8 kernels an overlayfs fd and its mappings legitimately carry
     // different keys (overlay vs backing device); the self-mapping probe
     // asks the kernel how it renders this exact fd before refusing. A

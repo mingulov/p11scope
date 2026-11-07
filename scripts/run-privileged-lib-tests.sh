@@ -803,6 +803,7 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_stale_m
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_metacopy_stale_mapper_joins_lower
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_second_lower_candidate_wins
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_upper_rewrite_keeps_stale_on_lower
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_candidate_opens_in_observer_namespace
 )
 
 # Expected-failure campaign cells: run only with

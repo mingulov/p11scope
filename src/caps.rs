@@ -19,8 +19,12 @@ pub(crate) const CAP_DAC_OVERRIDE_BIT: u32 = 1;
 /// `CAP_DAC_READ_SEARCH` (`linux/capability.h`): open provider files and
 /// traverse target paths the observer could not otherwise read.
 pub(crate) const CAP_DAC_READ_SEARCH_BIT: u32 = 2;
-/// `CAP_SETGID` / `CAP_SETUID` (`linux/capability.h`): assume `--user` in
-/// `run` (root runs). Never in the file set.
+/// `CAP_KILL` (`linux/capability.h`): signal the re-owned `run` child
+/// across uids (root runs). Never in the file set.
+pub(crate) const CAP_KILL_BIT: u32 = 5;
+/// `CAP_SETGID` / `CAP_SETUID` (`linux/capability.h`): the `run` identity
+/// change — the sudo drop as well as `--user` (root runs). Never in the
+/// file set.
 pub(crate) const CAP_SETGID_BIT: u32 = 6;
 pub(crate) const CAP_SETUID_BIT: u32 = 7;
 /// `CAP_SYS_PTRACE` (`linux/capability.h`): read a target's memory under
@@ -301,13 +305,15 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// need later, nothing else. That is the minimal live set plus the
 /// root-functional extras, each conditioned on the flags that need it:
 /// `-o` anywhere needs DAC_OVERRIDE and CHOWN, the singles fallback needs
-/// SYS_ADMIN, `run --user` needs SETUID/SETGID. A setcap user never holds
-/// the extras, so the same masks shed the whole grant surplus there;
-/// root keeps a functional subset instead of the full set. Live capture
-/// keeps the minimal set whole (dynamic attach and rescans run until the
-/// end); `doctor` keeps it too (it reports the invoking set, so it must
-/// not drop first); `inspect` never loads BPF, and scan-only `inventory`
-/// keeps only its target-read/map-files bits; `diff` keeps file IO only.
+/// SYS_ADMIN, `run` always needs SETUID/SETGID/KILL (the sudo drop runs
+/// without `--user`, and the parent signals the re-owned child across
+/// uids). A setcap user never holds the extras, so the same masks shed
+/// the whole grant surplus there; root keeps a functional subset instead
+/// of the full set. Live capture keeps the minimal set whole (dynamic
+/// attach and rescans run until the end); `doctor` keeps it too (it
+/// reports the invoking set, so it must not drop first); `inspect` never
+/// loads BPF, and scan-only `inventory` keeps only its
+/// target-read/map-files bits; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let live = minimal_live_mask();
@@ -327,11 +333,10 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
         }
         Command::Inventory(a) => live | sys_admin | out(&a.out),
         Command::Run(a) => {
-            let ids = if a.user.is_some() {
-                (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT)
-            } else {
-                0
-            };
+            // Always: the sudo drop re-owns the child without `--user`
+            // (setgroups/setresgid/setresuid need SETGID/SETUID), and the
+            // parent signals it across uids (pidfd/kill need KILL).
+            let ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT) | (1u64 << CAP_KILL_BIT);
             live | sys_admin | out(&a.out) | ids
         }
         // The diagnostic session links its self-probe on multi hosts,

@@ -556,9 +556,11 @@ else:
                        "ghcr.io/mingulov/p11scope", "docker push"):
             self.assertIn(marker, bodies, f"container-push must {marker}")
         # The published tag is the release tag without its leading v, and
-        # only a final X.Y.Z release tag publishes (no release candidates).
+        # only a final X.Y.Z release tag publishes (no release candidates):
+        # the job gate admits any v* tag, so this in-step regex is the whole
+        # RC guard and is pinned verbatim.
         self.assertIn('GITHUB_REF_NAME', bodies)
-        self.assertIn('[0-9]', bodies)
+        self.assertIn(r'[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]', bodies)
 
 
 if __name__ == "__main__":

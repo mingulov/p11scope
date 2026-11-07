@@ -339,11 +339,12 @@ const EVER_ENUMERATED_CAP: usize = 65_536;
 /// tasks are plentiful past the cap) without stalling a pass.
 const EVER_ENUMERATED_SWEEP: usize = 4_096;
 
-/// RED scaffolding: backstop cadence for the deep-scan skip (every Nth
-/// pass rescans). The stub value is wrong on purpose; the GREEN commit
-/// sets the pinned value.
-#[allow(dead_code)]
-pub(crate) const SKIP_BACKSTOP_EVERY: u64 = 0;
+/// Backstop cadence for the cross-pass deep-scan skip: every Nth applied
+/// pass withholds priors and rescans, so an in-place file swap (same
+/// maps, new bytes) surfaces within N passes. Ordinary maps changes
+/// rescan on the very next pass; the backstop only bounds the exotic
+/// same-maps swap.
+pub(crate) const SKIP_BACKSTOP_EVERY: u64 = 4;
 
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
 /// the caller registry behind one batch boundary, plus the attach set the
@@ -537,10 +538,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// passes. Discarded passes record nothing (their outcomes never
     /// applied); pid reuse drops the stale task by start-time mismatch.
     scan_freshness: BTreeSet<(u32, Option<u64>)>,
-    /// RED scaffolding: per-pid (generation, maps digest) from the last
-    /// applied pass. The GREEN commit records it in
-    /// `note_applied_scan_tasks` and serves it from
-    /// `priors_for_collection`; backstop passes withhold it.
+    /// Per-pid (generation start-time, maps digest) from the last
+    /// applied pass: the next collection's deep-scan skip priors.
+    /// Replaced wholesale per applied pass (a pid the pass never saw
+    /// carries no prior and scans); discarded passes record nothing.
     maps_prior: BTreeMap<u32, (Option<u64>, u64)>,
     /// Every task identity enumerated by an applied pass, across passes:
     /// the terminal stop diff reports live tasks this never saw, so a
@@ -8541,8 +8542,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// pass enumeration, while every enumerated member joins cross-pass
     /// enumeration memory for the terminal stop diff. Memory-unavailable,
     /// unreadable, exited and not-selected members stay fresh so the
-    /// next pass retries them. Discarded passes record nothing.
+    /// next pass retries them. The pass's sweep digests replace the
+    /// deep-scan skip priors wholesale. Discarded passes record nothing.
     fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
+        self.maps_prior = catalog.sweep_digests.clone();
         let current: BTreeMap<u32, Option<u64>> = catalog
             .processes
             .iter()
@@ -8616,12 +8619,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .collect()
     }
 
-    /// RED scaffolding (replaced by the GREEN commit): the deep-scan
-    /// skip priors for the next collection. The stub always withholds,
-    /// so the memory tests fail.
+    /// The deep-scan skip priors for the next collection: the last
+    /// applied pass's per-pid digests, or none on a backstop pass (every
+    /// `SKIP_BACKSTOP_EVERY`th pass rescans) and before the first pass.
     pub(crate) fn priors_for_collection(&self) -> crate::inspect_system::ScanPriors {
-        let _ = &self.maps_prior;
-        crate::inspect_system::ScanPriors::empty()
+        if self.passes % SKIP_BACKSTOP_EVERY == SKIP_BACKSTOP_EVERY - 1 {
+            return crate::inspect_system::ScanPriors::empty();
+        }
+        crate::inspect_system::ScanPriors {
+            digests: self.maps_prior.clone(),
+        }
     }
 
     /// A collection the stop discarded before apply: inspect the dropped
@@ -27787,7 +27794,9 @@ mod maps_skip_memory_tests {
     fn applied_pass_records_sweep_digests_for_the_next_pass() {
         let mut coordinator = skip_coordinator();
         let digests: BTreeMap<u32, (Option<u64>, u64)> =
-            [(11, (Some(110), 0xA11CE)), (12, (None, 0xB0B))].into_iter().collect();
+            [(11, (Some(110), 0xA11CE)), (12, (None, 0xB0B))]
+                .into_iter()
+                .collect();
         coordinator.note_applied_scan_tasks(&catalog_with_digests(digests.clone()));
         assert_eq!(
             coordinator.maps_priors_for_test(),
@@ -27800,7 +27809,9 @@ mod maps_skip_memory_tests {
     fn departed_pids_leave_prior_memory() {
         let mut coordinator = skip_coordinator();
         coordinator.note_applied_scan_tasks(&catalog_with_digests(
-            [(11, (Some(110), 1)), (12, (Some(120), 2))].into_iter().collect(),
+            [(11, (Some(110), 1)), (12, (Some(120), 2))]
+                .into_iter()
+                .collect(),
         ));
         coordinator.note_applied_scan_tasks(&catalog_with_digests(
             [(11, (Some(110), 3))].into_iter().collect(),
@@ -27836,7 +27847,8 @@ mod maps_skip_memory_tests {
             "the backstop must repeat"
         );
         assert_eq!(
-            super::SKIP_BACKSTOP_EVERY, 4,
+            super::SKIP_BACKSTOP_EVERY,
+            4,
             "the backstop cadence is pinned"
         );
     }

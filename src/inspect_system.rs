@@ -352,8 +352,7 @@ struct Collection {
     /// into the confirmation reads.
     budget: CaptureWorkBudget,
     /// Per-swept-pid maps-snapshot digest: the next pass's skip priors.
-    /// Empty under the cap (no sweep ran) and in RED scaffolding.
-    #[allow(dead_code)]
+    /// Empty under the cap (no sweep ran).
     digests: BTreeMap<u32, u64>,
 }
 
@@ -363,7 +362,7 @@ impl Collection {
         &self.digests
     }
 
-    pub(crate) fn sweep_for_test(&self) -> &[(u32, Vec<MapEntry>)] {
+    pub(crate) fn sweep_for_test(&self) -> &Vec<(u32, Vec<MapEntry>)> {
         &self.sweep
     }
 
@@ -388,15 +387,17 @@ impl Collection {
     }
 }
 
-/// RED scaffolding (replaced by the GREEN commit): prior-pass memory for
-/// the cross-pass deep-scan skip. `digests` maps pid -> (generation
-/// start-time, sweep-snapshot digest) from the last applied pass.
-#[allow(dead_code)]
+/// Prior-pass memory for the cross-pass deep-scan skip. `digests` maps
+/// pid -> (generation start-time, sweep-snapshot digest) from the last
+/// applied pass. A selected member whose snapshot digest and live
+/// generation both match is confirmed, not deep-scanned: its mappings
+/// are byte-identical to a pass that already decoded them, so a rescan
+/// could only repeat the same findings. New mappings, pid reuse, and
+/// unreadable generations never skip; backstop passes carry no priors.
 pub(crate) struct ScanPriors {
     pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
 }
 
-#[allow(dead_code)]
 impl ScanPriors {
     pub(crate) fn empty() -> Self {
         Self {
@@ -405,31 +406,86 @@ impl ScanPriors {
     }
 }
 
-/// RED stub: always 0, so every digest-change test fails.
-#[allow(dead_code)]
-pub(crate) fn digest_maps_snapshot(_entries: &[MapEntry]) -> u64 {
-    0
+/// FNV-1a over one maps snapshot: every entry's addresses, offset,
+/// permissions, device, inode and rendered path, in snapshot order. The
+/// digest is a same-run change detector only (never persisted, never
+/// compared across runs); order sensitivity is conservative (a reorder
+/// rescans).
+pub(crate) fn digest_maps_snapshot(entries: &[MapEntry]) -> u64 {
+    const OFFSET: u64 = 0xcbf29ce484222325;
+    const PRIME: u64 = 0x100000001b3;
+    let mut hash = OFFSET;
+    let mut mix = |bytes: &[u8]| {
+        for byte in bytes {
+            hash ^= u64::from(*byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+    mix(&(entries.len() as u64).to_le_bytes());
+    for entry in entries {
+        mix(&entry.start.to_le_bytes());
+        mix(&entry.end.to_le_bytes());
+        mix(&entry.file_offset.to_le_bytes());
+        mix(&entry.permissions);
+        mix(&entry.device.major.to_le_bytes());
+        mix(&entry.device.minor.to_le_bytes());
+        mix(&entry.inode.to_le_bytes());
+        match &entry.raw_path {
+            Some(path) => {
+                mix(&(path.len() as u64).to_le_bytes());
+                mix(path);
+            }
+            None => mix(b"\xff"),
+        }
+    }
+    hash
 }
 
-/// RED stub: skips everything, so every skip-set test fails.
-#[allow(dead_code)]
+/// The swept pids proven unchanged since the priors: snapshot digest
+/// matches and the live generation equals the recorded one. Every other
+/// pid scans: changed maps, recycled pids, unreadable generations, and
+/// members the prior pass never saw. `generation` reads the live
+/// start-time (a miss or mismatch refuses the skip).
 pub(crate) fn unchanged_skip_set(
     sweep: &[(u32, Vec<MapEntry>)],
-    _priors: &ScanPriors,
-    _generation: impl Fn(u32) -> Option<u64>,
+    priors: &ScanPriors,
+    generation: impl Fn(u32) -> Option<u64>,
 ) -> BTreeSet<u32> {
-    sweep.iter().map(|(pid, _)| *pid).collect()
+    if priors.digests.is_empty() {
+        return BTreeSet::new();
+    }
+    sweep
+        .iter()
+        .filter(|(pid, entries)| {
+            let Some((Some(start), digest)) = priors.digests.get(pid) else {
+                return false;
+            };
+            if digest_maps_snapshot(entries) != *digest {
+                return false;
+            }
+            generation(*pid).is_some_and(|live| live == *start)
+        })
+        .map(|(pid, _)| *pid)
+        .collect()
 }
 
-/// RED stub: empty selection, so the wiring test fails.
-#[allow(dead_code)]
+/// The deep-scan selection over one sweep, for tests: rarity order with
+/// kernel threads excluded, tiered by `scanned` freshness.
+#[cfg(test)]
 pub(crate) fn select_for_test(
-    _sweep: &[(u32, Vec<MapEntry>)],
-    _unavailable: &BTreeSet<u32>,
-    _cap: usize,
-    _scanned: &BTreeSet<u32>,
+    sweep: &Vec<(u32, Vec<MapEntry>)>,
+    unavailable: &BTreeSet<u32>,
+    cap: usize,
+    scanned: &BTreeSet<u32>,
 ) -> Vec<u32> {
-    Vec::new()
+    select_excluding_kernel_threads(
+        sweep,
+        unavailable,
+        std::path::Path::new("/proc"),
+        cap,
+        &mut CaptureWorkBudget::default(),
+        scanned,
+    )
 }
 
 /// Enumerate the machine, sweep over the cap, deep-scan every selected
@@ -503,8 +559,6 @@ fn collect_members_identity(
     scanned: &BTreeSet<u32>,
     priors: &ScanPriors,
 ) -> (Collection, Option<ExaminedCustody>) {
-    // RED scaffolding: priors are ignored until the GREEN commit.
-    let _ = priors;
     debug_assert!(!take_anchors || identity);
     progress!("p11scope: enumerating processes...");
     let scope = Scope::System;
@@ -526,7 +580,7 @@ fn collect_members_identity(
     // then, from its counts.
     let mut sweep = Vec::new();
     let mut sweep_unavailable = BTreeSet::new();
-    let selected: Vec<u32> = if pids.len() > cap {
+    let mut selected: Vec<u32> = if pids.len() > cap {
         progress!(
             "p11scope: sweeping {} process maps (cap {cap})...",
             pids.len()
@@ -564,9 +618,38 @@ fn collect_members_identity(
     };
     let cap_hit = pids.len() > cap;
 
+    // Cross-pass deep-scan skip: selected members whose maps digest and
+    // live generation both match the prior pass leave the deep-scan
+    // selection and flow through the confirm path as unselected members
+    // (their mappings are byte-identical to decoded ones). Under the cap
+    // no sweep ran, so nothing skips. Selection order is untouched: the
+    // filter only drops proven-unchanged members from its output.
+    let digests: BTreeMap<u32, u64> = sweep
+        .iter()
+        .map(|(pid, entries)| (*pid, digest_maps_snapshot(entries)))
+        .collect();
+    let mut selected_set: BTreeSet<_> = selected.iter().copied().collect();
+    if !priors.digests.is_empty() && !sweep.is_empty() {
+        let candidates: Vec<(u32, Vec<MapEntry>)> = sweep
+            .iter()
+            .filter(|(pid, _)| selected_set.contains(pid))
+            .map(|(pid, entries)| (*pid, entries.clone()))
+            .collect();
+        let skip = unchanged_skip_set(&candidates, priors, |pid| {
+            crate::process::process_start_time(pid).ok()
+        });
+        if !skip.is_empty() {
+            progress!(
+                "p11scope: skipping {} unchanged members (maps identical since the prior pass)...",
+                skip.len()
+            );
+            selected.retain(|pid| !skip.contains(pid));
+            selected_set.retain(|pid| !skip.contains(pid));
+        }
+    }
+
     let mut custody = identity.then(|| {
         let mut callers = BTreeMap::new();
-        let selected_set: BTreeSet<_> = selected.iter().copied().collect();
         for (pid, entries) in &sweep {
             if selected_set.contains(pid) {
                 continue;
@@ -620,7 +703,7 @@ fn collect_members_identity(
             sweep,
             sweep_unavailable,
             budget,
-            digests: BTreeMap::new(),
+            digests,
         },
         custody,
     )
@@ -1200,7 +1283,6 @@ pub(crate) struct Catalog {
     pub stage_timings: StageTimings,
     /// Per-swept-pid (generation start-time, maps digest): the next pass's
     /// deep-scan skip priors. Internal capture memory, never rendered.
-    #[allow(dead_code)]
     pub sweep_digests: BTreeMap<u32, (Option<u64>, u64)>,
 }
 
@@ -2620,6 +2702,45 @@ fn assemble(
     } else {
         None
     };
+    // Next pass's skip priors: this pass's sweep digests keyed with the
+    // generation each read proved (deep scans and maps matches pin it;
+    // pids no read reached carry no generation and never skip).
+    let member_generation: BTreeMap<u32, Option<u64>> = collection
+        .members
+        .iter()
+        .map(|member| {
+            (
+                member.pid,
+                member
+                    .generation
+                    .as_ref()
+                    .and_then(|generation| generation.start_time),
+            )
+        })
+        .collect();
+    let attributed_generation: BTreeMap<u32, u64> = attributed
+        .as_ref()
+        .map(|attributed| {
+            attributed
+                .attribution
+                .members
+                .iter()
+                .map(|member| (member.pid, member.start_time))
+                .collect()
+        })
+        .unwrap_or_default();
+    let sweep_digests: BTreeMap<u32, (Option<u64>, u64)> = collection
+        .digests
+        .iter()
+        .map(|(pid, digest)| {
+            let generation = member_generation
+                .get(pid)
+                .copied()
+                .flatten()
+                .or_else(|| attributed_generation.get(pid).copied());
+            (*pid, (generation, *digest))
+        })
+        .collect();
     Catalog {
         lowering: Some(CatalogLowering {
             plan,
@@ -2648,8 +2769,7 @@ fn assemble(
         excluded,
         exclude_inputs,
         stage_timings: StageTimings::new(),
-        // RED scaffolding: empty until the GREEN commit records digests.
-        sweep_digests: BTreeMap::new(),
+        sweep_digests,
     }
 }
 
@@ -10602,7 +10722,10 @@ mod maps_skip_tests {
 
     #[test]
     fn identical_snapshots_digest_equal() {
-        assert_eq!(digest_maps_snapshot(&snapshot()), digest_maps_snapshot(&snapshot()));
+        assert_eq!(
+            digest_maps_snapshot(&snapshot()),
+            digest_maps_snapshot(&snapshot())
+        );
         assert_eq!(digest_maps_snapshot(&[]), digest_maps_snapshot(&[]));
     }
 
@@ -10618,7 +10741,11 @@ mod maps_skip_tests {
     fn removed_mapping_changes_the_digest() {
         let before = digest_maps_snapshot(&snapshot());
         let after = vec![snapshot()[0].clone()];
-        assert_ne!(before, digest_maps_snapshot(&after), "a dlclose must rescan");
+        assert_ne!(
+            before,
+            digest_maps_snapshot(&after),
+            "a dlclose must rescan"
+        );
     }
 
     #[test]

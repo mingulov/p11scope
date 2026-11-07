@@ -2025,6 +2025,17 @@ fn unexamined_maps_gap(pid: u32, count: usize) -> PidGap {
     )
 }
 
+/// The sweep-refusal gap reason for an object on a filesystem without
+/// unique inode numbers: names the filesystem kind and why sweep
+/// matching cannot use it. Pure so the per-kind wording is unit-testable.
+fn refused_sweep_gap_reason(filesystem: &str) -> String {
+    format!(
+        "on a {filesystem} filesystem, whose inode numbers are not unique: processes past the \
+         deep-scan cap are never matched to it by device and inode, so only deep \
+         scans attribute it"
+    )
+}
+
 /// The GT-5 admission rule for a collected catalog, mirroring the engine: a
 /// named process, or a capture the operator aimed with `--module`, admits
 /// first-come; any other system capture admits in value order with a reserve
@@ -2386,12 +2397,7 @@ fn assemble(
                     || "maps attribution".to_string(),
                     |pin| pin.path.to_string(),
                 ),
-                reason: format!(
-                    "on a {} filesystem, whose inode numbers are not unique: processes past the \
-                     deep-scan cap are never matched to it by device and inode, so only deep \
-                     scans attribute it",
-                    object.filesystem
-                ),
+                reason: refused_sweep_gap_reason(object.filesystem),
             }));
         }
         for (object, reason) in &attributed.changed {
@@ -10426,6 +10432,36 @@ mod refused_filter_tests {
         });
         assert_eq!(scans, 2, "only unselected entries are scanned");
         assert_eq!(refused, vec![refused_object(1, key(42))]);
+    }
+
+    #[test]
+    fn unresolved_tmpfs_refusal_names_unproven_uniqueness() {
+        // An unreadable tmpfs mount is unproven, not non-unique: the gap
+        // must say so instead of leaking the internal kind slug.
+        let reason =
+            super::refused_sweep_gap_reason(crate::discovery::identity::TMPFS_UNRESOLVED_KIND);
+        assert!(
+            reason.contains(
+                "a tmpfs mount whose options could not be read, so inode uniqueness is unproven"
+            ),
+            "unresolved wording must not claim non-unique inodes: {reason}"
+        );
+        assert!(
+            !reason.contains("tmpfs-unresolved"),
+            "the internal kind slug must not leak: {reason}"
+        );
+    }
+
+    #[test]
+    fn named_filesystem_refusal_keeps_the_kind_sentence() {
+        let reason = super::refused_sweep_gap_reason("tmpfs-inode32");
+        assert_eq!(
+            reason,
+            "on a tmpfs-inode32 filesystem, whose inode numbers are not unique: processes past \
+             the deep-scan cap are never matched to it by device and inode, so only deep scans \
+             attribute it",
+            "named kinds keep the generic sentence"
+        );
     }
 }
 

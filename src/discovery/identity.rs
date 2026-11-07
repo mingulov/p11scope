@@ -502,6 +502,11 @@ pub(crate) fn nonunique_inode_kind(f_type: u64) -> Option<&'static str> {
 /// mount's `inode32`/`inode64` option, read from the mount table.
 pub(crate) const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
 
+/// The non-unique-inode kind for a tmpfs mount whose super-options could
+/// not be read: shared with gap renderers so the kind match cannot drift
+/// from the classifier.
+pub(crate) const TMPFS_UNRESOLVED_KIND: &str = "tmpfs-unresolved";
+
 /// The non-unique-inode kind for a tmpfs mount with these super-options
 /// (`None` when the mount table could not be read), or `None` when its
 /// inode numbers name one file. Pure so every option shape is
@@ -12167,6 +12172,63 @@ mod tests {
         );
         assert_eq!(tmpfs_nonunique_kind(Some("rw,inode64")), None);
         assert_eq!(tmpfs_nonunique_kind(Some("rw,relatime")), None);
+    }
+
+    // Doc-accuracy pins (fs-identity r4): `docs/known-limitations.md`
+    // discloses the filesystem-identity edge as the code behaves. Each
+    // pin fails on its own old sentence (RED) and passes on the
+    // reviewed wording (GREEN).
+    const KNOWN_LIMITATIONS_MD: &str = include_str!("../../docs/known-limitations.md");
+
+    #[test]
+    fn known_limitations_discloses_snapshot_twin_refusal() {
+        assert!(
+            KNOWN_LIMITATIONS_MD
+                .contains("Two Btrfs snapshot copies of one provider mapped at the same time")
+                && KNOWN_LIMITATIONS_MD.contains("btrfs storage driver")
+                && KNOWN_LIMITATIONS_MD.contains("the group is refused with an ambiguity gap"),
+            "the snapshot-twin refusal is disclosed"
+        );
+    }
+
+    #[test]
+    fn known_limitations_names_the_real_exclude_flag() {
+        assert!(
+            !KNOWN_LIMITATIONS_MD.contains("--exclude-path"),
+            "the doc must not name a flag that does not exist"
+        );
+        assert!(
+            KNOWN_LIMITATIONS_MD.contains("`--exclude-module` path matching"),
+            "the exclusion check names the real flag"
+        );
+    }
+
+    #[test]
+    fn known_limitations_drops_the_pin_time_classification_claim() {
+        // Classification re-reads the observer's mount table at every
+        // comparison (`filesystem_without_unique_inodes`), never once
+        // at pin time.
+        assert!(
+            !KNOWN_LIMITATIONS_MD.contains("at pin time"),
+            "the pin-time claim must not return"
+        );
+        assert!(
+            KNOWN_LIMITATIONS_MD.contains("classified from the observer's table"),
+            "observer-table classification is stated without a pin-time claim"
+        );
+    }
+
+    #[test]
+    fn known_limitations_states_the_detail_toggle_misreport_in_plain_words() {
+        assert!(
+            !KNOWN_LIMITATIONS_MD.contains("reports `Foreign` instead of `Changed`"),
+            "internal refusal names must not leak into the doc"
+        );
+        assert!(
+            KNOWN_LIMITATIONS_MD
+                .contains("reports the provider as another file instead of a changed one"),
+            "the detail-toggle misreport is stated in plain words"
+        );
     }
 
     #[test]

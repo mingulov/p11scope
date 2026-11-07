@@ -2404,7 +2404,11 @@ impl TmpfsMount {
             .arg(&mount)
             .status()
             .unwrap_or_else(|error| panic!("mount is required: {error}"));
-        assert!(status.success(), "mount -t tmpfs -o {options}: {status}");
+        assert!(
+            status.success(),
+            "mount -t tmpfs -o {options}: {status} (this cell needs a kernel with \
+             CONFIG_TMPFS_INODE64 for the inode32/inode64 options)"
+        );
         Self { _dir: dir, mount }
     }
 }
@@ -2437,7 +2441,8 @@ fn assert_mount_token(mount: &std::path::Path, token: &str) {
     let super_options = line.split_ascii_whitespace().next_back().unwrap();
     assert!(
         super_options.split(',').any(|t| t == token),
-        "{mount_str} super-options {super_options:?} lack {token:?}"
+        "{mount_str} super-options {super_options:?} lack {token:?} (this cell needs a kernel \
+         with CONFIG_TMPFS_INODE64 for the inode32/inode64 options)"
     );
 }
 
@@ -2515,6 +2520,23 @@ fn privileged_tmpfs_inode32_refuses_while_inode64_merges() {
     let skipped = first.absorb(second);
     assert!(skipped.is_empty(), "{skipped:?}");
     assert_eq!(first.pinned().count(), 1);
+    // Positive twin of the inode32 never-cached assertion: a unique
+    // file's inspection IS stored and reused.
+    let mapping64 = mapping_file_key(&file64).unwrap();
+    let key64 = InspectedFileKey::for_open_file(
+        &file64,
+        Device {
+            major: mapping64.device_major,
+            minor: mapping64.device_minor,
+        },
+        mapping64.inode,
+        pin_of(&file64).unwrap(),
+    )
+    .unwrap();
+    assert!(
+        budget.inspected_file(&key64).is_some(),
+        "the inode64 control's inspection must be cached"
+    );
 }
 
 /// A private ext4 filesystem on a loop device under a temporary directory,

@@ -1688,6 +1688,79 @@ fn discovery_row_marks_only_the_pre_copy_up_object() {
 }
 
 #[test]
+fn discovery_pair_rows_share_the_merge_view_key() {
+    // Both rows of a witness-proven copy-up pair publish the merge
+    // path and the shared merge-view key; each row's sha256 is its
+    // own file's digest and only the lower row carries the layer
+    // marker — digest and layer tell the two rows apart
+    // (observed-profile-v3 copy-up section).
+    use crate::discovery::identity::test_fixture::{
+        mark_pre_copy_up, pin_set, repath_single_pin,
+    };
+    let key = ObjectKey {
+        device: p11scope_manifest::maps::Device { major: 0, minor: 140 },
+        inode: 100,
+    };
+    let merge = "/merged/libsofthsm2.so";
+    let mut upper = pin_set(&[(key, "sha-u", 1)], false);
+    let mut lower = pin_set(&[(key, "sha-l", 2)], false);
+    mark_pre_copy_up(&mut lower);
+    repath_single_pin(&mut upper, merge);
+    repath_single_pin(&mut lower, merge);
+    let mut pins = crate::discovery::identity::PinnedObjects::empty();
+    assert!(pins.absorb(upper).is_empty());
+    assert!(pins.absorb(lower).is_empty());
+    assert_eq!(pins.pinned().count(), 2);
+    let upper_id = pins.pinned().find(|pin| pin.sha256 == "sha-u").unwrap().id;
+    let lower_id = pins.pinned().find(|pin| pin.sha256 == "sha-l").unwrap().id;
+    let mut plan = plan_with(2, 0);
+    let mut upper_module = plan.modules[0].clone();
+    upper_module.id = plan::ModuleId(0);
+    upper_module.object = upper_id;
+    upper_module.key = key;
+    upper_module.path = merge.to_string();
+    let mut lower_module = plan.modules[0].clone();
+    lower_module.id = plan::ModuleId(1);
+    lower_module.object = lower_id;
+    lower_module.key = key;
+    lower_module.path = merge.to_string();
+    plan.modules = vec![upper_module, lower_module];
+    plan.slots[0].object = upper_id;
+    plan.slots[0].module_ids = vec![plan::ModuleId(0)];
+    plan.slots[0].object_path = merge.to_string();
+    plan.slots[1].object = lower_id;
+    plan.slots[1].module_ids = vec![plan::ModuleId(1)];
+    plan.slots[1].object_path = merge.to_string();
+    let evidence = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
+    assert_eq!(evidence.modules.len(), 2);
+    let upper_row = evidence
+        .modules
+        .iter()
+        .find(|row| row.sha256.as_deref() == Some("sha-u"))
+        .unwrap();
+    let lower_row = evidence
+        .modules
+        .iter()
+        .find(|row| row.sha256.as_deref() == Some("sha-l"))
+        .unwrap();
+    assert_eq!(upper_row.dev, lower_row.dev, "shared merge-view device");
+    assert_eq!(upper_row.ino, lower_row.ino, "shared merge-view inode");
+    assert_eq!(upper_row.path, lower_row.path, "shared merge path");
+    assert_eq!(upper_row.build_id, lower_row.build_id, "same build id");
+    assert_eq!(upper_row.layer, None, "no marker on the upper row");
+    assert_eq!(
+        lower_row.layer,
+        Some(crate::render::ModuleLayer::PreCopyUp),
+        "layer marks the lower row"
+    );
+}
+
+#[test]
 fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
     let (mut plan, pins) = plan_with_pins(2, 0);
     plan.slots[1].object = PinnedObjectId(u32::MAX);

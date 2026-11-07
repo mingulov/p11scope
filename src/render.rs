@@ -996,8 +996,9 @@ pub struct UnobservedWindow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModuleLayer {
-    /// The lower file's row: the merge path, the lower file's identity,
-    /// and the stale-mapping calls. JSON `"layer": "pre_copy_up"`.
+    /// The lower file's row: the merge path, the shared merge-view
+    /// key, the lower file's own digest, and the stale-mapping calls.
+    /// JSON `"layer": "pre_copy_up"`.
     PreCopyUp,
 }
 

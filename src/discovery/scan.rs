@@ -4340,10 +4340,17 @@ pub(crate) fn lower_candidates_from_mountinfo(
             Some(rest) => rest,
             None => continue,
         };
-        let rel = match rest.strip_prefix('/') {
-            Some(rel) => rel,
-            None if rest.is_empty() => "",
-            None => continue,
+        let rel = if rest.is_empty() {
+            ""
+        } else if let Some(rel) = rest.strip_prefix('/') {
+            rel
+        } else if mountpoint.ends_with('/') {
+            // The root mount consumed the only separator: the rest is
+            // already relative. Every other mountpoint ends mid-path
+            // here, so only the root falls through.
+            rest
+        } else {
+            continue;
         };
         if std::path::Path::new(rel)
             .components()

@@ -5011,6 +5011,31 @@ fn lower_candidates_longest_overlay_prefix_wins() {
 }
 
 #[test]
+fn lower_candidates_root_mount_serves_container_paths() {
+    // D1-extended live failure: every container root is mountpoint "/",
+    // where the prefix consumes the only separator. The remainder is
+    // already relative; only the root falls through (a mid-path prefix
+    // like /var/tmp/x against /var/tmp/xbin still refuses).
+    let table = "9433 9341 0:104 / / rw,relatime - overlay overlay rw,lowerdir=/snap/1/fs:/snap/2/fs,upperdir=/snap/3/fs,workdir=/snap/3/work,nouserxattr\\n";
+    let got = lower_candidates_from_mountinfo(
+        table,
+        std::path::Path::new("/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"),
+    );
+    assert_eq!(
+        got,
+        vec![
+            std::path::PathBuf::from("/snap/1/fs/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"),
+            std::path::PathBuf::from("/snap/2/fs/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so"),
+        ]
+    );
+    let sibling = "31 23 0:27 / /var/tmp/x rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\\n";
+    assert!(
+        lower_candidates_from_mountinfo(sibling, std::path::Path::new("/var/tmp/xbin/lib.so"))
+            .is_empty()
+    );
+}
+
+#[test]
 fn lower_candidates_skips_non_overlay_and_prefix_siblings() {
     let table = concat!(
         "10 1 8:1 / /var/tmp/x rw,relatime - ext4 /dev/sda3 rw\n",

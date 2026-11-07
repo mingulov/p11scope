@@ -2860,6 +2860,24 @@ impl LiveJointMachine {
                 };
                 let (raw, poll) = retain_on_refusal!(Phase::Idle, collected);
                 let poll = poll.expect("positive initial work actually polls the original cursor");
+                // TEMP F9 DIAGNOSTIC (revert before freeze): collect cadence.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static N: AtomicU64 = AtomicU64::new(0);
+                    static ROWS: AtomicU64 = AtomicU64::new(0);
+                    let n = N.fetch_add(1, Ordering::Relaxed);
+                    let rows = ROWS.fetch_add(poll.attempted as u64, Ordering::Relaxed)
+                        + poll.attempted as u64;
+                    if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
+                        && (n < 5 || n % 20 == 0)
+                    {
+                        eprintln!(
+                            "m-collect n={n} attempted={} rows_total={rows} t_mono={} work={work}",
+                            poll.attempted,
+                            crate::attach::monotonic_ns().unwrap_or(0),
+                        );
+                    }
+                }
                 budget.spend(poll.attempted.max(1));
                 let Some(ledger) = raw.ledger_binding() else {
                     return (
@@ -3025,6 +3043,24 @@ impl LiveJointMachine {
                 let poll = retain_on_refusal!(Phase::Collecting(original), continued);
                 original.attempted += poll.attempted;
                 original.poll = poll;
+                // TEMP F9 DIAGNOSTIC (revert before freeze): extension cadence.
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static XN: AtomicU64 = AtomicU64::new(0);
+                    static XROWS: AtomicU64 = AtomicU64::new(0);
+                    let xn = XN.fetch_add(1, Ordering::Relaxed);
+                    let xrows = XROWS.fetch_add(poll.attempted as u64, Ordering::Relaxed)
+                        + poll.attempted as u64;
+                    if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
+                        && (xn < 5 || xn % 20 == 0)
+                    {
+                        eprintln!(
+                            "m-extend xn={xn} attempted={} xrows_total={xrows} t_mono={} work={work}",
+                            poll.attempted,
+                            crate::attach::monotonic_ns().unwrap_or(0),
+                        );
+                    }
+                }
                 budget.spend(poll.attempted.max(1));
                 let step = if poll.attempted == 0 {
                     Step::Yield

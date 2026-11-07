@@ -1327,6 +1327,14 @@ impl JointStaging {
                             Some(&mut *ledger),
                             assoc_fallback.as_deref_mut(),
                         );
+                        // TEMP F9 DIAGNOSTIC (revert before freeze): death timestamp.
+                        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() {
+                            eprintln!(
+                                "death-tick gap={:?} t_mono={} replayed={replayed}",
+                                failure.gap,
+                                crate::attach::monotonic_ns().unwrap_or(0),
+                            );
+                        }
                         self.close_segment(false, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }

@@ -391,12 +391,13 @@ impl DiscoveryScheduler {
     /// Opens one admission window: settles the previous tick's backlog
     /// debt, resets this tick's attempt ledger, and rotates the
     /// newcomer-attempt sets so the backlog rotation sinks exactly the
-    /// previous tick's newcomer attempts. Every admission window calls
-    /// this first. A backlog attempt paid the debt; a round that
-    /// attempted work but no backlog while backlog waited owes the next
-    /// lead to backlog; no backlog waiting clears it; a round that
-    /// attempted nothing (an expired quantum before the first scan)
-    /// leaves it for the retry.
+    /// previous tick's newcomer attempts — unless that tick attempted
+    /// nothing, in which case the sets are kept for the retry. Every
+    /// admission window calls this first. A backlog attempt paid the debt;
+    /// a round that attempted work but no backlog while backlog waited
+    /// owes the next lead to backlog; no backlog waiting clears it; a
+    /// round that attempted nothing (an expired quantum before the first
+    /// scan) leaves it for the retry.
     fn open_attempt_window(&mut self) {
         if self.tick_attempted_backlog {
             self.backlog_owed = false;
@@ -405,9 +406,14 @@ impl DiscoveryScheduler {
         } else if !self.tick_backlog_waited {
             self.backlog_owed = false;
         }
+        let attempted_any = self.tick_attempted_any;
         self.tick_attempted_any = false;
         self.tick_attempted_backlog = false;
-        self.last_newcomer_attempts = std::mem::take(&mut self.tick_newcomer_attempts);
+        if attempted_any {
+            self.last_newcomer_attempts = std::mem::take(&mut self.tick_newcomer_attempts);
+        } else {
+            self.tick_newcomer_attempts.clear();
+        }
     }
 
     /// One admission tick's window with newcomers first (free view slots

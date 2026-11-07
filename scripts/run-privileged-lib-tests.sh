@@ -826,6 +826,17 @@ tests/object_producer_activation.rs:counter_artifact_modes_have_exact_maps_and_r
 tests/object_producer_activation.rs:counter_artifact_mutations_are_causally_rejected
 )
 
+# Discover btrfs-subvolume curation (checker-enforced, never executed
+# by this script): the ignored discover cli twin that needs scratch on
+# btrfs. The privileged-btrfs job runs the equivalent
+# scripts/ci/discover-btrfs-subvol.sh cell (loop-mounted btrfs, run as
+# the runner user because the fence refuses root); the ignored test
+# itself runs by hand with --exact --ignored on btrfs scratch.
+# shellcheck disable=SC2034  # read by scripts/check-ignored-tests.py, by design
+DISCOVER_BTRFS_SUBVOL_TESTS=(
+crates/discover/tests/cli.rs:isolation_btrfs_subvolume_outside_the_output_is_denied
+)
+
 # Integration-test curation: `tests/<target>.rs:<exact test path>` entries
 # for the ignored integration tests (each target builds one binary named
 # after the file stem). Verified, never executed, by --list-integration

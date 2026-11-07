@@ -90,14 +90,17 @@ COUNTER_PROOF_LIST = "COUNTER_BANK_PROOF_TESTS"
 COUNTER_PROOF_OWNER = "counter-bank-proof build"
 COUNTER_ARTIFACTS_LIST = "COUNTER_ARTIFACTS_TESTS"
 COUNTER_ARTIFACTS_OWNER = "counter-artifacts build"
+DISCOVER_BTRFS_SUBVOL_LIST = "DISCOVER_BTRFS_SUBVOL_TESTS"
+DISCOVER_BTRFS_SUBVOL_OWNER = "discover-btrfs-subvol cell"
 # Every allowed feature owner and the curation list that proves it. The
 # form tells how an entry resolves to a member: the wide runner curates
-# plain lib paths, the counter builds curate `file:path` selectors
-# (their tests are integration targets).
+# plain lib paths, the counter builds and the discover btrfs-subvolume
+# cell curate `file:path` selectors (their tests are integration targets).
 OWNER_LISTS = (
     (WIDE_OWNER, WIDE_LIST, "path"),
     (COUNTER_PROOF_OWNER, COUNTER_PROOF_LIST, "file:path"),
     (COUNTER_ARTIFACTS_OWNER, COUNTER_ARTIFACTS_LIST, "file:path"),
+    (DISCOVER_BTRFS_SUBVOL_OWNER, DISCOVER_BTRFS_SUBVOL_LIST, "file:path"),
 )
 ALLOWED_OWNERS = tuple(owner for owner, _, _ in OWNER_LISTS)
 INTEGRATION_LIST = "INTEGRATION_TESTS"

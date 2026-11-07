@@ -236,10 +236,21 @@ RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED = (
     "discovery::engine::tests::exit_loader_balanced_benign_transaction_needs_no_terminal_truncation"
 )
 
+# The discover btrfs-subvolume twin: ignored (needs btrfs scratch) and
+# curated for its privileged-btrfs cell. Pinned literally so a dropped
+# or renamed curation fails here, not silently.
+DISCOVER_BTRFS_SUBVOL_EXPECTED = [
+    "crates/discover/tests/cli.rs:"
+    "isolation_btrfs_subvolume_outside_the_output_is_denied",
+]
+
+DISCOVER_BTRFS_SUBVOL_OWNER = "discover-btrfs-subvol cell"
+
 
 def write_fixture(root, sources, entries, registered, wide_registered=(),
                   integration_registered=(), counter_proof_registered=(),
-                  counter_artifacts_registered=(), skip_registered=(),
+                  counter_artifacts_registered=(),
+                  discover_btrfs_subvol_registered=(), skip_registered=(),
                   manifest_version="0.5.0"):
     """A minimal checkable tree: sources {rel: text}, inventory, runner."""
     for rel, text in sources.items():
@@ -282,6 +293,8 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("INTEGRATION_TESTS", integration_registered),
             ("COUNTER_BANK_PROOF_TESTS", counter_proof_registered),
             ("COUNTER_ARTIFACTS_TESTS", counter_artifacts_registered),
+            ("DISCOVER_BTRFS_SUBVOL_TESTS",
+             discover_btrfs_subvol_registered),
         )
     )
     runner.write_text(body, encoding="utf-8")
@@ -991,6 +1004,29 @@ class IgnoredTestsTests(unittest.TestCase):
                 self.assertIn("--include-overlay", entries[name]["reason"])
         self.assertEqual(entries[RESIDUAL_REDBYDESIGN_XFAIL_EXPECTED]["cell"],
                          "performance")
+
+    def test_discover_btrfs_subvol_cell_is_curated(self):
+        # The ignored discover cli twin stays tracked: the runner list
+        # holds exactly the pinned selector, and the inventory files it
+        # under the cell's feature owner (never the lib campaign lists,
+        # whose binaries do not contain it).
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        self.assertEqual(set(lists["DISCOVER_BTRFS_SUBVOL_TESTS"]),
+                         set(DISCOVER_BTRFS_SUBVOL_EXPECTED))
+        entries = {entry["path"]: entry
+                   for entry in json.loads(INVENTORY.read_text())["sites"]}
+        entry = entries[
+            "isolation_btrfs_subvolume_outside_the_output_is_denied"]
+        self.assertEqual(entry["file"], "crates/discover/tests/cli.rs")
+        self.assertEqual(entry["cell"], "feature")
+        self.assertEqual(entry["owner"], DISCOVER_BTRFS_SUBVOL_OWNER)
+        self.assertIn("btrfs", entry["reason"])
+        for name in ("DEFAULT_TESTS", "ALTERNATIVE_TESTS", "LONG_TESTS",
+                     "BTRFS_TESTS", "OVERLAY_TESTS",
+                     "EXPECTED_FAILURE_TESTS", "SKIP_TESTS"):
+            self.assertNotIn(
+                "isolation_btrfs_subvolume_outside_the_output_is_denied",
+                lists[name], name)
 
     def test_skip_reasons_align_with_skip_tests(self):
         tests = runner_array_lines(RUNNER, "SKIP_TESTS")
@@ -1731,6 +1767,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "COUNTER_FIXTURE_TESTS=0 BTRFS_TMPDIR_XFAIL_TESTS=0 "
             "WIDE_DETAILED_2112_TESTS=1 "
             "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
+            "DISCOVER_BTRFS_SUBVOL_TESTS=0 "
             "INTEGRATION_TESTS=0",
             result.stdout,
         )
@@ -1751,6 +1788,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",
             "COUNTER_ARTIFACTS_TESTS=2",
+            "DISCOVER_BTRFS_SUBVOL_TESTS=1",
             "INTEGRATION_TESTS=17",
         ):
             with self.subTest(pin=pin):

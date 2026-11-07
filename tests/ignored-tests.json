@@ -1958,6 +1958,13 @@
       "path": "run::tests::privileged_spawned_child_home_matches_the_target_passwd_row",
       "reason": "privileged: drops a child to a non-root account; run as root with --ignored --test-threads=1",
       "cell": "privileged"
+    },
+    {
+      "file": "crates/discover/tests/cli.rs",
+      "path": "isolation_btrfs_subvolume_outside_the_output_is_denied",
+      "reason": "needs btrfs scratch; run by exact selector (privileged-btrfs runs the equivalent scripts/ci/discover-btrfs-subvol.sh cell; the ignored test itself runs by hand on btrfs scratch)",
+      "cell": "feature",
+      "owner": "discover-btrfs-subvol cell"
     }
   ]
 }

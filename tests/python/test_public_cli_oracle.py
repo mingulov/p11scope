@@ -365,8 +365,15 @@ class OracleTests(unittest.TestCase):
     def test_run_exact_requires_confirmed_pause(self):
         # WP-4: run-short/run-cover are exact, not smoke. Default inputs carry
         # pause none and must fail; a confirmed pause with an exited child passes.
-        self.run_case(cell="run-short", want=1)
+        # Run-tree (v0.7.0): owned runs capture at cgroup scope, so both
+        # arms build cgroup inputs; the first still fails on the pause.
+        def tree_scope(d, l, r):
+            d["capture"]["scope"] = "cgroup"
+            r["scope"] = "cgroup"
+            d["evidence"]["attach_backend"]["scope_filter"] = None
+        self.run_case(tree_scope, cell="run-short", want=1)
         def confirmed(d, l, r):
+            tree_scope(d, l, r)
             d["evidence"].update(pause="sigstop", pause_attempts=1, pause_confirmed=1, pause_partial=0)
             d["evidence"]["child_still_running"] = False
         self.run_case(confirmed, cell="run-short", want=0)

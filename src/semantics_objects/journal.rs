@@ -5536,8 +5536,12 @@ impl JournalAdapter {
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
         // takes again), exactly like moved native evidence.
-        let Ok(fresh) = births.take_birth_evidence() else {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "evidence_take"));
+        let fresh = match births.take_birth_evidence() {
+            Ok(fresh) => fresh,
+            Err(refusal) => {
+                let site: &str = &format!("evidence_take_{refusal:?}");
+                return Err(self.diag_failure(JournalGap::BootstrapMismatch, site));
+            }
         };
         // Re-verify the birth with fresh Session evidence against
         // current retained truth: moved native evidence or a chain break

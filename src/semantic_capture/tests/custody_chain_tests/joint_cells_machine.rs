@@ -3458,9 +3458,7 @@ fn running_hook_budget_drains_saturated_quantum_in_one_hook() {
     let outcome = scene.service(crate::inventory::RUNNING_HOOK_ACTIONS);
     assert_eq!(
         outcome,
-        Ok(
-            crate::inventory_semantics::JointServiceProgress::Published
-        ),
+        Ok(crate::inventory_semantics::JointServiceProgress::Published),
         "one running hook completes the saturated quantum cycle"
     );
     assert_ne!(

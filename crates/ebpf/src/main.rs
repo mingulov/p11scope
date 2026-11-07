@@ -626,8 +626,13 @@ fn scope_auth() -> Option<ScopeAuth> {
     let flags = CONFIG.get(CFG_FLAGS).copied().unwrap_or(0);
     #[cfg(not(feature = "inventory-only"))]
     let valid = valid_config(flags);
-    #[cfg(feature = "inventory-only")]
+    // The Callers flavor is the only inventory build that arms the
+    // exe-identity bit; every other inventory build keeps the exact
+    // compares, so its object stays byte-identical without the bit.
+    #[cfg(all(feature = "inventory-only", feature = "inventory-callers"))]
     let valid = p11scope_ebpf_common::valid_inventory_config(flags);
+    #[cfg(all(feature = "inventory-only", not(feature = "inventory-callers")))]
+    let valid = p11scope_ebpf_common::valid_inventory_config_exact(flags);
     if !valid {
         return None;
     }

@@ -386,15 +386,27 @@ pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
 pub const FLAG_TRACK_SHORT_LIVED: u64 = 1 << 8;
 
 /// Inventory accepts one external scope and its own policy, without detail or pause.
-/// Exe identity for unidentified callers: the bit rides beside any one scope (uniform
-/// validator; the publisher arms selectively, mirroring Detailed
-/// aggregate-plus-bit). In-kernel `scope_auth` and the userspace
-/// publisher share this gate.
+/// Exe identity for unidentified callers: the bit rides beside one scope in the
+/// Callers flavor only (uniform validator; the publisher arms selectively, mirroring
+/// Detailed aggregate-plus-bit). The Callers in-kernel `scope_auth` and the userspace
+/// publisher share this gate; every other inventory build keeps the exact gate below.
 pub const fn valid_inventory_config(flags: u64) -> bool {
     let base = flags & !FLAG_TRACK_SHORT_LIVED;
     base == (FLAG_POLICY_INVENTORY | FLAG_PID_FILTER)
         || base == (FLAG_POLICY_INVENTORY | FLAG_CGROUP_FILTER)
         || base == (FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER)
+}
+
+/// The exact inventory gate for non-Callers builds: one scope plus the
+/// inventory policy, compared exactly, with no exe-identity bit. The
+/// Callers flavor is the only inventory build that ever arms the bit,
+/// so every other inventory object keeps byte-identical codegen on
+/// this gate. `const`, like its sibling, so both inline into `scope_auth`
+/// without leaving a symbol.
+pub const fn valid_inventory_config_exact(flags: u64) -> bool {
+    flags == (FLAG_POLICY_INVENTORY | FLAG_PID_FILTER)
+        || flags == (FLAG_POLICY_INVENTORY | FLAG_CGROUP_FILTER)
+        || flags == (FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER)
 }
 
 pub const INVENTORY_COOKIE_TAG: u32 = 0x5055_5347;
@@ -2926,6 +2938,32 @@ mod tests {
                 | FLAG_SYSTEM_FILTER
                 | FLAG_TRACK_SHORT_LIVED
                 | FLAG_PAUSE_ENABLED
+        ));
+    }
+
+    #[test]
+    fn inventory_config_exact_refuses_exe_identity_bit() {
+        // Non-Callers inventory builds keep the exact compares: one
+        // scope plus the inventory policy, nothing else. The
+        // exe-identity bit never arms there, so it never validates
+        // there either — the Callers gate above is its only home.
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            assert!(
+                valid_inventory_config_exact(FLAG_POLICY_INVENTORY | scope),
+                "scope {scope:#x}"
+            );
+            assert!(
+                !valid_inventory_config_exact(
+                    FLAG_POLICY_INVENTORY | scope | FLAG_TRACK_SHORT_LIVED
+                ),
+                "scope {scope:#x} with the exe-identity bit"
+            );
+        }
+        assert!(!valid_inventory_config_exact(
+            FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
+        ));
+        assert!(!valid_inventory_config_exact(
+            FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER | FLAG_PAUSE_ENABLED
         ));
     }
 

@@ -4394,7 +4394,7 @@ fn first_failed_quantum_audit_latches_the_failing_audit_only() {
 }
 
 #[test]
-fn collected_bounded_loss_with_failed_raise_fails_coverage_permanently() {
+fn collected_bounded_loss_sheds_scoped_without_fault_raise_then_recovers() {
     use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
     use crate::semantics_edge::resources::SemanticResourcePool;
     use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
@@ -4437,9 +4437,10 @@ fn collected_bounded_loss_with_failed_raise_fails_coverage_permanently() {
             .calls()
             .all(|call| matches!(call.route(), Route::Joined(_)))
     );
-    // Failed quantum: one genuine call behind one discarded reservation,
-    // but the scoped fault-era advance cannot land.
-    io.raise_fails = true;
+    assert_eq!(io.raises, 0, "a healthy quantum raises nothing");
+    // Failed quantum: one genuine call behind one discarded reservation.
+    // The bounded loss sheds scoped (this tick only) WITHOUT a global
+    // fault raise: short-lived churn must not void every joint domain.
     io.semantic_call("C_Sign", 0, 0);
     let records: Vec<_> = io
         .records
@@ -4479,22 +4480,95 @@ fn collected_bounded_loss_with_failed_raise_fails_coverage_permanently() {
         )),
         "the failed quantum discloses its coverage loss"
     );
+    assert_eq!(
+        io.raises, 0,
+        "a bounded per-quantum loss must not raise the global fault"
+    );
+    assert!(
+        !capture.image_failed,
+        "a bounded per-quantum loss must not latch coverage"
+    );
+    // Recovery: the next healthy quantum audits, re-scans, and joins.
+    io.semantic_call("C_Sign", 0, 1);
+    let (mut healed, _, _) = retained_joint_quantum(&mut io);
+    let recovered = capture.tick_collected_with(&mut io, &mut healed).unwrap();
+    assert_eq!(recovered.calls().count(), 1);
+    assert!(
+        matches!(recovered.calls().next().unwrap().route(), Route::Joined(_)),
+        "the post-loss quantum joins against a fresh observation"
+    );
+    assert_eq!(io.raises, 0, "recovery raises nothing either");
+}
+
+#[test]
+fn collected_permanent_failure_still_raises_fault() {
+    use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+    use std::collections::VecDeque;
+    use std::ops::Deref;
+    /// A producer-protocol violation: the reader counter is saturated,
+    /// so no lost-history bound can be established from this audit.
+    struct SaturatedRecords {
+        queue: VecDeque<Vec<u8>>,
+    }
+    impl RecordSource for SaturatedRecords {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            self.queue.pop_front()
+        }
+        fn discarded(&self) -> u64 {
+            u64::MAX
+        }
+    }
+    struct Fault;
+    impl crate::semantics_objects::journal::FaultEpoch for Fault {
+        fn fault_epoch(&self) -> Result<u64, crate::semantics_objects::journal::FaultReadError> {
+            Ok(0)
+        }
+    }
+    let mut io = ScriptIo::small(NativeDomainId::mint());
+    let mut capture = capture(&io);
+    io.semantic_call("C_SignInit", 0, 0);
+    io.semantic_call("C_Sign", 0, 0);
+    let (mut primed, _, _) = retained_joint_quantum(&mut io);
+    let joined = capture.tick_collected_with(&mut io, &mut primed).unwrap();
+    assert_eq!(joined.calls().count(), 2);
+    assert_eq!(io.raises, 0, "a healthy quantum raises nothing");
+    // Unbounded failure: no lost-history bound is provable, so the
+    // permanent path still raises the global fault and latches.
+    io.semantic_call("C_Sign", 0, 0);
+    let records: Vec<_> = io
+        .records
+        .drain(..)
+        .map(|record| record_bytes(&record.base))
+        .collect();
+    let events = EventsDomain::test_standin(0xef01);
+    let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+    let mut drain = EventDrain::over_domain(
+        SaturatedRecords {
+            queue: records.into(),
+        },
+        events,
+    );
+    let pool = SemanticResourcePool::default();
+    let mut failed = RawJointQuantum::collect(
+        &mut drain,
+        &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+        4_096,
+        &Fault,
+        &producers,
+        |bytes| pool.reserve(bytes),
+    )
+    .unwrap();
+    let shed = capture.tick_collected_with(&mut io, &mut failed).unwrap();
+    assert_eq!(shed.calls().count(), 1);
     assert!(
         capture.image_failed,
-        "a scoped recovery whose fault-era advance fails must latch coverage: \
-         old-era stamps stay routable without it"
+        "an unbounded failure latches coverage permanently"
     );
-    // No recovery: with raises working again the latched capture still
-    // sheds, exactly as under permanent coverage failure.
-    io.raise_fails = false;
-    io.semantic_call("C_Sign", 0, 0);
-    let (mut healed, _, _) = retained_joint_quantum(&mut io);
-    let refused = capture.tick_collected_with(&mut io, &mut healed).unwrap();
-    assert_eq!(refused.calls().count(), 1);
-    assert_eq!(
-        refused.calls().next().unwrap().route(),
-        Route::Unknown(UnknownReason::CoverageFault),
-        "the post-loss quantum must not join once the failed raise latched coverage"
+    assert!(
+        io.raises >= 1,
+        "an unbounded failure still raises the global fault"
     );
 }
 

@@ -11151,6 +11151,29 @@ mod tests {
         }
     }
 
+    /// The same kernel file re-pinned with a different digest is a
+    /// rewrite under a held observation, not version skew: the kept
+    /// digest no longer matches the file, so the key still rejects.
+    #[test]
+    fn absorbing_rewritten_same_file_still_rejects() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let file = backing_file(&dir, "provider.so");
+        let mut first = image_pins(&[(key, "aaaaaaaa", 1)]);
+        reback(&mut first, &file);
+        let mut second = image_pins(&[(key, "bbbbbbbb", 2)]);
+        reback(&mut second, &file);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(first).is_empty());
+        let skipped = acc.absorb(second);
+        assert!(acc.rejects(key));
+        assert_eq!(acc.pinned().count(), 0);
+        assert!(!skipped.is_empty(), "the rewrite is disclosed, not silent");
+    }
+
     #[test]
     fn btrfs_snapshot_twins_with_same_mapping_pin_and_digest_do_not_merge() {
         // The Btrfs snapshot shape: one mount, one shared mount-table

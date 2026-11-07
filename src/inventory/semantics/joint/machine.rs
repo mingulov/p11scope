@@ -4701,19 +4701,7 @@ impl AttestedSemanticLane {
         mode: JointServiceMode,
         budget: &mut JointWorkBudget,
     ) -> Result<JointServiceProgress, SemanticRefusal> {
-        // TEMP F9 DIAGNOSTIC (revert before merge): slow-hook log.
-        let timing = std::env::var_os("P11SCOPE_JOINT_TIMING").is_some_and(|v| v == "1");
-        let start = std::time::Instant::now();
-        let actions_before = budget.remaining_actions;
-        let out = self.service_joint_with_acquisition(coordinator, mode, budget, None);
-        if timing {
-            let elapsed_us = start.elapsed().as_micros();
-            if elapsed_us > 5_000 {
-                let spent = actions_before.saturating_sub(budget.remaining_actions);
-                eprintln!("joint-timing: hook actions={spent} elapsed_us={elapsed_us} out={out:?}");
-            }
-        }
-        out
+        self.service_joint_with_acquisition(coordinator, mode, budget, None)
     }
 
     pub(crate) fn service_joint_with_acquisition(

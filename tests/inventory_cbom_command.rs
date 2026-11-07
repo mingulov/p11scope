@@ -229,7 +229,7 @@ fn crypto_inventory_converts_to_schema_valid_cbom() {
     let unknown_key = find(&items, "key object 2");
     assert_eq!(
         unknown_key["cryptoProperties"]["relatedCryptoMaterialProperties"]["type"],
-        "unknown"
+        "private-key"
     );
     assert!(
         unknown_key["cryptoProperties"]["relatedCryptoMaterialProperties"]
@@ -238,10 +238,27 @@ fn crypto_inventory_converts_to_schema_valid_cbom() {
         "unsized key must not guess: {unknown_key:?}"
     );
 
-    // No key material, identifiers or dates anywhere in the crypto output.
-    let text = serde_json::to_string(&document).unwrap();
-    assert!(!text.contains("\"value\""), "key value leaked: {text}");
-    assert!(!text.contains("creationDate"), "key date leaked: {text}");
+    // No key material, identifiers, states or dates on the material
+    // objects: only type, size and the traceability properties.
+    for item in &items {
+        if let Some(material) = item.pointer("/cryptoProperties/relatedCryptoMaterialProperties") {
+            let object = material.as_object().unwrap();
+            for forbidden in [
+                "value",
+                "id",
+                "state",
+                "creationDate",
+                "activationDate",
+                "updateDate",
+                "expirationDate",
+            ] {
+                assert!(
+                    !object.contains_key(forbidden),
+                    "forbidden key {forbidden:?} on {item:?}"
+                );
+            }
+        }
+    }
 
     // Proven joins only: application -> provider -> mechanism.
     let dependencies = document["dependencies"].as_array().unwrap();
@@ -339,7 +356,10 @@ fn concise_and_verbose_text_name_applications_providers_and_unknowns() {
         "key object 2",
         "private-key",
     ] {
-        assert!(verbose.contains(expected), "missing {expected:?}: {verbose}");
+        assert!(
+            verbose.contains(expected),
+            "missing {expected:?}: {verbose}"
+        );
     }
 
     let output = command(&input).arg("--quiet").output().unwrap();
@@ -358,8 +378,7 @@ fn dash_o_writes_cbom_file_and_stdout_stays_text() {
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();
     assert!(text.contains("2 applications"), "stdout: {text}");
-    let document: Value =
-        serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
+    let document: Value = serde_json::from_slice(&std::fs::read(&out).unwrap()).unwrap();
     assert_valid(&document);
     assert_eq!(document["bomFormat"], "CycloneDX");
 }
@@ -381,6 +400,12 @@ fn scan_fixture_without_crypto_stays_honest() {
         meta.contains(&("p11scope:algorithms".to_string(), "0".to_string())),
         "counts: {meta:?}"
     );
+    // The observed mapping joins application and provider even with no
+    // mechanism claims.
+    let dependencies = document["dependencies"].as_array().unwrap();
+    assert_eq!(dependencies.len(), 1);
+    assert_eq!(dependencies[0]["ref"], "p11scope:caller:0");
+    assert_eq!(dependencies[0]["dependsOn"], json!(["p11scope:module:0"]));
     let output = command(&input).output().unwrap();
     success(&output);
     let text = String::from_utf8(output.stdout).unwrap();

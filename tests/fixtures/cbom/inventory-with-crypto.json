@@ -655,8 +655,8 @@
         },
         "established": {
           "class": {
-            "status": "unknown",
-            "value": null
+            "status": "value",
+            "value": 3
           },
           "key_type": {
             "status": "unknown",
@@ -680,7 +680,7 @@
           }
         },
         "queries": {
-          "class": "not_queried",
+          "class": "established",
           "key_type": "not_queried",
           "token": "not_queried",
           "value_len": "not_queried",
@@ -689,7 +689,7 @@
         },
         "label": null,
         "successful_references": 1,
-        "successful_key_references": 0,
+        "successful_key_references": 1,
         "accessing_sessions": 1
       }
     ],

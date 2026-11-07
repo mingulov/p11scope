@@ -19,6 +19,9 @@ pub(crate) const CAP_DAC_OVERRIDE_BIT: u32 = 1;
 /// `CAP_DAC_READ_SEARCH` (`linux/capability.h`): open provider files and
 /// traverse target paths the observer could not otherwise read.
 pub(crate) const CAP_DAC_READ_SEARCH_BIT: u32 = 2;
+/// `CAP_FOWNER` (`linux/capability.h`): chmod a handed-over `-o` stream
+/// private after the sudo handover (root runs). Never in the file set.
+pub(crate) const CAP_FOWNER_BIT: u32 = 3;
 /// `CAP_KILL` (`linux/capability.h`): signal the re-owned `run` child
 /// across uids (root runs). Never in the file set.
 pub(crate) const CAP_KILL_BIT: u32 = 5;
@@ -304,7 +307,8 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// The capabilities one command keeps after startup: everything it can
 /// need later, nothing else. That is the minimal live set plus the
 /// root-functional extras, each conditioned on the flags that need it:
-/// `-o` anywhere needs DAC_OVERRIDE and CHOWN, the singles fallback needs
+/// `-o` anywhere needs DAC_OVERRIDE, CHOWN and FOWNER (the handover
+/// plus the post-handover chmod), the singles fallback needs
 /// SYS_ADMIN, `run` always needs SETUID/SETGID/KILL (the sudo drop runs
 /// without `--user`, and the parent signals the re-owned child across
 /// uids). A setcap user never holds the extras, so the same masks shed
@@ -320,7 +324,7 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
     let out = |out: &Option<std::path::PathBuf>| {
         if out.is_some() {
-            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT)
+            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << CAP_FOWNER_BIT)
         } else {
             0
         }
@@ -517,10 +521,11 @@ mod tests {
             assert_ne!(live & (1u64 << cap.bit), 0, "{} is kept", cap.name);
         }
         // `-o` extras: CHOWN for the handover, DAC_OVERRIDE to write
-        // where only privilege allows, FOWNER (`linux/capability.h` bit 3)
-        // to chmod the handed-over stream private. Spelled literally so
-        // this test pins the requirement before the constant lands.
-        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << 3);
+        // where only privilege allows, FOWNER to chmod the handed-over
+        // stream private.
+        let file_out = (1u64 << CAP_CHOWN_BIT)
+            | (1u64 << CAP_DAC_OVERRIDE_BIT)
+            | (1u64 << CAP_FOWNER_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let set_ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT);
         let kill = 1u64 << CAP_KILL_BIT;
@@ -609,8 +614,9 @@ mod tests {
     fn scan_inventory_drops_load_and_sys_admin_it_never_uses() {
         let live = minimal_live_mask();
         let scan_keep = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
-        let file_out =
-            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << 3);
+        let file_out = (1u64 << CAP_CHOWN_BIT)
+            | (1u64 << CAP_DAC_OVERRIDE_BIT)
+            | (1u64 << CAP_FOWNER_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         // Scan in every scope keeps only target-read/map-files.
         for argv in [

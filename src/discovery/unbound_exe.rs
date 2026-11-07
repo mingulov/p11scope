@@ -16,7 +16,7 @@
 use crate::discovery::caller_registry::{ExeIdentity, ExeResolution, UnboundExe};
 use p11scope_manifest::maps::Device;
 use std::collections::HashMap;
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
 use std::path::{Path, PathBuf};
 
 /// Fixed system binary dirs for source (c): never the user's PATH
@@ -61,16 +61,67 @@ pub(crate) struct ProcReads<'a> {
 /// scripted closure in tests, the mapping probe in production.
 type VerifyProbe<'a> = Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>;
 
+/// Open `path` for the mapping probe: close-on-exec, never a
+/// controlling terminal, never following a final-component symlink,
+/// never blocking on a FIFO or device open. A symlink (however
+/// benign), a FIFO, a device, or anything unopenable fails closed
+/// here, before any identity read — a path swapped in under a
+/// user-writable dir can neither redirect the probe nor hang the
+/// root observer.
+fn open_probe(path: &str) -> Option<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
+}
+
+/// Open one `/proc/<pid>/exe` link for source (a): the same safe
+/// open minus `O_NOFOLLOW`, because the path itself is a
+/// kernel-managed symlink the kernel always resolves to the
+/// process's real executable — never to a user-controlled target.
+/// Any other shape is refused: only `/proc/<digits>/exe` resolves
+/// here.
+fn open_proc_exe_link(path: &str) -> Option<std::fs::File> {
+    let pid = path.strip_prefix("/proc/")?.strip_suffix("/exe")?;
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+        .open(path)
+        .ok()
+}
+
 /// The maps-domain identity of one path: privately map its first
 /// page and read the mapping's `(dev, ino)` from our own maps (no
 /// capability needed for our own mappings). This is the device
 /// domain the kernel's EXEC pair lives in (`i_sb->s_dev`): on btrfs
 /// it differs from `stat`'s subvolume device, so stat alone can
 /// never confirm an EXEC pair there. Fail-closed: any failure
-/// (unreadable, empty, unmappable, unparsable) is `None`. Content
-/// is never read — the page is mapped, never touched.
+/// (unopenable, symlink, non-regular, empty, unmappable,
+/// unparsable) is `None`. Content is never read — the page is
+/// mapped, never touched.
 pub(crate) fn real_maps_identity(path: &str) -> Option<(u64, u64)> {
-    let file = std::fs::File::open(path).ok()?;
+    let file = open_probe(path)?;
+    maps_identity_of_open_file(&file)
+}
+
+/// Source (a): the maps-domain identity of a live process's own
+/// executable, probed by opening its `/proc/<pid>/exe` link itself —
+/// never by opening the readlink target, which a user-writable dir
+/// could swap for a FIFO or a device between the link read and the
+/// open. Only `/proc/<digits>/exe` paths resolve here.
+pub(crate) fn real_maps_identity_proc_exe_link(path: &str) -> Option<(u64, u64)> {
+    let file = open_proc_exe_link(path)?;
+    maps_identity_of_open_file(&file)
+}
+
+/// The shared probe tail: `fstat` regularity (a real page to map)
+/// gates the private one-page mapping, whose `(dev, ino)` reads back
+/// from our own maps.
+fn maps_identity_of_open_file(file: &std::fs::File) -> Option<(u64, u64)> {
     let meta = file.metadata().ok()?;
     if !meta.is_file() || meta.len() == 0 {
         return None;
@@ -84,7 +135,7 @@ pub(crate) fn real_maps_identity(path: &str) -> Option<(u64, u64)> {
             page,
             libc::PROT_READ,
             libc::MAP_PRIVATE,
-            std::os::fd::AsRawFd::as_raw_fd(&file),
+            std::os::fd::AsRawFd::as_raw_fd(file),
             0,
         )
     };
@@ -1208,5 +1259,36 @@ malformed line without fields
             .recv_timeout(std::time::Duration::from_secs(10))
             .expect("the probe must not block on a fifo");
         assert_eq!(answer, None);
+    }
+
+    /// Source (a): opening `/proc/<pid>/exe` itself names the same
+    /// identity as probing the resolved target.
+    #[test]
+    fn proc_exe_link_agrees_with_the_resolved_target() {
+        let pid = std::process::id();
+        let proc_exe = format!("/proc/{pid}/exe");
+        let link = std::fs::read_link(&proc_exe).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+        let via_link =
+            real_maps_identity_proc_exe_link(&proc_exe).expect("our own exe opens");
+        let via_target = real_maps_identity(&link_text).expect("our own exe maps");
+        assert_eq!(via_link, via_target);
+    }
+
+    /// Source (a): only `/proc/<digits>/exe` resolves here — every
+    /// other shape, however mappable, is refused.
+    #[test]
+    fn proc_exe_link_refuses_non_proc_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"tool").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        assert!(
+            real_maps_identity(&path_text).is_some(),
+            "the staged tool maps"
+        );
+        assert_eq!(real_maps_identity_proc_exe_link(&path_text), None);
+        assert_eq!(real_maps_identity_proc_exe_link("/proc/self/exe"), None);
+        assert_eq!(real_maps_identity_proc_exe_link("/proc//exe"), None);
     }
 }

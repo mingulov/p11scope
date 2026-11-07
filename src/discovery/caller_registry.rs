@@ -240,22 +240,25 @@ pub(crate) trait ProcessSource {
 }
 
 /// The maps-domain exe identity of `pid`: the `/proc/<pid>/exe`
-/// link text plus the target's mapped `(dev, ino)` (a private
-/// one-page mapping read back from our own maps), or `None` when
+/// link text plus the link's own mapped `(dev, ino)` — the probe
+/// opens `/proc/<pid>/exe` itself, never the readlink target, so a
+/// path swapped in under a user-writable dir can neither redirect
+/// the probe nor hang the root observer on a FIFO. `None` when
 /// unreadable or unmappable. This is the device domain the kernel's
 /// EXEC pair lives in; the stat-domain [`read_exe_identity`] feeds
 /// the caller adapter and the C1b confirmation read instead, so the
 /// two compare like for like there and this one compares like for
-/// like with EXEC records here. Only the link and the target's
+/// like with EXEC records here. Only the link and the executable's
 /// metadata are read — no cwd, cmdline, or environ.
 pub(crate) fn read_exe_maps_identity_with(
     pid: u32,
     maps: impl Fn(&str) -> Option<(u64, u64)>,
 ) -> Option<ExeIdentity> {
-    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let proc_exe = format!("/proc/{pid}/exe");
+    let link = std::fs::read_link(&proc_exe).ok()?;
     let link_text = link.to_string_lossy().into_owned();
-    let metadata = std::fs::metadata(&link_text).ok()?;
-    let (dev, ino) = maps(&link_text)?;
+    let metadata = std::fs::metadata(&proc_exe).ok()?;
+    let (dev, ino) = maps(&proc_exe)?;
     Some(ExeIdentity {
         dev,
         ino,
@@ -266,9 +269,12 @@ pub(crate) fn read_exe_maps_identity_with(
 }
 
 /// The maps-domain exe identity of `pid` through the real mapping
-/// probe.
+/// probe, opening `/proc/<pid>/exe` itself.
 pub(crate) fn read_exe_maps_identity(pid: u32) -> Option<ExeIdentity> {
-    read_exe_maps_identity_with(pid, crate::discovery::unbound_exe::real_maps_identity)
+    read_exe_maps_identity_with(
+        pid,
+        crate::discovery::unbound_exe::real_maps_identity_proc_exe_link,
+    )
 }
 
 /// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link
@@ -6655,23 +6661,26 @@ pub(crate) mod tests {
     /// The maps-domain reader takes its `(dev, ino)` from the mapping
     /// probe, not from stat: the scripted probe stands in for a
     /// split-device host, and the link text still names the target.
+    /// The probe opens `/proc/<pid>/exe` itself, never the readlink
+    /// target.
     #[test]
     fn maps_exe_reader_takes_identity_from_the_probe() {
         let pid = std::process::id();
-        let link = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let proc_exe = format!("/proc/{pid}/exe");
+        let link = std::fs::read_link(&proc_exe).unwrap();
         let link_text = link.to_string_lossy().into_owned();
         let seen = std::cell::RefCell::new(Vec::new());
         let exe = read_exe_maps_identity_with(pid, |path| {
             seen.borrow_mut().push(path.to_string());
-            (path == link_text).then_some((0x0bad_1abe, 0xc0ffee))
+            (path == proc_exe).then_some((0x0bad_1abe, 0xc0ffee))
         })
         .expect("our own exe reads");
         assert_eq!((exe.dev, exe.ino), (0x0bad_1abe, 0xc0ffee));
         assert_eq!(exe.path.as_deref(), Some(link_text.as_str()));
         assert_eq!(
             seen.borrow().as_slice(),
-            &[link_text],
-            "the probe reads the link target exactly once"
+            &[proc_exe],
+            "the probe opens the /proc exe link itself, exactly once"
         );
     }
 

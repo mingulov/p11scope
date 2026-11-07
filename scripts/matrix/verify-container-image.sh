@@ -106,6 +106,10 @@ OUT=$(cd "$OUT" && pwd -P) || { echo "cannot resolve OUT: $OUT" >&2; exit 2; }
 . scripts/matrix/matrix-lib.sh
 
 RUN_ID=$(date +%s%N)-$$
+# No test container needs the network (the observer and the workload never
+# touch it), so every run in this lane is hermetic -- and immune to the
+# host's bridge state, which a shared test host may break out from under us.
+NET_FLAGS=(--network none)
 OBS_IMAGE=
 OBS_IMAGE_OWNED=
 VICTIM_IMAGE="p11scope-container-victim:$RUN_ID"
@@ -235,7 +239,7 @@ test "$ENTRYPOINT" = "[/usr/local/bin/p11scope]" || {
     echo "image entrypoint is not the observer: $ENTRYPOINT" >&2
     exit 2
 }
-timeout --signal=TERM --kill-after=10s 60s docker run --rm "$OBS_IMAGE" --version \
+timeout --signal=TERM --kill-after=10s 60s docker run --rm "${NET_FLAGS[@]}" "$OBS_IMAGE" --version \
     >"$OUT/observer-version.txt" 2>&1 || {
     echo "image does not run the observer entrypoint" >&2
     exit 2
@@ -271,6 +275,7 @@ if [ -r /sys/module/apparmor/parameters/enabled ] \
     OBS_FLAGS+=(--security-opt apparmor=unconfined)
 fi
 OBS_FLAGS+=("${SE_FLAGS[@]}")
+OBS_FLAGS+=("${NET_FLAGS[@]}")
 OBS_FLAGS+=(-v /sys/fs/cgroup:/sys/fs/cgroup:ro)
 echo "observer flags: ${OBS_FLAGS[*]}"
 
@@ -392,6 +397,7 @@ leg_container() {
     wlog="$OUT/container-workload.log"
     rm -f "$WORK/shared/go-c" "$WORK/shared/fin-c" || return 1
     timeout --signal=TERM --kill-after=10s 60s docker run -d --name "$VICTIM_NAME" "${SE_FLAGS[@]}" \
+        "${NET_FLAGS[@]}" \
         -v "$WORK/harness:/usr/local/bin/harness:ro" -v "$WORK/shared:/shared" \
         "$VICTIM_IMAGE" >/dev/null || return 1
     local vpid

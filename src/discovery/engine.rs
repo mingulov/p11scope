@@ -12193,11 +12193,16 @@ impl Engine {
         // emits for tasks in the scope cgroup at exit); without this
         // drop a fork-only reused PID would consume the dead image
         // with no loss and no PARTIAL.
+        // Only open admissions drop here: an already-closed admission
+        // dropped its generation's entries when it closed (a matched
+        // exit closes before retirement), so any entry under its PID
+        // now belongs to a reused PID's new generation and survives.
         let removed_pids: Vec<u32> = views
             .iter()
             .filter_map(|view| {
                 self.admitted_cgroup_views
                     .get(view)
+                    .filter(|admission| admission.closed_ns.is_none())
                     .map(|admission| admission.pid)
             })
             .collect();

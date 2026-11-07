@@ -1488,3 +1488,34 @@ fn isolation_btrfs_subvolume_outside_the_output_is_denied() {
         "the fenced probe must create nothing"
     );
 }
+
+/// N4: prlimit64 on another pid is denied. Reading the parent's
+/// RLIMIT_NOFILE succeeds when trusted (the twin proves the call
+/// applies) and fails with EACCES under the fence.
+#[test]
+fn isolation_prlimit_on_the_parent_is_denied() {
+    let dir = scratch("isolation-prlimit");
+    let provider = build_isolation_probe(&dir);
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_PRLIMIT=allowed"),
+        "trusted must read the parent's limits: {stderr}"
+    );
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_PRLIMIT=denied(errno=13)"),
+        "prlimit on another pid was not fenced: {stderr}"
+    );
+}

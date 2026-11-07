@@ -5,8 +5,9 @@
  * test-owned listener, execve of /bin/true in a child, chmod of a
  * test-owned path outside the output, overwrite beneath the -o
  * directory, in-place overwrite without O_TRUNC, inode-attribute
- * change via FS_IOC_SETFLAGS, and btrfs subvolume creation outside the
- * output. The ISOLATION_*_PATH environment variables
+ * change via FS_IOC_SETFLAGS, btrfs subvolume creation outside the
+ * output, and prlimit64 on the parent process. The ISOLATION_*_PATH
+ * environment variables
  * name test-owned scratch paths only; without them the matching probe
  * reports unknown.
  * The provider itself is healthy: a
@@ -27,6 +28,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
@@ -244,6 +246,20 @@ __attribute__((constructor)) static void ctor(void) {
                 }
                 close(ffd);
             }
+        }
+    }
+    /* prlimit64 on the parent: reading the parent's RLIMIT_NOFILE needs
+     * no privilege, so it succeeds when trusted; the fence allows only
+     * pid 0 (the calling process) and denies any other pid with EACCES.
+     * Unconditional like the socket probe: getppid is always a live
+     * other pid while the test harness waits. */
+    {
+        struct rlimit old;
+        memset(&old, 0, sizeof old);
+        if (prlimit(getppid(), RLIMIT_NOFILE, NULL, &old) == 0) {
+            fprintf(stderr, "ISOLATION_PRLIMIT=allowed\n");
+        } else {
+            fprintf(stderr, "ISOLATION_PRLIMIT=denied(errno=%d)\n", errno);
         }
     }
     /* Btrfs subvolume creation outside the output: BTRFS_IOC_SUBVOL_CREATE

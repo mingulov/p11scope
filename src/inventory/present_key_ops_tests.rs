@@ -367,7 +367,7 @@ fn key_ops_line_counts_not_attributed_beside_exact_rows() {
         block,
         vec![
             "key operations: 0 keys on 1 provider; rev 9 partial; 0 sessions",
-            "  per-key tracking stopped; plain counts are unaffected",
+            "  per-key tracking lost some calls; exact rows continue",
             "  unidentified provider: sign 4 completed, 0 returned errors, 0 active operations",
             "  not attributed: record_lost 2",
             "  not attributed: proof_refused_fallback 3",
@@ -1395,11 +1395,9 @@ fn overlay_witness_gap_reasons_render_plain_words_with_machine_tokens() {
             .push(named_gap("/provider/lib.so", reason));
         let concise =
             render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-        let gaps = concise
-            .lines()
-            .find(|line| line.starts_with("gaps: "))
-            .expect("the concise gaps line");
-        assert!(gaps.contains(plain), "{reason}: {gaps}");
+        let block = gaps_block(&concise);
+        assert_eq!(block.len(), 2, "header plus one group line: {concise}");
+        assert!(block[1].contains(plain), "{reason}: {concise}");
         assert!(
             !concise.contains("original_file_unproven"),
             "{reason}: {concise}"
@@ -2243,10 +2241,15 @@ fn key_ops_line_pqc_spotlight_sorts_by_label() {
     );
     let presentation = key_ops_presentation(observations);
     let snapshot = render_snapshot(&presentation);
-    let line = key_ops_line(&snapshot);
-    assert!(
-        line.contains("; pqc keys: ML-KEM-512 sign: 6, ML-KEM-1024 sign: 4"),
-        "the line follows label order: {line}"
+    let block = key_ops_block(&snapshot);
+    let spotlight = block
+        .iter()
+        .find(|line| line.starts_with("  pqc keys: "))
+        .unwrap_or_else(|| panic!("the spotlight line: {snapshot}"));
+    assert_eq!(
+        *spotlight,
+        "  pqc keys: ML-KEM-512 sign: 6, ML-KEM-1024 sign: 4",
+        "the line follows label order: {snapshot}"
     );
 }
 
@@ -2265,10 +2268,10 @@ fn key_ops_line_pqc_spotlight_skips_zero_completed_segments() {
     );
     let presentation = key_ops_presentation(observations);
     let snapshot = render_snapshot(&presentation);
-    let line = key_ops_line(&snapshot);
+    let block = key_ops_block(&snapshot);
     assert!(
-        !line.contains("pqc keys:"),
-        "no spotlight without a proved completion: {line}"
+        !block.iter().any(|line| line.starts_with("  pqc keys:")),
+        "no spotlight without a proved completion: {snapshot}"
     );
 }
 

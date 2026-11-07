@@ -11,7 +11,9 @@
 # (its own NSS softokn token, empty-password database, so no PIN
 # prompt can stall the handshake); Firefox must show mechanisms
 # and functions for its own NSS token. MODE=first is the
-# p11scope-first twin (observer seals before the browser launches).
+# p11scope-first twin (the observer process starts before the
+# browser launches; the scan seal settles over every provider
+# discovered before the post-attach signs are signalled).
 #
 # Usage: demo4-run.sh SRC_MIRROR P11SCOPE OUTDIR RUN_LABEL BROWSER MODE
 #   BROWSER: chromium | firefox
@@ -241,14 +243,14 @@ elif [ "$MODE" = first ]; then
     start_observer
     wait_observer_running \
         || { echo "FAIL observer-never-ran mode=first"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }
-    # p11scope starts first, but without a manifest the scan seal
-    # can only mint once a complete provider exists to discover:
-    # give the observer a head start, then launch the browser and
-    # let the seal complete over its softokn, all before the
-    # post-attach signs are signalled.
-    # DEMO4_HEAD_START (seconds, default 20) varies the browser's
-    # launch against the observer's startup for race exploration.
-    wait_seal "${DEMO4_HEAD_START:-20}" || true
+    # Launch the browser as soon as the observer process exists.
+    # Waiting for the seal would serialize the browser's arrival
+    # behind it, so a pre-existing provider's early seal could never
+    # cover the browser (v0.6.0 F1); the seal settles over every
+    # discovered provider instead, all before the post-attach signs
+    # are signalled. DEMO4_HEAD_START is retired (any launch delay
+    # reintroduces the seal-then-arrival miss); DEMO4_OBSERVER_DELAY
+    # above keeps the delayed-observer variant.
     kill -0 "$observer_pid" 2>/dev/null \
         || { echo "FAIL observer-exited-before-launch"; tail -15 "$work/inventory.err"; trap - RETURN; exit 1; }
     : >"$work/launch"

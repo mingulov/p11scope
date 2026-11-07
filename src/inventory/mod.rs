@@ -60,7 +60,7 @@ use crate::process::PidPin;
 use anyhow::{Context as _, Result};
 #[cfg(test)]
 use p11scope_ebpf_common::ImageIdentity;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -1603,6 +1603,10 @@ fn run_with_terminal_budget(
         display: None,
         semantic,
         scan_seal_pending: manifests.is_empty() && key_operations && native_available,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(request.second_signal),
@@ -2290,6 +2294,14 @@ struct ClassicDriver<'a> {
     /// a scan-derived subset mints (then this clears). Never set
     /// when a manifest was given.
     scan_seal_pending: bool,
+    /// Deferred scan seal settle: the last peeked complete-provider
+    /// set (`None` until the first successful peek), its consecutive
+    /// run, the waiting passes so far, and whether the set ever
+    /// changed (the settle gap names the wait only when it did).
+    scan_seal_last_sets: Option<BTreeSet<crate::discovery::identity::PinnedObjectId>>,
+    scan_seal_stable_runs: u32,
+    scan_seal_waited: u32,
+    scan_seal_changed: bool,
     /// A lane batch is already staged ahead of the next commit: at most
     /// one ordinary collection quantum is owned at a time, so later
     /// ticks in the same pass stay quiet instead of backpressuring.
@@ -2436,6 +2448,10 @@ pub(crate) fn classic_semantic_ticks_for_test(
         display: None,
         semantic: Some(lane),
         scan_seal_pending: false,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2507,6 +2523,10 @@ pub(crate) fn classic_semantic_pass_for_test(
         display: None,
         semantic: Some(lane),
         scan_seal_pending: false,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2691,6 +2711,10 @@ pub(crate) fn classic_semantic_stop_for_test(
         display: None,
         semantic: Some(lane),
         scan_seal_pending: false,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -2788,6 +2812,10 @@ pub(crate) fn classic_promotion_full_loop_for_test(
         display: Some(display),
         semantic: None,
         scan_seal_pending: false,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: None,
@@ -3098,6 +3126,12 @@ impl ClassicDriver<'_> {
     /// would never be attempted (fedora diag1, 2026-11-05).
     fn attempt_deferred_scan_seal(&mut self, scope: InspectScope) {
         if self.semantic.is_none() && self.scan_seal_pending {
+            // Settle first: a pre-existing provider lets the first
+            // mint succeed while the application's provider is still
+            // arriving, and seating at once would exclude it forever.
+            if !self.settle_scan_seal() {
+                return;
+            }
             let engine_scope = Scope::from(scope);
             if let Some(lane) = start_semantic_lane(
                 self.coordinator,
@@ -3116,6 +3150,7 @@ impl ClassicDriver<'_> {
                     let live = lane.is_live();
                     self.semantic = Some(lane);
                     self.scan_seal_pending = false;
+                    self.disclose_scan_seal_settle();
                     if live {
                         self.coordinator.note_scope_gap(
                             "semantic subset scan-derived".into(),
@@ -3129,6 +3164,53 @@ impl ClassicDriver<'_> {
                 }
             }
         }
+    }
+
+    /// Settle gate: peek the current scan mint and seat only once the
+    /// complete-provider set holds still (`SCAN_SEAL_STABLE_PEEKS`
+    /// consecutive identical peeks) or the bounded horizon passes
+    /// (`SCAN_SEAL_MAX_SETTLE_PASSES` waiting passes). A failed peek
+    /// resets the run and falls through to the ordinary start below,
+    /// which discloses its refusals exactly as before.
+    fn settle_scan_seal(&mut self) -> bool {
+        let Some(sets) = scan_seal_peek_sets(self.coordinator) else {
+            self.scan_seal_last_sets = None;
+            self.scan_seal_stable_runs = 0;
+            return true;
+        };
+        if self.scan_seal_last_sets.as_ref() == Some(&sets) {
+            self.scan_seal_stable_runs += 1;
+        } else {
+            if self.scan_seal_last_sets.is_some() {
+                self.scan_seal_changed = true;
+            }
+            self.scan_seal_last_sets = Some(sets);
+            self.scan_seal_stable_runs = 1;
+        }
+        // The cap counts this pass: seat instead of waiting past the
+        // horizon. The waited count below names deferrals only.
+        if self.scan_seal_stable_runs >= SCAN_SEAL_STABLE_PEEKS
+            || self.scan_seal_waited + 1 >= SCAN_SEAL_MAX_SETTLE_PASSES
+        {
+            return true;
+        }
+        self.scan_seal_waited += 1;
+        false
+    }
+
+    /// Name a settle that outlasted a set change: confirming an
+    /// unchanged set is not news.
+    fn disclose_scan_seal_settle(&mut self) {
+        if !self.scan_seal_changed {
+            return;
+        }
+        self.coordinator.note_scope_gap(
+            "scan seal settled".into(),
+            format!(
+                "the scan seal waited {} passes for the provider set to settle",
+                self.scan_seal_waited
+            ),
+        );
     }
 
     fn initialize_joint_lane(&mut self) {
@@ -5457,6 +5539,24 @@ fn fallback_shell(
             shell.mark_startup_failed();
             shell
         })
+}
+
+/// The settle peek: the current scan mint's complete-provider set, or
+/// `None` when the mint fails. Silent (no gaps): the start path
+/// discloses refusals when it runs. Tests script peeks through
+/// `seal_startup_test::with_peek`; an empty peek queue drives the
+/// production mint, so twins that never peek behave exactly as before.
+fn scan_seal_peek_sets(
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+) -> Option<BTreeSet<crate::discovery::identity::PinnedObjectId>> {
+    #[cfg(test)]
+    if let Some(scripted) = seal_startup_test::take_peek() {
+        return scripted;
+    }
+    coordinator
+        .prepare_scan_semantic_subset()
+        .subset
+        .map(|subset| subset.required().keys().copied().collect())
 }
 
 /// The subset-mint boundary of the lane startup: the coordinator's
@@ -7816,6 +7916,10 @@ fn run_dashboard(
         display: Some(display),
         semantic,
         scan_seal_pending: false,
+        scan_seal_last_sets: None,
+        scan_seal_stable_runs: 0,
+        scan_seal_waited: 0,
+        scan_seal_changed: false,
         semantic_staged: false,
         seated_summary: None,
         second_signal: Some(second_signal),
@@ -14141,6 +14245,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -14239,6 +14347,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -14315,6 +14427,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -14446,6 +14562,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -14585,6 +14705,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: true,
                 seated_summary: None,
                 second_signal: None,
@@ -14680,6 +14804,10 @@ mod tests {
                 display: None,
                 semantic: Some(scene.lane),
                 scan_seal_pending: false,
+                scan_seal_last_sets: None,
+                scan_seal_stable_runs: 0,
+                scan_seal_waited: 0,
+                scan_seal_changed: false,
                 semantic_staged: false,
                 seated_summary: None,
                 second_signal: None,
@@ -19147,6 +19275,10 @@ mod promotion_driver_tests {
             display: Some(display),
             semantic: None,
             scan_seal_pending: false,
+            scan_seal_last_sets: None,
+            scan_seal_stable_runs: 0,
+            scan_seal_waited: 0,
+            scan_seal_changed: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,
@@ -25913,6 +26045,10 @@ mod promotion_driver_tests {
             display: None,
             semantic: None,
             scan_seal_pending: false,
+            scan_seal_last_sets: None,
+            scan_seal_stable_runs: 0,
+            scan_seal_waited: 0,
+            scan_seal_changed: false,
             semantic_staged: false,
             seated_summary: None,
             second_signal: None,

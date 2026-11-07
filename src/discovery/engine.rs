@@ -11983,7 +11983,8 @@ impl Engine {
         // under metrics the key stays absent instead of reading an
         // all-`unknown` split. `gap_exit_mappings` reads `None`
         // unless armed.
-        self.exit_map.set_enabled(gap && policy.wants_instance_hooks());
+        self.exit_map
+            .set_enabled(gap && policy.wants_instance_hooks());
         if gap || pid {
             self.extensive.snapshot_watched(&self.pinned);
         }

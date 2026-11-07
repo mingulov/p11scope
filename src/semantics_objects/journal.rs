@@ -4233,8 +4233,9 @@ impl JournalAdapter {
         // closure's, and the marker word must authorize the claimed
         // kind under the real native encoding: READY naming the
         // image's full exec id for an exec birth, or the exactly
-        // unmarked word for absence. Dirty, invalid or mismatched
-        // states refuse; zero custody binds nothing.
+        // unmarked word for absence. Invalid or mismatched states
+        // refuse; DIRTY is consistent only with attach-observed
+        // (lost prefix, counted); zero custody binds nothing.
         if evidence.image != image || evidence.custody == 0 || evidence.admission_failed != 0 {
             return Err(BirthRefusal::EvidenceMismatch);
         }

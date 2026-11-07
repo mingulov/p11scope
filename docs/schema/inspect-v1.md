@@ -12,8 +12,9 @@ lists one row per distinct excluded file (`path`, `dev`, `ino`,
 mapped file.
 
 A `modules[]` row for a witness-proven pre-copy-up lower file carries the
-additive `"layer": "pre_copy_up"` key beside its merge path and the lower
-file's identity; the key is absent on every ordinary row. The lowerdir host
+additive `"layer": "pre_copy_up"` key beside its merge path, the shared
+merge-view key `{dev, ino}`, and the lower file's own `sha256`; the key
+is absent on every ordinary row. The lowerdir host
 paths that produced the lower candidates are never published. Verbose text
 marks that row `(file before copy-up)`; the concise one-line-per-provider
 summary shows the same counts unmarked.

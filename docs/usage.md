@@ -1333,7 +1333,9 @@ Limits that matter in pods:
   verbose text and JSON show the full 64-hex ID. Installed two-container,
   synthetic-pod and host-view real-kind-pod qualification passed on Fedora 7.2
   in v0.7.0; in-node kind (observer inside the node) remains open
-  (nested-PID-namespace binding limitation, R-45).
+  (nested-PID-namespace binding limitation: `--cgroup` refuses
+  pid-namespace-mismatch and `--system` binds nothing across 39 passes
+  with pid_namespace gaps; tracked separately).
 
   `--capture auto|scan|native` selects the usage lane. `scan` reads
   `/proc` without loading usage BPF: every edge's usage coverage

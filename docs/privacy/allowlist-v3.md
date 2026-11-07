@@ -19,7 +19,7 @@ which describes its reviewed development implementation with installed gates
 still open,
 and [inventory diagnostics](#inventory-diagnostics-v04), which defines the
 optional userspace decision export without additional target reads,
-and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification passed on Fedora 7.2 with Docker, synthetic pod cgroups and real kind pods watched from the host in v0.7.0 (in-node kind cells blocked, R-45),
+and [DR04 caller metadata](#dr04-caller-metadata-2026-10-18), whose opt-in source contract is described below and whose installed qualification passed on Fedora 7.2 with Docker, synthetic pod cgroups and real kind pods watched from the host in v0.7.0 (in-node kind cells blocked: nested-observer cgroup refusal and unbound system passes; tracked separately),
 and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-14),
 which implements the reviewed finite producer below with no public
 object projection,
@@ -1379,7 +1379,9 @@ Docker (two-container labels), synthetic pod cgroups (systemd and cgroupfs
 stems) and real kind pods watched from the host (two-pod labels with
 kubectl-matched IDs and counted calls) in v0.7.0. In-node kind
 qualification (observer inside the node, nested PID namespace) remains
-blocked (R-45).** This
+blocked (nested observer: `--cgroup` refuses pid-namespace-mismatch
+and `--system` binds nothing across 39 passes with pid_namespace
+gaps).** This
 subsection permits only the finite Inventory context below.
 Every other section keeps its own status; v1/v2 bytes and exclusions are
 unchanged, and there is no global v3 activation. Real two-container,

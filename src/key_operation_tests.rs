@@ -17255,6 +17255,166 @@ fn key_operation_history_loss_preserves_observed_pair_as_unknown() {
     );
 }
 
+/// Mid-fallback resource refusal preserves the still-queued
+/// remainder: the first head replays, the second refuses (live S1
+/// invalidates with terminals teed, no leaked opens — N14), and the
+/// remaining fully-observed Init+terminal pair rows unknown-key
+/// beside the counted `record_lost`, instead of disposing
+/// counts-only like the failed head.
+#[test]
+fn key_operation_mid_fallback_refusal_preserves_remaining_pair_as_unknown() {
+    use crate::semantics_edge::resources::REDUCER_BASE_CHARGE;
+
+    // One seal replay's machine growth (N14 probe): the fallback
+    // replay reserves the same.
+    let growth = {
+        let mut probe = GuardedScene::new();
+        let bootstrap = probe.scene.bootstrap();
+        let key = probe.key(1);
+        assert!(probe.registry.install_joint_receipt(key.clone(), bootstrap));
+        let (_, id) = probe.register(1);
+        let shape = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+        let (facts, position) = probe.admit_shape(&shape);
+        probe.observe(&key, position, facts);
+        probe
+            .registry
+            .publish_with_ledger(probe.scene.adapter.ledger_mut());
+        ingest_call(&mut probe.scene, &shape, position);
+        let seal = probe.scene.seal().expect("probe quantum seals");
+        let before = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert_eq!(
+            probe.registry.deliver_joint_algorithm_seal_for_test(
+                id,
+                &seal,
+                &probe.scene.model,
+                probe.scene.adapter.ledger_mut()
+            ),
+            SealApplyOutcome::ReplayedOne
+        );
+        let after = probe.registry.semantic_resource_snapshot().charged_bytes;
+        assert!(after > before, "probe: replay reserves");
+        after - before
+    };
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    guarded
+        .registry
+        .install_joint_receipt(joint_key.clone(), bootstrap);
+    let (_, joint_id) = guarded.register(1);
+
+    // Four staged heads: two lone Inits on distinct sessions, then a
+    // complete Init+terminal pair on a third session.
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let mut init8 = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init8.session = Some(8);
+    let mut init9 = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    init9.session = Some(9);
+    let mut sign9 = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    sign9.session = Some(9);
+    let stage = |guarded: &mut GuardedScene, shape: &ShapedS1| {
+        let (facts, position) = guarded.admit_shape(shape);
+        guarded.observe(&joint_key, position, facts);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    };
+    let before_staging = guarded
+        .registry
+        .semantic_resource_snapshot()
+        .charged_bytes;
+    stage(&mut guarded, &init);
+    stage(&mut guarded, &init8);
+    let staged_two = guarded
+        .registry
+        .semantic_resource_snapshot()
+        .charged_bytes
+        - before_staging;
+    stage(&mut guarded, &init9);
+    stage(&mut guarded, &sign9);
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        4,
+        "the refused head plus the remaining pair are queued"
+    );
+
+    // Room for exactly one replay plus 512 bytes of the second
+    // machine-only growth (1024): replay two must refuse. The clamp
+    // baseline already holds the staged charges, so the N14 formula
+    // sheds the two-head staged cost it implicitly carried.
+    guarded.registry.clamp_semantic_resource_room_for_test(
+        REDUCER_BASE_CHARGE + growth + 512 - staged_two,
+    );
+    let failure = guarded.scene.adapter.scripted_failure(
+        JournalGap::ClosureStale,
+        &bootstrap,
+        crate::semantics_objects::ObjectEffects::default(),
+    );
+    let mut clean = ScriptedH3Source::once(H3DispositionEvidence::scripted_clean(u64::MAX));
+    let outcome = guarded.registry.deliver_joint_algorithm_failure_for_test(
+        joint_id,
+        &failure,
+        &mut clean,
+        &guarded.scene.model,
+        guarded.scene.adapter.ledger_mut(),
+    );
+    assert_eq!(outcome, FailureApplyOutcome::FellBack { replayed: 1 });
+    assert_eq!(
+        guarded.scene.adapter.ledger().staged(),
+        0,
+        "refusal disposes the rest as history"
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "fallback still degrades the feed"
+    );
+    assert_eq!(
+        guarded.edge_calls(joint_id),
+        1,
+        "only the first head replays: the refused head and the remainder \
+         never reduce through live S1"
+    );
+
+    // Live S1 ended Unknown with terminals teed: no leaked opens. The
+    // disposed failed head latches the loss reason; counts stay
+    // honest with or without preservation.
+    let observations = guarded.registry.joint_observations(19);
+    assert_eq!(
+        (observations.status, observations.reason),
+        (ObsStatus::Partial, "authority_lost")
+    );
+    let row = observations
+        .unknown_key_operations
+        .iter()
+        .find(|row| row.category == "sign" && row.reason == "unbound")
+        .expect("the replayed start's terminal routes to unknown-key");
+    assert_eq!((row.unknown, row.active), (1, 0));
+    assert_eq!(
+        row.completed, 1,
+        "the remaining observed pair rows its completion beside the counted loss"
+    );
+    assert_eq!(
+        observations.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "record_lost",
+                count: 3,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 1,
+            },
+        ]
+    );
+    assert_eq!(guarded.registry.semantic_resource_snapshot().refused, 1);
+    assert_eq!(guarded.scene.adapter.ledger().charged_bytes(), 0);
+    let pool = guarded.registry.semantic_resource_snapshot();
+    let reserve = guarded.registry.semantic_storage_reserver();
+    assert_semantic_pool_refunded_after_drop(guarded, reserve, pool.limit_bytes);
+}
+
 /// The capture owner holds ONE ledger: a staged H9 charge plus its
 /// association mint account together in one census/total, so either
 /// release frees allowance for the other role. Scalar-role charges

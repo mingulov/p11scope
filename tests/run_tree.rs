@@ -657,6 +657,37 @@ int main(int argc, char **argv)
 }
 "#;
 
+/// The cgroup v2 path of `pid` relative to the cgroup root, from
+/// `/proc/<pid>/cgroup` (empty for the root cgroup).
+fn cgroup_v2_relative(pid: u32) -> String {
+    let text = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .unwrap_or_else(|error| panic!("reading the cgroup of {pid}: {error}"));
+    text.lines()
+        .find_map(|line| line.strip_prefix("0::"))
+        .map(|path| path.trim_start_matches('/').to_string())
+        .unwrap_or_else(|| panic!("no cgroup v2 line for {pid}: {text:?}"))
+}
+
+/// Waits (bounded) for a fixture's pid file and parses it.
+fn wait_for_pid_file(path: &Path) -> i32 {
+    let deadline = Instant::now() + TIMEOUT;
+    loop {
+        if let Some(pid) = std::fs::read_to_string(path)
+            .ok()
+            .and_then(|text| text.trim().parse::<i32>().ok())
+            .filter(|pid| *pid > 0)
+        {
+            return pid;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{} never named a pid",
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Common `run` prefix: pre-armed SoftHSM, scan filter, JSON output.
 fn run_prefix(module: &Path, out: &Path) -> Vec<String> {
     ["run"]
@@ -777,13 +808,39 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
     args.push(pidfile.to_str().expect("utf8 pidfile").to_string());
     args.push("60".to_string());
     let mut capture = spawn_run(&args, &conf);
+    // Placement, from the outside while the command runs: the leaf's
+    // cgroup is a `p11scope-run-*` directory directly under the
+    // observer's own cgroup (the root only when the observer runs there).
+    let observer_base = cgroup_v2_relative(capture.child.id());
+    let leaf = wait_for_pid_file(&pidfile);
+    let leaf_cgroup = PathBuf::from(cgroup_v2_relative(leaf as u32));
+    let run_leaf = leaf_cgroup
+        .file_name()
+        .and_then(|name| name.to_str())
+        .expect("the leaf cgroup has a name")
+        .to_string();
+    assert!(
+        run_leaf.starts_with("p11scope-run-"),
+        "the leaf runs in the run cgroup: {}",
+        leaf_cgroup.display()
+    );
+    assert_eq!(
+        leaf_cgroup.parent(),
+        Some(Path::new(&observer_base)),
+        "the run cgroup is directly under the observer's cgroup {observer_base:?}"
+    );
+    let base_dir = Path::new("/sys/fs/cgroup").join(&observer_base);
+    let listed = std::fs::read_dir(&base_dir)
+        .expect("the observer cgroup lists")
+        .flatten()
+        .any(|entry| entry.file_name().to_str() == Some(&run_leaf) && entry.path().is_dir());
+    assert!(
+        listed,
+        "{run_leaf} is a directory under {}",
+        base_dir.display()
+    );
     let status = capture.wait_expect("run");
     assert!(status.success(), "run exits with the direct child's status");
-    let leaf: i32 = std::fs::read_to_string(&pidfile)
-        .expect("leaf pid file")
-        .trim()
-        .parse()
-        .expect("leaf pid");
     // The leaf must still be alive: it proves the run ended first.
     let alive = unsafe { libc::kill(leaf, 0) } == 0;
     assert!(alive, "the leaf outlives the run");
@@ -792,6 +849,17 @@ fn privileged_run_tree_outliving_child_is_disclosed() {
     let sha = record_sha256(&profile, &module);
     assert_exact_counts(&function_calls(&profile, &sha), &want);
     assert_eq!(verdict(&profile), "PARTIAL", "{profile}");
+    let labels: Vec<&str> = profile
+        .get("cgroups")
+        .and_then(|cgroups| cgroups.as_array())
+        .expect("cgroups")
+        .iter()
+        .filter_map(|cgroup| cgroup.get("label").and_then(|label| label.as_str()))
+        .collect();
+    assert!(
+        labels.contains(&run_leaf.as_str()),
+        "the published label is the run cgroup's leaf {run_leaf}: {labels:?}"
+    );
     let evidence = profile.get("evidence").expect("evidence");
     assert_eq!(
         evidence.get("run_tree_handed_back"),

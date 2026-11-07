@@ -414,7 +414,7 @@ wait_for_line() {
         if [ "$(date +%s)" -ge "$deadline" ]; then
             return 1
         fi
-        sleep 0.5
+        sleep 2
     done
     return 0
 }
@@ -433,7 +433,7 @@ wait_for_pass() {
         if [ "$(date +%s)" -ge "$deadline" ]; then
             return 1
         fi
-        sleep 0.5
+        sleep 2
     done
     return 0
 }

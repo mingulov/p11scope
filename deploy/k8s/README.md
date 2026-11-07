@@ -139,7 +139,9 @@ Why each grant:
   held the kernel accepts it for every CAP_BPF/CAP_PERFMON check, so those
   two are not listed. It also grants `/proc/<pid>/map_files` access
   (otherwise `CAP_CHECKPOINT_RESTORE`), which `inventory` needs to
-  attribute callers past its scan cap.
+  attribute callers past its scan cap. The observer retains it wherever
+  the narrow grant is absent (doctor, inspect, scan, and post-setup
+  map_files reads); where the narrow set is complete it sheds it.
 - **CAP_SYS_PTRACE** — ptrace-mode access to other processes'
   `/proc/<pid>/mem` and `maps` (Yama scope 1, other UIDs).
 - **CAP_DAC_READ_SEARCH** — the memory scan without CAP_DAC_OVERRIDE, and

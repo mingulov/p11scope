@@ -1855,9 +1855,9 @@ five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `CAP_SYS_ADMIN`): `profile --pid` observed 120/123 completed calls with
 `attach_mechanisms: ["uprobe-multi"]` and no attach failures, and
 `inventory --system` and `run` completed the same way
-(`scripts/ci/minimal-setcap.sh`, 18/18 rows on that host; the same cell
-also runs on the CI host and the v6.6 and 7.x guest kernels). Stated
-plainly: at
+(`scripts/ci/minimal-setcap.sh`, 25/25 rows on that host after the
+root-run, handover and DaemonSet rows landed; the same cell also runs on
+the CI host and the v6.6 and 7.x guest kernels). Stated plainly: at
 `perf_event_paranoid >= 3`, capturing on the default lane needs the
 minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
 keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,
@@ -1899,11 +1899,35 @@ sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_
 getcap /usr/local/bin/p11scope
 ```
 
+Grant the set on the static release binary only: a file-capable dynamic
+binary runs under glibc `AT_SECURE`, which strips `LD_*` and `TMPDIR`
+for `run` children. Package upgrades replace the binary and drop its
+file-capability xattr, so re-grant after every upgrade; `nosuid` mounts
+ignore file capabilities entirely. As a service, prefer ambient
+capabilities in the unit over file caps:
+
+```ini
+[Service]
+AmbientCapabilities=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFMON CAP_SYS_PTRACE
+CapabilityBoundingSet=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFMON CAP_SYS_PTRACE
+```
+
+Treat the minimal set as root-equivalent for reading: anyone who can
+execute a capability-carrying observer can observe other users'
+processes, so restrict execution (a dedicated group and mode `0750`).
+Inside a container or unit running as uid 0 without file caps, add the
+grant to the container/unit definition instead of `sudo setcap` on a
+binary (the xattr does not survive image builds and `nosuid` mounts).
+
 Log out and back in for the group membership to apply, then run
 `p11scope doctor` as yourself: the `effective capabilities` row lists the
 held set, and any gap names the missing capability with what it enables.
 A capture missing a capability refuses or degrades with a plain `needs
-CAP_...` line rather than a raw errno. After setup the observer drops
+CAP_...` line rather than a raw errno. `run` as root additionally needs
+`CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` in the invoking set for the
+identity drop and child signalling; the observer keeps them whenever
+they are held, and a container that drops them fails the child with an
+`EPERM` instead of a needs-line. After setup the observer drops
 capabilities the rest of the capture does not need, and a `run` child
 never inherits any. Dynamic loader/export probes link only where the
 kernel's uprobe-multi pid filter is proven (a functional probe at startup;

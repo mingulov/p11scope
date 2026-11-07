@@ -356,6 +356,19 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     }
 }
 
+/// The keep mask for `command` given the `effective` set it runs with:
+/// the static keep plus `CAP_SYS_ADMIN` when the effective set lacks any
+/// of the BPF/PERFMON/CHECKPOINT_RESTORE bits the command needs (the
+/// DaemonSet holds SYS_ADMIN, not the narrow caps, and the kernel
+/// accepts SYS_ADMIN for those checks). Stub: returns the static keep;
+/// the fallback lands with the fix.
+pub(crate) fn keep_mask_for_command_in(
+    _effective: u64,
+    command: &crate::cli::Command,
+) -> u64 {
+    keep_mask_for_command(command)
+}
+
 /// Drop what `command` never needs, before it runs. Returns the kept mask.
 pub fn drop_unneeded_for_command(command: &crate::cli::Command) -> io::Result<u64> {
     let keep = keep_mask_for_command(command);
@@ -761,5 +774,77 @@ mod tests {
             "the child must keep exactly the inspect set"
         );
         assert_eq!(read_effective(), parent_before, "the parent keeps its sets");
+    }
+
+    /// The DaemonSet grant (`SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`):
+    /// where it lacks a narrow capability the command needs, the keep
+    /// must retain `SYS_ADMIN` as the only grant the kernel accepts for
+    /// it; where the narrow set is complete, no `SYS_ADMIN` is kept.
+    #[test]
+    fn sys_admin_fallback_keeps_the_only_grant() {
+        let daemonset = (1u64 << CAP_SYS_ADMIN_BIT)
+            | (1u64 << CAP_SYS_PTRACE_BIT)
+            | (1u64 << CAP_DAC_READ_SEARCH_BIT);
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        let live = minimal_live_mask();
+        // Doctor needs the BPF pair: the DaemonSet lacks both, so the
+        // keep retains SYS_ADMIN; the minimal set holds both, so none.
+        let doctor = parse(&["doctor"]);
+        assert_ne!(
+            keep_mask_for_command_in(daemonset, &doctor) & sys_admin,
+            0,
+            "doctor under the DaemonSet set must keep SYS_ADMIN for BPF"
+        );
+        assert_eq!(
+            keep_mask_for_command_in(live, &doctor) & sys_admin,
+            0,
+            "doctor with the minimal set must not keep SYS_ADMIN"
+        );
+        // Inspect and scan need map_files only: the DaemonSet lacks
+        // CHECKPOINT_RESTORE, so SYS_ADMIN stays; the minimal set holds
+        // it, so SYS_ADMIN goes.
+        for argv in [
+            vec!["inspect", "--pid", "1"],
+            vec!["inspect", "--system"],
+            vec!["inventory", "--system", "--capture", "scan"],
+            vec!["inventory", "--pid", "1", "--capture", "scan"],
+        ] {
+            let command = parse(&argv);
+            assert_ne!(
+                keep_mask_for_command_in(daemonset, &command) & sys_admin,
+                0,
+                "{argv:?} under the DaemonSet set must keep SYS_ADMIN for map_files"
+            );
+            assert_eq!(
+                keep_mask_for_command_in(live, &command) & sys_admin,
+                0,
+                "{argv:?} with the minimal set must not keep SYS_ADMIN"
+            );
+        }
+        // Live `--system` capture keeps SYS_ADMIN either way (the singles
+        // fallback), so the DaemonSet twin pins the kept bit.
+        for argv in [
+            vec!["inventory", "--system"],
+            vec!["profile", "--system", "--duration", "1s"],
+        ] {
+            let command = parse(&argv);
+            assert_ne!(
+                keep_mask_for_command_in(daemonset, &command) & sys_admin,
+                0,
+                "{argv:?} under the DaemonSet set must keep SYS_ADMIN"
+            );
+        }
+        // Post-setup: multi sheds only when CHECKPOINT_RESTORE survives
+        // it; the DaemonSet lacks it, so the shed keeps SYS_ADMIN.
+        assert_eq!(
+            post_setup_keep(true, daemonset),
+            daemonset,
+            "post-setup under the DaemonSet set must keep SYS_ADMIN for map_files"
+        );
+        assert_eq!(
+            post_setup_keep(true, live | sys_admin),
+            live,
+            "post-setup with CHECKPOINT_RESTORE sheds SYS_ADMIN"
+        );
     }
 }

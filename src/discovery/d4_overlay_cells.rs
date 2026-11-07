@@ -20,6 +20,7 @@
 //! mode; a contradiction fails the cell.
 
 use super::*;
+use crate::discovery::scan::lower_candidates_from_mountinfo;
 use std::time::{Duration, Instant};
 
 /// Overlay lane by the `file_user_inode` boundary: A renders the
@@ -4743,91 +4744,6 @@ fn copyup_old_file_setup(
     })
 }
 
-/// Lower-layer candidates for a merged path, read back from a mount
-/// table: the overlay mount with the longest mountpoint prefix of the
-/// path contributes its `lowerdir` stack in order, each joined with the
-/// path's remainder. Empty when no overlay row covers the path, the row
-/// names no lowerdir, or the remainder escapes (fail closed): the caller
-/// keeps the named gap. Mountinfo escapes are decoded on both sides;
-/// the stack splits on `:` exactly like the kernel mount parser.
-fn lower_candidates_from_mountinfo(
-    mountinfo: &str,
-    merged: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
-    fn unescape(field: &str) -> String {
-        field
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\")
-    }
-    let merged_str = merged.to_string_lossy();
-    let mut best: Option<(usize, Vec<String>, String)> = None;
-    for line in mountinfo.lines() {
-        let Some((pre, post)) = line.split_once(" - ") else {
-            continue;
-        };
-        let pre_fields: Vec<&str> = pre.split_whitespace().collect();
-        let post_fields: Vec<&str> = post.split_whitespace().collect();
-        let (Some(mountpoint), Some(fstype)) = (pre_fields.get(4), post_fields.first()) else {
-            continue;
-        };
-        if *fstype != "overlay" {
-            continue;
-        }
-        let mountpoint = unescape(mountpoint);
-        let rest = match merged_str.strip_prefix(mountpoint.as_str()) {
-            Some(rest) => rest,
-            None => continue,
-        };
-        let rel = match rest.strip_prefix('/') {
-            Some(rel) => rel,
-            None if rest.is_empty() => "",
-            None => continue,
-        };
-        if std::path::Path::new(rel)
-            .components()
-            .any(|component| component == std::path::Component::ParentDir)
-        {
-            continue;
-        }
-        let super_opts = post_fields.get(2).unwrap_or(&"");
-        let mut lowers = Vec::new();
-        for opt in super_opts.split(',') {
-            if let Some(stack) = opt.strip_prefix("lowerdir=") {
-                lowers.extend(
-                    stack
-                        .split(':')
-                        .filter(|layer| !layer.is_empty())
-                        .map(unescape),
-                );
-            }
-        }
-        if lowers.is_empty() {
-            continue;
-        }
-        let len = mountpoint.len();
-        if best
-            .as_ref()
-            .is_some_and(|(best_len, _, _)| *best_len >= len)
-        {
-            continue;
-        }
-        best = Some((len, lowers, rel.to_string()));
-    }
-    let Some((_, lowers, rel)) = best else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for lower in lowers {
-        let candidate = std::path::Path::new(&lower).join(&rel);
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out
-}
-
 /// One diagnosed original-file query against an explicitly opened file
 /// (held upper or a lower candidate), with the global query spend delta.
 /// The caller picks the anchor; the verdict names which file the range
@@ -5314,17 +5230,24 @@ fn copyup_join_row(
             }
             {
                 use std::os::unix::fs::MetadataExt as _;
-                let got = std::fs::metadata(&proof.path).map_err(|error| {
-                    format!("copyup join proof open {}: {error}", proof.path.display())
-                })?;
-                let want = std::fs::metadata(setup.fixture.lower_path("lib.so"))
+                let lower = std::fs::File::open(setup.fixture.lower_path("lib.so"))
+                    .map_err(|error| format!("copyup join lower open: {error}"))?;
+                let metadata = lower
+                    .metadata()
                     .map_err(|error| format!("copyup join lower fstat: {error}"))?;
-                if (got.dev(), got.ino()) != (want.dev(), want.ino()) {
+                if (metadata.dev(), metadata.ino())
+                    != (proof.mapped.identity.dev, proof.mapped.identity.ino)
+                {
                     return Err(format!(
-                        "copyup join proof names the wrong file: {} (candidate {:?} vs lower {:?})",
-                        proof.path.display(),
-                        (got.dev(), got.ino()),
-                        (want.dev(), want.ino())
+                        "copyup join proof names the wrong file: proof {:?} vs lower {:?}",
+                        (proof.mapped.identity.dev, proof.mapped.identity.ino),
+                        (metadata.dev(), metadata.ino())
+                    ));
+                }
+                if proof.candidate != 0 {
+                    return Err(format!(
+                        "copyup join proof selects candidate {}, not the first lower layer",
+                        proof.candidate
                     ));
                 }
             }

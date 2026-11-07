@@ -4226,6 +4226,7 @@ impl ScannedModuleCopy {
                     key: source.key,
                     double_loaded: source.double_loaded,
                     same_file_loads: source.same_file_loads,
+                    pre_copy_up: source.pre_copy_up,
                     path: exact_owned_string(&source.path),
                     tables_scan_finished: false,
                     decoder_abi: source.decoder_abi,
@@ -9486,6 +9487,7 @@ fn publication_module(
         mapped_identity: None,
         double_loaded: false,
         same_file_loads: 1,
+        pre_copy_up: None,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key,
@@ -9499,17 +9501,19 @@ fn publication_module(
 }
 
 /// Whether `module` has no counterpart among already-retained modules:
-/// the same (view, mount namespace, object key, path) match
-/// `merge_scanned_module` unions on, ignoring decoder ABI (an
+/// the same (view, mount namespace, object key, path, pre-copy-up mark)
+/// match `merge_scanned_module` unions on, ignoring decoder ABI (an
 /// ABI-mismatched twin keeps its raw pins; binding drops whichever twin it
-/// cannot use). The retention tests keep this predicate in sync with that
-/// union.
+/// cannot use). A pre-copy-up module never unions with the plain module
+/// for the same key: they are different files under one maps identity.
+/// The retention tests keep this predicate in sync with that union.
 fn is_newly_observed_module(retained: &[ScannedModule], module: &ScannedModule) -> bool {
     !retained.iter().any(|known| {
         known.view == module.view
             && known.mount_namespace == module.mount_namespace
             && known.key == module.key
             && known.path == module.path
+            && known.pre_copy_up == module.pre_copy_up
     })
 }
 
@@ -9519,6 +9523,7 @@ fn is_still_observed_module(found: &[ScannedModule], module: &ScannedModule) -> 
             && current.mount_namespace == module.mount_namespace
             && current.key == module.key
             && current.path == module.path
+            && current.pre_copy_up == module.pre_copy_up
     })
 }
 
@@ -9528,6 +9533,7 @@ fn merge_scanned_module(modules: &mut Vec<ScannedModule>, mut incoming: ScannedM
             && module.mount_namespace == incoming.mount_namespace
             && module.key == incoming.key
             && module.path == incoming.path
+            && module.pre_copy_up == incoming.pre_copy_up
     }) else {
         modules.push(incoming);
         return;
@@ -10760,6 +10766,7 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
         mapped_identity: None,
         double_loaded: false,
         same_file_loads: 1,
+        pre_copy_up: None,
         view: view.id(),
         mount_namespace: view.mount_namespace(),
         key: ObjectKey::of(mapping),
@@ -16727,6 +16734,7 @@ impl Engine {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: view.id(),
                 mount_namespace: view.mount_namespace(),
                 key,
@@ -19740,6 +19748,7 @@ impl Engine {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view_id,
             mount_namespace: self.views[position].mount_namespace(),
             key: loader_identity,

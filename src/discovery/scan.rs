@@ -18,7 +18,7 @@ use crate::discovery::overlay_witness::{
 };
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
-use crate::process::{MountNamespaceId, PidPin, ProcessView, ProcessViewId};
+use crate::process::{MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
 use p11scope_manifest::identity::{InspectedObject, open_object};
 use p11scope_manifest::maps::{
@@ -2222,6 +2222,13 @@ pub struct ScannedModule {
     /// that sees fewer loads is not fresh evidence of fewer loads —
     /// and only a complete-scan replacement lowers it.
     pub same_file_loads: u32,
+    /// Scan evidence: the kernel witness proved this module's trigger
+    /// range is the pre-copy-up lower file at this index of the
+    /// mount-table candidate list (not the opened upper file). The pin
+    /// recomputes the same list and reopens this index, and the
+    /// proof-time `mapped_identity` binds it to the proof. `None` for
+    /// every other module. The candidate path itself is never stored.
+    pub pre_copy_up: Option<u32>,
     pub path: String,
     /// Scan evidence: this module's tables scan ran to completion in a real
     /// process scan with no truncating skip (`scan_skip_truncates`), I/O
@@ -4291,6 +4298,96 @@ pub(crate) enum GuardOutcome {
     UnprovenOverlay { range: (u64, u64) },
 }
 
+/// Lower-layer candidates for a merged path, read back from a mount
+/// table: the overlay mount with the longest mountpoint prefix of the
+/// path contributes its `lowerdir` stack in order, each joined with the
+/// path's remainder. Empty when no overlay row covers the path, the row
+/// names no lowerdir, or the remainder escapes (fail closed): the caller
+/// keeps the named gap. Mountinfo escapes are decoded on both sides;
+/// the stack splits on `:` exactly like the kernel mount parser.
+///
+/// The scan and the pin both compute this list — the scan to prove one
+/// candidate, the pin to reopen the proven index — so both must feed it
+/// the same normalized merged path and the target's mount table. A
+/// non-UTF-8 table or path yields no candidates: the gap, never a join.
+pub(crate) fn lower_candidates_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    fn unescape(field: &str) -> String {
+        field
+            .replace("\\040", " ")
+            .replace("\\011", "\t")
+            .replace("\\012", "\n")
+            .replace("\\134", "\\")
+    }
+    let merged_str = merged.to_string_lossy();
+    let mut best: Option<(usize, Vec<String>, String)> = None;
+    for line in mountinfo.lines() {
+        let Some((pre, post)) = line.split_once(" - ") else {
+            continue;
+        };
+        let pre_fields: Vec<&str> = pre.split_whitespace().collect();
+        let post_fields: Vec<&str> = post.split_whitespace().collect();
+        let (Some(mountpoint), Some(fstype)) = (pre_fields.get(4), post_fields.first()) else {
+            continue;
+        };
+        if *fstype != "overlay" {
+            continue;
+        }
+        let mountpoint = unescape(mountpoint);
+        let rest = match merged_str.strip_prefix(mountpoint.as_str()) {
+            Some(rest) => rest,
+            None => continue,
+        };
+        let rel = match rest.strip_prefix('/') {
+            Some(rel) => rel,
+            None if rest.is_empty() => "",
+            None => continue,
+        };
+        if std::path::Path::new(rel)
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            continue;
+        }
+        let super_opts = post_fields.get(2).unwrap_or(&"");
+        let mut lowers = Vec::new();
+        for opt in super_opts.split(',') {
+            if let Some(stack) = opt.strip_prefix("lowerdir=") {
+                lowers.extend(
+                    stack
+                        .split(':')
+                        .filter(|layer| !layer.is_empty())
+                        .map(unescape),
+                );
+            }
+        }
+        if lowers.is_empty() {
+            continue;
+        }
+        let len = mountpoint.len();
+        if best
+            .as_ref()
+            .is_some_and(|(best_len, _, _)| *best_len >= len)
+        {
+            continue;
+        }
+        best = Some((len, lowers, rel.to_string()));
+    }
+    let Some((_, lowers, rel)) = best else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for lower in lowers {
+        let candidate = std::path::Path::new(&lower).join(&rel);
+        if !out.contains(&candidate) {
+            out.push(candidate);
+        }
+    }
+    out
+}
+
 /// Prove one witness-requiring provider file with the original-file
 /// witness: `None` joins, `Some` refuses with the gap reason. Runs once
 /// per file at the provider branch; every range of the group shares the
@@ -4304,6 +4401,10 @@ pub(crate) enum GuardOutcome {
 /// unavailable verdict with a diagnosis refuses with the canonical
 /// prefix plus the plain-words stage; without one the reason stays the
 /// exact canonical string.
+/// The K1 twins' harness entry: one held query plus its refusal.
+/// Production joins through `witness_join_with_copyup` (which adds the
+/// copy-up fallback); the twins pin the witness-level rule underneath.
+#[cfg(test)]
 pub(crate) fn witness_join(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4313,7 +4414,35 @@ pub(crate) fn witness_join(
     range: (u64, u64),
     budget: &mut CaptureWorkBudget,
 ) -> Option<String> {
-    let outcome = io.prove_original_file_diagnosed(view, file, held, key, range, budget);
+    witness_refusal(&io.prove_original_file_diagnosed(view, file, held, key, range, budget))
+}
+
+/// What the provider-branch join proved: the group joins the held
+/// (current) file, or a witness-proven pre-copy-up lower file.
+#[derive(Debug)]
+pub(crate) enum CopyUpJoin {
+    Held,
+    LowerProven(LowerProof),
+}
+
+/// A lower file the kernel witness proved for the trigger range: the
+/// proven open file, its proof-time held identity (the pin's
+/// scanned check must still match it), and its index in the
+/// mount-table candidate list (the pin recomputes the same list and
+/// reopens this index). The candidate path itself stays transient:
+/// nothing persists it.
+#[derive(Debug)]
+pub(crate) struct LowerProof {
+    pub file: File,
+    pub mapped: MappedFile,
+    pub candidate: u32,
+}
+
+/// The gap reason for a witness outcome, or `None` for a join. An
+/// unavailable verdict with a diagnosis refuses with the canonical
+/// prefix plus the plain-words stage; without one the reason stays the
+/// exact canonical string.
+fn witness_refusal(outcome: &WitnessOutcome) -> Option<String> {
     let canonical = outcome.verdict.gap_reason()?;
     match (&outcome.verdict, outcome.diagnosis) {
         (WitnessVerdict::Failed(WitnessFailure::Unavailable), Some(diagnosis)) => {
@@ -4323,29 +4452,56 @@ pub(crate) fn witness_join(
     }
 }
 
-/// What the provider-branch join proved: the group joins the held
-/// (current) file, or a witness-proven pre-copy-up lower file.
-#[allow(dead_code)] // The copy-up fallback constructs `LowerProven`.
-pub(crate) enum CopyUpJoin {
-    Held,
-    LowerProven(LowerProof),
-}
-
-/// A lower file the kernel witness proved for the trigger range: the
-/// target-rooted path to pin (a pin-time open only, never published),
-/// and the proof-time identity the pin must still match.
-#[allow(dead_code)] // The copy-up fallback constructs this.
-pub(crate) struct LowerProof {
-    pub path: PathBuf,
-    pub identity: crate::discovery::identity::FileIdentity,
-    pub pin: Pin,
+/// Prove the trigger range against the mount-table lower candidates in
+/// kernel stack order: the first same-file verdict wins and stops the
+/// search — the proof, not the path, selects the file. Unopenable
+/// candidates and candidates without a readable held identity are
+/// skipped silently (bounded opens are cheap); a spent witness budget
+/// stops the search. `None` keeps today's gap.
+fn prove_lower_candidates(
+    io: &mut impl ScanIo,
+    view: &ProcessView,
+    key: ObjectKey,
+    range: (u64, u64),
+    merged: &Path,
+    budget: &mut CaptureWorkBudget,
+) -> Option<LowerProof> {
+    for (index, candidate) in io
+        .lower_candidates(view, merged, budget)
+        .into_iter()
+        .enumerate()
+    {
+        let Ok(candidate_index) = u32::try_from(index) else {
+            continue;
+        };
+        let Ok(file) = io.open_lower_candidate(view, &candidate, budget) else {
+            continue;
+        };
+        let Some(mapped) = io.held_identity(&file) else {
+            continue;
+        };
+        let outcome = io.prove_original_file_diagnosed(view, &file, &mapped, key, range, budget);
+        match outcome.verdict {
+            WitnessVerdict::SameFile => {
+                return Some(LowerProof {
+                    file,
+                    mapped,
+                    candidate: candidate_index,
+                });
+            }
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted) => return None,
+            WitnessVerdict::OtherFile | WitnessVerdict::Failed(_) => {}
+        }
+    }
+    None
 }
 
 /// Prove one witness-requiring provider file, falling back to the
 /// pre-copy-up lower file on an other-file verdict: `Ok` joins (held
 /// or proven lower), `Err` refuses with the gap reason. The fallback
-/// spends from the same per-scan witness budget as the held query.
-#[allow(dead_code)] // The provider branch calls this once the fallback lands.
+/// spends from the same per-scan witness budget as the held query; a
+/// held verdict other than other-file refuses without a fallback, and
+/// no proven lower keeps the held query's reason byte-identical.
 #[allow(clippy::too_many_arguments)] // The join's inputs are already separate bindings at both call sites.
 pub(crate) fn witness_join_with_copyup(
     io: &mut impl ScanIo,
@@ -4354,13 +4510,162 @@ pub(crate) fn witness_join_with_copyup(
     held: &MappedFile,
     key: ObjectKey,
     range: (u64, u64),
-    _merged: &Path,
+    merged: &Path,
     budget: &mut CaptureWorkBudget,
 ) -> Result<CopyUpJoin, String> {
-    // Stub: the copy-up fallback lands next; today this is `witness_join`.
-    match witness_join(io, view, file, held, key, range, budget) {
-        None => Ok(CopyUpJoin::Held),
-        Some(reason) => Err(reason),
+    let outcome = io.prove_original_file_diagnosed(view, file, held, key, range, budget);
+    if outcome.verdict == WitnessVerdict::SameFile {
+        return Ok(CopyUpJoin::Held);
+    }
+    if outcome.verdict == WitnessVerdict::OtherFile
+        && let Some(proof) = prove_lower_candidates(io, view, key, range, merged, budget)
+    {
+        return Ok(CopyUpJoin::LowerProven(proof));
+    }
+    Err(witness_refusal(&outcome).expect("a non-join verdict refuses"))
+}
+
+/// Read (or reuse the cached) ELF export facts for one opened file
+/// under its pin bracket. `key` is the group's maps identity. A repeat
+/// scan of the unchanged file reuses the cached facts with zero reads.
+/// On filesystems without unique inode numbers the key cannot name one
+/// file, so the facts are never cached there: always read, never store.
+fn provider_facts_for(
+    file: &File,
+    key: ObjectKey,
+    wanted: &[&str],
+    budget: &mut CaptureWorkBudget,
+) -> Result<ElfExportFacts, String> {
+    let before = pin_of(file)?;
+    // DetailedLegacy has no whole-size gate on this demand-paged export
+    // check. Inventory reserves the full logical mapped range below.
+    let cache_key = InspectedFileKey::for_open_file(file, key.device, key.inode, before)?;
+    // On filesystems without unique inode numbers the key cannot name
+    // one file, so the facts are never cached there: always read, never
+    // store.
+    let cacheable = file_inodes_are_unique(file);
+    // Nothing is read for this hit, but the file may have changed since
+    // `before`; only the still-unchanged file may reuse the cached facts.
+    let cached = if cacheable {
+        budget
+            .elf_export_facts_for(&cache_key)
+            .filter(|_| pin_of(file).is_ok_and(|after| after == before))
+    } else {
+        None
+    };
+    match cached {
+        Some(facts) => Ok(facts),
+        None => {
+            let facts = read_raw_scan_facts_budgeted(file, wanted, budget)?;
+            // File-derived anchor exclusions share the export pin bracket.
+            check_pin_after_read(pin_of(file), &before)?;
+            if cacheable {
+                budget.note_elf_export_facts(cache_key, facts.clone());
+            }
+            Ok(facts)
+        }
+    }
+}
+
+/// Attribute `--module` hints to one opened file: the first matched
+/// hint the alias gate accepts, whether any attributed, and the
+/// carried refusal. Corroborates an inode-only match before attributing
+/// the object to the hint; each accepted inode candidate confirms its
+/// hint (path gates are free, so only inode candidates repeat their
+/// hint open — the helper above stops at the first acceptance).
+fn attribute_module_hint(
+    matched: &[(usize, HintMatch)],
+    hints: &[PathBuf],
+    file: &File,
+    hint_matched: &mut [bool],
+) -> (Option<PathBuf>, bool, Option<String>) {
+    let (named_hint, refusal) = first_attributable_hint(matched, hints, file);
+    let attributable = named_hint.is_some();
+    if attributable {
+        for (index, kind) in matched {
+            if *kind == HintMatch::Inode && hint_gate(*kind, &hints[*index], file).is_ok() {
+                hint_matched[*index] = true;
+            }
+        }
+    }
+    (named_hint, attributable, refusal)
+}
+
+/// What `--exclude-module` decided for one opened file.
+enum ExcludeDecision {
+    Keep,
+    Excluded,
+    Contradiction(String),
+}
+
+/// Evaluate `--exclude-module` for one opened file: excluded files get
+/// no probes and use no slots; they are recorded, never silent. A file
+/// both hinted (`--module`) and excluded is an operator contradiction,
+/// refused here with a named error before any attach.
+#[allow(clippy::too_many_arguments)] // One call per effective file; the group-loop state has no narrower bundle.
+fn evaluate_excludes(
+    path: &str,
+    file: &File,
+    hinted: bool,
+    subject: &str,
+    pid: u32,
+    exclude_paths: &ExcludePaths,
+    exclude_names: &ExcludeNames,
+    budget: &mut CaptureWorkBudget,
+) -> ExcludeDecision {
+    if exclude_paths.is_empty() && exclude_names.is_empty() {
+        return ExcludeDecision::Keep;
+    }
+    let Some(matched) = exclude_match(path, file, exclude_paths, exclude_names) else {
+        return ExcludeDecision::Keep;
+    };
+    if hinted {
+        return ExcludeDecision::Contradiction(format!(
+            "{subject} is both named by --module and matched by --exclude-module {}; refusing a module that is both included and excluded",
+            matched.display()
+        ));
+    }
+    if let Ok(metadata) = file.metadata() {
+        budget.push_excluded(ExcludedRecord {
+            pid,
+            path: path.to_string(),
+            dev: metadata.dev(),
+            ino: metadata.ino(),
+            via: matched,
+        });
+    }
+    ExcludeDecision::Excluded
+}
+
+/// Record one opened, identified, and read file as examined (not a
+/// provider) and offer it to the anchor census. Shared by the opened
+/// file and the proven lower file after a copy-up join.
+fn offer_examined_file(
+    examined: &mut Vec<ExaminedObject>,
+    custody: &mut Option<(&mut crate::discovery::kernel_identity::ExaminedCustody, u64)>,
+    key: ObjectKey,
+    mapped: MappedFile,
+    file: File,
+    budget: &mut CaptureWorkBudget,
+) {
+    examined.push(ExaminedObject {
+        key,
+        identity: mapped.identity,
+        key_is_identity: mapped.key_is_identity(key),
+    });
+    if let Some((custody, scan)) = custody {
+        // The census includes this actual File and all current
+        // scan/admitted FDs. Enclosing stop/deadline checks refuse
+        // a count that completes after the collection has stopped.
+        if budget.check_deadline_now().is_none() && budget.poll_collection(1) {
+            custody.offer(*scan, *examined.last().expect("just examined"), file);
+            if budget.check_deadline_now().is_some() || !budget.poll_collection(0) {
+                custody.close();
+            }
+        } else {
+            custody.close();
+            custody.offer(*scan, *examined.last().expect("just examined"), file);
+        }
     }
 }
 
@@ -5031,6 +5336,33 @@ pub(crate) trait ScanIo {
             diagnosis: None,
         }
     }
+    /// Lower-layer candidates for a merged path, in kernel stack order,
+    /// read back from the target's mount table. The default names none,
+    /// so scripted scans keep the named gap; the production IO parses
+    /// the target's table exactly like the pin site does.
+    fn lower_candidates(
+        &mut self,
+        view: &ProcessView,
+        merged: &Path,
+        budget: &mut CaptureWorkBudget,
+    ) -> Vec<PathBuf> {
+        let _ = (view, merged, budget);
+        Vec::new()
+    }
+    /// Open one lower candidate as the target sees it. The default
+    /// refuses, so scripted scans keep the named gap.
+    fn open_lower_candidate(
+        &mut self,
+        view: &ProcessView,
+        candidate: &Path,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<File, String> {
+        let _ = (view, budget);
+        Err(format!(
+            "cannot open lower candidate {}: unscripted scan IO",
+            candidate.display()
+        ))
+    }
 }
 
 pub(crate) struct ProcScanIo {
@@ -5180,6 +5512,41 @@ impl ScanIo for ProcScanIo {
         }
         self.witness_used += 1;
         prove_original_file_diagnosed(view.pid(), file, held, key, &[range], budget)
+    }
+
+    fn lower_candidates(
+        &mut self,
+        view: &ProcessView,
+        merged: &Path,
+        budget: &mut CaptureWorkBudget,
+    ) -> Vec<PathBuf> {
+        // The target's own table through the retained view (never the
+        // observer's): a container's lowerdirs resolve in its mount
+        // namespace. Any read or normalization failure names nothing.
+        let mut mounts = MountTableCache::default();
+        let table = view.open_then_cached_mountinfo(|_| Ok(()), &mut mounts, budget);
+        let ((), text) = match table {
+            Ok(table) => table,
+            Err(_) => return Vec::new(),
+        };
+        let Some(normalized) = merged
+            .to_str()
+            .and_then(crate::discovery::identity::normalize_target_path)
+        else {
+            return Vec::new();
+        };
+        lower_candidates_from_mountinfo(text, Path::new(&normalized))
+    }
+
+    fn open_lower_candidate(
+        &mut self,
+        view: &ProcessView,
+        candidate: &Path,
+        budget: &mut CaptureWorkBudget,
+    ) -> Result<File, String> {
+        view.with_filesystem(budget, |filesystem, _| {
+            filesystem.open_rooted_object(candidate)
+        })
     }
 
     fn note_cold_member(&mut self, pid: u32, member: RetainedGroupMember, minter: Arc<PidPin>) {
@@ -5866,7 +6233,7 @@ fn scan_view_examined_mode(
         let held = budget
             .retained_mapped_identity(&file)
             .or_else(|| io.held_identity(&file));
-        let scanned_identity = held.map(|held| held.identity);
+        let mut scanned_identity = held.map(|held| held.identity);
         let guarded = match mapped_file_guard(io, view, held, key, &group, budget) {
             Ok(outcome) => outcome,
             Err(reason) => {
@@ -5876,24 +6243,10 @@ fn scan_view_examined_mode(
                 continue;
             }
         };
-        // Corroborate an inode-only match before attributing the object to
-        // the hint. The attributed hint is also the operator-named signal
-        // the planner reads; naming follows the narrowing exactly.
-        let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);
-        let attributable = named_hint.is_some();
-        // Each accepted inode candidate confirms its hint; a refused one
-        // keeps its miss. The gates re-run here because the helper above
-        // stops at the first acceptance (path gates are free, so
-        // only inode candidates repeat their hint open).
-        if attributable {
-            for (index, kind) in &matched {
-                if *kind == HintMatch::Inode
-                    && hint_gate(*kind, &request.hints[*index], &file).is_ok()
-                {
-                    hint_matched[*index] = true;
-                }
-            }
-        }
+        // The attributed hint is also the operator-named signal the
+        // planner reads; naming follows the narrowing exactly.
+        let (mut named_hint, attributable, refusal) =
+            attribute_module_hint(&matched, request.hints, &file, &mut hint_matched);
         if hinted && !attributable {
             skipped.push(Skipped {
                 subject,
@@ -5902,93 +6255,141 @@ fn scan_view_examined_mode(
             });
             continue;
         }
-        // `--exclude-module`: excluded files get no probes and use no
-        // slots; they are recorded, never silent. A file both hinted
-        // (`--module`) and excluded is an operator contradiction, refused
-        // here with a named error before any attach. Evaluated for
-        // narrowed-out mappings too (F5), which then skip the scan body.
-        if (!exclude_paths.is_empty() || !exclude_names.is_empty())
-            && let Some(matched) = exclude_match(&path, &file, &exclude_paths, &exclude_names)
-        {
-            if hinted {
-                return Err(format!(
-                    "{} is both named by --module and matched by --exclude-module {}; refusing a module that is both included and excluded",
-                    subject,
-                    matched.display()
-                ));
-            }
-            if let Ok(metadata) = file.metadata() {
-                budget.push_excluded(ExcludedRecord {
-                    pid,
-                    path: path.clone(),
-                    dev: metadata.dev(),
-                    ino: metadata.ino(),
-                    via: matched,
-                });
-            }
-            continue;
+        // Evaluated for narrowed-out mappings too (F5), which then skip
+        // the scan body.
+        match evaluate_excludes(
+            &path,
+            &file,
+            hinted,
+            &subject,
+            pid,
+            &exclude_paths,
+            &exclude_names,
+            budget,
+        ) {
+            ExcludeDecision::Keep => {}
+            ExcludeDecision::Excluded => continue,
+            ExcludeDecision::Contradiction(reason) => return Err(reason),
         }
         if narrowed_out {
             continue;
         }
-        // A repeat scan of the unchanged file reuses the cached export facts with
-        // zero reads. The key's (device, inode) is the maps identity the guard
+        // The key's (device, inode) is the maps identity the guard
         // above validated against the opened file.
-        let before = match pin_of(&file) {
-            Ok(pin) => pin,
+        let mut facts = match provider_facts_for(&file, key, &wanted, budget) {
+            Ok(facts) => facts,
             Err(reason) => {
                 skipped.push(Skipped { subject, reason });
                 continue;
             }
         };
-        // DetailedLegacy has no whole-size gate on this demand-paged export
-        // check. Inventory reserves the full logical mapped range below.
-        let cache_key = match InspectedFileKey::for_open_file(&file, key.device, key.inode, before)
-        {
-            Ok(cache_key) => cache_key,
-            Err(reason) => {
-                skipped.push(Skipped { subject, reason });
-                continue;
+        let mut hook_exports: Vec<String> = facts
+            .exports
+            .iter()
+            .filter(|(name, _)| request.hooks.abi(name).is_some())
+            .map(|(name, _)| name.clone())
+            .collect();
+        if request.hints.is_empty() && hook_exports.is_empty() {
+            // Opened, identified, and read: examined, and not a provider.
+            if let Some(held) = held {
+                offer_examined_file(&mut examined, &mut custody, key, held, file, budget);
             }
-        };
-        // On filesystems without unique inode numbers the key cannot name
-        // one file, so the facts are never cached there: always read, never
-        // store.
-        let cacheable = file_inodes_are_unique(&file);
-        // Nothing is read for this hit, but the file may have changed since
-        // `before`; only the still-unchanged file may reuse the cached facts.
-        let cached = if cacheable {
-            budget
-                .elf_export_facts_for(&cache_key)
-                .filter(|_| pin_of(&file).is_ok_and(|after| after == before))
-        } else {
-            None
-        };
-        let facts = match cached {
-            Some(facts) => facts,
-            None => {
-                let facts = match read_raw_scan_facts_budgeted(&file, &wanted, budget) {
-                    Ok(facts) => facts,
-                    Err(reason) => {
-                        skipped.push(Skipped { subject, reason });
-                        continue;
-                    }
-                };
-                // File-derived anchor exclusions share the export pin bracket.
-                match check_pin_after_read(pin_of(&file), &before) {
-                    Ok(()) => {
-                        if cacheable {
-                            budget.note_elf_export_facts(cache_key, facts.clone());
+            continue;
+        }
+        let same_file_loads = duplicate_exec_load_count(&group);
+        // A provider file the guard could not prove needs the kernel
+        // witness before its row joins: one query over the group's first
+        // witness-requiring range. A same-file verdict joins the held
+        // file; an other-file verdict falls back to the mount-table
+        // lower candidates (the copy-up shape), and anything else —
+        // or no proven lower — refuses with the finite gap, never a
+        // join. Files that prove not to be providers (above) never
+        // spend witness work.
+        let mut pre_copy_up: Option<u32> = None;
+        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held) {
+            match witness_join_with_copyup(
+                io,
+                view,
+                &file,
+                &held,
+                key,
+                range,
+                Path::new(&path),
+                budget,
+            ) {
+                Err(reason) => {
+                    skipped.push(Skipped { subject, reason });
+                    continue;
+                }
+                Ok(CopyUpJoin::Held) => {}
+                Ok(CopyUpJoin::LowerProven(proof)) => {
+                    // The stale shape with a proven lower file: this
+                    // process runs the lower bytes, so everything
+                    // file-derived is re-derived from the proven lower
+                    // file — upper offsets are never reused.
+                    let lower_facts = match provider_facts_for(&proof.file, key, &wanted, budget) {
+                        Ok(lower_facts) => lower_facts,
+                        Err(reason) => {
+                            skipped.push(Skipped { subject, reason });
+                            continue;
                         }
-                        facts
-                    }
-                    Err(reason) => {
-                        skipped.push(Skipped { subject, reason });
+                    };
+                    let lower_hooks: Vec<String> = lower_facts
+                        .exports
+                        .iter()
+                        .filter(|(name, _)| request.hooks.abi(name).is_some())
+                        .map(|(name, _)| name.clone())
+                        .collect();
+                    if request.hints.is_empty() && lower_hooks.is_empty() {
+                        // Opened, identified, and read: examined, and not
+                        // a provider.
+                        offer_examined_file(
+                            &mut examined,
+                            &mut custody,
+                            key,
+                            proof.mapped,
+                            proof.file,
+                            budget,
+                        );
                         continue;
                     }
+                    let (lower_hint, lower_attributable, lower_refusal) = attribute_module_hint(
+                        &matched,
+                        request.hints,
+                        &proof.file,
+                        &mut hint_matched,
+                    );
+                    if hinted && !lower_attributable {
+                        skipped.push(Skipped {
+                            subject,
+                            reason: lower_refusal.unwrap_or_else(|| {
+                                "no --module hint could be attributed here".into()
+                            }),
+                        });
+                        continue;
+                    }
+                    match evaluate_excludes(
+                        &path,
+                        &proof.file,
+                        hinted,
+                        &subject,
+                        pid,
+                        &exclude_paths,
+                        &exclude_names,
+                        budget,
+                    ) {
+                        ExcludeDecision::Keep => {}
+                        ExcludeDecision::Excluded => continue,
+                        ExcludeDecision::Contradiction(reason) => return Err(reason),
+                    }
+                    facts = lower_facts;
+                    hook_exports = lower_hooks;
+                    named_hint = lower_hint;
+                    scanned_identity = Some(proof.mapped.identity);
+                    pre_copy_up = Some(proof.candidate);
                 }
             }
-        };
+        }
         let ElfExportFacts {
             abi,
             exports,
@@ -5997,52 +6398,10 @@ fn scan_view_examined_mode(
             excluded_anchor_ranges,
         } = facts;
         let layout = target_layout(abi);
-        let hook_exports: Vec<_> = exports
-            .iter()
-            .filter(|(name, _)| request.hooks.abi(name).is_some())
-            .map(|(name, _)| name.clone())
-            .collect();
-        if request.hints.is_empty() && hook_exports.is_empty() {
-            // Opened, identified, and read: examined, and not a provider.
-            if let Some(held) = held {
-                examined.push(ExaminedObject {
-                    key,
-                    identity: held.identity,
-                    key_is_identity: held.key_is_identity(key),
-                });
-                if let Some((custody, scan)) = &mut custody {
-                    // The census includes this actual File and all current
-                    // scan/admitted FDs. Enclosing stop/deadline checks refuse
-                    // a count that completes after the collection has stopped.
-                    if budget.check_deadline_now().is_none() && budget.poll_collection(1) {
-                        custody.offer(*scan, *examined.last().expect("just examined"), file);
-                        if budget.check_deadline_now().is_some() || !budget.poll_collection(0) {
-                            custody.close();
-                        }
-                    } else {
-                        custody.close();
-                        custody.offer(*scan, *examined.last().expect("just examined"), file);
-                    }
-                }
-            }
-            continue;
-        }
         // The operator-named signal is the narrowing's own attribution: the
         // first matched hint the alias gate accepted above. Recorded only;
         // the planner reads it for the operator-named closure exception.
         let module_hint = named_hint;
-        let same_file_loads = duplicate_exec_load_count(&group);
-        // A provider file the guard could not prove needs the kernel
-        // witness before its row joins: one query over the group's first
-        // witness-requiring range. Anything but a same-file verdict
-        // refuses with the finite gap, never a join. Files that prove
-        // not to be providers (above) never spend witness work.
-        if let (GuardOutcome::UnprovenOverlay { range }, Some(held)) = (guarded, held)
-            && let Some(reason) = witness_join(io, view, &file, &held, key, range, budget)
-        {
-            skipped.push(Skipped { subject, reason });
-            continue;
-        }
         let mut module = ScannedModule {
             module_hint,
             mapped_identity: scanned_identity,
@@ -6051,6 +6410,7 @@ fn scan_view_examined_mode(
             key,
             double_loaded: same_file_loads >= 2,
             same_file_loads,
+            pre_copy_up,
             path,
             tables_scan_finished: false,
             decoder_abi: Some(abi),
@@ -9293,6 +9653,7 @@ mod tests {
                     key,
                     double_loaded: false,
                     same_file_loads: 1,
+                    pre_copy_up: None,
                     path,
                     tables_scan_finished: false,
                     decoder_abi: Some(ElfAbi::Lp64),
@@ -10700,11 +11061,13 @@ mod tests {
             ],
             "identity mismatch skips the opened object unless narrowed out"
         );
+        // Hint attribution lives in its helper now (the proven lower
+        // file re-attributes through the same gates); the call site
+        // still orders it after the guard.
         let attribution = scan_lines
             .iter()
             .position(|line| {
-                *line
-                    == "let (named_hint, refusal) = first_attributable_hint(&matched, request.hints, &file);"
+                *line == "attribute_module_hint(&matched, request.hints, &file, &mut hint_matched);"
             })
             .expect("hint-specific attribution must remain after the guard");
         assert!(
@@ -10718,9 +11081,31 @@ mod tests {
             .map(str::trim)
             .position(|line| line == "match hint_gate(*kind, &hints[*index], actual) {")
             .expect("attribution must gate aliases using both opened files");
+        // The moved helpers keep their contracts: the attribution helper
+        // still gates aliases, the facts helper still brackets its read
+        // with the pin, and the offer helper still records the held
+        // identity it examined.
+        for helper_line in [
+            "let (named_hint, refusal) = first_attributable_hint(matched, hints, file);",
+            "let before = pin_of(file)?;",
+            "check_pin_after_read(pin_of(file), &before)?;",
+            "identity: mapped.identity,",
+            "key_is_identity: mapped.key_is_identity(key),",
+        ] {
+            include_str!("scan.rs")
+                .lines()
+                .map(str::trim)
+                .position(|line| line == helper_line)
+                .expect("the moved helper keeps its contract");
+        }
+        // ELF facts live in their helper now (the proven lower file
+        // re-reads through the same pin bracket); the call site still
+        // orders the read after attribution.
         let elf_pin = scan_lines
             .iter()
-            .position(|line| *line == "let before = match pin_of(&file) {")
+            .position(|line| {
+                *line == "let mut facts = match provider_facts_for(&file, key, &wanted, budget) {"
+            })
             .expect("ELF inspection pin");
         assert!(
             guard < attribution && attribution < elf_pin,
@@ -10732,15 +11117,14 @@ mod tests {
         assert!(guard_body.contains(
             "crate::discovery::identity::retained_object_key_cached(view, file, mounts, budget)"
         ));
+        // The examined push lives in its offer helper now (the proven
+        // lower file offers through the same census); the call site
+        // still offers the opened file.
         for decision in [
             "if narrowed_out && !excludes_present {\n            continue;\n        }",
             "if hinted && !attributable {",
             "if request.hints.is_empty() && exports.is_empty() {",
-            "examined.push(ExaminedObject {\n                    \
-             key,\n                    \
-             identity: held.identity,\n                    \
-             key_is_identity: held.key_is_identity(key),\n                \
-             });",
+            "offer_examined_file(&mut examined, &mut custody, key, held, file, budget);",
         ] {
             assert!(
                 scan_body.contains(decision),
@@ -14132,6 +14516,339 @@ mod tests {
                 diagnosis: None,
             }
         }
+    }
+
+    /// Scripted IO for the copy-up fallback twins: verdicts served
+    /// from a queue under a scripted witness budget, candidates and
+    /// opens scripted by path (a missing open is unopenable).
+    struct CopyUpScriptIo {
+        verdicts: std::collections::VecDeque<WitnessVerdict>,
+        prove_calls: usize,
+        witness_used: u32,
+        witness_max: u32,
+        candidates: Vec<std::path::PathBuf>,
+        opens: std::collections::BTreeMap<std::path::PathBuf, std::fs::File>,
+        opened: Vec<std::path::PathBuf>,
+        held: MappedFile,
+    }
+
+    impl CopyUpScriptIo {
+        fn scripted(verdicts: Vec<WitnessVerdict>, candidates: Vec<std::path::PathBuf>) -> Self {
+            Self {
+                verdicts: verdicts.into(),
+                prove_calls: 0,
+                witness_used: 0,
+                witness_max: 8,
+                candidates,
+                opens: std::collections::BTreeMap::new(),
+                opened: Vec::new(),
+                held: MappedFile {
+                    identity: crate::discovery::identity::FileIdentity { dev: 9, ino: 9 },
+                    fs_magic: None,
+                },
+            }
+        }
+
+        fn serve(&mut self, candidate: &std::path::Path, file: std::fs::File) {
+            self.opens.insert(candidate.to_path_buf(), file);
+        }
+
+        fn exhaust(&mut self) {
+            self.witness_used = self.witness_max;
+        }
+    }
+
+    impl ScanIo for CopyUpScriptIo {
+        type Memory = std::fs::File;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn std::io::Read>> {
+            panic!("the join never opens maps")
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Self::Memory> {
+            panic!("the join never opens memory")
+        }
+
+        fn final_generation(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            panic!("the join never checks the final generation")
+        }
+
+        fn range_identity(
+            &mut self,
+            _: &ProcessView,
+            _: u64,
+            _: u64,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<std::io::Result<crate::discovery::identity::FileIdentity>, String> {
+            panic!("the join never reads range identity")
+        }
+
+        fn prove_original_file(
+            &mut self,
+            _: &ProcessView,
+            _: &std::fs::File,
+            _: &MappedFile,
+            _: ObjectKey,
+            _: (u64, u64),
+            _: &mut CaptureWorkBudget,
+        ) -> WitnessVerdict {
+            if self.witness_used >= self.witness_max {
+                return WitnessVerdict::Failed(WitnessFailure::BudgetExhausted);
+            }
+            self.prove_calls += 1;
+            self.witness_used += 1;
+            self.verdicts
+                .pop_front()
+                .expect("scripted witness queried past its script")
+        }
+
+        fn held_identity(&mut self, _: &std::fs::File) -> Option<MappedFile> {
+            Some(self.held)
+        }
+
+        fn lower_candidates(
+            &mut self,
+            _: &ProcessView,
+            _: &Path,
+            _: &mut CaptureWorkBudget,
+        ) -> Vec<PathBuf> {
+            self.candidates.clone()
+        }
+
+        fn open_lower_candidate(
+            &mut self,
+            _: &ProcessView,
+            candidate: &Path,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<File, String> {
+            self.opened.push(candidate.to_path_buf());
+            self.opens
+                .get(candidate)
+                .and_then(|file| file.try_clone().ok())
+                .ok_or_else(|| format!("cannot open lower candidate {}", candidate.display()))
+        }
+    }
+
+    fn copyup_script_key() -> ObjectKey {
+        ObjectKey {
+            device: Device {
+                major: 0,
+                minor: 42,
+            },
+            inode: 7,
+        }
+    }
+
+    fn run_copyup_join(io: &mut CopyUpScriptIo, merged: &Path) -> Result<CopyUpJoin, String> {
+        let view = ProcessView::open(crate::process::ProcessViewId(1), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let file = std::fs::File::open("/dev/null").unwrap();
+        let held = MappedFile {
+            identity: crate::discovery::identity::FileIdentity { dev: 42, ino: 7 },
+            fs_magic: Some(K1_RED_OVERLAY_MAGIC),
+        };
+        witness_join_with_copyup(
+            io,
+            &view,
+            &file,
+            &held,
+            copyup_script_key(),
+            (0x1000, 0x2000),
+            merged,
+            &mut budget,
+        )
+    }
+
+    #[test]
+    fn copyup_fallback_first_same_file_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower0 = dir.path().join("lower0.so");
+        let lower1 = dir.path().join("lower1.so");
+        std::fs::write(&lower0, b"lower-zero").unwrap();
+        std::fs::write(&lower1, b"lower-one").unwrap();
+        let mut io = CopyUpScriptIo::scripted(
+            vec![
+                WitnessVerdict::OtherFile,
+                WitnessVerdict::OtherFile,
+                WitnessVerdict::SameFile,
+            ],
+            vec![lower0.clone(), lower1.clone()],
+        );
+        io.serve(&lower0, std::fs::File::open(&lower0).unwrap());
+        io.serve(&lower1, std::fs::File::open(&lower1).unwrap());
+        let proof = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Ok(CopyUpJoin::LowerProven(proof)) => proof,
+            other => panic!("the second lower candidate proves: {other:?}"),
+        };
+        assert_eq!(proof.candidate, 1, "the proof carries the winning index");
+        assert_eq!(proof.mapped, io.held, "the proof carries the lower held");
+        assert_eq!(io.prove_calls, 3, "held plus two lower queries");
+        assert_eq!(io.opened, vec![lower0, lower1], "candidates open in order");
+    }
+
+    #[test]
+    fn copyup_fallback_held_same_file_skips_candidates() {
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::SameFile],
+            vec![PathBuf::from("/lower/lib.so")],
+        );
+        match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Ok(CopyUpJoin::Held) => {}
+            other => panic!("the held file joins without a fallback: {other:?}"),
+        }
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+        assert!(io.opened.is_empty(), "no candidate opens");
+    }
+
+    #[test]
+    fn copyup_fallback_exhausted_held_keeps_gap() {
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile],
+            vec![PathBuf::from("/lower/lib.so")],
+        );
+        io.exhaust();
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("an exhausted held query refuses: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            WitnessVerdict::Failed(WitnessFailure::BudgetExhausted)
+                .gap_reason()
+                .expect("the exhausted verdict refuses"),
+            "the held exhaustion reason, byte-identical"
+        );
+        assert_eq!(io.prove_calls, 0, "no query runs past exhaustion");
+        assert!(io.opened.is_empty(), "no candidate opens");
+    }
+
+    #[test]
+    fn copyup_fallback_exhaustion_mid_search_stops() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("lower.so");
+        std::fs::write(&lower, b"lower").unwrap();
+        let mut io = CopyUpScriptIo::scripted(vec![WitnessVerdict::OtherFile], vec![lower.clone()]);
+        io.serve(&lower, std::fs::File::open(&lower).unwrap());
+        io.witness_used = 7;
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("exhaustion mid-search refuses: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            WitnessVerdict::OtherFile
+                .gap_reason()
+                .expect("the other-file verdict refuses"),
+            "no proven lower keeps the held query's reason"
+        );
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+        assert_eq!(
+            io.opened,
+            vec![lower],
+            "the candidate opens, then the search stops"
+        );
+    }
+
+    #[test]
+    fn copyup_fallback_unopenable_candidate_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::write(&good, b"good").unwrap();
+        let bad = PathBuf::from("/lower/missing.so");
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile, WitnessVerdict::SameFile],
+            vec![bad.clone(), good.clone()],
+        );
+        io.serve(&good, std::fs::File::open(&good).unwrap());
+        let proof = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Ok(CopyUpJoin::LowerProven(proof)) => proof,
+            other => panic!("the openable candidate proves: {other:?}"),
+        };
+        assert_eq!(proof.candidate, 1, "the proof carries the winning index");
+        assert_eq!(io.prove_calls, 2, "held plus the openable query");
+        assert_eq!(io.opened, vec![bad, good], "both candidates attempted");
+    }
+
+    #[test]
+    fn copyup_fallback_no_candidates_keeps_gap() {
+        let mut io = CopyUpScriptIo::scripted(vec![WitnessVerdict::OtherFile], Vec::new());
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("no lower candidates refuses: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            WitnessVerdict::OtherFile
+                .gap_reason()
+                .expect("the other-file verdict refuses"),
+            "no proven lower keeps the held query's reason"
+        );
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+    }
+
+    #[test]
+    fn copyup_fallback_all_candidates_other_keeps_gap() {
+        let dir = tempfile::tempdir().unwrap();
+        let lower0 = dir.path().join("lower0.so");
+        let lower1 = dir.path().join("lower1.so");
+        std::fs::write(&lower0, b"lower-zero").unwrap();
+        std::fs::write(&lower1, b"lower-one").unwrap();
+        let mut io = CopyUpScriptIo::scripted(
+            vec![
+                WitnessVerdict::OtherFile,
+                WitnessVerdict::OtherFile,
+                WitnessVerdict::OtherFile,
+            ],
+            vec![lower0, lower1],
+        );
+        for candidate in io.candidates.clone() {
+            io.serve(&candidate, std::fs::File::open(&candidate).unwrap());
+        }
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("all-other candidates refuse: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            WitnessVerdict::OtherFile
+                .gap_reason()
+                .expect("the other-file verdict refuses"),
+            "no proven lower keeps the held query's reason"
+        );
+        assert_eq!(io.prove_calls, 3, "held plus two lower queries");
+    }
+
+    #[test]
+    fn copyup_fallback_held_unavailable_refuses_without_fallback() {
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::Failed(WitnessFailure::Unavailable)],
+            vec![PathBuf::from("/lower/lib.so")],
+        );
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("an unavailable held query refuses: {other:?}"),
+        };
+        assert_eq!(
+            reason,
+            WitnessVerdict::Failed(WitnessFailure::Unavailable)
+                .gap_reason()
+                .expect("the unavailable verdict refuses"),
+            "the held unavailable reason, byte-identical"
+        );
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+        assert!(io.opened.is_empty(), "no candidate opens");
     }
 
     fn k1_red_identity() -> crate::discovery::identity::FileIdentity {

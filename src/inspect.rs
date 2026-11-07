@@ -1142,6 +1142,7 @@ mod tests {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -1343,6 +1344,7 @@ mod tests {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,
@@ -1988,6 +1990,7 @@ mod tests {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: crate::process::ProcessViewId(0),
                 mount_namespace: crate::process::MountNamespaceId {
                     device: 1,

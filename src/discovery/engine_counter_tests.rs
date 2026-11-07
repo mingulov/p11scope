@@ -613,6 +613,7 @@ fn owning_module_for_test(
             key,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             path,
             tables_scan_finished: false,
             decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),

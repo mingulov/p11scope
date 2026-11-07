@@ -152,6 +152,7 @@ impl Fixture {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,

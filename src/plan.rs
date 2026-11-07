@@ -7406,6 +7406,7 @@ mod tests {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,
@@ -7468,6 +7469,7 @@ mod tests {
                 mapped_identity: None,
                 double_loaded: false,
                 same_file_loads: 1,
+                pre_copy_up: None,
                 view: ProcessViewId(0),
                 mount_namespace: MountNamespaceId {
                     device: 1,

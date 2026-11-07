@@ -161,7 +161,7 @@ impl RawObjectInstance {
     }
 }
 
-fn normalize_target_path(path: &str) -> Option<String> {
+pub(crate) fn normalize_target_path(path: &str) -> Option<String> {
     let path = Path::new(path);
     if !path.is_absolute() {
         return None;
@@ -8250,6 +8250,7 @@ pub(crate) mod test_fixture {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: ProcessViewId(key.device.minor as u32),
             mount_namespace: MountNamespaceId {
                 device: 1,
@@ -8412,6 +8413,7 @@ pub(crate) mod test_fixture {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key,
@@ -9617,6 +9619,7 @@ mod tests {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -9732,6 +9735,7 @@ mod tests {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -9809,6 +9813,7 @@ mod tests {
             mapped_identity: None,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {
@@ -11762,6 +11767,7 @@ mod tests {
             mapped_identity,
             double_loaded: false,
             same_file_loads: 1,
+            pre_copy_up: None,
             view: view.id(),
             mount_namespace: view.mount_namespace(),
             key: ObjectKey {

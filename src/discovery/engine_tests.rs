@@ -15864,9 +15864,9 @@ fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
         .arg("30")
         .spawn()
         .expect("spawn sleeper");
-    engine.views.push(
-        ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"),
-    );
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"));
     // Provider-free under a generation-admitting scope: both gate.
     assert!(engine.loader_arming_gated(ProcessViewId(0)));
     assert!(engine.loader_arming_gated(ProcessViewId(1)));

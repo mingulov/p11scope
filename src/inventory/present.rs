@@ -2458,10 +2458,14 @@ fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &Edg
         UseCoverage::Witnessed { .. } => false,
     };
     if show_coverage {
+        // The base label: the observation above already names the
+        // pre-watch window, so the edge-qualified label would repeat it.
+        // (The edge dump and dashboard coverage items, which show no
+        // observation, keep the qualified label.)
         let _ = write!(
             out,
             "; coverage {}",
-            escape_controls(&coverage_label_for_edge_at(edge, presentation.ended_ns))
+            escape_controls(&coverage_label_at(&edge.coverage, presentation.ended_ns))
         );
     }
     out.push('\n');

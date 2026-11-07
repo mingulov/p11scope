@@ -522,6 +522,23 @@ else:
         # the tarball, never push by tag alone.
         self.assertIn("image-id", bodies)
 
+    def test_container_image_selects_only_the_observer_tarball(self):
+        self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
+        body = step("Verify and stage the packaged FULL musl observer", "container-image")["run"]
+        patterns = [line.split("set -- ", 1)[1].strip() for line in body.splitlines()
+                    if line.strip().startswith("set -- p11scope-")]
+        self.assertTrue(patterns, "the staging step must select the packaged tarball by glob")
+        fixture = self.base / "tarballs"
+        fixture.mkdir()
+        observer = "p11scope-0.7.0-x86_64-linux-musl.tar.gz"
+        (fixture / observer).write_text("observer")
+        (fixture / "p11scope-discover-0.7.0-x86_64-linux-musl.tar.gz").write_text("discover")
+        # The first selection runs before extraction, when both musl tarballs
+        # the packager emits are present; it must yield exactly the observer
+        # one, or the `test "$#" -eq 1` gate fails the job on every run.
+        selected = sorted(path.name for path in fixture.glob(patterns[0]))
+        self.assertEqual(selected, [observer])
+
     def test_container_push_reaches_the_registry_only_on_a_release_tag(self):
         self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
         document = workflow()

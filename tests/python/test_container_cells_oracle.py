@@ -1409,6 +1409,46 @@ class OracleCliTest(unittest.TestCase):
             completed = run_oracle(*args)
             self.assertNotEqual(completed.returncode, 0)
 
+    def changed_args(self, work, inputs):
+        note = Path(work) / "run-note.txt"
+        note.write_text(inputs.pop("run_note"))
+        facts = Path(work) / "facts.txt"
+        facts.write_text(inputs.pop("facts_text"))
+        args = ["copy-up-changed",
+                "--pid-b-pre", str(inputs.pop("pid_b_pre")),
+                "--pid-b2", str(inputs.pop("pid_b2")),
+                "--iters-s", str(inputs.pop("iters_s")),
+                "--iters-f", str(inputs.pop("iters_f")),
+                "--run-note", str(note), "--facts-log", str(facts)]
+        for key, document in inputs.items():
+            args += [f"--{key.replace('_', '-')}",
+                     write_json(work, f"{key}.json", document)]
+        return args
+
+    def test_changed_cli_passes(self):
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(*self.changed_args(work, good_changed_inputs()))
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["check"], "copy-up-changed")
+            self.assertEqual(result["lower_module"]["sha256"], SHA_LOWER)
+            self.assertEqual(result["upper_module"]["sha256"], SHA_UPPER)
+            self.assertIn(
+                "D1-changed cell=D1-changed copy-up-stale-caller resolved: "
+                "pid=102 edge=lower-module mapped (stale ranges joined the "
+                "witness-proven lower file; the upper copy is its own module; "
+                "no gap)",
+                completed.stderr)
+
+    def test_changed_cli_refuses_mutation(self):
+        inputs = good_changed_inputs()
+        inputs["facts_text"] = facts_text()
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(*self.changed_args(work, inputs))
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("copy-up changed no bytes", completed.stderr)
+
     def test_late_reported_cli_passes(self):
         inputs = good_late_inputs()
         with tempfile.TemporaryDirectory() as work:

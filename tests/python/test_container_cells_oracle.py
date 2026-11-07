@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Container-cells oracle (D1 copy-up, N4 late-reported): healthy twins pass, every check refuses its mutation.
+"""Container-cells oracle (D1 copy-up, D1-changed, N4 late-reported): healthy twins pass, every check refuses its mutation.
 
 D1 follows the live D1-extended shape (binding): pre collapses B-pre onto
 A's module on the kernel leg while the userspace leg honestly gaps both
@@ -88,18 +88,22 @@ def span_gaps():
 
 
 def inventory(edges, gaps=(), observer="initial", backend="kernel",
-              fallback="anchor_not_installed", modules=None, paths=None):
+              fallback="anchor_not_installed", modules=None, paths=None,
+              shas=None):
     """One inventory v1 document over callers A/B-pre/B-post/B-span (D1) or O/L (N4).
 
     `edges` is a list of edge(...) dicts; `modules` maps module id ->
-    (major, minor, inode); `paths` maps module id -> [paths]. Callers always
-    carries every pid the legs need; gaps are (subject, reason, pid|None).
+    (major, minor, inode); `paths` maps module id -> [paths]; `shas`
+    maps module id -> sha256 (omitted identities stay sha-less, as
+    before). Callers always carries every pid the legs need; gaps are
+    (subject, reason, pid|None).
     """
     pids = [PID_A, PID_B_PRE, PID_B_POST, PID_B_SPAN, PID_B3, PID_O, PID_L]
     callers = [{"id": f"c{i}", "pid": pid} for i, pid in enumerate(pids)]
     by_pid = {pid: f"c{i}" for i, pid in enumerate(pids)}
     modules = modules if modules is not None else {"m0": (0, 35, 7)}
     paths = paths if paths is not None else {mid: [PROVIDER] for mid in modules}
+    shas = shas if shas is not None else {}
     return {
         "schema": "p11scope/inventory/v1",
         "observation": {"identity": {"backend": backend, "fallback": fallback}},
@@ -107,7 +111,8 @@ def inventory(edges, gaps=(), observer="initial", backend="kernel",
         "modules": [{"id": mid,
                      "paths": paths[mid],
                      "identity": {"device": {"major": key[0], "minor": key[1]},
-                                  "inode": key[2]}}
+                                  "inode": key[2],
+                                  **({"sha256": shas[mid]} if mid in shas else {})}}
                     for mid, key in sorted(modules.items())],
         "edges": [{"caller": by_pid[item["pid"]], "module": item["module"],
                    "mapping": {"evidence": item["evidence"], "state": item["state"],
@@ -254,6 +259,88 @@ def check_copy_up(**overrides):
     inputs = good_copy_up_inputs(overrides.pop("lane", "B"))
     inputs.update(overrides)
     return ORACLE["copy_up"](**inputs)
+
+
+ITERS_S, ITERS_F = 250, 100
+SHA_LOWER = "8453e1bde7dac7a24ed1bab11786fa8641a0ff2b4093c5f027ceaf368a7a438d"
+SHA_UPPER = "8d8a5c98d7a0b1c2e3f4a5b6c7d8e9f0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6"
+# The witness-proven pair files two objects under one maps key: the
+# same-key shape is the good case (proof routes, not the key).
+CHANGED_MODULES = {"m8": KEY_B, "m9": KEY_B}
+CHANGED_SHAS = {"m8": SHA_LOWER, "m9": SHA_UPPER}
+NOTE_CHANGED = ("run log: copy-up-stale-caller disclosed for B-pre "
+                "(witness-proven lower on its key with layer pre_copy_up, "
+                "upper copy its own module, both mappers ledgered exact)")
+
+
+def changed_facts(**overrides):
+    """facts.log proving the different-bytes copy-up (upper bytes differ)."""
+    return facts_text(upper_sha=SHA_UPPER, **overrides)
+
+
+def changed_kernel_edges():
+    return [edge(PID_B_PRE, "m8"), edge(PID_B_SPAN, "m9")]
+
+
+def changed_profile(iters_s=ITERS_S, iters_f=ITERS_F):
+    """The cgroup-B profile over the different-bytes copy-up: two exact rows.
+
+    The lower row carries the stale ledger (S) with the pre_copy_up
+    marker; the upper row carries the fresh ledger (F) with no marker.
+    Both exact, zero loss.
+    """
+    lower = {"dev": [0, 140], "ino": 100, "sha256": SHA_LOWER}
+    upper = {"dev": [0, 140], "ino": 100, "sha256": SHA_UPPER}
+    functions = []
+    for name in NAMES:
+        functions.append({"names": [name], "calls": iters_s, "errors": 0,
+                          "module": dict(lower), "module_ambiguous": False})
+        functions.append({"names": [name], "calls": iters_f, "errors": 0,
+                          "module": dict(upper), "module_ambiguous": False})
+    functions.append({"calls": 0, "errors": 0, "names": ["C_Login"],
+                      "module": None})
+    return {
+        "capture": {"scope": "cgroup",
+                    "modules": [{"path": PROVIDER, **lower},
+                                {"path": PROVIDER, **upper}]},
+        "evidence": {
+            "discovery": [{"path": PROVIDER, **lower, "build_id": "bd",
+                           "layer": "pre_copy_up"},
+                          {"path": PROVIDER, **upper, "build_id": "bd"}],
+            "attached_probes": 136,
+            "event_loss": 0,
+            "in_flight_at_end": 0,
+            "verdict_detail": "attribution_only",
+            "pid_namespace": {"observer": "initial", "kernel_pids": "initial",
+                              "proc_pids": "observer"},
+            "gap_classes": {"observation": {"causes": [], "status": "exact"}},
+        },
+        "functions": functions,
+    }
+
+
+def good_changed_inputs():
+    """Healthy D1-changed legs: dual attribution, dual exact counts."""
+    return {
+        "kernel": inventory(
+            changed_kernel_edges(), backend="kernel",
+            fallback="anchor_not_installed", modules=dict(CHANGED_MODULES),
+            shas=dict(CHANGED_SHAS)),
+        "userspace": gap_only(PID_B_PRE, PID_B_SPAN),
+        "profile": changed_profile(),
+        "pid_b_pre": PID_B_PRE,
+        "pid_b2": PID_B_SPAN,
+        "iters_s": ITERS_S,
+        "iters_f": ITERS_F,
+        "run_note": NOTE_CHANGED,
+        "facts_text": changed_facts(),
+    }
+
+
+def check_changed(**overrides):
+    inputs = good_changed_inputs()
+    inputs.update(overrides)
+    return ORACLE["copy_up_changed"](**inputs)
 
 
 def with_ambient(document, pid=9999, module="m9", key=(0, 35, 356176),
@@ -869,6 +956,141 @@ class CopyUpTest(unittest.TestCase):
         self.assertIn(PID_A, edges)
         self.assertNotIn(PID_B_PRE, edges)
         self.assertIn(PID_B_PRE, pid_of.values())
+
+
+class CopyUpChangedTest(unittest.TestCase):
+    """D1-changed: different-bytes copy-up, both mappers ledgered exact.
+
+    The kernel leg attributes B-pre to the witness-proven lower module
+    and B2 to the upper module (same maps key, routed by proof); the
+    userspace leg honestly gaps both; the cgroup-B profile counts the
+    stale ledger S on the pre_copy_up row and the fresh ledger F on the
+    upper row, both exact.
+    """
+
+    def test_changed_healthy_passes(self):
+        result = check_changed()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["check"], "copy-up-changed")
+        self.assertEqual(result["lower_module"]["sha256"], SHA_LOWER)
+        self.assertEqual(result["upper_module"]["sha256"], SHA_UPPER)
+        self.assertEqual(result["lower_stack_b"], 3)
+
+    def test_changed_same_bytes_facts_fail(self):
+        """Same-bytes evidence is not this cell (D1 owns that shape)."""
+        with self.assertRaises(AssertionError):
+            check_changed(facts_text=facts_text())
+
+    def test_changed_same_inode_facts_fail(self):
+        with self.assertRaises(AssertionError):
+            check_changed(facts_text=changed_facts(upper_dev=140,
+                                                   upper_ino=100))
+
+    def test_changed_single_row_fails(self):
+        """One kernel module cannot carry both mappers."""
+        kernel = inventory(
+            [edge(PID_B_PRE, "m8"), edge(PID_B_SPAN, "m8")],
+            backend="kernel", fallback="anchor_not_installed",
+            modules={"m8": KEY_B}, shas={"m8": SHA_LOWER})
+        with self.assertRaises(AssertionError):
+            check_changed(kernel=kernel)
+
+    def test_changed_swapped_edges_fail(self):
+        """B-pre on the upper row (or B2 on the lower) is misattribution."""
+        kernel = inventory(
+            [edge(PID_B_PRE, "m9"), edge(PID_B_SPAN, "m8")],
+            backend="kernel", fallback="anchor_not_installed",
+            modules=dict(CHANGED_MODULES), shas=dict(CHANGED_SHAS))
+        with self.assertRaises(AssertionError):
+            check_changed(kernel=kernel)
+
+    def test_changed_b2_unprobed_fails(self):
+        """The fresh mapper joins mapped deep_scan, never unprobed."""
+        kernel = inventory(
+            [edge(PID_B_PRE, "m8"),
+             edge(PID_B_SPAN, "m9", state="uncertain",
+                  cov_reason="not_attached")],
+            backend="kernel", fallback="anchor_not_installed",
+            modules=dict(CHANGED_MODULES), shas=dict(CHANGED_SHAS))
+        with self.assertRaises(AssertionError):
+            check_changed(kernel=kernel)
+
+    def test_changed_collapse_fails(self):
+        """No collapse may hide the lower/upper split."""
+        kernel = inventory(
+            changed_kernel_edges(), [collapse_gap()], backend="kernel",
+            fallback="anchor_not_installed", modules=dict(CHANGED_MODULES),
+            shas=dict(CHANGED_SHAS))
+        with self.assertRaises(AssertionError):
+            check_changed(kernel=kernel)
+
+    def test_changed_identity_loss_fails(self):
+        kernel = inventory(
+            changed_kernel_edges(), [("x", "identity_mismatch", None)],
+            backend="kernel", fallback="anchor_not_installed",
+            modules=dict(CHANGED_MODULES), shas=dict(CHANGED_SHAS))
+        with self.assertRaises(AssertionError):
+            check_changed(kernel=kernel)
+
+    def test_changed_userspace_edged_fails(self):
+        """The negative leg never edges: without the witness, no join."""
+        userspace = inventory(
+            [edge(PID_B_PRE, "m8")], [unproven_gap(PID_B_SPAN)],
+            backend="userspace", fallback=None,
+            modules={"m8": KEY_B}, shas={"m8": SHA_LOWER})
+        with self.assertRaises(AssertionError):
+            check_changed(userspace=userspace)
+
+    def test_changed_lower_row_unmarked_fails(self):
+        """The profile's lower row carries the pre_copy_up marker."""
+        profile = changed_profile()
+        del profile["evidence"]["discovery"][0]["layer"]
+        with self.assertRaises(AssertionError):
+            check_changed(profile=profile)
+
+    def test_changed_upper_row_marked_fails(self):
+        """The marker travels only on the lower file's row."""
+        profile = changed_profile()
+        profile["evidence"]["discovery"][1]["layer"] = "pre_copy_up"
+        with self.assertRaises(AssertionError):
+            check_changed(profile=profile)
+
+    def test_changed_swapped_counts_fail(self):
+        """S counts on the lower row, F on the upper row — never swapped."""
+        profile = changed_profile(iters_s=ITERS_F, iters_f=ITERS_S)
+        with self.assertRaises(AssertionError):
+            check_changed(profile=profile)
+
+    def test_changed_single_profile_row_fails(self):
+        profile = changed_profile()
+        profile["capture"]["modules"] = profile["capture"]["modules"][:1]
+        profile["evidence"]["discovery"] = profile["evidence"]["discovery"][:1]
+        profile["functions"] = [row for row in profile["functions"]
+                                if row.get("module", {}) is None
+                                or row["module"]["sha256"] == SHA_LOWER]
+        with self.assertRaises(AssertionError):
+            check_changed(profile=profile)
+
+    def test_changed_equal_ledgers_fail(self):
+        """Equal S and F cannot pin the routing direction."""
+        with self.assertRaises(AssertionError):
+            check_changed(iters_s=ITERS_F)
+
+    def test_changed_different_overlay_keys_also_pass(self):
+        """The pair routes by proof: distinct overlay keys pass too."""
+        upper_key = (0, 140, 200)
+        kernel = inventory(
+            changed_kernel_edges(), backend="kernel",
+            fallback="anchor_not_installed",
+            modules={"m8": KEY_B, "m9": upper_key},
+            shas=dict(CHANGED_SHAS))
+        result = check_changed(kernel=kernel)
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["upper_module"]["ino"], 200)
+
+    def test_changed_note_without_stale_caller_fails(self):
+        with self.assertRaises(AssertionError):
+            check_changed(run_note="run log: no disclosure here")
 
 
 class LateReportedTest(unittest.TestCase):

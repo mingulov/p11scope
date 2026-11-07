@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-3.0-or-later
-"""Container-cells oracle for scripts/docker-shared-layer-e2e.sh (D1) and scripts/late-provider-negative.sh (N4).
+"""Container-cells oracle for scripts/docker-shared-layer-e2e.sh (D1), scripts/docker-copyup-changed-e2e.sh (D1-changed) and scripts/late-provider-negative.sh (N4).
 
-Subcommands: copy-up (D1 shared-layer / copy-up), late-reported (N4 never-seen
+Subcommands: copy-up (D1 shared-layer / copy-up), copy-up-changed
+(D1-changed different-bytes copy-up), late-reported (N4 never-seen
 late provider), --self-test. Every check ships a mutation this oracle refuses;
 see --self-test and tests/python/test_container_cells_oracle.py.
 
@@ -33,6 +34,17 @@ in skipped, so B2's in-span round is uncounted but never silent). Fresh
 captures after B restarts attribute B exactly on its own key. The
 observer runs on the host in the initial PID namespace, so no
 pid_namespace cause is allowed.
+
+D1-changed patches one unmapped provider byte inside B (the holder
+image's patch-unmapped tool), so the copy-up changes both the inode
+and the bytes and no byte-identical collapse can preempt the witness.
+The kernel leg attributes B-pre to the witness-proven lower module and
+B2 to the upper module (the pair routes by proof under one maps key or
+two); the userspace leg honestly gaps both joins (the negative); the
+cgroup-B profile counts the stale ledger S on the pre_copy_up row and
+the fresh ledger F on the upper row, both exact, with S != F so a
+swapped routing fails. All legs are settled single-pass captures (no
+spanning), and the loss gate is global zero on every leg.
 
 N4 follows the run-1 ruling: O exact and gap-free; L passes when scanned and
 EITHER a named gap from the frozen vocabulary references the late module OR
@@ -726,6 +738,197 @@ def late_reported(document, pid_o, pid_l, late_module, iters_l,
             "boundary": boundary}
 
 
+def changed_caller_line(pid):
+    return (f"D1-changed cell=D1-changed copy-up-stale-caller resolved: "
+            f"pid={pid} edge=lower-module mapped (stale ranges joined the "
+            f"witness-proven lower file; the upper copy is its own module; "
+            f"no gap)")
+
+
+def require_changed_profile_dual_rows(document, iters_s, iters_f, lower_sha,
+                                      upper_sha, label,
+                                      module_suffix=PROVIDER):
+    """The cgroup-B profile over the different-bytes copy-up: two exact rows.
+
+    The lower row carries the stale ledger S with the pre_copy_up marker;
+    the upper row carries the fresh ledger F with no marker. Both rows
+    exact (zero errors, unambiguous), zero loss, zero in-flight rows: a
+    same-bytes collapse, a swapped routing, or a dropped side fails.
+    """
+    modules = [module for module in document["capture"]["modules"]
+               if module["path"].endswith(module_suffix)]
+    assert len(modules) == 2, (label, "want the lower and upper rows",
+                               modules)
+    by_sha = {}
+    for module in modules:
+        assert isinstance(module.get("sha256"), str), (label, module)
+        by_sha[module["sha256"]] = module
+    assert set(by_sha) == {lower_sha, upper_sha}, \
+        (label, "row identities", sorted(by_sha))
+    rows = [row for row in document["evidence"]["discovery"]
+            if row["path"].endswith(module_suffix)]
+    assert len(rows) == 2, (label, "want the lower and upper rows", rows)
+    lower_rows = [row for row in rows if row.get("sha256") == lower_sha]
+    upper_rows = [row for row in rows if row.get("sha256") == upper_sha]
+    assert len(lower_rows) == 1 and len(upper_rows) == 1, \
+        (label, "row identities", rows)
+    assert lower_rows[0].get("layer") == "pre_copy_up", \
+        (label, "lower row unmarked", lower_rows)
+    assert upper_rows[0].get("layer") is None, \
+        (label, "marker off the lower row", upper_rows)
+    for name in sorted(LEDGER_FUNCTIONS):
+        named = [row for row in document["functions"]
+                 if row.get("names") == [name] and row["calls"]]
+        assert len(named) == 2, \
+            (label, name, "want the stale and fresh rows", named)
+        by_module = {}
+        for row in named:
+            module = row.get("module")
+            assert isinstance(module, dict), (label, name, row)
+            assert isinstance(module.get("sha256"), str), (label, name, row)
+            by_module[module["sha256"]] = row
+        assert set(by_module) == {lower_sha, upper_sha}, \
+            (label, name, "row identities", sorted(by_module))
+        assert by_module[lower_sha]["calls"] == iters_s, \
+            (label, name, "stale count", by_module[lower_sha], iters_s)
+        assert by_module[upper_sha]["calls"] == iters_f, \
+            (label, name, "fresh count", by_module[upper_sha], iters_f)
+        for row in named:
+            assert row["errors"] == 0, (label, name, row)
+            assert row.get("module_ambiguous") is False, (label, name, row)
+    evidence = document["evidence"]
+    assert document["capture"]["scope"] == "cgroup", (label, document["capture"])
+    require_initial_observer(evidence, label)
+    assert evidence["attached_probes"] > 0, (label, evidence)
+    assert evidence["event_loss"] == 0, (label, evidence)
+    assert evidence["in_flight_at_end"] == 0, (label, evidence)
+    assert evidence["verdict_detail"] != "concrete_gap", (label, evidence)
+    assert evidence["gap_classes"]["observation"]["causes"] == [], (label, evidence)
+
+
+def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
+                    iters_f, run_note, facts_text, module_suffix=PROVIDER):
+    """D1-changed: different-bytes copy-up, both mappers ledgered, both exact.
+
+    pid_b_pre mapped the provider before the copy-up and keeps the lower
+    file; pid_b2 mapped after and runs the upper copy. facts_text is
+    facts.log, which proves the copy-up changed both the inode and the
+    bytes (an unmapped-byte patch: no byte-identical collapse can preempt
+    the witness). The kernel leg attributes B-pre to the witness-proven
+    lower module and B2 to the upper module (the pair routes by proof:
+    one maps key or two, the sha split decides); the userspace leg
+    honestly gaps both joins (no witness, no edges — the negative); the
+    cgroup-B profile counts the stale ledger S on the pre_copy_up row
+    and the fresh ledger F on the upper row, both exact. S and F differ
+    so a swapped routing fails.
+    """
+    assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
+    facts = parse_facts(facts_text)
+    for key in ("stat-b-pre", "sha-b-pre", "upper-stat-b", "upper-sha-b",
+                "lower-stack-b"):
+        assert key in facts, (f"facts.log names no {key}", sorted(facts))
+    lower_stack = int(facts["lower-stack-b"])
+    assert lower_stack >= 2, ("B's mount stacks a single lower layer", lower_stack)
+    lower_key = stat_key(facts["stat-b-pre"])
+    lower_sha = facts["sha-b-pre"]
+    upper_sha = facts["upper-sha-b"]
+    assert facts["upper-stat-b"] != facts["stat-b-pre"], \
+        ("copy-up changed no inode", facts["upper-stat-b"])
+    assert upper_sha != lower_sha, \
+        "copy-up changed no bytes (not different-bytes)"
+    assert iters_s != iters_f, \
+        "equal ledgers cannot pin the routing direction"
+    copy_up_proof = {"upper": facts["upper-stat-b"], "lower": facts["stat-b-pre"],
+                     "lower_sha256": lower_sha, "upper_sha256": upper_sha}
+
+    for label, document in (("kernel", kernel), ("userspace", userspace)):
+        require_initial_observer(document, label)
+    kernel_proof = {"finding": KERNEL_PROOF_FINDING, "runs": {}}
+    for label, document, want in (("kernel", kernel, "kernel"),
+                                  ("userspace", userspace, "userspace")):
+        identity = document["observation"]["identity"]
+        assert identity["backend"] == want, (label, identity)
+        if want == "kernel":
+            fallback = identity["fallback"]
+            assert fallback is None or fallback in KERNEL_FALLBACK_LABELS, \
+                (label, "kernel run with an unknown fallback", identity)
+        kernel_proof["runs"][label] = {"backend": identity["backend"],
+                                       "fallback": identity["fallback"]}
+
+    # Kernel: exactly the lower and upper provider modules; B-pre edges
+    # only the lower (mapped, deep_scan, gap-free), B2 only the upper
+    # (mapped, deep_scan, gap-free). No collapse hides the split, no
+    # identity loss anywhere: the loss gate is global zero here too.
+    label = "kernel"
+    provider_modules = [module for module in kernel["modules"]
+                        if any(p.endswith(module_suffix)
+                               for p in module["paths"])]
+    assert len(provider_modules) == 2, \
+        (label, "want the lower and upper modules", provider_modules)
+    lower_ids = [m["id"] for m in provider_modules
+                 if m.get("identity", {}).get("sha256") == lower_sha]
+    upper_ids = [m["id"] for m in provider_modules
+                 if m.get("identity", {}).get("sha256") == upper_sha]
+    assert len(lower_ids) == 1 and len(upper_ids) == 1, \
+        (label, "module identities", provider_modules)
+    assert lower_ids != upper_ids, (label, "one row carries both files")
+    lower_mod = next(m for m in provider_modules if m["id"] == lower_ids[0])
+    upper_mod = next(m for m in provider_modules if m["id"] == upper_ids[0])
+    lower_device = lower_mod["identity"]["device"]
+    assert (lower_device["major"], lower_device["minor"],
+            lower_mod["identity"]["inode"]) == lower_key, \
+        (label, "lower module off B's pre key", lower_mod, lower_key)
+    upper_device = upper_mod["identity"]["device"]
+    upper_key = (upper_device["major"], upper_device["minor"],
+                 upper_mod["identity"]["inode"])
+    k_pid, k_edges = inventory_maps(kernel, module_suffix)
+    _k_pid, k_records = edge_records(kernel, module_suffix)
+    assert pid_b_pre in k_edges, (label, pid_b_pre, sorted(k_edges))
+    assert pid_b2 in k_edges, (label, pid_b2, sorted(k_edges))
+    assert sorted(k_edges[pid_b_pre]) == lower_ids, \
+        (label, "B-pre edges", pid_b_pre, k_edges.get(pid_b_pre), lower_ids)
+    assert sorted(k_edges[pid_b2]) == upper_ids, \
+        (label, "B2 edges", pid_b2, k_edges.get(pid_b2), upper_ids)
+    for pid, mid in ((pid_b_pre, lower_ids[0]), (pid_b2, upper_ids[0])):
+        mapping = k_records[(pid, mid)]["mapping"]
+        assert mapping["evidence"] == "deep_scan", (label, pid, mapping)
+        assert mapping["state"] == "mapped", (label, pid, mapping)
+    for pid in (pid_b_pre, pid_b2):
+        assert not unproven_gaps_for(kernel, k_pid, pid, module_suffix), \
+            (label, "joined yet still carries the gap", pid)
+    assert collapse_gaps(kernel, module_suffix) == [], \
+        (label, "a collapse hides the split")
+    assert not has_identity_loss(kernel["gaps"]), (label, "identity loss")
+
+    # Userspace: the negative — both joins honestly gapped, never edged.
+    require_userspace_gap_only(userspace, "userspace", [pid_b_pre, pid_b2],
+                               {lower_key, upper_key}, module_suffix)
+
+    assert "copy-up-stale-caller" in run_note, \
+        "run log without the copy-up-stale-caller disclosure"
+    for token in ("lower", "upper", "pre_copy_up"):
+        assert token in run_note, \
+            ("run log without the copy-up proof facts", token)
+
+    require_changed_profile_dual_rows(profile, iters_s, iters_f, lower_sha,
+                                      upper_sha, "profile-b", module_suffix)
+    return {"check": "copy-up-changed", "ok": True,
+            "lower_module": {"id": lower_ids[0],
+                             "dev": [lower_device["major"],
+                                     lower_device["minor"]],
+                             "ino": lower_mod["identity"]["inode"],
+                             "sha256": lower_sha},
+            "upper_module": {"id": upper_ids[0],
+                             "dev": [upper_device["major"],
+                                     upper_device["minor"]],
+                             "ino": upper_mod["identity"]["inode"],
+                             "sha256": upper_sha},
+            "copy_up_proof": copy_up_proof,
+            "lower_stack_b": lower_stack,
+            "kernel_proof": kernel_proof,
+            "stale_caller": changed_caller_line(pid_b_pre)}
+
+
 # ---------------------------------------------------------------- self-test
 
 
@@ -1288,6 +1491,208 @@ def self_test():
                                                modules=ST_MODULES_SPAN))
     refuses("unknown lane", lambda: copy_up(**{**good_copy_up("B"), "lane": "C"}))
 
+    ch_lower_sha = "a" * 64
+    ch_upper_sha = "b" * 64
+    ch_facts = ("stat-a-pre=138:100 941088 sha-a-pre=" + ch_lower_sha + "\n"
+                "stat-b-pre=140:100 941088 sha-b-pre=" + ch_lower_sha +
+                " lower-stack-b=3\n"
+                "upper-stat-b=51:200 941088 upper-sha-b=" + ch_upper_sha + "\n")
+    ch_note = ("run log: copy-up-stale-caller disclosed for B-pre "
+               "(witness-proven lower on its key with layer pre_copy_up, "
+               "upper copy its own module, both mappers ledgered exact)")
+    ch_modules = (("m8", ST_KEY_B, ST_PROVIDER), ("m9", ST_KEY_B, ST_PROVIDER))
+
+    def ch_inventory(edges, gaps=(), backend="kernel", modules=ch_modules):
+        document = good_inventory(
+            edges, gaps, backend=backend,
+            fallback="anchor_not_installed" if backend == "kernel" else None,
+            modules=modules)
+        shas = {"m8": ch_lower_sha, "m9": ch_upper_sha}
+        for module in document["modules"]:
+            if module["id"] in shas:
+                module["identity"]["sha256"] = shas[module["id"]]
+        return document
+
+    def good_changed_profile(iters_s=250, iters_f=100):
+        lower = {"dev": [0, 140], "ino": 100, "sha256": ch_lower_sha}
+        upper = {"dev": [0, 140], "ino": 100, "sha256": ch_upper_sha}
+        functions = []
+        for name in sorted(LEDGER_FUNCTIONS):
+            functions.append({"names": [name], "calls": iters_s, "errors": 0,
+                              "module": dict(lower), "module_ambiguous": False})
+            functions.append({"names": [name], "calls": iters_f, "errors": 0,
+                              "module": dict(upper), "module_ambiguous": False})
+        functions.append({"calls": 0, "errors": 0, "names": ["C_Login"],
+                          "module": None})
+        return {
+            "capture": {"scope": "cgroup",
+                        "modules": [{"path": ST_PROVIDER, **lower},
+                                    {"path": ST_PROVIDER, **upper}]},
+            "evidence": {
+                "discovery": [{"path": ST_PROVIDER, **lower,
+                               "build_id": "bd", "layer": "pre_copy_up"},
+                              {"path": ST_PROVIDER, **upper,
+                               "build_id": "bd"}],
+                "attached_probes": 136,
+                "event_loss": 0,
+                "in_flight_at_end": 0,
+                "verdict_detail": "attribution_only",
+                "pid_namespace": {"observer": "initial",
+                                  "kernel_pids": "initial",
+                                  "proc_pids": "observer"},
+                "gap_classes": {"observation": {"causes": [],
+                                                "status": "exact"}},
+            },
+            "functions": functions,
+        }
+
+    def good_changed():
+        return {
+            "kernel": ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")]),
+            "userspace": good_gap_only(102, 104),
+            "profile": good_changed_profile(),
+            "pid_b_pre": 102,
+            "pid_b2": 104,
+            "iters_s": 250,
+            "iters_f": 100,
+            "run_note": ch_note,
+            "facts_text": ch_facts,
+        }
+
+    def mutate_changed(label, **overrides):
+        inputs = good_changed()
+        inputs.update(overrides)
+        refuses(label, lambda: copy_up_changed(**inputs))
+
+    healthy_changed = copy_up_changed(**good_changed())
+    assert healthy_changed["check"] == "copy-up-changed"
+    assert healthy_changed["lower_module"]["sha256"] == ch_lower_sha
+    assert healthy_changed["upper_module"]["sha256"] == ch_upper_sha
+    assert healthy_changed["lower_stack_b"] == 3
+    assert "edge=lower-module mapped" in healthy_changed["stale_caller"]
+    assert changed_caller_line(102) == \
+        ("D1-changed cell=D1-changed copy-up-stale-caller resolved: pid=102 "
+         "edge=lower-module mapped (stale ranges joined the witness-proven "
+         "lower file; the upper copy is its own module; no gap)")
+    mutate_changed("changed empty facts", facts_text="  \n")
+    mutate_changed("changed facts without the upper sha",
+                   facts_text="stat-b-pre=140:100 sha-b-pre=abc "
+                              "upper-stat-b=51:200 lower-stack-b=3\n")
+    mutate_changed("changed single lower layer",
+                   facts_text=ch_facts.replace("lower-stack-b=3",
+                                               "lower-stack-b=1"))
+    mutate_changed("changed copy-up kept the inode",
+                   facts_text=ch_facts.replace("upper-stat-b=51:200",
+                                               "upper-stat-b=140:100"))
+    mutate_changed("changed copy-up kept the bytes",
+                   facts_text=ch_facts.replace(ch_upper_sha, ch_lower_sha))
+    mutate_changed("changed equal ledgers", iters_s=100)
+    mutate_changed("changed kernel leg with userspace identity",
+                   kernel=ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")],
+                                       backend="userspace"))
+    unknown_fallback = ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")])
+    unknown_fallback["observation"]["identity"]["fallback"] = "bogus_label"
+    mutate_changed("changed kernel run with unknown fallback",
+                   kernel=unknown_fallback)
+    drifted_user = good_gap_only(102, 104)
+    drifted_user["pid_namespace"]["observer"] = "other"
+    mutate_changed("changed userspace observer drift", userspace=drifted_user)
+    mutate_changed("changed single kernel module",
+                   kernel=ch_inventory([st_edge(102, "m8"),
+                                        st_edge(104, "m8")],
+                                       modules=(("m8", ST_KEY_B, ST_PROVIDER),)))
+    both_lower = ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")])
+    for module in both_lower["modules"]:
+        module["identity"]["sha256"] = ch_lower_sha
+    mutate_changed("changed upper identity missing", kernel=both_lower)
+    off_key = ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")],
+                           modules=(("m8", (0, 141, 100), ST_PROVIDER),
+                                    ("m9", ST_KEY_B, ST_PROVIDER)))
+    mutate_changed("changed lower module off B's pre key", kernel=off_key)
+    mutate_changed("changed B2 without an edge",
+                   kernel=ch_inventory([st_edge(102, "m8")]))
+    mutate_changed("changed mappers swapped",
+                   kernel=ch_inventory([st_edge(102, "m9"),
+                                        st_edge(104, "m8")]))
+    mutate_changed("changed B-pre edge not deep_scan",
+                   kernel=ch_inventory([st_edge(102, "m8", evidence="maps_match"),
+                                        st_edge(104, "m9")]))
+    mutate_changed("changed B2 admitted yet still gapped",
+                   kernel=ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")],
+                                       [(ST_PROVIDER, ST_STALE_GAP, 104)]))
+    mutate_changed("changed kernel collapse hides the split",
+                   kernel=ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")],
+                                       [st_collapse()]))
+    mutate_changed("changed kernel identity loss",
+                   kernel=ch_inventory([st_edge(102, "m8"), st_edge(104, "m9")],
+                                       [("x", "identity_mismatch: stale",
+                                         None)]))
+    mutate_changed("changed userspace leg edged the provider",
+                   userspace=ch_inventory([st_edge(102, "m8")],
+                                          [st_unproven_gap(104)],
+                                          backend="userspace",
+                                          modules=(("m8", ST_KEY_B,
+                                                    ST_PROVIDER),)))
+    mutate_changed("changed run note without the disclosure",
+                   run_note="run log: no disclosure here")
+    mutate_changed("changed run note without the marker token",
+                   run_note=ch_note.replace("pre_copy_up", "layer"))
+    single_capture = good_changed_profile()
+    single_capture["capture"]["modules"] = single_capture["capture"]["modules"][:1]
+    mutate_changed("changed profile single capture row",
+                   profile=single_capture)
+    drifted_capture = good_changed_profile()
+    drifted_capture["capture"]["modules"][1]["sha256"] = "c" * 64
+    mutate_changed("changed profile capture identity drift",
+                   profile=drifted_capture)
+    single_discovery = good_changed_profile()
+    single_discovery["evidence"]["discovery"] = \
+        single_discovery["evidence"]["discovery"][:1]
+    mutate_changed("changed profile single discovery row",
+                   profile=single_discovery)
+    unmarked = good_changed_profile()
+    del unmarked["evidence"]["discovery"][0]["layer"]
+    mutate_changed("changed profile lower row unmarked", profile=unmarked)
+    marked_upper = good_changed_profile()
+    marked_upper["evidence"]["discovery"][1]["layer"] = "pre_copy_up"
+    mutate_changed("changed profile marker off the lower row",
+                   profile=marked_upper)
+    dropped_fresh = good_changed_profile()
+    dropped_fresh["functions"] = [
+        row for row in dropped_fresh["functions"]
+        if row.get("module", {}) is None
+        or row["module"]["sha256"] == ch_lower_sha
+        or row.get("names") != ["C_GenerateRandom"]]
+    mutate_changed("changed profile fresh row dropped", profile=dropped_fresh)
+    swapped_counts = good_changed_profile(iters_s=100, iters_f=250)
+    mutate_changed("changed profile counts swapped", profile=swapped_counts)
+    errored = good_changed_profile()
+    errored["functions"][0]["errors"] = 1
+    mutate_changed("changed profile row errored", profile=errored)
+    ambiguous = good_changed_profile()
+    ambiguous["functions"][1]["module_ambiguous"] = True
+    mutate_changed("changed profile module ambiguous", profile=ambiguous)
+    scoped = good_changed_profile()
+    scoped["capture"]["scope"] = "system"
+    mutate_changed("changed profile off the cgroup scope", profile=scoped)
+    drifted_profile = good_changed_profile()
+    drifted_profile["evidence"]["pid_namespace"]["observer"] = "other"
+    mutate_changed("changed profile observer drift", profile=drifted_profile)
+    unprobed = good_changed_profile()
+    unprobed["evidence"]["attached_probes"] = 0
+    mutate_changed("changed profile without probes", profile=unprobed)
+    lossy = good_changed_profile()
+    lossy["evidence"]["event_loss"] = 1
+    mutate_changed("changed profile event loss", profile=lossy)
+    flying = good_changed_profile()
+    flying["evidence"]["in_flight_at_end"] = 1
+    mutate_changed("changed profile in-flight rows", profile=flying)
+    gapped = good_changed_profile()
+    gapped["evidence"]["verdict_detail"] = "concrete_gap"
+    gapped["evidence"]["gap_classes"]["observation"]["causes"] = ["skipped"]
+    mutate_changed("changed profile honestly lossy is not exact",
+                   profile=gapped)
+
     late_module = "/tmp/private/libsofthsm2.so"
     late_modules = (("m7", (0, 412, 900), ST_PROVIDER),
                     ("m8", (0, 138, 901), late_module))
@@ -1437,6 +1842,17 @@ def main(argv):
     copy_parser.add_argument("--facts-log", required=True)
     copy_parser.add_argument("--b-pre-round2-pid", type=int, required=True)
     copy_parser.add_argument("--module-suffix", default=PROVIDER)
+    changed_parser = sub.add_parser("copy-up-changed")
+    changed_parser.add_argument("--kernel", required=True)
+    changed_parser.add_argument("--userspace", required=True)
+    changed_parser.add_argument("--profile", required=True)
+    changed_parser.add_argument("--pid-b-pre", type=int, required=True)
+    changed_parser.add_argument("--pid-b2", type=int, required=True)
+    changed_parser.add_argument("--iters-s", type=int, required=True)
+    changed_parser.add_argument("--iters-f", type=int, required=True)
+    changed_parser.add_argument("--run-note", required=True)
+    changed_parser.add_argument("--facts-log", required=True)
+    changed_parser.add_argument("--module-suffix", default=PROVIDER)
     late_parser = sub.add_parser("late-reported")
     late_parser.add_argument("file")
     late_parser.add_argument("--pid-o", type=int, required=True)
@@ -1474,6 +1890,21 @@ def main(argv):
         print(round2_line(round2["pid"], 6 * options.iters_b,
                           round2["twin"]),
               file=sys.stderr)
+    elif options.command == "copy-up-changed":
+        def load(path):
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+
+        with open(options.run_note, encoding="utf-8") as handle:
+            note = handle.read()
+        facts = open(options.facts_log, encoding="utf-8").read()
+        result = copy_up_changed(load(options.kernel), load(options.userspace),
+                                 load(options.profile), options.pid_b_pre,
+                                 options.pid_b2, options.iters_s,
+                                 options.iters_f, note, facts,
+                                 options.module_suffix)
+        print(json.dumps(result, sort_keys=True))
+        print(changed_caller_line(options.pid_b_pre), file=sys.stderr)
     elif options.command == "late-reported":
         with open(options.file, encoding="utf-8") as handle:
             document = json.load(handle)

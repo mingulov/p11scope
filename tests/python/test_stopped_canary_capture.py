@@ -1429,6 +1429,112 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
             self.assertEqual(self.sanitized_ring(error), ['retained-rings: RingRecordRefusal'])
 
 
+class IdentityMapPartitionTests(unittest.TestCase):
+    """The owned observer preloads the witness identity session: five
+    lowercase maps beside the 44 capture maps. The partition holds the
+    five exact shapes out of capture acquisition, requires all five on
+    owned lanes (the preload is mandatory there), and requires none on
+    external lanes (a witness load mid-capture is a loud failure, never
+    silently absorbed). Shapes mirror crates/ebpf/native/vma_identity.c;
+    flags are bpftool-observed (the kernel does not echo BPF_F_WRONLY).
+    """
+
+    SHAPES = {
+        'anchors': ('hash', 8, 16, 1024, (0, 16)),
+        'anchor_slots': ('array', 4, 8, 1024, (0, 16)),
+        'anchor_observed': ('array', 4, 8, 1024, (0, 16)),
+        'config': ('array', 4, 40, 1, (0,)),
+        'scope_bitmap': ('array', 4, 8, 65536, (1024,)),
+    }
+
+    def row(self, name, flags=None, **override):
+        kind, key, value, entries, accepted = self.SHAPES[name]
+        row = {'id': 1000 + len(name), 'name': name, 'type': kind,
+               'bytes_key': key, 'bytes_value': value, 'max_entries': entries,
+               'map_flags': accepted[0] if flags is None else flags,
+               'bytes_memlock': 64, 'frozen': 0, 'btf_id': 7}
+        row.update(override)
+        return row
+
+    def test_owned_accepts_exact_five_and_nothing_else(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        rows.append({'id': 2000, 'name': 'EVENTS', 'type': 'ringbuf'})
+        kept, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual({row['name'] for row in identity}, set(self.SHAPES))
+        self.assertEqual([row['name'] for row in kept], ['EVENTS'])
+
+    def test_owned_requires_all_five(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        for missing in self.SHAPES:
+            with self.subTest(missing=missing):
+                with self.assertRaises(capture.CaptureError):
+                    capture.partition_identity_maps(
+                        [row for row in rows if row['name'] != missing], 'owned')
+
+    def test_owned_rejects_near_miss_shapes(self):
+        fields = {'type': 'hash', 'bytes_key': 8, 'bytes_value': 16,
+                  'max_entries': 2048, 'map_flags': 8}
+        for name in self.SHAPES:
+            for field, value in fields.items():
+                if self.row(name)[field] == value:
+                    continue
+                with self.subTest(name=name, field=field):
+                    mutated = [self.row(other) for other in self.SHAPES if other != name]
+                    bad = self.row(name, **{field: value})
+                    mutated.append(bad)
+                    with self.assertRaises(capture.CaptureError):
+                        capture.partition_identity_maps(mutated, 'owned')
+                    kept, _ = capture.partition_identity_maps([bad], 'external')
+                    self.assertEqual(kept, [bad])
+
+    def test_wronly_flag_echo_variants(self):
+        for name in ('anchors', 'anchor_slots', 'anchor_observed'):
+            rows = [self.row(other) for other in self.SHAPES if other != name]
+            rows.append(self.row(name, flags=16))
+            _, identity = capture.partition_identity_maps(rows, 'owned')
+            self.assertEqual(len(identity), 5, name)
+        for name, flags in (('config', 16), ('scope_bitmap', 0)):
+            rows = [self.row(other) for other in self.SHAPES if other != name]
+            rows.append(self.row(name, flags=flags))
+            with self.subTest(name=name, flags=flags):
+                with self.assertRaises(capture.CaptureError):
+                    capture.partition_identity_maps(rows, 'owned')
+
+    def test_flags_alias_matches_normalize(self):
+        rows = [self.row(name) for name in self.SHAPES if name != 'config']
+        aliased = self.row('config')
+        aliased['flags'] = aliased.pop('map_flags')
+        rows.append(aliased)
+        _, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual(len(identity), 5)
+        rows = [self.row(name) for name in self.SHAPES if name != 'anchors']
+        conflicted = self.row('anchors')
+        conflicted['flags'] = 8
+        rows.append(conflicted)
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps(rows, 'owned')
+
+    def test_external_requires_none(self):
+        rows = [{'id': 2000, 'name': 'EVENTS', 'type': 'ringbuf'}]
+        kept, identity = capture.partition_identity_maps(rows, 'external')
+        self.assertEqual((kept, identity), (rows, []))
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps(rows + [self.row('config')], 'external')
+
+    def test_rejects_unknown_origin(self):
+        with self.assertRaises(capture.CaptureError):
+            capture.partition_identity_maps([], 'matrix')
+
+    def test_duplicate_identity_shape_stays_in_capture(self):
+        rows = [self.row(name) for name in self.SHAPES]
+        duplicate = self.row('config')
+        duplicate['id'] = 4242
+        rows.append(duplicate)
+        kept, identity = capture.partition_identity_maps(rows, 'owned')
+        self.assertEqual(len(identity), 5)
+        self.assertEqual(kept, [duplicate])
+
+
 class StoppedCanaryCaptureTests(unittest.TestCase):
     def test_outside_epoch_sample_publishes_all_values_without_iterator_identities(self):
         self.probe('case:epoch_sample')

@@ -3717,7 +3717,18 @@ impl SemanticCapture {
         quantum: &mut crate::semantics_objects::journal::joint_driver::RawJointQuantum,
     ) -> anyhow::Result<TickReport> {
         anyhow::ensure!(targets.len() <= MAX_PENDING, "semantic target capacity");
-        self.tick_collected_with(&mut SessionIo { session, targets }, quantum)
+        // TEMP F9 DIAGNOSTIC (revert before merge): H0 timing.
+        let diag = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1");
+        let start = std::time::Instant::now();
+        let out = self.tick_collected_with(&mut SessionIo { session, targets }, quantum);
+        if diag {
+            eprintln!(
+                "joint-timing: h0 ms={} ok={}",
+                start.elapsed().as_millis(),
+                out.is_ok()
+            );
+        }
+        out
     }
 
     fn tick_with_inner(

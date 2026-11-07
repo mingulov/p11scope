@@ -1101,32 +1101,59 @@ class SchemaOracleAgreement(unittest.TestCase):
         split.update(overrides)
         return split
 
-    def armed_profile_document(self):
+    def gap_armed_profile_document(self):
         document = CHECKER["document_fixture"](
             CHECKER["evidence_fixture"]({}))
         evidence = document["evidence"]
         evidence["gap_exe_hints"] = self.hint_split()
-        evidence["target_exec_hints"] = self.hint_split(links_provider=0)
         evidence["gap_exit_mappings"] = self.exit_split()
         return document
 
+    def target_armed_profile_document(self):
+        document = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}))
+        document["evidence"]["target_exec_hints"] = self.hint_split(
+            links_provider=0)
+        return document
+
     def test_short_lived_splits_accepted_in_profile_metrics_and_terminal(self):
-        """Armed evidence carries the three short-lived splits in every
-        lane that publishes them: profile and metrics documents plus
-        the terminal trace EVIDENCE object."""
-        CHECKER["exact_profile_v3_selection"](self.armed_profile_document())
-        metrics = self.metrics_document()
-        metrics["evidence"]["gap_exe_hints"] = self.hint_split()
-        metrics["evidence"]["target_exec_hints"] = self.hint_split()
-        metrics["evidence"]["gap_exit_mappings"] = self.exit_split()
-        CHECKER["exact_metrics_schema"](metrics)
-        terminal = copy.deepcopy(self.armed_profile_document()["evidence"])
+        """Armed evidence carries the short-lived splits in every lane
+        that publishes them: profile and metrics documents plus the
+        terminal trace EVIDENCE object. The engine arms exactly one
+        consumer per capture, so each document carries either the gap
+        splits or the target split, never both; metrics never carries
+        the exit-mapping split (no instance hooks there)."""
+        CHECKER["exact_profile_v3_selection"](
+            self.gap_armed_profile_document())
+        CHECKER["exact_profile_v3_selection"](
+            self.target_armed_profile_document())
+        gap_metrics = self.metrics_document()
+        gap_metrics["evidence"]["gap_exe_hints"] = self.hint_split()
+        CHECKER["exact_metrics_schema"](gap_metrics)
+        target_metrics = self.metrics_document()
+        target_metrics["evidence"]["target_exec_hints"] = self.hint_split()
+        CHECKER["exact_metrics_schema"](target_metrics)
+        terminal = copy.deepcopy(
+            self.gap_armed_profile_document()["evidence"])
         terminal.update(
             privacy_mode="allowlisted", capture_aborted=None,
             final_drain=False, counters_available=True,
             trace_truncated=False,
         )
         CHECKER["exact_profile_v3_selection"](terminal, terminal=True)
+
+    def test_short_lived_splits_wrong_lane_or_combined_rejected(self):
+        """The exit-mapping split is profile-only (metrics never arms
+        it), and the gap splits never publish together with the
+        target split (one consumer per capture)."""
+        metrics = self.metrics_document()
+        metrics["evidence"]["gap_exit_mappings"] = self.exit_split()
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_metrics_schema"](metrics)
+        combined = self.gap_armed_profile_document()
+        combined["evidence"]["target_exec_hints"] = self.hint_split()
+        with self.assertRaises(AssertionError):
+            CHECKER["exact_profile_v3_selection"](combined)
 
     def test_short_lived_splits_malformed_rejected(self):
         """Each split validates its closed shape: exact keys, the
@@ -1148,7 +1175,10 @@ class SchemaOracleAgreement(unittest.TestCase):
         ]
         for key, bad in cases:
             with self.subTest(key=key, bad=bad):
-                document = self.armed_profile_document()
+                if key == "target_exec_hints":
+                    document = self.target_armed_profile_document()
+                else:
+                    document = self.gap_armed_profile_document()
                 document["evidence"][key] = bad
                 with self.assertRaises(AssertionError):
                     CHECKER["exact_profile_v3_selection"](document)

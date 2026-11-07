@@ -3,8 +3,11 @@
 
 use p11scope::doctor::{Check, Status};
 
+/// The refusal as the observer binary prints it: the recipe names that
+/// binary. Compare a spawned `p11scope`'s stderr with this.
+#[allow(dead_code)]
 pub fn refusal() -> Option<String> {
-    refusal_from_checks(&p11scope::doctor::probe(None, None)).map(|reason| {
+    in_process_refusal().map(|reason| {
         let probe = std::env::current_exe().expect("test executable path");
         as_observer(
             &reason,
@@ -12,6 +15,14 @@ pub fn refusal() -> Option<String> {
             env!("CARGO_BIN_EXE_p11scope"),
         )
     })
+}
+
+/// The refusal as this test process meets it: a capture run in process
+/// (through the library, not the binary) names this test executable in
+/// its recipe. Compare an in-process capture error with this.
+#[allow(dead_code)]
+pub fn in_process_refusal() -> Option<String> {
+    refusal_from_checks(&p11scope::doctor::probe(None, None))
 }
 
 /// The in-process probe's setcap recipe names its own executable (this

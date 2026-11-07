@@ -974,4 +974,19 @@ mod tests {
             "capget and /proc must report the same effective set"
         );
     }
+
+    /// The invoking snapshot for `doctor`: `main` records the effective
+    /// set before the startup drop, `doctor` reports it instead of the
+    /// dropped live set, and clearing restores live reads. Serialized:
+    /// the snapshot is process-global.
+    #[test]
+    fn invoking_snapshot_reports_snapshot_until_cleared() {
+        let _guard = snapshot_test_guard();
+        clear_invoking_effective_for_test();
+        assert_eq!(invoking_effective(), None);
+        set_invoking_effective(0x1234);
+        assert_eq!(invoking_effective(), Some(0x1234));
+        clear_invoking_effective_for_test();
+        assert_eq!(invoking_effective(), None);
+    }
 }

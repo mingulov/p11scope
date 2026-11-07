@@ -27569,6 +27569,99 @@ int main(void) {
         );
     }
 
+    /// Clock-flag sync: the pin query already sees the exit but
+    /// reconcile has not retired the record yet, so the row waits for
+    /// the revalidation pass with a retained proof. The detection
+    /// clock then fails on an unrelated admission; the next (empty)
+    /// pass takes the flag and its revalidation decision — before any
+    /// staged batch — leaves the row unbound. Fails if the pass
+    /// clears only the coordinator copy (the binder would bind).
+    #[test]
+    fn a_revalidation_after_a_detection_clock_failure_leaves_the_retained_row_unbound() {
+        let (mut native, caller) = pre_activation_scene();
+        native.query_answer(7, 500, CookieQuery::Exited);
+        let row = native.row(41, 2, 7, 210, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (1, 0), "waits for the pass");
+        // The detection clock fails on an unrelated admission: the flag
+        // stands until the next pass takes it. (No peek: taking would
+        // clear it. A pass on unmutated code proves the flag was set —
+        // without it the binder copy stays true and the row binds.)
+        native.scene.source.spawn(8, 600);
+        let observed: BTreeSet<u32> = [7, 8].into_iter().collect();
+        let events = native.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            240,
+            &mut || None,
+        );
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 240);
+        empty_pass(&mut native, 250);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (0, 0));
+        assert_eq!(
+            census.unbound.get(&UnboundReason::CallerExited),
+            Some(&1),
+            "the pass revalidated and only the clocks gate held the row"
+        );
+        assert!(!native.scene.coverage(caller).is_witnessed());
+    }
+
+    /// Same sync through a full scan pass (`apply_catalog`): the pass
+    /// takes the failure flag and its revalidation leaves the retained
+    /// row unbound.
+    #[test]
+    fn a_full_scan_pass_after_a_detection_clock_failure_leaves_the_retained_row_unbound() {
+        let (mut native, caller) = pre_activation_scene();
+        native.query_answer(7, 500, CookieQuery::Exited);
+        let row = native.row(41, 2, 7, 210, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (1, 0), "waits for the pass");
+        native.scene.source.spawn(8, 600);
+        let observed: BTreeSet<u32> = [7, 8].into_iter().collect();
+        let events = native.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            240,
+            &mut || None,
+        );
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 240);
+        let generation = native
+            .scene
+            .coordinator
+            .adapter
+            .record(caller)
+            .map(|record| crate::inspect_system::MemberGeneration {
+                start_time: record.start_time,
+                exe: record.exe.clone(),
+            });
+        let catalog = capture_catalog(&native.scene.pins, &[&native.scene.path], 7, generation);
+        native.scene.coordinator.apply_catalog(
+            catalog,
+            &mut UnavailableImageGuard,
+            &mut native.cookies,
+            u64::MAX,
+            250,
+        );
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.pending, census.bound), (0, 0));
+        assert_eq!(
+            census.unbound.get(&UnboundReason::CallerExited),
+            Some(&1),
+            "the pass revalidated and only the clocks gate held the row"
+        );
+        assert!(!native.scene.coverage(caller).is_witnessed());
+    }
+
     /// C5.1 carry (C5.2 review): a read proves a clean instant only when it
     /// completes a gap-free CALLER_USE sweep, and that instant is the health
     /// read of the batch the sweep began in — a bounded read that stopped
@@ -28506,6 +28599,161 @@ int main(void) {
         assert_ne!(
             crate::inventory_present::coverage_label_at(&coverage, 3_000),
             "counted until the PID target exited (lower bound)"
+        );
+    }
+
+    #[test]
+    fn a_later_loss_after_a_clean_pid_exit_records_a_gap_naming_that_loss() {
+        // The exit claim is revoked by a later generic loss: the
+        // revocation records a gap under "native capture scope custody
+        // unproven" naming the later loss, next to the first-loss gap.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ));
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::PidHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.witness(vec![row]);
+        let custody = ScopeCustody::PidExited {
+            at_ns: 600,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                native.domain,
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ),
+        };
+        native.scene.coordinator.note_capture_custody(&custody);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let lost = ScopeCustody::PidLost {
+            at_ns: 700,
+            reason: "PID custody lost: an exec of the PID target was observed".into(),
+        };
+        native.scene.coordinator.note_capture_custody(&lost);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let gaps: Vec<_> = native
+            .scene
+            .coordinator
+            .registry
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "native capture scope custody unproven")
+            .collect();
+        assert_eq!(gaps.len(), 2, "the exit gap plus the later-loss gap");
+        assert!(
+            gaps.iter().any(|gap| gap
+                .reason
+                .contains("an exec of the PID target was observed")
+                && gap.reason.contains("withdrawn")),
+            "the later gap names the later loss and the withdrawn claim: {gaps:?}"
+        );
+    }
+
+    #[test]
+    fn a_superseding_exit_proof_revokes_the_registry_exit_claim() {
+        // A later exit proof that differs from the folded one clears the
+        // coordinator copy, so the registry's exit-only claim is revoked
+        // too — and the revocation is disclosed.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ));
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::PidHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.witness(vec![row]);
+        let custody = ScopeCustody::PidExited {
+            at_ns: 600,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                native.domain,
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ),
+        };
+        native.scene.coordinator.note_capture_custody(&custody);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        assert!(
+            matches!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted {
+                    lossy: true,
+                    pid_exit: true,
+                    ..
+                }
+            ),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        let later = ScopeCustody::PidExited {
+            at_ns: 700,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                NativeDomainId::mint(),
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ),
+        };
+        native.scene.coordinator.note_capture_custody(&later);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let coverage = native.scene.coverage(caller);
+        assert!(
+            matches!(
+                coverage,
+                UseCoverage::Counted {
+                    lossy: true,
+                    pid_exit: false,
+                    ..
+                }
+            ),
+            "a superseding exit proof must clear the exit-only claim: {coverage:?}"
+        );
+        assert_ne!(
+            crate::inventory_present::coverage_label_at(&coverage, 3_000),
+            "counted until the PID target exited (lower bound)"
+        );
+        assert!(
+            native
+                .scene
+                .coordinator
+                .registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == "native capture scope custody unproven"
+                    && gap.reason.contains("superseded")),
+            "the supersede revocation is disclosed"
         );
     }
 

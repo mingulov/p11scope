@@ -582,14 +582,13 @@ pub(crate) fn publish_inventory(
     )
 }
 
-/// Round 7: the exe-identity bit arms only where the (ticket, exe)
+/// Exe identity for unidentified callers: the bit arms only where the (ticket, exe)
 /// join is possible — the Callers flavor outside PID scope. The
 /// Global flavor stamps no EXEC ticket and PID scope never acquires
 /// one, so arming there would capture unjoinable, unpublished exe
 /// data; both stay on the plain config.
 pub(crate) fn inventory_exe_identity_armed(callers: bool, scope: &Scope) -> bool {
-    let _ = (callers, scope);
-    false
+    callers && !matches!(scope, Scope::Pid(_))
 }
 
 fn scope_flag(scope: &Scope) -> u64 {
@@ -674,10 +673,21 @@ fn publish_detailed_with(
 
 fn publish_inventory_with(
     scope: &Scope,
-    _exe_identity: bool,
+    exe_identity: bool,
     io: &mut impl ScopePublicationIo,
 ) -> Result<()> {
-    let config = scope_flag(scope) | FLAG_POLICY_INVENTORY;
+    // PID scope stamps no EXEC ticket, so the exe word would
+    // be unjoinable there; refuse before any map operation rather
+    // than capture data the join can never consume.
+    if exe_identity && matches!(scope, Scope::Pid(_)) {
+        bail!("refusing exe identity for PID scope inventory: no EXEC ticket to join it to");
+    }
+    let extensive_flag = if exe_identity {
+        FLAG_TRACK_SHORT_LIVED
+    } else {
+        0
+    };
+    let config = scope_flag(scope) | FLAG_POLICY_INVENTORY | extensive_flag;
     if !valid_inventory_config(config) {
         bail!("refusing invalid Inventory CONFIG {config:#x}");
     }

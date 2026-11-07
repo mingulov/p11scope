@@ -2168,9 +2168,11 @@ fn emit_lifecycle(kind: u8, case_id: u8, scope: ScopeAuth, pause_eligible: bool)
     // only when extensive mode is armed for this capture. In every
     // flavor (the ticket above stays flavor-gated): the kernel read
     // never happens otherwise — not captured but unclassified is
-    // forbidden — and inventory-only never arms the bit. A failed
-    // kernel read keeps the initializer's zeroed pair, which
-    // userspace treats as absent.
+    // forbidden. Inventory-callers captures outside PID scope arm the bit
+    // (the only inventory captures whose EXEC
+    // records carry a joinable ticket); every other inventory
+    // capture stays disarmed. A failed kernel read keeps the
+    // initializer's zeroed pair, which userspace treats as absent.
     if kind == DISCOVERY_KIND_EXEC && scope.flags & FLAG_TRACK_SHORT_LIVED != 0 {
         let mut dev = 0u64;
         let mut ino = 0u64;

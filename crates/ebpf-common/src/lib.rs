@@ -380,14 +380,21 @@ pub const FLAG_PAUSE_ENABLED: u64 = 1 << 5;
 pub const FLAG_POLICY_INVENTORY: u64 = 1 << 7;
 /// 6.14 Option B: extensive mode arms the exec-time exe-identity word
 /// in EXEC records (`--track-short-lived`, default off). Detailed
-/// objects only; the inventory-only exact config refuses it.
+/// objects arm it per capture; inventory objects accept it beside one
+/// scope, and userspace arms it only where the (ticket, exe) join is
+/// possible (the Callers flavor outside PID scope).
 pub const FLAG_TRACK_SHORT_LIVED: u64 = 1 << 8;
 
 /// Inventory accepts one external scope and its own policy, without detail or pause.
+/// Exe identity for unidentified callers: the bit rides beside any one scope (uniform
+/// validator; the publisher arms selectively, mirroring Detailed
+/// aggregate-plus-bit). In-kernel `scope_auth` and the userspace
+/// publisher share this gate.
 pub const fn valid_inventory_config(flags: u64) -> bool {
-    flags == (FLAG_POLICY_INVENTORY | FLAG_PID_FILTER)
-        || flags == (FLAG_POLICY_INVENTORY | FLAG_CGROUP_FILTER)
-        || flags == (FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER)
+    let base = flags & !FLAG_TRACK_SHORT_LIVED;
+    base == (FLAG_POLICY_INVENTORY | FLAG_PID_FILTER)
+        || base == (FLAG_POLICY_INVENTORY | FLAG_CGROUP_FILTER)
+        || base == (FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER)
 }
 
 pub const INVENTORY_COOKIE_TAG: u32 = 0x5055_5347;
@@ -2900,7 +2907,7 @@ mod tests {
 
     #[test]
     fn inventory_config_accepts_exe_identity_bit_with_one_scope() {
-        // Round 7: inventory-callers captures arm the extensive bit for
+        // Unidentified-caller executables: inventory-callers captures arm the extensive bit for
         // the EXEC exe-identity read (the EXEC ticket rides the record
         // already, so the join needs no new kernel state). The bit stays
         // orthogonal to scope; without a scope, or beside an unknown

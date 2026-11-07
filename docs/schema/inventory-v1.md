@@ -255,6 +255,24 @@ non-null values needs a new allowlist row.
   caller (once per caller and module).
   Witness gaps never carry a `pid`: an unbound row's tgid is exactly
   what could not be identified.
+  `initialize` (additive within v1) is the per-module `C_Initialize`
+  roll-up `{calls, ok, already_initialized, last_error_rv, status,
+  detail}` over observed init returns since the semantic lane sealed,
+  from joined (converted) and shed (unrouted) Events. `calls` counts
+  every tapped return; `ok` counts `CKR_OK`; `already_initialized`
+  counts `CKR_CRYPTOKI_ALREADY_INITIALIZED` (0x191), which proves
+  initialised like OK; `last_error_rv` is the most recently observed
+  other return as a `{rv, rv_hex, name}` row (`name` is the registered
+  `CKR_*` name or `null`), or `null` when none was observed. `status`
+  is `initialised` (an OK or already-initialized return was observed —
+  proof that stands even under loss), `failed` (returns were observed
+  but none proves initialised), `unseen` (sealed and quiet: `detail`
+  reads "no C_Initialize seen since the semantic lane started" — the
+  call may have run before the seal, so zero never claims "never
+  initialised"), or `unknown` (the lane never sealed, or EVENTS loss —
+  a `native capture events lost` or `native capture events loss
+  unknown` gap — may have hidden evidence). Counts are exact
+  observations since the seal; only the verdict fails closed.
   Boundary: the key is file identity, not load-instance authority —
   a same-file double-load (two loader mappings of one file, notably
   a `dlmopen` private-namespace double-load whose objects own

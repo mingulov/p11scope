@@ -1028,9 +1028,9 @@ mod tests {
     /// A mapping first seen this pass admits ahead of backlog: with 2,000
     /// backlog processes and one newcomer, one admission tick puts the
     /// newcomer first while the backlog keeps backlog-cursor order behind
-    /// it. Scarce ticks never classify: they keep the pending-first order
-    /// verbatim (see `pending_requests_sort_before_rotation_candidates` and
-    /// the engine's waiter-settle test).
+    /// it. Scarce ticks classify pending by request recency instead (see
+    /// `scarce_window_pending_newcomers_first` and the engine's
+    /// waiter-settle test).
     #[test]
     fn newcomer_mapping_admitted_before_backlog() {
         let batch = MAX_NEW_VIEWS_PER_TICK;
@@ -1064,7 +1064,7 @@ mod tests {
 
     /// With no backlog, a free tick keeps exactly today's rotation order:
     /// the window is the plain newcomer order, admitted plus deferred.
-    /// Scarce ticks keep the pending-first order instead and never classify.
+    /// Scarce ticks classify pending by request recency instead.
     #[test]
     fn free_tick_without_backlog_keeps_rotation_order() {
         let batch = MAX_NEW_VIEWS_PER_TICK;

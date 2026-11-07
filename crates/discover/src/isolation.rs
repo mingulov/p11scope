@@ -1504,7 +1504,9 @@ mod tests {
         // in bits 8-15): btrfs subvolume/snapshot creation bypasses the
         // Landlock path hooks, so exact-command denials cannot cover
         // it. Numbers from linux/btrfs.h, linux/fs.h, linux/fscrypt.h,
-        // linux/ext4.h and linux/f2fs.h.
+        // linux/ext4.h, linux/f2fs.h, linux/msdos_fs.h and the in-tree
+        // fs/ocfs2/ocfs2_ioctl.h (no uapi header carries the ocfs2
+        // numbers).
         let cmds: &[(u32, &str)] = &[
             (0x5000_940e, "BTRFS_IOC_SUBVOL_CREATE"),
             (0x5000_9418, "BTRFS_IOC_SUBVOL_CREATE_V2"),
@@ -1516,6 +1518,10 @@ mod tests {
             (0x4008_6604, "EXT4_IOC_SETVERSION"),
             (0xc040_6618, "FS_IOC_REMOVE_ENCRYPTION_KEY"),
             (0x4004_f50d, "F2FS_IOC_SET_PIN_FILE"),
+            (0x4018_6f04, "OCFS2_IOC_REFLINK"),
+            (0x4004_7211, "FAT_IOCTL_SET_ATTRIBUTES"),
+            (0xc018_9436, "FIDEDUPERANGE"),
+            (0x4020_940d, "FICLONERANGE"),
         ];
         for (cmd, name) in cmds {
             assert_eq!(
@@ -1526,11 +1532,16 @@ mod tests {
         }
         // Ordinary terminal-window and availability queries stay
         // allowed: the type rule must not swallow type 'T' (0x54).
+        // The close-on-exec flags ride the same type on x86-64.
+        assert_eq!(0x5451, libc::FIOCLEX as u32, "wrong FIOCLEX");
+        assert_eq!(0x5450, libc::FIONCLEX as u32, "wrong FIONCLEX");
         for cmd in [
             0x5401, /* TCGETS */
             0x5413, /* TIOCGWINSZ */
             0x541b, /* FIONREAD */
             0x5421, /* FIONBIO */
+            0x5451, /* FIOCLEX */
+            0x5450, /* FIONCLEX */
         ] {
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, cmd),

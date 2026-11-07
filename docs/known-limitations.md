@@ -410,7 +410,10 @@ that is about 14 hours of capture.
 When callers with provider edges exit before semantic admission
 completes — the common shape for suites that spawn one short-lived
 process per test — the terminal `callers never admitted` gap counts
-them. Callers admitted after their calls were already collected shed
+them. Callers whose instance registrations were refused for cause
+(identity, capacity, ...) count separately under the terminal
+`callers refused admission` gap, never as exited before admission.
+Callers admitted after their calls were already collected shed
 those calls the same way; the terminal `admitted callers with no
 joined calls` gap counts them. Their unjoined calls shed instead of
 joining (counted under `semantic calls unrouted` and the

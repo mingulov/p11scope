@@ -6388,11 +6388,14 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
         self.coordinator.note_short_lived_never_scanned();
         // The counted never-admitted gap stages from stop-time
         // records: retired subset-edged callers no subset instance
-        // ever covered. Its without-joins companion counts retired
-        // subset-instanced callers with zero joined calls. Only when
-        // a semantic lane exists (no lane, no admission to miss).
+        // ever covered. Its refused-admission companion counts the
+        // refused-for-cause partition; its without-joins companion
+        // counts retired subset-instanced callers with zero joined
+        // calls. Only when a semantic lane exists (no lane, no
+        // admission to miss).
         if let Some(lane) = self.semantic.as_ref() {
             self.coordinator.note_callers_never_admitted(lane);
+            self.coordinator.note_callers_refused_admission(lane);
             self.coordinator.note_admitted_callers_without_joins(lane);
         }
         // Terminal pre-arm close, staged before the loop's final commit so

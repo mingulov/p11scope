@@ -4111,10 +4111,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .collect()
             };
             for (caller, result) in staged {
-                match result {
-                    Ok(input) => self.registry.note_instance(input),
-                    Err(reason) => self.conversion_gap(Some(caller), reason),
-                }
+                self.apply_staged_registration(caller, result);
             }
         }
         let registrations = self.registry.end_joint_registrations(registration_start);
@@ -4259,6 +4256,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             );
         state.h3_last = evidence.clone();
         state.h3_pending = Some(evidence);
+    }
+
+    /// Apply one staged registration: admissions stage for commit,
+    /// refusals mark the caller refused and disclose through the
+    /// audited path, so the terminal counts never call the caller a
+    /// timing miss.
+    fn apply_staged_registration(
+        &mut self,
+        caller: CallerId,
+        result: Result<
+            crate::discovery::caller_registry::instance_input::AdmittedInstance,
+            ConversionRefusal,
+        >,
+    ) {
+        match result {
+            Ok(input) => self.registry.note_instance(input),
+            Err(reason) => {
+                self.registry.note_registration_refused(caller);
+                self.conversion_gap(Some(caller), reason);
+            }
+        }
     }
 
     /// Finite conversion refusal through the audited path.
@@ -5175,6 +5193,59 @@ mod finalizer_history_tests {
         assert!(
             reasons.contains(&InstanceReason::SemanticLoss),
             "history-only admission discloses its reason: {reasons:?}"
+        );
+    }
+
+    /// A staged registration refusal marks the caller refused and
+    /// still discloses through the audited path; an admission marks
+    /// nothing.
+    #[test]
+    fn staged_registration_refusal_marks_the_caller_refused() {
+        use crate::discovery::caller_registry::instance_input::{
+            AdmittedInstance, ConversionRefusal, InstanceKey,
+        };
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let domain = NativeDomainId::mint();
+        let key = InstanceKey::scripted(
+            domain,
+            ImageIdentity {
+                task_cookie: 7,
+                exec_id: 1,
+            },
+            InstanceId::from_raw(11),
+            ModuleKey::physical(7, 7, 777, None, "/staged/provider.so"),
+        );
+        coordinator.apply_staged_registration(caller, Ok(AdmittedInstance::scripted(key, caller)));
+        assert!(
+            !coordinator.registry().registration_refused(caller),
+            "an admitted registration marks nothing"
+        );
+        coordinator.apply_staged_registration(caller, Err(ConversionRefusal::Custody));
+        assert!(
+            coordinator.registry().registration_refused(caller),
+            "a refused registration marks its caller"
+        );
+        coordinator.commit_batch(false).unwrap();
+        assert!(
+            coordinator.registry().gaps().iter().any(|gap| {
+                gap.caller == Some(caller)
+                    && gap.subject == "semantic input refused"
+                    && gap.reason == "custody"
+            }),
+            "the refusal still discloses through the audited path"
         );
     }
 

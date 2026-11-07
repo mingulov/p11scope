@@ -7588,6 +7588,164 @@ fn retired_subset_edged_callers_with_only_foreign_instances_count_as_never_admit
     );
 }
 
+/// Terminal refused-admission disclosure: a retired caller with a
+/// subset edge, no registered instance and a refused registration
+/// counts exactly once in the refused gap, never as a timing miss;
+/// a repeated terminal call stays silent.
+#[test]
+fn retired_subset_edged_callers_with_refused_registrations_count_as_refused_admission() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    // Two callers race one instance key: the first registers, the
+    // second refuses caller-unbound.
+    let first = OwnedStoppedChild::new();
+    let second = OwnedStoppedChild::new();
+    let caller_a = scene.admit(first.id(), 100);
+    let caller_b = scene.admit(second.id(), 110);
+    scene.map_module(caller_a, first.id(), &module, pin.path, 200);
+    scene.map_module(caller_b, second.id(), &module, pin.path, 210);
+    let domain = crate::attach::capture::NativeDomainId::try_mint().expect("a fresh test domain");
+    let image = p11scope_ebpf_common::ImageIdentity {
+        task_cookie: 6071428351,
+        exec_id: 824619,
+    };
+    let key = crate::discovery::caller_registry::instance_input::InstanceKey::scripted(
+        domain,
+        image,
+        crate::discovery::instances::InstanceId::from_raw(745021),
+        module,
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+            key.clone(),
+            caller_a,
+        ),
+    );
+    scene.coordinator.registry_mut().note_instance(
+        crate::discovery::caller_registry::instance_input::AdmittedInstance::scripted(
+            key, caller_b,
+        ),
+    );
+    drop(first);
+    drop(second);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene
+            .coordinator
+            .adapter()
+            .record(caller_b)
+            .unwrap()
+            .retired,
+        "the reaped child retires"
+    );
+    assert!(
+        scene.coordinator.registry().gaps().iter().any(|gap| {
+            gap.caller == Some(caller_b)
+                && gap.subject == "instance semantics refused"
+                && gap.reason == "caller_unbound"
+        }),
+        "the lost race discloses its named refusal"
+    );
+    assert!(
+        !scene.coordinator.note_callers_never_admitted(&lane),
+        "a refused caller is not a timing miss"
+    );
+    assert!(scene.coordinator.note_callers_refused_admission(&lane));
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::CALLERS_REFUSED_ADMISSION_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("1 caller(s)"),
+        "the gap counts the refused caller: {}",
+        found.reason
+    );
+    assert!(
+        found.reason.contains("were refused semantic admission"),
+        "the gap names the refusal cause, never an exit: {}",
+        found.reason
+    );
+    assert!(
+        !scene.coordinator.note_callers_refused_admission(&lane),
+        "a repeated terminal call stays silent"
+    );
+}
+
+/// A retired subset-edged caller with no instance and no refusal is
+/// a pure timing miss: the never-admitted disclosure counts it with
+/// its exit wording, and the refused-admission disclosure stays
+/// silent.
+#[test]
+fn retired_subset_edged_callers_without_refusals_stay_silent_for_refused_admission() {
+    let fixture = ProviderFixture::new();
+    let mut scene = BindingScene::new();
+    let lane =
+        AttestedSemanticLane::start(fixture.subset(), &Scope::System, BackendSelection::Auto)
+            .unwrap();
+    let pin = lane.subset().pins().pinned().next().unwrap();
+    let module = ModuleKey::physical(
+        pin.key.device.major,
+        pin.key.device.minor,
+        pin.key.inode,
+        Some(pin.sha256.to_owned()),
+        pin.path,
+    );
+    let child = OwnedStoppedChild::new();
+    let caller = scene.admit(child.id(), 100);
+    scene.map_module(caller, child.id(), &module, pin.path, 200);
+    drop(child);
+    scene.coordinator.adapter_mut().reconcile(
+        &std::collections::BTreeSet::new(),
+        &mut |_| ImageAuthority::ScanPinned,
+        300,
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    assert!(
+        scene.coordinator.adapter().record(caller).unwrap().retired,
+        "the reaped child retires"
+    );
+    assert!(scene.coordinator.note_callers_never_admitted(&lane));
+    assert!(
+        !scene.coordinator.note_callers_refused_admission(&lane),
+        "an unrefused caller is not a refusal"
+    );
+    scene.coordinator.commit_batch(false).unwrap();
+    let gaps = scene.coordinator.registry().gaps();
+    let found = gaps
+        .iter()
+        .find(|gap| {
+            gap.subject
+                == crate::discovery::engine::inventory_coordinator::CALLERS_NEVER_ADMITTED_SUBJECT
+        })
+        .expect("the terminal call discloses the counted gap");
+    assert!(
+        found.reason.contains("exited before semantic admission"),
+        "the timing miss keeps its exit wording: {}",
+        found.reason
+    );
+}
+
 #[test]
 fn native_semantic_refresh_picks_share_one_registry_scan() {
     // Two attested providers, six callers alternating between them. Every

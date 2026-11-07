@@ -1488,6 +1488,16 @@ pub(super) struct InstanceState {
     /// returns of `apply_instance_call`. Read only by the
     /// conservation check; no report output carries it.
     instance_calls_refused: BTreeMap<CallerId, u64>,
+    /// Callers with at least one refused instance registration: a
+    /// registration refused for cause (identity, capacity, ...)
+    /// leaves no instance, so without this mark the terminal
+    /// never-admitted count would mislabel the caller as a timing
+    /// miss. Set at every registration-refusal return of
+    /// `apply_instance` and at the staged-registration conversion
+    /// refusal; read only by the terminal refused-admission count.
+    /// Bounded by the caller population: marks name admitted
+    /// callers only, one entry each.
+    registration_refused_callers: BTreeSet<CallerId>,
 }
 
 impl Default for InstanceState {
@@ -1516,6 +1526,7 @@ impl Default for InstanceState {
             journal_unavailable_disclosed: false,
             joint_backstop_routed: 0,
             instance_calls_refused: BTreeMap::new(),
+            registration_refused_callers: BTreeSet::new(),
         }
     }
 }
@@ -1584,6 +1595,20 @@ impl CallerRegistry {
     }
     pub(crate) fn instance_refused(&self) -> u64 {
         self.instance_state.refused
+    }
+    /// Mark one refused instance registration: the caller keeps no
+    /// instance from it, so the terminal counts must not call the
+    /// caller a timing miss.
+    pub(crate) fn note_registration_refused(&mut self, caller: CallerId) {
+        self.instance_state
+            .registration_refused_callers
+            .insert(caller);
+    }
+    /// Whether any instance registration for this caller refused.
+    pub(crate) fn registration_refused(&self, caller: CallerId) -> bool {
+        self.instance_state
+            .registration_refused_callers
+            .contains(&caller)
     }
     pub(crate) fn instance_semantic_occupied(&self) -> usize {
         self.instance_state.occupied
@@ -2517,6 +2542,7 @@ impl CallerRegistry {
         };
         if let Some(reason) = refuse {
             self.instance_gap(Some(input.caller), module, reason, None);
+            self.note_registration_refused(input.caller);
             return;
         }
         let module = module.expect("physical mapping checked");
@@ -2531,6 +2557,7 @@ impl CallerRegistry {
                 },
                 None,
             );
+            self.note_registration_refused(input.caller);
             return;
         }
         let mut boundary = input.boundary.map(|p| p.ordinal);
@@ -2552,6 +2579,7 @@ impl CallerRegistry {
         }
         if let Some(reason) = permanent {
             self.instance_gap(Some(input.caller), Some(module), reason, None);
+            self.note_registration_refused(input.caller);
             return;
         }
 
@@ -2566,6 +2594,7 @@ impl CallerRegistry {
             };
             if let Some(reason) = refusal {
                 self.instance_gap(Some(input.caller), Some(module), reason, None);
+                self.note_registration_refused(input.caller);
                 return;
             }
             let last_seen_ns = record.last_seen_ns.max(input.observed_ns);
@@ -2602,6 +2631,7 @@ impl CallerRegistry {
                     requested: self.instance_state.records.len() + 1,
                 }),
             );
+            self.note_registration_refused(input.caller);
             return;
         }
         let Some(next) = self.instance_state.next_id.checked_add(1) else {
@@ -2627,6 +2657,7 @@ impl CallerRegistry {
                 InstanceReason::AuthorityExhausted,
                 None,
             );
+            self.note_registration_refused(input.caller);
             return;
         };
         let id = RegistryInstanceId(self.instance_state.next_id);

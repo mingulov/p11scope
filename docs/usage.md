@@ -1188,9 +1188,12 @@ Limits that matter in pods:
   of joining, and count under `not attributed`
   (`foreign_or_unproven_caller`) plus `semantic calls unrouted` gaps.
   The terminal `callers never admitted` gap counts how many callers
-  with provider edges exited without admission, and the companion
-  `admitted callers with no joined calls` gap counts admitted callers
-  that exited before any of their calls joined. `--track-short-lived`
+  with provider edges exited without admission; callers whose
+  admission was refused for cause count separately under `callers
+  refused admission`, never as exited without admission. The
+  companion `admitted callers with no joined calls` gap counts
+  admitted callers that exited before any of their calls joined.
+  `--track-short-lived`
   widens discovery matching only; it never admits callers
   semantically, so it does not recover these rows either. Prefer
   longer-lived callers when per-key rows matter; see the known

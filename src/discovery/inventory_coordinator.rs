@@ -197,6 +197,15 @@ pub(crate) const CALLERS_NEVER_ADMITTED_SUBJECT: &str = "callers never admitted"
 pub(crate) const ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT: &str =
     "admitted callers with no joined calls";
 
+/// Terminal gap subject for callers whose semantic admission was
+/// refused for cause: discovery mapped a provider for them, but an
+/// instance registration refused (identity, capacity, ...), so none
+/// of their calls could join. The companion that keeps
+/// [`CALLERS_NEVER_ADMITTED_SUBJECT`] a pure timing count: refused
+/// callers count here, never as exited-before-admission. Pinned
+/// verbatim by the semantics tests.
+pub(crate) const CALLERS_REFUSED_ADMISSION_SUBJECT: &str = "callers refused admission";
+
 /// Terminal wording for the short-lived never-scanned count: `confirmed`
 /// programs were never enumerated twice in a row or were listed only as
 /// exited before their scan, so no scan ever examined them; `untracked`
@@ -226,6 +235,20 @@ pub(crate) fn callers_never_admitted_reason(missed: u64) -> String {
     format!(
         "{missed} caller(s) with provider edges exited before semantic admission; \
          their pre-admission calls shed instead of joining (counted under \
+         semantic-calls-unrouted and not-attributed)"
+    )
+}
+
+/// Terminal wording for the refused-admission count: `refused`
+/// retired callers held a provider edge but an instance registration
+/// refused for cause, so no instance was ever registered for them and
+/// their calls shed instead of joining. The shed calls themselves are
+/// counted beside the rows (unrouted gaps and not-attributed tallies),
+/// never guessed per key. Pinned verbatim by the semantics tests.
+pub(crate) fn callers_refused_admission_reason(refused: u64) -> String {
+    format!(
+        "{refused} caller(s) with provider edges were refused semantic admission; \
+         their registrations were refused, so their calls shed instead of joining (counted under \
          semantic-calls-unrouted and not-attributed)"
     )
 }
@@ -627,6 +650,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// The terminal admitted-without-joins disclosure already ran:
     /// same stop-time rule as its never-admitted companion.
     reported_admitted_without_joins: bool,
+    /// The terminal refused-admission disclosure already ran: same
+    /// stop-time rule as its never-admitted companion.
+    reported_callers_refused_admission: bool,
     /// At least one scan pass completed: the terminal disclosure reads
     /// against the last completed scan, never a zero-pass run.
     completed_scan_pass: bool,
@@ -997,6 +1023,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             short_lived_untracked: 0,
             reported_callers_never_admitted: false,
             reported_admitted_without_joins: false,
+            reported_callers_refused_admission: false,
             completed_scan_pass: false,
             cgroup_fence: CgroupFence::default(),
             pending_cgroup: None,
@@ -9032,10 +9059,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// admitted: retired records holding an edge to a subset module
     /// with no registered instance on any subset module. An instance
     /// on another module does not exclude: the caller was never
-    /// admitted to the observed provider set. Their pre-admission
-    /// calls shed instead of joining, so this counts the missed
-    /// callers the per-key view cannot name; the shed calls
-    /// themselves stay counted beside the rows. Computed from
+    /// admitted to the observed provider set. Callers with a refused
+    /// registration count under the refused-admission companion
+    /// instead, so this stays a pure timing count of callers that
+    /// exited before admission. Their pre-admission calls shed
+    /// instead of joining, so this counts the missed callers the
+    /// per-key view cannot name; the shed calls themselves stay
+    /// counted beside the rows. Computed from
     /// stop-time records (a repeated terminal call stays silent). No
     /// completed-scan guard: a zero-pass run holds no records, so the
     /// missed count is structurally zero and the call stays silent.
@@ -9071,6 +9101,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut missed = 0u64;
         for record in self.adapter.records().filter(|record| record.retired) {
             if subset_instanced.contains(&record.id) {
+                continue;
+            }
+            if self.registry.registration_refused(record.id) {
                 continue;
             }
             if self
@@ -9152,6 +9185,70 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.note_scope_gap(
             ADMITTED_CALLERS_WITHOUT_JOINS_SUBJECT.into(),
             admitted_without_joins_reason(missed),
+        );
+        true
+    }
+
+    /// Terminal aggregate for callers refused semantic admission:
+    /// retired records holding an edge to a subset module with no
+    /// registered instance on any subset module and at least one
+    /// refused registration. The refused companion of
+    /// [`Self::note_callers_never_admitted`]: together they partition
+    /// every retired subset-edged uninstanced caller into refused
+    /// for cause versus exited before admission. Computed from
+    /// stop-time records (a repeated terminal call stays silent),
+    /// with the same structural zero-pass silence. True when anything
+    /// staged, so the tail can publish it.
+    pub(crate) fn note_callers_refused_admission(&mut self, lane: &AttestedSemanticLane) -> bool {
+        if self.reported_callers_refused_admission {
+            return false;
+        }
+        self.reported_callers_refused_admission = true;
+        let required = lane.subset().required();
+        if required.is_empty() {
+            return false;
+        }
+        let subset_modules: BTreeSet<ModuleId> = self
+            .registry
+            .modules()
+            .filter(|module| {
+                required
+                    .keys()
+                    .any(|object| lane.subset().proves_provider_module(*object, &module.key))
+            })
+            .map(|module| module.id)
+            .collect();
+        if subset_modules.is_empty() {
+            return false;
+        }
+        let subset_instanced: BTreeSet<CallerId> = self
+            .registry
+            .instances()
+            .filter(|record| subset_modules.contains(&record.module))
+            .map(|record| record.caller)
+            .collect();
+        let mut refused = 0u64;
+        for record in self.adapter.records().filter(|record| record.retired) {
+            if subset_instanced.contains(&record.id) {
+                continue;
+            }
+            if !self.registry.registration_refused(record.id) {
+                continue;
+            }
+            if self
+                .registry
+                .edges_of(record.id)
+                .any(|edge| subset_modules.contains(&edge.module))
+            {
+                refused = refused.saturating_add(1);
+            }
+        }
+        if refused == 0 {
+            return false;
+        }
+        self.note_scope_gap(
+            CALLERS_REFUSED_ADMISSION_SUBJECT.into(),
+            callers_refused_admission_reason(refused),
         );
         true
     }

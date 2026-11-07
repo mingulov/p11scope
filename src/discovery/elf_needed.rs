@@ -127,15 +127,12 @@ impl ExeIdentity {
 }
 
 /// Decode the kernel kdev_t `(major, minor)` pair from a raw `s_dev`
-/// word (12-bit major at bits 20–31, 20-bit minor), the same decode
-/// the watched-file calibration uses. `libc::major`/`libc::minor`
-/// would misread the raw word.
+/// word through the one shared decode ([`Device::from_kdev`]), the
+/// same decode the watched-file calibration and the unidentified-caller
+/// maps probe use. `libc::major`/`libc::minor` would misread the raw word.
 pub(crate) fn kdev_key(dev: u64, ino: u64) -> ObjectKey {
     ObjectKey {
-        device: Device {
-            major: (dev >> 20) & 0xfff,
-            minor: dev & 0xfffff,
-        },
+        device: Device::from_kdev(dev),
         inode: ino,
     }
 }
@@ -258,13 +255,16 @@ struct WalkProof {
 
 /// The raw `(dev, ino)` pair the kernel records for the file behind an
 /// open handle: `fstat` major/minor recombined into the kernel kdev_t
-/// layout plus the inode. Comparing this against the recorded pair is
-/// the same-file proof; the path alone never is.
+/// layout through the one shared encode ([`Device::to_kdev`]) plus the
+/// inode. Comparing this against the recorded pair is the same-file
+/// proof; the path alone never is.
 fn identity_of(file: &File) -> std::io::Result<(u64, u64)> {
     let meta = file.metadata()?;
-    let major = u64::from(libc::major(meta.dev()));
-    let minor = u64::from(libc::minor(meta.dev()));
-    Ok(((major << 20) | minor, meta.ino()))
+    let device = Device {
+        major: u64::from(libc::major(meta.dev())),
+        minor: u64::from(libc::minor(meta.dev())),
+    };
+    Ok((device.to_kdev(), meta.ino()))
 }
 
 fn snapshot_of(file: &File) -> std::io::Result<(u64, i64, i64, i64, i64)> {

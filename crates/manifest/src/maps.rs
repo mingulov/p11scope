@@ -12,6 +12,30 @@ pub struct Device {
     pub minor: u64,
 }
 
+impl Device {
+    /// Decode a raw kernel `s_dev` word (`dev_t` as the kernel stores
+    /// it: 12-bit major at bits 20-31, 20-bit minor) into the
+    /// major/minor pair `/proc/<pid>/maps` renders for it. This is the
+    /// one shared decode: `libc::major`/`libc::minor` decode the
+    /// userspace `st_dev` layout instead and must never meet a raw
+    /// word (the two layouts agree only for major 0 with minor < 256,
+    /// which is why a `makedev` comparison silently passed on btrfs
+    /// and failed everywhere else).
+    pub fn from_kdev(dev: u64) -> Self {
+        Self {
+            major: (dev >> 20) & 0xfff,
+            minor: dev & 0xfffff,
+        }
+    }
+
+    /// Encode back to the raw kernel `s_dev` word, the exact inverse
+    /// of [`Device::from_kdev`] for every pair the kernel's
+    /// `new_encode_dev` can hold (major < 4096, minor < 2^20).
+    pub fn to_kdev(self) -> u64 {
+        (self.major << 20) | self.minor
+    }
+}
+
 /// What `/proc/<pid>/maps` says a mapping is: `inode->i_sb->s_dev`, the device of the
 /// *superblock* the mapping was reached through, not the file's `st_dev`. So this
 /// identifies a mapping, never a physical file, and it is wrong in both directions:
@@ -603,5 +627,31 @@ mod tests {
         assert_eq!(index.containing(0x4000).unwrap().start, 0x4000);
         assert!(index.containing(0x5000).is_none());
         assert_eq!(index.resolve(0x3000), Resolved::Unmapped);
+    }
+
+    /// The kernel `s_dev` word round-trips through the shared
+    /// decode/encode on every device family the observer meets:
+    /// spinning disk, device-mapper, NVMe, loop, and a big overlay
+    /// minor. Each twin pins the exact raw word, so a `makedev`
+    /// regression fails here instead of silently passing on btrfs.
+    #[test]
+    fn kdev_word_round_trips_on_every_device_family() {
+        for (major, minor, raw) in [
+            (8u64, 1u64, (8u64 << 20) | 1),
+            (253u64, 1u64, (253u64 << 20) | 1),
+            (259u64, 3u64, (259u64 << 20) | 3),
+            (7u64, 0u64, 7u64 << 20),
+            (0u64, 0x14du64, 0x14d),
+        ] {
+            let device = Device::from_kdev(raw);
+            assert_eq!((device.major, device.minor), (major, minor));
+            assert_eq!(device.to_kdev(), raw);
+            assert_eq!(
+                Device { major, minor }.to_kdev(),
+                raw,
+                "maps {major:x}:{minor:x} encodes the kernel word"
+            );
+        }
+        assert_eq!(Device::from_kdev(0), Device { major: 0, minor: 0 });
     }
 }

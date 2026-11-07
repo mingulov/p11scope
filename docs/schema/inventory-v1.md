@@ -280,18 +280,21 @@ non-null values needs a new allowlist row.
   it is zero.
   `executables` carries one complete executable record per collected
   image, in the same order as `pids`: `exe` (the resolved path, or
-  null), `dev`/`ino` (the EXEC-joined kernel pair, zero when no EXEC
-  joined or the kernel read failed), `resolution` (one of
+  null), `dev` (`{major, minor}`, the EXEC-joined kernel `s_dev` word
+  decoded through the shared kdev decode — the mapped-device domain,
+  like `modules[].identity.device`, and never the stat-domain
+  `callers[].image.exe.dev`), `ino`, `resolution` (one of
   `proc_alive`, `scan_learned`, `system_index`, `path_unknown`,
   `exe_unavailable`, `no_exec_record`, `exec_record_lost`),
   `pid_host`, `first_call_ns`, and `calls_at_least` (the folded
   entry-count lower bound over this image's rows on this module).
-  A path reads exactly on the resolved verdicts; a nonzero pair
-  reads exactly when an EXEC joined. The concise
+  A path reads exactly on the resolved verdicts; a nonzero
+  `{major, minor}`/`ino` triple reads exactly when an EXEC joined
+  (all zero when no EXEC joined or the kernel read failed). The concise
   `unidentified executables` line groups the run-wide images by
   executable with call counts (five groups, five pids each, the rest
   counted); the verbose per-module line names every collected
-  executable with its pid, `dev`/`ino`, resolution source, and
+  executable with its pid, `dev major:minor`/`ino`, resolution source, and
   first-call time. Absent in captures that predate exe naming.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records

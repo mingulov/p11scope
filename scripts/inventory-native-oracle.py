@@ -2140,11 +2140,11 @@ UNBOUND_EXE_JOINED = frozenset(
 def check_unbound_exes(view, res):
     """Unidentified-caller executables: the optional `executables`
     array (absent in captures that predate exe naming) carries one
-    complete record per image — exe path, dev, ino, resolution, pid,
-    first call, call lower bound — in the same order as `pids`, with
-    the finite resolution vocabulary. A path reads exactly on the
-    resolved verdicts; a nonzero pair reads exactly when an EXEC
-    joined (resolved or path-unknown)."""
+    complete record per image — exe path, dev {major, minor}, ino,
+    resolution, pid, first call, call lower bound — in the same
+    order as `pids`, with the finite resolution vocabulary. A path
+    reads exactly on the resolved verdicts; a nonzero triple reads
+    exactly when an EXEC joined (resolved or path-unknown)."""
     for mid in sorted(view.modules):
         use = (view.modules[mid] or {}).get("unbound_use")
         if use is None or "executables" not in use:
@@ -2159,7 +2159,9 @@ def check_unbound_exes(view, res):
                     and set(e) == {"exe", "dev", "ino", "resolution",
                                    "pid_host", "first_call_ns", "calls_at_least"}
                     and (e["exe"] is None or type(e["exe"]) is str)
-                    and type(e["dev"]) is int and 0 <= e["dev"] <= U64_MAX
+                    and type(e["dev"]) is dict and set(e["dev"]) == {"major", "minor"}
+                    and type(e["dev"]["major"]) is int and 0 <= e["dev"]["major"] <= 0xFFF
+                    and type(e["dev"]["minor"]) is int and 0 <= e["dev"]["minor"] <= 0xFFFFF
                     and type(e["ino"]) is int and 0 <= e["ino"] <= U64_MAX
                     and type(e["resolution"]) is str
                     and e["resolution"] in UNBOUND_EXE_RESOLUTIONS
@@ -2178,7 +2180,7 @@ def check_unbound_exes(view, res):
             and len(exes) == images
             and want is not None and pairs == want
             and all((e["exe"] is not None) == (e["resolution"] in UNBOUND_EXE_RESOLVED)
-                    and ((e["dev"], e["ino"]) != (0, 0)) == (e["resolution"] in UNBOUND_EXE_JOINED)
+                    and ((e["dev"]["major"], e["dev"]["minor"], e["ino"]) != (0, 0, 0)) == (e["resolution"] in UNBOUND_EXE_JOINED)
                     for e in exes)
         )
         res.ok(view.name, "*", "UNBOUND-EXES", ok,
@@ -6569,75 +6571,76 @@ def self_test():
         # --- Unidentified-caller executables ---------------------------
         # The optional `executables` array (src/inventory/mod.rs
         # module_json): one complete record per image in pid order —
-        # exe, dev, ino, resolution, pid_host, first_call_ns,
-        # calls_at_least — with the finite resolution vocabulary, a
-        # path exactly on resolved verdicts, and a nonzero pair
-        # exactly when an EXEC joined. Absent in old captures.
+        # exe, dev {major, minor}, ino, resolution, pid_host,
+        # first_call_ns, calls_at_least — with the finite resolution
+        # vocabulary, a path exactly on resolved verdicts, and a
+        # nonzero triple exactly when an EXEC joined. Absent in old
+        # captures.
         def _exes(s, d, **kw):
-            exes = [{"exe": "/usr/bin/tool", "dev": 8, "ino": 99, "resolution": "system_index",
+            exes = [{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99, "resolution": "system_index",
                      "pid_host": 11, "first_call_ns": T0, "calls_at_least": 2},
-                    {"exe": None, "dev": 0, "ino": 0, "resolution": "exec_record_lost",
+                    {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0, "resolution": "exec_record_lost",
                      "pid_host": 12, "first_call_ns": T0 + 10, "calls_at_least": 1}]
             _unbound(s, d, executables=exes, **kw)
         case("unbound-exes-valid", None, lambda s, d, dash: _exes(s, d))
         case("unbound-exes-absent-valid", None, lambda s, d, dash: _unbound(s, d))
 
         def exes_len(s, d, dash):
-            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "system_index", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": 2}])
         case("unbound-exes-len", "UNBOUND-EXES", exes_len)
 
         def exes_keys(s, d, dash):
-            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "system_index", "pid_host": 11,
                                           "first_call_ns": T0},
-                                         {"exe": None, "dev": 0, "ino": 0,
+                                         {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1}])
         case("unbound-exes-keys", "UNBOUND-EXES", exes_keys)
 
         def exes_resolution(s, d, dash):
-            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "guessed", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": 2},
-                                         {"exe": None, "dev": 0, "ino": 0,
+                                         {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1}])
         case("unbound-exes-resolution", "UNBOUND-EXES", exes_resolution)
 
         def exes_path_mismatch(s, d, dash):
-            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "path_unknown", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": 2},
-                                         {"exe": None, "dev": 0, "ino": 0,
+                                         {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1}])
         case("unbound-exes-path-mismatch", "UNBOUND-EXES", exes_path_mismatch)
 
         def exes_pair_mismatch(s, d, dash):
-            _unbound(s, d, executables=[{"exe": None, "dev": 0, "ino": 0,
+            _unbound(s, d, executables=[{"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "path_unknown", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": 2},
-                                         {"exe": None, "dev": 0, "ino": 0,
+                                         {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1}])
         case("unbound-exes-pair-mismatch", "UNBOUND-EXES", exes_pair_mismatch)
 
         def exes_order(s, d, dash):
-            _unbound(s, d, executables=[{"exe": None, "dev": 0, "ino": 0,
+            _unbound(s, d, executables=[{"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1},
-                                         {"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                         {"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "system_index", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": 2}])
         case("unbound-exes-order", "UNBOUND-EXES", exes_order)
 
         def exes_calls_bool(s, d, dash):
-            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99,
                                           "resolution": "system_index", "pid_host": 11,
                                           "first_call_ns": T0, "calls_at_least": True},
-                                         {"exe": None, "dev": 0, "ino": 0,
+                                         {"exe": None, "dev": {"major": 0, "minor": 0}, "ino": 0,
                                           "resolution": "exec_record_lost", "pid_host": 12,
                                           "first_call_ns": T0 + 10, "calls_at_least": 1}])
         case("unbound-exes-calls-bool", "UNBOUND-EXES", exes_calls_bool)

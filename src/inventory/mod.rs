@@ -8506,15 +8506,22 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
                     "first_call_ns": pid.first_call_ns,
                 })).collect::<Vec<_>>(),
                 "pids_dropped": unbound.pids_dropped,
-                "executables": pids.iter().map(|pid| serde_json::json!({
-                    "exe": pid.exe.path,
-                    "dev": pid.exe.dev,
-                    "ino": pid.exe.ino,
-                    "resolution": pid.exe.resolution.json_label(),
-                    "pid_host": pid.pid_host,
-                    "first_call_ns": pid.first_call_ns,
-                    "calls_at_least": pid.calls_at_least,
-                })).collect::<Vec<_>>(),
+                "executables": pids.iter().map(|pid| {
+                    // The EXEC-joined kernel word, published decoded like
+                    // `modules[].identity.device` — never the raw word and
+                    // never the stat-domain `callers[].image.exe.dev`.
+                    let device =
+                        p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
+                    serde_json::json!({
+                        "exe": pid.exe.path,
+                        "dev": {"major": device.major, "minor": device.minor},
+                        "ino": pid.exe.ino,
+                        "resolution": pid.exe.resolution.json_label(),
+                        "pid_host": pid.pid_host,
+                        "first_call_ns": pid.first_call_ns,
+                        "calls_at_least": pid.calls_at_least,
+                    })
+                }).collect::<Vec<_>>(),
             })
         }),
         // Additive (v1): observed `C_Initialize` returns since the

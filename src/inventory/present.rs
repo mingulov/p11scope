@@ -2499,10 +2499,18 @@ fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &Edg
 /// Concise application edges grouped per provider: one line per module
 /// naming the mapped application count and the outcome, without internal
 /// caller/module ids (those stay verbose-only). JSON keeps every edge.
-/// Reason label for an unidentified image without a path.
+/// Reason label for an unidentified image without a path. The
+/// EXEC-joined kernel word reads decoded (`dev major:minor`), like the
+/// published JSON pair — never the raw word.
 fn unknown_exe_label(exe: &crate::discovery::caller_registry::UnboundExe) -> String {
     match exe.resolution {
-        ExeResolution::PathUnknown => format!("unknown executable ({}:{})", exe.dev, exe.ino),
+        ExeResolution::PathUnknown => {
+            let device = p11scope_manifest::maps::Device::from_kdev(exe.dev);
+            format!(
+                "unknown executable (dev {}:{}, ino {})",
+                device.major, device.minor, exe.ino
+            )
+        }
         ExeResolution::ExecRecordLost => "executable unknown (exec record lost)".to_string(),
         ExeResolution::NoExecRecord => "executable unknown (no exec record)".to_string(),
         ExeResolution::ExeUnavailable => {
@@ -3381,14 +3389,17 @@ fn render_snapshot_inner(
                                 Some(path) => escape_controls(path).into_owned(),
                                 None => unknown_exe_label(&pid.exe),
                             };
+                            let device =
+                                p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
                             format!(
-                                "{} pid {} (first call {} ago; dev {} ino {}; {})",
+                                "{} pid {} (first call {} ago; dev {}:{} ino {}; {})",
                                 name,
                                 pid.pid_host,
                                 crate::render::fmt_ns(Some(
                                     presentation.ended_ns.saturating_sub(pid.first_call_ns)
                                 )),
-                                pid.exe.dev,
+                                device.major,
+                                device.minor,
                                 pid.exe.ino,
                                 exe_source_label(pid.exe.resolution),
                             )

@@ -29670,16 +29670,19 @@ int main(void) {
             &presentation,
             crate::cli::TextVerbosity::Verbose,
         );
+        let device = p11scope_manifest::maps::Device::from_kdev(dev);
         let resolved = format!(
-            "{} pid 9 (first call 1.8µs ago; dev {dev} ino {ino}; via system index)",
-            path.display()
+            "{} pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via system index)",
+            path.display(),
+            device.major,
+            device.minor,
         );
         assert!(
             text.contains(&resolved),
             "verbose names the resolved executable:\n{text}"
         );
         assert!(
-            text.contains("executable unknown (exec record lost) pid 10 (first call 1.8µs ago; dev 0 ino 0; lifecycle evidence lost)"),
+            text.contains("executable unknown (exec record lost) pid 10 (first call 1.8µs ago; dev 0:0 ino 0; lifecycle evidence lost)"),
             "verbose names the lost executable with its reason:\n{text}"
         );
     }
@@ -29758,11 +29761,12 @@ int main(void) {
             native.row(42, 1, 11, 220, 0),
         ]);
         let (_, document) = slice_one_views(&native);
+        let device = p11scope_manifest::maps::Device::from_kdev(dev);
         assert_eq!(
             document["modules"][0]["unbound_use"]["executables"],
             serde_json::json!([
-                {"exe": path.to_string_lossy(), "dev": dev, "ino": ino, "resolution": "system_index", "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
-                {"exe": null, "dev": 0, "ino": 0, "resolution": "no_exec_record", "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
+                {"exe": path.to_string_lossy(), "dev": {"major": device.major, "minor": device.minor}, "ino": ino, "resolution": "system_index", "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
+                {"exe": null, "dev": {"major": 0, "minor": 0}, "ino": 0, "resolution": "no_exec_record", "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
             ])
         );
         assert_eq!(

@@ -360,9 +360,9 @@ fn unbound_use_executables_are_carried_when_present() {
                  {"pid_host": 11, "first_call_ns": 220}],
         "pids_dropped": 0,
         "executables": [
-            {"exe": "/usr/bin/tool", "dev": 8, "ino": 99, "resolution": "system_index",
+            {"exe": "/usr/bin/tool", "dev": {"major": 0, "minor": 8}, "ino": 99, "resolution": "system_index",
              "pid_host": 9, "first_call_ns": 210, "calls_at_least": 2},
-            {"exe": null, "dev": 0, "ino": 0, "resolution": "exec_record_lost",
+            {"exe": null, "dev": {"major": 0, "minor": 0}, "ino": 0, "resolution": "exec_record_lost",
              "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
         ]
     });

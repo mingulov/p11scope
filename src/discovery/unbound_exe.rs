@@ -14,6 +14,7 @@
 //! stat alone. No argv, environ, key, PIN, or payload is ever read.
 
 use crate::discovery::caller_registry::{ExeIdentity, ExeResolution, UnboundExe};
+use p11scope_manifest::maps::Device;
 use std::collections::HashMap;
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
@@ -102,8 +103,11 @@ pub(crate) fn real_maps_identity(path: &str) -> Option<(u64, u64)> {
 }
 
 /// Parse our own maps for the mapping covering `addr`: `(dev, ino)`
-/// with the device reconstructed from the hex major:minor pair.
-/// Malformed lines are skipped, never fatal.
+/// with the device reconstructed from the hex major:minor pair
+/// through the one shared kernel encode ([`Device::to_kdev`]), so the
+/// pair compares like for like with the kernel's raw `s_dev` word.
+/// `libc::makedev` builds the userspace `st_dev` layout instead and
+/// must never meet a maps pair. Malformed lines are skipped, never fatal.
 fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
     for line in maps.lines() {
         let mut fields = line.split_whitespace();
@@ -138,8 +142,11 @@ fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
         let Ok(ino) = ino.parse::<u64>() else {
             continue;
         };
-        let dev = libc::makedev(major, minor) as u64;
-        return Some((dev, ino));
+        let device = Device {
+            major: u64::from(major),
+            minor: u64::from(minor),
+        };
+        return Some((device.to_kdev(), ino));
     }
     None
 }
@@ -477,6 +484,17 @@ mod tests {
 
     const TICK_NS: u64 = 10_000_000;
 
+    /// The kernel word for `fstat` metadata: major/minor through the
+    /// shared encode, so staged EXEC pairs live in the mapped domain
+    /// like every real EXEC pair.
+    fn kdev_of(meta: &std::fs::Metadata) -> u64 {
+        Device {
+            major: u64::from(libc::major(meta.dev())),
+            minor: u64::from(libc::minor(meta.dev())),
+        }
+        .to_kdev()
+    }
+
     struct ScriptedProc {
         start: Option<u64>,
         exe: Option<ExeIdentity>,
@@ -799,7 +817,7 @@ mod tests {
         let scan = ScriptedScan::empty();
         let exe = resolver.resolve(
             7,
-            meta.dev(),
+            kdev_of(&meta),
             meta.ino(),
             2_000_000_000,
             &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
@@ -914,7 +932,7 @@ mod tests {
         let reads = || proc.reads(true, Some(9_000_000_000), Some(9_000_000_000));
         resolver.resolve(
             7,
-            meta.dev(),
+            kdev_of(&meta),
             meta.ino(),
             2_000_000_000,
             &reads(),
@@ -922,7 +940,7 @@ mod tests {
         );
         resolver.resolve(
             8,
-            meta.dev(),
+            kdev_of(&meta),
             meta.ino(),
             2_000_000_000,
             &reads(),
@@ -1110,7 +1128,11 @@ malformed line without fields
 7f00-7g00 r--p 00000000 00:00 0
 7fab0000-7fab1000 r--p 00000000 00:2f 4242 /lib/y
 ";
-        let expect = libc::makedev(0x103, 0x04) as u64;
+        let expect = Device {
+            major: 0x103,
+            minor: 0x04,
+        }
+        .to_kdev();
         assert_eq!(maps_identity_at(maps, 0x0040_0000), Some((expect, 99)));
         assert_eq!(maps_identity_at(maps, 0x0040_0fff), Some((expect, 99)));
         assert_eq!(maps_identity_at(maps, 0x0040_1000), None);

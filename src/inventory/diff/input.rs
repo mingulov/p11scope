@@ -1015,9 +1015,17 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
                     .enumerate()
                     .map(|(i, v)| {
                         let e = Object::new(v, format!("{}.executables[{i}]", u.path))?;
+                        // The published `{major, minor}` pair, re-encoded
+                        // to the kernel word through the one shared encode
+                        // so diff comparisons stay on the join key.
+                        let dev = e.object("dev")?;
+                        let device = p11scope_manifest::maps::Device {
+                            major: u64::from(dev.uint32("major")?),
+                            minor: u64::from(dev.uint32("minor")?),
+                        };
                         Ok::<_, anyhow::Error>(UnboundExe {
                             exe: e.text_null("exe")?,
-                            dev: e.uint("dev")?,
+                            dev: device.to_kdev(),
                             ino: e.uint("ino")?,
                             resolution: e.text("resolution")?,
                             pid_host: e.uint32("pid_host")?,

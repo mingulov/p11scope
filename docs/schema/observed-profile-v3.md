@@ -646,6 +646,29 @@ Like `selected_detail` and `instance_reload_not_excluded`, this is a
 v3-additive disclosure that introduces no new schema revision: the
 `functions[]` item shape stays open and the key stays optional.
 
+## Return-code names on `functions[]` rows
+
+Every `functions[]` row carries `rv_names`: the `CKR_*` names for the
+row's `rv_counts` keys that have a registered name, keyed by the same
+16-digit hex strings (`"0x00000000000000a0": "CKR_PIN_INCORRECT"`).
+Unregistered (vendor) codes are absent from `rv_names` — their
+`rv_counts` hex key is the verbatim rendering, never a guessed name.
+`rv_names` is always present (possibly `{}`) in both lanes; it is
+render-time presentation of the already-captured full-width `CK_RV`
+values through the same lookup trace lines use. `rv_counts` is
+unchanged, and like `initialization` this introduces no new schema
+revision: the `functions[]` item shape stays open.
+
+The live text report explains each row's ERR count the same way: an
+`ERROR REASONS:` section after the function table lists one
+`NAME: CKR_X xN, …` line per function with errors, in table order.
+Concise text keeps the top three reasons by count with an `and N more`
+tail; `-v` lists every distinct code. `CKR_OK` and `CKR_PENDING` are
+never reasons. A function with errors but no error breakdown in
+`rv_counts` (the return-value table read failed) reads
+`NAME: N errors (return-code breakdown unavailable)`: a named gap,
+never a stopped view. Captures without failures render no section.
+
 ## Forwarding-layer split on `functions[]` rows
 
 Every `functions[]` row carries `forwarding_layer` (boolean, always

@@ -885,6 +885,15 @@ machine cause name, and the `Evidence:` line repeats the same verdict
 reasons after the probe and slot counts. A `COMPLETE` verdict reads
 `coverage: complete`.
 
+When calls fail, the profile text says why: an `ERROR REASONS:` section
+after the function table lists each failing function's return codes by
+name with counts (`C_Login: CKR_PIN_INCORRECT x3, CKR_USER_NOT_LOGGED_IN
+x1`). Concise output keeps the top three reasons per function with an
+`and N more` tail; `-v` lists every distinct code. Unregistered vendor
+codes render as verbatim hex. JSON carries the same names in
+`functions[].rv_names`, keyed by the same hex strings as `rv_counts`
+(see [the v3 schema](schema/observed-profile-v3.md)).
+
 **Historical pre-terminal-drain output**, `trace` against the same workload
 (`scripts/verify-attach-e2e.sh`'s harness, captured while writing this doc —
 `sess#N` is a per-capture pseudonym, never the provider's raw session handle):

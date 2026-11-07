@@ -140,14 +140,24 @@ caller identity row of [privacy allowlist v3](../privacy/allowlist-v3.md).
 Owner ruling (2026-11-07): the native lane additionally publishes each
 unidentified caller image's executable (`modules[].unbound_use.executables`),
 from the kernel `(dev, ino)` of the exec image joined by (domain, ticket)
-plus three narrowly scoped userspace resolution sources (a live
-`/proc/<pid>/exe` with a start-time generation check, scan-learned
-identities, and a lazy index of the fixed system binary dirs), each
-confirmed in the mapped device domain (a private one-page mapping
-read back from the observer's own maps — the page is never
-touched), never by stat alone — still no argv, environ, key, PIN,
-payload, `comm`, cwd, or cmdline. See the unidentified caller
-executables row of [privacy allowlist v3](../privacy/allowlist-v3.md).
+plus three narrowly scoped userspace resolution sources: (a) a live
+`/proc/<pid>/exe` with a start-time generation check — the starttime
+from `/proc/<pid>/stat` (the whole line is read; the start field is
+parsed around the comm field, which is discarded, never retained or
+published), the exe link text, the exe mtime, and the mapped
+`(dev, ino)` from opening `/proc/<pid>/exe` itself, refused under
+pidns mismatch, incomparable clocks, or boottime skew; (b)
+scan-learned identities, re-probed through a sticky per-path cache
+(once per distinct path per capture); and (c) a lazy index of the
+fixed system binary dirs — each confirmed in the mapped device
+domain (a private one-page mapping read back from the observer's own
+maps — the page is never touched), never by stat alone. Publication
+decodes the kernel word to `dev: {major, minor}` through the shared
+kdev decode, like `modules[].identity.device` — never the raw word
+and never the stat-domain `callers[].image.exe.dev`. Still no argv,
+environ, key, PIN, payload, `comm`, cwd, or cmdline. See the
+unidentified caller executables row of
+[privacy allowlist v3](../privacy/allowlist-v3.md).
 `callers[].image.task_cookie` and `.exec_id` are always null in v0.2.0
 (`owner_image` returns `None` everywhere in production); only a future
 lane returning exact owner images would fill them, and publishing
@@ -249,7 +259,7 @@ non-null values needs a new allowlist row.
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
   `unbound_use` is `null`, or `{first_ns, rows, reasons, entries,
-  images, images_saturated, pids, pids_dropped}`:
+  images, images_saturated, pids, pids_dropped, executables}`:
   native witness rows of this module that no caller edge carries —
   positive, monotonic module-level use, never attributed to a caller by
   pid. Only a row whose witness endpoint belongs to this one admitted
@@ -273,9 +283,11 @@ non-null values needs a new allowlist row.
   `pids` lists one `{pid_host, first_call_ns}` per collected image,
   oldest first call first: the kernel tgid in host (init-namespace)
   numbering with the earliest row's first-association instant.
-  Historical only — never the process now holding that number, never
-  re-read through `/proc`, never a name — and never deduplicated
-  (two images of one tgid list twice). `pids_dropped` counts the
+  Historical only — never the process now holding that number — and
+  never deduplicated (two images of one tgid list twice). The numbers
+  themselves are never re-read through `/proc` and never a name;
+  executable naming (the next paragraph) is the only `/proc` read
+  over these images. `pids_dropped` counts the
   distinct images the bound turned away; the list is complete while
   it is zero.
   `executables` carries one complete executable record per collected
@@ -292,7 +304,7 @@ non-null values needs a new allowlist row.
   `{major, minor}`/`ino` triple reads exactly when an EXEC joined
   (all zero when no EXEC joined or the kernel read failed). The concise
   `unidentified executables` line groups the run-wide images by
-  executable with call counts (five groups, five pids each, the rest
+  executable with call counts (five groups, five host pids each, the rest
   counted); the verbose per-module line names every collected
   executable with its pid, `dev major:minor`/`ino`, resolution source, and
   first-call time. Absent in captures that predate exe naming.

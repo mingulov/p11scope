@@ -2467,11 +2467,12 @@ pub(crate) struct UnboundPid {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum ExeResolution {
     /// A live process at the image's pid whose start time predates
-    /// the EXEC and whose `/proc/<pid>/exe` stats to the joined
-    /// `(dev, ino)`.
+    /// the EXEC and whose `/proc/<pid>/exe`, opened and mapped
+    /// itself, probes to the joined `(dev, ino)`.
     ProcAlive,
     /// An exe identity the scan already learned from an admitted
-    /// caller, with the same `(dev, ino)` (re-verified by stat).
+    /// caller, with the same `(dev, ino)` (re-verified by the
+    /// mapping probe).
     ScanLearned,
     /// The lazy system-binary index matched the joined `(dev, ino)`.
     SystemIndex,

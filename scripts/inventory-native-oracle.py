@@ -4976,6 +4976,33 @@ def self_test():
             cov["until_ns"] = cov["since_ns"]
         case("coverage-until-not-after-since", "COVERAGE-SHAPE", until_before_since)
 
+        # v0.7.0 PID exit: a counted feed whose sole loss cause is a clean
+        # PID-target exit carries lossy True with detail "the PID target
+        # exited" (src/inventory/mod.rs coverage_json). Any other counted
+        # detail, or the exit detail on an exact feed, is malformed.
+        def counted_exit_detail(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(lossy=True, detail="the PID target exited")
+            d["gaps"].append({"caller": None, "module": None, "pid": None,
+                              "subject": "native capture scope custody unproven",
+                              "reason": "PID custody lost: the PID target exited",
+                              "budget": None, "repeats": 1})
+        case("counted-exit-detail", None, counted_exit_detail)
+
+        def counted_exit_detail_exact(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(detail="the PID target exited")
+        case("counted-exit-detail-lossy-false", "COVERAGE-SHAPE", counted_exit_detail_exact)
+
+        def counted_other_detail(s, d, dash):
+            e = _edge(d, cid(s, "P1"), s.mid["A"])
+            e["entries"]["coverage"].update(lossy=True, detail="something else")
+            d["gaps"].append({"caller": None, "module": None, "pid": None,
+                              "subject": "native count refresh loss",
+                              "reason": "count refresh lookup failed",
+                              "budget": None, "repeats": 1})
+        case("counted-other-detail", "COVERAGE-SHAPE", counted_other_detail)
+
         def watch_ending_before_use(until_offset):
             def mutate(s, d, dash):
                 e = _edge(d, cid(s, "P2"), s.mid["B"])

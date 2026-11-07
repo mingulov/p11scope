@@ -739,6 +739,13 @@ impl NativeBinder {
         *latest = (*latest).max(at_ns);
     }
 
+    /// Test seam: recorded reuses held (the retained fallback consults
+    /// this; production forwards PID-scope turnovers only).
+    #[cfg(test)]
+    pub(crate) fn reuse_len_for_test(&self) -> usize {
+        self.reuse_ns.len()
+    }
+
     pub(crate) fn census(&self) -> &BindingCensus {
         &self.census
     }

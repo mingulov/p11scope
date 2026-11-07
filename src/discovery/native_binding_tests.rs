@@ -798,6 +798,31 @@ fn exit_before_the_poll_binds_the_unambiguous_retained_row() {
 }
 
 #[test]
+fn incomparable_exit_clocks_after_the_read_leave_the_retained_row_unbound() {
+    // The clocks-comparable gate is read at decision time: a row read
+    // while comparable but decided after the clocks went incomparable
+    // stays unbound (its exec/loss orderings are meaningless). Kills the
+    // mutant that drops the `!clocks_comparable` early return.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.binder.set_exit_clocks_comparable(false);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+}
+
+#[test]
 fn pid_reuse_leaves_the_retained_row_unbound() {
     // Two retained incarnations hold the tgid (a PID reuse): even though
     // the row falls inside the first lifetime, the match is ambiguous.

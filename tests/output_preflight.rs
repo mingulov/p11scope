@@ -25,7 +25,7 @@ fn assert_failure_stage(text: &str, expected_after_admission: &str, host_refusal
 
 #[test]
 fn untrusted_output_is_refused_before_the_discovery_scan() {
-    let host_refusal = multi_host::refusal();
+    let host_refusal = multi_host::in_process_refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     // Group-writable without the sticky bit: untrusted (cf. F-Scale-6's 0775 dir).
@@ -101,7 +101,7 @@ fn poisoned_profile_args(out: PathBuf) -> CaptureArgs {
 /// the whole capture. They are refused before the discovery scan now.
 #[test]
 fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
-    let host_refusal = multi_host::refusal();
+    let host_refusal = multi_host::in_process_refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let captures = dir.path().join("captures");
@@ -145,7 +145,7 @@ fn directory_and_special_file_outputs_are_refused_before_the_discovery_scan() {
 /// failure must preserve the previous file and leave a fresh path absent.
 #[test]
 fn a_failed_trace_keeps_the_previous_output_file() {
-    let host_refusal = multi_host::refusal();
+    let host_refusal = multi_host::in_process_refusal();
     let dir = tempfile::tempdir().unwrap();
     std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
     let previous = dir.path().join("prior-trace.log");

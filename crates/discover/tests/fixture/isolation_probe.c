@@ -224,7 +224,9 @@ __attribute__((constructor)) static void ctor(void) {
     /* Inode-attribute change outside the output: FS_IOC_SETFLAGS from
      * an O_RDONLY fd would set FS_NODUMP_FL on a test-owned file.
      * Landlock's IOCTL_DEV does not mediate regular files, so the
-     * seccomp filter must deny it. */
+     * seccomp filter must deny it. The flag word is fixed (fresh test
+     * files start with no flags): the type-byte rule denies
+     * FS_IOC_GETFLAGS too, so there is no read-modify-write. */
     {
         const char *target = getenv("ISOLATION_SETFLAGS_PATH");
         if (!target) {
@@ -234,16 +236,11 @@ __attribute__((constructor)) static void ctor(void) {
             if (ffd < 0) {
                 fprintf(stderr, "ISOLATION_SETFLAGS=unknown(open errno=%d)\n", errno);
             } else {
-                int flags = 0;
-                if (ioctl(ffd, FS_IOC_GETFLAGS, &flags) != 0) {
-                    fprintf(stderr, "ISOLATION_SETFLAGS=unknown(getflags errno=%d)\n", errno);
+                int flags = FS_NODUMP_FL;
+                if (ioctl(ffd, FS_IOC_SETFLAGS, &flags) == 0) {
+                    fprintf(stderr, "ISOLATION_SETFLAGS=allowed\n");
                 } else {
-                    flags |= FS_NODUMP_FL;
-                    if (ioctl(ffd, FS_IOC_SETFLAGS, &flags) == 0) {
-                        fprintf(stderr, "ISOLATION_SETFLAGS=allowed\n");
-                    } else {
-                        fprintf(stderr, "ISOLATION_SETFLAGS=denied(errno=%d)\n", errno);
-                    }
+                    fprintf(stderr, "ISOLATION_SETFLAGS=denied(errno=%d)\n", errno);
                 }
                 close(ffd);
             }

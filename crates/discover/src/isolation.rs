@@ -6,7 +6,8 @@
 //! filesystem plus denied TCP bind/connect) followed by a seccomp denylist
 //! (no IP networking or socket connect/bind; no exec, mount, ptrace, BPF,
 //! io_uring, keyring or file-metadata syscalls; no terminal-input-injection
-//! or inode-attribute ioctls). Every denial fails with `EACCES`, never
+//! ioctls or filesystem-mutation ioctl types). Every denial fails with
+//! `EACCES`, never
 //! kill/trap, so a fenced
 //! provider call reads as an ordinary error. Applied after the shared
 //! privilege drop and before any provider code runs; any failure refuses
@@ -117,19 +118,22 @@ const ARG0_LO_OFFSET: u32 = 16;
 const ARG1_LO_OFFSET: u32 = 24;
 const AF_UNIX: u32 = 1;
 const AF_NETLINK: u32 = 16;
-// Ioctl commands denied below: terminal-input-injection plus the inode
-// mutators reachable from an O_RDONLY fd (Landlock's IOCTL_DEV does not
-// mediate regular files). Every other ioctl stays allowed.
+// Ioctl denials below: terminal-input-injection stays exact
+// (TIOCSTI/TIOCLINUX), while filesystem mutation is denied by _IOC_TYPE
+// byte (bits 8-15 of the command): btrfs subvolume/snapshot creation
+// bypasses the Landlock path hooks, and the inode mutators are reachable
+// from an O_RDONLY fd (Landlock's IOCTL_DEV does not mediate regular
+// files). Every other ioctl stays allowed.
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541C;
-// linux/fs.h, linux/fsverity.h, linux/fscrypt.h. The 32-bit SETFLAGS is
-// _IOW('f', 2, int) for compat callers.
-const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
-const FS_IOC_SETFLAGS32: u32 = 0x4004_6602;
-const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
-const FS_IOC_ENABLE_VERITY: u32 = 0x4080_6685;
-const FS_IOC_SET_ENCRYPTION_POLICY: u32 = 0x800c_6613;
-const FS_IOC_SETVERSION: u32 = 0x4008_7602;
+// Masked command values (cmd & 0xff00): btrfs 0x94 (incl.
+// FICLONE/FIDEDUPERANGE), 'f' 0x66 (inode flags, verity, fscrypt),
+// 'X' 0x58 (fsxattr), 'v' 0x76 (versions), f2fs 0xf5.
+const IOCTL_TYPE_BTRFS: u32 = 0x9400;
+const IOCTL_TYPE_FS: u32 = 0x6600;
+const IOCTL_TYPE_FSXATTR: u32 = 0x5800;
+const IOCTL_TYPE_FSVER: u32 = 0x7600;
+const IOCTL_TYPE_F2FS: u32 = 0xf500;
 
 // x86-64 syscall numbers in the denylist (contract §5).
 const SYS_IOCTL: u32 = 16;
@@ -206,9 +210,10 @@ const SYS_UTIMENSAT: u32 = 280;
 
 /// Unconditional denials. `socket`, `ioctl` and `prlimit64` are handled
 /// separately: `AF_UNIX` and `AF_NETLINK` socket domains stay allowed
-/// while every other domain is denied, only the listed terminal-injection
-/// and inode-attribute ioctl commands are denied, and only `prlimit64`
-/// on pid 0 (the calling process) stays allowed.
+/// while every other domain is denied, only the terminal-injection
+/// commands and the filesystem-mutation type bytes are denied for
+/// `ioctl`, and only `prlimit64` on pid 0 (the calling process) stays
+/// allowed.
 const DENY_ALWAYS: &[u32] = &[
     SYS_CONNECT,
     SYS_BIND,
@@ -291,11 +296,12 @@ struct SockFprog {
 }
 
 // Classic BPF opcodes: ld [k] is LD|W|ABS, jeq #k is JMP|JEQ|K,
-// jge #k is JMP|JGE|K, ret #k.
+// jge #k is JMP|JGE|K, ret #k is RET|K, a &= #k is ALU|AND|K.
 const BPF_LD_W_ABS: u16 = 0x20;
 const BPF_JMP_JEQ_K: u16 = 0x15;
 const BPF_JMP_JGE_K: u16 = 0x35;
 const BPF_RET_K: u16 = 0x06;
+const BPF_ALU_AND_K: u16 = 0x54;
 
 /// The x32 ABI bit: x32 syscalls arrive with the audit arch of x86-64
 /// but nr | 0x4000_0000, matching no 64-bit equality check.
@@ -375,22 +381,27 @@ impl FilterBuilder {
         let deny_socket = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_unix = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         // ioctl(fd, cmd, ...): TIOCSTI/TIOCLINUX inject input into the
-        // operator's terminal, and the inode ioctls mutate flags, xattr,
-        // version, encryption policy or verity from an O_RDONLY fd, so
-        // those commands are denied and every other ioctl stays allowed.
+        // operator's terminal and stay exact; filesystem mutation is
+        // denied by type byte (cmd & 0xff00), because btrfs
+        // subvolume/snapshot creation bypasses the Landlock path hooks
+        // and the inode ioctls mutate flags, xattr, version, encryption
+        // policy or verity from an O_RDONLY fd. Every other ioctl stays
+        // allowed.
         let ioctl_check = self.emit(stmt(BPF_LD_W_ABS, ARG1_LO_OFFSET));
-        let mut ioctl_jumps = Vec::with_capacity(8);
-        for cmd in [
-            TIOCSTI,
-            TIOCLINUX,
-            FS_IOC_SETFLAGS,
-            FS_IOC_SETFLAGS32,
-            FS_IOC_FSSETXATTR,
-            FS_IOC_ENABLE_VERITY,
-            FS_IOC_SET_ENCRYPTION_POLICY,
-            FS_IOC_SETVERSION,
-        ] {
+        let mut ioctl_jumps = Vec::with_capacity(2);
+        for cmd in [TIOCSTI, TIOCLINUX] {
             ioctl_jumps.push(self.jeq(cmd));
+        }
+        let ioctl_mask = self.emit(stmt(BPF_ALU_AND_K, 0xff00));
+        let mut ioctl_type_jumps = Vec::with_capacity(5);
+        for masked in [
+            IOCTL_TYPE_BTRFS,
+            IOCTL_TYPE_FS,
+            IOCTL_TYPE_FSXATTR,
+            IOCTL_TYPE_FSVER,
+            IOCTL_TYPE_F2FS,
+        ] {
+            ioctl_type_jumps.push(self.jeq(masked));
         }
         let deny_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
@@ -415,12 +426,18 @@ impl FilterBuilder {
         self.patch(prlimit_jump, prlimit_check, allow)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
         self.patch(is_netlink, allow_unix, deny_socket)?;
-        // Each denied ioctl: equal falls into `deny_ioctl`, else the next
-        // command check, walked back to front; the last falls to allow.
+        // Each denied ioctl type: equal falls into `deny_ioctl`, else
+        // the next type check, walked back to front; the last falls to
+        // allow. The exact checks above fall into the mask instead.
         let mut next_ioctl = allow_ioctl;
-        for at in ioctl_jumps.iter().rev() {
+        for at in ioctl_type_jumps.iter().rev() {
             self.patch(*at, deny_ioctl, next_ioctl)?;
             next_ioctl = *at;
+        }
+        let mut next_exact = ioctl_mask;
+        for at in ioctl_jumps.iter().rev() {
+            self.patch(*at, deny_ioctl, next_exact)?;
+            next_exact = *at;
         }
         self.patch(is_self, allow_prlimit, deny_prlimit)?;
         validate_filter(&self.insns)?;
@@ -440,7 +457,8 @@ fn validate_filter(insns: &[SockFilter]) -> Result<(), String> {
             if jt >= insns.len() || jf >= insns.len() {
                 return Err(format!("seccomp jump from {at} leaves the program"));
             }
-        } else if insn.code != BPF_LD_W_ABS && insn.code != BPF_RET_K {
+        } else if insn.code != BPF_LD_W_ABS && insn.code != BPF_RET_K && insn.code != BPF_ALU_AND_K
+        {
             return Err(format!(
                 "unexpected seccomp opcode {:#x} at {at}",
                 insn.code
@@ -782,6 +800,18 @@ pub fn apply_isolated(out: Option<&Path>) -> Result<(), String> {
 mod tests {
     use super::*;
 
+    // Exact commands the type rule must cover (linux/fs.h,
+    // linux/fsverity.h, linux/fscrypt.h): each denies by its type byte
+    // now, including the 32-bit SETFLAGS value (a native caller issuing
+    // it is denied like any other 'f' command; compat callers never get
+    // here past the arch gate).
+    const FS_IOC_SETFLAGS: u32 = 0x4008_6602;
+    const FS_IOC_SETFLAGS32: u32 = 0x4004_6602;
+    const FS_IOC_FSSETXATTR: u32 = 0x401c_5820;
+    const FS_IOC_ENABLE_VERITY: u32 = 0x4080_6685;
+    const FS_IOC_SET_ENCRYPTION_POLICY: u32 = 0x800c_6613;
+    const FS_IOC_SETVERSION: u32 = 0x4008_7602;
+
     #[test]
     fn filter_starts_with_the_arch_gate_and_covers_the_denylist() {
         let insns = FilterBuilder::new().build().unwrap();
@@ -1075,6 +1105,10 @@ mod tests {
                 BPF_JMP_JGE_K => {
                     pc += 1 + if acc >= insn.k { insn.jt } else { insn.jf } as usize;
                 }
+                BPF_ALU_AND_K => {
+                    acc &= insn.k;
+                    pc += 1;
+                }
                 BPF_RET_K => return insn.k,
                 other => panic!("evaluator hit an unexpected opcode {other:#x}"),
             }
@@ -1352,8 +1386,8 @@ mod tests {
         assert_eq!(TIOCSTI, libc::TIOCSTI as u32, "wrong TIOCSTI");
         assert_eq!(TIOCLINUX, libc::TIOCLINUX as u32, "wrong TIOCLINUX");
         // TIOCSTI/TIOCLINUX inject input into the operator's terminal;
-        // they are denied alongside the inode-attribute commands below,
-        // while ordinary ioctls stay allowed.
+        // they are denied alongside the filesystem-mutation type bytes
+        // below, while ordinary ioctls stay allowed.
         for cmd in [TIOCSTI, TIOCLINUX] {
             assert_eq!(
                 eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, cmd),
@@ -1379,9 +1413,10 @@ mod tests {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
         // Inode mutators reachable from an O_RDONLY fd (Landlock's
-        // IOCTL_DEV does not mediate regular files): each must deny.
-        // Numbers from linux/fs.h, linux/fsverity.h and linux/fscrypt.h;
-        // the 32-bit SETFLAGS is _IOW('f', 2, int).
+        // IOCTL_DEV does not mediate regular files): each must deny by
+        // its type byte. Numbers from linux/fs.h, linux/fsverity.h and
+        // linux/fscrypt.h; the 32-bit SETFLAGS value denies as type 'f'
+        // like the rest.
         let cmds: &[(u32, u32, &str)] = &[
             (FS_IOC_SETFLAGS, 0x4008_6602, "FS_IOC_SETFLAGS"),
             (FS_IOC_SETFLAGS32, 0x4004_6602, "FS_IOC_SETFLAGS32"),

@@ -543,10 +543,11 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Replaced wholesale per applied pass (a pid the pass never saw
     /// carries no prior and scans); discarded passes record nothing.
     maps_prior: BTreeMap<u32, (Option<u64>, u64)>,
-    /// Members that mapped a pinned object in the last applied pass:
-    /// they never skip, so a watch's confirmed mapping survives across
-    /// passes without an armed/coverage-lost flap. Replaced wholesale
-    /// with the digests; discarded passes record nothing.
+    /// Members that mapped a watch-feeding (admitted or partial)
+    /// object in the last applied pass: they never skip, so a watch's
+    /// confirmed mapping survives across passes without an
+    /// armed/coverage-lost flap. Replaced wholesale with the digests;
+    /// discarded passes record nothing.
     mappers_prior: BTreeSet<u32>,
     /// Every task identity enumerated by an applied pass, across passes:
     /// the terminal stop diff reports live tasks this never saw, so a
@@ -8549,14 +8550,28 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// enumeration memory for the terminal stop diff. Memory-unavailable,
     /// unreadable, exited and not-selected members stay fresh so the
     /// next pass retries them. The pass's sweep digests replace the
-    /// deep-scan skip priors wholesale, and its pinned-object mappers
+    /// deep-scan skip priors wholesale, and its watch-feeding mappers
     /// join the never-skip set. Discarded passes record nothing.
     fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
         self.maps_prior = catalog.sweep_digests.clone();
+        // Never-skip covers only watch-feeding mappers: members mapping
+        // solely refused/unresolved objects skip safely (their modules
+        // carry no watch, so no edge can flap). A re-admission a skip
+        // would miss waits for the backstop at most. Dangling indices
+        // cannot occur (both lists are built together); if they ever
+        // do, the member keeps its watch (never skips) rather than
+        // risking a flap.
         self.mappers_prior = catalog
             .processes
             .iter()
-            .filter(|process| !process.objects.is_empty())
+            .filter(|process| {
+                process.objects.iter().any(|index| {
+                    catalog
+                        .objects
+                        .get(*index)
+                        .is_none_or(|object| object.admission.feeds_watch())
+                })
+            })
             .map(|process| process.pid)
             .collect();
         let current: BTreeMap<u32, Option<u64>> = catalog

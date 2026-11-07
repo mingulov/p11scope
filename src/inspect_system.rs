@@ -397,10 +397,11 @@ impl Collection {
 /// generation both match is confirmed, not deep-scanned: its mappings
 /// are byte-identical to a pass that already decoded them, so a rescan
 /// could only repeat the same findings. `mappers` names the members
-/// that mapped a pinned object last pass; they never skip, because a
-/// skip emits an uncertain mapping (coverage lost) while a re-decode
-/// keeps the watch's confirmed state. New mappings, pid reuse, and
-/// unreadable generations never skip; backstop passes carry no priors.
+/// that mapped a watch-feeding object last pass; they never skip,
+/// because a skip emits an uncertain mapping (coverage lost) while a
+/// re-decode keeps the watch's confirmed state. New mappings, pid
+/// reuse, and unreadable generations never skip; backstop passes
+/// carry no priors.
 pub(crate) struct ScanPriors {
     pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
     pub(crate) mappers: BTreeSet<u32>,
@@ -1122,6 +1123,18 @@ pub(crate) enum AdmissionRecord {
 }
 
 impl AdmissionRecord {
+    /// Whether modules with this verdict can carry a watch: only
+    /// admitted and partial objects attach endpoints. Refused modules
+    /// render refused whatever the mapping state, and unresolved ones
+    /// read coverage-lost either way, so their mappers skip without
+    /// flapping any edge (see `Capture::for_edge`).
+    pub(crate) const fn feeds_watch(&self) -> bool {
+        match self {
+            Self::Admitted { .. } | Self::Partial { .. } => true,
+            Self::Refused { .. } | Self::Unresolved { .. } => false,
+        }
+    }
+
     pub(crate) const fn state(&self) -> &'static str {
         match self {
             Self::Admitted { .. } => "admitted",

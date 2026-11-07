@@ -14536,6 +14536,7 @@ mod tests {
     /// opens scripted by path (a missing open is unopenable).
     struct CopyUpScriptIo {
         verdicts: std::collections::VecDeque<WitnessVerdict>,
+        outcomes: std::collections::VecDeque<WitnessOutcome>,
         prove_calls: usize,
         witness_used: u32,
         witness_max: u32,
@@ -14549,6 +14550,7 @@ mod tests {
         fn scripted(verdicts: Vec<WitnessVerdict>, candidates: Vec<std::path::PathBuf>) -> Self {
             Self {
                 verdicts: verdicts.into(),
+                outcomes: std::collections::VecDeque::new(),
                 prove_calls: 0,
                 witness_used: 0,
                 witness_max: 8,
@@ -14568,6 +14570,10 @@ mod tests {
 
         fn exhaust(&mut self) {
             self.witness_used = self.witness_max;
+        }
+
+        fn script_outcome(&mut self, outcome: WitnessOutcome) {
+            self.outcomes.push_back(outcome);
         }
     }
 
@@ -14625,6 +14631,37 @@ mod tests {
             self.verdicts
                 .pop_front()
                 .expect("scripted witness queried past its script")
+        }
+
+        fn prove_original_file_diagnosed(
+            &mut self,
+            view: &ProcessView,
+            file: &std::fs::File,
+            held: &MappedFile,
+            key: ObjectKey,
+            range: (u64, u64),
+            budget: &mut CaptureWorkBudget,
+        ) -> WitnessOutcome {
+            // Scripted diagnosed outcomes serve queries past the
+            // scripted verdicts (a missing verdict past them is a
+            // harness bug, not a witness query).
+            if self.verdicts.is_empty()
+                && let Some(outcome) = self.outcomes.pop_front()
+            {
+                if self.witness_used >= self.witness_max {
+                    return WitnessOutcome {
+                        verdict: WitnessVerdict::Failed(WitnessFailure::BudgetExhausted),
+                        diagnosis: None,
+                    };
+                }
+                self.prove_calls += 1;
+                self.witness_used += 1;
+                return outcome;
+            }
+            WitnessOutcome {
+                verdict: self.prove_original_file(view, file, held, key, range, budget),
+                diagnosis: None,
+            }
         }
 
         fn held_identity(&mut self, _: &std::fs::File) -> Option<MappedFile> {
@@ -14759,12 +14796,15 @@ mod tests {
             Err(reason) => reason,
             other => panic!("exhaustion mid-search refuses: {other:?}"),
         };
+        let canonical = WitnessVerdict::OtherFile
+            .gap_reason()
+            .expect("the other-file verdict refuses");
         assert_eq!(
             reason,
-            WitnessVerdict::OtherFile
-                .gap_reason()
-                .expect("the other-file verdict refuses"),
-            "no proven lower keeps the held query's reason"
+            format!(
+                "{canonical}; lower candidates refused: 1 (index 0: witness query budget exhausted)"
+            ),
+            "the exhausting candidate is named"
         );
         assert_eq!(io.prove_calls, 1, "only the held query runs");
         assert_eq!(
@@ -14833,12 +14873,15 @@ mod tests {
             Err(reason) => reason,
             other => panic!("all-other candidates refuse: {other:?}"),
         };
+        let canonical = WitnessVerdict::OtherFile
+            .gap_reason()
+            .expect("the other-file verdict refuses");
         assert_eq!(
             reason,
-            WitnessVerdict::OtherFile
-                .gap_reason()
-                .expect("the other-file verdict refuses"),
-            "no proven lower keeps the held query's reason"
+            format!(
+                "{canonical}; lower candidates refused: 2 (index 0: the kernel witness proved another file; index 1: the kernel witness proved another file)"
+            ),
+            "every refusal named by index"
         );
         assert_eq!(io.prove_calls, 3, "held plus two lower queries");
     }
@@ -14862,6 +14905,136 @@ mod tests {
         );
         assert_eq!(io.prove_calls, 1, "only the held query runs");
         assert!(io.opened.is_empty(), "no candidate opens");
+    }
+
+    #[test]
+    fn copyup_fallback_names_per_candidate_refusals() {
+        // RED: every skipped candidate is a named refusal in the terminal
+        // gap (index + finite stage, never the path), not a silent skip.
+        let dir = tempfile::tempdir().unwrap();
+        let good = dir.path().join("good.so");
+        std::fs::write(&good, b"good").unwrap();
+        let bad = PathBuf::from("/lower/missing.so");
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile, WitnessVerdict::OtherFile],
+            vec![bad.clone(), good.clone()],
+        );
+        io.serve(&good, std::fs::File::open(&good).unwrap());
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("all-refused candidates refuse: {other:?}"),
+        };
+        let canonical = WitnessVerdict::OtherFile
+            .gap_reason()
+            .expect("the other-file verdict refuses");
+        assert!(
+            reason.starts_with(canonical),
+            "the held reason keeps its prefix: {reason}"
+        );
+        assert!(
+            reason.contains("lower candidates refused: 2"),
+            "both skips counted: {reason}"
+        );
+        for (index, stage) in [
+            (0, "could not be opened"),
+            (1, "the kernel witness proved another file"),
+        ] {
+            assert!(
+                reason.contains(&format!("index {index}: {stage}")),
+                "candidate {index} named: {reason}"
+            );
+        }
+        assert!(
+            !reason.contains("missing.so"),
+            "candidate paths never published: {reason}"
+        );
+        assert_eq!(io.prove_calls, 2, "held plus the openable query");
+    }
+
+    #[test]
+    fn copyup_fallback_all_unopenable_names_each_refusal() {
+        // The nested-container shape: every candidate unopenable, each
+        // refusal named (design step 5: named, per-candidate, not silent).
+        let mut io = CopyUpScriptIo::scripted(
+            vec![WitnessVerdict::OtherFile],
+            vec![
+                PathBuf::from("/lower/first.so"),
+                PathBuf::from("/lower/second.so"),
+            ],
+        );
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("unopenable candidates refuse: {other:?}"),
+        };
+        assert!(
+            reason.contains("lower candidates refused: 2"),
+            "both skips counted: {reason}"
+        );
+        assert!(reason.contains("index 0"), "first refusal named: {reason}");
+        assert!(reason.contains("index 1"), "second refusal named: {reason}");
+        assert!(
+            !reason.contains("first.so") && !reason.contains("second.so"),
+            "candidate paths never published: {reason}"
+        );
+        assert_eq!(io.prove_calls, 1, "only the held query runs");
+    }
+
+    #[test]
+    fn copyup_fallback_failed_candidate_verdicts_named() {
+        // Failed candidate queries name their finite stage, with the
+        // diagnosis note when the query carries one.
+        let dir = tempfile::tempdir().unwrap();
+        let lower0 = dir.path().join("lower0.so");
+        let lower1 = dir.path().join("lower1.so");
+        std::fs::write(&lower0, b"lower-zero").unwrap();
+        std::fs::write(&lower1, b"lower-one").unwrap();
+        let mut io = CopyUpScriptIo::scripted(
+            vec![
+                WitnessVerdict::OtherFile,
+                WitnessVerdict::Failed(WitnessFailure::Unavailable),
+                WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed),
+            ],
+            vec![lower0.clone(), lower1.clone()],
+        );
+        io.serve(&lower0, std::fs::File::open(&lower0).unwrap());
+        io.serve(&lower1, std::fs::File::open(&lower1).unwrap());
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("failed candidates refuse: {other:?}"),
+        };
+        assert!(
+            reason.contains("index 0: kernel witness unavailable"),
+            "unavailable named: {reason}"
+        );
+        assert!(
+            reason.contains("index 1: witness anchor binding failed"),
+            "binding failure named: {reason}"
+        );
+        assert_eq!(io.prove_calls, 3, "held plus two lower queries");
+    }
+
+    #[test]
+    fn copyup_fallback_unavailable_candidate_carries_diagnosis_note() {
+        // A diagnosed unavailable candidate appends the plain-words stage.
+        let dir = tempfile::tempdir().unwrap();
+        let lower = dir.path().join("lower.so");
+        std::fs::write(&lower, b"lower").unwrap();
+        let mut io = CopyUpScriptIo::scripted(vec![WitnessVerdict::OtherFile], vec![lower.clone()]);
+        io.serve(&lower, std::fs::File::open(&lower).unwrap());
+        io.script_outcome(WitnessOutcome {
+            verdict: WitnessVerdict::Failed(WitnessFailure::Unavailable),
+            diagnosis: Some(WitnessDiagnosis {
+                stage: WitnessStage::ExplicitUserspace,
+            }),
+        });
+        let reason = match run_copyup_join(&mut io, Path::new("/mnt/merged/lib.so")) {
+            Err(reason) => reason,
+            other => panic!("a diagnosed refusal refuses: {other:?}"),
+        };
+        assert!(
+            reason.contains("index 0: kernel witness unavailable: explicit userspace disables the kernel witness"),
+            "diagnosis note carried: {reason}"
+        );
     }
 
     fn k1_red_identity() -> crate::discovery::identity::FileIdentity {

@@ -543,12 +543,15 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Replaced wholesale per applied pass (a pid the pass never saw
     /// carries no prior and scans); discarded passes record nothing.
     maps_prior: BTreeMap<u32, (Option<u64>, u64)>,
-    /// Members that mapped a watch-feeding (admitted or partial)
-    /// object in the last applied pass: they never skip, so a watch's
-    /// confirmed mapping survives across passes without an
-    /// armed/coverage-lost flap. Replaced wholesale with the digests;
-    /// discarded passes record nothing.
-    mappers_prior: BTreeSet<u32>,
+    /// Watch-feeding (admitted or partial) object groups from the last
+    /// applied pass: prior catalog object index -> mapper pids. The next
+    /// collection re-decodes one live stable member per group as its
+    /// representative, so the group's object is pinned every pass and
+    /// its stable peers confirm as maps matches without a flap.
+    /// Dangling indices (impossible in production) file as per-pid
+    /// singletons, failing toward never-skip. Replaced wholesale with
+    /// the digests; discarded passes record nothing.
+    mapper_groups_prior: BTreeMap<usize, BTreeSet<u32>>,
     /// Every task identity enumerated by an applied pass, across passes:
     /// the terminal stop diff reports live tasks this never saw, so a
     /// starter that never execs cannot stay invisible. Capped (departed
@@ -936,7 +939,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             post_pass_exec_newcomers: BTreeSet::new(),
             scan_freshness: BTreeSet::new(),
             maps_prior: BTreeMap::new(),
-            mappers_prior: BTreeSet::new(),
+            mapper_groups_prior: BTreeMap::new(),
             ever_enumerated: BTreeSet::new(),
             stop_diff_done: false,
             pending_exec_newcomers: BTreeMap::new(),
@@ -8551,29 +8554,39 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// unreadable, exited and not-selected members stay fresh so the
     /// next pass retries them. The pass's sweep digests replace the
     /// deep-scan skip priors wholesale, and its watch-feeding mappers
-    /// join the never-skip set. Discarded passes record nothing.
+    /// group by object for next-pass representatives. Discarded passes
+    /// record nothing.
     fn note_applied_scan_tasks(&mut self, catalog: &crate::inspect_system::Catalog) {
         self.maps_prior = catalog.sweep_digests.clone();
-        // Never-skip covers only watch-feeding mappers: members mapping
-        // solely refused/unresolved objects skip safely (their modules
-        // carry no watch, so no edge can flap). A re-admission a skip
-        // would miss waits for the backstop at most. Dangling indices
-        // cannot occur (both lists are built together); if they ever
-        // do, the member keeps its watch (never skips) rather than
-        // risking a flap.
-        self.mappers_prior = catalog
-            .processes
-            .iter()
-            .filter(|process| {
-                process.objects.iter().any(|index| {
-                    catalog
-                        .objects
-                        .get(*index)
-                        .is_none_or(|object| object.admission.feeds_watch())
-                })
-            })
-            .map(|process| process.pid)
-            .collect();
+        // Group watch-feeding mappers by prior object: next pass one
+        // live stable member per group re-decodes as its representative
+        // and the stable peers skip into maps matches. Members mapping
+        // solely refused/unresolved objects join no group and skip
+        // safely (their modules carry no watch, so no edge can flap).
+        // A re-admission a skip would miss waits for the backstop at
+        // most. Dangling indices cannot occur (both lists are built
+        // together); if they ever do, each dangling mapper files as a
+        // per-pid singleton, failing toward never-skip rather than
+        // risking a flap or a false grouping.
+        let mut groups: BTreeMap<usize, BTreeSet<u32>> = BTreeMap::new();
+        for process in &catalog.processes {
+            for index in &process.objects {
+                match catalog.objects.get(*index) {
+                    Some(object) if object.admission.feeds_watch() => {
+                        groups.entry(*index).or_default().insert(process.pid);
+                    }
+                    Some(_) => {}
+                    None => {
+                        groups
+                            .entry(catalog.objects.len() + process.pid as usize)
+                            .or_default()
+                            .insert(process.pid);
+                    }
+                }
+            }
+        }
+        groups.retain(|_, members| !members.is_empty());
+        self.mapper_groups_prior = groups;
         let current: BTreeMap<u32, Option<u64>> = catalog
             .processes
             .iter()
@@ -8648,16 +8661,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// The deep-scan skip priors for the next collection: the last
-    /// applied pass's per-pid digests plus its pinned-object mappers,
-    /// or none on a backstop pass (every `SKIP_BACKSTOP_EVERY`th pass
-    /// rescans) and before the first pass.
+    /// applied pass's per-pid digests plus its watch-feeding mapper
+    /// groups, or none on a backstop pass (every
+    /// `SKIP_BACKSTOP_EVERY`th pass rescans) and before the first pass.
     pub(crate) fn priors_for_collection(&self) -> crate::inspect_system::ScanPriors {
         if self.passes % SKIP_BACKSTOP_EVERY == SKIP_BACKSTOP_EVERY - 1 {
             return crate::inspect_system::ScanPriors::empty();
         }
         crate::inspect_system::ScanPriors {
             digests: self.maps_prior.clone(),
-            mappers: self.mappers_prior.clone(),
+            mapper_groups: self.mapper_groups_prior.clone(),
         }
     }
 
@@ -27921,10 +27934,7 @@ mod maps_skip_memory_tests {
         );
         coordinator.passes = 3;
         assert!(
-            coordinator
-                .priors_for_collection()
-                .mapper_groups
-                .is_empty(),
+            coordinator.priors_for_collection().mapper_groups.is_empty(),
             "the backstop sheds mapper memory with the digests"
         );
     }

@@ -396,22 +396,25 @@ impl Collection {
 /// applied pass. A selected member whose snapshot digest and live
 /// generation both match is confirmed, not deep-scanned: its mappings
 /// are byte-identical to a pass that already decoded them, so a rescan
-/// could only repeat the same findings. `mappers` names the members
-/// that mapped a watch-feeding object last pass; they never skip,
-/// because a skip emits an uncertain mapping (coverage lost) while a
-/// re-decode keeps the watch's confirmed state. New mappings, pid
+/// could only repeat the same findings. `mapper_groups` groups the
+/// members that mapped a watch-feeding object last pass by prior
+/// catalog object index (opaque per-pass ids, replaced wholesale);
+/// one live stable member per group re-decodes as its representative,
+/// so the group's pinned object is decoded every pass and the stable
+/// peers skip into the confirm path as maps matches (confirmed
+/// mappings, no flap) instead of uncertain gaps. New mappings, pid
 /// reuse, and unreadable generations never skip; backstop passes
 /// carry no priors.
 pub(crate) struct ScanPriors {
     pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
-    pub(crate) mappers: BTreeSet<u32>,
+    pub(crate) mapper_groups: BTreeMap<usize, BTreeSet<u32>>,
 }
 
 impl ScanPriors {
     pub(crate) fn empty() -> Self {
         Self {
             digests: BTreeMap::new(),
-            mappers: BTreeSet::new(),
+            mapper_groups: BTreeMap::new(),
         }
     }
 }
@@ -452,10 +455,16 @@ pub(crate) fn digest_maps_snapshot(entries: &[MapEntry]) -> u64 {
 }
 
 /// The swept pids proven unchanged since the priors: snapshot digest
-/// matches and the live generation equals the recorded one. Every other
-/// pid scans: changed maps, recycled pids, unreadable generations, and
-/// members the prior pass never saw. `generation` reads the live
-/// start-time (a miss or mismatch refuses the skip).
+/// matches and the live generation equals the recorded one, minus one
+/// representative per prior watch-feeding object group (the smallest
+/// stable pid in the group re-decodes, so the object is pinned this
+/// pass and its stable peers confirm as maps matches). Every other pid
+/// scans: representatives, changed maps, recycled pids, unreadable
+/// generations, and members the prior pass never saw. `generation`
+/// reads the live start-time (a miss or mismatch refuses the skip);
+/// it is read once per swept pid. A group with no live stable member
+/// contributes no representative (its mappers exited, remapped, or
+/// were never selected); those members scan on their own mismatch.
 pub(crate) fn unchanged_skip_set(
     sweep: &[(u32, Vec<MapEntry>)],
     priors: &ScanPriors,
@@ -464,22 +473,30 @@ pub(crate) fn unchanged_skip_set(
     if priors.digests.is_empty() {
         return BTreeSet::new();
     }
-    sweep
+    let live: BTreeMap<u32, Option<u64>> = sweep
         .iter()
-        .filter(|(pid, entries)| {
-            if priors.mappers.contains(pid) {
-                return false;
-            }
-            let Some((Some(start), digest)) = priors.digests.get(pid) else {
-                return false;
-            };
-            if digest_maps_snapshot(entries) != *digest {
-                return false;
-            }
-            generation(*pid).is_some_and(|live| live == *start)
-        })
-        .map(|(pid, _)| *pid)
-        .collect()
+        .map(|(pid, _)| (*pid, generation(*pid)))
+        .collect();
+    let mut stable = BTreeSet::new();
+    for (pid, entries) in sweep {
+        let Some((Some(start), digest)) = priors.digests.get(pid) else {
+            continue;
+        };
+        if digest_maps_snapshot(entries) != *digest {
+            continue;
+        }
+        if live.get(pid).copied().flatten() != Some(*start) {
+            continue;
+        }
+        stable.insert(*pid);
+    }
+    let mut representatives = BTreeSet::new();
+    for group in priors.mapper_groups.values() {
+        if let Some(rep) = group.intersection(&stable).next() {
+            representatives.insert(*rep);
+        }
+    }
+    stable.difference(&representatives).copied().collect()
 }
 
 /// Pair one pass's sweep digests with the start-times read beside them:

@@ -3637,6 +3637,18 @@ impl SemanticCapture {
                 });
             }
         }
+        // TEMP F9: refresh outcome census (sampled).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static RO: AtomicU64 = AtomicU64::new(0);
+            if RO.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                eprintln!(
+                    "refresh-outcome pid={} new={} accepted={accepted}",
+                    job.pin.pid(),
+                    if outcome == ObserveOutcome::New { 1 } else { 0 },
+                );
+            }
+        }
         report.observations.push(outcome);
         // Invalidation exhaustion cannot leak a previously computed join.
         if self.exhausted {

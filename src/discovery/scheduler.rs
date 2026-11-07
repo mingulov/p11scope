@@ -918,6 +918,21 @@ impl DiscoveryScheduler {
         self.backlog_owed
     }
 
+    #[cfg(test)]
+    pub(crate) fn tick_attempted_any_for_test(&self) -> bool {
+        self.tick_attempted_any
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_newcomer_attempts_for_test(&self) -> BTreeSet<u32> {
+        self.last_newcomer_attempts.clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_view_cursor_for_test(&self) -> Option<u32> {
+        self.new_view_cursor
+    }
+
     /// The ordinary fairness-rotation window: the lowest `slots` pids
     /// outside `exclude` (retained views plus pending refresh pids), in
     /// pid order. Admitted pids join the excluded set, so successive
@@ -1908,6 +1923,66 @@ mod tests {
         );
         assert_eq!(admitted, vec![1_000_002]);
         assert_eq!(deferred, vec![2]);
+    }
+
+    /// Bare scarce rotation attempts never record in the owed ledger: a
+    /// rotation-only tick still reads as attempting no classified pid,
+    /// so the failed-newcomer sink survives for the retry instead of
+    /// rotating the rotation pid in. Recording the rotation attempt
+    /// classified would set `tick_attempted_any` and rotate the sink
+    /// out from under the retry.
+    #[test]
+    fn bare_rotation_attempt_leaves_the_owed_ledger_alone() {
+        let mut scheduler = DiscoveryScheduler::new();
+        // Tick 1: a fresh attempt with backlog waiting raises the debt
+        // and parks tick 1's newcomer in the sink.
+        let (admitted, _) = scheduler.scarce_window_pending_newcomers_first(
+            &[1_000_000],
+            &[1],
+            &[],
+            MAX_NEW_VIEWS_PER_TICK,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![1_000_000, 1]);
+        scheduler.note_newcomer_attempt(1_000_000);
+        // Tick 2: a rotation-only window with a bare rotation attempt.
+        let (admitted, _) = scheduler.scarce_window_pending_newcomers_first(
+            &[],
+            &[],
+            &[2],
+            MAX_NEW_VIEWS_PER_TICK,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![2]);
+        assert!(
+            scheduler.backlog_owed_for_test(),
+            "tick 1's fresh attempt raised the debt"
+        );
+        scheduler.note_new_view_attempt(2);
+        assert!(
+            !scheduler.tick_attempted_any_for_test(),
+            "a bare rotation attempt never sets tick_attempted_any"
+        );
+        // Tick 3 opens: no backlog waited on the rotation-only tick, so
+        // the debt clears — but the sink still holds tick 1's newcomer,
+        // not the rotation pid.
+        let (admitted, _) = scheduler.scarce_window_pending_newcomers_first(
+            &[1_000_001],
+            &[1],
+            &[],
+            MAX_NEW_VIEWS_PER_TICK,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![1_000_001, 1]);
+        assert!(
+            !scheduler.backlog_owed_for_test(),
+            "no backlog waited on the rotation-only tick, so the debt clears"
+        );
+        assert_eq!(
+            scheduler.last_newcomer_attempts_for_test(),
+            BTreeSet::from([1_000_000]),
+            "the bare attempt kept the sink for the retry"
+        );
     }
 
     /// The tick-start pair tracks the previous tick: each deep-scan tick

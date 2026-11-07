@@ -6,29 +6,33 @@ Subcommands: copy-up (D1 shared-layer / copy-up), late-reported (N4 never-seen
 late provider), --self-test. Every check ships a mutation this oracle refuses;
 see --self-test and tests/python/test_container_cells_oracle.py.
 
-D1 follows the live run-5/6 shape (dev host, over the deep-scan cap) and
-the d1fed1 shape (Fedora host, under it): pre-copy-up both backends
-collapse B onto A's module (same lower file, honest); the span shows
-B-pre's old edge still mapped (the kernel witness proves it still runs
-the lower file: never ended, never gapped, never edged to the new
-module), and B2 mapped exactly to the new module with its ledgered
-round counted, on BOTH backends with no named identity loss. The
-round-2 twin is gap-only when never deep-scanned (over-cap hosts) or
-keeps its mapped old edge, deep_scan, with its post-copy-up ledger
-counted on it when scanned before the collapse resolves (under-cap
-hosts). A forced-kernel run either names
-its first proof fallback or reports null (no proof attempted: the sweep
-skipped under the 256 cap, never a proof claim); the kernel and
-userspace legs of every phase must agree on the cell's own provider
-modules and edges (ambient host edges drift between the sequential
-legs), entries counts included. The copy-up itself is proven from
-facts.log (a different real inode in B's upper layer, same sha256),
-which also proves B's mount stacks at least two lower layers. A span
-profile of B's cgroup shows both module rows under the merge path with
-identical identity and the pre_copy_up marker on exactly the lower one,
-and every ledger function's twin-row total is exact. Fresh captures after B
-restarts attribute B exactly on lane B. The observer runs on the host in
-the initial PID namespace, so no pid_namespace cause is allowed.
+D1 follows the honest span split. Pre-copy-up the kernel leg collapses
+B onto A's module (same lower file, honest) while the userspace leg
+gaps both joins (no kernel witness there). The span shows B-pre's
+collapsed edge ended and its stale ranges rejoined on the new module
+carrying B's key (mapped, deep_scan, gap-free: the stale join); B2 and
+the round-2 twin are each either gap-only (the sweep never attributed
+the mapper: no edge, only the unproven gap) or admitted under the new
+module but unprobed (mapped or uncertain, deep_scan evidence, zero
+counted entries with the not_attached disclosure, never a gap). The two
+mapper shapes are the documented sweep-attribution race, not per-host
+pins: each branch carries its distinguishing evidence, and the verdict
+records which shape each mapper took. All four cell pids stay gap-only
+on the userspace span leg. No named identity loss is allowed on any leg:
+pre, span and fresh all assert global zero (the 0-vs-2 span flip race is
+a named known flake, never an allowance). A forced-kernel run either
+names its first proof fallback or reports null (no proof attempted: the
+sweep skipped under the 256 cap, never a proof claim). The copy-up
+itself is proven from facts.log (a different real inode in B's upper
+layer, same sha256: same bytes, different file identities), which also
+proves B's mount stacks at least two lower layers. A span profile of B's
+cgroup shows one stale row under the merge path (the twin's exact
+ledger, no layer marker) with an honestly lossy verdict (concrete_gap:
+the upper ranges refuse as an ambiguous all-plain collision, disclosed
+in skipped, so B2's in-span round is uncounted but never silent). Fresh
+captures after B restarts attribute B exactly on its own key. The
+observer runs on the host in the initial PID namespace, so no
+pid_namespace cause is allowed.
 
 N4 follows the run-1 ruling: O exact and gap-free; L passes when scanned and
 EITHER a named gap from the frozen vocabulary references the late module OR
@@ -405,9 +409,11 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     onto A's module. Span: the split is honest — A stays on its key, B-pre's
     collapsed edge ends and its stale ranges rejoin the proven lower on B's
     own key module (mapped, gap-free: the stale join), while B2 and the twin
-    are admitted under the same key but unprobed (the byte-identical collapse
-    suppresses probing, so their ledgered rounds show count 0 with the
-    not_attached disclosure, never a gap). Fresh: both backends exact on
+    are each either admitted under the same key but unprobed (the
+    byte-identical collapse suppresses probing, so their ledgered rounds
+    show count 0 with the not_attached disclosure, never a gap) or
+    gap-only where the sweep never attributed the mapper. Fresh: both
+    backends exact on
     their own shape. span_profile is the cgroup-B capture spanning the
     copy-up (required): one stale row with the twin's exact ledger, no
     marker, honestly lossy (the upper ranges refuse as an ambiguous
@@ -491,11 +497,13 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     # new module carries B's overlay key; B-pre's collapsed edge ended and
     # its stale ranges rejoin the proven lower on the new module (mapped,
     # deep_scan, gap-free: the stale join — never mapped to the old
-    # module anymore); B2 and the round-2 twin are admitted under the new
-    # module but unprobed (the byte-identical collapse suppresses probing,
-    # so their ledgered rounds show count 0 with the not_attached
-    # disclosure, never a gap). At least one collapse names key_b (the
-    # flip records both directions while A keeps the committed survivor).
+    # module anymore); B2 and the round-2 twin are each either admitted
+    # under the new module but unprobed (the byte-identical collapse
+    # suppresses probing, so their ledgered rounds show count 0 with the
+    # not_attached disclosure, never a gap) or gap-only where the sweep
+    # never attributed the mapper (no edge, only the unproven gap). At
+    # least one collapse names key_b (the flip records both directions
+    # while A keeps the committed survivor).
     label = "span-kernel"
     span_k_pid, span_k_edges = inventory_maps(span_kernel, module_suffix)
     span_k_keys = module_keys(span_kernel, module_suffix)

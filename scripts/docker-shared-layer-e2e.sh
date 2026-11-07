@@ -7,16 +7,18 @@
 # so both map the provider through overlay lower layers. Pre-copy-up both
 # identity backends collapse B onto A's module (same lower file, honest).
 # Two inventory captures plus a cgroup profile then span a same-bytes
-# copy-up in B only (OQ5): a second process in B maps the upper copy and
-# ledgers one round, and on BOTH backends B's first process keeps its
-# mapped edge to the old module (D1-extended: the kernel witness proves
-# it still runs the lower file — the stale join) while the second mapper
-# is attributed to the upper copy with its round counted and no loss.
-# A second pre-copy-up mapper (the round-2 twin) ledgers after the copy-up
-# inside the span; the oracle asserts its ledger counts on the old edge
-# where scanned and is honestly gapped where not. The span profile shows
-# both module rows with the pre_copy_up marker on the lower one. After B
-# restarts, fresh captures open their anchor from the upper copy and
+# copy-up in B only (OQ5): B's first process ends its collapsed edge and
+# rejoins the proven lower file on B's own key module (mapped, deep_scan,
+# gap-free: the stale join), while a second process in B maps the upper
+# copy and ledgers one round admitted-but-unprobed (the byte-identical
+# collapse suppresses probing: count 0, not_attached, never a gap) or
+# gap-only where the sweep never attributed it. A second pre-copy-up
+# mapper (the round-2 twin) ledgers its round after the copy-up inside
+# the span with the same two shapes. Every userspace leg honestly gaps
+# the overlay joins (no kernel witness there). The span profile of B keeps
+# one stale row with the twin's exact ledger, no layer marker, honestly
+# lossy (concrete_gap with the upper refusal disclosed in skipped). After
+# B restarts, fresh captures open their anchor from the upper copy and
 # attribute B exactly. The observer is the host release binary run through
 # `sudo -n` in the initial PID namespace.
 #

@@ -119,6 +119,8 @@ WPID=
 HPID_R=
 OPID=
 SPID=
+TABLE_CLASS_HOST=
+TABLE_CLASS_CONTAINER=
 
 cleanup() {
     CLEANUP_STATUS=$?
@@ -431,6 +433,7 @@ leg_host() {
     local table_class
     table_class=$(classify_provider_tables "$OUT/host.json" 2>>"$OUT/host-oracle.log") || return 1
     echo "provider table class: $table_class" >>"$OUT/host-oracle.log"
+    TABLE_CLASS_HOST=$table_class
     case $table_class in
         26)
             python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/host.json" spike/expected.txt \
@@ -505,6 +508,21 @@ leg_container() {
     }
     reclaim_root_output "$OUT/container.json" || return 1
     docker rm -f "$name" >/dev/null 2>&1 || return 1
+    # clean-metrics stays 2.6-calibrated while the victim image floats with
+    # its archive: prove the victim is still 2.6-shaped first, and fail
+    # closed (not multiset-degraded) when it drifts, so the drift gets a
+    # conscious re-qualification instead of a silently weaker leg.
+    local table_class
+    table_class=$(classify_provider_tables "$OUT/container.json" 2>>"$OUT/container-oracle.log") || return 1
+    echo "provider table class: $table_class" >>"$OUT/container-oracle.log"
+    TABLE_CLASS_CONTAINER=$table_class
+    case $table_class in
+        26) ;;
+        *)
+            echo "victim provider table class $table_class is not 2.6-shaped" >&2
+            return 1
+            ;;
+    esac
     python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/container.json" spike/expected.txt \
         >>"$OUT/container-oracle.log" 2>&1 || return 1
     python3 -I scripts/matrix/check-count-multiset.py "$OUT/container.json" spike/expected.txt \
@@ -629,13 +647,17 @@ leg_refusal_cap() {
 echo "=== legs ==="
 FAILED=0
 if leg_host; then
-    record host-exact 1 qualified "exact counts, host provider file attributed"
+    if [ "$TABLE_CLASS_HOST" = 26 ]; then
+        record host-exact 1 qualified "exact counts, host provider file attributed (provider table class 26)"
+    else
+        record host-exact 1 qualified "multiset counts plus oracle core, host provider file attributed (provider table class $TABLE_CLASS_HOST)"
+    fi
 else
     record host-exact 0 failed "see host-observer.log and host-oracle.log"
     FAILED=1
 fi
 if leg_container; then
-    record container-exact 1 qualified "exact counts, victim provider file attributed"
+    record container-exact 1 qualified "exact counts, victim provider file attributed (provider table class $TABLE_CLASS_CONTAINER)"
 else
     record container-exact 0 failed "see container-observer.log and container-oracle.log"
     FAILED=1

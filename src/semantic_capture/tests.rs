@@ -4673,6 +4673,124 @@ fn collected_counter_error_stays_a_permanent_coverage_failure() {
 }
 
 #[test]
+fn collected_fault_read_error_stays_a_permanent_coverage_failure() {
+    use crate::events::{EventDrain, EventsDomain, RecordSource, record_bytes};
+    use crate::semantics_edge::resources::SemanticResourcePool;
+    use crate::semantics_objects::journal::FaultReadError;
+    use crate::semantics_objects::journal::joint_driver::RawJointQuantum;
+    use std::cell::Cell;
+    use std::collections::VecDeque;
+    use std::ops::Deref;
+    /// The fault cell reads once (the drain bracket opens at era 0),
+    /// then fails: fault eras are unprovable from here on.
+    struct FailingFault {
+        reads: Cell<u32>,
+        error: FaultReadError,
+    }
+    impl crate::semantics_objects::journal::FaultEpoch for FailingFault {
+        fn fault_epoch(&self) -> Result<u64, FaultReadError> {
+            let reads = self.reads.get();
+            self.reads.set(reads + 1);
+            if reads == 0 { Ok(0) } else { Err(self.error) }
+        }
+    }
+    struct QueueRecords {
+        queue: VecDeque<Vec<u8>>,
+    }
+    impl RecordSource for QueueRecords {
+        fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+            self.queue.pop_front()
+        }
+    }
+    for error in [FaultReadError::Unreadable, FaultReadError::Saturated] {
+        let mut io = ScriptIo::small(NativeDomainId::mint());
+        let mut capture = capture(&io);
+        // Prime: a healthy quantum binds and joins, fault era 0.
+        io.semantic_call("C_SignInit", 0, 0);
+        io.semantic_call("C_Sign", 0, 0);
+        let (mut primed, _, _) = retained_joint_quantum(&mut io);
+        let joined = capture.tick_collected_with(&mut io, &mut primed).unwrap();
+        assert_eq!(joined.calls().count(), 2);
+        assert!(
+            joined
+                .calls()
+                .all(|call| matches!(call.route(), Route::Joined(_))),
+            "{error:?}: the prime joins"
+        );
+        assert_eq!(io.raises, 0, "{error:?}: a healthy quantum raises nothing");
+        // Failed quantum: one genuine call behind a fault-cell read
+        // error. Fault eras are unprovable, so the permanent path
+        // still raises the global fault and latches.
+        io.semantic_call("C_Sign", 0, 0);
+        let records: Vec<_> = io
+            .records
+            .drain(..)
+            .map(|record| record_bytes(&record.base))
+            .collect();
+        let events = EventsDomain::test_standin(0xef01);
+        let producers = crate::attach::SessionDrainProducers::test_pair(io.domain, events.clone());
+        let mut drain = EventDrain::over_domain(
+            QueueRecords {
+                queue: records.into(),
+            },
+            events,
+        );
+        let pool = SemanticResourcePool::default();
+        let fault = FailingFault {
+            reads: Cell::new(0),
+            error,
+        };
+        let mut failed = RawJointQuantum::collect(
+            &mut drain,
+            &p11scope_ebpf_common::object_wire::publish_object_descriptors(),
+            4_096,
+            &fault,
+            &producers,
+            |bytes| pool.reserve(bytes),
+        )
+        .unwrap();
+        assert_eq!(
+            failed.collection_audit_for_test().fault_error,
+            Some(error),
+            "{error:?}: the audit records the fault read error"
+        );
+        let shed = capture.tick_collected_with(&mut io, &mut failed).unwrap();
+        assert_eq!(shed.calls().count(), 1);
+        assert_eq!(
+            shed.calls().next().unwrap().route(),
+            Route::Unknown(UnknownReason::CoverageFault)
+        );
+        assert!(
+            shed.outcomes().iter().any(|outcome| matches!(
+                outcome,
+                TickOutcome::Invalidation(loss)
+                    if matches!(loss.scope(), InvalidationScope::CoverageFailed)
+            )),
+            "the failed quantum discloses its coverage loss"
+        );
+        assert!(
+            capture.image_failed,
+            "{error:?}: an unreadable fault cell must latch coverage permanently"
+        );
+        assert!(
+            io.raises >= 1,
+            "{error:?}: an unreadable fault cell still raises the global fault"
+        );
+        // No recovery: the next healthy quantum still sheds, exactly as
+        // under permanent coverage failure.
+        io.semantic_call("C_Sign", 0, 1);
+        let (mut healed, _, _) = retained_joint_quantum(&mut io);
+        let refused = capture.tick_collected_with(&mut io, &mut healed).unwrap();
+        assert_eq!(refused.calls().count(), 1);
+        assert_eq!(
+            refused.calls().next().unwrap().route(),
+            Route::Unknown(UnknownReason::CoverageFault),
+            "{error:?}: the post-loss quantum must not join once the fault error latched coverage"
+        );
+    }
+}
+
+#[test]
 fn merge_stash_records_shed_floor_and_exhaustion() {
     // C5: merged-overflow sheds record their minimum position; a
     // shed outcome without a position records exhaustion.

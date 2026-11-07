@@ -22351,6 +22351,178 @@ fn key_operation_degraded_window_calls_count_under_loss_reason() {
     assert_eq!(proved, 2, "both clean-segment signs attribute exactly");
 }
 
+/// v0.7.0 issue 3 (second cycle): the fallback latch re-latches.
+/// A clean resume clears `fell_back`; a second ordered fallback
+/// sets it again with its window again a counted gap; a second
+/// clean resume clears it again. The retained counters accumulate
+/// across both closed segments.
+#[test]
+fn key_operation_second_fallback_relatches_after_clean_resume() {
+    fn force_ordered_fallback(guarded: &mut GuardedScene, key: &InstanceKey) {
+        let mut complete = SemanticCall {
+            function: "C_AsyncComplete".into(),
+            session: SESSION,
+            target_function: crate::kinds::function_id("C_SignInit").unwrap(),
+            capture: op_capture(),
+            ts_ns: 999,
+            ..SemanticCall::default()
+        };
+        complete.rv = CkRv::OK.0;
+        complete.authorized = true;
+        complete.unambiguous = true;
+        complete.attributable = true;
+        let complete_pos = guarded
+            .scene
+            .fixture
+            .admit_function("C_SignInit")
+            .h0_ordinal();
+        guarded.observe(key, complete_pos, complete);
+        guarded
+            .registry
+            .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    }
+
+    let mut guarded = GuardedScene::new();
+    let bootstrap = guarded.scene.bootstrap();
+    let joint_key = guarded.key(1);
+    assert!(
+        guarded
+            .registry
+            .install_joint_receipt(joint_key.clone(), bootstrap)
+    );
+    let (_, joint_id) = guarded.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+
+    // One exact Joint sign.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+
+    // First ordered fallback: one staged init behind an affecting
+    // unsealable completion ends the segment.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    force_ordered_fallback(&mut guarded, &joint_key);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the fallback ends only the current segment"
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 0);
+
+    // The next init is a clean point: the latch clears.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(guarded.registry.joint_feeds(), 1);
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    let resumed = guarded.registry.joint_observations(71);
+    assert_eq!(resumed.status, ObsStatus::Populated);
+    assert_eq!(resumed.reason, "none");
+    assert_eq!(
+        resumed.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 1,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 1,
+            },
+        ],
+        "the first resume clears the latch; its segment stays counted: {:?}",
+        resumed.unattributed
+    );
+
+    // Second ordered fallback on the resumed feed: the latch sets
+    // again, and the second window is again a counted gap.
+    let (facts, position) = guarded.admit_shape(&init);
+    guarded.observe(&joint_key, position, facts);
+    guarded
+        .registry
+        .publish_with_ledger(guarded.scene.adapter.ledger_mut());
+    assert_eq!(guarded.scene.adapter.ledger().staged(), 1);
+    force_ordered_fallback(&mut guarded, &joint_key);
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::S1Only),
+        "the second fallback ends only the current segment"
+    );
+    let refell = guarded.registry.joint_observations(72);
+    assert_eq!(
+        (refell.status, refell.reason),
+        (ObsStatus::Partial, "proof_refused_fallback"),
+        "the second fallback re-latches before any resume"
+    );
+    assert_eq!(
+        refell.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 2,
+            },
+        ],
+        "both fallback windows stay counted: {:?}",
+        refell.unattributed
+    );
+
+    // The next init is a clean point again: the latch clears again
+    // while both closed segments stay counted beside it.
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    assert_eq!(
+        guarded.registry.feed_mode_for_test(joint_id),
+        Some(FeedMode::Joint)
+    );
+    assert_eq!(
+        guarded.drive_joint(&joint_key, joint_id, &sign),
+        SealApplyOutcome::ReplayedOne
+    );
+    let resumed = guarded.registry.joint_observations(73);
+    assert_eq!(resumed.status, ObsStatus::Populated);
+    assert_eq!(resumed.reason, "none");
+    assert_eq!(
+        resumed.unattributed,
+        vec![
+            crate::key_operation_projection::UnattributedRow {
+                reason: "unmodelled_call_shape",
+                count: 2,
+            },
+            crate::key_operation_projection::UnattributedRow {
+                reason: "proof_refused_fallback",
+                count: 2,
+            },
+        ],
+        "the second resume clears the latch; both segments stay counted: {:?}",
+        resumed.unattributed
+    );
+}
+
 /// F4 (round 3): `started_before_attach` counts key operations
 /// only. Proved-irrelevant info/session-state calls on a feed
 /// registered without a witnessed birth are not key operations

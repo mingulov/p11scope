@@ -14950,9 +14950,7 @@ mod tests {
             .expect("the other-file verdict refuses");
         assert_eq!(
             reason,
-            format!(
-                "{canonical}; lower candidates refused: 1 (witness query budget exhausted)"
-            ),
+            format!("{canonical}; lower candidates refused: 1 (witness query budget exhausted)"),
             "the exhausting stage is named"
         );
         assert_eq!(io.prove_calls, 1, "only the held query runs");
@@ -15088,10 +15086,7 @@ mod tests {
             "could not be opened",
             "the kernel witness proved another file",
         ] {
-            assert!(
-                reason.contains(stage),
-                "refusal stage named: {reason}"
-            );
+            assert!(reason.contains(stage), "refusal stage named: {reason}");
         }
         assert!(
             !reason.contains("index "),
@@ -15237,7 +15232,9 @@ mod tests {
             other => panic!("a diagnosed refusal refuses: {other:?}"),
         };
         assert!(
-            reason.contains("kernel witness unavailable: explicit userspace disables the kernel witness"),
+            reason.contains(
+                "kernel witness unavailable: explicit userspace disables the kernel witness"
+            ),
             "diagnosis note carried: {reason}"
         );
         assert!(

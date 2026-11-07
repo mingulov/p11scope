@@ -1694,11 +1694,12 @@ fn discovery_pair_rows_share_the_merge_view_key() {
     // own file's digest and only the lower row carries the layer
     // marker — digest and layer tell the two rows apart
     // (observed-profile-v3 copy-up section).
-    use crate::discovery::identity::test_fixture::{
-        mark_pre_copy_up, pin_set, repath_single_pin,
-    };
+    use crate::discovery::identity::test_fixture::{mark_pre_copy_up, pin_set, repath_single_pin};
     let key = ObjectKey {
-        device: p11scope_manifest::maps::Device { major: 0, minor: 140 },
+        device: p11scope_manifest::maps::Device {
+            major: 0,
+            minor: 140,
+        },
         inode: 100,
     };
     let merge = "/merged/libsofthsm2.so";

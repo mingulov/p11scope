@@ -2786,7 +2786,13 @@ pub(crate) mod tests {
         repath_single_pin(&mut pins2, upper_path.to_str().unwrap());
         let pass2 = set.absorb(
             &lower(
-                &[copyup_module(&pins2, &upper_path, "sha-o", &offsets(3), None)],
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-o",
+                    &offsets(3),
+                    None,
+                )],
                 &pins2,
                 policy,
             ),
@@ -2843,7 +2849,13 @@ pub(crate) mod tests {
         assert_eq!(pins2.pinned().count(), 2);
         let pass2 = set.absorb(
             &lower(
-                &[copyup_module(&pins2, &upper_path, "sha-u2", &offsets(3), None)],
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-u2",
+                    &offsets(3),
+                    None,
+                )],
                 &pins2,
                 policy,
             ),
@@ -2865,7 +2877,12 @@ pub(crate) mod tests {
             "the pair keeps two members"
         );
         assert_eq!(set.len(), 6, "the pair keeps its endpoints");
-        assert_eq!(pass2.gaps.len(), 1, "the refusal is disclosed: {:?}", pass2.gaps);
+        assert_eq!(
+            pass2.gaps.len(),
+            1,
+            "the refusal is disclosed: {:?}",
+            pass2.gaps
+        );
         assert_eq!(pass2.gaps[0].subject, REFUSED_SUBJECT);
     }
 

@@ -2586,21 +2586,16 @@ impl PinnedObjects {
         let ids: BTreeSet<PinnedObjectId> = self
             .by_id
             .iter()
-            .filter_map(|(id, entry)| {
-                (entry.raw.key == key && !entry.pre_copy_up).then_some(*id)
-            })
+            .filter_map(|(id, entry)| (entry.raw.key == key && !entry.pre_copy_up).then_some(*id))
             .collect();
         let kept_pre: BTreeSet<PinnedObjectId> = self
             .by_id
             .iter()
-            .filter_map(|(id, entry)| {
-                (entry.raw.key == key && entry.pre_copy_up).then_some(*id)
-            })
+            .filter_map(|(id, entry)| (entry.raw.key == key && entry.pre_copy_up).then_some(*id))
             .collect();
         self.by_id.retain(|id, _| !ids.contains(id));
-        self.raw_to_id.retain(|raw, id| {
-            !ids.contains(id) && (raw.key != key || kept_pre.contains(id))
-        });
+        self.raw_to_id
+            .retain(|raw, id| !ids.contains(id) && (raw.key != key || kept_pre.contains(id)));
         for raws in self.raw_ownership.values_mut() {
             raws.retain(|raw| {
                 raw.key != key
@@ -11145,14 +11140,22 @@ mod tests {
         let mut acc = rejected_view();
         acc.absorb(proven_view());
         let kept: Vec<_> = acc.pinned().collect();
-        assert_eq!(kept.len(), 1, "the proven pre files despite the carried rejection");
+        assert_eq!(
+            kept.len(),
+            1,
+            "the proven pre files despite the carried rejection"
+        );
         assert!(kept[0].pre_copy_up && kept[0].sha256 == "bbbbbbbb");
         assert!(acc.rejects(key), "the key stays rejected for plains");
         // A later plain is still refused under the carried rejection.
         let mut late = image_pins(&[(key, "cccccccc", 3)]);
         reback(&mut late, &backing_file(&dir, "late.so"));
         acc.absorb(late);
-        assert_eq!(acc.pinned().count(), 1, "a later plain never pairs under a rejected key");
+        assert_eq!(
+            acc.pinned().count(),
+            1,
+            "a later plain never pairs under a rejected key"
+        );
         // Rejected into proven: the carried rejection spares the kept pre.
         let mut acc = proven_view();
         acc.absorb(rejected_view());
@@ -11197,12 +11200,7 @@ mod tests {
                 let mut pins = image_pins(&[(key, sha, ctime)]);
                 reback(&mut pins, file);
                 if remap {
-                    pins.by_id
-                        .values_mut()
-                        .next()
-                        .unwrap()
-                        .mapping
-                        .mount_id += 1;
+                    pins.by_id.values_mut().next().unwrap().mapping.mount_id += 1;
                 }
                 if pre {
                     mark_pre_copy_up(&mut pins);

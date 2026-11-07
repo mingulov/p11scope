@@ -4600,6 +4600,17 @@ fn run_owned_inner_with_host(
         args.track_short_lived,
         args.select_endpoint.as_deref(),
     )?;
+    // 614b P1: programmatic callers bypass the CLI refusal, so
+    // `run_owned` re-checks it here, before anything is forked. Without
+    // this an owned cgroup-scope run would arm exe-identity recording
+    // the grant never authorized (Detailed profile --cgroup/--system
+    // only); the message mirrors the CLI's.
+    if args.track_short_lived {
+        anyhow::bail!(
+            "--track-short-lived records nothing beside run; remove it \
+             (it arms only Detailed profile --cgroup/--system captures)"
+        );
+    }
     // DR-K8S-1: `run` controls its own child by PID, numbered in this
     // observer's namespace (whatever shape the capture scope takes);
     // refuse before anything is forked.

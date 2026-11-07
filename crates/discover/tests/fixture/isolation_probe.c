@@ -4,8 +4,9 @@
  * plus the review-PoC probes: io_uring setup, AF_UNIX connect to a
  * test-owned listener, execve of /bin/true in a child, chmod of a
  * test-owned path outside the output, overwrite beneath the -o
- * directory, in-place overwrite without O_TRUNC, and inode-attribute
- * change via FS_IOC_SETFLAGS. The ISOLATION_*_PATH environment variables
+ * directory, in-place overwrite without O_TRUNC, inode-attribute
+ * change via FS_IOC_SETFLAGS, and btrfs subvolume creation outside the
+ * output. The ISOLATION_*_PATH environment variables
  * name test-owned scratch paths only; without them the matching probe
  * reports unknown.
  * The provider itself is healthy: a
@@ -19,6 +20,7 @@
 #include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <linux/btrfs.h>
 #include <linux/fs.h>
 #include <linux/io_uring.h>
 #include <stdio.h>
@@ -244,6 +246,42 @@ __attribute__((constructor)) static void ctor(void) {
                     }
                 }
                 close(ffd);
+            }
+        }
+    }
+    /* Btrfs subvolume creation outside the output: BTRFS_IOC_SUBVOL_CREATE
+     * on a directory fd bypasses the Landlock path hooks (btrfs checks
+     * only inode permission), so only the seccomp type-byte rule stops
+     * it. The test owns ISOLATION_SUBVOL_PATH; without it the probe
+     * reports unknown. */
+    {
+        const char *target = getenv("ISOLATION_SUBVOL_PATH");
+        if (!target) {
+            fprintf(stderr, "ISOLATION_SUBVOL=unknown(no target)\n");
+        } else {
+            const char *slash = strrchr(target, '/');
+            size_t namelen = slash ? strlen(slash + 1) : 0;
+            size_t dirlen = slash ? (size_t)(slash - target) : 0;
+            if (!slash || dirlen == 0 || dirlen >= 4096 || namelen == 0 || namelen >= 256) {
+                fprintf(stderr, "ISOLATION_SUBVOL=unknown(bad target)\n");
+            } else {
+                char parent[4096];
+                memcpy(parent, target, dirlen);
+                parent[dirlen] = '\0';
+                int dfd = open(parent, O_RDONLY | O_DIRECTORY);
+                if (dfd < 0) {
+                    fprintf(stderr, "ISOLATION_SUBVOL=unknown(open errno=%d)\n", errno);
+                } else {
+                    struct btrfs_ioctl_vol_args args;
+                    memset(&args, 0, sizeof args);
+                    memcpy(args.name, slash + 1, namelen);
+                    if (ioctl(dfd, BTRFS_IOC_SUBVOL_CREATE, &args) == 0) {
+                        fprintf(stderr, "ISOLATION_SUBVOL=allowed\n");
+                    } else {
+                        fprintf(stderr, "ISOLATION_SUBVOL=denied(errno=%d)\n", errno);
+                    }
+                    close(dfd);
+                }
             }
         }
     }

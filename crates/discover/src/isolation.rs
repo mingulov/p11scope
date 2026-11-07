@@ -1416,6 +1416,50 @@ mod tests {
     }
 
     #[test]
+    fn ioctl_mutation_type_bytes_evaluate_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // Filesystem-mutation ioctls are denied by type byte (_IOC_TYPE
+        // in bits 8-15): btrfs subvolume/snapshot creation bypasses the
+        // Landlock path hooks, so exact-command denials cannot cover
+        // it. Numbers from linux/btrfs.h, linux/fs.h, linux/fscrypt.h,
+        // linux/ext4.h and linux/f2fs.h.
+        let cmds: &[(u32, &str)] = &[
+            (0x5000_940e, "BTRFS_IOC_SUBVOL_CREATE"),
+            (0x5000_9418, "BTRFS_IOC_SUBVOL_CREATE_V2"),
+            (0x5000_9401, "BTRFS_IOC_SNAP_CREATE"),
+            (0x5000_9417, "BTRFS_IOC_SNAP_CREATE_V2"),
+            (0x5000_940f, "BTRFS_IOC_SNAP_DESTROY"),
+            (0x4008_941a, "BTRFS_IOC_SUBVOL_SETFLAGS"),
+            (0x4004_9409, "FICLONE"),
+            (0x4008_6604, "EXT4_IOC_SETVERSION"),
+            (0xc040_6618, "FS_IOC_REMOVE_ENCRYPTION_KEY"),
+            (0x4004_f50d, "F2FS_IOC_SET_PIN_FILE"),
+        ];
+        for (cmd, name) in cmds {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, *cmd),
+                denied,
+                "{name} ({cmd:#x}) escapes the fence"
+            );
+        }
+        // Ordinary terminal-window and availability queries stay
+        // allowed: the type rule must not swallow type 'T' (0x54).
+        for cmd in [
+            0x5401, /* TCGETS */
+            0x5413, /* TIOCGWINSZ */
+            0x541b, /* FIONREAD */
+            0x5421, /* FIONBIO */
+        ] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_IOCTL, 0, cmd),
+                SECCOMP_RET_ALLOW,
+                "ioctl {cmd:#x} must stay allowed"
+            );
+        }
+    }
+
+    #[test]
     fn file_setattr_evaluates_to_eacces() {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;

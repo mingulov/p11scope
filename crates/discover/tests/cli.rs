@@ -1404,3 +1404,87 @@ fn isolation_setflags_outside_the_output_is_denied() {
         "the fenced probe must not modify the scratch file"
     );
 }
+
+/// Whether `dir` lives on btrfs (statfs magic), for the fs-gated cell.
+fn dir_is_btrfs(dir: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    const BTRFS_SUPER_MAGIC: u64 = 0x9123_683e;
+    let path = std::ffi::CString::new(dir.as_os_str().as_bytes()).unwrap();
+    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
+    // SAFETY: statfs writes the whole struct on success.
+    let rc = unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) };
+    assert_eq!(rc, 0, "statfs {} failed", dir.display());
+    // SAFETY: success above initialized it.
+    let stat = unsafe { stat.assume_init() };
+    // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+    #[allow(clippy::unnecessary_cast)]
+    {
+        stat.f_type as u64 == BTRFS_SUPER_MAGIC
+    }
+}
+
+/// The btrfs gate itself: `/proc` and `/sys` are never btrfs, so the
+/// detector must say so (portable negative control; the positive side
+/// is the subvolume twin running instead of NOT_RUN on btrfs hosts).
+#[test]
+fn btrfs_gate_rejects_non_btrfs_filesystems() {
+    assert!(!dir_is_btrfs(Path::new("/proc")));
+    assert!(!dir_is_btrfs(Path::new("/sys")));
+}
+
+/// The btrfs subvolume hole: BTRFS_IOC_SUBVOL_CREATE bypasses the
+/// Landlock path hooks, so only the seccomp type-byte rule stops it.
+/// Trusted creates the subvolume outside -o; isolated fails with EACCES
+/// and creates nothing. Needs scratch on btrfs; elsewhere it reports
+/// NOT_RUN instead of passing.
+#[test]
+fn isolation_btrfs_subvolume_outside_the_output_is_denied() {
+    let dir = scratch("isolation-subvol");
+    assert!(
+        dir_is_btrfs(&dir),
+        "NOT_RUN: needs scratch on btrfs for the subvolume twin ({} is not btrfs); \
+         run where CARGO_TARGET_TMPDIR is on btrfs or provision a loopback btrfs",
+        dir.display()
+    );
+    let provider = build_isolation_probe(&dir);
+    let trusted_target = dir.join("sv-trusted");
+    let trusted = Command::new(BIN)
+        .args(["--module"])
+        .arg(&provider)
+        .env("ISOLATION_SUBVOL_PATH", &trusted_target)
+        .output()
+        .unwrap();
+    assert_eq!(trusted.status.code(), Some(0), "{trusted:?}");
+    let stderr = String::from_utf8_lossy(&trusted.stderr);
+    assert!(
+        stderr.contains("ISOLATION_SUBVOL=allowed"),
+        "trusted must create the subvolume: {stderr}"
+    );
+    assert!(
+        trusted_target.is_dir(),
+        "the trusted probe must leave the subvolume behind"
+    );
+    // Empty subvolumes remove with rmdir; no privilege needed.
+    std::fs::remove_dir(&trusted_target).unwrap();
+    assert!(
+        !trusted_target.exists(),
+        "trusted cleanup must remove the subvolume"
+    );
+    let isolated_target = dir.join("sv-isolated");
+    let isolated = Command::new(BIN)
+        .args(["--isolation", "isolated", "--module"])
+        .arg(&provider)
+        .env("ISOLATION_SUBVOL_PATH", &isolated_target)
+        .output()
+        .unwrap();
+    assert_eq!(isolated.status.code(), Some(0), "{isolated:?}");
+    let stderr = String::from_utf8_lossy(&isolated.stderr);
+    assert!(
+        stderr.contains("ISOLATION_SUBVOL=denied(errno=13)"),
+        "subvolume creation was not fenced: {stderr}"
+    );
+    assert!(
+        !isolated_target.exists(),
+        "the fenced probe must create nothing"
+    );
+}

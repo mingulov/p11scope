@@ -726,9 +726,12 @@ impl DiscoveryScheduler {
 
     /// Installs the current tick's deep-scan deadline from the caller's
     /// clock poll plus the tick quantum, and shifts the tick-start pair
-    /// for scarce newcomer classification. A failed clock installs an
-    /// already-expired deadline: with no clock there is no bounded phase,
-    /// so new scan work defers rather than running blind.
+    /// for scarce newcomer classification. Scarce ticks cannot classify
+    /// fresh until a second working tick — `prev_tick_start_ns` stays
+    /// `None` until then, so the first tick reads everything as backlog;
+    /// tests stage an earlier tick to exercise fresh. A failed clock
+    /// installs an already-expired deadline: with no clock there is no
+    /// bounded phase, so new scan work defers rather than running blind.
     pub(crate) fn begin_deep_scan_tick(&mut self, now_ns: Option<u64>) {
         self.tick_scan_started = false;
         self.prev_tick_start_ns = self.last_tick_start_ns;

@@ -2195,7 +2195,7 @@ fn gap_plain_reason(reason: &str) -> &str {
     match reason {
         "joint_birth_unoffered" => "no key session was offered to track",
         "joint_image_refused" | "joint_birth_claim_ImageTainted" => {
-            "process image changed before tracking could start"
+            "process was not tracked from its first call"
         }
         "joint_birth_no_admission" => "process was not admitted for tracking",
         "joint_journal_unavailable" => "per-key tracking is off in this run",

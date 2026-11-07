@@ -1966,6 +1966,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/scope.rs",
+      "path": "scope::tests::privileged_run_cgroup_create_under_observer_stays_nested",
+      "reason": "privileged: creates a run cgroup under the observer cgroup; run as root with --ignored --test-threads=1",
+      "cell": "privileged"
+    },
+    {
       "file": "tests/run_tree.rs",
       "path": "privileged_run_tree_shell_wrapper_shows_grandchild_calls",
       "reason": "privileged: run-tree shell-wrapper cell (root BPF capture, runtime SoftHSM workload + token)",

@@ -130,7 +130,9 @@ incarnation's `pid`, `start_time` and `image.exe` (`dev`, `ino`, `mtime_*`
 and `path`), read from `/proc/<pid>/stat` and `/proc/<pid>/exe` of processes
 whose mappings hold a provider object — reads the scan lane already makes.
 The native lane adds none: its witness rows bind through a pidfd cookie
-query, and no witness gap carries the kernel tgid. No command line,
+query (live callers) or the scan lane's already-read start time plus exe
+identity (short-lived callers, PID scope only), and no witness gap
+carries the kernel tgid. No command line,
 environment or argument is read or published, and no `comm` is retained
 or published (start-time sampling reads the whole stat line and parses
 around the comm field, discarding it). See the inventory
@@ -451,21 +453,29 @@ non-null values needs a new allowlist row.
     A row that lifecycle loss left unbound (`lifecycle_loss`) downgrades
     the same way but reads `loss` (`detail`: the lost lifecycle
     evidence), since the loss, not an early use, is what it shows.
-    A `no_live_caller`/`caller_exited` row provably after the holder's
-    admission (its admission is at or before the row) downgrades the
-    same way but reads `caller_exited_before_match`: the caller exited
-    before the row could be matched, not before admission. A short-lived
-    caller whose retained identity is unambiguous (exactly one retained
-    incarnation held the tgid when the row was read, the row falls inside
-    its lifetime, and no exec, lost lifecycle evidence, or competing image
-    is recorded at or after its admission) binds instead and counts on the
-    edge. A second holder admitted after the row was read does not void
-    the binding: the holder count is evaluated once, at the read. A
-    retained row that an exec record voids still reads
-    `use_before_admission` even when its admission provably predates the
-    row: only exit-miss rows carry the post-admission wording, and no
-    post-admission exec-void label exists (residual pending a wording
-    ruling — exec-voids are never relabeled as exits).
+    A `no_live_caller`/`caller_exited` row provably inside the holder's
+    lifetime (its admission is at or before the row, and a retired
+    holder's observed exit is strictly after it) downgrades the same way
+    but reads `caller_exited_before_match`: the caller exited before the
+    row could be matched, not before admission. Under PID scope only, a
+    short-lived caller whose retained identity is unambiguous (exactly
+    one retained incarnation held the tgid when the row was read, with a
+    proven start time and exe identity, an observed exec detector, and a
+    mapped or exited lifecycle; the row falls inside its monotonic
+    lifetime; and no exec, recorded PID reuse, lost lifecycle evidence,
+    or competing image is recorded at or after its admission) binds
+    instead and counts on the edge. The fallback is PID-scope-only
+    because the kernel binds PID-scope entry probes to the original
+    task; in cgroup and system scope the same row is ambiguous and stays
+    unbound. The holder count is evaluated once, at the read: a second
+    holder admitted fresh after the noticed exit (no reuse recorded)
+    does not void the binding, while a reuse recorded at or after the
+    admission voids it. A retained row that an exec record voids still
+    reads `use_before_admission` even when its admission provably
+    predates the row: only exit-miss rows carry the post-admission
+    wording, and `use_before_admission` is the general fail-safe label
+    for every other unbound row (exec-voids are never relabeled as
+    exits).
   - `pending_first_use` (native lane, transient): a `CALLER_USE` row of
     this caller's pid on this module is read but undecided — its
     lifecycle and health horizons have not arrived yet, so the edge may

@@ -8138,14 +8138,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// stash bound every caller of the scope reads it, with a gap. A row
     /// left unbound by lifecycle loss downgrades the same way but reads
     /// `loss` (R-C51-3): the loss, not an early use, is what it shows.
-    /// A `NoLiveCaller`/`CallerExited` row provably after a holder's
-    /// admission (its `first_seen_ns` is at or before `row_ns`) reads
+    /// A `NoLiveCaller`/`CallerExited` row provably inside a holder's
+    /// lifetime (its `first_seen_ns` is at or before `row_ns`, and a
+    /// retired holder's `last_seen_ns` is strictly after it) reads
     /// `caller_exited_before_match`: the caller exited before the row
     /// could be matched, not before admission. A retained row that an
     /// exec record voids still reads `use_before_admission` even when
     /// its admission provably predates the row: only exit-miss rows get
-    /// the post-admission wording (residual pending a wording ruling —
-    /// exec-voids are never relabeled as exits).
+    /// the post-admission wording, and `use_before_admission` is the
+    /// general fail-safe label for every other unbound row (exec-voids
+    /// are never relabeled as exits).
     fn note_preadmission(
         &mut self,
         pid: u32,
@@ -27902,8 +27904,8 @@ int main(void) {
 
     #[test]
     fn a_post_admission_retained_exec_void_keeps_the_before_admission_label() {
-        // Residual (pending a wording ruling): a retained row voided by an
-        // exec record reads `use_before_admission` even when its admission
+        // `use_before_admission` is the general fail-safe label: a retained
+        // row voided by an exec record reads it even when its admission
         // provably predates the row. Only exit-miss rows carry the
         // post-admission wording; no post-admission exec-void label exists.
         let (mut native, caller) = watched_native();

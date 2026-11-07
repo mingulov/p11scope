@@ -49,14 +49,17 @@
 //! incarnation held `T` when the row was read, with a proven start time
 //! and exe identity; `t0` falls inside its monotonic lifetime (admitted
 //! at or before `t0`, and strictly before the observed exit when
-//! retired); and no exec, lost lifecycle evidence, or competing image is
-//! recorded at or after its admission. The holder count is evaluated
-//! once, when the row is read: a second retained holder of `T` (PID
-//! reuse) admitted after the read does not void the binding — reuse
-//! requires the old task dead, and the old task was alive at the event,
-//! so the row is still its use. The exec, loss, coverage, and
-//! competing-image checks run at decision time under the same horizons;
-//! anything else keeps its [`UnboundReason::NoLiveCaller`] or
+//! retired); and no exec, recorded PID reuse, lost lifecycle evidence,
+//! or competing image is recorded at or after its admission. The
+//! fallback runs under PID scope only: the kernel binds PID-scope entry
+//! probes to the original task, so a row read before admission is still
+//! its use even if the pid is reused later. The holder count is
+//! evaluated once, when the row is read: a second holder admitted fresh
+//! after the noticed exit (no reuse recorded) does not void the
+//! binding, while a reuse recorded at or after the admission voids it
+//! (the turnover window is ambiguous). The exec, reuse, loss, coverage,
+//! and competing-image checks run at decision time under the same
+//! horizons; anything else keeps its [`UnboundReason::NoLiveCaller`] or
 //! [`UnboundReason::CallerExited`] gap, never a merge by pid.
 //!
 //! Every domain is settled on its own: lifecycle quanta carry the domain
@@ -249,8 +252,10 @@ pub(crate) struct LiveCaller<'a, Pin> {
 /// post-exit fallback sees it: the scan-time identity (PID plus start
 /// time and exe identity) with its monotonic lifetime. The binder binds
 /// through it only when exactly one retained incarnation held the row's
-/// tgid when the row was read (a reuse admitted later does not void the
-/// binding) and the row's instant falls inside its lifetime.
+/// tgid when the row was read (a later holder without a recorded reuse
+/// does not void the binding) and the row's instant falls inside its
+/// lifetime; a reuse recorded at or after the admission voids it. The
+/// coordinator runs this fallback under PID scope only.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RetainedCaller {
     pub id: CallerId,

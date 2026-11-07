@@ -756,6 +756,20 @@ beside the slice-1 image sets, in the same bounds.
 | --- | --- | --- | --- |
 | Unidentified caller image host `pid_host` and `first_call_ns` | The kernel tgid in host (init-namespace) numbering, with the row's first-association instant, of a CALLER_USE row the binder could not bind to any caller incarnation — read from the row already in hand. No `/proc` read for these numbers: no name, no cmdline/environ, no argument or memory read. Equal numbers across images are pid reuse, not identity. | Public per module in `p11scope/inventory/v1` (`modules[].unbound_use.pids`, complete while `pids_dropped` is zero), up to five on the concise `unidentified callers` line, all collected on the verbose `host pids` line. Bounded (4096 per module, 16384 run-wide; LIM-1, never lowered); saturation counts, never refuses. | Historical only, always qualified (`not running now or never scanned`): a listed pid is never the process now holding that number, and a live different process at that pid is not described. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
 
+## Unidentified caller executables (owner ruling 2026-11-07)
+
+**Status: IMPLEMENTED on this branch per the owner ruling of
+2026-11-07 ("really no way to get executable which did the
+call?").** It adds a kernel exe-identity read at exec plus three
+narrowly scoped userspace resolution sources, each verified by
+matching `(dev, ino)` with stat. No argv, environ, key, PIN, payload,
+`comm`, cwd, or cmdline is read or published; allowlist v1 is
+byte-identical.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Unidentified caller image executable (`exe`, `dev`, `ino`, `resolution`) | The kernel `(s_dev, i_ino)` of `current->mm->exe_file`, read at exec into the EXEC record's pointer word when a Callers-flavor inventory capture outside PID scope arms the exe-identity bit (the Detailed extensive bit, accepted beside one inventory scope; no new BPF state, and no arming where the EXEC carries no joinable ticket). Userspace joins the exact (domain, ticket) pair against the row's (domain, cookie) — never a bare PID — and resolves the pair to a path, in order: (a) a live `/proc/<pid>/exe` whose start time predates the EXEC (starttime plus the exe link only — no other reads — and refused under pidns mismatch, incomparable clocks, or boottime skew); (b) an exe identity the scan already learned from an admitted caller (re-verified by stat); (c) a lazy, bounded, cached index of the fixed system binary dirs (`/usr/bin`, `/usr/sbin`, `/usr/local/bin`, `/usr/local/sbin`, `/bin`, `/sbin`, `/usr/libexec` plus one level below it — never the user's PATH or environment), verified by stat at lookup; else (d) unknown with its reason. | Public per module in `p11scope/inventory/v1` (`modules[].unbound_use.executables`, one complete record per collected image in pid order while `pids_dropped` is zero), grouped with call counts on the concise `unidentified executables` line (five groups, five pids each, the rest counted), and with `dev`/`ino`/source/first-call on the verbose per-module line. Bounded (EXEC stash 16384, system index 65536; LIM-1, never lowered); shed EXEC records latch domain loss and saturation counts, never refuse. | Each image reads its resolution or its reason: `exec_record_lost` (counted) when lifecycle evidence was lost in its domain, `no_exec_record` when the exec predates the capture or the ticket was unavailable, `exe_unavailable` when the kernel read failed, `path_unknown` when no source names the pair (deleted file, container overlay, or a binary outside the system index). A listed pid never names the live process now holding that number: the generation check refuses PID reuse, and a re-exec keeps its ticket with the latest EXEC winning the pair. Documented in [inventory v1](../schema/inventory-v1.md#privacy). |
+
 **Status of the row below: IMPLEMENTED on this branch per owner ruling
 D-C7-1 (2026-10-05); the controller shows this final text to the owner
 before merge.** It adds no target-memory or argument capture: the only

@@ -1689,8 +1689,22 @@ The old bounds are measurements, not a product startup SLA.
   (`images_saturated` / `unbound_images_saturated` mark lower bounds).
   Each image also lists its historical host pid
   (`modules[].unbound_use.pids`, up to five on the concise line):
-  never the process now holding that number, never re-read through
-  `/proc`, never a name. An exec-chain image that was never admitted
+  never the process now holding that number, and never re-read
+  through `/proc` for the numbers themselves. Each image's
+  executable is named beside it (`modules[].unbound_use.executables`,
+  grouped with call counts on the concise `unidentified executables`
+  line): the EXEC-joined kernel `(dev, ino)` resolved to a path
+  through a live `/proc/<pid>/exe` (generation-checked), the scan's
+  admitted-caller identities, or the system binary index. An image
+  whose EXEC never arrived reads why: `exec_record_lost` (counted)
+  under lifecycle loss, `no_exec_record` when the exec predates the
+  capture or the ticket was unavailable (PID scope stamps none; a
+  process that exec'd before the capture, called during it, and
+  exited before the first scan pass leaves no record and no loss —
+  the known gap), `exe_unavailable` when the kernel read failed, or
+  `path_unknown` (deleted file, container overlay, or a binary
+  outside the system index). A re-exec keeps its ticket with the
+  latest EXEC winning the pair. An exec-chain image that was never admitted
   (a thread exec inside one pass) likewise binds nothing: the
   retired caller's edge reads `unknown`/`use_before_admission` and
   the use is disclosed only via `unbound_use` (see the next entry).

@@ -5,6 +5,14 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
+## [0.7.0] - Unreleased
+
+### Added
+
+### Changed
+
+### Fixed
+
 ## [0.6.0] - 2026-11-06
 
 v0.6.0 answers "which application used which key, and how": inventory

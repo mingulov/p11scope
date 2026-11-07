@@ -621,6 +621,10 @@ struct WorkerState {
     quarantined: Vec<CloseSlot<DetailedClose>>,
     retained_pending: usize,
     quarantined_retention: Vec<Arc<CollectedCleanupRetention>>,
+    /// Latched closer-pool start or shed-restart failure. Live admission
+    /// refuses with it, so the session keeps its untouched fallback
+    /// instead of transferring links into a broken pool.
+    pool_error: Option<String>,
 }
 
 struct DetailedClose {
@@ -651,6 +655,17 @@ impl Drop for WorkerState {
         std::mem::forget(std::mem::take(&mut self.quarantined_retention));
     }
 }
+
+/// How the worker thread starts its three closer helpers: production
+/// spawns threads, tests inject failures. One starter serves both the
+/// eager start and the shed restart, so both paths share the latch.
+pub(crate) type PoolStarter =
+    Arc<dyn Fn(CloseOperation<DetailedClose>) -> Result<ClosePool<DetailedClose>, String> + Send + Sync>;
+
+/// How the worker thread drops its own capabilities on `Shed`:
+/// production calls `caps::drop_to_keep`, tests record the thread and
+/// the mask.
+pub(crate) type ShedDropFn = Arc<dyn Fn(u64) -> std::io::Result<()> + Send + Sync>;
 
 /// Pre-started background worker that closes submitted links in
 /// [`DetachOrder`] while the foreground prints progress.
@@ -700,12 +715,31 @@ impl CleanupWorker {
         clock: BoxClock,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
     ) -> Self {
+        Self::pre_start_with_hooks(
+            closer,
+            clock,
+            spawn,
+            Arc::new(|operation| ClosePool::start(operation)),
+            Arc::new(|keep| crate::caps::drop_to_keep(keep)),
+        )
+    }
+
+    /// Test seam: injected closer-helper starter and shed drop alongside
+    /// the worker-thread spawn. Production uses [`ClosePool::start`] and
+    /// [`crate::caps::drop_to_keep`] through [`pre_start_with_spawn`].
+    pub(crate) fn pre_start_with_hooks(
+        closer: BoxCloser,
+        clock: BoxClock,
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,
+        pool_starter: PoolStarter,
+        drop_fn: ShedDropFn,
+    ) -> Self {
         let state = Arc::new(Mutex::new(WorkerState::default()));
         let (tx, rx) = mpsc::channel::<Command>();
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_state = Arc::clone(&state);
         let (handle, start_error) = match spawn(Box::new(move || {
-            run_cleanup(rx, thread_state, Arc::from(closer), ready_tx)
+            run_cleanup(rx, thread_state, Arc::from(closer), ready_tx, pool_starter, drop_fn)
         })) {
             Ok(handle) => {
                 let error = match ready_rx.recv() {
@@ -767,6 +801,9 @@ impl CleanupWorker {
             .state
             .lock()
             .map_err(|_| "cleanup worker state is poisoned")?;
+        if let Some(error) = &state.pool_error {
+            return Err(error.clone());
+        }
         if state.counts_invalid {
             return Err("cleanup worker accounting is uncertain".into());
         }
@@ -1243,6 +1280,8 @@ fn run_cleanup(
     state: Arc<Mutex<WorkerState>>,
     closer: Arc<LinkCloser>,
     ready: mpsc::SyncSender<Result<(), String>>,
+    pool_starter: PoolStarter,
+    drop_fn: ShedDropFn,
 ) {
     let close_state = Arc::clone(&state);
     let operation: CloseOperation<DetailedClose> = Arc::new(move |item| {
@@ -1260,13 +1299,19 @@ fn run_cleanup(
         }
         Ok(())
     });
-    // The closer pool starts lazily on the first submit, not at thread
-    // start: the post-setup shed lands between the two, so helpers
-    // spawned after it inherit the shed set instead of retaining the
-    // startup grant (per-thread `capset`). A shed resets an already
-    // started pool for the same reason.
-    let mut pool: Option<Result<ClosePool<DetailedClose>, String>> = None;
-    let _ = ready.send(Ok(()));
+    // The coordinator and its three helpers start eagerly, before the
+    // post-setup shed: a spawn failure then refuses live batches with
+    // the untouched fallback instead of quarantining transferred links.
+    // The shed drops this thread and restarts the helpers eagerly, so
+    // they inherit the shed set (per-thread `capset`).
+    let mut pool = pool_starter(Arc::clone(&operation));
+    let _ = ready.send(pool.as_ref().map(|_| ()).map_err(|error| error.clone()));
+    if let Err(error) = &pool {
+        let mut counts = state.lock().unwrap();
+        counts.counts_invalid = true;
+        counts.failures.push(error.clone());
+        counts.pool_error = Some(error.clone());
+    }
     for command in rx {
         match command {
             Command::Submit {
@@ -1296,15 +1341,7 @@ fn run_cleanup(
                         })
                         .unwrap_or(items.len());
                     for chunk in items[first..end].chunks(4) {
-                        if pool.is_none() {
-                            pool = Some(ClosePool::start(Arc::clone(&operation)));
-                            if let Some(Err(error)) = &pool {
-                                let mut counts = state.lock().unwrap();
-                                counts.counts_invalid = true;
-                                counts.failures.push(error.clone());
-                            }
-                        }
-                        let results = match pool.as_mut().expect("pool started above") {
+                        let results = match &mut pool {
                             Ok(pool) => pool.close_chunk(chunk),
                             Err(error) => chunk
                                 .iter()
@@ -1378,12 +1415,40 @@ fn run_cleanup(
                 finish_retained_release(&state, &batch, result);
             }
             Command::Shed { keep, done } => {
-                // This thread only (`capset` pid 0); helpers spawned after
-                // this inherit the shed set. An already-started pool is
-                // reset so its helpers restart shed on the next submit.
-                let result = crate::caps::drop_to_keep(keep);
-                pool = None;
-                let _ = done.send(result);
+                // This thread only (`capset` pid 0). On success the old
+                // helpers drop and restart eagerly, so they inherit the
+                // shed set; a refused drop keeps the old pool. A failed
+                // restart latches its error for live admission and
+                // surfaces through `done`, quarantining nothing.
+                match drop_fn(keep) {
+                    Err(error) => {
+                        let _ = done.send(Err(error));
+                    }
+                    Ok(()) => {
+                        drop(std::mem::replace(
+                            &mut pool,
+                            Err("shed restart replaces this placeholder".to_string()),
+                        ));
+                        match pool_starter(Arc::clone(&operation)) {
+                            Ok(restarted) => {
+                                pool = Ok(restarted);
+                                let _ = done.send(Ok(()));
+                            }
+                            Err(error) => {
+                                {
+                                    let mut counts = state.lock().unwrap();
+                                    counts.pool_error = Some(error.clone());
+                                    counts.failures.push(error.clone());
+                                }
+                                pool = Err(error.clone());
+                                let _ = done.send(Err(std::io::Error::new(
+                                    std::io::ErrorKind::Other,
+                                    error,
+                                )));
+                            }
+                        }
+                    }
+                }
             }
             Command::Shutdown => break,
         }

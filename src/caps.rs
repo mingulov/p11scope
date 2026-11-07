@@ -601,6 +601,31 @@ mod tests {
         assert_eq!(post_setup_keep(true, false, u64::MAX), u64::MAX);
     }
 
+    /// Post-setup keeps `CAP_SYS_ADMIN` unless the narrow BPF, PERFMON
+    /// and CHECKPOINT_RESTORE grants all survive it: later dynamic
+    /// links still need BPF/PERFMON, and later identity proofs still
+    /// need map_files, so any missing narrow grant keeps the fallback.
+    #[test]
+    fn post_setup_keep_requires_bpf_perfmon_and_cr_to_shed() {
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        let live = minimal_live_mask();
+        // Each missing narrow grant keeps SYS_ADMIN, even with the
+        // other two held (late dynamic work still needs the fallback).
+        for bit in [CAP_BPF_BIT, CAP_PERFMON_BIT, CAP_CHECKPOINT_RESTORE_BIT] {
+            let without = (live & !(1u64 << bit)) | sys_admin;
+            assert_eq!(
+                post_setup_keep(true, true, without),
+                without,
+                "missing bit {bit} must keep SYS_ADMIN"
+            );
+        }
+        // All three held sheds; none held (the DaemonSet shape) keeps.
+        assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
+        let daemonset =
+            sys_admin | (1u64 << CAP_SYS_PTRACE_BIT) | (1u64 << CAP_DAC_READ_SEARCH_BIT);
+        assert_eq!(post_setup_keep(true, true, daemonset), daemonset);
+    }
+
     fn parse(argv: &[&str]) -> crate::cli::Command {
         crate::cli::parse(argv.iter().map(std::ffi::OsString::from)).expect("test argv parses")
     }

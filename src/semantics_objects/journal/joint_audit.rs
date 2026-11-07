@@ -1609,15 +1609,6 @@ impl IngestedJointQuantum {
                 // no-progress guard observe the actual committed work.
                 *remaining -= 1;
                 self.advance_consumer(ConsumerState::Future);
-                // TEMP F9: await census (sampled).
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static AF: AtomicU64 = AtomicU64::new(0);
-                    let n = AF.fetch_add(1, Ordering::Relaxed);
-                    if n % 200 == 0 {
-                        eprintln!("await-future n={n}");
-                    }
-                }
                 return Ok(QuantumSealProgress::AwaitFutureInput);
             }
         }

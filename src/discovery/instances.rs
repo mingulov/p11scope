@@ -1224,11 +1224,15 @@ impl InstanceRouter {
     /// this quantum's history (observations cleared, every pending call
     /// shed as CoverageFault) without latching and without advancing the
     /// shared fault era. Clearing forces fresh scans, which mint from the
-    /// still-authoritative live counters (the audit proves the loss is a
-    /// userspace-side read gap, not BPF-side uncertainty); calls rejoin
-    /// only on an exact epoch match, so continuity is re-proven rather
-    /// than assumed. BPF-side faults still advance the era and still
-    /// refuse old stamps globally.
+    /// still-authoritative live counters: the audit proves the loss is
+    /// bounded and exactly quantified inside this quantum (exact
+    /// malformed/discard deltas with a stable fault bracket and readable
+    /// counters — `discarded()` counts kernel-discarded reservations the
+    /// reader consumed, an exact count, not an unscoped gap); calls
+    /// rejoin only on an exact epoch match, so continuity is re-proven
+    /// rather than assumed (JK-22: one bad quantum must not void every
+    /// key row). BPF-side faults still advance the era and still refuse
+    /// old stamps globally.
     pub(crate) fn fail_quantum_coverage(&mut self) -> Vec<(u64, Route)> {
         self.observed.clear();
         self.clear_carry();

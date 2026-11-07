@@ -3305,10 +3305,11 @@ impl SemanticCapture {
     /// is disclosed, but nothing latches and the shared fault is NOT
     /// raised, so the next tick audits normally and fresh scans re-prove
     /// at the unchanged era. A bounded per-quantum loss (short-lived
-    /// churn missed by a read) must not void every joint domain: the
-    /// cleared observations force fresh scans, which mint from the
-    /// still-authoritative live counters, and calls rejoin only on an
-    /// exact epoch match. BPF-side faults still raise independently
+    /// churn shed inside one quantum with exact deltas, a stable fault
+    /// bracket and readable counters) must not void every joint domain
+    /// (JK-22): the cleared observations force fresh scans, which mint
+    /// from the still-authoritative live counters, and calls rejoin only
+    /// on an exact epoch match. BPF-side faults still raise independently
     /// (those still void, as they should). Legacy drain failures keep
     /// the permanent path: without the quantum audit the scope is
     /// unknowable.

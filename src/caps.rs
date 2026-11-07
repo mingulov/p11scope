@@ -343,8 +343,9 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// uids). A setcap user never holds the extras, so the same masks shed
 /// the whole grant surplus there; root keeps a functional subset instead
 /// of the full set. Live capture keeps the minimal set whole (dynamic
-/// attach and rescans run until the end); `doctor` keeps it too (it
-/// reports the invoking set, so it must not drop first); `inspect` never
+/// attach and rescans run until the end); `doctor` keeps the live set
+/// whole too (it reports the invoking set, so it must not narrow it to a
+/// subset first; surplus above the live set still drops); `inspect` never
 /// loads BPF, and scan-only `inventory` keeps only its
 /// target-read/map-files bits; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
@@ -380,7 +381,17 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
         // contract, and it has no `-o`); the witness still needs
         // checkpoint/restore.
         Command::Inspect(_) => live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT)),
-        Command::InventoryDiff(a) => (1u64 << CAP_DAC_READ_SEARCH_BIT) | out(&a.out),
+        // `diff` reads two inputs: root keeps DAC_READ_SEARCH for
+        // unreadable ones, anyone else sheds it (offline inputs must be
+        // readable; a setcap surplus must not survive here).
+        Command::InventoryDiff(a) => {
+            let read = if unsafe { libc::geteuid() } == 0 {
+                1u64 << CAP_DAC_READ_SEARCH_BIT
+            } else {
+                0
+            };
+            read | out(&a.out)
+        }
         Command::Version => 0,
     }
 }

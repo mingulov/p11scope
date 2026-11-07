@@ -4670,15 +4670,18 @@ fn run_owned_inner_with_host(
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
     // The run tree scope: a dedicated cgroup under the observer's own
-    // cgroup, holding the owned child before release, so every
+    // cgroup; that is the root only when the observer itself runs in the
+    // root cgroup, holding the owned child before release, so every
     // descendant is born in scope while ancestor limits and unit kill
     // semantics stay intact. Any failure below degrades to the exact
-    // child with a named gap — never a refusal of a runnable command,
-    // and never a fallback to the filesystem root.
+    // child with a named gap — never a refusal of a runnable command.
     let (pre_tree_group, mut run_tree_gap) = match crate::scope::RunCgroup::create_under_observer(
         std::path::Path::new("/sys/fs/cgroup"),
     ) {
-        Ok(group) => (Some(group), None),
+        Ok(mut group) => {
+            group.set_verbose(args.verbose);
+            (Some(group), None)
+        }
         Err(error) => {
             emit_capture_diagnostic(&format!(
                 "p11scope: {}",

@@ -334,18 +334,29 @@ for _ in $(seq 1 60); do
   sleep 0.5
 done
 if grep -q "capturing:" "$CELLTMP/out/postsetup.err" 2>/dev/null; then
-  eff_hex=$(awk '/^CapEff:/{print $2}' /proc/"$opid"/status)
-  if python3 -I - "$eff_hex" <<'PY'; then
+  # The shed is per-thread: every task must hold the minimal set only,
+  # not just the leader (the cleanup worker and its helpers predate it).
+  tasks_detail=""
+  tasks_bad=""
+  for task in /proc/"$opid"/task/*; do
+    tid=${task#/proc/"$opid"/task/}
+    eff_hex=$(awk '/^CapEff:/{print $2}' "$task/status" 2>/dev/null) || continue
+    tasks_detail="$tasks_detail $tid=$eff_hex"
+    if ! python3 -I - "$eff_hex" <<'PY'; then
 import sys
 eff = int(sys.argv[1], 16)
 live = {39, 40, 2, 38, 19}
 assert all((eff >> bit) & 1 for bit in live), hex(eff)
 assert not (eff >> 21) & 1, hex(eff)
 PY
-    detail="CapEff=$eff_hex minimal-set-only"
+      tasks_bad="$tasks_bad $tid=$eff_hex"
+    fi
+  done
+  if [ -z "$tasks_bad" ] && [ -n "$tasks_detail" ]; then
+    detail="CapEff minimal-set-only on all tasks:$tasks_detail"
   else
     pass=0
-    detail="unexpected mid-run CapEff=$eff_hex"
+    detail="unexpected mid-run CapEff on tasks:$tasks_bad (all:$tasks_detail)"
   fi
 else
   pass=0

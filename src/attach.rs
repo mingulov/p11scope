@@ -11032,16 +11032,22 @@ impl Session {
     /// singles session, or a multi session whose dynamics stay on perf
     /// (an unproven pid filter), keeps it for dynamic perf re-attach.
     /// The effective set comes from `capget`, never `/proc` (a broken
-    /// `/proc` must not zero the shed). Fail-closed like the startup
-    /// drop. Callers invoke this after their session starts, before the
-    /// capture loop.
+    /// `/proc` must not zero the shed). The shed is per-thread, so the
+    /// pre-spawned cleanup worker sheds to the same keep. Fail-closed
+    /// like the startup drop. Callers invoke this after their session
+    /// starts, before the capture loop.
     pub(crate) fn drop_post_setup_capabilities(&self) -> std::io::Result<()> {
         let multi = self.backend == AttachBackend::Multi;
         if !multi || !self.dynamic_multi {
             return Ok(());
         }
         let effective = crate::caps::read_effective_via_capget()?;
-        crate::caps::drop_to_keep(crate::caps::post_setup_keep(multi, self.dynamic_multi, effective))
+        let keep = crate::caps::post_setup_keep(multi, self.dynamic_multi, effective);
+        crate::caps::drop_to_keep(keep)?;
+        if let Some(worker) = self.cleanup_worker.as_ref() {
+            worker.shed_to(keep)?;
+        }
+        Ok(())
     }
 }
 

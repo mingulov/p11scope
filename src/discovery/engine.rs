@@ -12185,6 +12185,26 @@ impl Engine {
         if !self.admits_generations() {
             return;
         }
+        // A removed admitted view's generation is gone (dead or
+        // migrated out of the scope cgroup), so its pending exe
+        // identity and exec timing die with it, exactly like a
+        // matched exit. Under --cgroup a member that migrates out
+        // produces no exit record at all (the BPF exit hook only
+        // emits for tasks in the scope cgroup at exit); without this
+        // drop a fork-only reused PID would consume the dead image
+        // with no loss and no PARTIAL.
+        let removed_pids: Vec<u32> = views
+            .iter()
+            .filter_map(|view| {
+                self.admitted_cgroup_views
+                    .get(view)
+                    .map(|admission| admission.pid)
+            })
+            .collect();
+        for pid in removed_pids {
+            self.extensive.drop_stash_for_pid(pid);
+            self.exit_map.drop_exec_for_pid(pid);
+        }
         if let Some(closed_ns) = closed_ns {
             for view in views {
                 self.close_cgroup_admission(*view, closed_ns);

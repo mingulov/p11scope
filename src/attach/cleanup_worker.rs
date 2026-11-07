@@ -721,7 +721,7 @@ impl CleanupWorker {
             clock,
             spawn,
             Arc::new(|operation| ClosePool::start(operation)),
-            Arc::new(|keep| crate::caps::drop_to_keep(keep)),
+            Arc::new(crate::caps::drop_to_keep),
         )
     }
 
@@ -1449,10 +1449,7 @@ fn run_cleanup(
                                     counts.failures.push(error.clone());
                                 }
                                 pool = Err(error.clone());
-                                let _ = done.send(Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    error,
-                                )));
+                                let _ = done.send(Err(std::io::Error::other(error)));
                             }
                         }
                     }

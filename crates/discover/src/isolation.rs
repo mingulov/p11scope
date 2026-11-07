@@ -14,8 +14,9 @@
 //!
 //! Documented residuals: the provider still runs in-process as the
 //! helper's uid with its environment, supplementary groups, readable
-//! files and signaling; other terminal ioctls pass, as does `AF_UNIX`
-//! datagram `sendto` without `connect`.
+//! files, signaling and limit/priority changes (setpriority,
+//! sched_setscheduler, ioprio_set); other terminal ioctls pass, as does
+//! `AF_UNIX` datagram `sendto` without `connect`.
 
 use std::fs::File;
 use std::os::fd::{AsRawFd as _, FromRawFd as _};
@@ -133,6 +134,7 @@ const FS_IOC_SETVERSION: u32 = 0x4008_7602;
 // x86-64 syscall numbers in the denylist (contract §5).
 const SYS_IOCTL: u32 = 16;
 const SYS_SOCKET: u32 = 41;
+const SYS_PRLIMIT64: u32 = 302;
 const SYS_CONNECT: u32 = 42;
 const SYS_BIND: u32 = 49;
 const SYS_LISTEN: u32 = 50;
@@ -200,10 +202,11 @@ const SYS_UTIMES: u32 = 235;
 const SYS_FUTIMESAT: u32 = 261;
 const SYS_UTIMENSAT: u32 = 280;
 
-/// Unconditional denials. `socket` and `ioctl` are handled separately:
-/// `AF_UNIX` and `AF_NETLINK` socket domains stay allowed while every
-/// other domain is denied, and only the listed terminal-injection and
-/// inode-attribute ioctl commands are denied.
+/// Unconditional denials. `socket`, `ioctl` and `prlimit64` are handled
+/// separately: `AF_UNIX` and `AF_NETLINK` socket domains stay allowed
+/// while every other domain is denied, only the listed terminal-injection
+/// and inode-attribute ioctl commands are denied, and only `prlimit64`
+/// on pid 0 (the calling process) stays allowed.
 const DENY_ALWAYS: &[u32] = &[
     SYS_CONNECT,
     SYS_BIND,
@@ -357,6 +360,7 @@ impl FilterBuilder {
         }
         let socket_jump = self.jeq(SYS_SOCKET);
         let ioctl_jump = self.jeq(SYS_IOCTL);
+        let prlimit_jump = self.jeq(SYS_PRLIMIT64);
         let allow = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         let deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let x32_deny = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::ENOSYS as u32));
@@ -386,6 +390,13 @@ impl FilterBuilder {
         }
         let deny_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
         let allow_ioctl = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
+        // prlimit64(pid, ...): pid 0 is the calling process (what libc
+        // passes for self) and stays allowed; any other pid would lower
+        // a sibling's limits and is denied.
+        let prlimit_check = self.emit(stmt(BPF_LD_W_ABS, ARG0_LO_OFFSET));
+        let is_self = self.jeq(0);
+        let deny_prlimit = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ERRNO | libc::EACCES as u32));
+        let allow_prlimit = self.emit(stmt(BPF_RET_K, SECCOMP_RET_ALLOW));
         // Every target is known now; patch the whole chain explicitly.
         // Each `jeq nr`: equal falls into `deny`, else the next check,
         // walked back to front so `next` is always the following check.
@@ -396,7 +407,8 @@ impl FilterBuilder {
         }
         self.patch(x32, x32_deny, next)?;
         self.patch(socket_jump, socket_check, ioctl_jump)?;
-        self.patch(ioctl_jump, ioctl_check, allow)?;
+        self.patch(ioctl_jump, ioctl_check, prlimit_jump)?;
+        self.patch(prlimit_jump, prlimit_check, allow)?;
         self.patch(is_unix, allow_unix, is_netlink)?;
         self.patch(is_netlink, allow_unix, deny_socket)?;
         // Each denied ioctl: equal falls into `deny_ioctl`, else the next
@@ -406,6 +418,7 @@ impl FilterBuilder {
             self.patch(*at, deny_ioctl, next_ioctl)?;
             next_ioctl = *at;
         }
+        self.patch(is_self, allow_prlimit, deny_prlimit)?;
         validate_filter(&self.insns)?;
         Ok(self.insns)
     }
@@ -1415,23 +1428,22 @@ mod tests {
     fn prlimit64_on_other_pids_evaluates_to_eacces() {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
-        // prlimit64(302): pid 0 is the calling process (libc passes 0
-        // for self), which stays allowed; any other pid would lower a
+        // prlimit64: pid 0 is the calling process (libc passes 0 for
+        // self), which stays allowed; any other pid would lower a
         // sibling's limits and is denied.
-        const SYS_PRLIMIT64_PROBE: u32 = 302;
         assert_eq!(
-            SYS_PRLIMIT64_PROBE,
+            SYS_PRLIMIT64,
             libc::SYS_prlimit64 as u32,
             "wrong number for prlimit64"
         );
         assert_eq!(
-            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64_PROBE, 0, 0),
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64, 0, 0),
             SECCOMP_RET_ALLOW,
             "prlimit64 on self must stay allowed"
         );
         for pid in [1u32, 1234u32, u32::MAX] {
             assert_eq!(
-                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64_PROBE, pid, 0),
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64, pid, 0),
                 denied,
                 "prlimit64 on pid {pid} escapes the fence"
             );

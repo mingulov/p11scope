@@ -10400,7 +10400,8 @@ mod tests {
     /// some shells replace themselves with a lone `sh -c` command
     /// instead of forking. The trailing `exec sleep 2` settles the
     /// terminal drain: without it the grandchild's exit can land past
-    /// the drain's read position on some hosts and the gap undercounts.
+    /// the drain's read position on some hosts and the gap counts via
+    /// the fail-closed sweep instead of the exit ledger.
     #[test]
     #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {

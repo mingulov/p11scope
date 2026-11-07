@@ -56,7 +56,9 @@ the finite eighteen-label vocabulary below,
 and [per-provider mechanism counts](#per-provider-mechanism-counts-owner-ruling-kg-1kg-2-2026-11-03),
 which partitions each mechanism row's calls/errors by provider module,
 and [short-lived tracking widened to trace, metrics, `--pid` and owned run (7.10b)](#short-lived-tracking-widened-to-trace-metrics---pid-and-owned-run-710b),
-which approves the widened read/retention contract below.**
+which approves the widened read/retention contract below,
+and [offline CBOM export re-projection](#offline-cbom-export-re-projection-v070),
+which describes the implemented offline report and grants no capture authority.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1874,3 +1876,49 @@ whose target execs mid-capture) through the privileged lanes, and
 equal-coverage cost cells (armed versus disarmed over the identical
 workload: identical call/attribution surfaces plus the measured
 arm/disarm cost delta) before release claims.
+
+## Offline CBOM export re-projection (v0.7.0)
+
+**Status: IMPLEMENTED in v0.7.0 by owner scope-freeze exception
+(2026-11-07): `p11scope inventory cbom` converts one explicitly
+supplied saved `p11scope/inventory/v1` or observed-profile file into
+a CycloneDX 1.6 document. Derived output only: no new capture, no
+new read, no new retained field. Allowlist-v1 bytes are unchanged.**
+
+`p11scope inventory cbom` reads one explicitly supplied saved
+`p11scope/inventory/v1`, `p11scope/observed-profile/v3` or
+`p11scope/observed-profile/v2` file as an ordinary user. Its
+CycloneDX 1.6 document reprojects only already-published inventory or
+profile fields. It performs no target-memory or argument read, live
+process lookup, provider loading, or new capture. This section adds
+no permission to any live observer, decoder, profile, metrics,
+trace, inventory producer or kernel map. V1/v2 exclusions remain
+unchanged.
+
+| Field | Source, authority and validation | Retention and public output | Failure and evidence boundary |
+| --- | --- | --- | --- |
+| Offline CBOM conversion | Exact saved inventory v1 or observed-profile v3/v2 schema, bounded JSON under the shared offline-reader bounds, and resolved same-input caller/module/edge/instance references; mechanism names and operation categories verbatim from the input (never re-resolved); key metadata from established slots only — requested, conflicting and invalidated slots never qualify. No additional authority inferred from file contents. | CycloneDX 1.6 components minted per distinct caller path (`application`), per module record (`library`, with the SHA-256 hash only when the input carries a valid digest), per mechanism id (`cryptographic-asset` algorithm with name-determined primitive/mode/padding and observed operation categories as `cryptoFunctions`), and per key-class, labelled or key-operation-used object (`related-crypto-material` with established class, size and curve only). Report-local `bom-ref` values; `dependencies[]` only for joins the input proves (application to module, application/module to mechanism, key to module/caller through key-operation to instance). Provenance, counts and unknown tallies in `metadata.properties`; concise and verbose text views carry the same facts. | Malformed shapes/references, unsupported schemas and exceeded limits fail. Unknown additive data is bounded and ignored, never copied to output. A malformed crypto detail degrades its component to unknown with a named note and never stops the view. Unknown labels/units remain unknown. Validate staged installed offline behavior separately from input capture provenance and live capture qualification. |
+
+The [CBOM design note](../cbom-export.md) defines the precise output
+projection. Input caller/module IDs are not output identities:
+`bom-ref` values are minted by the report, and the capture-local
+object id rides a `p11scope:object` traceability property, never the
+material `id`. Detailed operation aggregates, API-return histories
+beyond their names, per-edge usage counts, session rows and arbitrary
+unknown subtrees are not copied into the report. Key values, CKA
+labels and IDs, PINs, key states and key dates are never in the
+input and are never emitted: the material `value`, `id`, `state`
+and date keys stay absent. Recorded paths and allowed free-text
+evidence remain input facts; a saved file does not authorize new
+reads or establish that the application called a provider. Text
+escapes controls; JSON preserves decoded input strings through JSON
+escaping.
+
+Every count belongs to its own observation window; no host/boot,
+process or physical continuity is inferred. Missing observations do
+not prove inactivity, and unknown scope completeness remains
+explicit. This re-projection introduces no host ID, boot ID, machine
+ID, executable hash, command line, argument, buffer, handle, or raw
+address capture. Its output remains subject to the input
+publication's privacy contract; it is not a secret scrubber for
+fabricated or otherwise untrusted saved input.

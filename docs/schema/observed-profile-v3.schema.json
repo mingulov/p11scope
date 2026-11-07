@@ -1096,7 +1096,8 @@
                 {"required": ["interface_selection"]},
                 {"required": ["attach_mechanisms"]},
                 {"required": ["pid_descendant_gaps"]},
-                {"required": ["multi_rebuild_gaps"]}
+                {"required": ["multi_rebuild_gaps"]},
+                {"required": ["gap_exit_mappings"]}
               ]
             }
           }

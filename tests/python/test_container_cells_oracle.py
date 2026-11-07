@@ -578,10 +578,36 @@ class CopyUpTest(unittest.TestCase):
             check_copy_up(pre_kernel=pre)
 
     def test_span_collapse_missing_fails(self):
-        """At least one collapse must name B's key in the span."""
+        """A span with no collapse is neither observed shape."""
         span = inventory(span_edges(), backend="kernel",
                          modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "no collapse names"):
+        with self.assertRaisesRegex(AssertionError, "not an observed shape"):
+            check_copy_up(span_kernel=span)
+
+    def test_span_collapse_single_stable_passes(self):
+        """The stable shape — exactly B's key onto A's — passes."""
+        span = inventory(span_edges(), [collapse_gap()],
+                         backend="kernel", modules=dict(D1_MODULES_SPAN))
+        result = check_copy_up(span_kernel=span)
+        self.assertTrue(result["ok"])
+
+    def test_span_collapse_reversed_flip_fails(self):
+        """RED: the flip pins its observed order; reversed refuses."""
+        span = inventory(
+            span_edges(),
+            [collapse_gap(mapping_key=KEY_A, target_key=KEY_B),
+             collapse_gap()],
+            backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_collapse_single_inverted_fails(self):
+        """RED: a lone inverted collapse (A's onto B's) refuses."""
+        span = inventory(
+            span_edges(),
+            [collapse_gap(mapping_key=KEY_A, target_key=KEY_B)],
+            backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=span)
 
     def test_span_b_pre_old_edge_live_fails(self):

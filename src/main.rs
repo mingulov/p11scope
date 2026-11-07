@@ -77,8 +77,13 @@ fn run() -> Result<i32> {
     let parsed = cli::parse(std::env::args_os().skip(1));
     // Least privilege: shed every capability this command never needs
     // before it runs. Fail closed: a refused drop means the kernel or the
-    // sandbox is not what the keep sets assume.
-    if let Ok(command) = &parsed {
+    // sandbox is not what the keep sets assume. Doctor is exempt: it
+    // reports the invoking set, so dropping first would warn about
+    // capabilities the operator granted (the paranoid row would miss a
+    // held SYS_ADMIN it just shed).
+    if let Ok(command) = &parsed
+        && !matches!(command, Command::Doctor(_))
+    {
         p11scope::caps::drop_unneeded_for_command(command)
             .context("cannot drop unneeded capabilities")?;
     }

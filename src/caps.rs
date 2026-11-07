@@ -343,9 +343,10 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// uids). A setcap user never holds the extras, so the same masks shed
 /// the whole grant surplus there; root keeps a functional subset instead
 /// of the full set. Live capture keeps the minimal set whole (dynamic
-/// attach and rescans run until the end); `doctor` keeps the live set
-/// whole too (it reports the invoking set, so it must not narrow it to a
-/// subset first; surplus above the live set still drops); `inspect` never
+/// attach and rescans run until the end); `doctor` needs the live set
+/// whole (it reports the invoking set, so `main` exempts it from the
+/// startup drop entirely — dropping first would warn about capabilities
+/// the operator granted); `inspect` never
 /// loads BPF, and scan-only `inventory` keeps only its
 /// target-read/map-files bits; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {

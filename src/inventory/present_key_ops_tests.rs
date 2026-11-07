@@ -411,8 +411,7 @@ fn key_ops_line_partial_authority_lost_with_rows_names_continuing_rows() {
             .find(|line| line.contains("per-key tracking lost some calls"))
             .unwrap_or_else(|| panic!("{label}: the reason line: {snapshot}"));
         assert_eq!(
-            *reason,
-            "  per-key tracking lost some calls; exact rows continue",
+            *reason, "  per-key tracking lost some calls; exact rows continue",
             "{label}: the reason matches the continuing rows: {snapshot}"
         );
         let text = block.join("\n");
@@ -2115,8 +2114,7 @@ fn key_ops_line_spotlights_pqc_uses() {
         .find(|line| line.starts_with("  pqc keys: "))
         .expect("the PQC spotlight line");
     assert_eq!(
-        *spotlight,
-        "  pqc keys: ML-DSA-65 sign: 12, ML-DSA-65 verify: 3",
+        *spotlight, "  pqc keys: ML-DSA-65 sign: 12, ML-DSA-65 verify: 3",
         "one segment per (label, category): {snapshot}"
     );
     let text = block.join("\n");
@@ -2175,8 +2173,7 @@ fn key_ops_line_pqc_spotlight_verbose_adds_terminals() {
     encap.metadata_at_use = "ml_kem_768";
     observations.key_operations.push(encap);
     let presentation = key_ops_presentation(observations);
-    let verbose =
-        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     let block = key_ops_block(&verbose);
     let spotlight = block
         .iter()
@@ -2187,8 +2184,7 @@ fn key_ops_line_pqc_spotlight_verbose_adds_terminals() {
         "singular noun: {verbose}"
     );
     assert!(
-        spotlight
-            .contains("ML-KEM-768 encapsulate: 7 completed, 2 returned errors, 1 active"),
+        spotlight.contains("ML-KEM-768 encapsulate: 7 completed, 2 returned errors, 1 active"),
         "plural nouns: {verbose}"
     );
     let concise = render_snapshot(&presentation);
@@ -2198,8 +2194,7 @@ fn key_ops_line_pqc_spotlight_verbose_adds_terminals() {
         .find(|line| line.starts_with("  pqc keys: "))
         .expect("the concise spotlight line");
     assert_eq!(
-        *brief,
-        "  pqc keys: ML-DSA-65 sign: 12, ML-KEM-768 encapsulate: 7",
+        *brief, "  pqc keys: ML-DSA-65 sign: 12, ML-KEM-768 encapsulate: 7",
         "concise shows completions only: {concise}"
     );
 }

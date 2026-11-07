@@ -15918,6 +15918,43 @@ fn key_operation_n1_ledger_contact_releases_before_new_staging() {
     assert_eq!(g.scene.adapter.ledger().census(), MAX_UNSETTLED_STAGED);
 }
 
+/// Sustained 10k/s with ~300 ms seal delay holds ~3,080 unsettled
+/// BEGINs (Little's law); the staging table must absorb them so quanta
+/// fill instead of closing early (early closes fragment flow into small
+/// quanta whose per-quantum waits overload the single-flight machine).
+#[test]
+fn key_operation_staging_holds_sustained_10k_backlog() {
+    let mut g = GuardedScene::new();
+    let bootstrap = g.scene.bootstrap();
+    let key = g.key(1);
+    g.registry.install_joint_receipt(key.clone(), bootstrap);
+    let (_, id) = g.register(1);
+    let init = ShapedS1::shaped("C_SignInit", CkRv::OK.0, RSA_PKCS, init_capture());
+    assert_eq!(
+        g.drive_joint(&key, id, &init),
+        SealApplyOutcome::ReplayedOne
+    );
+    let sign = ShapedS1::shaped("C_Sign", CkRv::OK.0, 0, op_capture());
+    g.drive_s1only(&key, &sign);
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        1,
+        "the ended shared ticket awaits contact"
+    );
+    for token in 0..3_100 {
+        g.scene
+            .adapter
+            .ledger_mut()
+            .charge_model(20_000 + token as u64, 1)
+            .unwrap();
+    }
+    assert_eq!(
+        g.scene.adapter.ledger().census(),
+        3_101,
+        "one ended ticket plus a 3,100-call sustained backlog fits"
+    );
+}
+
 #[test]
 fn key_operation_n1_empty_ledger_publish_releases_ended_association() {
     let mut g = GuardedScene::new();

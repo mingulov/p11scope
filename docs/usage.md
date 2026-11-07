@@ -746,7 +746,8 @@ already written and stays intact. Only a second SIGINT does this; a second
 SIGTERM does not escalate.
 
 `run` captures the command with its child processes: before release the
-child is placed in a dedicated cgroup under the observer's own cgroup,
+child is placed in a dedicated cgroup under the observer's own cgroup;
+that is the root only when the observer itself runs in the root cgroup,
 so every descendant — `fork`/`exec` children, `sh -c` and `env`
 wrappers, double forks — is born in the cgroup. Only the direct child
 is paused; descendants are never paused. A descendant that loads an
@@ -761,18 +762,19 @@ supported shape.) The run still ends with the direct child's exit:
 descendants still alive are handed back alive, never killed, and
 disclosed by count (`evidence.run_tree_handed_back` with a `run
 process tree` gap entry; `PARTIAL`). A retained nonempty cgroup names
-itself on stderr so the operator can remove it after its members exit.
-Descendants that retire between admission passes count
-`pid_descendant_gaps` like cgroup scope (same bounded ledger, same
-lossy-by-design rule), so a forking workload with prearmed or
-already-attached providers reports exact counts with `PARTIAL`
+its leaf on stderr (the full path only under `-v`) so the operator can
+remove it after its members exit; a crash can leave an empty run cgroup
+behind until the session ends. Descendants that retire between admission
+passes count `pid_descendant_gaps` like cgroup scope (same bounded
+ledger, same lossy-by-design rule), so a forking workload with prearmed
+or already-attached providers reports exact counts with `PARTIAL`
 observation; unprearmed cold grandchildren may show missing calls; see
 the [known limitations](known-limitations.md). Without permission to
 create the cgroup, `run` observes only the started command itself and
 names the gap; `capture.scope` reads `cgroup` for the tree scope, `pid`
 when degraded. The run-cgroup leaf name (random `p11scope-run-*`, never
 a PID) is published in `cgroups[].label`; the full path is printed on
-stderr only, in the retention notice.
+stderr only under `-v`, in the retention notice.
 
 sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
   --prearm-module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -o tree.json -- \

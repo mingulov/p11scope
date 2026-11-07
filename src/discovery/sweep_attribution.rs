@@ -12,7 +12,7 @@
 //!   object (`PinnedObjects::sweep_match_keys`). Overlay-collapsed and
 //!   alias keys never match; neither does a key on a filesystem whose
 //!   inode numbers are not unique (FUSE, network filesystems, tmpfs
-//!   mounted `inode32`).
+//!   mounted `inode32` or whose mount cannot be resolved).
 //! - Each phase-1 match is confirmed while the aggregate pins (and their
 //!   fds) are held: a pidfd/start-time pin, the exe identity read before
 //!   and after, a maps re-read, and `still_the_same()`. Only the
@@ -86,8 +86,8 @@ pub(crate) enum AttributionLoss {
     /// collapse, an alias, or an unusable pathname).
     KeyRejected,
     /// The object lives on a filesystem whose inode numbers are not unique
-    /// per device (FUSE, network filesystems, tmpfs mounted `inode32`):
-    /// a maps key cannot name it.
+    /// per device (FUSE, network filesystems, tmpfs mounted `inode32` or
+    /// whose mount cannot be resolved): a maps key cannot name it.
     InodeNotUnique,
     /// The confirmation read hit a capture work, I/O, or deadline ceiling.
     Budget,

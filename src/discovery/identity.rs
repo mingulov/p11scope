@@ -516,7 +516,7 @@ pub(crate) fn tmpfs_nonunique_kind(super_options: Option<&str>) -> Option<&'stat
     // object on such kernels, while the collision it risks needs
     // billions of allocations plus an exact pin match.
     match super_options {
-        None => Some("tmpfs-inode32"),
+        None => Some("tmpfs-unresolved"),
         Some(options) if options.split(',').any(|token| token == "inode32") => {
             Some("tmpfs-inode32")
         }
@@ -598,8 +598,9 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
 
 /// Whether identity decisions may treat this fd's `(st_dev, st_ino)` as
 /// naming one file: false on filesystems without unique inode numbers
-/// (FUSE, network filesystems, tmpfs mounted `inode32`) and when the
-/// classification itself fails. Fail-closed everywhere it is used.
+/// (FUSE, network filesystems, tmpfs mounted `inode32` or whose mount
+/// cannot be resolved) and when the classification itself fails.
+/// Fail-closed everywhere it is used.
 pub(crate) fn file_inodes_are_unique(file: &std::fs::File) -> bool {
     filesystem_without_unique_inodes(file.as_raw_fd()).is_ok_and(|kind| kind.is_none())
 }
@@ -1724,9 +1725,9 @@ impl PinnedObjects {
 
     /// `Some(filesystem)` when the pinned object lives on a filesystem whose
     /// inode numbers are not unique per device (FUSE, network filesystems,
-    /// tmpfs mounted `inode32`): there a maps `(device, inode)` cannot name
-    /// one file, so C1b refuses sweep matching for it. `Err` only when
-    /// `fstatfs` itself fails.
+    /// tmpfs mounted `inode32` or whose mount cannot be resolved): there a
+    /// maps `(device, inode)` cannot name one file, so C1b refuses sweep
+    /// matching for it. `Err` only when `fstatfs` itself fails.
     pub(crate) fn nonunique_inode_filesystem(
         &self,
         id: PinnedObjectId,
@@ -6387,8 +6388,8 @@ fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
 /// target. Merge only on proof — same key, equal pin, equal non-empty digest,
 /// equal fstat `(st_dev, st_ino)` on the two retained fds, and unique inode
 /// numbers on both filesystems (`same_kernel_file` refuses FUSE, network
-/// filesystems and tmpfs mounted `inode32`). `mount_id` is not consulted
-/// here; anything unproven fails closed.
+/// filesystems and tmpfs mounted `inode32` or unresolved). `mount_id` is
+/// not consulted here; anything unproven fails closed.
 fn same_open_file(left: &Entry, right: &Entry) -> bool {
     left.raw.key == right.raw.key
         && left.pin == right.pin

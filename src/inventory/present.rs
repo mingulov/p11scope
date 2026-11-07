@@ -2362,6 +2362,9 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
             match metadata.status {
                 crate::caller_metadata::presentation::MetadataStatus::Pending => pending += 1,
                 crate::caller_metadata::presentation::MetadataStatus::Sampled => {}
+                crate::caller_metadata::presentation::MetadataStatus::Stale
+                | crate::caller_metadata::presentation::MetadataStatus::Historical
+                    if metadata.validity.is_some() => {}
                 crate::caller_metadata::presentation::MetadataStatus::Unknown
                 | crate::caller_metadata::presentation::MetadataStatus::Stale
                 | crate::caller_metadata::presentation::MetadataStatus::Historical => unknown += 1,

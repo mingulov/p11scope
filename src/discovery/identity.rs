@@ -528,7 +528,9 @@ pub(crate) fn tmpfs_nonunique_kind(super_options: Option<&str>) -> Option<&'stat
 /// Whether inode numbers on a filesystem with this `fstatfs` magic name
 /// one file per device, given the mount's super-options (`None` when the
 /// mount table could not be read). Pure so every listed filesystem is
-/// unit-testable without mounting it.
+/// unit-testable without mounting it. Test-only: production reads the
+/// kind from [`tmpfs_nonunique_kind`] instead.
+#[cfg(test)]
 pub(crate) fn inodes_name_one_file(f_type: u64, super_options: Option<&str>) -> bool {
     if nonunique_inode_kind(f_type).is_some() {
         return false;

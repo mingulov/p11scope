@@ -541,6 +541,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "missing-cap-cap_sys_ptrace-p3",
                      "inventory-system", "run-minimal",
                      "run-child-drops-caps", "postsetup-drops-sysadmin",
+                     "postsetup-inventory-drops-sysadmin",
                      "run-sudo", "run-user-nobody",
                      "run-kill-on-timeout", "trace-sudo-out",
                      "daemonset-doctor", "daemonset-profile",

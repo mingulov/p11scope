@@ -988,6 +988,7 @@ jobs:
             --require missing-cap-cap_sys_ptrace-p4 --require missing-cap-cap_sys_ptrace-p3 \
             --require inventory-system --require run-minimal \
             --require run-child-drops-caps --require postsetup-drops-sysadmin \
+            --require postsetup-inventory-drops-sysadmin \
             --require run-sudo --require run-user-nobody \
             --require run-kill-on-timeout --require trace-sudo-out \
             --require daemonset-doctor --require daemonset-profile \

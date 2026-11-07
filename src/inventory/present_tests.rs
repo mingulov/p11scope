@@ -3662,3 +3662,121 @@ fn concise_edge_less_labeled_caller_prints_no_scope_line() {
         "no callers with edges means no count line: {out}"
     );
 }
+
+/// Sampled host rows stay silent when they age or retire: a host
+/// cgroup matched no container pattern, so it carries no scope line,
+/// and its sampled/stale/historical rows with edges contribute no
+/// `caller context:` part. Only never-sampled or refused rows count
+/// as unknown.
+#[test]
+fn concise_sampled_host_rows_stay_silent_when_stale_or_historical() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    let with_edges: BTreeSet<CallerId> =
+        presentation.edges.iter().map(|edge| edge.caller).collect();
+    assert!(
+        with_edges.len() >= 3,
+        "fixture must give three callers with edges: {}",
+        with_edges.len()
+    );
+    let ids: Vec<CallerId> = presentation
+        .callers
+        .iter()
+        .map(|caller| caller.id)
+        .filter(|id| with_edges.contains(id))
+        .collect();
+    let host = scope_metadata_for("user.slice/user-1000.slice/session-2.scope");
+    assert!(host.validity.is_some(), "host fixture must be sampled");
+    assert_eq!(
+        crate::caller_metadata::presentation::concise_scope_label(&host, false),
+        None,
+        "host must carry no scope label"
+    );
+    let stale = host.to_stale();
+    let historical = host.to_historical();
+    assert!(stale.validity.is_some());
+    assert!(historical.validity.is_some());
+    assert_eq!(
+        crate::caller_metadata::presentation::concise_scope_label(&stale, false),
+        None
+    );
+    assert_eq!(
+        crate::caller_metadata::presentation::concise_scope_label(&historical, false),
+        None
+    );
+    let rows: Vec<(
+        CallerId,
+        crate::caller_metadata::presentation::CallerMetadata,
+    )> = ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            let metadata = match index % 3 {
+                0 => host,
+                1 => stale,
+                _ => historical,
+            };
+            (*id, metadata)
+        })
+        .collect();
+    presentation.caller_metadata =
+        crate::caller_metadata::runtime::MetadataFrame::for_test(&rows);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out
+            .lines()
+            .any(|line| line.starts_with("caller ") && line.contains(" pid ")),
+        "host rows print no scope lines: {out}"
+    );
+    assert!(
+        !out.lines().any(|line| line.starts_with("caller context:")),
+        "sampled host rows stay silent: {out}"
+    );
+}
+
+/// A retired caller that was never sampled carries no validity and
+/// counts as unknown, not silent: it matched nothing because it was
+/// never observed, not because it matched no container pattern.
+#[test]
+fn concise_never_sampled_historical_counts_unknown() {
+    let mut harness = harness();
+    harness.stage_scale(&ScaleSpec {
+        name: "host-historical-unknown",
+        callers: 1,
+        modules: 1,
+        edges_per_caller: 1,
+        endpoints_per_module: 1,
+        first_pid: 81_000,
+    });
+    harness.commit();
+    let mut presentation = Presentation::capture(
+        harness.coordinator(),
+        "host-historical-unknown",
+        1,
+        2,
+        1,
+    );
+    assert_eq!(presentation.edges.len(), 1, "one edge for one caller");
+    let id = presentation.edges[0].caller;
+    let never_sampled =
+        crate::caller_metadata::presentation::CallerMetadata::pending().to_historical();
+    assert!(never_sampled.validity.is_none());
+    assert_eq!(
+        crate::caller_metadata::presentation::concise_scope_label(&never_sampled, false),
+        None
+    );
+    presentation.caller_metadata =
+        crate::caller_metadata::runtime::MetadataFrame::for_test(&[(id, never_sampled)]);
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        !out
+            .lines()
+            .any(|line| line.starts_with("caller ") && line.contains(" pid ")),
+        "never-sampled row prints no scope line: {out}"
+    );
+    assert!(
+        out.lines()
+            .any(|line| line == "caller context: 1 unknown (-v for details)"),
+        "never-sampled historical counts unknown: {out}"
+    );
+}

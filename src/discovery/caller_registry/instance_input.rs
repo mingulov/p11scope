@@ -2766,17 +2766,7 @@ impl CallerRegistry {
         // this same population), so record its ENTRY-to-application
         // delay here. One branch when the diagnostic is off.
         if let Some(hist) = self.settlement_latency.as_mut() {
-            let now = super::now_ns();
-            hist.record(input.facts.ts_ns, now);
-            // TEMP F9 DIAGNOSTIC (revert before merge): slow settle pairs.
-            if now.saturating_sub(input.facts.ts_ns) > 1_000_000_000
-                && std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|v| v == "1")
-            {
-                eprintln!(
-                    "joint-timing: slow_settle entry_ns={} applied_ns={}",
-                    input.facts.ts_ns, now
-                );
-            }
+            hist.record(input.facts.ts_ns, super::now_ns());
         }
         let state = &self.instance_state.semantics[&id];
         let historical = if self.instance_state.negative_exhausted {

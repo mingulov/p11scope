@@ -2115,6 +2115,32 @@ impl LiveJointMachine {
         self.service_with_io_and_acquisition(lane, coordinator, io, mode, budget, None)
     }
 
+    // TEMP F9 DIAGNOSTIC (revert before freeze): phase names for timers.
+    fn diag_phase_name(phase: &Phase) -> &'static str {
+        match phase {
+            Phase::Idle => "Idle",
+            Phase::Collecting(_) => "Collecting",
+            Phase::Binding(_) => "Binding",
+            Phase::AwaitH0(_) => "AwaitH0",
+            Phase::PendingQ { .. } => "PendingQ",
+            Phase::Preparing(_) => "Preparing",
+            Phase::PreparationAttempted(_) => "PreparationAttempted",
+            Phase::FinishStopReady(_) => "FinishStopReady",
+            Phase::FinishStopReport { .. } => "FinishStopReport",
+            Phase::PreparingAdmissions(_) => "PreparingAdmissions",
+            Phase::BindingKeys { .. } => "BindingKeys",
+            Phase::Ingesting(_) => "Ingesting",
+            Phase::StagingNegative(_) => "StagingNegative",
+            Phase::Claiming { .. } => "Claiming",
+            Phase::InstallingClosure { .. } => "InstallingClosure",
+            Phase::Births { .. } => "Births",
+            Phase::Staging { .. } => "Staging",
+            Phase::Auditing { .. } => "Auditing",
+            Phase::Negative { .. } => "Negative",
+            Phase::Audited { .. } => "Audited",
+        }
+    }
+
     pub(crate) fn service_with_io_and_acquisition<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -2155,6 +2181,9 @@ impl LiveJointMachine {
         }
         while budget.available() {
             let phase = self.phase.take().expect("one original machine phase");
+            // TEMP F9 DIAGNOSTIC (revert before freeze): advance wall ms.
+            let adv_start = std::time::Instant::now();
+            let adv_name = Self::diag_phase_name(&phase);
             let (phase, result) = self.advance(
                 phase,
                 lane,
@@ -2164,6 +2193,18 @@ impl LiveJointMachine {
                 None,
                 reborrow_acquisition(&mut acquisition),
             );
+            {
+                use std::sync::atomic::{AtomicU64, Ordering};
+                static AN: AtomicU64 = AtomicU64::new(0);
+                let an = AN.fetch_add(1, Ordering::Relaxed);
+                if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && an % 200 == 0 {
+                    eprintln!(
+                        "adv-tick an={an} phase={adv_name} ms={} t_mono={}",
+                        adv_start.elapsed().as_millis(),
+                        crate::attach::monotonic_ns().unwrap_or(0),
+                    );
+                }
+            }
             self.phase = Some(phase);
             match result {
                 Ok(Step::Continue) => {}
@@ -2175,29 +2216,10 @@ impl LiveJointMachine {
                         let yn = YN.fetch_add(1, Ordering::Relaxed);
                         if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && yn % 50 == 0
                         {
-                            let name = match self.phase.as_ref() {
-                                None => "NoPhase",
-                                Some(Phase::Idle) => "Idle",
-                                Some(Phase::Collecting(_)) => "Collecting",
-                                Some(Phase::Binding(_)) => "Binding",
-                                Some(Phase::AwaitH0(_)) => "AwaitH0",
-                                Some(Phase::PendingQ { .. }) => "PendingQ",
-                                Some(Phase::Preparing(_)) => "Preparing",
-                                Some(Phase::PreparationAttempted(_)) => "PreparationAttempted",
-                                Some(Phase::FinishStopReady(_)) => "FinishStopReady",
-                                Some(Phase::FinishStopReport { .. }) => "FinishStopReport",
-                                Some(Phase::PreparingAdmissions(_)) => "PreparingAdmissions",
-                                Some(Phase::BindingKeys { .. }) => "BindingKeys",
-                                Some(Phase::Ingesting(_)) => "Ingesting",
-                                Some(Phase::StagingNegative(_)) => "StagingNegative",
-                                Some(Phase::Claiming { .. }) => "Claiming",
-                                Some(Phase::InstallingClosure { .. }) => "InstallingClosure",
-                                Some(Phase::Births { .. }) => "Births",
-                                Some(Phase::Staging { .. }) => "Staging",
-                                Some(Phase::Auditing { .. }) => "Auditing",
-                                Some(Phase::Negative { .. }) => "Negative",
-                                Some(Phase::Audited { .. }) => "Audited",
-                            };
+                            let name = self
+                                .phase
+                                .as_ref()
+                                .map_or("NoPhase", Self::diag_phase_name);
                             eprintln!(
                                 "yield-tick yn={yn} phase={name} t_mono={}",
                                 crate::attach::monotonic_ns().unwrap_or(0),

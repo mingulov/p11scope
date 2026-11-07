@@ -66,14 +66,18 @@ pub(crate) const RECONCILE_EVICTION_COOLDOWN_SWEEPS: u64 = 2;
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 
-/// Bounded newcomer share of one admission tick's window: at most this many
-/// of the tick's admitted batch are first-seen-this-pass newcomers; the
-/// rest of the batch serves backlog in its existing order, so in window
-/// selection a steady newcomer stream delays the backlog but never starves
-/// it. Half the tick batch: the window keeps at least half the batch for
-/// a non-empty backlog. Selection is not attempts: the tick quantum or view
-/// capacity can still defer the admitted tail (backlog first) before any
-/// scan; see `admit_inventory_new_views`.
+/// Bounded newcomer share of one admission tick's window (free view slots
+/// only; scarce ticks keep the pending-first order verbatim): newcomers —
+/// candidates absent from the previous tick's enumeration, see
+/// `note_enumeration` — take up to this many of the tick's admitted batch,
+/// and the rest of the batch serves backlog in backlog-cursor order. Either
+/// class fills batch slots the other cannot use, so a steady newcomer
+/// stream delays the backlog but never starves it: the admitted window
+/// interleaves both classes (leading with backlog when the previous tick
+/// owed it one), so the tick quantum defers both proportionally instead of
+/// striking the backlog tail first. Half the tick batch, so a non-empty
+/// backlog keeps at least half the batch in selection and at least one
+/// attempt per tick under sustained flood.
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEWCOMER_ADMISSIONS_PER_TICK: usize = MAX_NEW_VIEWS_PER_TICK / 2;
 
@@ -108,12 +112,15 @@ enum InventoryScanClass {
 }
 
 /// The H1 fairness-accounting cursors a pressure service pass must leave
-/// untouched: pass counts, rotation cursors, the scan-class alternation and
-/// the tick deadline. Restored verbatim after each selected transaction, so
-/// pressure service never consumes an ordinary tick's polling round,
-/// reconcile turn or alternation share. Cooling entries are real admission
-/// facts, not accounting, and are never restored.
-#[derive(Debug, Clone, Copy)]
+/// untouched: pass counts, rotation cursors (including the backlog-only
+/// cursor and the backlog-owed flag with its per-tick attempt ledger), the
+/// previous-tick enumeration for newcomer classification, the scan-class
+/// alternation and the tick deadline. Restored verbatim after each selected
+/// transaction, so pressure service never consumes an ordinary tick's
+/// polling round, reconcile turn, alternation share or newcomer/backlog
+/// standing. Cooling entries are real admission facts, not accounting, and
+/// are never restored.
+#[derive(Debug, Clone)]
 pub(crate) struct FairnessCheckpoint {
     over_cap_passes: u64,
     cursor: Option<u32>,
@@ -125,6 +132,12 @@ pub(crate) struct FairnessCheckpoint {
     tick_deadline_ns: Option<u64>,
     under_cap_ticks: u64,
     poll_cursor: Option<u32>,
+    backlog_cursor: Option<u32>,
+    backlog_owed: bool,
+    tick_backlog_waited: bool,
+    tick_attempted_any: bool,
+    tick_attempted_backlog: bool,
+    prev_enumerated: BTreeSet<u32>,
 }
 
 /// The per-capture discovery schedule. Reconciliation, polling and new-view
@@ -160,6 +173,27 @@ pub(crate) struct DiscoveryScheduler {
     /// by `begin_deep_scan_tick`. `None` outside a tick means unbounded —
     /// direct scan calls (and unit tests driving them) are not ticks.
     tick_deadline_ns: Option<u64>,
+    /// Backlog-only rotation cursor: advanced solely by backlog attempts, so
+    /// a newcomer flood cannot drag backlog rotation toward recent deferrals.
+    /// Scarce ticks (pending-first, no classification) leave it untouched.
+    backlog_cursor: Option<u32>,
+    /// Whether the next free-slots window leads with backlog: set when a
+    /// tick attempted work but no backlog while backlog waited, cleared when
+    /// a backlog attempt runs or no backlog waits. Covers one attempt per
+    /// tick, where interleaving alone cannot alternate the lead.
+    backlog_owed: bool,
+    /// Per-tick attempt ledger behind `backlog_owed`: whether this tick's
+    /// window saw backlog, attempted anything, and attempted backlog. Reset
+    /// by each window call after settling the previous tick's debt; scarce
+    /// ticks never touch it.
+    tick_backlog_waited: bool,
+    tick_attempted_any: bool,
+    tick_attempted_backlog: bool,
+    /// The previous tick's live enumeration for newcomer classification: a
+    /// candidate absent here was first observed this tick. Replaced every
+    /// tick, so it holds at most the live enumerated pids (the same bound
+    /// argument as `cooling`). Timing arrival marks stay timing-only.
+    prev_enumerated: BTreeSet<u32>,
 }
 
 impl DiscoveryScheduler {
@@ -182,6 +216,12 @@ impl DiscoveryScheduler {
             tick_deadline_ns: None,
             under_cap_ticks: 0,
             poll_cursor: None,
+            backlog_cursor: None,
+            backlog_owed: false,
+            tick_backlog_waited: false,
+            tick_attempted_any: false,
+            tick_attempted_backlog: false,
+            prev_enumerated: BTreeSet::new(),
         }
     }
 
@@ -294,50 +334,64 @@ impl DiscoveryScheduler {
         ordered
     }
 
-    /// One admission tick's window with newcomers first: `newcomers` (the
-    /// subset of `pids` first seen this pass) ahead of backlog, up to
-    /// `newcomer_share` of the `max_new_views` batch; the rest of the batch
-    /// serves backlog in its existing order. Within each class the order is
-    /// `pending`-first when `scarce` (Lane-A P2a) and rotation otherwise, so
-    /// with no backlog the window is exactly today's order. Either class
-    /// fills batch slots the other cannot use, so the window stays full.
-    /// The no-starvation bound governs this window selection, not the
-    /// attempts below: quantum or capacity pressure defers the admitted
-    /// tail (backlog first) before any scan. Returns `(admitted, deferred)`
-    /// in admission order. Every input list must be sorted ascending;
-    /// `newcomers` must be a subset of `pids`; `pending` entries outside
-    /// `pids` are ignored.
+    /// Backlog order under its own cursor: the same rotation as
+    /// `new_view_order`, but parked by backlog attempts only, so newcomer
+    /// attempts never drag it toward recent deferrals. Free-slots windows
+    /// use this for the backlog class; scarce ticks never classify.
+    /// `pids` must be sorted ascending.
+    pub(crate) fn backlog_order(&self, pids: &[u32]) -> Vec<u32> {
+        Self::rotated_after(pids, self.backlog_cursor)
+    }
+
+    /// One admission tick's window with newcomers first (free view slots
+    /// only; scarce ticks keep `new_view_order_pending_first` verbatim and
+    /// never call this): `newcomers` (the subset of `pids` absent from the
+    /// previous enumeration) take up to `newcomer_share` of the
+    /// `max_new_views` batch, and the rest of the batch serves backlog in
+    /// backlog-cursor order. Either class fills batch slots the other
+    /// cannot use, so the window stays full and a missing class leaves
+    /// today's single-class order untouched. The admitted window
+    /// interleaves both classes — leading with backlog when the previous
+    /// tick owed it one — so the tick quantum defers both proportionally
+    /// and the backlog keeps progressing under a steady flood. Settles the
+    /// previous tick's backlog debt first (a backlog attempt clears it; an
+    /// attempt round with backlog waiting but none attempted raises it;
+    /// a tick that attempted nothing leaves it), then opens this tick's
+    /// attempt ledger. Returns `(admitted, deferred)` in admission order.
+    /// Every input list must be sorted ascending; `newcomers` must be a
+    /// subset of `pids`.
     pub(crate) fn new_view_window_newcomers_first(
-        &self,
+        &mut self,
         pids: &[u32],
         newcomers: &BTreeSet<u32>,
-        pending: &BTreeSet<u32>,
-        scarce: bool,
         max_new_views: usize,
         newcomer_share: usize,
     ) -> (Vec<u32>, Vec<u32>) {
+        // Settle the previous tick's debt before opening this tick's ledger.
+        // A backlog attempt paid it; a round that attempted work but no
+        // backlog while backlog waited owes the next lead to backlog; no
+        // backlog waiting clears it; a round that attempted nothing (an
+        // expired quantum before the first scan) leaves it for the retry.
+        if self.tick_attempted_backlog {
+            self.backlog_owed = false;
+        } else if self.tick_backlog_waited && self.tick_attempted_any {
+            self.backlog_owed = true;
+        } else if !self.tick_backlog_waited {
+            self.backlog_owed = false;
+        }
+        self.tick_attempted_any = false;
+        self.tick_attempted_backlog = false;
         let (fresh, backlog): (Vec<u32>, Vec<u32>) = pids
             .iter()
             .copied()
             .partition(|pid| newcomers.contains(pid));
-        // Lane-A P2a inside each class while slots are scarce, so a tick
-        // with no backlog keeps exactly today's pending-first order and
-        // only the fresh/backlog boundary reorders.
-        let fresh_order = if scarce {
-            self.new_view_order_pending_first(&fresh, pending)
-        } else {
-            self.new_view_order(&fresh)
-        };
-        let backlog_order = if scarce {
-            self.new_view_order_pending_first(&backlog, pending)
-        } else {
-            self.new_view_order(&backlog)
-        };
-        // Newcomers take at most their share, plus any batch slots the
+        let fresh_order = self.new_view_order(&fresh);
+        let backlog_order = self.backlog_order(&backlog);
+        self.tick_backlog_waited = !backlog_order.is_empty();
+        // Newcomers take up to their share, plus any batch slots the
         // backlog cannot fill; the backlog fills the rest. Callers keep
         // the share below the batch, so a non-empty backlog keeps at
-        // least the difference in the selected window every tick. Either
-        // class empty leaves today's single-class window untouched.
+        // least the difference in the selected window every tick.
         let newcomer_share = newcomer_share.min(max_new_views);
         let fresh_take = fresh_order
             .len()
@@ -345,20 +399,116 @@ impl DiscoveryScheduler {
         let backlog_take = backlog_order
             .len()
             .min(max_new_views.saturating_sub(fresh_take));
-        let mut admitted = Vec::with_capacity(fresh_take + backlog_take);
-        admitted.extend_from_slice(&fresh_order[..fresh_take]);
-        admitted.extend_from_slice(&backlog_order[..backlog_take]);
+        let (fresh_take, backlog_take) =
+            (&fresh_order[..fresh_take], &backlog_order[..backlog_take]);
+        let mut admitted = Vec::with_capacity(fresh_take.len() + backlog_take.len());
+        if fresh_take.is_empty() || backlog_take.is_empty() {
+            // A missing class keeps today's single-class order verbatim.
+            admitted.extend_from_slice(fresh_take);
+            admitted.extend_from_slice(backlog_take);
+        } else if self.backlog_owed {
+            // Alternate backlog-first: the owed tick repays the debt even
+            // at one attempt per tick.
+            let mut fresh = fresh_take.iter().copied();
+            let mut backlog = backlog_take.iter().copied();
+            loop {
+                match (backlog.next(), fresh.next()) {
+                    (Some(pid), Some(next)) => {
+                        admitted.push(pid);
+                        admitted.push(next);
+                    }
+                    (Some(pid), None) => {
+                        admitted.push(pid);
+                        admitted.extend(backlog);
+                        break;
+                    }
+                    (None, Some(next)) => {
+                        admitted.push(next);
+                        admitted.extend(fresh);
+                        break;
+                    }
+                    (None, None) => break,
+                }
+            }
+        } else {
+            // Alternate newcomer-first: a lone newcomer still jumps the
+            // queue, while the backlog shares every truncated attempt round.
+            let mut fresh = fresh_take.iter().copied();
+            let mut backlog = backlog_take.iter().copied();
+            loop {
+                match (fresh.next(), backlog.next()) {
+                    (Some(pid), Some(next)) => {
+                        admitted.push(pid);
+                        admitted.push(next);
+                    }
+                    (Some(pid), None) => {
+                        admitted.push(pid);
+                        admitted.extend(fresh);
+                        break;
+                    }
+                    (None, Some(next)) => {
+                        admitted.push(next);
+                        admitted.extend(backlog);
+                        break;
+                    }
+                    (None, None) => break,
+                }
+            }
+        }
         let mut deferred =
             Vec::with_capacity(fresh_order.len() + backlog_order.len() - admitted.len());
-        deferred.extend_from_slice(&fresh_order[fresh_take..]);
-        deferred.extend_from_slice(&backlog_order[backlog_take..]);
+        deferred.extend_from_slice(&fresh_order[fresh_take.len()..]);
+        deferred.extend_from_slice(&backlog_order[backlog_take.len()..]);
         (admitted, deferred)
+    }
+
+    /// Records the current tick's live enumeration for next tick's newcomer
+    /// classification. Replaces (never grows): the next tick's newcomers are
+    /// its candidates absent here. The engine calls this every tick, even
+    /// empty ones; pressure service passes restore it via the checkpoint.
+    pub(crate) fn note_enumeration(&mut self, enumerated: &BTreeSet<u32>) {
+        self.prev_enumerated.clone_from(enumerated);
+    }
+
+    /// The subset of `new_pids` absent from the previous tick's enumeration:
+    /// the truly first-observed candidates. Long runners deferred by an
+    /// over-cap pass were enumerated before, so they read as backlog even
+    /// though no arrival mark was ever set for them.
+    pub(crate) fn newcomers_in(&self, new_pids: &[u32]) -> BTreeSet<u32> {
+        new_pids
+            .iter()
+            .copied()
+            .filter(|pid| !self.prev_enumerated.contains(pid))
+            .collect()
     }
 
     /// Called only after the tick's time and capacity checks permit an attempt.
     /// Work deferred before an attempt keeps its place for the next tick.
+    /// Scarce ticks (pending-first, no classification) record every attempt
+    /// here; free-slots ticks record newcomers via `note_newcomer_attempt`
+    /// and backlog via `note_backlog_attempt` so the owed ledger can tell
+    /// them apart. All three advance the scan-class alternation alike.
     pub(crate) fn note_new_view_attempt(&mut self, pid: u32) {
         self.new_view_cursor = Some(pid);
+        self.note_scan_attempt(InventoryScanClass::Newcomer);
+    }
+
+    /// A free-slots newcomer attempt: parks the newcomer cursor and records
+    /// the attempt in the owed ledger. Backlog attempts use
+    /// `note_backlog_attempt`, which additionally parks the backlog cursor.
+    pub(crate) fn note_newcomer_attempt(&mut self, pid: u32) {
+        self.new_view_cursor = Some(pid);
+        self.tick_attempted_any = true;
+        self.note_scan_attempt(InventoryScanClass::Newcomer);
+    }
+
+    /// A free-slots backlog attempt: parks the backlog cursor (the newcomer
+    /// cursor stays, so the two rotations never drag each other) and records
+    /// the attempt in the owed ledger, repaying any debt.
+    pub(crate) fn note_backlog_attempt(&mut self, pid: u32) {
+        self.backlog_cursor = Some(pid);
+        self.tick_attempted_any = true;
+        self.tick_attempted_backlog = true;
         self.note_scan_attempt(InventoryScanClass::Newcomer);
     }
 
@@ -481,6 +631,12 @@ impl DiscoveryScheduler {
             tick_deadline_ns: self.tick_deadline_ns,
             under_cap_ticks: self.under_cap_ticks,
             poll_cursor: self.poll_cursor,
+            backlog_cursor: self.backlog_cursor,
+            backlog_owed: self.backlog_owed,
+            tick_backlog_waited: self.tick_backlog_waited,
+            tick_attempted_any: self.tick_attempted_any,
+            tick_attempted_backlog: self.tick_attempted_backlog,
+            prev_enumerated: self.prev_enumerated.clone(),
         }
     }
 
@@ -498,6 +654,12 @@ impl DiscoveryScheduler {
         self.tick_deadline_ns = checkpoint.tick_deadline_ns;
         self.under_cap_ticks = checkpoint.under_cap_ticks;
         self.poll_cursor = checkpoint.poll_cursor;
+        self.backlog_cursor = checkpoint.backlog_cursor;
+        self.backlog_owed = checkpoint.backlog_owed;
+        self.tick_backlog_waited = checkpoint.tick_backlog_waited;
+        self.tick_attempted_any = checkpoint.tick_attempted_any;
+        self.tick_attempted_backlog = checkpoint.tick_attempted_backlog;
+        self.prev_enumerated = checkpoint.prev_enumerated;
     }
 
     pub(crate) fn quantum_ns(&self) -> u64 {
@@ -562,6 +724,11 @@ impl DiscoveryScheduler {
             .filter(|(_, evicted_at)| sweeps.saturating_sub(**evicted_at) < cooldown)
             .map(|(pid, _)| *pid)
             .collect()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn backlog_owed_for_test(&self) -> bool {
+        self.backlog_owed
     }
 
     /// The ordinary fairness-rotation window: the lowest `slots` pids
@@ -688,8 +855,10 @@ mod tests {
 
     /// A mapping first seen this pass admits ahead of backlog: with 2,000
     /// backlog processes and one newcomer, one admission tick puts the
-    /// newcomer in the first batch while the backlog keeps its existing
-    /// order — rotation order with free slots, pending-first when scarce.
+    /// newcomer first while the backlog keeps backlog-cursor order behind
+    /// it. Scarce ticks never classify: they keep the pending-first order
+    /// verbatim (see `pending_requests_sort_before_rotation_candidates` and
+    /// the engine's waiter-settle test).
     #[test]
     fn newcomer_mapping_admitted_before_backlog() {
         let batch = MAX_NEW_VIEWS_PER_TICK;
@@ -700,21 +869,15 @@ mod tests {
         pids.push(newcomer);
         let newcomers: BTreeSet<u32> = BTreeSet::from([newcomer]);
 
-        let scheduler = DiscoveryScheduler::new();
-        let (admitted, deferred) = scheduler.new_view_window_newcomers_first(
-            &pids,
-            &newcomers,
-            &BTreeSet::new(),
-            false,
-            batch,
-            share,
-        );
+        let mut scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
         assert_eq!(admitted.len(), batch);
         assert_eq!(
             admitted[0], newcomer,
             "the newcomer joins the first admitted batch"
         );
-        let baseline = scheduler.new_view_order(&backlog);
+        let baseline = scheduler.backlog_order(&backlog);
         assert_eq!(
             &admitted[1..],
             &baseline[..batch - 1],
@@ -725,40 +888,26 @@ mod tests {
             baseline[batch - 1..],
             "deferred backlog keeps rotation order"
         );
-
-        // Scarce slots: the newcomer still leads, and the backlog behind it
-        // keeps the Lane-A P2a pending-first order verbatim.
-        let pending: BTreeSet<u32> = [500, 1500].into_iter().collect();
-        let (admitted, deferred) = scheduler
-            .new_view_window_newcomers_first(&pids, &newcomers, &pending, true, batch, share);
-        assert_eq!(admitted[0], newcomer);
-        let window: Vec<u32> = admitted.into_iter().chain(deferred).collect();
-        let rest: Vec<u32> = window.into_iter().filter(|pid| *pid != newcomer).collect();
-        assert_eq!(
-            rest,
-            scheduler.new_view_order_pending_first(&backlog, &pending),
-            "scarce backlog order is otherwise unchanged"
-        );
     }
 
-    /// With no backlog, a scarce tick keeps exactly today's Lane-A P2a
-    /// order: pending fresh pids first, then the rest by rotation. Only
-    /// the fresh/backlog boundary reorders.
+    /// With no backlog, a free tick keeps exactly today's rotation order:
+    /// the window is the plain newcomer order, admitted plus deferred.
+    /// Scarce ticks keep the pending-first order instead and never classify.
     #[test]
-    fn scarce_tick_without_backlog_keeps_pending_first_order() {
+    fn free_tick_without_backlog_keeps_rotation_order() {
         let batch = MAX_NEW_VIEWS_PER_TICK;
         let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
         let pids: Vec<u32> = (1..=100).collect();
         let newcomers: BTreeSet<u32> = pids.iter().copied().collect();
-        let pending: BTreeSet<u32> = [7, 42, 99].into_iter().collect();
-        let scheduler = DiscoveryScheduler::new();
-        let (admitted, deferred) = scheduler
-            .new_view_window_newcomers_first(&pids, &newcomers, &pending, true, batch, share);
-        assert_eq!(admitted[0], 7, "pending fresh pids stay first");
+        let mut scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
+        assert_eq!(admitted.len(), batch);
+        assert_eq!(admitted[0], 1, "rotation still leads with the lowest pid");
         let window: Vec<u32> = admitted.into_iter().chain(deferred).collect();
         assert_eq!(
             window,
-            scheduler.new_view_order_pending_first(&pids, &pending),
+            scheduler.new_view_order(&pids),
             "no backlog means exactly today's order"
         );
     }
@@ -795,20 +944,18 @@ mod tests {
             } else {
                 BTreeSet::new()
             };
-            let (admitted, _) = scheduler.new_view_window_newcomers_first(
-                &pids,
-                &newcomers,
-                &BTreeSet::new(),
-                false,
-                batch,
-                share,
-            );
+            let (admitted, _) =
+                scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
             assert!(
                 !admitted.is_empty(),
                 "tick {tick}: a non-empty queue admits nothing"
             );
             for pid in &admitted {
-                scheduler.note_new_view_attempt(*pid);
+                if newcomers.contains(pid) {
+                    scheduler.note_newcomer_attempt(*pid);
+                } else {
+                    scheduler.note_backlog_attempt(*pid);
+                }
                 remaining.remove(pid);
             }
             if remaining.iter().all(|pid| *pid > 1_000_000) {
@@ -836,14 +983,8 @@ mod tests {
         }
         let pids: Vec<u32> = remaining.iter().copied().collect();
         let newcomers: BTreeSet<u32> = (1_000_000..1_000_100).collect();
-        let (admitted, _) = scheduler.new_view_window_newcomers_first(
-            &pids,
-            &newcomers,
-            &BTreeSet::new(),
-            false,
-            batch,
-            share,
-        );
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
         let fresh_admitted = admitted
             .iter()
             .filter(|pid| newcomers.contains(pid))
@@ -853,7 +994,11 @@ mod tests {
             "the first tick splits the batch: {admitted:?}"
         );
         for pid in &admitted {
-            scheduler.note_new_view_attempt(*pid);
+            if newcomers.contains(pid) {
+                scheduler.note_newcomer_attempt(*pid);
+            } else {
+                scheduler.note_backlog_attempt(*pid);
+            }
             remaining.remove(pid);
         }
         // The flood continues; deferred newcomers rejoin as marked backlog.
@@ -872,16 +1017,14 @@ mod tests {
                 arrival += 1;
             }
             let pids: Vec<u32> = remaining.iter().copied().collect();
-            let (admitted, _) = scheduler.new_view_window_newcomers_first(
-                &pids,
-                &fresh_set,
-                &BTreeSet::new(),
-                false,
-                batch,
-                share,
-            );
+            let (admitted, _) =
+                scheduler.new_view_window_newcomers_first(&pids, &fresh_set, batch, share);
             for pid in &admitted {
-                scheduler.note_new_view_attempt(*pid);
+                if fresh_set.contains(pid) {
+                    scheduler.note_newcomer_attempt(*pid);
+                } else {
+                    scheduler.note_backlog_attempt(*pid);
+                }
                 remaining.remove(pid);
             }
         }
@@ -903,6 +1046,8 @@ mod tests {
         scheduler.note_retained_view_attempt(3);
         scheduler.advance_poll_cursor(11);
         scheduler.advance_cursor(13);
+        scheduler.note_backlog_attempt(5);
+        scheduler.note_enumeration(&BTreeSet::from([2, 4, 6]));
         for _ in 0..3 {
             scheduler.begin_under_cap_tick();
         }
@@ -911,6 +1056,8 @@ mod tests {
         let order_before = scheduler.new_view_order(&[5, 7, 9]);
         let retained_before = scheduler.retained_view_order(&[1, 3, 5]);
         let alternation_before = scheduler.newcomers_first(true, true);
+        let backlog_before = scheduler.backlog_order(&[1, 5, 9]);
+        let newcomers_before = scheduler.newcomers_in(&[2, 3, 4]);
         scheduler.begin_under_cap_tick();
         scheduler.begin_over_cap_pass();
         scheduler.begin_deep_scan_tick(Some(1_000));
@@ -918,14 +1065,19 @@ mod tests {
         scheduler.note_retained_view_attempt(5);
         scheduler.advance_poll_cursor(17);
         scheduler.advance_cursor(19);
+        scheduler.note_backlog_attempt(9);
+        scheduler.note_enumeration(&BTreeSet::from([8, 10]));
         scheduler.note_evicted(21);
         assert_ne!(scheduler.new_view_order(&[5, 7, 9]), order_before);
+        assert_ne!(scheduler.backlog_order(&[1, 5, 9]), backlog_before);
         scheduler.note_admitted(21);
         scheduler.note_evicted(23);
         scheduler.restore_fairness(checkpoint);
         assert_eq!(scheduler.new_view_order(&[5, 7, 9]), order_before);
         assert_eq!(scheduler.retained_view_order(&[1, 3, 5]), retained_before);
         assert_eq!(scheduler.newcomers_first(true, true), alternation_before);
+        assert_eq!(scheduler.backlog_order(&[1, 5, 9]), backlog_before);
+        assert_eq!(scheduler.newcomers_in(&[2, 3, 4]), newcomers_before);
         assert_eq!(scheduler.under_cap_ticks_for_test(), 3);
         assert_eq!(scheduler.over_cap_passes(), 1);
         assert_eq!(scheduler.cursor_for_test(), Some(13));
@@ -933,6 +1085,90 @@ mod tests {
         assert!(!scheduler.is_stale(21));
         assert!(scheduler.cooling_down(23));
         assert!(scheduler.is_stale(23));
+    }
+
+    /// The backlog-owed debt survives a pressure checkpoint: a tick that
+    /// attempted a newcomer but no backlog while backlog waited owes the
+    /// next lead to backlog, and a service pass in between must not consume
+    /// or clear that debt.
+    #[test]
+    fn fairness_checkpoint_restores_the_backlog_debt_ledger() {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        let mut scheduler = DiscoveryScheduler::new();
+        let pids = [1, 2, 1_000_000];
+        let newcomers = BTreeSet::from([1_000_000]);
+        // Tick 1 opens with backlog waiting; only the newcomer is attempted.
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
+        assert_eq!(admitted[0], 1_000_000, "the first tick leads newcomer");
+        scheduler.note_newcomer_attempt(1_000_000);
+        assert!(
+            !scheduler.backlog_owed_for_test(),
+            "the debt settles at the next window, not at the attempt"
+        );
+        // A pressure service pass runs its own window and attempts, then the
+        // checkpoint puts the ledger back: the debt is still pending.
+        let checkpoint = scheduler.fairness_checkpoint();
+        let (pressure_admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
+        assert_eq!(
+            pressure_admitted[0], 1,
+            "the pressure window itself leads backlog (debt honored inside)"
+        );
+        scheduler.note_backlog_attempt(1);
+        scheduler.note_enumeration(&BTreeSet::from([7, 8, 9]));
+        scheduler.restore_fairness(checkpoint);
+        assert!(
+            !scheduler.backlog_owed_for_test(),
+            "the restore returns the still-pending debt, not the serviced one"
+        );
+        // The next ordinary window honors the restored debt.
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
+        assert!(
+            scheduler.backlog_owed_for_test(),
+            "the restored ledger raises the debt at the next window"
+        );
+        assert_eq!(admitted[0], 1, "the owed tick leads backlog");
+        // Servicing the backlog repays it: the tick after leads newcomer.
+        scheduler.note_backlog_attempt(1);
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
+        assert!(
+            !scheduler.backlog_owed_for_test(),
+            "a backlog attempt repays the debt"
+        );
+        assert_eq!(admitted[0], 1_000_000, "the repaid tick leads newcomer");
+    }
+
+    /// Newcomer classification reads the previous enumeration, not arrival
+    /// marks: long runners deferred by an over-cap pass were enumerated
+    /// before, so they are backlog even with no mark ever set. Each tick
+    /// replaces the set, bounding it by the live scope.
+    #[test]
+    fn newcomers_are_candidates_absent_from_the_previous_enumeration() {
+        let mut scheduler = DiscoveryScheduler::new();
+        assert_eq!(
+            scheduler.newcomers_in(&[1, 2, 3]),
+            BTreeSet::from([1, 2, 3]),
+            "before the first enumeration everything is first-observed"
+        );
+        scheduler.note_enumeration(&BTreeSet::from([1, 2, 3]));
+        assert!(
+            scheduler.newcomers_in(&[1, 2, 3]).is_empty(),
+            "an unchanged enumeration has no newcomers"
+        );
+        assert_eq!(
+            scheduler.newcomers_in(&[2, 3, 4]),
+            BTreeSet::from([4]),
+            "only the truly absent pid is a newcomer"
+        );
+        scheduler.note_enumeration(&BTreeSet::from([2, 3, 4]));
+        assert!(
+            scheduler.newcomers_in(&[2, 3, 4]).is_empty(),
+            "replacement (not growth) bounds the set by the live scope"
+        );
     }
 
     /// The reconcile slice starts after the cursor and wraps past the end,
@@ -1161,15 +1397,9 @@ mod tests {
         assert_eq!(share, 32);
         let pids: Vec<u32> = (1..=40).collect();
         let newcomers: BTreeSet<u32> = pids.iter().copied().collect();
-        let scheduler = DiscoveryScheduler::new();
-        let (admitted, deferred) = scheduler.new_view_window_newcomers_first(
-            &pids,
-            &newcomers,
-            &BTreeSet::new(),
-            false,
-            batch,
-            share,
-        );
+        let mut scheduler = DiscoveryScheduler::new();
+        let (admitted, deferred) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
         assert_eq!(
             admitted.len(),
             40,
@@ -1194,15 +1424,9 @@ mod tests {
         pids.extend(fresh.iter().copied());
         pids.sort_unstable();
         let newcomers: BTreeSet<u32> = fresh.into_iter().collect();
-        let scheduler = DiscoveryScheduler::new();
-        let (admitted, _) = scheduler.new_view_window_newcomers_first(
-            &pids,
-            &newcomers,
-            &BTreeSet::new(),
-            false,
-            batch,
-            share,
-        );
+        let mut scheduler = DiscoveryScheduler::new();
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, batch, share);
         let fresh_admitted = admitted
             .iter()
             .filter(|pid| newcomers.contains(pid))

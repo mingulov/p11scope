@@ -13396,6 +13396,23 @@ impl Engine {
         }
     }
 
+    /// Newcomer bookkeeping for one complete scope walk that started at
+    /// `walk_start` and ended at `walk_end`, listing exactly `live`.
+    /// Newcomer arrival marks track the same live scope: a departed pid's
+    /// mark is arrival evidence for a generation that can never arrive.
+    /// Fail-closed first: an unadmitted departed birth gaps here, so a
+    /// short-lived descendant whose exit lands past the terminal drain
+    /// still gaps instead of vanishing silently.
+    fn note_scope_walk(
+        &mut self,
+        live: &BTreeSet<u32>,
+        _walk_start: Option<u64>,
+        _walk_end: Option<u64>,
+    ) {
+        self.close_pruned_newcomer_gaps(live);
+        self.newcomer_first_seen.retain(|pid, _| live.contains(pid));
+    }
+
     /// Fail-closed births: every diff-discovered newcomer mark for a pid
     /// no longer live that was never admitted and never matched to a
     /// drained exit counts one descendant gap. A short-lived descendant
@@ -24120,6 +24137,7 @@ impl Engine {
         }
         let enumerate_start = crate::attach::monotonic_ns();
         let (pids, mut skipped) = scope_pids(&self.scope);
+        let enumerate_end = crate::attach::monotonic_ns();
         let max_scan_pids = self.max_scan_pids;
         let membership_complete = skipped.is_empty() && pids.len() <= max_scan_pids;
         let enumerated = pids.len();
@@ -24129,13 +24147,7 @@ impl Engine {
         // new generation, correctly fresh).
         let live: BTreeSet<u32> = pids.iter().copied().collect();
         self.scheduler.prune_stale_to_enumerated(&live);
-        // Newcomer arrival marks track the same live scope: a departed pid's
-        // mark is arrival evidence for a generation that can never arrive.
-        // Fail-closed first: an unadmitted departed birth gaps here, so a
-        // short-lived descendant whose exit lands past the terminal drain
-        // still gaps instead of vanishing silently.
-        self.close_pruned_newcomer_gaps(&live);
-        self.newcomer_first_seen.retain(|pid, _| live.contains(pid));
+        self.note_scope_walk(&live, enumerate_start, enumerate_end);
         // Ordinary ticks never sweep maps: over the cap the scheduler serves
         // queued event-driven work plus a fairness-rotation window, and only
         // the slower reconciliation pass re-reads one bounded slice (Task

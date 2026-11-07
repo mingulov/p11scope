@@ -1035,7 +1035,14 @@ impl CleanupWorker {
     /// worker has no capabilities to shed, so a broken channel reads Ok.
     pub(crate) fn shed_to(&self, keep: u64) -> std::io::Result<()> {
         let (done_tx, done_rx) = mpsc::sync_channel(1);
-        if self.tx.send(Command::Shed { keep, done: done_tx }).is_err() {
+        if self
+            .tx
+            .send(Command::Shed {
+                keep,
+                done: done_tx,
+            })
+            .is_err()
+        {
             return Ok(());
         }
         done_rx.recv().unwrap_or(Ok(()))

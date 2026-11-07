@@ -218,10 +218,7 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// session whose dynamics stay on perf (an unproven pid filter on 6.6-6.9
 /// without the backport), keeps it for dynamic perf re-attach.
 pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) -> u64 {
-    if multi
-        && dynamic_multi
-        && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0
-    {
+    if multi && dynamic_multi && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0 {
         effective & !(1u64 << CAP_SYS_ADMIN_BIT)
     } else {
         effective
@@ -406,9 +403,8 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
 /// need map_files only; diff and version need none of the three.
 fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
-    let bpf = (1u64 << CAP_BPF_BIT)
-        | (1u64 << CAP_PERFMON_BIT)
-        | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
+    let bpf =
+        (1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
     let map_files = 1u64 << CAP_CHECKPOINT_RESTORE_BIT;
     match command {
         Command::Profile(_)
@@ -435,10 +431,7 @@ fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
 /// of the BPF/PERFMON/CHECKPOINT_RESTORE bits the command needs (the
 /// DaemonSet holds SYS_ADMIN, not the narrow caps, and the kernel
 /// accepts SYS_ADMIN for those checks).
-pub(crate) fn keep_mask_for_command_in(
-    effective: u64,
-    command: &crate::cli::Command,
-) -> u64 {
+pub(crate) fn keep_mask_for_command_in(effective: u64, command: &crate::cli::Command) -> u64 {
     let base = keep_mask_for_command(command);
     let needs = sys_admin_fallback_bits(command);
     if effective & needs != needs {
@@ -593,10 +586,7 @@ mod tests {
         let live = minimal_live_mask();
         assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
         assert_eq!(post_setup_keep(true, true, live), live);
-        assert_eq!(
-            post_setup_keep(true, true, u64::MAX),
-            u64::MAX & !sys_admin
-        );
+        assert_eq!(post_setup_keep(true, true, u64::MAX), u64::MAX & !sys_admin);
         assert_eq!(
             post_setup_keep(false, false, live | sys_admin),
             live | sys_admin
@@ -633,9 +623,8 @@ mod tests {
         // `-o` extras: CHOWN for the handover, DAC_OVERRIDE to write
         // where only privilege allows, FOWNER to chmod the handed-over
         // stream private.
-        let file_out = (1u64 << CAP_CHOWN_BIT)
-            | (1u64 << CAP_DAC_OVERRIDE_BIT)
-            | (1u64 << CAP_FOWNER_BIT);
+        let file_out =
+            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << CAP_FOWNER_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let set_ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT);
         let kill = 1u64 << CAP_KILL_BIT;
@@ -729,9 +718,8 @@ mod tests {
     fn scan_inventory_drops_load_and_sys_admin_it_never_uses() {
         let live = minimal_live_mask();
         let scan_keep = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
-        let file_out = (1u64 << CAP_CHOWN_BIT)
-            | (1u64 << CAP_DAC_OVERRIDE_BIT)
-            | (1u64 << CAP_FOWNER_BIT);
+        let file_out =
+            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << CAP_FOWNER_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         // Scan in every scope keeps only target-read/map-files.
         for argv in [

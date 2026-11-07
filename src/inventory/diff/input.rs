@@ -344,7 +344,7 @@ pub(crate) const DEFAULT_INPUT_DEPTH: usize = 64;
 pub(crate) const DEFAULT_INPUT_NODES: usize = 2_000_000;
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct InputLimits {
+pub(crate) struct InputLimits {
     pub bytes: usize,
     pub rows: usize,
     pub string_bytes: usize,
@@ -367,6 +367,21 @@ pub(super) fn read_snapshot(path: &Path) -> Result<LoadedSnapshot> {
     read_with_limits(path, InputLimits::default())
 }
 pub(super) fn read_with_limits(path: &Path, limits: InputLimits) -> Result<LoadedSnapshot> {
+    let (value, source) = read_bounded_value(path, limits)?;
+    let context = || {
+        format!(
+            "inventory input {}",
+            crate::render::escape_controls(&path.to_string_lossy())
+        )
+    };
+    let snapshot =
+        convert_snapshot(&value, limits).map_err(|e| anyhow::anyhow!("{}: {e:#}", context()))?;
+    Ok(LoadedSnapshot { snapshot, source })
+}
+/// Bounded read shared by the offline readers: a regular file only,
+/// opened nonblocking before a FIFO could hang, parsed under `limits`.
+/// The caller converts the returned temporary JSON tree and releases it.
+pub(crate) fn read_bounded_value(path: &Path, limits: InputLimits) -> Result<(Value, File)> {
     let context = || {
         format!(
             "inventory input {}",
@@ -390,9 +405,9 @@ pub(super) fn read_with_limits(path: &Path, limits: InputLimits) -> Result<Loade
     );
     let bytes = read_bounded(&mut source, limits.bytes)
         .map_err(|e| anyhow::anyhow!("{}: {e:#}", context()))?;
-    let snapshot =
-        parse_with_limits(&bytes, limits).map_err(|e| anyhow::anyhow!("{}: {e:#}", context()))?;
-    Ok(LoadedSnapshot { snapshot, source })
+    let value =
+        parse_bounded_value(&bytes, limits).map_err(|e| anyhow::anyhow!("{}: {e:#}", context()))?;
+    Ok((value, source))
 }
 pub(super) fn read_bounded(source: impl Read, limit: usize) -> Result<Vec<u8>> {
     let maximum = u64::try_from(limit)?
@@ -413,6 +428,13 @@ pub(super) fn parse_snapshot(bytes: &[u8]) -> Result<Snapshot> {
     parse_with_limits(bytes, InputLimits::default())
 }
 pub(super) fn parse_with_limits(bytes: &[u8], limits: InputLimits) -> Result<Snapshot> {
+    let value = parse_bounded_value(bytes, limits)?;
+    // The bounded temporary JSON tree is released once conversion returns.
+    convert_snapshot(&value, limits)
+}
+/// Bounded JSON parse shared by the offline readers: byte, depth,
+/// string and node limits apply together, with no trailing input.
+pub(crate) fn parse_bounded_value(bytes: &[u8], limits: InputLimits) -> Result<Value> {
     ensure!(
         bytes.len() <= limits.bytes,
         "inventory byte limit exceeded ({})",
@@ -429,8 +451,7 @@ pub(super) fn parse_with_limits(bytes: &[u8], limits: InputLimits) -> Result<Sna
     deserializer
         .end()
         .map_err(|e| anyhow::anyhow!("inventory JSON trailing input: {e}"))?;
-    // The bounded temporary JSON tree is released once conversion returns.
-    convert_snapshot(&value, limits)
+    Ok(value)
 }
 
 struct ParseBudget {

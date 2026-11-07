@@ -42,6 +42,7 @@ fn help_routes_and_channels() {
         "doctor",
         "inventory",
         "inventory diff",
+        "inventory cbom",
     ] {
         for flag in ["--help", "-h"] {
             let mut words: Vec<_> = topic.split_whitespace().collect();
@@ -130,6 +131,11 @@ fn usage_error_is_scoped() {
             ],
             "unknown inventory diff option",
             "inventory diff",
+        ),
+        (
+            vec!["inventory", "cbom", "input.json", "--pid", "1"],
+            "unknown inventory cbom option",
+            "inventory cbom",
         ),
         (vec!["run", "echo"], "run takes its command after", "run"),
         (vec!["run", "--"], "requires a command", "run"),

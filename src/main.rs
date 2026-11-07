@@ -11,7 +11,7 @@ use anyhow::{Context as _, Result};
 use p11scope::cli::{self, CliError, Command};
 use p11scope::{
     capture, capture_startup_signal_dispositions, doctor, failure_already_reported,
-    failure_exit_code, inspect, inventory, inventory_diff, pidns, run_owned,
+    failure_exit_code, inspect, inventory, inventory_cbom, inventory_diff, pidns, run_owned,
 };
 
 fn main() {
@@ -179,6 +179,10 @@ fn run() -> Result<i32> {
         Ok(Command::InventoryDiff(a)) => {
             let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
             inventory_diff::run(&a)
+        }
+        Ok(Command::InventoryCbom(a)) => {
+            let _verbosity = VerbosityGuard::arm(a.verbose, a.quiet);
+            inventory_cbom::run(&a)
         }
         // `inventory`'s hard failures — an unreadable target, an
         // unwritable `-o` — mean "nothing could be observed": one line

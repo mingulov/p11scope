@@ -50,6 +50,8 @@ pub mod inspect_system;
 pub mod inventory;
 #[path = "inventory/capture.rs"]
 pub(crate) mod inventory_capture;
+#[path = "inventory/cbom/mod.rs"]
+pub mod inventory_cbom;
 #[path = "inventory/dashboard.rs"]
 pub mod inventory_dashboard;
 #[path = "inventory/diagnostics.rs"]

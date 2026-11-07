@@ -429,6 +429,19 @@ pub struct InventoryDiffArgs {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InventoryCbomArgs {
+    pub input: PathBuf,
+    pub json: bool,
+    pub out: Option<PathBuf>,
+    /// `-v`/`--verbose`: full text detail. Default off; refused beside
+    /// `--quiet`.
+    pub verbose: bool,
+    /// `--quiet`: the concise summary without the detail hint. Default
+    /// off; refused beside `--verbose`.
+    pub quiet: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Command {
     Version,
     Profile(CaptureArgs),
@@ -438,6 +451,7 @@ pub enum Command {
     Doctor(DoctorArgs),
     Inventory(InventoryArgs),
     InventoryDiff(InventoryDiffArgs),
+    InventoryCbom(InventoryCbomArgs),
 }
 
 /// Which help text `--help` asked for: global usage or task-oriented scoped guidance.
@@ -451,6 +465,7 @@ pub enum HelpTopic {
     Doctor,
     Inventory,
     InventoryDiff,
+    InventoryCbom,
 }
 
 impl HelpTopic {
@@ -464,6 +479,7 @@ impl HelpTopic {
             Self::Doctor => "Try 'p11scope doctor --help'.",
             Self::Inventory => "Try 'p11scope inventory --help'.",
             Self::InventoryDiff => "Try 'p11scope inventory diff --help'.",
+            Self::InventoryCbom => "Try 'p11scope inventory cbom --help'.",
         }
     }
 
@@ -477,6 +493,7 @@ impl HelpTopic {
             HelpTopic::Doctor => DOCTOR_HELP.to_string(),
             HelpTopic::Inventory => inventory_help(),
             HelpTopic::InventoryDiff => inventory_diff_help(),
+            HelpTopic::InventoryCbom => inventory_cbom_help(),
         }
     }
 }
@@ -516,6 +533,7 @@ Choose a task:
   run: start and observe your own command after --.
   inventory: separate mapped modules from observed usage entries.
   inventory diff: compare two saved inventory files offline.
+  inventory cbom: export a saved file as CycloneDX CBOM offline.
 Use p11scope <command> --help for examples and mode-specific guidance.
 
 usage:
@@ -530,11 +548,12 @@ usage:
   p11scope inventory --cgroup <path> [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory --system [--capture auto|scan|native] [--manifest <m.json>]... [--duration <…>] [--json] [-v] [--quiet] [-o <out.json>]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
+  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
   p11scope doctor [--pid <n>] [--cgroup <path>] [--extra-strict] [-v] [--quiet]
   p11scope-discover --module <provider.so> [-o <manifest.json>]   (offline helper; executes provider code)
 
 discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file.
-Live capture needs root; inspect, inventory diff and inventory --capture scan do not.
+Live capture needs root; inspect, inventory diff, inventory cbom and inventory --capture scan do not.
 Default text output is concise: the main results, one coverage line, and a hint. -v, --verbose shows full detail; --quiet prints only the summary head. --json and -o are always complete.
 --help and --version also answer to -h and -V.
 Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
@@ -742,6 +761,7 @@ const INVENTORY_HELP_HEAD: &str = "usage:
                    [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
+  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
 
 example (4242 is an example PID, not a detected target):
   p11scope inventory --pid 4242 --capture scan --json -o inventory.json
@@ -787,7 +807,7 @@ Default text output is concise: the summary head plus the limits line. -v, --ver
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
 A missing observation or incomplete retained history does not establish zero activity.
-Compare saved files offline with inventory diff; see docs/usage.md.
+Compare saved files offline with inventory diff, and export one saved file as CycloneDX CBOM with inventory cbom; see docs/usage.md.
 --attach-backend auto (default) uses one multi-uprobe link per attach group where one links, else safe per-offset fallback; multi forces multi, singles forces per-offset.
 Live capture (auto/native) needs root and usable uprobe_multi host capability (normally Linux 6.6+); --capture scan does not.
 exit codes: 0 ok (partial results still exit 0); 1 nothing could be observed; 2 wrong arguments.
@@ -836,6 +856,42 @@ fn inventory_diff_limits_line() -> String {
 /// The assembled diff help: head plus the live bounds line.
 fn inventory_diff_help() -> String {
     format!("{INVENTORY_DIFF_HELP_HEAD}{}", inventory_diff_limits_line())
+}
+
+/// Offline CBOM help is separate from capture scope and privileges.
+const INVENTORY_CBOM_HELP_HEAD: &str = "usage:
+  p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
+
+Convert one saved p11scope/inventory/v1 or observed-profile file offline, without privileges, into a CycloneDX 1.6 cryptographic bill of materials.
+Default stdout is readable text; --json writes one CycloneDX JSON document.
+Default text output is concise: counts plus caveats. -v, --verbose shows full detail; --quiet omits the detail hint.
+-o saves the same JSON atomically before stdout. Use -- before a dash-prefixed input.
+Stdin (-) and -o - are unsupported; use --json for JSON on stdout.
+Only fields already present in the saved file are converted; nothing new is captured and unknowns stay explicit.
+exit codes: unknown evidence exits 0; input/output failures exit 1; usage exits 2.
+Counts describe one observation window; absence does not prove inactivity.
+";
+
+/// The CBOM reader shares the diff reader's per-input bounds, so this
+/// line carries the same live constants, never a hard-coded copy.
+fn inventory_cbom_limits_line() -> String {
+    use crate::inventory_diff::input::{
+        DEFAULT_INPUT_BYTES, DEFAULT_INPUT_DEPTH, DEFAULT_INPUT_NODES, DEFAULT_INPUT_ROWS,
+        DEFAULT_INPUT_STRING_BYTES,
+    };
+    format!(
+        "Input limits: {} read, {} rows, {} decoded bytes per string/key,\nnesting depth {}, and {} JSON values plus object keys.\n",
+        mib_or_bytes(DEFAULT_INPUT_BYTES as u64),
+        grouped_count(DEFAULT_INPUT_ROWS as u64),
+        grouped_count(DEFAULT_INPUT_STRING_BYTES as u64),
+        grouped_count(DEFAULT_INPUT_DEPTH as u64),
+        grouped_count(DEFAULT_INPUT_NODES as u64),
+    )
+}
+
+/// The assembled CBOM help: head plus the live bounds line.
+fn inventory_cbom_help() -> String {
+    format!("{INVENTORY_CBOM_HELP_HEAD}{}", inventory_cbom_limits_line())
 }
 
 /// The assembled trace help: head, the live cap line, and tail.
@@ -1432,6 +1488,11 @@ pub fn parse(argv: impl IntoIterator<Item = impl Into<OsString>>) -> Result<Comm
                 parse_inventory_diff(args)
                     .map(Command::InventoryDiff)
                     .map_err(|error| error.with_topic(HelpTopic::InventoryDiff))
+            } else if args.peek().is_some_and(|value| value == "cbom") {
+                args.next();
+                parse_inventory_cbom(args)
+                    .map(Command::InventoryCbom)
+                    .map_err(|error| error.with_topic(HelpTopic::InventoryCbom))
             } else {
                 parse_inventory(args)
                     .map(Command::Inventory)
@@ -1467,6 +1528,7 @@ fn parse_help_topic(argv: impl Iterator<Item = OsString>) -> CliError {
         ["doctor"] => HelpTopic::Doctor,
         ["inventory"] => HelpTopic::Inventory,
         ["inventory", "diff"] => HelpTopic::InventoryDiff,
+        ["inventory", "cbom"] => HelpTopic::InventoryCbom,
         [unknown] => {
             return usage_err(format!("unknown help topic: {unknown}"));
         }
@@ -1628,6 +1690,89 @@ fn parse_inventory_diff(
     Ok(InventoryDiffArgs {
         before,
         after,
+        json,
+        out,
+        verbose,
+        quiet,
+    })
+}
+
+/// `p11scope inventory cbom`: one saved file in, CycloneDX out.
+/// Mirrors the diff option shape; parsing here never changes the
+/// capture path below.
+fn parse_inventory_cbom(
+    mut args: impl Iterator<Item = OsString>,
+) -> Result<InventoryCbomArgs, CliError> {
+    let error = |message: &str| usage_err(message).with_topic(HelpTopic::InventoryCbom);
+    let mut input = None;
+    let mut json = false;
+    let mut out = None;
+    let mut verbose = false;
+    let mut quiet = false;
+    let mut positional = false;
+    while let Some(value) = args.next() {
+        if !positional {
+            match value.to_str() {
+                Some("--help" | "-h") => return Err(CliError::Help(HelpTopic::InventoryCbom)),
+                Some("--") => {
+                    positional = true;
+                    continue;
+                }
+                Some("--json") => {
+                    if json {
+                        return Err(error("--json given twice"));
+                    }
+                    json = true;
+                    continue;
+                }
+                Some("-v" | "--verbose") => {
+                    verbose = true;
+                    continue;
+                }
+                Some("--quiet") => {
+                    quiet = true;
+                    continue;
+                }
+                Some("-o") => {
+                    if out.is_some() {
+                        return Err(error("-o given twice"));
+                    }
+                    let path = args.next().ok_or_else(|| error("-o requires a path"))?;
+                    if path == "-" {
+                        return Err(error("-o - is unsupported; use --json for JSON on stdout"));
+                    }
+                    if path.is_empty() || path.as_bytes().starts_with(b"-") {
+                        return Err(error("-o requires a path (prefix a leading dash with ./)"));
+                    }
+                    out = Some(PathBuf::from(path));
+                    continue;
+                }
+                _ if value.as_bytes().starts_with(b"-") && value != "-" => {
+                    return Err(error(&format!("unknown inventory cbom option: {value:?}")));
+                }
+                _ => {}
+            }
+        }
+        if value == "-" {
+            return Err(error(
+                "stdin is unsupported; pass one regular inventory or profile file",
+            ));
+        }
+        if value.is_empty() {
+            return Err(error("inventory cbom requires a non-empty input path"));
+        }
+        if input.is_some() {
+            return Err(error("inventory cbom takes exactly one input file"));
+        }
+        input = Some(PathBuf::from(value));
+    }
+    let Some(input) = input else {
+        return Err(error("inventory cbom takes exactly one input file"));
+    };
+    TextVerbosity::resolve(verbose, quiet)
+        .map_err(|error| error.with_topic(HelpTopic::InventoryCbom))?;
+    Ok(InventoryCbomArgs {
+        input,
         json,
         out,
         verbose,
@@ -3072,6 +3217,68 @@ mod tests {
         ]))
         .unwrap() else {
             panic!("expected diff")
+        };
+        assert!(!quiet.verbose);
+        assert!(quiet.quiet, "--quiet selects quiet");
+    }
+
+    #[test]
+    fn inventory_cbom_parser_accepts_one_offline_file_and_scoped_options() {
+        for words in [
+            vec!["inventory", "cbom", "input.json"],
+            vec![
+                "inventory",
+                "cbom",
+                "--json",
+                "input.json",
+                "-o",
+                "out.cdx.json",
+            ],
+            vec!["inventory", "cbom", "--", "-input.json"],
+        ] {
+            let command = parse(args(&words)).unwrap();
+            assert!(format!("{command:?}").starts_with("InventoryCbom("));
+        }
+        for words in [
+            vec!["inventory", "cbom"],
+            vec!["inventory", "cbom", "a.json", "b.json"],
+            vec!["inventory", "cbom", "-"],
+            vec!["inventory", "cbom", "a.json", "-o", "-"],
+            vec!["inventory", "cbom", "a.json", "-v", "--quiet"],
+        ] {
+            assert!(parse(args(&words)).is_err(), "{words:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn inventory_cbom_help_has_its_own_offline_topic() {
+        let Err(CliError::Help(topic)) = parse(args(&["inventory", "cbom", "--help"])) else {
+            panic!("cbom help must select an offline help topic")
+        };
+        assert!(topic.text().contains("inventory cbom INPUT"));
+        assert!(!topic.text().contains("--pid"));
+    }
+
+    #[test]
+    fn inventory_cbom_parses_verbosity_and_defaults_it_off() {
+        let Command::InventoryCbom(plain) =
+            parse(args(&["inventory", "cbom", "input.json"])).unwrap()
+        else {
+            panic!("expected cbom")
+        };
+        assert!(!plain.verbose, "verbose defaults off");
+        assert!(!plain.quiet, "quiet defaults off");
+        let Command::InventoryCbom(verbose) =
+            parse(args(&["inventory", "cbom", "-v", "input.json"])).unwrap()
+        else {
+            panic!("expected cbom")
+        };
+        assert!(verbose.verbose, "-v selects verbose");
+        assert!(!verbose.quiet);
+        let Command::InventoryCbom(quiet) =
+            parse(args(&["inventory", "cbom", "input.json", "--quiet"])).unwrap()
+        else {
+            panic!("expected cbom")
         };
         assert!(!quiet.verbose);
         assert!(quiet.quiet, "--quiet selects quiet");
@@ -5136,6 +5343,10 @@ mod tests {
                 vec!["inventory", "diff", "--help"],
                 HelpTopic::InventoryDiff,
             ),
+            (
+                vec!["inventory", "cbom", "--help"],
+                HelpTopic::InventoryCbom,
+            ),
             (vec!["--help"], HelpTopic::Global),
             (vec!["-h"], HelpTopic::Global),
         ] {
@@ -5184,6 +5395,7 @@ mod tests {
             HelpTopic::Doctor,
             HelpTopic::Inventory,
             HelpTopic::InventoryDiff,
+            HelpTopic::InventoryCbom,
         ]
         .iter()
         .map(|topic| topic.text())
@@ -5260,8 +5472,12 @@ mod tests {
         // 2740 / 0xba5954dfb55f7904 (run `--user`): diff vs the
         // 2720/0x80058f0fef22a940 pin is exactly ` [--user <name|uid>]`
         // on the run synopsis line (+20); no other drift.
-        assert_eq!(USAGE.len(), 2740);
-        assert_eq!(hash, 0xba5954dfb55f7904);
+        // 2900 / 0x503e1b5b770a1434 (inventory cbom): diff vs the
+        // 2740/0xba5954dfb55f7904 pin is exactly the `inventory cbom`
+        // task line (+64), its usage line (+81) and `, inventory cbom`
+        // on the live-gate line (+15); no other drift.
+        assert_eq!(USAGE.len(), 2900);
+        assert_eq!(hash, 0x503e1b5b770a1434);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 
@@ -5272,6 +5488,7 @@ mod tests {
         let inventory = HelpTopic::Inventory.text();
         let trace = trace_help();
         let diff = inventory_diff_help();
+        let cbom = inventory_cbom_help();
         let helps = [
             ("USAGE", USAGE),
             ("PROFILE_HELP", PROFILE_HELP),
@@ -5281,6 +5498,7 @@ mod tests {
             ("DOCTOR_HELP", DOCTOR_HELP),
             ("INVENTORY_HELP", inventory.as_str()),
             ("INVENTORY_DIFF_HELP", diff.as_str()),
+            ("INVENTORY_CBOM_HELP", cbom.as_str()),
         ];
         for (name, help) in helps {
             for jargon in [
@@ -5882,6 +6100,7 @@ mod tests {
             (vec!["help", "doctor"], HelpTopic::Doctor),
             (vec!["help", "inventory"], HelpTopic::Inventory),
             (vec!["help", "inventory", "diff"], HelpTopic::InventoryDiff),
+            (vec!["help", "inventory", "cbom"], HelpTopic::InventoryCbom),
         ] {
             assert_eq!(parse(args(&words)), Err(CliError::Help(topic)), "{words:?}");
         }
@@ -6049,6 +6268,7 @@ mod tests {
             HelpTopic::Doctor,
             HelpTopic::Inventory,
             HelpTopic::InventoryDiff,
+            HelpTopic::InventoryCbom,
         ] {
             let help = topic.text();
             assert_eq!(

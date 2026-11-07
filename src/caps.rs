@@ -516,13 +516,14 @@ mod tests {
         for cap in &MINIMAL_LIVE {
             assert_ne!(live & (1u64 << cap.bit), 0, "{} is kept", cap.name);
         }
-        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT);
+        // `-o` extras: CHOWN for the handover, DAC_OVERRIDE to write
+        // where only privilege allows, FOWNER (`linux/capability.h` bit 3)
+        // to chmod the handed-over stream private. Spelled literally so
+        // this test pins the requirement before the constant lands.
+        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << 3);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let set_ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT);
-        // `CAP_KILL` bit 5 (`linux/capability.h`): signalling the re-owned
-        // run child across uids. Spelled literally here so this test pins
-        // the requirement before the constant lands.
-        let kill = 1u64 << 5;
+        let kill = 1u64 << CAP_KILL_BIT;
         let run_keep = live | sys_admin | set_ids | kill;
         // Live capture without `-o`: minimal set plus the singles fallback.
         for argv in [
@@ -608,7 +609,8 @@ mod tests {
     fn scan_inventory_drops_load_and_sys_admin_it_never_uses() {
         let live = minimal_live_mask();
         let scan_keep = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
-        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT);
+        let file_out =
+            (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << 3);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         // Scan in every scope keeps only target-read/map-files.
         for argv in [

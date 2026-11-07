@@ -763,6 +763,8 @@ it; the eBPF observer itself is new code.
 
 ## License
 
+Copyright (C) 2026 Denis Mingulov <denis@mingulov.com>. See [COPYRIGHT](COPYRIGHT).
+
 Public license: GPL-3.0-or-later — see [LICENSE](LICENSE).
 BPF sources: GPL-2.0-only — see
 [LICENSES/GPL-2.0-only.txt](LICENSES/GPL-2.0-only.txt).

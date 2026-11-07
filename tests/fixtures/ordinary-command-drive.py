@@ -31,10 +31,15 @@ require, run, success = shared.require, shared.run, shared.success
 
 # An unprivileged observer names each capability it lacks, once, where the
 # gated read fails (map_files proof, another task's memory under Yama): one
-# stderr line per note, ending in the setcap recipe for this observer.
+# stderr line per note, ending in the setcap recipe for this observer. The
+# recipe always names the full five-capability minimal set in canonical
+# order (`src/caps.rs` `setcap_spec`): a subset or reordered spec is a
+# product bug and must fail here, never pass silently.
 CAPABILITY_NOTE = re.compile(
     rb"p11scope: needs CAP_[A-Z_]+ \([^()]*\)(?:; needs CAP_[A-Z_]+ \([^()]*\))*\. "
-    rb"Grant the minimal set: sudo setcap '[a-z_,]+=ep' (?P<binary>\S+)")
+    rb"Grant the minimal set: sudo setcap "
+    rb"'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' "
+    rb"(?P<binary>\S+)")
 
 
 def success_noting_capabilities(result, binary):
@@ -167,12 +172,26 @@ def dashboards(binary, root):
 
 
 class Controls(unittest.TestCase):
+    # The product's real line for the target-read pair (`src/caps.rs`
+    # `lacking_line` over the two `needs` clauses plus the full recipe).
     NOTE = (b"p11scope: needs CAP_DAC_READ_SEARCH (open provider files and target paths "
             b"unreadable to the observer); needs CAP_SYS_PTRACE (read a target's memory). "
-            b"Grant the minimal set: sudo setcap 'cap_bpf,cap_sys_ptrace=ep' /o/p11scope\n")
+            b"Grant the minimal set: sudo setcap "
+            b"'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' "
+            b"/o/p11scope\n")
+    # A setcap subset the product never emits (its recipe always names the
+    # full five-capability minimal set): the filter must reject it, so a
+    # product bug printing a wrong subset fails loudly instead of passing.
+    SUBSET_NOTE = (b"p11scope: needs CAP_DAC_READ_SEARCH (open provider files and target paths "
+                   b"unreadable to the observer); needs CAP_SYS_PTRACE (read a target's memory). "
+                   b"Grant the minimal set: sudo setcap 'cap_bpf,cap_sys_ptrace=ep' /o/p11scope\n")
 
     def test_capability_notes_for_this_observer_are_allowed(self):
         self.assertEqual(success_noting_capabilities((0, b"out", self.NOTE * 2), "/o/p11scope"), b"out")
+
+    def test_subset_setcap_spec_is_rejected(self):
+        with self.assertRaisesRegex(AssertionError, "unexpected stderr"):
+            success_noting_capabilities((0, b"out", self.SUBSET_NOTE), "/o/p11scope")
 
     def test_other_stderr_or_another_observer_fails(self):
         for stderr in (self.NOTE + b"p11scope: warning: something else\n",

@@ -88,6 +88,7 @@ RUN = [
     ("test_cgroup_trace_oracle.py", []),
     ("test_container_cells.py", []),
     ("test_container_cells_oracle.py", []),
+    ("test_container_image_cell.py", []),
     ("test_dashboard_pty_cleanup.py", []),
     ("test_detailed_leader_held_entry.py", []),
     ("test_docker_runtime_workflow.py", []),

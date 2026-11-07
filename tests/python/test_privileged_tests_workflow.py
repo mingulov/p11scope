@@ -617,6 +617,30 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertNotIn("--allow-nonqualifying", job)
         self.assertIn("witness-cli-${{ matrix.kernel }}", job)
 
+    def test_container_image_cell_builds_and_judges(self):
+        job = job_body(self.yml, "container-image")
+        # A self-contained FULL musl build: the image holds this commit's
+        # static observer, and the build-time guards prove FULL defaults
+        # (no size overrides, default features).
+        self.assertIn("x86_64-unknown-linux-musl", job)
+        self.assertIn("--bin p11scope", job)
+        self.assertIn("musl-tools", job)
+        self.assertIn("P11SCOPE_SMALL_", job)
+        # The permanent cell runs the committed lane script against those
+        # musl bytes and judges every row with the shared checker: exact
+        # counts on the host and in the second container, then both
+        # refusals. No smoke, no expected failures.
+        self.assertIn("scripts/matrix/verify-container-image.sh", job)
+        self.assertIn("--observer-bin", job)
+        self.assertIn("scripts/ci/check-cell-results.py", job)
+        for cell in ("host-exact", "container-exact",
+                     "refusal-pidns", "refusal-cap"):
+            with self.subTest(cell=cell):
+                self.assertIn(f"--require {cell}", job)
+        self.assertNotIn("--expected-failure", job)
+        self.assertNotIn("--allow-nonqualifying", job)
+        self.assertIn("name: container-image", job)
+
 
 if __name__ == "__main__":
     unittest.main()

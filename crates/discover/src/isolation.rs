@@ -1451,6 +1451,27 @@ mod tests {
     }
 
     #[test]
+    fn mount_attribute_syscalls_evaluate_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // mount_setattr(442) retunes a mount; open_tree_attr(467)
+        // postdates libc 0.2.189 (asm/unistd_64.h) and opens a detached
+        // mount with attributes. Both escape mount-namespace containment
+        // like the already-denied open_tree/move_mount.
+        assert_eq!(
+            442u32, libc::SYS_mount_setattr as u32,
+            "wrong number for mount_setattr"
+        );
+        for (nr, name) in [(442u32, "mount_setattr"), (467u32, "open_tree_attr")] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, nr, 0, 0),
+                denied,
+                "{name} escapes the fence"
+            );
+        }
+    }
+
+    #[test]
     fn x32_syscall_numbers_get_enosys() {
         let insns = FilterBuilder::new().build().unwrap();
         let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;

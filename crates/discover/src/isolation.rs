@@ -1412,6 +1412,33 @@ mod tests {
     }
 
     #[test]
+    fn prlimit64_on_other_pids_evaluates_to_eacces() {
+        let insns = FilterBuilder::new().build().unwrap();
+        let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;
+        // prlimit64(302): pid 0 is the calling process (libc passes 0
+        // for self), which stays allowed; any other pid would lower a
+        // sibling's limits and is denied.
+        const SYS_PRLIMIT64_PROBE: u32 = 302;
+        assert_eq!(
+            SYS_PRLIMIT64_PROBE,
+            libc::SYS_prlimit64 as u32,
+            "wrong number for prlimit64"
+        );
+        assert_eq!(
+            eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64_PROBE, 0, 0),
+            SECCOMP_RET_ALLOW,
+            "prlimit64 on self must stay allowed"
+        );
+        for pid in [1u32, 1234u32, u32::MAX] {
+            assert_eq!(
+                eval_filter(&insns, AUDIT_ARCH_X86_64, SYS_PRLIMIT64_PROBE, pid, 0),
+                denied,
+                "prlimit64 on pid {pid} escapes the fence"
+            );
+        }
+    }
+
+    #[test]
     fn x32_syscall_numbers_get_enosys() {
         let insns = FilterBuilder::new().build().unwrap();
         let enosys = SECCOMP_RET_ERRNO | libc::ENOSYS as u32;

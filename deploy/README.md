@@ -24,13 +24,22 @@ The observer image is published on release tags as
 `ghcr.io/mingulov/p11scope:<version>` (see `RELEASING.md`); the holder image
 stays test-only. The minimal container run keeps the measured capability set
 (`--pid=host` plus `SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`, matching the
-DaemonSet); dropping any of them refuses, as
-`scripts/matrix/verify-container-image.sh` proves:
+DaemonSet) with the node cgroup hierarchy mounted read-only. Dropping
+`--pid=host` or `SYS_PTRACE` refuses, as
+`scripts/matrix/verify-container-image.sh` proves; `SYS_ADMIN` and
+`DAC_READ_SEARCH` necessity is per the kind evidence table in
+[`k8s/README.md`](k8s/README.md) ("Privileges and why"):
 
 ```sh
 docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
-  --cap-add DAC_READ_SEARCH ghcr.io/mingulov/p11scope:0.7.0 doctor
+  --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+  ghcr.io/mingulov/p11scope:0.7.0 doctor
 ```
+
+(On AppArmor hosts add `--security-opt apparmor=unconfined`; on
+SELinux-enforcing hosts `--security-opt label=disable`. The example tag is
+published with the 0.7.0 release; before that, substitute a locally built
+image tag from the recipe below.)
 
 To rebuild the image from this tree instead (`scripts/kind-e2e.sh` shows the
 exact, reproducible steps; network access is expected for the base images and

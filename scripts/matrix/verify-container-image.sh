@@ -324,6 +324,51 @@ print("attributed:", module["path"], module["dev"], module["sha256"][:16])
 PY
 }
 
+classify_provider_tables() {
+    # The host leg runs against the host's SoftHSM, whose table shape is
+    # environmental: 2.6 publishes one 68-entry exports table ([2,40]),
+    # while 2.7 publishes the same 68 slots twice (exports plus the live
+    # C_GetFunctionList return, [3,2] -- scripts/ci/fedora-softhsm-cell.sh
+    # agrees this {3,2} 68-slot shape is the real 2.7 provider). Prints
+    # 26 or 27 and fails closed on anything else. For 27 it also runs the
+    # version-independent core of the capture oracle (the oracle's own
+    # functions, not a copy): schema, common, counters, capture modules,
+    # scan-only sources, uncorroborated. check-capture-evidence.py
+    # clean-metrics itself stays 2.6-calibrated and judges the 26 path.
+    python3 -I - "$1" <<'PY' || return 1
+import importlib.util
+import json
+import sys
+observed = sys.argv[1]
+document = json.load(open(observed, encoding="utf-8"))
+spec = importlib.util.spec_from_file_location(
+    "check_capture_evidence", "scripts/check-capture-evidence.py")
+oracle = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(oracle)
+oracle.exact_metrics_schema(document)
+discovery = document["evidence"]["discovery"]
+assert len(discovery) == 1, discovery
+tables = sorted(
+    (t["entries"], t["exports_agreeing"], t["linkage"], tuple(t["version"]))
+    for t in (discovery[0].get("tables") or [])
+)
+if tables == [(68, 68, "exports", (2, 40))]:
+    print("26")
+elif tables == [(68, 68, "exports", (3, 2)), (68, 68, "live_return", (3, 2))]:
+    evidence = document["evidence"]
+    oracle.exact_common(evidence, aliases=[], skipped=[], in_flight=0)
+    oracle.exact_counters(evidence)
+    oracle.exact_capture_modules(document)
+    sources = [m["sources"] for m in evidence["discovery"]]
+    assert sources == [["scan"]], sources
+    corroborated = [m["corroborated"] for m in evidence["discovery"]]
+    assert corroborated == [False], corroborated
+    print("27")
+else:
+    raise SystemExit(f"unknown provider table shape: {tables}")
+PY
+}
+
 kill_obs() {
     if [ -n "${OPID-}" ]; then
         kill "$OPID" 2>/dev/null || true
@@ -381,10 +426,22 @@ leg_host() {
     }
     reclaim_root_output "$OUT/host.json" || return 1
     docker rm -f "$name" >/dev/null 2>&1 || return 1
-    python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/host.json" spike/expected.txt \
-        >>"$OUT/host-oracle.log" 2>&1 || return 1
     python3 -I scripts/matrix/check-count-multiset.py "$OUT/host.json" spike/expected.txt \
         >>"$OUT/host-oracle.log" 2>&1 || return 1
+    local table_class
+    table_class=$(classify_provider_tables "$OUT/host.json" 2>>"$OUT/host-oracle.log") || return 1
+    echo "provider table class: $table_class" >>"$OUT/host-oracle.log"
+    case $table_class in
+        26)
+            python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/host.json" spike/expected.txt \
+                >>"$OUT/host-oracle.log" 2>&1 || return 1
+            ;;
+        27) ;;
+        *)
+            echo "unknown provider table shape: $table_class" >&2
+            return 1
+            ;;
+    esac
     assert_module_identity "$OUT/host.json" "$OUT/host-mountinfo.txt" "$host_sha" \
         >>"$OUT/host-oracle.log" 2>&1 || return 1
     return 0

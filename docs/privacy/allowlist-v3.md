@@ -1813,7 +1813,7 @@ disarmed captures record nothing, as today):
 | --- | --- | --- |
 | trace `--cgroup`/`--system` | Novel unmatched exits, as profile today | `gap_exe_hints` + `gap_exit_mappings` in the terminal `EVIDENCE` object (the trace lane already renders through `versioned_evidence`) |
 | `--mode metrics` `--cgroup`/`--system` (non-counter) | Novel unmatched exits, as profile today | `gap_exe_hints` in the metrics evidence object (same closed shape as profile); `gap_exit_mappings` stays absent there because instance hooks never attach — use profile/trace for `mapped` |
-| profile/trace/metrics `--pid`, owned `run` (any lane) | Validated target execs (below) | `target_exec_hints` in that lane's evidence; the gap keys stay absent (no descendant-gap subpopulation exists under PID scope) |
+| profile/trace/metrics `--pid`, owned `run` (any lane) | Validated target execs (below) | `target_exec_hints` in that lane's evidence; the gap keys stay absent (no descendant-gap subpopulation exists under PID scope; after F8 lands the run-tree cgroup scope, an owned run still classifies only its direct child there — descendant gaps are counted without hints) |
 | profile/trace/metrics `--cgroup`/`--system` | — | `target_exec_hints` stays absent (no single target; per-member exec classification is out of scope) |
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |

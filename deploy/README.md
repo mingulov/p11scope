@@ -20,6 +20,25 @@
 - `k8s/e2e/workloads.yaml` — **test-only** ledgered pods and the idle negative
   control used by `scripts/kind-e2e.sh`.
 
-Nothing here is a published image: build both images from this tree
-(`scripts/kind-e2e.sh` shows the exact, reproducible steps; network access is
-expected for the base images and packages).
+The observer image is published on release tags as
+`ghcr.io/mingulov/p11scope:<version>` (see `RELEASING.md`); the holder image
+stays test-only. The minimal container run keeps the measured capability set
+(`--pid=host` plus `SYS_ADMIN`, `SYS_PTRACE`, `DAC_READ_SEARCH`, matching the
+DaemonSet); dropping any of them refuses, as
+`scripts/matrix/verify-container-image.sh` proves:
+
+```sh
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+  --cap-add DAC_READ_SEARCH ghcr.io/mingulov/p11scope:0.7.0 doctor
+```
+
+To rebuild the image from this tree instead (`scripts/kind-e2e.sh` shows the
+exact, reproducible steps; network access is expected for the base images and
+packages):
+
+```sh
+CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
+  cargo +"$(cat .release-rust-version)" build \
+  --locked --release --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
+docker build -f deploy/Dockerfile.observer -t p11scope-observer:dev .
+```

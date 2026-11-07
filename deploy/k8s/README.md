@@ -42,8 +42,17 @@ name order and the namespace must exist first.
 
 ## Deploy and capture
 
-Build the images from the repository root (the static observer first), then
-make them available to the nodes (a registry, or `kind load docker-image` on
+`20-daemonset.yaml` points at the published observer image
+(`ghcr.io/mingulov/p11scope:0.7.0`, pulled from the registry), so deploying
+is one apply:
+
+```sh
+kubectl apply -f p11scope/deploy/k8s/
+```
+
+To run a locally built image instead (development, or a registry mirror),
+build the static observer and the image from the repository root, make the
+image available to the nodes (a registry, or `kind load docker-image` on
 kind) and adjust `image:`/`imagePullPolicy` in `20-daemonset.yaml` to match.
 Run the commands below from the parent of the checkout, so the `p11scope/...`
 paths resolve (from the repo root itself they do not exist):
@@ -52,8 +61,7 @@ paths resolve (from the repo root itself they do not exist):
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
   cargo +"$(cat p11scope/.release-rust-version)" build --manifest-path p11scope/Cargo.toml \
   --locked --release --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
-docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:1 p11scope
-kubectl apply -f p11scope/deploy/k8s/
+docker build -f p11scope/deploy/Dockerfile.observer -t p11scope-observer:dev p11scope
 ```
 
 To package the exact release bytes instead of a local build, verify the

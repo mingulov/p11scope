@@ -278,11 +278,11 @@ jobs:
           umask 022
           cd container-package
           sha256sum --check SHA256SUMS
-          set -- p11scope-*-x86_64-linux-musl.tar.gz
+          set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
           test "$#" -eq 1
           test -f "$1"
           tar -xzf "$1"
-          set -- p11scope-*-x86_64-linux-musl/p11scope
+          set -- p11scope-[0-9]*-x86_64-linux-musl/p11scope
           test "$#" -eq 1
           test -f "$1" && test -x "$1" && test ! -L "$1"
           file -b "$1" | grep -q "static-pie linked"

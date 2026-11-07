@@ -498,7 +498,7 @@ else:
         self.assertEqual(downloads[0]["with"].get("name"), "release-preview-public-assets")
         bodies = "\n".join(item.get("run", "") for item in image["steps"])
         for marker in ("sha256sum --check SHA256SUMS",
-                       "p11scope-*-x86_64-linux-musl.tar.gz",
+                       "p11scope-[0-9]*-x86_64-linux-musl.tar.gz",
                        "static-pie linked",
                        "deploy/Dockerfile.observer",
                        "docker pull",

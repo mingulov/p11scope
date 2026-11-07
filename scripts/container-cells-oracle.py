@@ -515,7 +515,10 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     # not_attached disclosure, never a gap) or gap-only where the sweep
     # never attributed the mapper (no edge, only the unproven gap). At
     # least one collapse names key_b (the flip records both directions
-    # while A keeps the committed survivor).
+    # while A keeps the committed survivor). Exactly the two shapes
+    # 23 dev-host spans showed: the stable single collapse (B's key
+    # onto A's) or the flip (B's onto A's, then A's onto B's — that
+    # order). Any other count, key or order refuses.
     label = "span-kernel"
     span_k_pid, span_k_edges = inventory_maps(span_kernel, module_suffix)
     span_k_keys = module_keys(span_kernel, module_suffix)
@@ -550,8 +553,9 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     assert not has_identity_loss(span_kernel["gaps"]), \
         (label, "identity loss in span")
     collapses = collapse_gaps(span_kernel, module_suffix)
-    assert any(key_b in pair for pair in collapses), \
-        (label, "no collapse names B's key", collapses)
+    assert collapses == [(key_b, key_a)] \
+        or collapses == [(key_b, key_a), (key_a, key_b)], \
+        (label, "span collapse is not an observed shape", collapses)
     assert b_pre_round2_pid is not None, "round-2 twin pid is required"
     round2_pid = b_pre_round2_pid
     twin_shapes = {}

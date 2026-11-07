@@ -1697,9 +1697,10 @@ impl PinnedObjects {
     }
 
     /// `Some(filesystem)` when the pinned object lives on a filesystem whose
-    /// inode numbers are not unique per device (FUSE, network filesystems):
-    /// there a maps `(device, inode)` cannot name one file, so C1b refuses
-    /// sweep matching for it. `Err` only when `fstatfs` itself fails.
+    /// inode numbers are not unique per device (FUSE, network filesystems,
+    /// tmpfs mounted `inode32`): there a maps `(device, inode)` cannot name
+    /// one file, so C1b refuses sweep matching for it. `Err` only when
+    /// `fstatfs` itself fails.
     pub(crate) fn nonunique_inode_filesystem(
         &self,
         id: PinnedObjectId,
@@ -6348,8 +6349,10 @@ fn ordinary_identity_equal(left: &Entry, right: &Entry) -> bool {
 /// through two mount namespaces (a container bind-mounting the host's provider)
 /// carries a different `mount_id` per mount table while remaining one attach
 /// target. Merge only on proof — same key, equal pin, equal non-empty digest,
-/// and equal fstat `(st_dev, st_ino)` on the two retained fds. `mount_id` is
-/// not consulted here; anything unproven fails closed.
+/// equal fstat `(st_dev, st_ino)` on the two retained fds, and unique inode
+/// numbers on both filesystems (`same_kernel_file` refuses FUSE, network
+/// filesystems and tmpfs mounted `inode32`). `mount_id` is not consulted
+/// here; anything unproven fails closed.
 fn same_open_file(left: &Entry, right: &Entry) -> bool {
     left.raw.key == right.raw.key
         && left.pin == right.pin

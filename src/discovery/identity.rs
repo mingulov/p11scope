@@ -11942,6 +11942,25 @@ mod tests {
     }
 
     #[test]
+    fn unique_inode_decision_treats_neither_token_tmpfs_as_unique() {
+        // Pins the disclosed fallback in `inodes_name_one_file`: a tmpfs
+        // line showing neither `inode32` nor `inode64` counts as unique,
+        // because refusing it would drop every tmpfs object on kernels
+        // without the option display. The residual (two live files
+        // sharing a number plus an exact whole-pin and digest match) must
+        // be named in the release known issues; flipping this leg is a
+        // behaviour choice for the release line, not a silent edit.
+        assert!(
+            inodes_name_one_file(0x0102_1994, Some("rw,relatime")),
+            "neither-token tmpfs counts as unique (see comment)"
+        );
+        assert!(
+            inodes_name_one_file(0x0102_1994, Some("rw,size=1024k")),
+            "super-options without either token stay unique"
+        );
+    }
+
+    #[test]
     fn unique_inode_decision_matches_super_option_tokens_exactly() {
         assert!(
             inodes_name_one_file(0x0102_1994, Some("rw,noinode32x")),

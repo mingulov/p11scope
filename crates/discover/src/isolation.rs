@@ -1343,19 +1343,49 @@ mod tests {
     #[test]
     fn apply_isolated_refuses_without_fence_context_in_a_child() {
         // Wiring: apply_isolated must refuse when the calling context is
-        // weak. The test runner has no_new_privs unset, so the child
-        // must return the fence-context refusal. Fork so a successful
-        // fence (or a mutant that skips the check and fences) cannot
-        // affect the runner. The child prints nothing and exits 0 only
-        // on the expected refusal.
-        let parent = read_fence_context().unwrap();
-        if parent.no_new_privs == 1 && parent.euid != 0 {
-            eprintln!("SKIP: test runner is already fence-ready");
-            return;
-        }
+        // weak. Fork so a successful fence (or a mutant that skips the
+        // check and fences) cannot affect the runner. The child prints
+        // nothing and exits 0 only on the expected refusal.
+        //
+        // When the runner itself is fence-ready (no_new_privs set,
+        // non-root), a plain child would fence successfully, so the
+        // child starts a second thread first and must hit the
+        // multithreaded refusal instead: every runner shape is checked,
+        // none skipped. The parent reaps with a deadline: a hung child
+        // is killed and fails the test instead of hanging the suite.
+        let fence_ready = read_fence_context()
+            .map(|parent| parent.no_new_privs == 1 && parent.euid != 0)
+            .unwrap_or(false);
         let pid = unsafe { libc::fork() };
         assert!(pid >= 0, "fork failed");
         if pid == 0 {
+            if fence_ready {
+                // A second thread makes this child multithreaded; the
+                // fence must refuse it. The thread idles until _exit.
+                static READY: std::sync::atomic::AtomicBool =
+                    std::sync::atomic::AtomicBool::new(false);
+                let _thread = std::thread::spawn(|| {
+                    READY.store(true, std::sync::atomic::Ordering::SeqCst);
+                    loop {
+                        std::thread::sleep(std::time::Duration::from_secs(60));
+                    }
+                });
+                let started = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !READY.load(std::sync::atomic::Ordering::SeqCst) {
+                    if std::time::Instant::now() >= started {
+                        unsafe { libc::_exit(4) };
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                // _exit directly in each arm: no drop in the child.
+                match apply_isolated(None) {
+                    Err(error) if error.contains("refusing to fence a multithreaded process") => unsafe {
+                        libc::_exit(0)
+                    },
+                    Err(_) => unsafe { libc::_exit(2) },
+                    Ok(()) => unsafe { libc::_exit(3) },
+                }
+            }
             // _exit directly in each arm: no drop in the child after fork.
             match apply_isolated(None) {
                 Err(error) if error.contains("refusing to fence") => unsafe { libc::_exit(0) },
@@ -1363,13 +1393,29 @@ mod tests {
                 Ok(()) => unsafe { libc::_exit(3) },
             }
         }
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let mut status = 0;
         let waited = loop {
-            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
-            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
-                continue;
+            let waited = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
+            if waited == pid {
+                break waited;
             }
-            break waited;
+            if waited < 0 {
+                let errno = std::io::Error::last_os_error().raw_os_error();
+                if errno == Some(libc::EINTR) {
+                    continue;
+                }
+                break waited;
+            }
+            if std::time::Instant::now() >= deadline {
+                unsafe { libc::kill(pid, libc::SIGKILL) };
+                // Reap the killed child so it never leaks as a zombie; a
+                // blocking wait is safe now that it is dying.
+                let mut reaped = 0;
+                unsafe { libc::waitpid(pid, &mut reaped, 0) };
+                panic!("fence-context child did not exit within 10s; killed");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
         };
         assert_eq!(waited, pid, "waitpid failed");
         assert!(

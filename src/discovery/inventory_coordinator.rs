@@ -28861,7 +28861,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             1
         );
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise names the caller:\n{text}"
@@ -28881,7 +28881,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             2
         );
-        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned)";
+        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); pids 9, 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise names both callers:\n{text}"
@@ -28932,7 +28932,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             1
         );
-        let line = "unidentified callers: at least 2 calls from 1 caller process never identified (exited or never scanned)";
+        let line = "unidentified callers: at least 2 calls from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "one cookie is one caller:\n{text}"
@@ -29057,6 +29057,14 @@ int main(void) {
             true
         );
         assert_eq!(
+            document["modules"][0]["unbound_use"]["pids"]
+                .as_array()
+                .unwrap()
+                .len(),
+            4096
+        );
+        assert_eq!(document["modules"][0]["unbound_use"]["pids_dropped"], 1);
+        assert_eq!(
             document["observation"]["native_witnesses"]["unbound_images"],
             4097
         );
@@ -29064,7 +29072,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images_saturated"],
             false
         );
-        let line = "unidentified callers: at least 4097 calls from 4097 caller processes never identified (exited or never scanned)";
+        let line = "unidentified callers: at least 4097 calls from 4097 caller processes never identified (exited or never scanned); pids 9, 9, 9, 9, 9 (+4092 more; not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "the run-wide count stays exact:\n{text}"
@@ -29089,8 +29097,12 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images_saturated"],
             true
         );
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["pids_dropped"],
+            16385 - 4096
+        );
         assert!(
-            text.contains("from 16384 caller processes never identified (exited or never scanned); image bound reached, more callers possible"),
+            text.contains("from 16384 caller processes never identified (exited or never scanned); pids 9, 9, 9, 9, 9 (+16380 more; not running now or never scanned); image bound reached, more callers possible"),
             "saturation is disclosed:\n{text}"
         );
     }
@@ -29147,10 +29159,126 @@ int main(void) {
         let (text, document) = slice_one_views(&native);
         assert_eq!(document["edges"][0]["entries"]["count"], 9);
         assert_eq!(document["modules"][0]["unbound_use"]["entries"], 1);
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "only unidentified use counts:\n{text}"
+        );
+    }
+
+    /// Part C: the concise caller line lists the historical host pid.
+    #[test]
+    fn concise_unidentified_callers_list_the_host_pid() {
+        let (mut native, _) = NativeScene::new();
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        let (text, _) = slice_one_views(&native);
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise lists the host pid:\n{text}"
+        );
+    }
+
+    /// Part C: verbose module detail lists every collected host pid
+    /// with its first-call time.
+    #[test]
+    fn verbose_unidentified_use_lists_every_host_pid_with_first_call_time() {
+        let (mut native, _) = NativeScene::new();
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 11, 1_200, 0);
+        native.witness(vec![first, second]);
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2_000,
+            1,
+        );
+        let text = crate::inventory_present::render_snapshot_with_verbosity(
+            &presentation,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            text.contains(
+                "host pids: 9 (first call 1.8µs ago), 11 (first call 800ns ago) (not running now or never scanned)"
+            ),
+            "verbose lists every pid with its first call:\n{text}"
+        );
+    }
+
+    /// Part C: JSON carries the complete per-module pid list with
+    /// first-call stamps, plus the saturation count.
+    #[test]
+    fn json_unbound_use_carries_the_complete_pid_list() {
+        let (mut native, _) = NativeScene::new();
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 11, 220, 0);
+        native.witness(vec![first, second]);
+        let (_, document) = slice_one_views(&native);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["pids"],
+            serde_json::json!([
+                {"pid_host": 9, "first_call_ns": 210},
+                {"pid_host": 11, "first_call_ns": 220},
+            ])
+        );
+        assert_eq!(document["modules"][0]["unbound_use"]["pids_dropped"], 0);
+    }
+
+    /// Part C: a historical pid is never described as the live
+    /// process now holding it — the list carries no identity.
+    #[test]
+    fn a_reused_pid_is_listed_without_describing_the_live_process() {
+        let (mut native, _) = NativeScene::new();
+        let row = native.row(41, 1, 9, 210, 0);
+        native.witness(vec![row]);
+        // A different process now holds pid 9, admitted and live.
+        native.scene.source.spawn(9, 900);
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(9, ImageAuthority::ScanPinned, 1_000)
+            .unwrap();
+        native.scene.project(9, 1_100);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census().clone();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 0, 0));
+        let (text, document) = slice_one_views(&native);
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "the pid stays bare:\n{text}"
+        );
+        let pid = &document["modules"][0]["unbound_use"]["pids"][0];
+        assert_eq!(
+            pid,
+            &serde_json::json!({"pid_host": 9, "first_call_ns": 210}),
+            "exactly the number and its stamp, never an identity"
+        );
+    }
+
+    /// Part C: two images of one historical tgid list twice — the pid
+    /// list is one entry per image, never deduplicated.
+    #[test]
+    fn one_tgid_two_cookies_lists_the_pid_twice() {
+        let (mut native, _) = NativeScene::new();
+        let first = native.row(41, 1, 9, 210, 0);
+        let second = native.row(42, 1, 9, 220, 0);
+        native.witness(vec![first, second]);
+        let (text, document) = slice_one_views(&native);
+        assert_eq!(
+            document["modules"][0]["unbound_use"]["pids"],
+            serde_json::json!([
+                {"pid_host": 9, "first_call_ns": 210},
+                {"pid_host": 9, "first_call_ns": 220},
+            ])
+        );
+        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); pids 9, 9 (not running now or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "one entry per image:\n{text}"
         );
     }
 

@@ -853,9 +853,13 @@ fn native_semantic_resource_final_types_pinned() {
     // v0.7.0 `--forwarding-module`: one more inline Vec (unmatched
     // inputs), +24; operator-bounded (one short string per CLI input),
     // rendered once beside `unmatched_excludes`.
+    // +48 (round 6 slice 1 + Part C, repinned in round 7): the run-wide
+    // unidentified-caller publication — image counters, identity-refusal
+    // counters, and the host-pid Vec plus its dropped count. Round 7 adds
+    // no inline byte here (its executable data sits behind the pid Vec).
     pin!(
         crate::inventory_present::Presentation,
-        1240 + size_of::<crate::inventory_present::PresentationRenderIndex>()
+        1288 + size_of::<crate::inventory_present::PresentationRenderIndex>()
             + 4 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.

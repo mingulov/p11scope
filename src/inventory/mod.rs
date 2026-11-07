@@ -12125,7 +12125,7 @@ mod tests {
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
         assert_eq!(
             document["modules"][0]["unbound_use"],
-            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0, "images": 0, "images_saturated": false, "pids": [], "pids_dropped": 0})
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0, "images": 0, "images_saturated": false, "pids": [], "pids_dropped": 0, "executables": []})
         );
         assert_eq!(
             document["observation"]["native_witnesses"],

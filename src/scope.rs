@@ -961,7 +961,9 @@ mod tests {
     fn run_cgroup_place_uses_the_stored_cgroup_root() {
         let root = tempfile::tempdir().unwrap();
         let group = RunCgroup::create(root.path()).expect("create the run group under tmpfs");
-        let error = format!("{:#}", group.place(1).unwrap_err());
+        // Our own pid: its /proc cgroup line is always readable, and its
+        // real cgroup is never the tmpfs group, so place must refuse.
+        let error = format!("{:#}", group.place(std::process::id()).unwrap_err());
         assert!(
             error.contains(&root.path().display().to_string()),
             "place must join the readback with the stored root, not /sys/fs/cgroup: {error}"

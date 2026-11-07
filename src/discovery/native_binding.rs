@@ -694,9 +694,10 @@ pub(crate) struct NativeBinder {
     /// fact, shared by every domain like the census.
     reuse_ns: HashMap<u32, u64>,
     /// Whether BPF hook stamps and admission stamps share a clock. The
-    /// coordinator syncs this on every staged batch; fail-closed false
-    /// until synced. While false the retained-identity fallback stays
-    /// off (its exec/loss orderings are meaningless).
+    /// coordinator syncs this on every staged batch and immediately
+    /// when the clocks go incomparable; fail-closed false until
+    /// synced. While false the retained-identity fallback stays off
+    /// (its exec/loss orderings are meaningless).
     exit_clocks_comparable: bool,
     /// Qualified only on the explicit metadata opt-in, never an image grant.
     metadata_clock_qualified: bool,

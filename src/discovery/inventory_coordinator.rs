@@ -3151,16 +3151,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let Some(capture) = self.capture.as_mut() else {
             return;
         };
-        // Revocation precedes every sticky-loss early return. A later generic
-        // loss cannot leave the earlier historical exit allowance behind.
-        // When an honoured exit claim is withdrawn by a later generic loss
-        // while running, the registry's exit-only claim is revoked too (a
-        // generic loss clears it); after stop nothing stages (frozen facts).
+        // Revocation precedes every sticky-loss early return. A later loss
+        // cannot leave the earlier historical exit allowance behind. When
+        // an honoured exit claim is withdrawn while running, the
+        // registry's exit-only claim is revoked too; after stop nothing
+        // stages (frozen facts).
         let had_exit = capture.original_pid_exit.is_some();
-        let is_generic = matches!(
-            custody,
-            ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. }
-        );
         let exit = match custody {
             ScopeCustody::PidExited { proof, .. } => Some(*proof),
             ScopeCustody::PidUnproven { .. } | ScopeCustody::PidLost { .. } => {
@@ -3177,8 +3173,34 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             if capture.original_pid_exit != exit {
                 capture.original_pid_exit = None;
             }
-            if had_exit && is_generic {
+            // Every set->cleared transition of the coordinator copy while
+            // running revokes the registry's exit-only claim — not only
+            // the two generic-loss kinds (a superseding exit proof
+            // clears it too) — and the revocation names the later
+            // custody as a gap, beside the first-loss gap.
+            let revoked = had_exit && capture.original_pid_exit.is_none();
+            if revoked {
                 self.registry.note_counted_loss();
+                let later = match custody {
+                    ScopeCustody::PidUnproven { reason, .. }
+                    | ScopeCustody::PidLost { reason, .. } => Some(reason.clone()),
+                    ScopeCustody::PidExited { at_ns, .. } => Some(format!(
+                        "a later exit proof at {at_ns} superseded the earlier one"
+                    )),
+                    ScopeCustody::System | ScopeCustody::PidHeld | ScopeCustody::CgroupHeld => None,
+                };
+                if let Some(later) = later {
+                    self.registry.record_gap(RegistryGap {
+                        caller: None,
+                        module: None,
+                        pid: None,
+                        subject: "native capture scope custody unproven".into(),
+                        reason: format!(
+                            "{later}; the earlier clean-exit claim is withdrawn (counted columns stay lower bounds)"
+                        ),
+                        budget: None,
+                    });
+                }
             }
             return;
         }

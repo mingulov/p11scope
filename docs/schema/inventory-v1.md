@@ -371,8 +371,8 @@ non-null values needs a new allowlist row.
     but when `detail` is `the PID target exited` the sole cause is a
     clean PID-target exit (no records dropped) — the count ran until
     the exit. A zero with the exit detail still reads `unknown (usage
-    observation lossy)`: the lower bound 0 proves no use. Any later
-    generic loss clears the exit claim.
+    observation lossy)`: a lower bound of 0 does not prove no use.
+    Any later generic loss clears the exit claim.
   - `witnessed`: use was witnessed (first at `first_ns`) but nothing
     counts it — `count` stays 0 for old consumers, `observation` reads
     `unknown (count unavailable; use witnessed)`, and the dashboard

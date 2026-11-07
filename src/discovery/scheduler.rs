@@ -1437,4 +1437,79 @@ mod tests {
         );
         assert_eq!(admitted.len(), 64);
     }
+
+    /// A failed newcomer retries behind untried backlog: the next free
+    /// window sinks the previous tick's newcomer attempts to the end of
+    /// the backlog rotation (stable inside each part). Without the sink
+    /// the failed pid — backlog next tick, never seen by the backlog
+    /// cursor — retries ahead of untried backlog on every bounded tick.
+    #[test]
+    fn failed_newcomer_attempts_sink_behind_untried_backlog() {
+        let mut scheduler = DiscoveryScheduler::new();
+        // Tick 1: both pids are newcomers; the bounded batch admits the
+        // lower one and the attempt fails (never recorded as backlog).
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &[7, 9],
+            &BTreeSet::from([7, 9]),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![7]);
+        scheduler.note_newcomer_attempt(7);
+        // Tick 2: both are backlog now; the untried pid admits first.
+        let (admitted, deferred) = scheduler.new_view_window_newcomers_first(
+            &[7, 9],
+            &BTreeSet::new(),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(
+            admitted,
+            vec![9],
+            "the failed newcomer retries behind untried backlog"
+        );
+        assert_eq!(deferred, vec![7]);
+        scheduler.note_backlog_attempt(9);
+        // Tick 3: the sink lasts exactly one tick; the failed pid retries.
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &[7],
+            &BTreeSet::new(),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![7], "the failed pid retries third");
+    }
+
+    /// The fairness checkpoint covers the per-tick newcomer-attempt sets:
+    /// a pressure service pass that opens its own window and attempts a
+    /// newcomer must not change which pids ordinary backlog rotation
+    /// sinks afterwards.
+    #[test]
+    fn fairness_checkpoint_restores_the_newcomer_attempt_sets() {
+        let mut scheduler = DiscoveryScheduler::new();
+        let pids = [7, 9];
+        let newcomers = BTreeSet::from([7, 9]);
+        // Tick 1 admits the lower newcomer and attempts it.
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, 1, 1);
+        assert_eq!(admitted, vec![7]);
+        scheduler.note_newcomer_attempt(7);
+        // A pressure service pass runs its own window — rotating the
+        // attempt sets — and attempts the other newcomer.
+        let checkpoint = scheduler.fairness_checkpoint();
+        let (pressure_admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &newcomers, 1, 1);
+        assert_eq!(pressure_admitted, vec![9]);
+        scheduler.note_newcomer_attempt(9);
+        scheduler.restore_fairness(checkpoint);
+        // The next ordinary window sinks the restored tick's attempt (7),
+        // not the service pass's (9).
+        let (admitted, _) =
+            scheduler.new_view_window_newcomers_first(&pids, &BTreeSet::new(), 1, 1);
+        assert_eq!(
+            admitted,
+            vec![9],
+            "the restored ledger sinks the ordinary attempt"
+        );
+    }
 }

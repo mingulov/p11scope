@@ -6774,7 +6774,9 @@ mod tests {
         assert_eq!(document["schema"], "p11scope/observed-profile/v3-metrics");
         assert_eq!(document["lane"], "metrics");
         assert_eq!(document["capture"]["mode"], "metrics");
-        assert_eq!(document["capture"]["scope"], "pid");
+        // Owned runs capture the command's tree in a dedicated cgroup,
+        // so the report scope is cgroup, never the child pid.
+        assert_eq!(document["capture"]["scope"], "cgroup");
         let collection = &document["evidence"]["counter_collection"];
         assert_eq!(collection["mode"], mode.name());
         assert_eq!(collection["status"], "fresh");

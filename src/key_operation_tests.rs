@@ -10365,10 +10365,12 @@ fn key_operation_kem_decapsulate_mints_output_object() {
     );
 }
 
-/// Item 5 (M2): a proved ML-KEM key_operations row is NOT
-/// deliverable without a separately approved M1a contract. The
-/// genuine ML-KEM input completes into the unknown summary; no
-/// proved row appears for either KEM category.
+/// Item 5 (M2, as superseded by the approved F16 contract for labelled
+/// inputs): this scene establishes the ML-KEM key type with no
+/// parameter set, so no usable label can form and the genuine ML-KEM
+/// input completes into the unknown summary; no proved row appears
+/// for either KEM category. Labelled inputs do row proved — see
+/// `key_operation_kem_labelled_input_rows_proved`.
 #[test]
 fn key_operation_kem_proved_row_needs_m1a() {
     for name in ["C_EncapsulateKey", "C_DecapsulateKey"] {
@@ -10410,7 +10412,7 @@ fn key_operation_kem_proved_row_needs_m1a() {
         let committed = commit(1, &[&staging], &scene.model.project(), &keyuse);
         assert!(
             committed.key_operations.is_empty(),
-            "{name}: M2 proves no ML-KEM row"
+            "{name}: no label, so no proved ML-KEM row"
         );
         assert_eq!(
             committed.unknown_key_operations.len(),
@@ -10418,7 +10420,8 @@ fn key_operation_kem_proved_row_needs_m1a() {
             "{name}: the terminal partitions unknown exactly once"
         );
         // Unknown metadata is not a proved row by another name: the
-        // metadata vocabulary stays at 12 labels.
+        // frozen pre-PQC vocabulary stays at 12 labels (the eighteen
+        // PQC labels live in the versioned v5 table).
         assert_eq!(
             crate::key_operation_projection::contract::METADATA_LABELS.len(),
             12

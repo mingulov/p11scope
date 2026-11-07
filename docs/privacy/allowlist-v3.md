@@ -24,7 +24,7 @@ and [object producer activation](#object-producer-activation-h7-slice-d-2026-10-
 which implements the reviewed finite producer below with no public
 object projection,
 and [H7-E4 attribute capture](#h7-e4-attribute-capture-2026-10-20):
-the H7-E4 read set, the six attribute rows, the finite vocabulary,
+the H7-E4 read set, the six attribute rows (seven with F16), the finite vocabulary,
 the GetAttributeValue result rules, the output/retention table and
 the [H9 publication section](#object-observations-publication-h9) are
 APPROVED (owner decision OD11, 2026-10-24),
@@ -276,10 +276,10 @@ explicit, narrow internal exceptions, not finite attribute values.
 | KEM ciphertext/result-span guard | `C_EncapsulateKey`/`C_DecapsulateKey` arg 5 register word only: the ciphertext base bounds a wholly-below ordering check against the result cell. No ciphertext byte, no length value, and no decapsulation scalar length is read or used as a bound. | Probe scratch during entry only; no retention, no publication. | Unreadable arg 5, equality/interior/at-or-above-base geometry, or a null contradicting the non-null S1 decision withholds the result pointer; a null decapsulation input has no span. C1/C3. |
 | KEM entry ciphertext-pointer decision | The owned call's validated S1 entry output-pointer state (finite null/non-null/unreadable class, never an address) for `C_EncapsulateKey`: only a positively non-null decision authorizes result-pointer retention. | Decided at entry; retained as retained-vs-zero result pointer only, in the existing fixed side-row fields (no new retained KEM field). Public result-unavailable reason only. | Null or unavailable decision retains no pointer: zero result-cell reads, no output authority, no key-use count. S1 call accounting unchanged. C1/C3. |
 | KEM capture flavor gate | FULL builds only (`KEM_CAPTURE_WIRED`); P0 refuses KEM input and result-pointer acquisition before any fetch. Clearing follows the existing result-pointer row: private in-flight state only, cleared on every terminal, loss, cancellation, exec or teardown path. | No KEM state exists in P0; FULL retains only the existing fixed side-row fields above. | P0 KEM calls stay S1-only with explicit unavailability. C1. |
-| Attribute selector | Read just `CK_ATTRIBUTE.type` to test equality against the six identifiers below before reading its pointer/length. | Retain a six-value selector enum only; unknown selectors are discarded without retaining their raw number or reading their pointer/length. | No new `CKA_ID` collection or pre-collection, including its value, length or pointer. C5/C6. |
+| Attribute selector | Read just `CK_ATTRIBUTE.type` to test equality against the six identifiers below (seven with F16: plus `CKA_PARAMETER_SET`) before reading its pointer/length. | Retain a six-value selector enum only (seven with F16); unknown selectors are discarded without retaining their raw number or reading their pointer/length. | No new `CKA_ID` collection or pre-collection, including its value, length or pointer. C5/C6. |
 | Attribute value pointer | Only after selector equality; GetAttribute retains entry pointer and compares returned header pointer before decode. | Private in-flight GetAttribute slots only; request pointer is transient probe scratch. No pointer in result transport. | Null is size-only for GetAttribute, unavailable for requests; pointer/header changes or detectable overlap refuse the affected values. C1/C5/C6. |
 | Attribute entry capacity / returned length | Read the named selector's `ulValueLen`; target word, exact accepted value size and full-span checks. GetAttribute retains capacity and reads returned length. | Private in-flight validation; only finite state such as `size_only`, `unavailable`, `invalid_length`, `changed`, `unreadable` is public. | Width-correct unavailable sentinel, growing length, zero/wrong length, insufficient entry capacity, read failure: no value read. C5/C6. |
-| `CKA_CLASS` | Exact selector 0x0000; one target word, exact width, finite set below. | Six-field request/result snapshot; public finite class plus source/state. Raw unmatched word discarded in probe scratch. | Unsupported/conflicting value stays unknown. C5/C6. |
+| `CKA_CLASS` | Exact selector 0x0000; one target word, exact width, finite set below. | Six-field request/result snapshot (seven with F16); public finite class plus source/state. Raw unmatched word discarded in probe scratch. | Unsupported/conflicting value stays unknown. C5/C6. |
 | `CKA_KEY_TYPE` | Exact selector 0x0100; one target word, exact width, finite set below. | As class, with finite key-type label. No vendor numeric fallback. | Unsupported/conflicting value stays unknown. C5/C6. |
 | `CKA_TOKEN` | Exact selector 0x0001; exactly one byte and exact equality to 0 or 1. | Requested or established `session`/`token`, with provenance; only established result may drive object lifetime. | Other byte/length is unknown; a request is never promoted by CKR_OK creation alone. C3/C5/C6. |
 | `CKA_VALUE_LEN` | Exact selector 0x0161; one target word equal to 16, 24 or 32 only. | Finite byte-size code; label as AES 128/192/256 bits only with independently established AES type for established metadata. | Other values unknown; no `CKA_VALUE` read and no inference from mechanism alone. C5/C6. |
@@ -289,7 +289,9 @@ explicit, narrow internal exceptions, not finite attribute values.
 
 ## Finite attribute vocabulary
 
-Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`.
+Class and key-type numbers follow the OASIS PKCS #11 3.0 `pkcs11t.h`;
+the three PQC key-type codes and the parameter-set selector and code
+range follow PKCS #11 3.2.
 pkcs11-types is not a source for this vocabulary (its `CkKeyType` table
 misnumbered values from 0x27 upward before v0.2.3; the closed sets below
 stay the authority). The selected attribute
@@ -301,7 +303,8 @@ a reviewed policy change, not numeric passthrough.
 | Field | Exact accepted values and labels |
 | --- | --- |
 | Class | 0 `data`, 1 `certificate`, 2 `public_key`, 3 `private_key`, 4 `secret_key` |
-| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x40 `ec_edwards`, 0x41 `ec_montgomery` |
+| Key type | 0x00 `rsa`, 0x01 `dsa`, 0x02 `dh`, 0x03 `ec`, 0x04 `x9_42_dh`, 0x10 `generic_secret`, 0x1f `aes`, 0x40 `ec_edwards`, 0x41 `ec_montgomery`; 0x49/0x4a/0x4b PQC qualifier (PKCS #11 3.2, no standalone label) |
+| Parameter set | 1..=12, the `CKP_*` union across ML-DSA, ML-KEM and SLH-DSA (PKCS #11 3.2); uninterpretable without the same-view key type |
 | Token flag | 0 `session`, 1 `token` |
 | AES byte sizes | 16, 24, 32, presented as 128, 192, 256 bits with the type guard |
 | RSA bit sizes | 1024, 2048, 3072, 4096, 8192; an observer support set, not a cryptographic-strength recommendation |
@@ -364,7 +367,7 @@ For each selected slot, in order:
    A lifecycle uncertainty or successful `C_SetAttributeValue` does invalidate
    current facts. Keep historical provenance separate from current validity.
 
-Only the observed result may establish the six fields. Incomplete, unsupported
+Only the observed result may establish the six fields (seven with F16). Incomplete, unsupported
 or unreadable values never acquire a label from another attribute, another
 object, requested metadata or a recognized mechanism. For a known size without
 a known matching key type, retain the finite field fact but show type/size
@@ -658,7 +661,7 @@ raw buffer is read or kept, and no pointer is retained or emitted.
 ## Bounds, loss and output
 
 Proposed ceilings are eight inspected attributes per template, at most two
-templates per call, six classified fields per metadata snapshot, ten curve
+templates per call, six classified fields per metadata snapshot (seven with F16), ten curve
 bytes of transient scratch, two scalar input handles, two scalar result
 handles, and eight find handles per call. The existing in-flight owner ceiling
 of 16,448 still bounds private call state; an added side map cannot multiply
@@ -670,8 +673,9 @@ Userspace semantic state is additionally bounded: 1,024 live sessions and
 object records capture-wide, and at most 32 accessing-session relations per
 object. At most 4,096 instance records and 16,384 executable ranges are retained
 capture-wide; existing tighter caller/module/edge admission limits still
-apply. Six requested and six established attribute facts per object are
-fixed slots, not unbounded histories. Pending joins are capped at 1,024 calls;
+apply. Six requested and six established attribute facts per object
+(seven with F16) are fixed slots, not unbounded histories. Pending
+joins are capped at 1,024 calls;
 reject or invalidate on overflow, never wait unboundedly for a scan.
 
 Refusals do not erase broad module/caller inventory or historical positive
@@ -716,7 +720,7 @@ Observed attribute values live only on these surfaces, with these lifetimes:
 | --- | --- | --- |
 | Kernel `OBJECT_START` rows | At most 16,384 rows of 432 B: finite codes plus the Get template base, header-end and value pointers and capacity | Zeroed and deleted on every terminal path |
 | Kernel EVENTS ring | Tail records (616 B with header) | Stay in the 4 MiB ring until overwritten |
-| Observer memory | The validated tail (no Debug/Serialize) until ordinary decode or registry apply; the model holds at most 65,536 objects with six requested and six established fixed slots each | The capture's lifetime |
+| Observer memory | The validated tail (no Debug/Serialize) until ordinary decode or registry apply; the model holds at most 65,536 objects with six requested and six established fixed slots each (seven with F16) | The capture's lifetime |
 | Public inventory | Only `p11scope/inventory/v1` `object_observations` (objects requested, established, queries and label; key operations metadata at use) and inventory event kinds `object_observed`, `key_operations_observed` and `snapshot.object_observations` | The existing report-file and bounded event-file rotation lifetimes |
 | Dashboard | Aggregate counts only | The rendered view |
 | Never | Profile, trace, metrics, inspect, diagnostics, diff, logs or errors carry no object facts. Doctor and `evidence.object_capture` carry only the build fact | — |
@@ -1356,8 +1360,8 @@ recognized mechanism never labels.
 
 | Field | Source, authority and validation | Retention and public output | Failure and required evidence |
 | --- | --- | --- | --- |
-| `CKA_PARAMETER_SET` (P1) | Exact selector 0x061d at full target width before any pointer/length read, on the already template-authorized creation calls (requested) and `C_GetAttributeValue` (established) only; KEM calls gain no read. One target word (`W` bytes LP64/ia32, `ulValueLen` exact, ia32 zero-extended with high-bit refusal); the word must be `1..=12`. The H7-E4 request/Get protocols (selector-first, capacity, alias/overlap, header recheck, accepted partial RVs, duplicate/conflict rules, Set invalidation, pair separation) apply unchanged; no new read site or descriptor exists. | Raw code `1..=12` in the existing side-row cell and per-view seventh metadata field; scrubbed/deleted on every terminal path like the six existing kinds. Public: the `parameter_set` key (`{status, value}`) in the v5 requested/established/query blocks, and the eighteen `metadata_at_use`/object labels of Section 5 of the capture contract. Concise text spotlights PQC uses (`ML-DSA-65 sign: 12`); `-v` adds failed/active; JSON/JSONL carry every row; dashboard, profile, trace and metrics gain nothing. | Out-of-range code, valid-code/wrong-family pair, conflict, incompatible class or missing key type: no label (`metadata_unknown`/`metadata_conflicting` as today); the field reads unknown. P0 builds read nothing (`UNINSPECTED`, `not_enabled`). Required evidence: partial-error neighbor preservation, hostile-width (ia32 high-bit, `1<<16`, `1<<32` OR-alias) and secret-alias (`CKA_SEED`/`CKA_VALUE` silence, secret bytes behind the value pointer classify to nothing) twins; `object_producer_compiled_frames_are_bounded` unmodified; a live PQC-provider capture showing one PQC segment with matching v5 JSON. |
-| PQC `CKA_KEY_TYPE` qualifier (P2) | Exact selector 0x0100 (already approved); additionally accepted values `0x49` (`CKK_ML_KEM`), `0x4a` (`CKK_ML_DSA`), `0x4b` (`CKK_SLH_DSA`) from PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1. Same source/ABI/span rules as every key-type value; establishes the key-type field exactly like the nine existing types. | Same retention as the key-type field; public only as the numeric scalar beside `parameter_set` and inside the eighteen combined labels. Never a standalone PQC key-type label, never taken from a mechanism. | Any other key-type value (including XMSS and vendor types) stays refused with no numeric fallback; a PQC type without a valid same-view parameter set labels nothing. The M2 `!is_established(1)` pin for key type 73 is the one superseded assertion (contract Section 10). |
+| `CKA_PARAMETER_SET` (P1) | Exact selector 0x061d at full target width before any pointer/length read, on the already template-authorized creation calls (requested) and `C_GetAttributeValue` (established) only; KEM calls gain no read. The read is selector-`0x061d`-driven: any authorised slot carrying that selector classifies, not only slots beside PQC key types. One target word (`W` bytes LP64/ia32, `ulValueLen` exact, ia32 zero-extended with high-bit refusal); the word must be `1..=12`. The H7-E4 request/Get protocols (selector-first, capacity, alias/overlap, header recheck, accepted partial RVs, duplicate/conflict rules, Set invalidation, pair separation) apply unchanged; no new read site or descriptor exists. | Raw code `1..=12` in the existing side-row cell and per-view seventh metadata field; scrubbed/deleted on every terminal path like the six existing kinds. Public: the `parameter_set` key (`{status, value}`) in the v5 requested/established/query blocks, and the eighteen `metadata_at_use`/object labels enumerated in `$defs/metadata_label` of [the v5 schema](../schema/inventory-v1-object-observations-v5.schema.json). Concise text spotlights PQC uses (`ML-DSA-65 sign: 12`); `-v` adds failed/active; JSON/JSONL carry every row; dashboard, profile, trace and metrics gain nothing. | Missing key type, valid-code/wrong-family pair (including XMSS/XMSS-MT and vendor objects, whose codes name other parameter sets), incompatible class or conflict: no label (`metadata_unknown`/`metadata_conflicting` as today). The field publishes the classified code `1..=12` whenever the word is in range, whatever the key type; only the combined label needs the same-view PQC key type, a family-valid code and a compatible class. Out-of-range words publish no value (`unsupported`); conflicts publish `conflict`. P0 builds read nothing (`UNINSPECTED`, `not_enabled`). Required evidence: partial-error neighbor preservation, hostile-width (ia32 high-bit, `1<<16`, `1<<32` OR-alias) and secret-alias (`CKA_SEED`/`CKA_VALUE` silence, secret bytes behind the value pointer classify to nothing) twins; `object_producer_compiled_frames_are_bounded` unmodified; a live PQC-provider capture showing one PQC segment with matching v5 JSON. |
+| PQC `CKA_KEY_TYPE` qualifier (P2) | Exact selector 0x0100 (already approved); additionally accepted values `0x49` (`CKK_ML_KEM`), `0x4a` (`CKK_ML_DSA`), `0x4b` (`CKK_SLH_DSA`) from PKCS #11 3.2 sections 6.67.1/6.68.1/6.69.1. Same source/ABI/span rules as every key-type value; establishes the key-type field exactly like the nine existing types. | Same retention as the key-type field; public only as the numeric scalar beside `parameter_set` and inside the eighteen combined labels. Never a standalone PQC key-type label, never taken from a mechanism. | Any other key-type value (including XMSS and vendor types) stays refused with no numeric fallback; a PQC type without a valid same-view parameter set labels nothing. The M2 `!is_established(1)` pin for key type 73 is the one superseded assertion (the superseding assertion lives in `key_operation_kem_encapsulate_binds_input_role`). |
 
 `CKA_SEED` (0x637) and `CKA_VALUE` (0x11) — the FIPS 203/204/205 seed
 and private values, Table 13 footnote 7 — stay excluded: no selector

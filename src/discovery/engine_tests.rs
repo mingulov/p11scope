@@ -65551,3 +65551,145 @@ fn reconcile_marked_waiter_vs_ungrouped_slice_settles_within_one_sweep() {
         "the marked waiter settles within one sweep"
     );
 }
+
+/// OPUS r4 B4F: B4 with 20 fresh-classified waiters (requested after the
+/// previous working tick started) against a 32-eviction reconcile. All
+/// waiters must settle within one sweep: eviction-freed slots reach
+/// pending waiters before never-touched slice candidates.
+#[test]
+fn opus_r4_b4_fresh_waiters_settle_within_one_sweep() {
+    let (sleeps, _hold) = opus_spawn_static_sleeps(200);
+    let mut sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    sleep_pids.sort_unstable();
+    let cap = 40usize;
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], Some(cap));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    for _ in 0..40 {
+        if engine.views.len() >= cap {
+            break;
+        }
+        refresh_inventory_once(&mut engine);
+    }
+    assert_eq!(engine.views.len(), cap, "rotation fills the cap");
+    if engine.scheduler.over_cap_passes() % 2 == 1 {
+        refresh_inventory_once(&mut engine);
+        assert_eq!(engine.views.len(), cap);
+    }
+    let (waiters_g, _hold2) = opus_spawn_static_sleeps(20);
+    let waiters: Vec<u32> = waiters_g.iter().map(|guard| guard.pid()).collect();
+    let mut listing = sleep_pids.clone();
+    listing.extend(waiters.iter().copied());
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    let park = *opus_probe_view_pids(&engine).iter().max().unwrap();
+    engine.scheduler.advance_cursor(park);
+    let sweeps0 = engine.scheduler.reconcile_sweeps_for_test();
+    refresh_inventory_once(&mut engine);
+    assert_eq!(
+        engine.scheduler.reconcile_sweeps_for_test(),
+        sweeps0,
+        "an ordinary pass"
+    );
+    // A long-running capture has had a working tick before this one.
+    engine
+        .scheduler
+        .begin_deep_scan_tick(crate::attach::monotonic_ns());
+    for pid in &waiters {
+        let had = engine.refresh_requested.get(pid).map(|r| r.first_seen_ns);
+        assert!(engine.request_refresh(*pid, crate::attach::monotonic_ns()));
+        eprintln!(
+            "OPUS-B4F request pid={pid} existing={had:?} now_seen={:?}",
+            engine
+                .refresh_requested
+                .get(pid)
+                .and_then(|r| r.first_seen_ns)
+        );
+    }
+    let mut settled = 0usize;
+    for pass in 0..24 {
+        let evictions = engine.exploratory_evictions;
+        refresh_inventory_once(&mut engine);
+        let after = opus_probe_view_pids(&engine);
+        settled = waiters.iter().filter(|pid| after.contains(pid)).count();
+        let sweeps = engine.scheduler.reconcile_sweeps_for_test() - sweeps0;
+        eprintln!(
+            "OPUS-B4F pass={pass} sweeps={sweeps} evicted={} waiters_settled={settled}/20 views={}",
+            engine.exploratory_evictions - evictions,
+            after.len()
+        );
+        if sweeps >= 1 {
+            break;
+        }
+    }
+    assert_eq!(settled, 20, "every fresh waiter settles within one sweep");
+}
+
+/// OPUS r4 B4H: eviction budget 1, one fresh waiter requested right
+/// before each reconcile pass (the ordinary pass between has no pending
+/// work, so no window clears the owed flag). Each waiter must take its
+/// sweep's only freed slot ahead of the never-touched slice candidate.
+#[test]
+fn opus_r4_b4_owed_lead_never_hands_the_freed_slot_to_rotation() {
+    let (sleeps, _hold) = opus_spawn_static_sleeps(200);
+    let mut sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
+    sleep_pids.sort_unstable();
+    let cap = 40usize;
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &sleep_pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], Some(cap));
+    let mut engine = Engine::discover(&args, &scope, None).expect("a capped cgroup captures");
+    engine.scheduler.set_quantum_ns_for_test(u64::MAX);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    for _ in 0..40 {
+        if engine.views.len() >= cap {
+            break;
+        }
+        refresh_inventory_once(&mut engine);
+    }
+    assert_eq!(engine.views.len(), cap, "rotation fills the cap");
+    engine.scheduler.set_max_evictions_for_test(1);
+    engine
+        .scheduler
+        .begin_deep_scan_tick(crate::attach::monotonic_ns());
+    let (waiters_g, _hold2) = opus_spawn_static_sleeps(3);
+    let waiters: Vec<u32> = waiters_g.iter().map(|guard| guard.pid()).collect();
+    let mut listing = sleep_pids.clone();
+    for waiter in &waiters {
+        listing.push(*waiter);
+    }
+    listing.sort_unstable();
+    e06_write_listing(scope_dir.path(), &listing);
+    let mut outcomes = Vec::new();
+    for waiter in &waiters {
+        // Advance to the pass before a reconcile (B4's parity rule).
+        let mut guard = 0;
+        while engine.scheduler.over_cap_passes() % 2 == 0 {
+            refresh_inventory_once(&mut engine);
+            guard += 1;
+            assert!(guard < 8);
+        }
+        assert!(engine.request_refresh(*waiter, crate::attach::monotonic_ns()));
+        let before = engine.scheduler.reconcile_sweeps_for_test();
+        refresh_inventory_once(&mut engine);
+        assert!(
+            engine.scheduler.reconcile_sweeps_for_test() > before,
+            "a reconcile pass"
+        );
+        let settled = opus_probe_view_pids(&engine).contains(waiter);
+        eprintln!(
+            "OPUS-B4H waiter={waiter} settled_in_its_sweep={settled} views={}",
+            engine.views.len()
+        );
+        outcomes.push(settled);
+    }
+    assert!(
+        outcomes.iter().all(|settled| *settled),
+        "a fresh waiter lost the only freed slot: {outcomes:?}"
+    );
+}

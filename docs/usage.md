@@ -1329,10 +1329,14 @@ Limits that matter in pods:
   coordinates. Sampling targets1s within fixed budgets; a sample older than10s
   becomes stale, and failures clear current hints. Text/dashboard detail shows
   sampled-at/age and endpoint-only validity; equal endpoints do not exclude an
-  intervening migration. Concise text prints one scope line per labeled caller,
-  e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker, cgroup hint)`;
-  stale rows append `, stale`, retired rows `, exited`, and a `caller context:`
-  line counts labeled, unknown and pending callers. Verbose text and JSON show
+  intervening migration. Concise text prints one scope line per labeled caller
+  with edges, e.g. `caller pkcs11-tool pid 4242: 17 entries observed, container 0123456789ab (docker, cgroup hint)`
+  and `caller gated pid 7: 1 entry observed, pod 12345678 / container 0123456789ab (cgroup hint)`;
+  stale rows append `, stale`, retired rows `, exited` (JSON `historical`), and a `caller context:`
+  line counts labeled, unknown and pending callers with edges. At most eight
+  scope lines print; sampled host rows that matched no container pattern
+  (including Podman/libpod, left unrecognized) stay silent even when stale
+  or historical. Verbose text and JSON show
   the full 64-hex ID. Installed two-container, synthetic-pod and host-view
   real-kind-pod qualification passed on Fedora 7.2 in v0.7.0; in-node kind
   (observer inside the node) remains open (nested-PID-namespace binding

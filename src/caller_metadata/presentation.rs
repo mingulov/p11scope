@@ -342,6 +342,8 @@ pub(crate) fn concise_scope_label(metadata: &CallerMetadata, verbose: bool) -> O
     let freshness = match metadata.status {
         MetadataStatus::Sampled => None,
         MetadataStatus::Stale => Some("stale"),
+        // Concise display word for a retired caller; JSON and the verbose
+        // detail line use the canonical `historical` status label.
         MetadataStatus::Historical => Some("exited"),
         MetadataStatus::Pending => Some("pending"),
         MetadataStatus::Unknown => Some("unknown"),

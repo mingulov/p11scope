@@ -502,6 +502,28 @@ pub(crate) fn nonunique_inode_kind(f_type: u64) -> Option<&'static str> {
 /// mount's `inode32`/`inode64` option, read from the mount table.
 pub(crate) const TMPFS_SUPER_MAGIC: u64 = 0x0102_1994;
 
+/// The non-unique-inode kind for a tmpfs mount with these super-options
+/// (`None` when the mount table could not be read), or `None` when its
+/// inode numbers name one file. Pure so every option shape is
+/// unit-testable without mounting it.
+pub(crate) fn tmpfs_nonunique_kind(super_options: Option<&str>) -> Option<&'static str> {
+    // Tmpfs with 64-bit inode numbers is unique; with `inode32` the
+    // 32-bit counter wraps and two live files can share a number. An
+    // unreadable mount table fails closed. The option is matched as a
+    // whole comma-separated token, never a substring. A tmpfs line
+    // showing neither token (a kernel built without the inode64
+    // option) counts as unique: refusing it would drop every tmpfs
+    // object on such kernels, while the collision it risks needs
+    // billions of allocations plus an exact pin match.
+    match super_options {
+        None => Some("tmpfs-inode32"),
+        Some(options) if options.split(',').any(|token| token == "inode32") => {
+            Some("tmpfs-inode32")
+        }
+        Some(_) => None,
+    }
+}
+
 /// Whether inode numbers on a filesystem with this `fstatfs` magic name
 /// one file per device, given the mount's super-options (`None` when the
 /// mount table could not be read). Pure so every listed filesystem is
@@ -513,15 +535,7 @@ pub(crate) fn inodes_name_one_file(f_type: u64, super_options: Option<&str>) -> 
     if f_type != TMPFS_SUPER_MAGIC {
         return true;
     }
-    // Tmpfs with 64-bit inode numbers is unique; with `inode32` the
-    // 32-bit counter wraps and two live files can share a number. An
-    // unreadable mount table fails closed. The option is matched as a
-    // whole comma-separated token, never a substring. A tmpfs line
-    // showing neither token (a kernel built without the inode64
-    // option) counts as unique: refusing it would drop every tmpfs
-    // object on such kernels, while the collision it risks needs
-    // billions of allocations plus an exact pin match.
-    super_options.is_some_and(|options| !options.split(',').any(|token| token == "inode32"))
+    tmpfs_nonunique_kind(super_options).is_none()
 }
 
 /// The super-options field of mount `mnt_id` in a mountinfo table, or
@@ -579,11 +593,7 @@ fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, S
         .parse()
         .map_err(|_| format!("invalid fd mount identity {mount_id:?}"))?;
     let super_options = mount_super_options(&mountinfo, mount_id);
-    if inodes_name_one_file(f_type, super_options) {
-        Ok(None)
-    } else {
-        Ok(Some("tmpfs-inode32"))
-    }
+    Ok(tmpfs_nonunique_kind(super_options))
 }
 
 /// Whether identity decisions may treat this fd's `(st_dev, st_ino)` as
@@ -12137,6 +12147,21 @@ mod tests {
             None,
             "a line without the separator is malformed"
         );
+    }
+
+    #[test]
+    fn tmpfs_unresolved_mount_is_a_distinct_nonunique_kind() {
+        // A tmpfs mount the table cannot resolve (absent row, malformed
+        // line, container fd via the observer's table) fails closed but
+        // must not borrow the `inode32` name: operators reading the gap
+        // would otherwise chase a mount option that is not set.
+        assert_eq!(tmpfs_nonunique_kind(None), Some("tmpfs-unresolved"));
+        assert_eq!(
+            tmpfs_nonunique_kind(Some("rw,size=1024k,inode32")),
+            Some("tmpfs-inode32")
+        );
+        assert_eq!(tmpfs_nonunique_kind(Some("rw,inode64")), None);
+        assert_eq!(tmpfs_nonunique_kind(Some("rw,relatime")), None);
     }
 
     #[test]

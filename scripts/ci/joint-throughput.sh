@@ -655,7 +655,9 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=pass0-timeout" || return 1
         return 0
     fi
-    log "$cell: pass 0 published; spawning the keyed generator"
+    log "$cell: pass 0 published; waiting 30 s for uprobe attach to complete"
+    sleep 30
+    log "$cell: spawning the keyed generator"
     GEN_CALLS_SETUP_GATE="$dir/setup_go" SOFTHSM2_CONF="$SOFT_CONF" \
         "$GEN" "$PROVIDER" "$mode" "$RATE" "$DURATION" \
         "$dir/hot.jsonl" "$dir/go" "$dir/finish" \

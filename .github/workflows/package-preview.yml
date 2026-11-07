@@ -332,7 +332,7 @@ jobs:
           test "$code" -eq 0 -o "$code" -eq 1
           grep -q '^Doctor:' smoke-doctor.txt
           docker run --rm "${flags[@]}" p11scope-observer:preview \
-            inventory --system --duration 10 --json >smoke-inventory.json 2>smoke-inventory.err
+            inventory --system --duration 15 --json >smoke-inventory.json 2>smoke-inventory.err
           echo "inventory exit=$?"
           python3 -I - smoke-inventory.json smoke-inventory.err <<'PY'
           import json

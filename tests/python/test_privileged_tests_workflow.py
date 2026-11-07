@@ -560,11 +560,15 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "missing-cap-cap_sys_ptrace-p4",
                      "missing-cap-cap_sys_ptrace-p3",
                      "inventory-system", "run-minimal",
-                     "run-child-drops-caps", "postsetup-drops-sysadmin"):
+                     "run-child-drops-caps", "postsetup-drops-sysadmin",
+                     "run-sudo", "run-user-nobody",
+                     "run-kill-on-timeout", "trace-sudo-out",
+                     "daemonset-doctor", "daemonset-profile",
+                     "daemonset-inventory"):
             with self.subTest(cell=cell):
                 self.assertIn(f"--require {cell}", job)
         # Artifacts carry the minimal evidence.
-        self.assertIn("minimal-cells/tmp/out/*.out", job)
+        self.assertIn("minimal-cells/logs/*.out", job)
         self.assertIn("minimal.log", job)
 
     def test_witness_cli_matrix_runs_host_and_the_four_pinned_guests(self):

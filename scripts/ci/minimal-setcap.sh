@@ -59,7 +59,13 @@ restore_paranoid() { sysctl -w kernel.perf_event_paranoid="$SAVED_PARANOID" >/de
 cleanup() {
   restore_paranoid
   [ -n "${NOBODYOUT:-}" ] && rm -rf "$NOBODYOUT"
-  [ -n "${CELLTMP:-}" ] && rm -rf "$CELLTMP"
+  # Keep the detailed row logs beside the results for failed-run
+  # debugging (CELLTMP itself lives under /var/tmp and is removed).
+  if [ -n "${CELLTMP:-}" ] && [ -d "$CELLTMP/out" ]; then
+    rm -rf "$OUT/logs"
+    cp -r "$CELLTMP/out" "$OUT/logs" 2>/dev/null || true
+    rm -rf "$CELLTMP"
+  fi
 }
 trap cleanup EXIT
 cat >"$CELLTMP/workload.c" <<'EOF'
@@ -116,6 +122,46 @@ int main(int argc, char **argv) {
 }
 EOF
 gcc -O1 -o "$CELLTMP/sleeper" "$CELLTMP/sleeper.c" || exit 2
+# Capability-drop helper for the DaemonSet rows: root with exactly the
+# shipped grant (SYS_ADMIN, SYS_PTRACE, DAC_READ_SEARCH), via bounding
+# drops plus capset, then exec. capsh cannot restrict root across exec
+# (a bare uid-0 exec re-grants full), so this tiny helper does it.
+cat >"$CELLTMP/dropcaps.c" <<'EOF'
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <errno.h>
+#include <sys/syscall.h>
+#include <sys/prctl.h>
+#include <linux/capability.h>
+#include <linux/prctl.h>
+int main(int argc, char **argv) {
+    if (argc < 3) { fprintf(stderr, "usage: dropcaps MASK CMD...\n"); return 2; }
+    unsigned long long keep = strtoull(argv[1], 0, 0);
+    for (int cap = 0; cap <= 40; cap++) {
+        if (!(keep & (1ULL << cap))) {
+            if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) && errno != EINVAL)
+                { perror("PR_CAPBSET_DROP"); return 1; }
+        }
+    }
+    struct __user_cap_header_struct hdr = { _LINUX_CAPABILITY_VERSION_3, 0 };
+    struct __user_cap_data_struct data[2];
+    if (syscall(SYS_capget, &hdr, data)) { perror("capget"); return 1; }
+    data[0].effective &= (unsigned)(keep & 0xffffffffULL);
+    data[0].permitted &= (unsigned)(keep & 0xffffffffULL);
+    data[0].inheritable &= (unsigned)(keep & 0xffffffffULL);
+    data[1].effective &= (unsigned)((keep >> 32) & 0xffffffffULL);
+    data[1].permitted &= (unsigned)((keep >> 32) & 0xffffffffULL);
+    data[1].inheritable &= (unsigned)((keep >> 32) & 0xffffffffULL);
+    if (syscall(SYS_capset, &hdr, data)) { perror("capset"); return 1; }
+    if (prctl(PR_CAP_AMBIENT, PR_CAP_AMBIENT_CLEAR_ALL, 0, 0, 0)) { perror("ambient"); return 1; }
+    execvp(argv[2], argv + 2);
+    perror("exec");
+    return 127;
+}
+EOF
+gcc -O1 -o "$CELLTMP/dropcaps" "$CELLTMP/dropcaps.c" || exit 2
 FULL_CAPS="cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace"
 mkobserver() { # NAME CAPSPEC — copy staged under CELLTMP/bin with CAPSPEC=ep
   # A failed copy must abort: setcap would happily label the truncation.
@@ -219,6 +265,7 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
   rc=$?
   stop_workload "$wpid"
   err=$CELLTMP/out/miss-$lower-p$paranoid.err
+  out=$CELLTMP/out/miss-$lower-p$paranoid.out
   detail="paranoid=$paranoid exit=$rc"
   pass=1
   grep -q "needs $cap" "$err" || pass=0
@@ -226,6 +273,18 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
     CAP_BPF|CAP_PERFMON)
       grep -q "Grant the minimal set: sudo setcap" "$err" || pass=0
       [ "$rc" -ne 0 ] || pass=0
+      ;;
+    CAP_CHECKPOINT_RESTORE)
+      # Degraded proof only: counts stay complete for an in-scan-cap
+      # target, and the coverage line must say so (no silent success).
+      [ "$rc" -eq 0 ] || pass=0
+      grep -q "counts complete" "$out" || pass=0
+      ;;
+    CAP_DAC_READ_SEARCH)
+      # No target read: the coverage line must disclose the partial
+      # scan, not just the stderr needs-line.
+      [ "$rc" -eq 0 ] || pass=0
+      grep -q "memory scan unavailable" "$out" || pass=0
       ;;
     *)
       [ "$rc" -eq 0 ] || pass=0
@@ -242,17 +301,33 @@ for paranoid in $(paranoid_values); do
   done
 done
 sysctl -w kernel.perf_event_paranoid="$SAVED_PARANOID" >/dev/null || exit 2
-# inventory --system as nobody with the full set (current paranoid only).
+# inventory --system as nobody with the full set (current paranoid only),
+# with a calling SoftHSM workload so the report must name its module
+# and at least one caller edge (guards the 0-endpoint silent pass).
+wlog=$CELLTMP/out/workload-inventory.log
+wpid=$(start_workload 200 "$wlog") || exit 2
 json=$NOBODYOUT/inventory-system.json
 as_nobody timeout 300 "$CELLTMP/bin/full" inventory --system --duration 10s -o "$json" \
   >"$CELLTMP/out/inventory-system.out" 2>"$CELLTMP/out/inventory-system.err"
 rc=$?
+stop_workload "$wpid"
 mv -f "$json" "$CELLTMP/out/" 2>/dev/null || true
 json=$CELLTMP/out/inventory-system.json
 pass=1
 [ "$rc" -eq 0 ] || pass=0
-python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$json" || pass=0
-row inventory-system "$pass" qualified "exit=$rc"
+if python3 -I - "$json" <<'PY'; then
+import json, sys
+doc = json.load(open(sys.argv[1]))
+modules = [m.get("path", "") for m in doc.get("modules", [])]
+assert any("libsofthsm2" in p for p in modules), modules
+assert len(doc.get("edges", [])) > 0, "no caller edges"
+PY
+  detail="exit=$rc module+edge present"
+else
+  pass=0
+  detail="exit=$rc module or edge missing"
+fi
+row inventory-system "$pass" qualified "$detail"
 # run as nobody with the full set (current paranoid only).
 as_nobody timeout 120 "$CELLTMP/bin/full" run --duration 10s -- "$CELLTMP/workload" 40 \
   >"$CELLTMP/out/run.out" 2>"$CELLTMP/out/run.err"
@@ -365,6 +440,84 @@ fi
 wait "$opid" || pass=0
 stop_workload "$wpid"
 row postsetup-drops-sysadmin "$pass" qualified "$detail"
+# Root `run` rows: the sudo drop re-owns the child without `--user`
+# (SETUID/SETGID) and the parent signals across uids (KILL). Without
+# those keeps the child dies EPERM and the run reports "original
+# process exited before proc acquisition".
+SUDO_IDS="SUDO_UID=$(id -u nobody) SUDO_GID=$(id -g nogroup 2>/dev/null || id -g nobody)"
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" run --duration 8s -- "$CELLTMP/workload" 40 \
+  >"$CELLTMP/out/run-sudo.out" 2>"$CELLTMP/out/run-sudo.err"
+rc=$?
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -qE "[1-9][0-9]* completed calls" "$CELLTMP/out/run-sudo.out" || pass=0
+row run-sudo "$pass" qualified "exit=$rc $(grep -E 'completed calls' "$CELLTMP/out/run-sudo.out" | head -c 120)"
+timeout 120 "$CELLTMP/bin/full" run --user nobody --duration 8s -- "$CELLTMP/workload" 40 \
+  >"$CELLTMP/out/run-user.out" 2>"$CELLTMP/out/run-user.err"
+rc=$?
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -qE "[1-9][0-9]* completed calls" "$CELLTMP/out/run-user.out" || pass=0
+row run-user-nobody "$pass" qualified "exit=$rc $(grep -E 'completed calls' "$CELLTMP/out/run-user.out" | head -c 120)"
+# --kill-on-timeout across uids: the observer must signal (KILL) the
+# re-owned sleeper at duration end instead of leaving it running.
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" run --kill-on-timeout --duration 5s -- "$CELLTMP/sleeper" 60 \
+  >"$CELLTMP/out/run-kill.out" 2>"$CELLTMP/out/run-kill.err"
+rc=$?
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -q "child still running" "$CELLTMP/out/run-kill.err" && pass=0
+row run-kill-on-timeout "$pass" qualified "exit=$rc"
+# Sudo `trace -o` into an invoker-owned directory: the preflight hands
+# the stream over (CHOWN), then the first write chmods it private
+# (FOWNER) — without FOWNER the handover breaks with EPERM.
+SUDODIR=$(mktemp -d /tmp/trace-sudo-out.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+wlog=$CELLTMP/out/workload-tracesudo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" trace --pid "$wpid" --duration 6s -o "$SUDODIR/trace.txt" \
+  >"$CELLTMP/out/trace-sudo.out" 2>"$CELLTMP/out/trace-sudo.err"
+rc=$?
+stop_workload "$wpid"
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+[ -s "$SUDODIR/trace.txt" ] || pass=0
+[ "$(stat -c %U "$SUDODIR/trace.txt")" = "nobody" ] || pass=0
+[ "$(stat -c %a "$SUDODIR/trace.txt")" = "600" ] || pass=0
+row trace-sudo-out "$pass" qualified "exit=$rc owner=$(stat -c %U:%a "$SUDODIR/trace.txt" 2>/dev/null)"
+rm -rf "$SUDODIR"
+# DaemonSet rows: root with exactly the shipped grant (SYS_ADMIN,
+# SYS_PTRACE, DAC_READ_SEARCH). The observer must retain SYS_ADMIN as
+# the only BPF/map_files grant instead of dropping to an unusable set.
+DAEMONSET=0x280004
+"$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/full" doctor \
+  >"$CELLTMP/out/daemonset-doctor.out" 2>"$CELLTMP/out/daemonset-doctor.err"
+rc=$?
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -q "capture available" "$CELLTMP/out/daemonset-doctor.out" || pass=0
+row daemonset-doctor "$pass" qualified "exit=$rc"
+wlog=$CELLTMP/out/workload-daemonset.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+"$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/full" profile --pid "$wpid" --duration 6s \
+  >"$CELLTMP/out/daemonset-profile.out" 2>"$CELLTMP/out/daemonset-profile.err"
+rc=$?
+stop_workload "$wpid"
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -q "counts complete" "$CELLTMP/out/daemonset-profile.out" || pass=0
+row daemonset-profile "$pass" qualified "exit=$rc"
+wlog=$CELLTMP/out/workload-daemonset-inv.log
+wpid=$(start_workload 200 "$wlog") || exit 2
+"$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/full" inventory --system --duration 8s -o "$CELLTMP/out/daemonset-inventory.json" \
+  >"$CELLTMP/out/daemonset-inventory.out" 2>"$CELLTMP/out/daemonset-inventory.err"
+rc=$?
+stop_workload "$wpid"
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$CELLTMP/out/daemonset-inventory.json" || pass=0
+row daemonset-inventory "$pass" qualified "exit=$rc"
 trap - EXIT
 cleanup
 if [ "$FAILED" -ne 0 ]; then

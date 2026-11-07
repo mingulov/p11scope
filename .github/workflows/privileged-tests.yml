@@ -1019,7 +1019,11 @@ jobs:
             --require missing-cap-cap_dac_read_search-p4 --require missing-cap-cap_dac_read_search-p3 \
             --require missing-cap-cap_sys_ptrace-p4 --require missing-cap-cap_sys_ptrace-p3 \
             --require inventory-system --require run-minimal \
-            --require run-child-drops-caps --require postsetup-drops-sysadmin
+            --require run-child-drops-caps --require postsetup-drops-sysadmin \
+            --require run-sudo --require run-user-nobody \
+            --require run-kill-on-timeout --require trace-sudo-out \
+            --require daemonset-doctor --require daemonset-profile \
+            --require daemonset-inventory
           # The wrapper translates the documented nonqualifying-smoke exit 2
           # to 0 when results exist; the per-cell checks below still decide.
           python3 -I - "$out/cells/results.jsonl" <<'PY'
@@ -1117,9 +1121,9 @@ jobs:
             ${{ github.workspace }}/cli-out/qual.log
             ${{ github.workspace }}/cli-out/minimal.log
             ${{ github.workspace }}/cli-out/minimal-cells/results.jsonl
-            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.out
-            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.err
-            ${{ github.workspace }}/cli-out/minimal-cells/tmp/out/*.json
+            ${{ github.workspace }}/cli-out/minimal-cells/logs/*.out
+            ${{ github.workspace }}/cli-out/minimal-cells/logs/*.err
+            ${{ github.workspace }}/cli-out/minimal-cells/logs/*.json
             ${{ github.workspace }}/cli-out/vng-console.log
             ${{ runner.temp }}/qual.log
             ${{ runner.temp }}/minimal.log

@@ -345,14 +345,55 @@ def check_changed(**overrides):
 
 MIDCAPTURE_STAMPS = ("t-profile-ready=100 t-bpre-ledger=200 t-patch=300 "
                      "t-b2-ledger=400 t-profile-end=500\n")
-NOTE_MIDCAPTURE = NOTE_CHANGED + " (mid-capture: the patch landed mid-profile)"
+NOTE_MIDCAPTURE = (NOTE_CHANGED + " (mid-capture: the profile started before "
+                   "the patch, so the stale ledger is exact on the lower row "
+                   "and the fresh ledger is unattributed; the profile "
+                   "discloses provider_changed with a lossy observation)")
+
+
+def midcapture_profile(iters_s=ITERS_S):
+    """The mid-window cgroup-B profile: stale exact, fresh unattributed.
+
+    Discovery attaches once at capture start, when only the lower file
+    exists: one module, one unmarked discovery row, the stale ledger S on
+    the lower functions. The upper file (and B2's fresh ledger) never
+    joins the profile; the observer discloses that as provider_changed
+    with a lossy observation and a concrete_gap verdict.
+    """
+    lower = {"dev": [0, 140], "ino": 100, "sha256": SHA_LOWER}
+    functions = []
+    for name in NAMES:
+        functions.append({"names": [name], "calls": iters_s, "errors": 0,
+                          "module": dict(lower), "module_ambiguous": False})
+    functions.append({"calls": 0, "errors": 0, "names": ["C_Login"],
+                      "module": None})
+    return {
+        "capture": {"scope": "cgroup",
+                    "modules": [{"path": PROVIDER, **lower}]},
+        "evidence": {
+            "discovery": [{"path": PROVIDER, **lower, "build_id": "bd"}],
+            "attached_probes": 136,
+            "event_loss": 0,
+            "in_flight_at_end": 0,
+            "provider_changed": True,
+            "verdict_detail": "concrete_gap",
+            "pid_namespace": {"observer": "initial", "kernel_pids": "initial",
+                              "proc_pids": "observer"},
+            "gap_classes": {"observation": {
+                "causes": ["skipped", "provider_changed",
+                           "pid_descendant_gaps"],
+                "status": "lossy"}},
+        },
+        "functions": functions,
+    }
 
 
 def good_midcapture_inputs():
-    """Healthy D1-changed-midcapture legs: settled shapes, window stamps."""
+    """Healthy D1-changed-midcapture legs: settled legs, lossy profile."""
     inputs = good_changed_inputs()
     inputs["run_note"] = NOTE_MIDCAPTURE
     inputs["facts_text"] = changed_facts() + MIDCAPTURE_STAMPS
+    inputs["profile"] = midcapture_profile()
     return inputs
 
 
@@ -1183,6 +1224,43 @@ class CopyUpMidcaptureTest(unittest.TestCase):
             modules=dict(CHANGED_MODULES), shas=dict(CHANGED_SHAS))
         with self.assertRaises(AssertionError):
             check_midcapture(kernel=kernel)
+
+    def test_midcapture_settled_profile_fails(self):
+        """A dual exact profile is the settled shape, not a mid shape."""
+        with self.assertRaises(AssertionError):
+            check_midcapture(profile=changed_profile())
+
+    def test_midcapture_undisclosed_loss_fails(self):
+        """A single row without the provider_changed disclosure fails."""
+        profile = midcapture_profile()
+        profile["evidence"]["provider_changed"] = False
+        profile["evidence"]["verdict_detail"] = "attribution_only"
+        profile["evidence"]["gap_classes"]["observation"] = {
+            "causes": [], "status": "exact"}
+        with self.assertRaises(AssertionError):
+            check_midcapture(profile=profile)
+
+    def test_midcapture_fresh_row_fails(self):
+        """The upper file never joins a mid-window profile."""
+        profile = midcapture_profile()
+        upper = {"dev": [0, 140], "ino": 100, "sha256": SHA_UPPER}
+        profile["functions"].append(
+            {"names": ["C_GenerateRandom"], "calls": ITERS_F, "errors": 0,
+             "module": upper, "module_ambiguous": False})
+        with self.assertRaises(AssertionError):
+            check_midcapture(profile=profile)
+
+    def test_midcapture_stale_short_fails(self):
+        """The stale ledger stays exact even mid-window."""
+        with self.assertRaises(AssertionError):
+            check_midcapture(profile=midcapture_profile(iters_s=ITERS_S - 1))
+
+    def test_midcapture_marked_lower_fails(self):
+        """One file at attach time means no pair marker on the row."""
+        profile = midcapture_profile()
+        profile["evidence"]["discovery"][0]["layer"] = "pre_copy_up"
+        with self.assertRaises(AssertionError):
+            check_midcapture(profile=profile)
 
 
 class LateReportedTest(unittest.TestCase):

@@ -812,8 +812,65 @@ def require_changed_profile_dual_rows(document, iters_s, iters_f, lower_sha,
     assert evidence["gap_classes"]["observation"]["causes"] == [], (label, evidence)
 
 
+def require_changed_profile_mid_rows(document, iters_s, lower_sha,
+                                     upper_sha, label,
+                                     module_suffix=PROVIDER):
+    """The mid-window cgroup-B profile: stale exact, fresh unattributed.
+
+    Discovery attaches once at capture start, when only the lower file
+    exists: exactly one module and one discovery row, both the lower
+    sha, the discovery row unmarked (one file at attach time means no
+    pair marker). Each ledgered name counts the stale ledger S on the
+    lower row, zero errors, unambiguous; no function, discovery, or
+    module row may name the upper sha (the upper file never joins a
+    profile that started before the patch). The miss is disclosed, not
+    silent: provider_changed is true, the observation is lossy with
+    provider_changed among its causes, and the verdict is concrete_gap.
+    Zero event loss, zero in-flight rows: the loss is the unprobed
+    upper file, nothing else.
+    """
+    modules = [module for module in document["capture"]["modules"]
+               if module["path"].endswith(module_suffix)]
+    assert len(modules) == 1, (label, "want only the lower row", modules)
+    assert modules[0].get("sha256") == lower_sha, (label, modules)
+    rows = [row for row in document["evidence"]["discovery"]
+            if row["path"].endswith(module_suffix)]
+    assert len(rows) == 1, (label, "want only the lower row", rows)
+    assert rows[0].get("sha256") == lower_sha, (label, rows)
+    assert rows[0].get("layer") is None, (label, "lower row marked", rows)
+    for name in sorted(LEDGER_FUNCTIONS):
+        named = [row for row in document["functions"]
+                 if row.get("names") == [name] and row["calls"]]
+        assert len(named) == 1, \
+            (label, name, "want only the stale row", named)
+        module = named[0].get("module")
+        assert isinstance(module, dict), (label, name, named[0])
+        assert module.get("sha256") == lower_sha, (label, name, named[0])
+        assert named[0]["calls"] == iters_s, \
+            (label, name, "stale count", named[0], iters_s)
+        assert named[0]["errors"] == 0, (label, name, named[0])
+        assert named[0].get("module_ambiguous") is False, \
+            (label, name, named[0])
+    for row in document["functions"]:
+        module = row.get("module") or {}
+        assert module.get("sha256") != upper_sha, \
+            (label, "the upper file joined the window", row)
+    evidence = document["evidence"]
+    assert document["capture"]["scope"] == "cgroup", (label, document["capture"])
+    require_initial_observer(evidence, label)
+    assert evidence["attached_probes"] > 0, (label, evidence)
+    assert evidence["event_loss"] == 0, (label, evidence)
+    assert evidence["in_flight_at_end"] == 0, (label, evidence)
+    assert evidence["provider_changed"] is True, (label, evidence)
+    assert evidence["verdict_detail"] == "concrete_gap", (label, evidence)
+    observation = evidence["gap_classes"]["observation"]
+    assert observation["status"] == "lossy", (label, evidence)
+    assert "provider_changed" in observation["causes"], (label, evidence)
+
+
 def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
-                    iters_f, run_note, facts_text, module_suffix=PROVIDER):
+                    iters_f, run_note, facts_text, module_suffix=PROVIDER,
+                    mid=False):
     """D1-changed: different-bytes copy-up, both mappers ledgered, both exact.
 
     pid_b_pre mapped the provider before the copy-up and keeps the lower
@@ -826,7 +883,9 @@ def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
     honestly gaps both joins (no witness, no edges — the negative); the
     cgroup-B profile counts the stale ledger S on the pre_copy_up row
     and the fresh ledger F on the upper row, both exact. S and F differ
-    so a swapped routing fails.
+    so a swapped routing fails. With mid=True the profile started before
+    the patch: only the lower row is exact and the fresh ledger is
+    unattributed but disclosed (provider_changed, lossy observation).
     """
     assert isinstance(facts_text, str) and facts_text.strip(), "facts.log is empty"
     facts = parse_facts(facts_text)
@@ -895,8 +954,8 @@ def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
         (label, "B-pre edges", pid_b_pre, k_edges.get(pid_b_pre), lower_ids)
     assert sorted(k_edges[pid_b2]) == upper_ids, \
         (label, "B2 edges", pid_b2, k_edges.get(pid_b2), upper_ids)
-    for pid, mid in ((pid_b_pre, lower_ids[0]), (pid_b2, upper_ids[0])):
-        mapping = k_records[(pid, mid)]["mapping"]
+    for pid, mod in ((pid_b_pre, lower_ids[0]), (pid_b2, upper_ids[0])):
+        mapping = k_records[(pid, mod)]["mapping"]
         assert mapping["evidence"] == "deep_scan", (label, pid, mapping)
         assert mapping["state"] == "mapped", (label, pid, mapping)
     for pid in (pid_b_pre, pid_b2):
@@ -916,8 +975,14 @@ def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
         assert token in run_note, \
             ("run log without the copy-up proof facts", token)
 
-    require_changed_profile_dual_rows(profile, iters_s, iters_f, lower_sha,
-                                      upper_sha, "profile-b", module_suffix)
+    if mid:
+        require_changed_profile_mid_rows(profile, iters_s, lower_sha,
+                                         upper_sha, "profile-b",
+                                         module_suffix)
+    else:
+        require_changed_profile_dual_rows(profile, iters_s, iters_f,
+                                          lower_sha, upper_sha, "profile-b",
+                                          module_suffix)
     return {"check": "copy-up-changed", "ok": True,
             "lower_module": {"id": lower_ids[0],
                              "dev": [lower_device["major"],
@@ -944,18 +1009,20 @@ def copy_up_midcapture(kernel, userspace, profile, pid_b_pre, pid_b2,
                        module_suffix=PROVIDER):
     """D1-changed-midcapture: the patch lands DURING the running profile.
 
-    Same evidence as D1-changed, but the cgroup-B profile starts while B
+    Same legs as D1-changed, but the cgroup-B profile starts while B
     maps the single pre-copy-up file: B-pre's stale ledger completes
     inside the window, the unmapped-byte patch copies the file up
     mid-window, and the second mapper ledgers fresh on the upper copy
     before the window ends. The driver records the five window stamps in
     facts.log; they must be strictly increasing (fixed-width %s%N, so
     string order is time order), which proves the patch is strictly
-    inside the capture window. The settled legs then judge exactly as
+    inside the capture window. The settled inventories judge exactly as
     D1-changed: the kernel leg attributes B-pre to the witness-proven
     lower module and B2 to the upper module, the userspace leg honestly
-    gaps both joins, and the profile counts the stale ledger S on the
-    pre_copy_up row and the fresh ledger F on the upper row, both exact.
+    gaps both joins. The profile cannot: discovery attaches once at
+    capture start, so only the lower row is exact (the stale ledger S)
+    and the fresh ledger is unattributed — disclosed as provider_changed
+    with a lossy observation and a concrete_gap verdict, never silent.
     """
     facts = parse_facts(facts_text)
     for key in MIDCAPTURE_STAMPS:
@@ -969,7 +1036,7 @@ def copy_up_midcapture(kernel, userspace, profile, pid_b_pre, pid_b2,
         "run log does not name the mid-capture mode"
     result = copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2,
                              iters_s, iters_f, run_note, facts_text,
-                             module_suffix)
+                             module_suffix, mid=True)
     result["check"] = "copy-up-midcapture"
     result["window"] = dict(zip(MIDCAPTURE_STAMPS, stamps))
     return result
@@ -1744,10 +1811,41 @@ def self_test():
     mc_facts = ch_facts + mc_stamps
     mc_note = ch_note + " (mid-capture: the patch landed mid-profile)"
 
+    def good_midcapture_profile(iters_s=250):
+        lower = {"dev": [0, 140], "ino": 100, "sha256": ch_lower_sha}
+        functions = []
+        for name in sorted(LEDGER_FUNCTIONS):
+            functions.append({"names": [name], "calls": iters_s, "errors": 0,
+                              "module": dict(lower), "module_ambiguous": False})
+        functions.append({"calls": 0, "errors": 0, "names": ["C_Login"],
+                          "module": None})
+        return {
+            "capture": {"scope": "cgroup",
+                        "modules": [{"path": ST_PROVIDER, **lower}]},
+            "evidence": {
+                "discovery": [{"path": ST_PROVIDER, **lower,
+                               "build_id": "bd"}],
+                "attached_probes": 136,
+                "event_loss": 0,
+                "in_flight_at_end": 0,
+                "provider_changed": True,
+                "verdict_detail": "concrete_gap",
+                "pid_namespace": {"observer": "initial",
+                                  "kernel_pids": "initial",
+                                  "proc_pids": "observer"},
+                "gap_classes": {"observation": {
+                    "causes": ["skipped", "provider_changed",
+                               "pid_descendant_gaps"],
+                    "status": "lossy"}},
+            },
+            "functions": functions,
+        }
+
     def good_midcapture():
         inputs = good_changed()
         inputs["facts_text"] = mc_facts
         inputs["run_note"] = mc_note
+        inputs["profile"] = good_midcapture_profile()
         return inputs
 
     def mutate_midcapture(label, **overrides):
@@ -1773,6 +1871,28 @@ def self_test():
     mutate_midcapture("midcapture mappers swapped",
                       kernel=ch_inventory([st_edge(102, "m9"),
                                            st_edge(104, "m8")]))
+    mutate_midcapture("midcapture settled profile is not a mid shape",
+                      profile=good_changed_profile())
+    undisclosed = good_midcapture_profile()
+    undisclosed["evidence"]["provider_changed"] = False
+    undisclosed["evidence"]["verdict_detail"] = "attribution_only"
+    undisclosed["evidence"]["gap_classes"]["observation"] = {
+        "causes": [], "status": "exact"}
+    mutate_midcapture("midcapture loss without the disclosure",
+                      profile=undisclosed)
+    fresh = good_midcapture_profile()
+    fresh["functions"].append(
+        {"names": ["C_GenerateRandom"], "calls": 100, "errors": 0,
+         "module": {"dev": [0, 140], "ino": 100,
+                    "sha256": ch_upper_sha},
+         "module_ambiguous": False})
+    mutate_midcapture("midcapture fresh row joined the window",
+                      profile=fresh)
+    short = good_midcapture_profile(iters_s=249)
+    mutate_midcapture("midcapture stale row short", profile=short)
+    marked = good_midcapture_profile()
+    marked["evidence"]["discovery"][0]["layer"] = "pre_copy_up"
+    mutate_midcapture("midcapture lower row marked", profile=marked)
 
     late_module = "/tmp/private/libsofthsm2.so"
     late_modules = (("m7", (0, 412, 900), ST_PROVIDER),

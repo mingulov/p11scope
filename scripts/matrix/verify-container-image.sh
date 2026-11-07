@@ -379,6 +379,7 @@ leg_host() {
         docker rm -f "$name" >/dev/null 2>&1 || true
         return 1
     }
+    reclaim_root_output "$OUT/host.json" || return 1
     docker rm -f "$name" >/dev/null 2>&1 || return 1
     python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/host.json" spike/expected.txt \
         >>"$OUT/host-oracle.log" 2>&1 || return 1
@@ -445,6 +446,7 @@ leg_container() {
         docker rm -f "$name" >/dev/null 2>&1 || true
         return 1
     }
+    reclaim_root_output "$OUT/container.json" || return 1
     docker rm -f "$name" >/dev/null 2>&1 || return 1
     python3 -I scripts/check-capture-evidence.py clean-metrics "$OUT/container.json" spike/expected.txt \
         >>"$OUT/container-oracle.log" 2>&1 || return 1

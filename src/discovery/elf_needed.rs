@@ -292,9 +292,9 @@ pub(crate) struct ExtensiveState {
     /// capture; both share the caches and the capture budget below.
     pid_target: bool,
     /// 7.10b: under aggregate policy (`--mode metrics`) the kernel
-    /// stamps no EXEC ticket, so the gap stash seeds from
-    /// scope-admitted EXEC records without one. Detailed captures
-    /// keep requiring the ticket; PID scope never seeds the stash.
+    /// stamps no EXEC ticket, so the gap stash seeds from EXEC
+    /// records without one. Detailed captures keep requiring the
+    /// ticket; PID scope never seeds the stash.
     seed_without_ticket: bool,
     stash: BTreeMap<u32, StashedExe>,
     path_cache: BTreeMap<ObjectKey, PathBuf>,
@@ -329,9 +329,9 @@ impl ExtensiveState {
         self.enabled = on;
     }
 
-    /// 7.10b: allow the gap stash to seed from scope-admitted EXEC
-    /// records without a kernel ticket (aggregate policy only; the
-    /// kernel stamps no ticket there).
+    /// 7.10b: allow the gap stash to seed from EXEC records
+    /// without a kernel ticket (aggregate policy only; the kernel
+    /// stamps no ticket there).
     pub(crate) fn set_seed_without_ticket(&mut self, on: bool) {
         self.seed_without_ticket = on;
     }
@@ -422,9 +422,11 @@ impl ExtensiveState {
     }
 
     /// Row A: seed one pending exe identity from an EXEC record. The
-    /// stash is never bare-PID addressed: seeding requires the bounded
-    /// producer ticket, and consumption requires the stash timestamp to
-    /// precede the exit timestamp. A re-exec overwrites (latest wins);
+    /// stash is PID-keyed with timestamp-ordered consume-once:
+    /// consumption requires the stash timestamp to precede the exit
+    /// timestamp. Detailed seeding additionally requires the bounded
+    /// producer ticket; aggregate seeding does not. A re-exec
+    /// overwrites (latest wins);
     /// a full stash evicts the smallest PID first (deterministic).
     /// 7.10b: the gap stash seeds on generation-admitting scopes
     /// only (PID scope validates target execs directly instead), and
@@ -3263,9 +3265,9 @@ mod tests {
 
     // 7.10b: under aggregate policy (`--mode metrics`) the kernel
     // stamps no EXEC ticket, so an opted-in stash seeds from the
-    // scope-admitted EXEC's exe words and the gap exit classifies a
-    // real hint — the same join strength via admission plus
-    // timestamp ordering and consume-once.
+    // EXEC's exe words and the gap exit classifies a real hint —
+    // the same join strength via admission plus timestamp ordering
+    // and consume-once.
     #[test]
     fn aggregate_ticketless_exec_seeds_the_stash() {
         use p11scope_ebpf_common::DISCOVERY_KIND_EXEC;

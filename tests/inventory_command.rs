@@ -1584,3 +1584,196 @@ fn the_proof_stat_thread_note_prints_once_per_multi_pass_run() {
         "{passes} passes: {stderr}"
     );
 }
+
+/// `--event-log -` streams the versioned JSONL lines to stdout (one
+/// object per line, contiguous seqs, `started` to `ended`) while the
+/// human summary moves to stderr; `-` never names a file, and `-o`
+/// is unaffected.
+#[test]
+fn event_log_dash_streams_jsonl_to_stdout_and_summary_to_stderr() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-stdout");
+    let ready = dir.join("stdout.ready");
+    let driver = gcc(
+        &dir,
+        "stdout-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "stdout-prov.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let private = private_dir();
+    let document_path = private.path().join("stdout.json");
+    let stream_path = dir.join("stdout.jsonl");
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan", "--duration", "4s", "-o"])
+        .arg(&document_path)
+        .arg("--event-log")
+        .arg("-")
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &stream_path)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let _fixture = FixtureGuard { pids: vec![pid] };
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        !dir.join("-").exists(),
+        "`--event-log -` must not create a file named `-`"
+    );
+    let body = std::fs::read_to_string(&stream_path).unwrap();
+    let lines: Vec<Value> = body
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert!(lines.len() >= 3, "started, a pass marker and ended: {body}");
+    for (index, line) in lines.iter().enumerate() {
+        assert_eq!(line["schema"], "p11scope/inventory-events/v1", "{line}");
+        assert_eq!(line["seq"], index as u64, "{line}");
+    }
+    assert_eq!(lines.first().unwrap()["kind"], "started");
+    assert_eq!(lines.last().unwrap()["kind"], "ended");
+    assert_eq!(lines.last().unwrap()["event"]["stdout_lost"]["lines"], 0);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("--event-log - owns stdout"),
+        "the move is announced: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("inventory pid:{pid} (")),
+        "the text summary moved to stderr: {stderr}"
+    );
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&document_path).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{pid}"));
+}
+
+/// A stdout reader that goes away mid-run (`head -c` exits) never
+/// stalls capture: the observer sheds with counters, reports the
+/// loss on stderr, still commits its `-o` report, and exits 1.
+#[test]
+fn event_log_dash_reports_a_closed_stdout_and_keeps_the_report() {
+    use std::io::Read as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-epipe");
+    let ready = dir.join("epipe.ready");
+    let driver = gcc(
+        &dir,
+        "epipe-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "epipe-prov.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let private = private_dir();
+    let document_path = private.path().join("epipe.json");
+    let fifo = dir.join("events.fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+    // Hold the read end open so the observer's stdout redirect
+    // succeeds; the test drops it after the first event bytes.
+    let mut read_end = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NONBLOCK)
+        .open(&fifo)
+        .unwrap();
+    let mut child = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan", "--duration", "4s", "-o"])
+        .arg(&document_path)
+        .arg("--event-log")
+        .arg("-")
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &fifo)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .current_dir(&dir)
+        .spawn()
+        .unwrap();
+    let mut prefix = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline && !prefix.starts_with(b"{\"schema\"") {
+        let mut chunk = [0u8; 256];
+        match read_end.read(&mut chunk) {
+            Ok(n) => prefix.extend_from_slice(&chunk[..n]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) => panic!("reading the event fifo failed: {error}"),
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        prefix.starts_with(b"{\"schema\""),
+        "no event bytes arrived in 30s"
+    );
+    drop(read_end);
+    let output = child.wait_with_output().unwrap();
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let _fixture = FixtureGuard { pids: vec![pid] };
+    assert!(
+        !dir.join("-").exists(),
+        "`--event-log -` must not create a file named `-`"
+    );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a shed stream fails the command: {output:?}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("shed"), "the loss is reported: {stderr}");
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&document_path).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    assert_eq!(doc["scope"], format!("pid:{pid}"));
+}
+
+/// `--event-log -` beside `--json` or `--dashboard` is refused up
+/// front (exit 2), before anything is observed.
+#[test]
+fn event_log_dash_refuses_stdout_rivals_up_front() {
+    for rival in ["--json", "--dashboard"] {
+        let output = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+            .args(["inventory", "--pid", "1", "--event-log", "-", rival])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(2), "{rival}: {output:?}");
+        assert!(output.stdout.is_empty(), "{rival}: {output:?}");
+        let refusal = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            refusal.contains("--event-log - owns stdout"),
+            "{rival}: {refusal}"
+        );
+    }
+}

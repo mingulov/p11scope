@@ -11069,6 +11069,137 @@ mod tests {
         assert!(document["observation"].get("lane").is_none());
     }
 
+    /// A real pipe for `--event-log -` wiring tests: the event
+    /// writer acquires its own private description of the write end,
+    /// so the test's ends only close, fill and observe.
+    fn event_stdout_test_pipe() -> (std::fs::File, std::fs::File) {
+        use std::os::fd::FromRawFd as _;
+        let mut fds = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: `pipe` returned two fresh owned descriptors.
+        let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        // SAFETY: same call, the write end.
+        let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+        (read, write)
+    }
+
+    #[test]
+    fn event_stdout_runtime_refuses_json_and_dashboard() {
+        // The parser refuses these combinations; the runner repeats
+        // the refusal for programmatic callers, before any sink
+        // opens (no `-` file may appear).
+        for (json, dashboard) in [(true, false), (false, true)] {
+            let mut stdout = Vec::new();
+            let error = super::run_with_writer(
+                super::InspectScope::System,
+                &[],
+                &super::HookRegistry::builtin(),
+                json,
+                Some(1),
+                None,
+                None,
+                None,
+                dashboard,
+                Some(std::path::Path::new("-")),
+                None,
+                None,
+                super::CaptureMode::Scan,
+                crate::attach::BackendSelection::Auto,
+                &|| false,
+                &|| {},
+                false,
+                &mut super::WriterStdout(&mut stdout),
+            )
+            .expect_err("a stdout rival beside --event-log - must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("--event-log -"),
+                "the refusal names the owner: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn event_stdout_loss_surfaces_without_retiring() {
+        use std::os::fd::AsRawFd as _;
+        let (read, write) = event_stdout_test_pipe();
+        let mut stream = super::EventLogState::new(Some(
+            super::EventWriter::create_stdout_on_fd(
+                write.as_raw_fd(),
+                std::time::Duration::from_millis(10),
+            )
+            .unwrap(),
+        ));
+        drop(read);
+        // A shed batch reports immediately, like a file transport
+        // error — but the writer stays live for the next batch.
+        let first = stream.attempt("pass publication", |writer| {
+            writer.append("pass_committed", serde_json::json!({"pass": 0}), 100)
+        });
+        assert!(
+            first.is_some_and(|line| line.contains("shed")),
+            "a shed batch reports its loss"
+        );
+        assert!(
+            stream.writer.is_some(),
+            "a shed batch never retires the stdout sink"
+        );
+        let second = stream.attempt("pass publication", |writer| {
+            writer.append("pass_committed", serde_json::json!({"pass": 1}), 200)
+        });
+        assert!(second.is_some(), "later batches keep reporting");
+        assert!(stream.writer.is_some(), "the sink stays live");
+    }
+
+    #[test]
+    fn event_stdout_moves_the_text_summary_to_stderr() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let (mut read, write) = event_stdout_test_pipe();
+        let mut writer = super::EventWriter::create_stdout_on_fd(
+            write.as_raw_fd(),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        writer.begin_batch();
+        let mut stream = super::EventLogState::new(Some(writer));
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = super::Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let mut stdout = Vec::new();
+        let outcome = super::finish_output(
+            None,
+            &mut stream,
+            &mut super::StreamState::new(),
+            &view,
+            false,
+            false,
+            &mut super::WriterStdout(&mut stdout),
+            None,
+            None,
+        );
+        assert!(
+            stdout.is_empty(),
+            "stdout carries events only, never the human summary"
+        );
+        assert_eq!(outcome.exit_code(), 0);
+        // The stream itself completed: `ended` reached the pipe with
+        // zero loss.
+        drop(stream);
+        drop(write);
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).unwrap();
+        let lines: Vec<&str> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect();
+        assert!(!lines.is_empty());
+        let ended: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).unwrap();
+        assert_eq!(ended["kind"], "ended");
+        assert_eq!(ended["event"]["stdout_lost"]["lines"], 0);
+    }
+
     #[test]
     fn retired_event_failure_and_incomplete_stdout_remain_independent() {
         use crate::inventory_output::StdoutFailure;

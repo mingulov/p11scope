@@ -17320,17 +17320,10 @@ fn key_operation_mid_fallback_refusal_preserves_remaining_pair_as_unknown() {
             .registry
             .publish_with_ledger(guarded.scene.adapter.ledger_mut());
     };
-    let before_staging = guarded
-        .registry
-        .semantic_resource_snapshot()
-        .charged_bytes;
+    let before_staging = guarded.registry.semantic_resource_snapshot().charged_bytes;
     stage(&mut guarded, &init);
     stage(&mut guarded, &init8);
-    let staged_two = guarded
-        .registry
-        .semantic_resource_snapshot()
-        .charged_bytes
-        - before_staging;
+    let staged_two = guarded.registry.semantic_resource_snapshot().charged_bytes - before_staging;
     stage(&mut guarded, &init9);
     stage(&mut guarded, &sign9);
     assert_eq!(
@@ -17343,9 +17336,9 @@ fn key_operation_mid_fallback_refusal_preserves_remaining_pair_as_unknown() {
     // machine-only growth (1024): replay two must refuse. The clamp
     // baseline already holds the staged charges, so the N14 formula
     // sheds the two-head staged cost it implicitly carried.
-    guarded.registry.clamp_semantic_resource_room_for_test(
-        REDUCER_BASE_CHARGE + growth + 512 - staged_two,
-    );
+    guarded
+        .registry
+        .clamp_semantic_resource_room_for_test(REDUCER_BASE_CHARGE + growth + 512 - staged_two);
     let failure = guarded.scene.adapter.scripted_failure(
         JournalGap::ClosureStale,
         &bootstrap,

@@ -61,20 +61,24 @@ before calling a rerun green.
   `identity loss in span`) refuses it.
 - Mechanism: the overlay collapse direction inverts between span
   passes (both `(98 -> 82)` and `(82 -> 98)` collapse gaps in one
-  span); a fraction of inverted spans also lose per-process
-  attribution for pinned providers. The direction inversion is
-  proven pre-existing (base spans r2/r4/r5 invert with zero loss);
-  the loss trip tracks run conditions, not the lane's code (the
-  gate is identical in force on base and tip; the lane made zero
-  changes to the sweep, collapse, aggregate, or attach paths in D1).
+  span, that order); a fraction of inverted spans also lose per-process
+  attribution for pinned providers. Not yet shown to predate the
+  lane: no base span has tripped, and the lane touches the
+  admission path (`identity.rs` pair admission, attach-set `by_raw`
+  routing), so a lane contribution is not ruled out. In every trip
+  the copy-up branches are cold — `anchor_not_installed`,
+  0 `pre_copy_up` markers, 0 witness-proven rows, 0 refused lower
+  candidates — which bounds but does not settle the question.
 - Rates (2026-11-07, dev Docker,
   `--iters-a 400 --iters-b 250 --duration 30 --span 90`): tip
   Saturday-morning 3/7 spans trip (all 7 invert); tip
   Saturday-evening 0/2 (stable direction); base Saturday 0/14
   spans trip, 3/14 invert (evening base 0/8, stable, exact parity
-  with tip-evening).
-- Base-hit status: PENDING-MORNING-BATCH (4 quiet-window base runs
-  Sun 2026-11-08 ~06:30 UTC; outcome lands in the R2 report).
+  with tip-evening). The R2 base spans r2-r14 ran the release
+  observer (only r1 ran debug); the trip tally is exact.
+- Base-hit status: A/B RUNNING (interleaved tip/base release runs
+  on the quiet fedora host, same harness fix, ~10 each, stop at
+  first base trip; outcome lands below when the batch completes).
 - Disposition: named flake; the span gate stays exact. A rerun that
   trips must be preserved and retried serially, never averaged away.
   Future work (out of scope): collapse-order determinism across span

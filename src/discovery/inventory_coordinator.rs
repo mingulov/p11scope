@@ -27992,6 +27992,64 @@ mod maps_skip_memory_tests {
         }
     }
 
+    /// The rolling backstop composes into the skip set: the withheld
+    /// cohort's priors re-prove through `unchanged_skip_set`, so a
+    /// same-maps file swap surfaces within four passes. Each pass skips
+    /// exactly its three carried cohorts and re-decodes its own cohort;
+    /// every pid both skips and re-proves across the window.
+    #[test]
+    fn rolling_backstop_cohort_rescans_through_the_skip_set() {
+        use crate::inspect_system::{digest_maps_snapshot, unchanged_skip_set};
+        use p11scope_manifest::maps::{Device, MapEntry};
+        let entry = MapEntry {
+            start: 0x1000,
+            end: 0x2000,
+            permissions: *b"r-xp",
+            file_offset: 0,
+            device: Device { major: 8, minor: 1 },
+            inode: 11,
+            raw_path: Some(b"/usr/bin/sleep".to_vec()),
+        };
+        let digest = digest_maps_snapshot(std::slice::from_ref(&entry));
+        let sweep = vec![
+            (10, vec![entry.clone()]),
+            (11, vec![entry.clone()]),
+            (12, vec![entry.clone()]),
+            (13, vec![entry]),
+        ];
+        let mut coordinator = skip_coordinator();
+        coordinator.note_applied_scan_tasks(&catalog_with_digests(
+            [
+                (10, (Some(100), digest)),
+                (11, (Some(110), digest)),
+                (12, (Some(120), digest)),
+                (13, (Some(130), digest)),
+            ]
+            .into_iter()
+            .collect(),
+        ));
+        let live = |pid: u32| match pid {
+            10 => Some(100),
+            11 => Some(110),
+            12 => Some(120),
+            _ => Some(130),
+        };
+        for (pass, reproving) in [(0u64, 12u32), (1, 13), (2, 10), (3, 11)] {
+            coordinator.passes = pass;
+            let priors = coordinator.priors_for_collection();
+            let skip = unchanged_skip_set(&sweep, &priors, live);
+            let expected: BTreeSet<u32> = [10, 11, 12, 13]
+                .into_iter()
+                .filter(|pid| *pid != reproving)
+                .collect();
+            assert_eq!(
+                skip, expected,
+                "pass {pass} must re-prove pid {reproving} (cohort {}) and skip its three stable peers",
+                pass % super::SKIP_BACKSTOP_EVERY
+            );
+        }
+    }
+
     #[test]
     fn swapped_library_surfaces_within_four_rolling_passes() {
         use crate::inspect_system::{digest_maps_snapshot, unchanged_skip_set};

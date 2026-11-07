@@ -11252,6 +11252,28 @@ mod tests {
     }
 
     #[test]
+    fn lower_elf_facts_cache_under_the_lower_files_own_key() {
+        // The proven lower file's ELF facts must cache under the
+        // lower file's own mapping key — never under the upper's
+        // maps key with the lower fd (the pin carries no device, so
+        // that key collides across lower files). Line-pinned like
+        // the ELF inspection pin above.
+        let lines: Vec<&str> = include_str!("scan.rs").lines().map(str::trim).collect();
+        assert!(
+            lines.contains(
+                &"let lower_facts = match provider_facts_for(&proof.file, lower_key, &wanted, budget) {"
+            ),
+            "lower facts keyed by the lower file's mapping key"
+        );
+        assert!(
+            !lines.contains(
+                &"let lower_facts = match provider_facts_for(&proof.file, key, &wanted, budget) {"
+            ),
+            "lower facts never cached under the upper's maps key"
+        );
+    }
+
+    #[test]
     fn a_short_read_returns_what_it_got_and_says_why_it_stopped() {
         let file = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(file.path(), vec![7u8; 64]).unwrap();

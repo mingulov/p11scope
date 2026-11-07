@@ -24,9 +24,9 @@
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
-    CallerRegistry, ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId,
-    ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason,
-    UseCoverage, module_init,
+    CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending, MappingState,
+    ModuleId, ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN,
+    UnboundPid, UnknownReason, UseCoverage, module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -2499,6 +2499,151 @@ fn render_verbose_edge(out: &mut String, presentation: &Presentation, edge: &Edg
 /// Concise application edges grouped per provider: one line per module
 /// naming the mapped application count and the outcome, without internal
 /// caller/module ids (those stay verbose-only). JSON keeps every edge.
+/// Reason label for an unidentified image without a path.
+fn unknown_exe_label(exe: &crate::discovery::caller_registry::UnboundExe) -> String {
+    match exe.resolution {
+        ExeResolution::PathUnknown => format!("unknown executable ({}:{})", exe.dev, exe.ino),
+        ExeResolution::ExecRecordLost => "executable unknown (exec record lost)".to_string(),
+        ExeResolution::NoExecRecord => "executable unknown (no exec record)".to_string(),
+        ExeResolution::ExeUnavailable => {
+            "executable unknown (exe identity unavailable)".to_string()
+        }
+        // Unreachable: a resolved image carries a path. Read unknown
+        // rather than panic: the path is absent, whatever the label.
+        ExeResolution::ProcAlive | ExeResolution::ScanLearned | ExeResolution::SystemIndex => {
+            "executable unknown (unresolved)".to_string()
+        }
+    }
+}
+
+/// Where one unidentified executable came from (verbose detail).
+fn exe_source_label(resolution: ExeResolution) -> &'static str {
+    match resolution {
+        ExeResolution::ProcAlive => "via live process",
+        ExeResolution::ScanLearned => "via scan record",
+        ExeResolution::SystemIndex => "via system index",
+        ExeResolution::PathUnknown => {
+            "no path matched (deleted file, container overlay, or non-system binary)"
+        }
+        ExeResolution::ExeUnavailable => "the kernel exe read failed",
+        ExeResolution::NoExecRecord => "no exec record joined",
+        ExeResolution::ExecRecordLost => "lifecycle evidence lost",
+    }
+}
+
+/// The concise executable line: unidentified caller images grouped
+/// by executable with call counts and pids, busiest group first.
+/// Resolved groups read by basename (full path when basenames
+/// collide on the line); unknown groups read their reason. Up to
+/// five groups and five pids per group; the rest counts.
+fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<String> {
+    if pids.is_empty() {
+        return None;
+    }
+    #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+    enum GroupKey<'a> {
+        Path(&'a str),
+        Unknown(ExeResolution, u64, u64),
+    }
+    let mut members: std::collections::HashMap<GroupKey<'_>, Vec<&UnboundPid>> =
+        std::collections::HashMap::new();
+    for pid in pids {
+        let key = match (&pid.exe.path, pid.exe.resolution) {
+            (Some(path), resolution) if resolution.is_resolved() => GroupKey::Path(path),
+            _ => GroupKey::Unknown(pid.exe.resolution, pid.exe.dev, pid.exe.ino),
+        };
+        members.entry(key).or_default().push(pid);
+    }
+    struct Group<'a> {
+        key: GroupKey<'a>,
+        members: Vec<&'a UnboundPid>,
+        calls: u64,
+        first_ns: u64,
+    }
+    let mut groups: Vec<Group<'_>> = members
+        .into_iter()
+        .map(|(key, members)| {
+            let calls = members
+                .iter()
+                .fold(0u64, |calls, pid| calls.saturating_add(pid.calls_at_least));
+            let first_ns = members
+                .iter()
+                .map(|pid| pid.first_call_ns)
+                .min()
+                .unwrap_or(u64::MAX);
+            Group {
+                key,
+                members,
+                calls,
+                first_ns,
+            }
+        })
+        .collect();
+    groups.sort_by(|a, b| b.calls.cmp(&a.calls).then(a.first_ns.cmp(&b.first_ns)));
+    // Basenames shared by two groups on this line read by full path.
+    let mut basenames: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for group in &groups {
+        if let GroupKey::Path(path) = group.key {
+            let basename = path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path);
+            *basenames.entry(basename).or_default() += 1;
+        }
+    }
+    let mut parts = Vec::new();
+    for group in groups.iter().take(5) {
+        let name = match group.key {
+            GroupKey::Path(path) => {
+                let basename = path
+                    .rsplit('/')
+                    .find(|part| !part.is_empty())
+                    .unwrap_or(path);
+                let display = if basenames.get(basename).is_some_and(|count| *count > 1) {
+                    path
+                } else {
+                    basename
+                };
+                escape_controls(display).into_owned()
+            }
+            GroupKey::Unknown(..) => unknown_exe_label(&group.members[0].exe),
+        };
+        let mut members = group.members.clone();
+        members.sort_by(|a, b| {
+            a.first_call_ns
+                .cmp(&b.first_call_ns)
+                .then(a.pid_host.cmp(&b.pid_host))
+        });
+        let shown: Vec<String> = members
+            .iter()
+            .take(5)
+            .map(|pid| pid.pid_host.to_string())
+            .collect();
+        let pids_more = members.len().saturating_sub(shown.len());
+        let pids_text = if members.len() == 1 {
+            format!("pid {}", shown.join(", "))
+        } else if pids_more > 0 {
+            format!("pids {} (+{pids_more} more)", shown.join(", "))
+        } else {
+            format!("pids {}", shown.join(", "))
+        };
+        parts.push(format!(
+            "{name} ({} call{}, {pids_text})",
+            group.calls,
+            if group.calls == 1 { "" } else { "s" },
+        ));
+    }
+    let hidden: usize = groups.iter().skip(5).map(|group| group.members.len()).sum();
+    let more = u64::try_from(hidden)
+        .unwrap_or(u64::MAX)
+        .saturating_add(dropped);
+    let mut line = format!("unidentified executables: {}", parts.join("; "));
+    if more > 0 {
+        line.push_str(&format!(" (+{more} more)"));
+    }
+    Some(line)
+}
+
 fn render_concise_edges(out: &mut String, presentation: &Presentation) {
     use std::collections::{BTreeMap, BTreeSet};
     use std::fmt::Write as _;
@@ -2773,6 +2918,13 @@ fn render_snapshot_inner(
                     ""
                 }
             );
+            // The same images grouped by executable with call counts.
+            if let Some(line) = render_unidentified_executables(
+                &presentation.unbound_pids,
+                presentation.unbound_pids_dropped,
+            ) {
+                let _ = writeln!(out, "{line}");
+            }
         }
         // Slice 1, issue 9: caller images that never got an identity
         // are missing from M above; name the strain beside it.
@@ -3218,6 +3370,39 @@ fn render_snapshot_inner(
                             out,
                             "    host pids: {list} (not running now or never scanned)"
                         );
+                    }
+                    // Every collected executable with its pid,
+                    // dev:ino, resolution source, and first-call
+                    // time, oldest first.
+                    let exes = pids
+                        .iter()
+                        .map(|pid| {
+                            let name = match &pid.exe.path {
+                                Some(path) => escape_controls(path).into_owned(),
+                                None => unknown_exe_label(&pid.exe),
+                            };
+                            format!(
+                                "{} pid {} (first call {} ago; dev {} ino {}; {})",
+                                name,
+                                pid.pid_host,
+                                crate::render::fmt_ns(Some(
+                                    presentation.ended_ns.saturating_sub(pid.first_call_ns)
+                                )),
+                                pid.exe.dev,
+                                pid.exe.ino,
+                                exe_source_label(pid.exe.resolution),
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if unbound.pids_dropped > 0 {
+                        let _ = writeln!(
+                            out,
+                            "    unidentified executables: {exes} (+{} more)",
+                            unbound.pids_dropped
+                        );
+                    } else {
+                        let _ = writeln!(out, "    unidentified executables: {exes}");
                     }
                 }
             }

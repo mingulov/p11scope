@@ -8492,19 +8492,31 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
         },
         "lifecycle": record.lifecycle.label(),
         "unloaded_observed": record.unloaded_observed,
-        "unbound_use": record.unbound_use.as_ref().map(|unbound| serde_json::json!({
-            "first_ns": unbound.first_ns,
-            "rows": unbound.rows,
-            "reasons": unbound.reasons,
-            "entries": unbound.entries,
-            "images": unbound.images(),
-            "images_saturated": unbound.images_saturated,
-            "pids": unbound.pids_sorted().iter().map(|pid| serde_json::json!({
-                "pid_host": pid.pid_host,
-                "first_call_ns": pid.first_call_ns,
-            })).collect::<Vec<_>>(),
-            "pids_dropped": unbound.pids_dropped,
-        })),
+        "unbound_use": record.unbound_use.as_ref().map(|unbound| {
+            let pids = unbound.pids_sorted();
+            serde_json::json!({
+                "first_ns": unbound.first_ns,
+                "rows": unbound.rows,
+                "reasons": unbound.reasons,
+                "entries": unbound.entries,
+                "images": unbound.images(),
+                "images_saturated": unbound.images_saturated,
+                "pids": pids.iter().map(|pid| serde_json::json!({
+                    "pid_host": pid.pid_host,
+                    "first_call_ns": pid.first_call_ns,
+                })).collect::<Vec<_>>(),
+                "pids_dropped": unbound.pids_dropped,
+                "executables": pids.iter().map(|pid| serde_json::json!({
+                    "exe": pid.exe.path,
+                    "dev": pid.exe.dev,
+                    "ino": pid.exe.ino,
+                    "resolution": pid.exe.resolution.json_label(),
+                    "pid_host": pid.pid_host,
+                    "first_call_ns": pid.first_call_ns,
+                    "calls_at_least": pid.calls_at_least,
+                })).collect::<Vec<_>>(),
+            })
+        }),
         // Additive (v1): observed `C_Initialize` returns since the
         // semantic lane sealed, with the judged verdict.
         "initialize": {

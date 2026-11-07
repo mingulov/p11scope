@@ -1008,9 +1008,27 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
             } else {
                 0
             };
-            // RED stub: the `executables` key parses in GREEN;
-            // every capture reads no executables here.
-            let _ = u.fields.contains_key("executables");
+            // Executable names, absent in old captures.
+            let executables = if u.fields.contains_key("executables") {
+                u.array("executables")?
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let e = Object::new(v, format!("{}.executables[{i}]", u.path))?;
+                        Ok::<_, anyhow::Error>(UnboundExe {
+                            exe: e.text_null("exe")?,
+                            dev: e.uint("dev")?,
+                            ino: e.uint("ino")?,
+                            resolution: e.text("resolution")?,
+                            pid_host: e.uint32("pid_host")?,
+                            first_call_ns: e.uint("first_call_ns")?,
+                            calls_at_least: e.uint("calls_at_least")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
             Ok::<_, anyhow::Error>(UnboundUse {
                 first_ns: u.uint("first_ns")?,
                 rows: u.uint("rows")?,
@@ -1020,7 +1038,7 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
                 images_saturated,
                 pids,
                 pids_dropped,
-                executables: Vec::new(),
+                executables,
             })
         })
         .transpose()?;

@@ -1702,6 +1702,7 @@ def check_cells(view, images_by_cell, res):
     check_counted_nonzero(view, res)
     check_saturated(view, res)
     check_unbound_pids(view, res)
+    check_unbound_exes(view, res)
     check_uncounted(view, res)
 
 
@@ -2125,6 +2126,65 @@ def check_unbound_pids(view, res):
                f"pids {pids!r} dropped {dropped!r} rows {rows!r}: production publishes one "
                "pid entry per image oldest-first, saturation exactly when pids drop, "
                "images within rows, and no identity on a pid entry")
+
+
+UNBOUND_EXE_RESOLUTIONS = frozenset({
+    "proc_alive", "scan_learned", "system_index", "path_unknown",
+    "exe_unavailable", "no_exec_record", "exec_record_lost",
+})
+UNBOUND_EXE_RESOLVED = frozenset({"proc_alive", "scan_learned", "system_index"})
+UNBOUND_EXE_JOINED = frozenset(
+    {"proc_alive", "scan_learned", "system_index", "path_unknown"})
+
+
+def check_unbound_exes(view, res):
+    """Unidentified-caller executables: the optional `executables`
+    array (absent in captures that predate exe naming) carries one
+    complete record per image — exe path, dev, ino, resolution, pid,
+    first call, call lower bound — in the same order as `pids`, with
+    the finite resolution vocabulary. A path reads exactly on the
+    resolved verdicts; a nonzero pair reads exactly when an EXEC
+    joined (resolved or path-unknown)."""
+    for mid in sorted(view.modules):
+        use = (view.modules[mid] or {}).get("unbound_use")
+        if use is None or "executables" not in use:
+            continue
+        exes, images = use.get("executables"), use.get("images")
+        pids = use.get("pids")
+        wellformed = (
+            type(exes) is list
+            and type(images) is int and 0 <= images <= U64_MAX
+            and type(pids) is list
+            and all(type(e) is dict
+                    and set(e) == {"exe", "dev", "ino", "resolution",
+                                   "pid_host", "first_call_ns", "calls_at_least"}
+                    and (e["exe"] is None or type(e["exe"]) is str)
+                    and type(e["dev"]) is int and 0 <= e["dev"] <= U64_MAX
+                    and type(e["ino"]) is int and 0 <= e["ino"] <= U64_MAX
+                    and type(e["resolution"]) is str
+                    and e["resolution"] in UNBOUND_EXE_RESOLUTIONS
+                    and type(e["pid_host"]) is int and 0 <= e["pid_host"] <= 0xFFFFFFFF
+                    and type(e["first_call_ns"]) is int and 0 <= e["first_call_ns"] <= U64_MAX
+                    and type(e["calls_at_least"]) is int and 0 <= e["calls_at_least"] <= U64_MAX
+                    for e in exes)
+        )
+        pairs = [(e["pid_host"], e["first_call_ns"]) for e in exes] if wellformed else []
+        want = ([(p["pid_host"], p["first_call_ns"]) for p in pids]
+                if wellformed and all(type(p) is dict and "pid_host" in p
+                                       and "first_call_ns" in p for p in pids)
+                else None)
+        ok = (
+            wellformed
+            and len(exes) == images
+            and want is not None and pairs == want
+            and all((e["exe"] is not None) == (e["resolution"] in UNBOUND_EXE_RESOLVED)
+                    and ((e["dev"], e["ino"]) != (0, 0)) == (e["resolution"] in UNBOUND_EXE_JOINED)
+                    for e in exes)
+        )
+        res.ok(view.name, "*", "UNBOUND-EXES", ok,
+               f"module {mid} reads images {images!r} exes {exes!r}: production publishes one "
+               "complete executable record per image in pid order, a path exactly on resolved "
+               "verdicts, and a nonzero pair exactly when an EXEC joined")
 
 
 def check_uncounted(view, res):
@@ -6505,6 +6565,82 @@ def self_test():
             _unbound(s, d, pids=[{"pid_host": True, "first_call_ns": T0},
                                  {"pid_host": 12, "first_call_ns": T0 + 10}])
         case("unbound-pids-host-bool", "UNBOUND-PIDS", pids_host_bool)
+
+        # --- Unidentified-caller executables ---------------------------
+        # The optional `executables` array (src/inventory/mod.rs
+        # module_json): one complete record per image in pid order —
+        # exe, dev, ino, resolution, pid_host, first_call_ns,
+        # calls_at_least — with the finite resolution vocabulary, a
+        # path exactly on resolved verdicts, and a nonzero pair
+        # exactly when an EXEC joined. Absent in old captures.
+        def _exes(s, d, **kw):
+            exes = [{"exe": "/usr/bin/tool", "dev": 8, "ino": 99, "resolution": "system_index",
+                     "pid_host": 11, "first_call_ns": T0, "calls_at_least": 2},
+                    {"exe": None, "dev": 0, "ino": 0, "resolution": "exec_record_lost",
+                     "pid_host": 12, "first_call_ns": T0 + 10, "calls_at_least": 1}]
+            _unbound(s, d, executables=exes, **kw)
+        case("unbound-exes-valid", None, lambda s, d, dash: _exes(s, d))
+        case("unbound-exes-absent-valid", None, lambda s, d, dash: _unbound(s, d))
+
+        def exes_len(s, d, dash):
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "system_index", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": 2}])
+        case("unbound-exes-len", "UNBOUND-EXES", exes_len)
+
+        def exes_keys(s, d, dash):
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "system_index", "pid_host": 11,
+                                          "first_call_ns": T0},
+                                         {"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1}])
+        case("unbound-exes-keys", "UNBOUND-EXES", exes_keys)
+
+        def exes_resolution(s, d, dash):
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "guessed", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": 2},
+                                         {"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1}])
+        case("unbound-exes-resolution", "UNBOUND-EXES", exes_resolution)
+
+        def exes_path_mismatch(s, d, dash):
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "path_unknown", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": 2},
+                                         {"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1}])
+        case("unbound-exes-path-mismatch", "UNBOUND-EXES", exes_path_mismatch)
+
+        def exes_pair_mismatch(s, d, dash):
+            _unbound(s, d, executables=[{"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "path_unknown", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": 2},
+                                         {"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1}])
+        case("unbound-exes-pair-mismatch", "UNBOUND-EXES", exes_pair_mismatch)
+
+        def exes_order(s, d, dash):
+            _unbound(s, d, executables=[{"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1},
+                                         {"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "system_index", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": 2}])
+        case("unbound-exes-order", "UNBOUND-EXES", exes_order)
+
+        def exes_calls_bool(s, d, dash):
+            _unbound(s, d, executables=[{"exe": "/usr/bin/tool", "dev": 8, "ino": 99,
+                                          "resolution": "system_index", "pid_host": 11,
+                                          "first_call_ns": T0, "calls_at_least": True},
+                                         {"exe": None, "dev": 0, "ino": 0,
+                                          "resolution": "exec_record_lost", "pid_host": 12,
+                                          "first_call_ns": T0 + 10, "calls_at_least": 1}])
+        case("unbound-exes-calls-bool", "UNBOUND-EXES", exes_calls_bool)
 
         # --- O8: receipt boundary proof (astra A7, corrected round 2) ----
         # The C_GetFunctionList exclusion is acquisition-only AND

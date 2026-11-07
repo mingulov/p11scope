@@ -541,12 +541,17 @@ For providers you do not trust, `--isolation isolated` fences the helper
 before it loads the provider: the filesystem stays read-only except the
 `-o` directory, which must be an empty dedicated directory (a Landlock
 rule grants the whole subtree, so anything already there would be
-writable); without `-o` nothing is writable. IP networking, socket
-connect/bind, and exec/mount/ptrace/BPF/io_uring/file-metadata syscalls
-fail with `EACCES`, as do the terminal-input-injection ioctls
-`TIOCSTI`/`TIOCLINUX` and the inode-attribute ioctls (`FS_IOC_SETFLAGS`,
-`FS_IOC_FSSETXATTR`, `FS_IOC_SETVERSION`, `FS_IOC_SET_ENCRYPTION_POLICY`,
-`FS_IOC_ENABLE_VERITY`). The fence needs Landlock ABI 5 or newer and an
+writable); the only exception is the target name itself, which may
+already exist as a single-link regular file (the rename-over case) — a
+hard link, symlink or directory there is refused. Without `-o` nothing
+is writable. IP networking, socket connect/bind, and
+exec/mount/ptrace/BPF/io_uring/file-metadata syscalls fail with `EACCES`,
+as do the terminal-input-injection ioctls `TIOCSTI`/`TIOCLINUX` and the
+filesystem-mutation ioctl types: btrfs (`0x94`, including subvolume,
+snapshot, `FICLONE`/`FIDEDUPERANGE`), `f` (`0x66`: inode flags, verity,
+fscrypt), `X` (`0x58`: fsxattr), `v` (`0x76`: versions) and f2fs
+(`0xf5`). Reads in those types (such as `FS_IOC_GETFLAGS`) are denied
+along with the mutations. The fence needs Landlock ABI 5 or newer and an
 x86-64 helper; when either is unavailable the helper refuses before
 loading rather than running weaker. A provider that needs a denied access
 at discovery time fails plainly (a loader or getter error, or an

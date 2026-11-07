@@ -520,24 +520,22 @@ impl DiscoveryScheduler {
         // One slot with both classes waiting: the owed flag chooses the
         // class, so newcomer and backlog ticks alternate instead of the
         // flood taking every tick.
-        let (fresh_take, backlog_take) = if max_new_views == 1
-            && !fresh_order.is_empty()
-            && !backlog_order.is_empty()
-        {
-            if backlog_owed {
-                (&fresh_order[..0], &backlog_order[..1])
+        let (fresh_take, backlog_take) =
+            if max_new_views == 1 && !fresh_order.is_empty() && !backlog_order.is_empty() {
+                if backlog_owed {
+                    (&fresh_order[..0], &backlog_order[..1])
+                } else {
+                    (&fresh_order[..1], &backlog_order[..0])
+                }
             } else {
-                (&fresh_order[..1], &backlog_order[..0])
-            }
-        } else {
-            let fresh_take = fresh_order.len().min(
-                newcomer_share.max(max_new_views.saturating_sub(backlog_order.len())),
-            );
-            let backlog_take = backlog_order
-                .len()
-                .min(max_new_views.saturating_sub(fresh_take));
-            (&fresh_order[..fresh_take], &backlog_order[..backlog_take])
-        };
+                let fresh_take = fresh_order
+                    .len()
+                    .min(newcomer_share.max(max_new_views.saturating_sub(backlog_order.len())));
+                let backlog_take = backlog_order
+                    .len()
+                    .min(max_new_views.saturating_sub(fresh_take));
+                (&fresh_order[..fresh_take], &backlog_order[..backlog_take])
+            };
         let mut admitted = Vec::with_capacity(fresh_take.len() + backlog_take.len());
         if fresh_take.is_empty() || backlog_take.is_empty() {
             // A missing class keeps today's single-class rotation order verbatim.
@@ -1664,8 +1662,7 @@ mod tests {
         let pids = [7, 9];
         let newcomers = BTreeSet::from([7, 9]);
         // Tick 1 admits the lower newcomer and attempts it.
-        let (admitted, _) =
-            scheduler.new_view_window_newcomers_first(&pids, &newcomers, 1, 1);
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(&pids, &newcomers, 1, 1);
         assert_eq!(admitted, vec![7]);
         scheduler.note_newcomer_attempt(7);
         // A pressure service pass runs its own window — rotating the
@@ -1709,11 +1706,7 @@ mod tests {
             1,
             MAX_NEWCOMER_ADMISSIONS_PER_TICK,
         );
-        assert_eq!(
-            admitted,
-            vec![1],
-            "the owed tick serves the backlog pid"
-        );
+        assert_eq!(admitted, vec![1], "the owed tick serves the backlog pid");
         scheduler.note_backlog_attempt(1);
         let (admitted, _) = scheduler.new_view_window_newcomers_first(
             &[1002],
@@ -1811,13 +1804,8 @@ mod tests {
         let backlog: Vec<u32> = (1..=100).collect();
         let rotation: Vec<u32> = (200..=209).collect();
         let mut scheduler = DiscoveryScheduler::new();
-        let (admitted, deferred) = scheduler.scarce_window_pending_newcomers_first(
-            &fresh,
-            &backlog,
-            &rotation,
-            batch,
-            share,
-        );
+        let (admitted, deferred) = scheduler
+            .scarce_window_pending_newcomers_first(&fresh, &backlog, &rotation, batch, share);
         assert_eq!(admitted.len(), batch);
         let fresh_admitted = admitted.iter().filter(|pid| **pid >= 1_000_000).count();
         assert_eq!(fresh_admitted, share, "fresh takes exactly its share");

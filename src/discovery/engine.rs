@@ -23668,14 +23668,10 @@ impl Engine {
                         let (provider_free, probe_skips) = self.probe_newcomer_provider_free(pid);
                         skipped.extend(probe_skips);
                         match ledger {
-                            AdmissionLedger::Free { backlog }
-                                if backlog.contains(&pid) =>
-                            {
+                            AdmissionLedger::Free { backlog } if backlog.contains(&pid) => {
                                 self.scheduler.note_backlog_attempt(pid);
                             }
-                            AdmissionLedger::Scarce { backlog }
-                                if backlog.contains(&pid) =>
-                            {
+                            AdmissionLedger::Scarce { backlog } if backlog.contains(&pid) => {
                                 self.scheduler.note_scarce_backlog_attempt(pid);
                             }
                             _ => self.scheduler.note_newcomer_attempt(pid),
@@ -24179,22 +24175,15 @@ impl Engine {
                     backlog_pids.push(pid);
                 }
             }
-            let (admitted, deferred) = self
-                .scheduler
-                .scarce_window_pending_newcomers_first(
-                    &fresh,
-                    &backlog_pids,
-                    &rotation,
-                    max_new_views,
-                    MAX_NEWCOMER_ADMISSIONS_PER_TICK,
-                );
-            let backlog: BTreeSet<u32> =
-                backlog_pids.into_iter().chain(rotation).collect();
-            (
-                admitted,
-                deferred,
-                AdmissionLedger::Scarce { backlog },
-            )
+            let (admitted, deferred) = self.scheduler.scarce_window_pending_newcomers_first(
+                &fresh,
+                &backlog_pids,
+                &rotation,
+                max_new_views,
+                MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+            );
+            let backlog: BTreeSet<u32> = backlog_pids.into_iter().chain(rotation).collect();
+            (admitted, deferred, AdmissionLedger::Scarce { backlog })
         } else {
             let backlog: BTreeSet<u32> = new_pids
                 .iter()
@@ -24207,11 +24196,7 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
-            (
-                admitted,
-                deferred,
-                AdmissionLedger::Free { backlog },
-            )
+            (admitted, deferred, AdmissionLedger::Free { backlog })
         };
         // Arrival marks in processing order (first diff wins; the admitted
         // window marks first so cap pressure lands on the deferred tail).
@@ -24242,12 +24227,8 @@ impl Engine {
             )
         });
         let (refresh_outcome, admission_outcome) = if newcomers_first {
-            let admission = self.admit_inventory_new_views(
-                admitted,
-                &ledger,
-                max_scan_pids,
-                &mut *tick_now,
-            );
+            let admission =
+                self.admit_inventory_new_views(admitted, &ledger, max_scan_pids, &mut *tick_now);
             let refresh = self.scan_inventory_views(
                 &refreshed,
                 "a requested inventory refresh failed",
@@ -24260,12 +24241,8 @@ impl Engine {
                 "a requested inventory refresh failed",
                 &mut *tick_now,
             );
-            let admission = self.admit_inventory_new_views(
-                admitted,
-                &ledger,
-                max_scan_pids,
-                &mut *tick_now,
-            );
+            let admission =
+                self.admit_inventory_new_views(admitted, &ledger, max_scan_pids, &mut *tick_now);
             (refresh, admission)
         };
         let (mut refreshed_scans, failed_scan_pids, deferred_scan_pids, refresh_skips) =

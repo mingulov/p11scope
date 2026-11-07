@@ -65276,7 +65276,10 @@ fn opus_r3_backlog_rotation_passes_failing_low_pid() {
     let mid_pid = more[1].pid();
     let later_pid = more[2].pid();
     more[0].reap().expect("reap the owned failed candidate");
-    e06_write_listing(scope_dir.path(), &[first_pid, failed_pid, mid_pid, later_pid]);
+    e06_write_listing(
+        scope_dir.path(),
+        &[first_pid, failed_pid, mid_pid, later_pid],
+    );
     opus_probe_refresh_with_permits(&mut engine, 0);
     assert_eq!(engine.views.len(), 1);
     opus_probe_refresh_with_permits(&mut engine, 1);
@@ -65326,8 +65329,7 @@ fn opus_first_existing(candidates: &[&Path]) -> Option<PathBuf> {
 /// `gcc -static -nostdlib` (no libc to link), for hosts without busybox.
 /// Panics with a named reason when the build fails.
 fn opus_build_static_sleeper(dir: &Path) -> PathBuf {
-    let source =
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opus-static-sleeper.c");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opus-static-sleeper.c");
     let out = dir.join("opus-static-sleeper");
     let status = std::process::Command::new("gcc")
         .args([
@@ -65360,7 +65362,9 @@ fn opus_build_static_sleeper(dir: &Path) -> PathBuf {
 /// build directory when one was built (held so the binary outlives the
 /// children). `P11SCOPE_OPUS_SLEEPER=fallback` forces the gcc path.
 /// Panics with a named reason when neither backend exists.
-fn opus_spawn_static_sleeps(count: usize) -> (Vec<SystemScopeChildGuard>, Option<tempfile::TempDir>) {
+fn opus_spawn_static_sleeps(
+    count: usize,
+) -> (Vec<SystemScopeChildGuard>, Option<tempfile::TempDir>) {
     let force_fallback =
         std::env::var("P11SCOPE_OPUS_SLEEPER").is_ok_and(|value| value == "fallback");
     let busybox = if force_fallback {
@@ -65441,14 +65445,10 @@ fn opus_static_sleeper_fallback_builds_and_sleeps() {
         .expect("the fallback sleeper spawns");
     std::thread::sleep(std::time::Duration::from_secs(1));
     assert!(
-        child
-            .try_wait()
-            .expect("poll the sleeper")
-            .is_none(),
+        child.try_wait().expect("poll the sleeper").is_none(),
         "the sleeper is still asleep after a second"
     );
-    let exe =
-        std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("the sleeper exe");
+    let exe = std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("the sleeper exe");
     assert_eq!(
         std::fs::canonicalize(&exe).expect("canonical exe"),
         std::fs::canonicalize(&sleeper).expect("canonical sleeper"),

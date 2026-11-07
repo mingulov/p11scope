@@ -209,14 +209,19 @@ pub(crate) fn note_lacking(bits: &[u32]) {
     }
 }
 
-/// The keep mask after setup: a multi session sheds the transient
-/// `CAP_SYS_ADMIN` (no `perf_event_open` remains past attach, measured
-/// lane F15) unless it is the only map_files grant — the effective set
-/// lacks `CAP_CHECKPOINT_RESTORE` (the DaemonSet), so later identity
-/// proofs still need it; a singles session keeps it for dynamic perf
-/// re-attach.
-pub(crate) fn post_setup_keep(multi: bool, effective: u64) -> u64 {
-    if multi && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0 {
+/// The keep mask after setup: a multi session whose dynamic probes link
+/// (`dynamic_multi`: multi backend plus a proven kernel pid filter, so
+/// no `perf_event_open` remains past attach, measured lane F15) sheds
+/// the transient `CAP_SYS_ADMIN`, unless it is the only map_files grant
+/// — the effective set lacks `CAP_CHECKPOINT_RESTORE` (the DaemonSet),
+/// so later identity proofs still need it. A singles session, or a multi
+/// session whose dynamics stay on perf (an unproven pid filter on 6.6-6.9
+/// without the backport), keeps it for dynamic perf re-attach.
+pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) -> u64 {
+    if multi
+        && dynamic_multi
+        && effective & (1u64 << CAP_CHECKPOINT_RESTORE_BIT) != 0
+    {
         effective & !(1u64 << CAP_SYS_ADMIN_BIT)
     } else {
         effective
@@ -235,6 +240,27 @@ fn parse_cap_eff(status: &str) -> Option<u64> {
         .lines()
         .find_map(|line| line.strip_prefix("CapEff:"))?;
     u64::from_str_radix(hex.trim(), 16).ok()
+}
+
+/// This thread's effective capabilities via `capget` (no `/proc` read,
+/// so a broken `/proc` cannot zero the set the shed computes from).
+/// Fails closed on syscall error; callers propagate instead of guessing.
+pub(crate) fn read_effective_via_capget() -> io::Result<u64> {
+    let mut header = CapHeader {
+        version: 0x2008_0522,
+        pid: 0,
+    };
+    let mut data = [CapData {
+        effective: 0,
+        permitted: 0,
+        inheritable: 0,
+    }; 2];
+    // SAFETY: version-3 header with pid 0 addresses this thread; the two
+    // data words are caller-owned stack with the kernel's layout.
+    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok((data[0].effective as u64) | ((data[1].effective as u64) << 32))
 }
 
 /// `capget`/`capset` header (`linux/capability.h`, version 3).

@@ -295,8 +295,10 @@ getcap /usr/local/bin/p11scope
 
 `p11scope doctor` prints the exact command for its own binary and names
 any missing capability. The system packages set no capabilities by
-default. See [Privileges, per environment](docs/usage.md#privileges-per-environment)
-for the full matrix.
+default. Dynamic probes link only where the kernel's uprobe-multi pid
+filter is proven (6.10+, or backported 6.9.12+/6.6.y); elsewhere they stay
+on perf, which paranoid 3+ gates to `CAP_SYS_ADMIN`. See [Privileges, per
+environment](docs/usage.md#privileges-per-environment) for the full matrix.
 
 ### Build locally from source
 
@@ -368,10 +370,13 @@ sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_
 ```
 
 Only an explicit `--attach-backend singles` fallback still needs
-`CAP_SYS_ADMIN` at paranoid ≥ 3. Anyone who can execute a
-capability-carrying observer can observe other users' processes, so
-restrict who may execute it (for example, a dedicated group and mode
-`0750`); see [Run without sudo](#run-without-sudo).
+`CAP_SYS_ADMIN` at paranoid ≥ 3. Dynamic loader/export probes link only
+where the kernel's uprobe-multi pid filter is proven (a functional probe
+at startup; 6.10+, or 6.9.12+/6.6.y with the backport) — where it is not,
+they stay on perf, which paranoid 3+ gates to `CAP_SYS_ADMIN`. Anyone who
+can execute a capability-carrying observer can observe other users'
+processes, so restrict who may execute it (for example, a dedicated group
+and mode `0750`); see [Run without sudo](#run-without-sudo).
 
 **Check the install:**
 

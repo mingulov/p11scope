@@ -1905,8 +1905,12 @@ held set, and any gap names the missing capability with what it enables.
 A capture missing a capability refuses or degrades with a plain `needs
 CAP_...` line rather than a raw errno. After setup the observer drops
 capabilities the rest of the capture does not need, and a `run` child
-never inherits any. The DEB/RPM packages set no capabilities by default:
-granting the set is always the local administrator's explicit step.
+never inherits any. Dynamic loader/export probes link only where the
+kernel's uprobe-multi pid filter is proven (a functional probe at startup;
+6.10+, or 6.9.12+/6.6.y with the backport) — where it is not, they stay on
+perf, which paranoid 3+ gates to `CAP_SYS_ADMIN`. The DEB/RPM packages set
+no capabilities by default: granting the set is always the local
+administrator's explicit step.
 
 ## PID namespaces
 

@@ -53,10 +53,12 @@ pub struct RunCgroup {
 }
 
 impl RunCgroup {
-    /// Creates the run subgroup directly under `base` (production passes
-    /// `/sys/fs/cgroup`). No controllers are enabled: membership only, no
-    /// resource effects. The cgroup2 proof stays with scope construction
-    /// (`capture_cgroup`), which must build on this path before use.
+    /// Creates the run subgroup directly under `base`. Tests pass a
+    /// tmpfs dir; production must use [`RunCgroup::create_under_observer`]
+    /// instead, never the filesystem root. No controllers are enabled,
+    /// so the subgroup itself carries no resource state; the cgroup2
+    /// proof stays with scope construction (`capture_cgroup`), which
+    /// must build on this path before use.
     pub fn create(base: &Path) -> Result<Self> {
         let path = base.join(
             run_cgroup_name()
@@ -67,6 +69,17 @@ impl RunCgroup {
         Ok(Self { path })
     }
 
+    /// Creates the run subgroup under the observer's own cgroup (see
+    /// [`observer_run_cgroup_base`]): the command keeps its ancestor
+    /// limits and unit kill semantics, and no resource controllers are
+    /// touched. Any failure (unreadable membership, no v2 line,
+    /// permission, delegation) degrades the run to its exact child —
+    /// the caller must never fall back to the filesystem root.
+    pub fn create_under_observer(cgroup_root: &Path) -> Result<Self> {
+        let base = observer_run_cgroup_base(cgroup_root)?;
+        Self::create(&base)
+    }
+
     pub fn path(&self) -> &Path {
         &self.path
     }
@@ -74,6 +87,9 @@ impl RunCgroup {
     /// Moves the whole process `pid` into the run cgroup and proves the
     /// landing via `/proc/<pid>/cgroup`: a misplaced child would flip
     /// every later scope assertion, so a silent miss fails here instead.
+    /// The readback is relative to the v2 mount root, so it joins with
+    /// `/sys/fs/cgroup` — never with the run cgroup's own parent, which
+    /// is the observer's nested base, not the root.
     pub fn place(&self, pid: u32) -> Result<()> {
         std::fs::write(self.path.join("cgroup.procs"), format!("{pid}\n"))
             .with_context(|| format!("moving {pid} to run cgroup {}", self.path.display()))?;
@@ -81,11 +97,7 @@ impl RunCgroup {
             .with_context(|| format!("reading the cgroup of {pid}"))?;
         let relative = parse_cgroup_v2_relative(&text)
             .with_context(|| format!("no cgroup v2 entry for process {pid}: {text:?}"))?;
-        let base = self
-            .path
-            .parent()
-            .with_context(|| format!("run cgroup {} has no parent", self.path.display()))?;
-        let placed = base.join(relative);
+        let placed = Path::new("/sys/fs/cgroup").join(relative);
         anyhow::ensure!(
             placed == self.path,
             "process {pid} did not land in {} (in {})",
@@ -185,6 +197,32 @@ pub fn parse_cgroup_v2_relative(text: &str) -> Option<&str> {
     text.lines()
         .find_map(|line| line.strip_prefix("0::"))
         .map(|path| path.strip_prefix('/').unwrap_or(path))
+}
+
+/// The observer's own cgroup directory under `cgroup_root`
+/// (production: `/sys/fs/cgroup`), from a `/proc/self/cgroup` text:
+/// the v2 relative path joined to the root. The kernel never emits
+/// `..`, but a parent component is refused anyway so the base can
+/// never escape the root. Without a v2 line the run must degrade,
+/// never guess a base.
+pub fn observer_run_cgroup_base_from_text(
+    cgroup_root: &Path,
+    proc_self_cgroup_text: &str,
+) -> Result<PathBuf> {
+    let relative = parse_cgroup_v2_relative(proc_self_cgroup_text)
+        .with_context(|| "the observer has no cgroup v2 membership".to_string())?;
+    if relative.split('/').any(|component| component == "..") {
+        bail!("the observer cgroup path escapes its root");
+    }
+    Ok(cgroup_root.join(relative))
+}
+
+/// The observer's own cgroup directory: [`observer_run_cgroup_base_from_text`]
+/// over the live `/proc/self/cgroup`.
+pub fn observer_run_cgroup_base(cgroup_root: &Path) -> Result<PathBuf> {
+    let text = std::fs::read_to_string("/proc/self/cgroup")
+        .context("reading the observer cgroup membership")?;
+    observer_run_cgroup_base_from_text(cgroup_root, &text)
 }
 
 /// Proves the owned path's scope names the owned child: PID scope by
@@ -1392,6 +1430,38 @@ mod tests {
     }
 
     #[test]
+    fn observer_run_cgroup_base_stays_under_the_observer_cgroup() {
+        // The run cgroup must be created under the observer's own
+        // cgroup, never at the filesystem root: that keeps ancestor
+        // limits and unit kill semantics. Pure text-to-path mapping,
+        // so no cgroup rights are needed here.
+        let root = Path::new("/sys/fs/cgroup");
+        for (text, expected) in [
+            (
+                "0::/user.slice/user-1000.slice/session-c2.scope\n",
+                "user.slice/user-1000.slice/session-c2.scope",
+            ),
+            ("0::/\n", ""),
+            (
+                "0::/system.slice/p11scope.service\n",
+                "system.slice/p11scope.service",
+            ),
+        ] {
+            let base = observer_run_cgroup_base_from_text(root, text).expect("v2 line resolves");
+            assert_eq!(base, root.join(expected), "{text:?}");
+            assert!(
+                base.starts_with(root),
+                "the base never escapes the cgroup root: {}",
+                base.display()
+            );
+        }
+        for text in ["12:memory:/user.slice\n", ""] {
+            observer_run_cgroup_base_from_text(root, text)
+                .expect_err("without a v2 line the run must degrade, not guess");
+        }
+    }
+
+    #[test]
     #[ignore = "privileged: moves a real child into a real run cgroup; run as root with --ignored --test-threads=1"]
     fn privileged_run_cgroup_place_moves_a_real_child() {
         assert_eq!(
@@ -1415,6 +1485,39 @@ mod tests {
         child.kill().expect("kill the child");
         child.wait().expect("reap the child");
         placed.expect("a real child lands in the run cgroup");
+        let path = group.path().to_path_buf();
+        drop(group);
+        assert!(!path.exists(), "the emptied run cgroup is removed");
+    }
+
+    #[test]
+    #[ignore = "privileged: creates a run cgroup under the observer cgroup; run as root with --ignored --test-threads=1"]
+    fn privileged_run_cgroup_create_under_observer_stays_nested() {
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root: creation needs cgroup rights"
+        );
+        if filesystem_magic(&File::open("/sys/fs/cgroup").expect("cgroup root opens"))
+            .expect("magic reads")
+            != CGROUP2_SUPER_MAGIC
+        {
+            panic!("run as root on cgroup v2: creation needs a v2 mount");
+        }
+        let base =
+            observer_run_cgroup_base(Path::new("/sys/fs/cgroup")).expect("observer base resolves");
+        let group = RunCgroup::create_under_observer(Path::new("/sys/fs/cgroup"))
+            .expect("create the run cgroup under the observer");
+        assert!(
+            group.path().starts_with(&base),
+            "the run cgroup {} is under the observer base {}",
+            group.path().display(),
+            base.display()
+        );
+        assert!(
+            group.path() != base,
+            "the run cgroup is a child, not the base itself"
+        );
         let path = group.path().to_path_buf();
         drop(group);
         assert!(!path.exists(), "the emptied run cgroup is removed");

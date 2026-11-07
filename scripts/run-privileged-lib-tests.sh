@@ -559,6 +559,9 @@ run::tests::privileged_spawned_child_home_matches_the_target_passwd_row
 # Run-owned cgroup placement: creating a subgroup, moving a child into it
 # and proving the landing (needs only root and a cgroup v2 mount, no BPF).
 scope::tests::privileged_run_cgroup_place_moves_a_real_child
+# Run-owned cgroup nesting: the subgroup is created under the observer's
+# own cgroup, never at the filesystem root (same prerequisites, no BPF).
+scope::tests::privileged_run_cgroup_create_under_observer_stays_nested
 )
 
 # Counter-fixture membership: the DEFAULT_TESTS members that need the

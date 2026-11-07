@@ -343,6 +343,25 @@ def check_changed(**overrides):
     return ORACLE["copy_up_changed"](**inputs)
 
 
+MIDCAPTURE_STAMPS = ("t-profile-ready=100 t-bpre-ledger=200 t-patch=300 "
+                     "t-b2-ledger=400 t-profile-end=500\n")
+NOTE_MIDCAPTURE = NOTE_CHANGED + " (mid-capture: the patch landed mid-profile)"
+
+
+def good_midcapture_inputs():
+    """Healthy D1-changed-midcapture legs: settled shapes, window stamps."""
+    inputs = good_changed_inputs()
+    inputs["run_note"] = NOTE_MIDCAPTURE
+    inputs["facts_text"] = changed_facts() + MIDCAPTURE_STAMPS
+    return inputs
+
+
+def check_midcapture(**overrides):
+    inputs = good_midcapture_inputs()
+    inputs.update(overrides)
+    return ORACLE["copy_up_midcapture"](**inputs)
+
+
 def with_ambient(document, pid=9999, module="m9", key=(0, 35, 356176),
                  count=0):
     """An ambient host provider edge outside the cell (agreement ignores it)."""
@@ -1119,6 +1138,53 @@ class CopyUpChangedTest(unittest.TestCase):
             check_changed(run_note="run log: no disclosure here")
 
 
+class CopyUpMidcaptureTest(unittest.TestCase):
+    """D1-changed-midcapture: the patch lands during the running profile.
+
+    The settled legs judge exactly as D1-changed; the window stamps in
+    facts.log prove the patch is strictly inside the capture window.
+    """
+
+    def test_midcapture_healthy_passes(self):
+        result = check_midcapture()
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["check"], "copy-up-midcapture")
+        self.assertEqual(result["window"]["t-patch"], "300")
+
+    def test_midcapture_missing_stamp_fails(self):
+        facts = changed_facts() + MIDCAPTURE_STAMPS.replace("t-patch=300 ", "")
+        with self.assertRaises(AssertionError):
+            check_midcapture(facts_text=facts)
+
+    def test_midcapture_patch_before_stale_ledger_fails(self):
+        """The stale ledger must complete before the patch lands."""
+        facts = changed_facts() + MIDCAPTURE_STAMPS.replace(
+            "t-patch=300", "t-patch=150")
+        with self.assertRaises(AssertionError):
+            check_midcapture(facts_text=facts)
+
+    def test_midcapture_patch_after_window_fails(self):
+        """A patch past the window end is the settled cell, not this one."""
+        facts = changed_facts() + MIDCAPTURE_STAMPS.replace(
+            "t-profile-end=500", "t-profile-end=250")
+        with self.assertRaises(AssertionError):
+            check_midcapture(facts_text=facts)
+
+    def test_midcapture_settled_note_fails(self):
+        """The settled run note does not name the mid-capture mode."""
+        with self.assertRaises(AssertionError):
+            check_midcapture(run_note=NOTE_CHANGED)
+
+    def test_midcapture_swapped_edges_fail(self):
+        """The settled legs judge exactly as D1-changed."""
+        kernel = inventory(
+            [edge(PID_B_PRE, "m9"), edge(PID_B_SPAN, "m8")],
+            backend="kernel", fallback="anchor_not_installed",
+            modules=dict(CHANGED_MODULES), shas=dict(CHANGED_SHAS))
+        with self.assertRaises(AssertionError):
+            check_midcapture(kernel=kernel)
+
+
 class LateReportedTest(unittest.TestCase):
     def test_unwatched_prefix_passes(self):
         result = check_late()
@@ -1474,6 +1540,29 @@ class OracleCliTest(unittest.TestCase):
             completed = run_oracle(*self.changed_args(work, inputs))
             self.assertNotEqual(completed.returncode, 0)
             self.assertIn("copy-up changed no bytes", completed.stderr)
+
+    def midcapture_args(self, work, inputs):
+        args = self.changed_args(work, inputs)
+        args[0] = "copy-up-midcapture"
+        return args
+
+    def test_midcapture_cli_passes(self):
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(
+                *self.midcapture_args(work, good_midcapture_inputs()))
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            result = json.loads(completed.stdout)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["check"], "copy-up-midcapture")
+            self.assertEqual(result["window"]["t-patch"], "300")
+
+    def test_midcapture_cli_refuses_unstamped_window(self):
+        inputs = good_midcapture_inputs()
+        inputs["facts_text"] = changed_facts()
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(*self.midcapture_args(work, inputs))
+            self.assertNotEqual(completed.returncode, 0)
+            self.assertIn("t-profile-ready", completed.stderr)
 
     def test_late_reported_cli_passes(self):
         inputs = good_late_inputs()

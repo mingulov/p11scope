@@ -3,9 +3,11 @@
 """Container-cells oracle for scripts/docker-shared-layer-e2e.sh (D1), scripts/docker-copyup-changed-e2e.sh (D1-changed) and scripts/late-provider-negative.sh (N4).
 
 Subcommands: copy-up (D1 shared-layer / copy-up), copy-up-changed
-(D1-changed different-bytes copy-up), late-reported (N4 never-seen
-late provider), --self-test. Every check ships a mutation this oracle refuses;
-see --self-test and tests/python/test_container_cells_oracle.py.
+(D1-changed different-bytes copy-up), copy-up-midcapture
+(D1-changed-midcapture: the patch lands during the running profile),
+late-reported (N4 never-seen late provider), --self-test. Every check
+ships a mutation this oracle refuses; see --self-test and
+tests/python/test_container_cells_oracle.py.
 
 D1 follows the honest span split. Pre-copy-up the kernel leg collapses
 B onto A's module (same lower file, honest) while the userspace leg
@@ -933,6 +935,46 @@ def copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2, iters_s,
             "stale_caller": changed_caller_line(pid_b_pre)}
 
 
+MIDCAPTURE_STAMPS = ("t-profile-ready", "t-bpre-ledger", "t-patch",
+                     "t-b2-ledger", "t-profile-end")
+
+
+def copy_up_midcapture(kernel, userspace, profile, pid_b_pre, pid_b2,
+                       iters_s, iters_f, run_note, facts_text,
+                       module_suffix=PROVIDER):
+    """D1-changed-midcapture: the patch lands DURING the running profile.
+
+    Same evidence as D1-changed, but the cgroup-B profile starts while B
+    maps the single pre-copy-up file: B-pre's stale ledger completes
+    inside the window, the unmapped-byte patch copies the file up
+    mid-window, and the second mapper ledgers fresh on the upper copy
+    before the window ends. The driver records the five window stamps in
+    facts.log; they must be strictly increasing (fixed-width %s%N, so
+    string order is time order), which proves the patch is strictly
+    inside the capture window. The settled legs then judge exactly as
+    D1-changed: the kernel leg attributes B-pre to the witness-proven
+    lower module and B2 to the upper module, the userspace leg honestly
+    gaps both joins, and the profile counts the stale ledger S on the
+    pre_copy_up row and the fresh ledger F on the upper row, both exact.
+    """
+    facts = parse_facts(facts_text)
+    for key in MIDCAPTURE_STAMPS:
+        assert key in facts, (f"facts.log names no {key}", sorted(facts))
+    stamps = [facts[key] for key in MIDCAPTURE_STAMPS]
+    assert all(stamp.isdigit() for stamp in stamps), \
+        ("window stamps are not %s%N", stamps)
+    assert stamps == sorted(stamps) and len(set(stamps)) == len(stamps), \
+        ("the copy-up is not strictly inside the capture window", stamps)
+    assert "mid-capture" in run_note, \
+        "run log does not name the mid-capture mode"
+    result = copy_up_changed(kernel, userspace, profile, pid_b_pre, pid_b2,
+                             iters_s, iters_f, run_note, facts_text,
+                             module_suffix)
+    result["check"] = "copy-up-midcapture"
+    result["window"] = dict(zip(MIDCAPTURE_STAMPS, stamps))
+    return result
+
+
 # ---------------------------------------------------------------- self-test
 
 
@@ -1697,6 +1739,41 @@ def self_test():
     mutate_changed("changed profile honestly lossy is not exact",
                    profile=gapped)
 
+    mc_stamps = ("t-profile-ready=100 t-bpre-ledger=200 t-patch=300 "
+                 "t-b2-ledger=400 t-profile-end=500\n")
+    mc_facts = ch_facts + mc_stamps
+    mc_note = ch_note + " (mid-capture: the patch landed mid-profile)"
+
+    def good_midcapture():
+        inputs = good_changed()
+        inputs["facts_text"] = mc_facts
+        inputs["run_note"] = mc_note
+        return inputs
+
+    def mutate_midcapture(label, **overrides):
+        inputs = good_midcapture()
+        inputs.update(overrides)
+        refuses(label, lambda: copy_up_midcapture(**inputs))
+
+    healthy_midcapture = copy_up_midcapture(**good_midcapture())
+    assert healthy_midcapture["check"] == "copy-up-midcapture"
+    assert healthy_midcapture["window"]["t-patch"] == "300"
+    mutate_midcapture("midcapture facts without the patch stamp",
+                      facts_text=mc_facts.replace("t-patch=300 ", ""))
+    mutate_midcapture("midcapture patch before the stale ledger",
+                      facts_text=mc_facts.replace("t-patch=300", "t-patch=150"))
+    mutate_midcapture("midcapture patch after the window",
+                      facts_text=mc_facts.replace(
+                          "t-profile-end=500", "t-profile-end=250"))
+    mutate_midcapture("midcapture tied stamps",
+                      facts_text=mc_facts.replace(
+                          "t-b2-ledger=400", "t-b2-ledger=300"))
+    mutate_midcapture("midcapture settled note without the mode",
+                      run_note=ch_note)
+    mutate_midcapture("midcapture mappers swapped",
+                      kernel=ch_inventory([st_edge(102, "m9"),
+                                           st_edge(104, "m8")]))
+
     late_module = "/tmp/private/libsofthsm2.so"
     late_modules = (("m7", (0, 412, 900), ST_PROVIDER),
                     ("m8", (0, 138, 901), late_module))
@@ -1857,6 +1934,17 @@ def main(argv):
     changed_parser.add_argument("--run-note", required=True)
     changed_parser.add_argument("--facts-log", required=True)
     changed_parser.add_argument("--module-suffix", default=PROVIDER)
+    midcapture_parser = sub.add_parser("copy-up-midcapture")
+    midcapture_parser.add_argument("--kernel", required=True)
+    midcapture_parser.add_argument("--userspace", required=True)
+    midcapture_parser.add_argument("--profile", required=True)
+    midcapture_parser.add_argument("--pid-b-pre", type=int, required=True)
+    midcapture_parser.add_argument("--pid-b2", type=int, required=True)
+    midcapture_parser.add_argument("--iters-s", type=int, required=True)
+    midcapture_parser.add_argument("--iters-f", type=int, required=True)
+    midcapture_parser.add_argument("--run-note", required=True)
+    midcapture_parser.add_argument("--facts-log", required=True)
+    midcapture_parser.add_argument("--module-suffix", default=PROVIDER)
     late_parser = sub.add_parser("late-reported")
     late_parser.add_argument("file")
     late_parser.add_argument("--pid-o", type=int, required=True)
@@ -1907,6 +1995,21 @@ def main(argv):
                                  options.pid_b2, options.iters_s,
                                  options.iters_f, note, facts,
                                  options.module_suffix)
+        print(json.dumps(result, sort_keys=True))
+        print(changed_caller_line(options.pid_b_pre), file=sys.stderr)
+    elif options.command == "copy-up-midcapture":
+        def load(path):
+            with open(path, encoding="utf-8") as handle:
+                return json.load(handle)
+
+        with open(options.run_note, encoding="utf-8") as handle:
+            note = handle.read()
+        facts = open(options.facts_log, encoding="utf-8").read()
+        result = copy_up_midcapture(load(options.kernel), load(options.userspace),
+                                    load(options.profile), options.pid_b_pre,
+                                    options.pid_b2, options.iters_s,
+                                    options.iters_f, note, facts,
+                                    options.module_suffix)
         print(json.dumps(result, sort_keys=True))
         print(changed_caller_line(options.pid_b_pre), file=sys.stderr)
     elif options.command == "late-reported":

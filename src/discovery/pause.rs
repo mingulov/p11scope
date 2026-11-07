@@ -10239,15 +10239,38 @@ mod tests {
         command: Vec<std::ffi::OsString>,
         out: &std::path::Path,
     ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
+        wrapper_profile_inner(pause, command, out, Vec::new(), Vec::new())
+    }
+
+    /// The pre-armed twin: the named provider is armed before the fork,
+    /// so a grandchild that loads it mid-run is hooked from its first
+    /// call instead of racing discovery's admission passes.
+    fn wrapper_profile_prearmed(
+        pause: PausePolicy,
+        command: Vec<std::ffi::OsString>,
+        out: &std::path::Path,
+        module: &str,
+    ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
+        let path = std::path::PathBuf::from(module);
+        wrapper_profile_inner(pause, command, out, vec![path.clone()], vec![path])
+    }
+
+    fn wrapper_profile_inner(
+        pause: PausePolicy,
+        command: Vec<std::ffi::OsString>,
+        out: &std::path::Path,
+        modules: Vec<std::path::PathBuf>,
+        prearm_modules: Vec<std::path::PathBuf>,
+    ) -> (crate::run::OwnedRunOutcome, serde_json::Value) {
         let args = crate::cli::RunArgs {
             track_short_lived: false,
             verbose: false,
             quiet: false,
             kind: crate::cli::Kind::Profile,
-            modules: Vec::new(),
+            modules,
             exclude_modules: vec![],
             manifests: Vec::new(),
-            prearm_modules: Vec::new(),
+            prearm_modules,
             forwarding_modules: Vec::new(),
             hooks: crate::discovery::hooks::HookRegistry::builtin(),
             metrics: false,
@@ -10365,12 +10388,18 @@ mod tests {
         assert_sigstop_lattice(&outcome.evidence);
     }
 
-    /// `run --pause auto -- sh -c '…'` without `exec`: the provider loads in
-    /// a grandchild outside PID scope, which the pause cannot cover. The run
-    /// stays honest: the workload succeeds invisibly, zero calls are
-    /// observed, and the report is PARTIAL with no silent success. The
-    /// background `& wait` form forces the fork on every shell: some shells
-    /// replace themselves with a lone `sh -c` command instead of forking.
+    /// `run --pause auto -- sh -c '… & wait'`: the provider loads in a
+    /// grandchild inside the run-tree cgroup scope, so the pause+tree
+    /// follows it. The grandchild's calls land ledger-exact; the
+    /// grandchild retires between admission passes, so the verdict is
+    /// honestly PARTIAL with one descendant gap. The wrapped lattice is
+    /// not strict sigstop: the grandchild's quick exit strands one late
+    /// attempt unserviced, while every live window stays protected by a
+    /// confirmed stop. The background `& wait` form forces the fork on
+    /// every shell: some shells replace themselves with a lone `sh -c`
+    /// command instead of forking. The trailing `exec sleep 2` settles
+    /// the terminal drain: without it the grandchild's exit strands past
+    /// the drain's read position on some hosts and the gap undercounts.
     #[test]
     #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]
     fn privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64() {
@@ -10378,46 +10407,57 @@ mod tests {
         let conf = wrapper_token(&dir);
         let _env = WrapperEnvGuard::set(&conf);
         let module = wrapper_softhsm_lib();
-        let (direct, direct_doc) = wrapper_profile(
+        let (direct, direct_doc) = wrapper_profile_prearmed(
             PausePolicy::Auto,
             wrapper_pkcs11_tool(module),
             &dir.join("direct.json"),
+            module,
         );
         assert_eq!(direct.child_exit_code, Some(0));
-        assert!(
-            wrapper_total_calls(&direct_doc) > 0,
-            "the oracle proves the token can produce calls"
+        let oracle = wrapper_total_calls(&direct_doc);
+        assert!(oracle > 0, "the oracle proves the token can produce calls");
+        assert_sigstop_lattice(&direct.evidence);
+        let script = format!(
+            "/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234 & wait; exec sleep 2"
         );
-        let script = format!("/usr/bin/pkcs11-tool --module {module} -O --login --pin 1234 & wait");
         let wrapped = vec![
             std::ffi::OsString::from("/bin/sh"),
             std::ffi::OsString::from("-c"),
             std::ffi::OsString::from(script),
         ];
-        let (outcome, document) =
-            wrapper_profile(PausePolicy::Auto, wrapped, &dir.join("wrapped.json"));
+        let (outcome, document) = wrapper_profile_prearmed(
+            PausePolicy::Auto,
+            wrapped,
+            &dir.join("wrapped.json"),
+            module,
+        );
         assert_eq!(
             outcome.child_exit_code,
             Some(0),
-            "the grandchild workload must succeed invisibly"
+            "the grandchild workload must succeed"
         );
         assert_eq!(
             wrapper_total_calls(&document),
-            0,
-            "no call in the owned task may be observed"
+            oracle,
+            "the grandchild's calls land ledger-exact"
         );
         assert!(
-            document["functions"]
-                .as_array()
-                .expect("functions array")
-                .is_empty(),
-            "no attach slot may be planned for the owned task"
+            outcome.evidence.pause_attempts > 0,
+            "auto attempted nothing"
         );
-        assert_eq!(outcome.evidence.completeness, "PARTIAL");
         assert_eq!(
             outcome.evidence.pause_confirmed + outcome.evidence.pause_partial,
             outcome.evidence.pause_attempts,
             "pause counters do not add up"
+        );
+        assert_eq!(
+            outcome.evidence.unprotected_live_windows, 0,
+            "every live window was protected by a confirmed stop"
+        );
+        assert_eq!(outcome.evidence.completeness, "PARTIAL");
+        assert_eq!(
+            outcome.evidence.pid_descendant_gaps, 1,
+            "the retired grandchild is one honest gap"
         );
     }
 

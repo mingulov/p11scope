@@ -890,12 +890,14 @@ class SchemaOracleAgreement(unittest.TestCase):
     def test_evidence_keys_match_oracle_closed_sets(self):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
-        the optional additive envelopes (counter, selection, excludes, legacy)."""
+        the optional additive envelopes (counter, selection, excludes,
+        legacy, short-lived splits)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
             | {"child_still_running", "counter_collection", "selected_detail",
-               "excluded_modules", "unmatched_excludes", "legacy_collection"}
+               "excluded_modules", "unmatched_excludes", "legacy_collection",
+               "gap_exe_hints", "target_exec_hints", "gap_exit_mappings"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 
@@ -1081,6 +1083,113 @@ class SchemaOracleAgreement(unittest.TestCase):
             set(scheduling["properties"]["phase_ms"]["properties"]),
             set(CHECKER["SCHEDULING_PHASE_KEYS"]),
         )
+
+    def hint_split(self, **overrides):
+        split = {
+            "label": "STATIC HINT",
+            "scope": ("D-transitive depth=2 objects<=32 edges<=128 "
+                      "exe-bytes<=1MiB capture-bytes<=64MiB "
+                      "names<=255B verdicts<=1024"),
+            "links_provider": 1, "links_pkcs11_loader": 0,
+            "no_static_link_within_scope": 0, "unknown": 2,
+        }
+        split.update(overrides)
+        return split
+
+    def exit_split(self, **overrides):
+        split = {"mapped": 1, "unknown": 2}
+        split.update(overrides)
+        return split
+
+    def armed_profile_document(self):
+        document = CHECKER["document_fixture"](
+            CHECKER["evidence_fixture"]({}))
+        evidence = document["evidence"]
+        evidence["gap_exe_hints"] = self.hint_split()
+        evidence["target_exec_hints"] = self.hint_split(links_provider=0)
+        evidence["gap_exit_mappings"] = self.exit_split()
+        return document
+
+    def test_short_lived_splits_accepted_in_profile_metrics_and_terminal(self):
+        """Armed evidence carries the three short-lived splits in every
+        lane that publishes them: profile and metrics documents plus
+        the terminal trace EVIDENCE object."""
+        CHECKER["exact_profile_v3_selection"](self.armed_profile_document())
+        metrics = self.metrics_document()
+        metrics["evidence"]["gap_exe_hints"] = self.hint_split()
+        metrics["evidence"]["target_exec_hints"] = self.hint_split()
+        metrics["evidence"]["gap_exit_mappings"] = self.exit_split()
+        CHECKER["exact_metrics_schema"](metrics)
+        terminal = copy.deepcopy(self.armed_profile_document()["evidence"])
+        terminal.update(
+            privacy_mode="allowlisted", capture_aborted=None,
+            final_drain=False, counters_available=True,
+            trace_truncated=False,
+        )
+        CHECKER["exact_profile_v3_selection"](terminal, terminal=True)
+
+    def test_short_lived_splits_malformed_rejected(self):
+        """Each split validates its closed shape: exact keys, the
+        STATIC HINT label and scope, and saturating-u64 counts."""
+        cases = [
+            ("gap_exe_hints", self.hint_split(label="STATIC GUESS")),
+            ("gap_exe_hints", self.hint_split(scope="D-direct")),
+            ("gap_exe_hints", self.hint_split(extra=1)),
+            ("gap_exe_hints", {k: v for k, v in self.hint_split().items()
+                               if k != "unknown"}),
+            ("gap_exe_hints", self.hint_split(links_provider=-1)),
+            ("gap_exe_hints", self.hint_split(unknown="2")),
+            ("target_exec_hints", self.hint_split(label="STATIC GUESS")),
+            ("target_exec_hints", self.hint_split(extra=1)),
+            ("gap_exit_mappings", self.exit_split(extra=1)),
+            ("gap_exit_mappings", {"mapped": 1}),
+            ("gap_exit_mappings", self.exit_split(mapped=-1)),
+            ("gap_exit_mappings", self.exit_split(unknown="2")),
+        ]
+        for key, bad in cases:
+            with self.subTest(key=key, bad=bad):
+                document = self.armed_profile_document()
+                document["evidence"][key] = bad
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_profile_v3_selection"](document)
+
+    def test_short_lived_split_schemas_match_oracle(self):
+        """Schema properties for the three splits are the oracle's
+        closed shapes: exact keys, pinned label/scope, u64 counts."""
+        props = evidence_schema()["properties"]
+        for key in ("gap_exe_hints", "target_exec_hints"):
+            with self.subTest(key=key):
+                split = props[key]
+                self.assertFalse(split["additionalProperties"])
+                self.assertEqual(
+                    set(split["properties"]),
+                    set(CHECKER["STATIC_HINT_SPLIT_KEYS"]),
+                )
+                self.assertEqual(
+                    split["properties"]["label"]["const"],
+                    CHECKER["STATIC_HINT_LABEL"],
+                )
+                self.assertEqual(
+                    split["properties"]["scope"]["const"],
+                    CHECKER["STATIC_HINT_SCOPE"],
+                )
+                for count in ("links_provider", "links_pkcs11_loader",
+                              "no_static_link_within_scope", "unknown"):
+                    self.assertEqual(
+                        split["properties"][count],
+                        {"type": "integer", "minimum": 0},
+                    )
+        mappings = props["gap_exit_mappings"]
+        self.assertFalse(mappings["additionalProperties"])
+        self.assertEqual(
+            set(mappings["properties"]),
+            set(CHECKER["EXIT_MAPPINGS_SPLIT_KEYS"]),
+        )
+        for count in ("mapped", "unknown"):
+            self.assertEqual(
+                mappings["properties"][count],
+                {"type": "integer", "minimum": 0},
+            )
 
 
 class PrearmOracleAgreement(unittest.TestCase):

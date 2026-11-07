@@ -624,7 +624,9 @@ run_exact() {
   local output; output=$(product_output "$cell.json")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after wl='' pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
-  local gen='' readygen='' scope=pid
+  # Run-tree (v0.7.0): owned runs capture the command's child
+  # processes at cgroup scope.
+  local gen='' readygen='' scope=cgroup
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
   SUDO_UID=$RUNUID SUDO_GID=$RUNGID "$P" run --pause auto -o "$output" -- "$fixture" "$MODULE" "$iters" 0 - > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
   if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi

@@ -40,6 +40,9 @@ CELL_SCOPES = {
     "counter-counts-system": "system", "counter-timestamps-system": "system",
     "counter-latency-system": "system", "select-endpoint-system": "system",
     "profile-cgroup": "cgroup", "metrics-cgroup": "cgroup", "trace-cgroup": "cgroup",
+    # Run-tree (v0.7.0): owned runs follow the command's child
+    # processes in a dedicated cgroup; sigint still attaches by PID.
+    "run-short": "cgroup", "run-cover": "cgroup", "run-ia32": "cgroup",
 }
 METRICS_CELLS = {"metrics-pid", "metrics-cgroup",
                  "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",

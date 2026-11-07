@@ -295,11 +295,14 @@ impl JournalLimits {
 }
 
 /// Unsettled payloads across the whole capture (H9 §89): at most
-/// 1,024 open H8 calls, staged H9 payloads and prospective key
+/// 4,096 open H8 calls, staged H9 payloads and prospective key
 /// associations share one logical ticket space. The H9 staging
 /// bound mirrors this ceiling; the [`StagingLedger`] enforces it
-/// across all feeds.
-pub(crate) const MAX_UNSETTLED_STAGED: usize = 1_024;
+/// across all feeds. Raised 1,024 to 4,096 (measured: sustained
+/// 10k/s holds ~3,080 unsettled at ~300 ms seal delay; the 1,024
+/// table closed quanta early and fragmented flow; raises never
+/// lower a limit, OD29).
+pub(crate) const MAX_UNSETTLED_STAGED: usize = 4_096;
 
 #[path = "journal/ledger.rs"]
 mod ledger;

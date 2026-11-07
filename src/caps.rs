@@ -499,7 +499,8 @@ mod tests {
     /// Per-command keep sets: live capture keeps the minimal set plus
     /// the root-functional extras (`-o` anywhere needs DAC_OVERRIDE and
     /// CHOWN for the handoff, the singles fallback needs SYS_ADMIN,
-    /// `run --user` needs SETUID/SETGID);
+    /// `run` always keeps SETUID/SETGID/KILL for the sudo-drop identity
+    /// change and signalling its re-owned child);
     /// `inspect` drops the BPF pair it never uses; `diff` keeps file IO
     /// only; `--version` keeps nothing. A setcap user never holds the
     /// extras, so the same masks shed them there automatically.
@@ -513,11 +514,15 @@ mod tests {
         let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let set_ids = (1u64 << CAP_SETUID_BIT) | (1u64 << CAP_SETGID_BIT);
+        // `CAP_KILL` bit 5 (`linux/capability.h`): signalling the re-owned
+        // run child across uids. Spelled literally here so this test pins
+        // the requirement before the constant lands.
+        let kill = 1u64 << 5;
+        let run_keep = live | sys_admin | set_ids | kill;
         // Live capture without `-o`: minimal set plus the singles fallback.
         for argv in [
             vec!["profile", "--pid", "1"],
             vec!["trace", "--pid", "1"],
-            vec!["run", "--", "/bin/true"],
             vec!["inventory", "--system"],
         ] {
             assert_eq!(
@@ -526,11 +531,18 @@ mod tests {
                 "{argv:?}"
             );
         }
+        // `run` without `--user` still drops to the sudo invoker and
+        // signals across uids, so it keeps the identity caps always.
+        for argv in [
+            vec!["run", "--", "/bin/true"],
+            vec!["run", "--user", "nobody", "--", "/bin/true"],
+        ] {
+            assert_eq!(keep_mask_for_command(&parse(&argv)), run_keep, "{argv:?}");
+        }
         // `-o` anywhere needs DAC_OVERRIDE on top (root runs).
         for argv in [
             vec!["profile", "--pid", "1", "-o", "out.json"],
             vec!["trace", "--pid", "1", "-o", "out.json"],
-            vec!["run", "-o", "out.json", "--", "/bin/true"],
             vec!["inventory", "--system", "-o", "out.json"],
         ] {
             assert_eq!(
@@ -539,11 +551,24 @@ mod tests {
                 "{argv:?}"
             );
         }
-        // `run --user` assumes the identity: SETUID/SETGID on top.
-        assert_eq!(
-            keep_mask_for_command(&parse(&["run", "--user", "nobody", "--", "/bin/true"])),
-            live | sys_admin | set_ids
-        );
+        for argv in [
+            vec!["run", "-o", "out.json", "--", "/bin/true"],
+            vec![
+                "run",
+                "--user",
+                "nobody",
+                "-o",
+                "out.json",
+                "--",
+                "/bin/true",
+            ],
+        ] {
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                run_keep | file_out,
+                "{argv:?}"
+            );
+        }
         let inspect = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
         for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
             assert_eq!(keep_mask_for_command(&parse(&argv)), inspect, "{argv:?}");

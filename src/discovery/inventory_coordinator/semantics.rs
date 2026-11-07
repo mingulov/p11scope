@@ -4137,42 +4137,74 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             .into_iter()
             .map(|evidence| {
                 let token = evidence.token();
+                // A refused Joined `C_Initialize` still counts its
+                // return on the endpoint's module: read the tap facts
+                // before the consuming conversion below, mirroring the
+                // shed tap.
+                let joined_init = evidence.refused_init_facts();
                 let found = self
                     .semantic_bindings
                     .find_by_image(evidence.domain(), evidence.image());
-                let Some(binding) = found else {
-                    return (None, token, Err(ConversionRefusal::Custody));
+                let (caller, converted) = match found {
+                    None => (None, Err(ConversionRefusal::Custody)),
+                    Some(binding) => {
+                        let caller = binding.caller();
+                        if self.adapter.leader_exit_pending(caller) {
+                            (Some(caller), Err(ConversionRefusal::Custody))
+                        } else {
+                            let coverage = coverages.iter().find(|coverage| {
+                                binding.scope_current()
+                                    && coverage.domain() == evidence.domain()
+                                    && coverage.image() == evidence.image()
+                                    && coverage.instances().contains(&evidence.router())
+                            });
+                            // Joined is historical evidence: a call without same-batch
+                            // current proof (cached, quiet provider) still adds
+                            // history-only API returns under a disclosed reason, never
+                            // current continuity and never a re-proof.
+                            let standing = match coverage {
+                                Some(coverage) => CallStanding::Current(coverage),
+                                None => CallStanding::Historical(InstanceReason::SemanticLoss),
+                            };
+                            (
+                                Some(caller),
+                                admit_call_from_evidence(
+                                    evidence, binding, subset, standing, barrier,
+                                ),
+                            )
+                        }
+                    }
                 };
-                let caller = binding.caller();
-                if self.adapter.leader_exit_pending(caller) {
-                    return (Some(caller), token, Err(ConversionRefusal::Custody));
+                match converted.as_ref() {
+                    // A converted `C_Initialize` taps the module roll-up:
+                    // conversion proved the caller binding, the attested
+                    // slot name and the provider module.
+                    Ok(admitted) if admitted.s1_facts().function == module_init::C_INITIALIZE => {
+                        if let Some(module) =
+                            self.registry.module_id_for(admitted.provider_module())
+                        {
+                            init_taps.push((module, admitted.s1_facts().rv));
+                        }
+                    }
+                    // A refused `C_Initialize` taps under the shed
+                    // proof standard: the attested slot names it and the
+                    // endpoint proves the module. The tap reads the
+                    // refusal without consuming its disclosure: the
+                    // staged entry still sheds with a conversion gap.
+                    Err(_)
+                        if let Some((endpoint, slot, rv)) = joined_init
+                            && module_init::init_slot_for_shed(subset.plan(), slot, &endpoint)
+                            && let Some(module) = self.init_module_for_object(
+                                subset,
+                                endpoint.object,
+                                &mut init_objects,
+                            ) =>
+                    {
+                        init_taps.push((module, rv));
+                    }
+                    _ => {}
                 }
-                let coverage = coverages.iter().find(|coverage| {
-                    binding.scope_current()
-                        && coverage.domain() == evidence.domain()
-                        && coverage.image() == evidence.image()
-                        && coverage.instances().contains(&evidence.router())
-                });
-                // Joined is historical evidence: a call without same-batch
-                // current proof (cached, quiet provider) still adds
-                // history-only API returns under a disclosed reason, never
-                // current continuity and never a re-proof.
-                let standing = match coverage {
-                    Some(coverage) => CallStanding::Current(coverage),
-                    None => CallStanding::Historical(InstanceReason::SemanticLoss),
-                };
-                let converted =
-                    admit_call_from_evidence(evidence, binding, subset, standing, barrier);
-                // A converted `C_Initialize` taps the module roll-up:
-                // conversion proved the caller binding, the attested
-                // slot name and the provider module.
-                if let Ok(admitted) = converted.as_ref()
-                    && admitted.s1_facts().function == module_init::C_INITIALIZE
-                    && let Some(module) = self.registry.module_id_for(admitted.provider_module())
-                {
-                    init_taps.push((module, admitted.s1_facts().rv));
-                }
-                (Some(caller), token, converted)
+                (caller, token, converted)
             })
             .collect();
         for (module, rv) in init_taps {
@@ -8020,6 +8052,22 @@ mod module_init_seam_tests {
             .sum()
     }
 
+    /// Calls refused at staged conversion, whatever the caller: the
+    /// tap reads the refusal without consuming its disclosure.
+    fn conversion_refused_gap_calls(
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        reason: &str,
+    ) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject == "semantic input refused" && gap.reason == reason)
+            .map(|(_, repeats)| *repeats)
+            .sum()
+    }
+
     #[test]
     fn module_init_rollup_counts_joined_initialize() {
         let pid = std::process::id();
@@ -8307,5 +8355,153 @@ mod module_init_seam_tests {
             "a shed whose endpoint proves no module taps nothing"
         );
         assert_eq!(unrouted_gap_calls(&coordinator), 1);
+    }
+
+    #[test]
+    fn module_init_rollup_counts_refused_joined_initialize() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let endpoint = fixture.endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        // No binding: the Joined call refuses custody at conversion,
+        // but its endpoint still proves the module.
+        let routed = routed_call(
+            detailed,
+            fixture.init_slot,
+            CkRv::GENERAL_ERROR.0,
+            Route::Joined(InstanceId::from_raw(11)),
+            Some(endpoint),
+            Some(2),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup {
+                calls: 1,
+                ok: 0,
+                already_initialized: 0,
+                last_error_rv: Some(CkRv::GENERAL_ERROR.0),
+            },
+            "a conversion-refused Joined C_Initialize taps the module roll-up"
+        );
+        assert_eq!(
+            conversion_refused_gap_calls(&coordinator, "custody"),
+            1,
+            "the tap reads the refusal without consuming its disclosure"
+        );
+        assert_eq!(
+            unrouted_gap_calls(&coordinator),
+            0,
+            "the joined call sheds nowhere unrouted"
+        );
+    }
+
+    #[test]
+    fn module_init_rollup_ignores_refused_joined_non_initialize() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        // A fully matching `C_Sign` endpoint: only the name refuses
+        // the tap.
+        let endpoint = fixture.other_endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        let routed = routed_call(
+            detailed,
+            fixture.other_slot,
+            CkRv::GENERAL_ERROR.0,
+            Route::Joined(InstanceId::from_raw(11)),
+            Some(endpoint),
+            Some(2),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup::default(),
+            "a conversion-refused Joined non-init taps nothing"
+        );
+        assert_eq!(
+            conversion_refused_gap_calls(&coordinator, "custody"),
+            1,
+            "the refusal still discloses"
+        );
     }
 }

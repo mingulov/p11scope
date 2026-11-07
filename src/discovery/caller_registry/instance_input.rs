@@ -3559,6 +3559,14 @@ impl CallEvidence {
     pub(crate) fn router(&self) -> InstanceId {
         self.router
     }
+
+    /// Tap facts for a refused Joined call, read before the consuming
+    /// conversion: the endpoint plus the event's slot and return.
+    /// `None` without an endpoint.
+    pub(crate) fn refused_init_facts(&self) -> Option<(Endpoint, u32, u64)> {
+        self.endpoint
+            .map(|endpoint| (endpoint, self.event.slot, self.event.rv))
+    }
 }
 
 /// Reduction standing for one call: a validated current-partition proof

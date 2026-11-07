@@ -9483,8 +9483,8 @@ impl SchedulingAccumulator {
                 self.drain_repolls,
                 self.drain_budget_exhaustions,
                 self.max_inter_drain_gap_ms,
-                self.gaps.p50_ms(),
-                self.gaps.p99_ms(),
+                self.gaps.p50_ms().unwrap_or(u64::MAX),
+                self.gaps.p99_ms().unwrap_or(u64::MAX),
             );
         }
     }

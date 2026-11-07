@@ -8497,6 +8497,8 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "rows": unbound.rows,
             "reasons": unbound.reasons,
             "entries": unbound.entries,
+            "images": unbound.images(),
+            "images_saturated": unbound.images_saturated,
         })),
         // Additive (v1): observed `C_Initialize` returns since the
         // semantic lane sealed, with the judged verdict.
@@ -8762,10 +8764,7 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
             "ended_ns": presentation.ended_ns,
             "passes": presentation.passes,
             "usage_feed": presentation.usage_feed,
-            "native_witnesses": native_witnesses_json(
-                &presentation.native_witnesses,
-                presentation.witness_placement,
-            ),
+            "native_witnesses": native_witnesses_json(presentation),
             "semantic_capture": presentation.semantic_capture.json(),
         },
         "budgets": budgets_json(&presentation.budgets),
@@ -8825,9 +8824,10 @@ pub(crate) fn render_json_from_presentation(presentation: &Presentation) -> serd
 /// for their lifecycle horizon and rows that failed validation. All zero in
 /// the scan lane. The unbound ratio is `unbound / rows`.
 fn native_witnesses_json(
-    census: &crate::discovery::native_binding::BindingCensus,
-    placement: crate::discovery::caller_registry::WitnessPlacement,
+    presentation: &crate::inventory_present::Presentation,
 ) -> serde_json::Value {
+    let census = &presentation.native_witnesses;
+    let placement = presentation.witness_placement;
     serde_json::json!({
         "placement": {
             "edge": placement.edge,
@@ -8845,6 +8845,10 @@ fn native_witnesses_json(
             .iter()
             .map(|(reason, count)| (reason.code().to_string(), serde_json::json!(count)))
             .collect::<serde_json::Map<_, _>>(),
+        "unbound_images": presentation.unbound_images,
+        "unbound_images_saturated": presentation.unbound_images_saturated,
+        "identity_unavailable": presentation.identity_unavailable_refused,
+        "identity_budget_exhausted": presentation.identity_budget_exhausted,
     })
 }
 
@@ -12075,6 +12079,8 @@ mod tests {
                 "rows": 0, "bound": 0, "unbound": 0, "pending": 0, "integrity": 0,
                 "unbound_reasons": {},
                 "placement": {"edge": 0, "module": 0, "ambiguous": 0, "unresolved": 0},
+                "unbound_images": 0, "unbound_images_saturated": false,
+                "identity_unavailable": 0, "identity_budget_exhausted": false,
             })
         );
         assert!(document["modules"][0]["unbound_use"].is_null());
@@ -12102,7 +12108,7 @@ mod tests {
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
         assert_eq!(
             document["modules"][0]["unbound_use"],
-            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0})
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0, "images": 0, "images_saturated": false})
         );
         assert_eq!(
             document["observation"]["native_witnesses"],
@@ -12110,6 +12116,8 @@ mod tests {
                 "rows": 3, "bound": 1, "unbound": 1, "pending": 1, "integrity": 0,
                 "unbound_reasons": {"before_admission": 1},
                 "placement": {"edge": 0, "module": 1, "ambiguous": 0, "unresolved": 0},
+                "unbound_images": 0, "unbound_images_saturated": false,
+                "identity_unavailable": 0, "identity_budget_exhausted": false,
             })
         );
         assert!(
@@ -12872,6 +12880,7 @@ mod tests {
             rows: pairs.iter().map(|(_, n)| n).sum(),
             reasons: pairs.iter().copied().collect(),
             entries: 0,
+            ..Default::default()
         };
         let mut state = StreamState::new();
         let first = [(ModuleId(3), unbound(&[("no_live_caller", 2)]))];

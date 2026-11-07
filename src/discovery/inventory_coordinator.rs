@@ -40,7 +40,8 @@ use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
     CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ImageAuthority,
     MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
-    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnknownReason, UseCoverage,
+    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnboundImage, UnknownReason,
+    UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -215,7 +216,8 @@ pub(crate) const CALLERS_REFUSED_ADMISSION_SUBJECT: &str = "callers refused admi
 pub(crate) fn short_lived_never_scanned_reason(confirmed: u64, untracked: u64) -> String {
     let mut reason = format!(
         "{confirmed} short-lived process(es) started and exited before any scan could examine \
-         them; their provider mappings are unknown, and no caller use is counted for them"
+         them; their provider mappings are unknown; any calls to an already-watched provider \
+         are counted only as module-level unidentified use"
     );
     if untracked > 0 {
         reason.push_str(&format!(
@@ -581,6 +583,13 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     exit_clocks_comparable: bool,
     /// The unvalidated-clocks gap was already noted once.
     exit_clock_gap_noted: bool,
+    /// COOKIE_CTL identity refusals latched from witness health (slice
+    /// 1, issue 9): cumulative per capture, so the maximum stands. A
+    /// nonzero count means caller images that never got an identity —
+    /// the unidentified-caller count misses them.
+    identity_unavailable_refused: u64,
+    /// The identity ticket budget spent itself (sticky).
+    identity_budget_exhausted: bool,
     /// Retirements already staged in the registry (H6 slice 2): held
     /// handoffs report the old incarnation at mint and again at commit;
     /// the second report binds owners without restaging the retirement.
@@ -1035,6 +1044,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             leader_exit_cursor: None,
             exit_clocks_comparable: exit_clocks_comparable(),
             exit_clock_gap_noted: false,
+            identity_unavailable_refused: 0,
+            identity_budget_exhausted: false,
             staged_retirements: BTreeSet::new(),
             stopped: false,
             post_pass_exec_newcomers: BTreeSet::new(),
@@ -2260,6 +2271,32 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &self.registry
     }
 
+    /// Latch COOKIE_CTL identity strain (slice 1, issue 9): the
+    /// refusals are cumulative per capture, so the maximum stands;
+    /// the spent flag uses the metrics seam's predicate. Sticky; runs
+    /// for every witness batch, including terminal refreshes after
+    /// stop.
+    fn note_identity_unavailable(&mut self, batch: &WitnessBatch) {
+        let Some(control) = &batch.health.caller_control else {
+            return;
+        };
+        self.identity_unavailable_refused =
+            self.identity_unavailable_refused.max(control.unavailable);
+        if control.next_ticket >= control.limit.max(1) {
+            self.identity_budget_exhausted = true;
+        }
+    }
+
+    /// COOKIE_CTL identity refusals latched from witness health.
+    pub(crate) fn identity_unavailable_refused(&self) -> u64 {
+        self.identity_unavailable_refused
+    }
+
+    /// Whether the identity ticket budget spent itself.
+    pub(crate) fn identity_budget_exhausted(&self) -> bool {
+        self.identity_budget_exhausted
+    }
+
     /// The capture's `--exclude-module` report rows plus the inputs that
     /// matched nothing, aggregated from the engine budget's per-(pid, file)
     /// records. A declared operator choice, never a loss.
@@ -3300,6 +3337,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             }
         }
         self.note_count_freshness(batch);
+        self.note_identity_unavailable(batch);
         let Some(capture) = self.capture.as_mut().filter(|capture| !capture.stopped) else {
             return;
         };
@@ -8175,8 +8213,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason, row.recorded_at_ns);
-                self.registry
-                    .note_unbound_witness(modules, row.recorded_at_ns, reason, folded)
+                let image = UnboundImage {
+                    cookie: row.cookie(),
+                };
+                self.registry.note_unbound_witness_with_image(
+                    modules,
+                    row.recorded_at_ns,
+                    reason,
+                    folded,
+                    Some(image),
+                )
             }
         }
         Ok(())

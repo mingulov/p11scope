@@ -98,6 +98,10 @@ pub(super) struct NativeWitnesses {
     pub integrity: u64,
     pub unbound_reasons: BTreeMap<String, u64>,
     pub placement: Placement,
+    pub unbound_images: u64,
+    pub unbound_images_saturated: bool,
+    pub identity_unavailable: u64,
+    pub identity_budget_exhausted: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Placement {
@@ -208,6 +212,8 @@ pub(super) struct UnboundUse {
     pub rows: u64,
     pub reasons: BTreeMap<String, u64>,
     pub entries: u64,
+    pub images: u64,
+    pub images_saturated: bool,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Module {
@@ -952,11 +958,24 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
             } else {
                 0
             };
+            // Slice-1 keys, absent in old captures.
+            let images = if u.fields.contains_key("images") {
+                u.uint("images")?
+            } else {
+                0
+            };
+            let images_saturated = if u.fields.contains_key("images_saturated") {
+                u.boolean("images_saturated")?
+            } else {
+                false
+            };
             Ok::<_, anyhow::Error>(UnboundUse {
                 first_ns: u.uint("first_ns")?,
                 rows: u.uint("rows")?,
                 reasons: u.u64_map("reasons")?,
                 entries,
+                images,
+                images_saturated,
             })
         })
         .transpose()?;
@@ -1076,6 +1095,27 @@ fn parse_observation(o: &Object<'_>) -> Result<Observation> {
         .optional_object("native_witnesses", false)?
         .map(|n| {
             let p = n.object("placement")?;
+            // Slice-1 keys, absent in old captures.
+            let unbound_images = if n.fields.contains_key("unbound_images") {
+                n.uint("unbound_images")?
+            } else {
+                0
+            };
+            let unbound_images_saturated = if n.fields.contains_key("unbound_images_saturated") {
+                n.boolean("unbound_images_saturated")?
+            } else {
+                false
+            };
+            let identity_unavailable = if n.fields.contains_key("identity_unavailable") {
+                n.uint("identity_unavailable")?
+            } else {
+                0
+            };
+            let identity_budget_exhausted = if n.fields.contains_key("identity_budget_exhausted") {
+                n.boolean("identity_budget_exhausted")?
+            } else {
+                false
+            };
             Ok::<_, anyhow::Error>(NativeWitnesses {
                 rows: n.uint("rows")?,
                 bound: n.uint("bound")?,
@@ -1089,6 +1129,10 @@ fn parse_observation(o: &Object<'_>) -> Result<Observation> {
                     ambiguous: p.uint("ambiguous")?,
                     unresolved: p.uint("unresolved")?,
                 },
+                unbound_images,
+                unbound_images_saturated,
+                identity_unavailable,
+                identity_budget_exhausted,
             })
         })
         .transpose()?;

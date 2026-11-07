@@ -25,6 +25,7 @@ use instance_input::{
     AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
 };
 
+use crate::attach::capture::DomainCookie;
 use crate::discovery::native_binding::{BindingCensus, BoundImage, UnboundReason};
 use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::CaptureWorkBudget;
@@ -2348,7 +2349,7 @@ pub(crate) struct ModuleRecord {
 
 /// Module-level positive use from native witness rows that no caller edge
 /// carries, with the count per reason code.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct UnboundUse {
     /// Earliest first-association instant among the rows.
     pub first_ns: u64,
@@ -2364,6 +2365,59 @@ pub(crate) struct UnboundUse {
     /// staged decision, like `rows`. Shared-endpoint and unresolved rows
     /// fold nothing: their counts name no single module.
     pub entries: u64,
+    /// Distinct unidentified caller images (slice 1): one entry per
+    /// (domain, task cookie) that reached this module's committed
+    /// single-module path. Cookies never publish: only the count
+    /// ([`Self::images`]) and the saturation flag reach output.
+    /// `no_mapping_edge` rows never insert (their caller is known).
+    pub(crate) images: HashSet<DomainCookie>,
+    /// The per-module image set hit its bound: [`Self::images`] is a
+    /// lower bound. Sticky.
+    pub images_saturated: bool,
+}
+
+impl UnboundUse {
+    /// Distinct unidentified caller images on this module (a lower
+    /// bound while [`Self::images_saturated`]).
+    pub(crate) fn images(&self) -> u64 {
+        u64::try_from(self.images.len()).unwrap_or(u64::MAX)
+    }
+}
+
+/// The unidentified caller image one unbound row names (slice 1):
+/// the row's domain-tagged task cookie. Cookies are equality-only
+/// and never publish; only counts (and, where the allowlist says
+/// so, host pids) reach output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UnboundImage {
+    pub cookie: DomainCookie,
+}
+
+/// Slice-1 bounds for unidentified caller-image sets (LIM-1: never
+/// lowered). The per-module bound mirrors the pending-exec-newcomer
+/// bound (one entry per retainable caller); the run-wide bound
+/// mirrors the kernel ticket budget (cookies never reuse
+/// in-capture, so distinct images cannot outnumber minted tickets
+/// within one domain). Saturation is a disclosed lower bound, never
+/// a refusal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnboundImageLimits {
+    pub per_module: usize,
+    pub global: usize,
+}
+
+/// Default per-module unidentified-image bound (LIM-1).
+pub(crate) const DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE: usize = 4096;
+/// Default run-wide unidentified-image bound (LIM-1).
+pub(crate) const DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL: usize = 16_384;
+
+impl Default for UnboundImageLimits {
+    fn default() -> Self {
+        Self {
+            per_module: DEFAULT_MAX_UNBOUND_IMAGES_PER_MODULE,
+            global: DEFAULT_MAX_UNBOUND_IMAGES_GLOBAL,
+        }
+    }
 }
 
 /// Reason code for a witness bound to a caller incarnation whose edge to
@@ -2713,6 +2767,10 @@ enum Mutation {
         first_ns: u64,
         reason: UnboundReason,
         entries: u64,
+        /// The row's unidentified image, when the stager knows it.
+        /// `None` never inserts (test-direct staging, and the
+        /// `no_mapping_edge` path whose caller is known).
+        image: Option<UnboundImage>,
     },
     NoteUnresolvedWitness,
     NoteUseBeforeAdmission {
@@ -3072,6 +3130,16 @@ pub(crate) struct CallerRegistry {
     witness_census: BindingCensus,
     /// Where decided witness rows went (published with the batch).
     witness_placement: WitnessPlacement,
+    /// Bounds for unidentified caller-image sets (slice 1, LIM-1).
+    /// `pub(crate)` so tests shrink them; production keeps defaults.
+    pub(crate) unbound_image_limits: UnboundImageLimits,
+    /// Run-wide distinct unidentified caller images (slice 1): the
+    /// union of committed single-module inserts. Cookies never
+    /// publish: only the count and the saturation flag reach output.
+    unidentified_images: HashSet<DomainCookie>,
+    /// The run-wide image set hit its bound: the published count is a
+    /// lower bound. Sticky.
+    unidentified_images_saturated: bool,
     /// Pending-count placements the last publication decided, in apply
     /// order (P3): drained by the coordinator after each publish.
     pending_count_decisions: Vec<PendingCountDecision>,
@@ -3214,6 +3282,9 @@ impl CallerRegistry {
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
+            unbound_image_limits: UnboundImageLimits::default(),
+            unidentified_images: HashSet::new(),
+            unidentified_images_saturated: false,
             pending_count_decisions: Vec::new(),
             demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
@@ -3758,6 +3829,8 @@ impl CallerRegistry {
     /// process is exactly what could not be identified. `entries` is the
     /// row's held entry count at drop; it folds into the single module's
     /// lower bound and is ignored for shared or unresolved rows.
+    /// Test-direct staging (production always knows the image).
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn note_unbound_witness(
         &mut self,
         modules: Vec<ModuleKey>,
@@ -3765,11 +3838,26 @@ impl CallerRegistry {
         reason: UnboundReason,
         entries: u64,
     ) {
+        self.note_unbound_witness_with_image(modules, first_ns, reason, entries, None);
+    }
+
+    /// Stage one unbound row with its unidentified image (slice 1):
+    /// the image feeds the per-module and run-wide image sets on the
+    /// committed single-module path, beside `rows`/`entries`.
+    pub(crate) fn note_unbound_witness_with_image(
+        &mut self,
+        modules: Vec<ModuleKey>,
+        first_ns: u64,
+        reason: UnboundReason,
+        entries: u64,
+        image: Option<UnboundImage>,
+    ) {
         self.staged.push(Mutation::NoteUnboundWitness {
             modules,
             first_ns,
             reason,
             entries,
+            image,
         });
     }
 
@@ -3839,6 +3927,18 @@ impl CallerRegistry {
     /// Where the published decided witness rows went.
     pub(crate) fn witness_placement(&self) -> WitnessPlacement {
         self.witness_placement
+    }
+
+    /// Run-wide distinct unidentified caller images (slice 1): the
+    /// published count — a lower bound while
+    /// [`Self::unidentified_images_saturated`].
+    pub(crate) fn unidentified_images(&self) -> u64 {
+        u64::try_from(self.unidentified_images.len()).unwrap_or(u64::MAX)
+    }
+
+    /// The run-wide image set hit its bound. Sticky.
+    pub(crate) fn unidentified_images_saturated(&self) -> bool {
+        self.unidentified_images_saturated
     }
 
     /// Stage one coverage note for an edge from its producer (the capture
@@ -4822,6 +4922,7 @@ impl CallerRegistry {
                 first_ns,
                 reason,
                 entries,
+                image,
             } => match modules.as_slice() {
                 [key] => {
                     self.apply_unbound_use(
@@ -4831,6 +4932,7 @@ impl CallerRegistry {
                         reason.text(),
                         true,
                         entries,
+                        image,
                     );
                 }
                 [] => self.witness_placement.unresolved += 1,
@@ -5373,6 +5475,8 @@ impl CallerRegistry {
                     // Bound rows keep their counts in the pending-count
                     // pipeline; only unbound rows fold here.
                     0,
+                    // The caller is known: never an unidentified image.
+                    None,
                 );
             }
             RowPlacement::Unresolved => self.witness_placement.unresolved += 1,
@@ -5580,7 +5684,10 @@ impl CallerRegistry {
     /// One row of module-level use. `unidentified`: the row's caller image
     /// is unknown (a binder reason), so the module gets the
     /// unidentified-caller gap; a `no_mapping_edge` row's caller is known
-    /// and its gap names the caller instead.
+    /// and its gap names the caller instead. `image` feeds the
+    /// per-module and run-wide slice-1 sets on this committed path only
+    /// (shared, unresolved and `no_mapping_edge` rows never insert).
+    #[allow(clippy::too_many_arguments)] // The image joins the existing explicit apply seam; bundling would churn both call sites for no gain.
     fn apply_unbound_use(
         &mut self,
         key: &ModuleKey,
@@ -5589,6 +5696,7 @@ impl CallerRegistry {
         text: &str,
         unidentified: bool,
         entries: u64,
+        image: Option<UnboundImage>,
     ) {
         let Some(id) = self.modules_by_key.get(key).copied() else {
             self.witness_placement.unresolved += 1;
@@ -5604,20 +5712,43 @@ impl CallerRegistry {
             return;
         };
         self.witness_placement.module += 1;
-        let module = self.modules.get_mut(&id).expect("indexed module");
-        let path = module.paths.iter().next().cloned().unwrap_or_default();
-        let unbound = module.unbound_use.get_or_insert(UnboundUse {
-            first_ns,
-            rows: 0,
-            reasons: BTreeMap::new(),
-            entries: 0,
-        });
-        unbound.first_ns = unbound.first_ns.min(first_ns);
-        unbound.rows = unbound.rows.saturating_add(1);
-        unbound.entries = unbound.entries.saturating_add(entries);
-        let count = unbound.reasons.entry(code).or_default();
-        *count = count.saturating_add(1);
+        let limits = self.unbound_image_limits;
+        let cookie = image.map(|image| image.cookie);
+        {
+            let module = self.modules.get_mut(&id).expect("indexed module");
+            let unbound = module.unbound_use.get_or_insert(UnboundUse {
+                first_ns,
+                rows: 0,
+                reasons: BTreeMap::new(),
+                entries: 0,
+                images: HashSet::new(),
+                images_saturated: false,
+            });
+            unbound.first_ns = unbound.first_ns.min(first_ns);
+            unbound.rows = unbound.rows.saturating_add(1);
+            unbound.entries = unbound.entries.saturating_add(entries);
+            let count = unbound.reasons.entry(code).or_default();
+            *count = count.saturating_add(1);
+            if let Some(cookie) = cookie {
+                Self::insert_unbound_image(
+                    &mut unbound.images,
+                    &mut unbound.images_saturated,
+                    limits.per_module,
+                    cookie,
+                );
+            }
+        }
+        if let Some(cookie) = cookie {
+            Self::insert_unbound_image(
+                &mut self.unidentified_images,
+                &mut self.unidentified_images_saturated,
+                limits.global,
+                cookie,
+            );
+        }
         if unidentified {
+            let module = self.modules.get(&id).expect("indexed module");
+            let path = module.paths.iter().next().cloned().unwrap_or_default();
             self.push_witness_gap(
                 key,
                 Some(id),
@@ -5628,6 +5759,21 @@ impl CallerRegistry {
                      attributed by pid"
                 ),
             );
+        }
+    }
+
+    /// Insert `cookie` into a slice-1 image set: known images re-insert
+    /// free; a new image past the bound saturates instead of growing.
+    fn insert_unbound_image(
+        set: &mut HashSet<DomainCookie>,
+        saturated: &mut bool,
+        limit: usize,
+        cookie: DomainCookie,
+    ) {
+        if set.len() < limit {
+            set.insert(cookie);
+        } else if !set.contains(&cookie) {
+            *saturated = true;
         }
     }
 

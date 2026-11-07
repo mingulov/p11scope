@@ -264,6 +264,69 @@ fn unbound_use_entries_default_to_zero_for_old_captures() {
 }
 
 #[test]
+fn unbound_use_images_are_carried_when_present() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 744,
+        "images": 2, "images_saturated": true
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert_eq!((unbound.images, unbound.images_saturated), (2, true));
+}
+
+#[test]
+fn unbound_use_images_default_for_old_captures() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 744
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert_eq!((unbound.images, unbound.images_saturated), (0, false));
+}
+
+#[test]
+fn native_witness_images_are_carried_when_present() {
+    let mut v = fixture();
+    v["observation"]["native_witnesses"] = json!({
+        "rows": 2, "bound": 0, "unbound": 2, "pending": 0, "integrity": 0,
+        "unbound_reasons": {"no_live_caller": 2},
+        "placement": {"edge": 0, "module": 2, "ambiguous": 0, "unresolved": 0},
+        "unbound_images": 2, "unbound_images_saturated": false,
+        "identity_unavailable": 3, "identity_budget_exhausted": true
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let witnesses = snapshot.observation.native_witnesses.as_ref().unwrap();
+    assert_eq!(
+        (
+            witnesses.unbound_images,
+            witnesses.unbound_images_saturated,
+            witnesses.identity_unavailable,
+            witnesses.identity_budget_exhausted
+        ),
+        (2, false, 3, true)
+    );
+}
+
+#[test]
+fn native_witness_images_default_for_old_captures() {
+    let snapshot = parse_snapshot(FIXTURE).unwrap();
+    let witnesses = snapshot.observation.native_witnesses.as_ref().unwrap();
+    assert_eq!(
+        (
+            witnesses.unbound_images,
+            witnesses.unbound_images_saturated,
+            witnesses.identity_unavailable,
+            witnesses.identity_budget_exhausted
+        ),
+        (0, false, 0, false)
+    );
+}
+
+#[test]
 fn invalid_references_fail() {
     for (row, field) in [
         ("callers", "caller id"),

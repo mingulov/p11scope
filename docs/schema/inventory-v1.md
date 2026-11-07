@@ -237,7 +237,8 @@ non-null values needs a new allowlist row.
   `lifecycle` is `mapped`, `unloaded` (a complete rescan proved it
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
-  `unbound_use` is `null`, or `{first_ns, rows, reasons, entries}`:
+  `unbound_use` is `null`, or `{first_ns, rows, reasons, entries,
+  images, images_saturated}`:
   native witness rows of this module that no caller edge carries —
   positive, monotonic module-level use, never attributed to a caller by
   pid. Only a row whose witness endpoint belongs to this one admitted
@@ -251,6 +252,13 @@ non-null values needs a new allowlist row.
   row's held count at drop, saturating (a refresh read after the drop
   never merges, so a still-running producer's later entries are not
   included; a row read after its process exited carries all of them).
+  `images` counts distinct unidentified caller images on this module —
+  one per (capture domain, task cookie) that reached the committed
+  single-module path — so one short-lived command calling the provider
+  counts once however many rows it left. `no_mapping_edge` rows never
+  count (their caller is identified), and the cookie itself never
+  publishes. `images_saturated` is true once the per-module bound
+  (4096, LIM-1, never lowered) is hit: `images` is then a lower bound.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records
   instead a `native witness without mapping evidence` gap naming the
@@ -548,8 +556,18 @@ non-null values needs a new allowlist row.
   gaps stay authoritative.
 - `observation.native_witnesses` (Task 6 C4): the native caller binder's
   census, every witness row once: `{rows, bound, unbound, pending,
-  integrity, unbound_reasons, placement}`. All zero in the scan lane.
-  The unbound ratio is `unbound / rows`. Counts reconcile per row:
+  integrity, unbound_reasons, placement, unbound_images,
+  unbound_images_saturated, identity_unavailable,
+  identity_budget_exhausted}`. All zero in the scan lane.
+  The unbound ratio is `unbound / rows`. `unbound_images` counts
+  distinct unidentified caller images run-wide (the union of
+  committed single-module inserts, so an image calling two modules
+  counts once); `unbound_images_saturated` (bound 16384, LIM-1, never
+  lowered) marks it a lower bound. `identity_unavailable` counts
+  COOKIE_CTL identity refusals latched from witness health — caller
+  images that never got an identity and are missing from
+  `unbound_images`; `identity_budget_exhausted` says the ticket
+  budget spent itself. Counts reconcile per row:
   `rows = bound + unbound + pending`; every decided row lands in exactly
   one of `placement.{edge, module, ambiguous, unresolved}` (a caller edge
   witnessed; one module's `unbound_use`; an endpoint shared by several
@@ -584,7 +602,8 @@ non-null values needs a new allowlist row.
   exec sequence of a bound ticket (or a changed leader ticket) under the
   held pidfd retires the incarnation (`exec_retired`) and admits its
   successor. `unbound_reasons` codes: `no_live_caller` (nothing held the
-  tgid when the row was read: the process exited before the poll),
+  tgid when the row was read: the process exited before the poll or
+  was never admitted),
   `caller_exited` (it exited during the query), `cookie_unavailable`,
   `cookie_mismatch` (another ticket or none: pid reuse, a nonleader
   exec), `before_admission`, `exec_after_admission`, `lifecycle_loss`,
@@ -1191,7 +1210,9 @@ counts at each.
                   "native_witnesses": {"rows": 0, "bound": 0, "unbound": 0, "pending": 0,
                                        "integrity": 0, "unbound_reasons": {},
                                        "placement": {"edge": 0, "module": 0,
-                                                     "ambiguous": 0, "unresolved": 0}}},
+                                                     "ambiguous": 0, "unresolved": 0},
+                                       "unbound_images": 0, "unbound_images_saturated": false,
+                                       "identity_unavailable": 0, "identity_budget_exhausted": false}},
   "budgets": {
     "callers": {"limit": 4096, "occupied": 1, "refused": 0},
     "modules": {"limit": 4096, "occupied": 1, "refused": 0},

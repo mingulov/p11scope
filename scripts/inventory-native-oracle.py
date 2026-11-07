@@ -2784,9 +2784,18 @@ def demotion_public_health(inventory):
         demotion_uint(value)
         if key != "records" and value:
             problems.append("unhealthy_public_capture")
-    demotion_fields(census, {"rows", "bound", "unbound", "pending", "integrity", "unbound_reasons", "placement"})
+    demotion_fields(census, {"rows", "bound", "unbound", "pending", "integrity", "unbound_reasons", "placement",
+                             "unbound_images", "unbound_images_saturated", "identity_unavailable",
+                             "identity_budget_exhausted"})
     for key in ("rows", "bound", "unbound", "pending", "integrity"):
         demotion_uint(census[key])
+    demotion_uint(census["unbound_images"])
+    demotion_require(type(census["unbound_images_saturated"]) is bool)
+    demotion_uint(census["identity_unavailable"])
+    demotion_require(type(census["identity_budget_exhausted"]) is bool)
+    # Slice 1: distinct images count committed single-module unbound
+    # rows, so they never outnumber unbound decisions.
+    demotion_require(census["unbound_images"] <= census["unbound"], "public_census_mismatch")
     demotion_require(type(census["unbound_reasons"]) is dict)
     for value in census["unbound_reasons"].values():
         demotion_uint(value)
@@ -3588,7 +3597,9 @@ def demotion_self_test():
         i["observation"].update(lane="native", settlement="unsettled", retirement="closed",
             lifecycle={"records": 1, "ring_loss": 0, "malformed": 0, "failed_quanta": 0, "recovery_rescans": 0},
             native_witnesses={"rows": 1, "bound": 1, "unbound": 0, "pending": 0, "integrity": 0,
-                "unbound_reasons": {}, "placement": {"edge": 1, "module": 0, "ambiguous": 0, "unresolved": 0}})
+                "unbound_reasons": {}, "placement": {"edge": 1, "module": 0, "ambiguous": 0, "unresolved": 0},
+                "unbound_images": 0, "unbound_images_saturated": False,
+                "identity_unavailable": 0, "identity_budget_exhausted": False})
         i["budgets"] = {key: {"limit": 64, "occupied": 1, "refused": 0} for key in (
             "callers", "modules", "edges", "endpoints", "inventory_endpoints", "inventory_attach_modules")}
         i["budgets"].update(counters={"cap": U64_MAX, "observed_edges": 2, "saturated_edges": 0},

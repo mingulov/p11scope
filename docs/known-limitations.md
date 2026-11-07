@@ -1681,16 +1681,29 @@ The old bounds are measurements, not a product startup SLA.
 
 - What the user sees: sub-second CLI callers (100 ms at 10/s) may stay
   "used by an unidentified caller image": their `CALLER_USE` rows are
-  module-level `unbound_use`, never a caller edge. An exec-chain image
-  that was never admitted (a thread exec inside one pass) likewise binds
-  nothing: the retired caller's edge reads `unknown`/`use_before_admission`
-  and the use is disclosed only via `unbound_use` (see the next entry).
+  module-level `unbound_use`, never a caller edge. The concise summary
+  counts them instead: `unidentified callers: at least N calls from M
+  caller processes never identified (exited or never scanned)`, with
+  `modules[].unbound_use.images` per module and
+  `observation.native_witnesses.unbound_images` run-wide in JSON
+  (`images_saturated` / `unbound_images_saturated` mark lower bounds).
+  No caller is named: only distinct images count, never pids. An
+  exec-chain image that was never admitted (a thread exec inside one
+  pass) likewise binds nothing: the retired caller's edge reads
+  `unknown`/`use_before_admission` and the use is disclosed only via
+  `unbound_use` (see the next entry).
 - Kernels/conditions: P4/P5-style exec chains and short-lived callers.
-- Disclosure: `modules[].unbound_use`, `observation.native_witnesses`
-  (rows/bound/unbound/pending, `unbound_reasons`), and the `used by an
-  unidentified caller image` / `native witness without mapping evidence` /
-  `without a module` / `rows failed validation` gaps. Zero false joins is
-  the hard bar and holds.
+- Disclosure: `modules[].unbound_use` (rows/reasons/entries plus
+  `images`/`images_saturated`),
+  `observation.native_witnesses` (rows/bound/unbound/pending,
+  `unbound_reasons`, `unbound_images`/`unbound_images_saturated`,
+  `identity_unavailable`/`identity_budget_exhausted`), and the `used
+  by an unidentified caller image` / `native witness without mapping
+  evidence` / `without a module` / `rows failed validation` gaps.
+  Zero false joins is the hard bar and holds. Caller images that
+  never got an identity are missing from the image counts: a nonzero
+  `identity_unavailable` (with `identity_budget_exhausted` when the
+  ticket budget spent itself) is disclosed on its own concise line.
 - Workaround: long-lived callers (≥2 passes).
 - Planned: v0.3.0 (measure unbound ratio per cell after C5; I2c exact-image
   iterator or a documented boundary; D6 rule-3 relaxation only if

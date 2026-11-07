@@ -574,6 +574,18 @@ pub(crate) struct Presentation {
     /// Where the decided witness rows went (edge, module-level, ambiguous
     /// shared endpoint, unresolved); sums to `bound + unbound`.
     pub witness_placement: crate::discovery::caller_registry::WitnessPlacement,
+    /// Run-wide distinct unidentified caller images (slice 1): the
+    /// concise M and `native_witnesses.unbound_images` — a lower bound
+    /// while [`Self::unbound_images_saturated`].
+    pub unbound_images: u64,
+    /// The run-wide image set hit its bound. Sticky.
+    pub unbound_images_saturated: bool,
+    /// COOKIE_CTL identity refusals latched from witness health
+    /// (slice 1, issue 9): caller images that never got an identity,
+    /// which the unidentified-caller count misses.
+    pub identity_unavailable_refused: u64,
+    /// Whether the identity ticket budget spent itself.
+    pub identity_budget_exhausted: bool,
     /// Display-only opt-in metadata shared by every consumer of this frame.
     pub caller_metadata: crate::caller_metadata::runtime::MetadataFrame,
     pub callers: Vec<CallerView>,
@@ -953,6 +965,10 @@ impl Presentation {
             usage_feed: registry.usage_feed(),
             native_witnesses: registry.witness_census().clone(),
             witness_placement: registry.witness_placement(),
+            unbound_images: registry.unidentified_images(),
+            unbound_images_saturated: registry.unidentified_images_saturated(),
+            identity_unavailable_refused: coordinator.identity_unavailable_refused(),
+            identity_budget_exhausted: coordinator.identity_budget_exhausted(),
             caller_metadata: coordinator.metadata_frame(),
             callers,
             modules,
@@ -2693,6 +2709,49 @@ fn render_snapshot_inner(
                 entries,
                 rows,
                 if rows == 1 { "" } else { "s" }
+            );
+        }
+        // Slice 1: distinct unidentified caller images, run-wide. M
+        // is informative even when N is 0 (callers touched the
+        // provider but no call volume folded), so the gate is M
+        // alone. Exactly the folded lower bound: nothing else sums
+        // into N.
+        if presentation.unbound_images > 0 {
+            let _ = writeln!(
+                out,
+                "unidentified callers: at least {} call{} from {} caller process{} never identified (exited or never scanned){}",
+                entries,
+                if entries == 1 { "" } else { "s" },
+                presentation.unbound_images,
+                if presentation.unbound_images == 1 {
+                    ""
+                } else {
+                    "es"
+                },
+                if presentation.unbound_images_saturated {
+                    "; image bound reached, more callers possible"
+                } else {
+                    ""
+                }
+            );
+        }
+        // Slice 1, issue 9: caller images that never got an identity
+        // are missing from M above; name the strain beside it.
+        if presentation.identity_unavailable_refused > 0 {
+            let _ = writeln!(
+                out,
+                "identity unavailable: no caller identity for {} process image{}{}",
+                presentation.identity_unavailable_refused,
+                if presentation.identity_unavailable_refused == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                if presentation.identity_budget_exhausted {
+                    " (ticket budget spent)"
+                } else {
+                    ""
+                }
             );
         }
     }

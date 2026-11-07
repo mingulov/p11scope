@@ -558,6 +558,8 @@ fn changing_only_times_and_local_incarnations_is_not_an_application_change() {
         rows: 1,
         reasons: [("no_live_caller".into(), 1)].into_iter().collect(),
         entries: 0,
+        images: 0,
+        images_saturated: false,
     });
     let mut after = before.clone();
     after.observation.started_ns = 10000;

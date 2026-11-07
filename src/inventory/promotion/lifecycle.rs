@@ -1254,6 +1254,7 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         coverage: UseCoverage::Counted {
             since_ns: 0,
             lossy: false,
+            pid_exit: false,
         },
         presence: Presence::Mapped,
         capture: Capture::Armed,

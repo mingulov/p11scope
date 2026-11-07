@@ -2167,6 +2167,9 @@ impl UnknownReason {
 /// - `Counted`: a counting feed (actual call observations) covers the
 ///   edge since `since_ns`; the count and recency are meaningful, and
 ///   `lossy` says records were lost (a zero is then not a fact).
+///   `pid_exit` refines a lossy feed whose sole loss cause is a clean
+///   PID-target exit (no records dropped): the count ran until the
+///   exit and is a lower bound. Any generic loss clears it.
 /// - `Witnessed`: positive use was witnessed (first at `first_ns`); count
 ///   and recency are unavailable. Never rendered idle.
 /// - `WatchedNoUse`: every endpoint of the module is attached for this
@@ -2186,6 +2189,9 @@ pub(crate) enum UseCoverage {
     Counted {
         since_ns: u64,
         lossy: bool,
+        /// The lossy feed's sole loss cause is a clean PID-target exit
+        /// (implies `lossy`; cleared by any generic loss).
+        pid_exit: bool,
     },
     Witnessed {
         first_ns: u64,
@@ -2247,6 +2253,10 @@ enum Watch {
 pub(crate) struct EdgeCoverage {
     counted_since_ns: Option<u64>,
     lossy: bool,
+    /// The edge's counted loss is (so far) a clean PID-target exit
+    /// only: no generic loss touched it. Implies `lossy`; any generic
+    /// loss clears it.
+    clean_exit: bool,
     witnessed_first_ns: Option<u64>,
     watch: Watch,
     /// The current watch state is a demotion (a health regression or an
@@ -2684,6 +2694,10 @@ enum Mutation {
     /// column is a lower bound. The lifecycle/custody gap discloses
     /// the cause; this carries no second gap.
     NoteCountedLoss,
+    /// The PID target exited cleanly: same staging as `NoteCountedLoss`,
+    /// but the sole cause is the exit (no records dropped), so counted
+    /// columns name it until a generic loss clears the claim.
+    NoteCountedPidExit,
     NoteWitness {
         caller: CallerId,
         module: ModuleKey,
@@ -3037,6 +3051,16 @@ pub(crate) struct CallerRegistry {
     /// the capture, and honored by every later counted install and
     /// `Counted` note, including edges born after the loss.
     counted_loss: bool,
+    /// The sticky counted loss is (so far) a clean PID-target exit
+    /// only: set by `NoteCountedPidExit` when no loss of any kind came
+    /// before, cleared by any generic loss (counted, refresh, or
+    /// semantic). Honored alongside `counted_loss` for later installs.
+    counted_clean_exit: bool,
+    /// A generic counted loss (counted, refresh, or semantic) was ever
+    /// staged. Refresh and semantic losses leave `counted_loss` alone
+    /// (their scope is existing edges, not later installs), but they
+    /// still void any exit-only claim, past and future.
+    counted_generic_loss: bool,
     /// Coverage-note gaps already recorded, once per (caller, module,
     /// subject); bounded by the gap retention bound (past it the gap
     /// list is full and further gaps only count as suppressed).
@@ -3185,6 +3209,8 @@ impl CallerRegistry {
             last_health_regression_ns: None,
             watches_ended_ns: None,
             counted_loss: false,
+            counted_clean_exit: false,
+            counted_generic_loss: false,
             coverage_gap_memo: BTreeSet::new(),
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
@@ -3507,6 +3533,7 @@ impl CallerRegistry {
                     .or(edge.entry_first_seen_ns)
                     .unwrap_or(0),
                 lossy: coverage.lossy,
+                pid_exit: coverage.clean_exit,
             };
         }
         if let Some(first_ns) = coverage.witnessed_first_ns {
@@ -3516,6 +3543,7 @@ impl CallerRegistry {
             return UseCoverage::Counted {
                 since_ns,
                 lossy: coverage.lossy,
+                pid_exit: coverage.clean_exit,
             };
         }
         let admitted = self
@@ -3998,6 +4026,14 @@ impl CallerRegistry {
     /// stages no second gap — never silent loss.
     pub(crate) fn note_counted_loss(&mut self) {
         self.staged.push(Mutation::NoteCountedLoss);
+    }
+
+    /// Stage one clean PID-target exit boundary: same staging as
+    /// `note_counted_loss`, but the sole cause is the exit (no records
+    /// dropped), so counted columns name it until a generic loss
+    /// clears the claim.
+    pub(crate) fn note_counted_pid_exit(&mut self) {
+        self.staged.push(Mutation::NoteCountedPidExit);
     }
 
     /// Stage one caller retirement: the caller's edges end with the
@@ -4675,6 +4711,10 @@ impl CallerRegistry {
                 call,
             } => self.apply_semantic(caller, &module, &call),
             Mutation::NoteSemanticLoss { reason } => {
+                // Generic loss: no counted column may claim an
+                // exit-only cause, now or later.
+                self.counted_generic_loss = true;
+                self.counted_clean_exit = false;
                 for edge in self.edges.values_mut() {
                     if let Some(state) = edge.semantics.as_mut() {
                         state.invalidate();
@@ -4683,6 +4723,7 @@ impl CallerRegistry {
                     // lower bound: a counted zero is no longer a fact.
                     if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
                         edge.coverage.lossy = true;
+                        edge.coverage.clean_exit = false;
                     }
                 }
                 self.push_gap(RegistryGap {
@@ -4695,12 +4736,17 @@ impl CallerRegistry {
                 });
             }
             Mutation::NoteRefreshLoss { reason } => {
+                // Generic loss: no counted column may claim an
+                // exit-only cause, now or later.
+                self.counted_generic_loss = true;
+                self.counted_clean_exit = false;
                 for edge in self.edges.values_mut() {
                     // A failed or skipped count re-read leaves every
                     // counted column a lower bound: observed counts
                     // stand, quiet claims do not.
                     if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
                         edge.coverage.lossy = true;
+                        edge.coverage.clean_exit = false;
                     }
                 }
                 self.push_gap(RegistryGap {
@@ -4715,8 +4761,10 @@ impl CallerRegistry {
             Mutation::NoteCountedLoss => {
                 // Sticky for the capture: every later counted install
                 // and `Counted` note honors it, including edges born
-                // after the loss.
+                // after the loss. Generic: no exit-only claim survives.
                 self.counted_loss = true;
+                self.counted_generic_loss = true;
+                self.counted_clean_exit = false;
                 for edge in self.edges.values_mut() {
                     // The capture scope went unproven: bound-pair growth
                     // stages nothing more (pending first-sight installs
@@ -4724,6 +4772,29 @@ impl CallerRegistry {
                     // is a lower bound. Observed counts stand; the
                     // lifecycle/custody gap discloses the cause.
                     if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        edge.coverage.lossy = true;
+                        edge.coverage.clean_exit = false;
+                    }
+                }
+            }
+            Mutation::NoteCountedPidExit => {
+                // Sticky for the capture like `NoteCountedLoss`, with
+                // the exit-only cause: honored only when no generic
+                // loss of any kind came before (a later one still
+                // clears it).
+                if !self.counted_generic_loss && !self.counted_loss {
+                    self.counted_clean_exit = true;
+                }
+                self.counted_loss = true;
+                for edge in self.edges.values_mut() {
+                    // The PID target exited cleanly: the count ran
+                    // until the exit and is a lower bound. An edge
+                    // already lossy keeps its earlier cause; a fresh
+                    // edge names the exit.
+                    if edge.coverage.counted_since_ns.is_some() || edge.entry_count > 0 {
+                        if !edge.coverage.lossy {
+                            edge.coverage.clean_exit = true;
+                        }
                         edge.coverage.lossy = true;
                     }
                 }
@@ -5600,10 +5671,14 @@ impl CallerRegistry {
         last_ns: u64,
     ) {
         let counted_loss = self.counted_loss;
+        let counted_clean_exit = self.counted_clean_exit;
         let Some(edge) = self.coverage_edge(caller, module) else {
             return;
         };
         if counted_loss {
+            if !edge.coverage.lossy {
+                edge.coverage.clean_exit = counted_clean_exit;
+            }
             edge.coverage.lossy = true;
         }
         if count > edge.entry_count {
@@ -5732,6 +5807,7 @@ impl CallerRegistry {
         let regression = self.last_health_regression_ns;
         let ended = self.watches_ended_ns.is_some();
         let counted_loss = self.counted_loss;
+        let counted_clean_exit = self.counted_clean_exit;
         let positive = matches!(
             note,
             CoverageNote::Counted { .. } | CoverageNote::Watched { .. }
@@ -5773,6 +5849,9 @@ impl CallerRegistry {
                         .map_or(since_ns, |was| was.min(since_ns)),
                 );
                 if counted_loss {
+                    if !coverage.lossy {
+                        coverage.clean_exit = counted_clean_exit;
+                    }
                     coverage.lossy = true;
                 }
             }
@@ -5921,6 +6000,7 @@ impl CallerRegistry {
             return EntryOutcome::UnknownEdge;
         };
         let counted_loss = self.counted_loss;
+        let counted_clean_exit = self.counted_clean_exit;
         let Some(edge) = self.edges.get_mut(&(caller, id)) else {
             self.push_gap(RegistryGap {
                 caller: Some(caller),
@@ -5933,6 +6013,9 @@ impl CallerRegistry {
             return EntryOutcome::UnknownEdge;
         };
         if counted_loss {
+            if !edge.coverage.lossy {
+                edge.coverage.clean_exit = counted_clean_exit;
+            }
             edge.coverage.lossy = true;
         }
         let (count, overflowed) = edge.entry_count.overflowing_add(delta);
@@ -7784,7 +7867,8 @@ pub(crate) mod tests {
             registry.coverage(edge_of(&registry, CallerId(0), &keys[3])),
             UseCoverage::Counted {
                 since_ns: 110,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         let regressions = registry
@@ -7930,7 +8014,8 @@ pub(crate) mod tests {
             registry.coverage(a),
             UseCoverage::Counted {
                 since_ns: 110,
-                lossy: true
+                lossy: true,
+                pid_exit: false
             }
         );
         assert_eq!(
@@ -7943,7 +8028,8 @@ pub(crate) mod tests {
             registry.coverage(b),
             UseCoverage::Counted {
                 since_ns: 110,
-                lossy: true
+                lossy: true,
+                pid_exit: false
             }
         );
         assert_eq!(registry.entry_observation(b), EntryObservation::Observed);
@@ -8851,7 +8937,8 @@ pub(crate) mod tests {
             registry.coverage(edge),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         assert_eq!(registry.entry_observation(edge), EntryObservation::Observed);

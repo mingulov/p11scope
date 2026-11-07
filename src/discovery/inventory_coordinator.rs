@@ -3186,8 +3186,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         capture.unproven = Some(reason.clone());
         // Bound-pair growth stages nothing more past this point
         // (pending first-sight installs still land, now lossy), so
-        // counted columns are lower bounds from here on.
-        self.registry.note_counted_loss();
+        // counted columns are lower bounds from here on. A validated
+        // clean exit proof names the exit as the sole cause (no
+        // records dropped); anything else is a generic loss.
+        if capture.original_pid_exit.is_some() {
+            self.registry.note_counted_pid_exit();
+        } else {
+            self.registry.note_counted_loss();
+        }
         let until = capture.last_clean_ns.map_or(0, |clean| clean.min(at_ns));
         self.registry.note_watch_end(
             format!(
@@ -14893,7 +14899,8 @@ pub(crate) mod tests {
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         let edge = native
@@ -14948,6 +14955,7 @@ pub(crate) mod tests {
             UseCoverage::Counted {
                 since_ns: 100,
                 lossy: false,
+                pid_exit: false,
             }
         );
         (native, caller)
@@ -17969,7 +17977,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         assert_eq!(native.module_unbound(), None);
@@ -18094,7 +18103,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "the old image keeps its count"
         );
@@ -19967,7 +19977,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
     }
@@ -19986,7 +19997,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         let registry = &native.scene.coordinator.registry;
@@ -20026,7 +20038,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         // A stale refresh (below the staged count) moves nothing.
@@ -20077,7 +20090,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
     }
@@ -20146,7 +20160,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "pre-loss coverage is an exact count"
         );
@@ -20393,7 +20408,8 @@ exit 0
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 130,
-                lossy: true
+                lossy: true,
+                pid_exit: false
             },
             "a count placed after lifecycle loss reads lossy"
         );
@@ -22185,7 +22201,8 @@ exit 0
             registry.coverage(edge_b),
             UseCoverage::Counted {
                 since_ns: h + 1,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "the demoted edge windows from the base read, not the demoting read"
         );
@@ -22194,7 +22211,8 @@ exit 0
             registry.coverage(edge_a),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "the history holder keeps the pair's first record as its anchor"
         );
@@ -22300,7 +22318,8 @@ exit 0
             registry.coverage(edge_b),
             UseCoverage::Counted {
                 since_ns: h,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "the demoted edge windows from the base lookup, not the late batch stamp"
         );
@@ -22429,7 +22448,10 @@ exit 0
             6,
             "no growth duplication"
         );
-        let UseCoverage::Counted { since_ns, lossy } = registry.coverage(edge_b) else {
+        let UseCoverage::Counted {
+            since_ns, lossy, ..
+        } = registry.coverage(edge_b)
+        else {
             panic!("the demoted growth must retain counted coverage");
         };
         assert!(!lossy);
@@ -24064,7 +24086,8 @@ exit 0
                 native.scene.coverage(caller),
                 UseCoverage::Counted {
                     since_ns: 100,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 },
                 "the old image keeps its count"
             );
@@ -24949,7 +24972,8 @@ exit 0
             native.scene.coverage(leader),
             UseCoverage::Counted {
                 since_ns: 100,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             },
             "the old image keeps its count"
         );
@@ -26291,7 +26315,8 @@ exit 0
                 coordinator.registry.coverage(edge),
                 UseCoverage::Counted {
                     since_ns: 1_041,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 },
                 "useful new calls count on the successor"
             );
@@ -26884,7 +26909,8 @@ exit 0
                 native.scene.coverage(caller),
                 UseCoverage::Counted {
                     since_ns: 100,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 },
                 "the entered call binds and counts"
             );
@@ -26912,7 +26938,8 @@ exit 0
                 native.scene.coverage(caller),
                 UseCoverage::Counted {
                     since_ns: 100,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 }
             );
             // Following complete calls remain positive.
@@ -27009,7 +27036,8 @@ exit 0
                 native.scene.coverage(caller),
                 UseCoverage::Counted {
                     since_ns: 100,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 }
             );
             // Control: the sibling's record landed — a new proof for
@@ -27261,7 +27289,8 @@ int main(void) {
                 native.scene.coverage(successor),
                 UseCoverage::Counted {
                     since_ns: 1_071,
-                    lossy: false
+                    lossy: false,
+                    pid_exit: false
                 },
                 "the new instance recovers counted use from the proving read"
             );
@@ -27453,7 +27482,8 @@ int main(void) {
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 210,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
     }
@@ -27490,7 +27520,8 @@ int main(void) {
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 210,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
     }
@@ -27601,7 +27632,8 @@ int main(void) {
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 200,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         let presentation = presented(&native);
@@ -27614,7 +27646,8 @@ int main(void) {
             edge.coverage,
             UseCoverage::Counted {
                 since_ns: 200,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         assert_eq!(edge.activity, Activity::RecentlyObserved);
@@ -28482,7 +28515,8 @@ int main(void) {
             native.scene.coverage(caller),
             UseCoverage::Counted {
                 since_ns: 200,
-                lossy: false
+                lossy: false,
+                pid_exit: false
             }
         );
         assert!(

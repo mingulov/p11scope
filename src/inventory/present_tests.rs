@@ -792,6 +792,7 @@ fn overview_observations_preserve_evidence_meaning() {
     let counted = |lossy| UseCoverage::Counted {
         since_ns: 10,
         lossy,
+        pid_exit: false,
     };
     let ended = presentation.ended_ns;
     let ago = |then_ns: u64| crate::render::fmt_ns(Some(ended.saturating_sub(then_ns)));
@@ -1972,6 +1973,7 @@ fn event_doc_pins_activity_precedence_and_last_seen_presence() {
     let counted = UseCoverage::Counted {
         since_ns: 7,
         lossy: false,
+        pid_exit: false,
     };
     assert_eq!(
         Activity::for_edge(MappingState::Mapped, true, true, false, &counted),
@@ -2035,6 +2037,7 @@ fn f7_snapshot_baseline_preserves_interleaved_children() {
         edge.coverage = UseCoverage::Counted {
             since_ns: 100,
             lossy: false,
+            pid_exit: false,
         };
         edge.capture = Capture::Armed;
         edge.activity = Activity::Used;

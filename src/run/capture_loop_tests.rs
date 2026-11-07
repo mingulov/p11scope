@@ -2780,6 +2780,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             coverage: UseCoverage::Counted {
                 since_ns: 1000,
                 lossy: false,
+                pid_exit: false,
             },
             presence: Presence::Mapped,
             capture: Capture::Armed,

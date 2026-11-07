@@ -1085,6 +1085,7 @@ fn count_drift_emits_at_most_once_per_edge_per_ten_seconds() {
     edges[0].coverage = UseCoverage::Counted {
         since_ns: 100,
         lossy: false,
+        pid_exit: false,
     };
     edges[0].entry_count = 4;
     edges[0].entry_observation = "observed";
@@ -1153,6 +1154,7 @@ fn class_emissions_reset_the_count_cadence_and_buckets_stay_immediate() {
     edges[0].coverage = UseCoverage::Counted {
         since_ns: 100,
         lossy: false,
+        pid_exit: false,
     };
     edges[0].entry_count = 4;
     edges[0].entry_observation = "observed";

@@ -364,8 +364,11 @@ non-null values needs a new allowlist row.
     that returned errors; reads mid-capture are lower bounds, only the
     post-stop read is final. An edge reads `counted` only when its row
     is bound to an admitted caller incarnation and its count is ≥ 1.
-    `lossy: true` means records were lost: a positive count is a lower
-    bound and a zero reads `unknown (usage observation lossy)`.
+    `lossy: true` means the count is a lower bound: usually records
+    were lost (a zero then reads `unknown (usage observation lossy)`),
+    but when `detail` is `the PID target exited` the sole cause is a
+    clean PID-target exit (no records dropped) — the count ran until
+    the exit. Any later generic loss clears the exit claim.
   - `witnessed`: use was witnessed (first at `first_ns`) but nothing
     counts it — `count` stays 0 for old consumers, `observation` reads
     `unknown (count unavailable; use witnessed)`, and the dashboard

@@ -4306,6 +4306,7 @@ fn fixture_edge_json_schedule(
             UseCoverage::Counted {
                 since_ns: 110 + shift,
                 lossy: false,
+                pid_exit: false,
             }
         },
         presence: if is_a {
@@ -4526,6 +4527,7 @@ fn operator_diagnostics_wrap_fixture_edges_match_snapshot_renderer_shape() -> Re
         coverage: UseCoverage::Counted {
             since_ns: 110,
             lossy: false,
+            pid_exit: false,
         },
         presence: Presence::Mapped,
         capture: Capture::Armed,

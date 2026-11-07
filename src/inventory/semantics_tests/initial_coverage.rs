@@ -320,7 +320,8 @@ fn native_semantic_initial_coverage_stamp_does_not_demote_current_calls() {
         ),
         UseCoverage::Counted {
             since_ns: 100,
-            lossy: false
+            lossy: false,
+            pid_exit: false
         }
     );
 }
@@ -365,7 +366,8 @@ fn assert_mixed_witness_disclosure(delayed_physical: bool) {
         registry.coverage(edge),
         UseCoverage::Counted {
             since_ns: 300,
-            lossy: false
+            lossy: false,
+            pid_exit: false
         }
     );
     assert_eq!(conv.edge_rows(), vec![(Some(2), 0, false, 1, 1)]);

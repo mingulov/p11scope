@@ -8582,9 +8582,18 @@ pub(crate) fn instance_semantic_json(
 /// present (`null` when it does not apply), so consumers see one shape.
 fn coverage_json(coverage: &UseCoverage) -> serde_json::Value {
     let (since_ns, until_ns, first_ns, lossy, reason, detail) = match coverage {
-        UseCoverage::Counted { since_ns, lossy } => {
-            (Some(*since_ns), None, None, Some(*lossy), None, None)
-        }
+        UseCoverage::Counted {
+            since_ns,
+            lossy,
+            pid_exit,
+        } => (
+            Some(*since_ns),
+            None,
+            None,
+            Some(*lossy),
+            None,
+            pid_exit.then_some("the PID target exited"),
+        ),
         UseCoverage::Witnessed { first_ns } => (None, None, Some(*first_ns), None, None, None),
         UseCoverage::WatchedNoUse { since_ns, until_ns } => {
             (Some(*since_ns), *until_ns, None, None, None, None)

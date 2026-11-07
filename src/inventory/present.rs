@@ -1197,10 +1197,17 @@ pub(crate) fn coverage_label_at(coverage: &UseCoverage, now_ns: u64) -> String {
         UseCoverage::Counted {
             since_ns,
             lossy: false,
+            ..
         } => format!("counted exactly for the last {}", ago(*since_ns)),
+        UseCoverage::Counted {
+            lossy: true,
+            pid_exit: true,
+            ..
+        } => "counted until the PID target exited (lower bound)".to_string(),
         UseCoverage::Counted {
             since_ns,
             lossy: true,
+            ..
         } => format!(
             "counted for the last {} (lossy: some records dropped)",
             ago(*since_ns)

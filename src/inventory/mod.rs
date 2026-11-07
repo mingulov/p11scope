@@ -6778,6 +6778,15 @@ fn open_native_lane_with(
     });
     match NativeLane::start(capture, coordinator, LaneWindows::PROVISIONAL, lossy) {
         Ok(lane) => {
+            // Shed the transient startup grant once attach completes,
+            // mirroring `Session::drop_post_setup_capabilities`: a multi
+            // lane drops `CAP_SYS_ADMIN` (no `perf_event_open` remains
+            // past attach), a singles lane keeps it for dynamic perf
+            // re-attach. Fail-closed like the startup drop.
+            let multi = backend.backend == crate::attach::AttachBackend::Multi;
+            let effective = crate::caps::read_effective().unwrap_or(0);
+            crate::caps::drop_to_keep(crate::caps::post_setup_keep(multi, effective))
+                .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
             inventory_diagnostic(&lane_active_line(&backend));
             Ok(Some(lane))
         }

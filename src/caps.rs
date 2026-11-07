@@ -306,7 +306,8 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// root keeps a functional subset instead of the full set. Live capture
 /// keeps the minimal set whole (dynamic attach and rescans run until the
 /// end); `doctor` keeps it too (it reports the invoking set, so it must
-/// not drop first); `inspect` never loads BPF; `diff` keeps file IO only.
+/// not drop first); `inspect` never loads BPF, and scan-only `inventory`
+/// keeps only its target-read/map-files bits; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let live = minimal_live_mask();
@@ -320,6 +321,10 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     };
     match command {
         Command::Profile(a) | Command::Trace(a) => live | sys_admin | out(&a.out),
+        Command::Inventory(a) if a.capture == crate::cli::CaptureMode::Scan => {
+            // Scan reads `/proc` only: no BPF load, no links, no perf.
+            (live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT))) | out(&a.out)
+        }
         Command::Inventory(a) => live | sys_admin | out(&a.out),
         Command::Run(a) => {
             let ids = if a.user.is_some() {

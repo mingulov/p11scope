@@ -13,15 +13,15 @@
 #   Without it the pod cgroup resolves but holds no visible process (the
 #   entry script refuses with a named error; p11scope itself would read it
 #   as "no PKCS#11 modules discovered", 0 probes).
-# - CAP_SYS_ADMIN: BPF map/program load and perf-event attach. The
-#   uretprobe self-probe attaches through perf_event_open(), which
-#   kernel.perf_event_paranoid >= 3 (the Debian/Ubuntu default) refuses
-#   without CAP_SYS_ADMIN even on uprobe-multi kernels; CAP_BPF+CAP_PERFMON
-#   alone fail there. While SYS_ADMIN is held the kernel accepts it for
-#   every CAP_BPF/CAP_PERFMON check, so those two add nothing and are not
-#   listed (measured: the capture is exact without either). It also opens
-#   /proc/<pid>/map_files (else CAP_CHECKPOINT_RESTORE is needed), which
-#   inventory's caller attribution past the scan cap reads.
+# - CAP_SYS_ADMIN: BPF load and the singles-fallback perf-event attach.
+#   The self-probe, live-discovery and static probes attach through
+#   uprobe-multi links, which kernel.perf_event_paranoid >= 3 (the
+#   Debian/Ubuntu default) does not gate; only an explicit
+#   --attach-backend singles fallback still opens per-probe perf_event
+#   uprobes there. While it is held the kernel accepts it for every
+#   CAP_BPF/CAP_PERFMON check, so those two are not listed. It also
+#   grants /proc/<pid>/map_files access (otherwise CAP_CHECKPOINT_RESTORE),
+#   which inventory needs to attribute callers past its scan cap.
 # - CAP_SYS_PTRACE: ptrace-mode access to other processes' /proc/<pid>/mem
 #   (Yama ptrace_scope=1, other UIDs). Without it the memory scan fails and
 #   no provider is attached.
@@ -37,17 +37,17 @@
 # cell passes): nothing is pinned, the programs are raw/BTF tracepoints and
 # uprobes, and the container's sysfs already shows /sys/kernel/btf/vmlinux.
 #
-# Gated variant: on hosts with kernel.perf_event_paranoid <= 2 the
-# perf_event_open() refusal above does not apply, but SYS_ADMIN also covers
-# a second need: inventory's caller attribution past the scan cap reads
-# /proc/<pid>/map_files, which requires CAP_SYS_ADMIN or
+# Gated variant: the five-capability minimal set (BPF + PERFMON +
+# CHECKPOINT_RESTORE + SYS_PTRACE + DAC_READ_SEARCH, no SYS_ADMIN) is
+# expected to suffice at any paranoid on the default lane — measured at
+# host level, but this repository has NOT measured the kind removal, so
+# the shipped manifest keeps its grant. Do not simply drop SYS_ADMIN: it
+# also covers /proc/<pid>/map_files, which inventory's caller attribution
+# past the scan cap reads and which needs CAP_SYS_ADMIN or
 # CAP_CHECKPOINT_RESTORE (without either those callers read
-# `map_files_unavailable`). So there, never just drop SYS_ADMIN: replace it
-# by BPF + PERFMON + CHECKPOINT_RESTORE. That variant is NOT measured by this
-# repository (the sysctl is host-global and was left alone). Prove a node
-# first: `kubectl exec ... -- k8s-profile-entry --pod-uid <uid> --command
-# doctor` must read `uprobe attach (self) ... ok` and `verdict: capture
-# available`.
+# `map_files_unavailable`). Prove a node first: `kubectl exec ... --
+# k8s-profile-entry --pod-uid <uid> --command doctor` must read `uprobe
+# attach (self) ... ok` and `verdict: capture available`.
 #
 # BLAST RADIUS — read before deploying. This pod is root on its node, and
 # the hardening below narrows the surface, not the power:

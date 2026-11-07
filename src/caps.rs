@@ -221,9 +221,8 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// (an unproven pid filter on 6.6-6.9 without the backport), keeps it
 /// for dynamic perf re-attach.
 pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) -> u64 {
-    let narrow = (1u64 << CAP_BPF_BIT)
-        | (1u64 << CAP_PERFMON_BIT)
-        | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
+    let narrow =
+        (1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
     if multi && dynamic_multi && effective & narrow == narrow {
         effective & !(1u64 << CAP_SYS_ADMIN_BIT)
     } else {

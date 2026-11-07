@@ -659,8 +659,9 @@ impl Drop for WorkerState {
 /// How the worker thread starts its three closer helpers: production
 /// spawns threads, tests inject failures. One starter serves both the
 /// eager start and the shed restart, so both paths share the latch.
-type PoolStarter =
-    Arc<dyn Fn(CloseOperation<DetailedClose>) -> Result<ClosePool<DetailedClose>, String> + Send + Sync>;
+type PoolStarter = Arc<
+    dyn Fn(CloseOperation<DetailedClose>) -> Result<ClosePool<DetailedClose>, String> + Send + Sync,
+>;
 
 /// How the worker thread drops its own capabilities on `Shed`:
 /// production calls `caps::drop_to_keep`, tests record the thread and
@@ -739,7 +740,14 @@ impl CleanupWorker {
         let (ready_tx, ready_rx) = mpsc::sync_channel(1);
         let thread_state = Arc::clone(&state);
         let (handle, start_error) = match spawn(Box::new(move || {
-            run_cleanup(rx, thread_state, Arc::from(closer), ready_tx, pool_starter, drop_fn)
+            run_cleanup(
+                rx,
+                thread_state,
+                Arc::from(closer),
+                ready_tx,
+                pool_starter,
+                drop_fn,
+            )
         })) {
             Ok(handle) => {
                 let error = match ready_rx.recv() {
@@ -2913,8 +2921,7 @@ mod tests {
     /// fails here.
     #[test]
     fn shed_to_drops_the_worker_thread_without_breaking_closes() {
-        let seen: Arc<Mutex<Vec<(std::thread::ThreadId, u64)>>> =
-            Arc::new(Mutex::new(Vec::new()));
+        let seen: Arc<Mutex<Vec<(std::thread::ThreadId, u64)>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = Arc::clone(&seen);
         let drop_fn: super::ShedDropFn = Arc::new(move |keep| {
             seen_clone
@@ -2945,7 +2952,10 @@ mod tests {
         worker.shed_to(keep).expect("the worker sheds");
         let seen = seen.lock().unwrap();
         assert_eq!(seen.len(), 1, "the drop must run exactly once");
-        assert_eq!(seen[0].0, expected, "the drop must run on the worker thread");
+        assert_eq!(
+            seen[0].0, expected,
+            "the drop must run on the worker thread"
+        );
         assert_eq!(seen[0].1, keep, "the drop must receive the given keep");
         drop(seen);
         worker.submit(

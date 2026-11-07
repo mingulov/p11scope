@@ -4607,57 +4607,176 @@ fn cgroup_finish_sweep_counts_a_never_admitted_never_exited_newcomer() {
     );
 }
 
-#[test]
-fn cgroup_pruned_newcomer_ignores_an_older_generation_exit() {
-    // Time-aware exit matching: an exit from before the mark (an older
-    // generation) must not suppress the new birth's gap.
-    let mut engine = Engine::empty();
-    engine.scope = Scope::Cgroup {
-        id: 1,
-        path: PathBuf::from("/sys/fs/cgroup/test"),
-        dir: Arc::new(File::open("/dev/null").unwrap()),
-    };
+/// One drained leader exit for `pid` at `hook_ts` (unadmitted, so it
+/// reaches the generation ledger).
+fn drain_newcomer_exit(engine: &mut Engine, pid: u32, hook_ts: u64) {
     let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
     exit.kind = DISCOVERY_KIND_LEADER_EXIT;
-    exit.pid_tgid = u64::from(4242u32) << 32;
-    exit.hook_ts_ns = 100;
+    exit.pid_tgid = u64::from(pid) << 32;
+    exit.hook_ts_ns = hook_ts;
     let mut pending = PendingViewRetirements::new();
     engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+}
+
+/// One complete scope walk listing exactly `live`, from `start` to
+/// `start + 5`.
+fn walk_scope(engine: &mut Engine, live: &[u32], start: u64) {
+    let live: BTreeSet<u32> = live.iter().copied().collect();
+    engine.note_scope_walk(&live, Some(start), Some(start + 5));
+}
+
+fn system_generation_engine() -> Engine {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::System;
+    engine
+}
+
+#[test]
+fn cgroup_exit_between_walk_and_mark_counts_one_gap() {
+    // The walk lists the newcomer before its admission stamp is taken;
+    // an exit in between is the same generation, never a second one.
+    let mut engine = cgroup_generation_engine();
+    walk_scope(&mut engine, &[], 100);
+    walk_scope(&mut engine, &[4242], 200);
+    engine.mark_newcomer_arrival(4242, Some(210));
+    drain_newcomer_exit(&mut engine, 4242, 207);
     assert_eq!(engine.pid_descendant_gaps(), 1);
-    engine.mark_newcomer_arrival(4242, Some(200));
-    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    walk_scope(&mut engine, &[], 300);
     assert_eq!(
         engine.pid_descendant_gaps(),
-        2,
-        "an older exit must not match a newer birth"
+        1,
+        "an exit between the walk and the stamp is the marked generation"
+    );
+
+    // Same race, with the exit drained before the mark is taken.
+    let mut engine = cgroup_generation_engine();
+    walk_scope(&mut engine, &[], 100);
+    walk_scope(&mut engine, &[4242], 200);
+    drain_newcomer_exit(&mut engine, 4242, 207);
+    engine.mark_newcomer_arrival(4242, Some(210));
+    walk_scope(&mut engine, &[], 300);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an exit drained before the mark matches the marked generation"
     );
 }
 
 #[test]
-fn cgroup_reused_pid_after_an_exit_match_counts_its_new_birth() {
-    // PID reuse: once an exit matches a birth, the next arrival for the
-    // same pid is a new generation with its own gap.
-    let mut engine = Engine::empty();
-    engine.scope = Scope::Cgroup {
-        id: 1,
-        path: PathBuf::from("/sys/fs/cgroup/test"),
-        dir: Arc::new(File::open("/dev/null").unwrap()),
-    };
-    engine.mark_newcomer_arrival(4242, Some(100));
-    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
-    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
-    exit.pid_tgid = u64::from(4242u32) << 32;
-    exit.hook_ts_ns = 200;
-    let mut pending = PendingViewRetirements::new();
-    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+fn system_zombie_listed_after_its_drained_exit_counts_one_gap() {
+    // /proc keeps listing a zombie after its exit drained: the walk that
+    // still lists it is the same generation, so it never re-marks and
+    // never gaps a second time when it is finally reaped.
+    let mut engine = system_generation_engine();
+    walk_scope(&mut engine, &[], 100);
+    walk_scope(&mut engine, &[4242], 200);
+    engine.mark_newcomer_arrival(4242, Some(210));
+    drain_newcomer_exit(&mut engine, 4242, 220);
     assert_eq!(engine.pid_descendant_gaps(), 1);
-    engine.mark_newcomer_arrival(4242, Some(300));
-    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    walk_scope(&mut engine, &[4242], 300);
+    engine.mark_newcomer_arrival(4242, Some(310));
+    walk_scope(&mut engine, &[4242], 400);
+    engine.mark_newcomer_arrival(4242, Some(410));
+    walk_scope(&mut engine, &[], 500);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "a still-listed zombie is the generation its drained exit counted"
+    );
+}
+
+#[test]
+fn cgroup_exit_before_the_walk_bound_counts_its_own_gap() {
+    // An exit from before the last walk that did not list the pid is an
+    // older generation: the newly listed birth gaps on its own.
+    let mut engine = cgroup_generation_engine();
+    walk_scope(&mut engine, &[], 100);
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    walk_scope(&mut engine, &[], 200);
+    walk_scope(&mut engine, &[4242], 300);
+    engine.mark_newcomer_arrival(4242, Some(310));
+    walk_scope(&mut engine, &[], 400);
     assert_eq!(
         engine.pid_descendant_gaps(),
         2,
-        "a reused pid must gap its new birth"
+        "an exit before the walk bound must not match a newer birth"
     );
+}
+
+#[test]
+fn cgroup_reused_pid_after_a_pruned_birth_counts_two_gaps() {
+    // PID reuse: the first birth gaps when its pid leaves the walk; the
+    // reused pid is a new generation, and its own exit gaps it. The first
+    // generation's late exit stays single-counted.
+    let mut engine = cgroup_generation_engine();
+    walk_scope(&mut engine, &[4242], 100);
+    engine.mark_newcomer_arrival(4242, Some(110));
+    walk_scope(&mut engine, &[], 200);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    walk_scope(&mut engine, &[4242], 300);
+    engine.mark_newcomer_arrival(4242, Some(310));
+    drain_newcomer_exit(&mut engine, 4242, 350);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        2,
+        "the reused pid's exit is its own generation"
+    );
+    drain_newcomer_exit(&mut engine, 4242, 150);
+    walk_scope(&mut engine, &[], 400);
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        2,
+        "the first generation's late exit stays single-counted"
+    );
+}
+
+#[test]
+fn cgroup_finish_sweep_adds_nothing_for_admitted_or_exit_matched_newcomers() {
+    // Healthy twin of the finish sweep: an admitted newcomer and one
+    // whose exit already counted its gap add nothing at finish.
+    let mut engine = cgroup_generation_engine();
+    walk_scope(&mut engine, &[4242, 4343], 100);
+    engine.mark_newcomer_arrival(4242, Some(110));
+    engine.mark_newcomer_arrival(4343, Some(110));
+    engine.sample_newcomer_admission(4242, Some(120));
+    drain_newcomer_exit(&mut engine, 4343, 130);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        1,
+        "an admitted or exit-matched newcomer adds no finish gap"
+    );
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(engine.pid_descendant_gaps(), 1, "the sweep is idempotent");
+}
+
+#[test]
+fn system_finish_sweep_counts_each_pending_generation_once() {
+    // --system twin: a never-admitted newcomer gaps once at finish; a
+    // zombie still listed after its drained exit adds nothing; an
+    // admitted newcomer adds nothing.
+    let mut engine = system_generation_engine();
+    walk_scope(&mut engine, &[], 100);
+    walk_scope(&mut engine, &[4242, 4343, 4444], 200);
+    for pid in [4242, 4343, 4444] {
+        engine.mark_newcomer_arrival(pid, Some(210));
+    }
+    engine.sample_newcomer_admission(4444, Some(215));
+    drain_newcomer_exit(&mut engine, 4343, 220);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    walk_scope(&mut engine, &[4242, 4343], 300);
+    engine.mark_newcomer_arrival(4242, Some(310));
+    engine.mark_newcomer_arrival(4343, Some(310));
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        2,
+        "one finish gap for the pending birth, none for the drained zombie"
+    );
+    engine.settle_frame_deferrals_at_capture_end();
+    assert_eq!(engine.pid_descendant_gaps(), 2, "the sweep is idempotent");
 }
 
 #[test]

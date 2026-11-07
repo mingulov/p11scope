@@ -7327,9 +7327,8 @@ pub(crate) mod tests {
     #[test]
     fn terminal_gaps_survive_a_per_drain_flood() {
         // Terminal/stop-time gaps stage last and must never be
-        // crowded out by per-drain floods: the last
-        // TERMINAL_GAP_RESERVE slots stay reserved until the
-        // terminal phase begins.
+        // crowded out by a per-drain flood: in-run gaps keep the full
+        // bound, and terminal gaps use headroom above it.
         let mut registry = registry();
         for n in 0..1100 {
             registry.record_gap(RegistryGap {
@@ -7344,10 +7343,14 @@ pub(crate) mod tests {
         registry.publish();
         assert_eq!(
             registry.gaps().len(),
-            DEFAULT_MAX_GAPS - TERMINAL_GAP_RESERVE,
-            "per-drain stops at the reserve"
+            DEFAULT_MAX_GAPS,
+            "per-drain keeps the full bound"
         );
-        assert!(registry.gaps_suppressed() > 0, "flood overflow suppresses");
+        assert_eq!(
+            registry.gaps_suppressed(),
+            76,
+            "the 76 flood rows past the bound suppress exactly"
+        );
         registry.enter_terminal_phase();
         for n in 0..TERMINAL_GAP_RESERVE {
             registry.record_gap(RegistryGap {
@@ -7360,7 +7363,15 @@ pub(crate) mod tests {
             });
         }
         registry.publish();
-        assert_eq!(registry.gaps().len(), DEFAULT_MAX_GAPS);
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_GAP_RESERVE
+        );
+        assert_eq!(
+            registry.gaps_suppressed(),
+            76,
+            "terminal disclosures add headroom rows, never suppressions"
+        );
         assert!(
             registry
                 .gaps()
@@ -7375,6 +7386,57 @@ pub(crate) mod tests {
                 .any(|gap| gap.subject == format!("terminal-{}", TERMINAL_GAP_RESERVE - 1)),
             "last terminal gap retained"
         );
+    }
+
+    #[test]
+    fn terminal_gaps_survive_a_staged_flood_in_a_single_publish() {
+        // The staged interaction the split-publish twin hides: a flood
+        // staged before the phase flip applies in the same publication
+        // as terminal gaps staged after it. The per-staged-gap flag
+        // holds the flood to the bound, so the headroom stays whole
+        // for the terminal disclosures.
+        let mut registry = registry();
+        for n in 0..1100 {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("flood-{n}"),
+                reason: "x".into(),
+                budget: None,
+            });
+        }
+        registry.enter_terminal_phase();
+        for n in 0..TERMINAL_GAP_RESERVE {
+            registry.record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: format!("terminal-{n}"),
+                reason: "y".into(),
+                budget: None,
+            });
+        }
+        registry.publish();
+        assert_eq!(
+            registry.gaps().len(),
+            DEFAULT_MAX_GAPS + TERMINAL_GAP_RESERVE,
+            "the flood keeps the bound, the terminal gaps the headroom"
+        );
+        assert_eq!(
+            registry.gaps_suppressed(),
+            76,
+            "only the flood rows past the bound suppress"
+        );
+        for n in 0..TERMINAL_GAP_RESERVE {
+            assert!(
+                registry
+                    .gaps()
+                    .iter()
+                    .any(|gap| gap.subject == format!("terminal-{n}")),
+                "terminal gap {n} survives the staged flood"
+            );
+        }
     }
 
     #[test]

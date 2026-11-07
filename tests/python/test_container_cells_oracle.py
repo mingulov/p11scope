@@ -560,6 +560,25 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=span)
 
+    def test_span_pidless_mismatch_aggregate_passes(self):
+        """The --system span aggregate is host-global, not the cell path.
+
+        In heuristic mode the twin's and B2's upper ranges honestly
+        refuse against the retained lower pin once the flip commits
+        (§3b routes by proof only, and no witness proof exists here);
+        the aggregate discloses that without naming a cell process.
+        """
+        span = inventory(
+            span_edges(),
+            span_gaps() + [(
+                "maps attribution",
+                "processes mapping pinned provider objects were not "
+                "attributed to them: 2 identity_mismatch (per-process "
+                "reasons in the process table)",
+                None)],
+            backend="kernel", modules=dict(D1_MODULES_SPAN))
+        self.assertTrue(check_copy_up(span_kernel=span)["ok"])
+
     def test_span_b2_counted_fails(self):
         """Admitted-unprobed means zero counted entries, never a ledger."""
         edges = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")

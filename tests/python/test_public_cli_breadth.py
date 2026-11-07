@@ -160,8 +160,11 @@ class BreadthTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell, want=0, report_text=None):
         metrics = cell in {"metrics-pid", "metrics-cgroup"} or cell.startswith("counter-") or cell.startswith("select-endpoint-")
         scope = "system" if cell.endswith("-system") or cell == "system" else ("cgroup" if "cgroup" in cell else "pid")
+        # Run-tree (v0.7.0): owned runs capture at cgroup scope; sigint
+        # still attaches to one PID (profile --pid, not run).
+        if cell in {"run-short", "run-cover", "run-ia32"}:
+            scope = "cgroup"
         if cell in {"run-short", "run-cover", "run-ia32", "sigint"}:
-            scope = "pid"
             metrics = False
         report, ledger, receipt = inputs(metrics=metrics, scope=scope, cell=cell)
         if cell in {"run-short", "run-cover", "run-ia32"}:

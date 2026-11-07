@@ -504,7 +504,23 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
+      # Pin ff3707cb1, the run-tree fix-round tip (BPF inputs final since
+      # f27901c98; the pin commit itself only advances this baseline),
+      # on top of 3681a1ab7:
+      # the run-tree pause token (f27901c98): scope_auth's cgroup arm
+      # reads PID_FILTER[owned child] as its generation token instead of
+      # returning zero, so a run-tree session's owned child regains its
+      # pause token while unowned members keep reading zero. The default
+      # Detailed object grows .text (+88 B, one PID_FILTER map read)
+      # with one new .rel.text entry (+16 B); both Inventory objects
+      # grow .text (+80 B each) with one new .rel.text entry each. No
+      # map or program is added (.maps unchanged; the PID_FILTER map
+      # already served the PID arm), symbol sets are unchanged, and only
+      # .BTF.ext line info and .debug_* move with the added source
+      # lines. The journal object, which this gate does not compare,
+      # takes the same scope_auth change. No other BPF input changed
+      # since 3681a1ab7.
+      # Earlier pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
       # b27149d51; the pin commit itself only guards the canary strip),
       # on top of 873adf5c4:
       # the round-10 inventory lifecycle ring raise (805a596ae, 2 MiB to
@@ -655,7 +671,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81
+          BASELINE=ff3707cb19d17a90706f6f47c50ec6677df7fd43
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \

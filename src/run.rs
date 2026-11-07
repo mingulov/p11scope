@@ -17328,6 +17328,30 @@ mod tests {
         }
     }
 
+    /// 614b P1 extends to programmatic callers: the CLI refuses
+    /// `--track-short-lived` beside `run`, and `run_owned` refuses it
+    /// the same way before anything is forked — otherwise an owned
+    /// cgroup-scope run would arm exe-identity recording the grant
+    /// never authorized. A nonexistent command proves the refusal
+    /// precedes resolution, and the panicking host proves it precedes
+    /// admission.
+    #[test]
+    fn owned_run_refuses_track_short_lived_before_any_fork() {
+        let mut args = run_args(
+            cli::PausePolicy::Never,
+            &["definitely-not-a-p11scope-program"],
+        );
+        args.track_short_lived = true;
+        let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
+            panic!("host admission must not run for a refused flag combination")
+        })
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--track-short-lived records nothing beside run"),
+            "{error:#}"
+        );
+    }
+
     #[test]
     fn counter_capture_and_run_require_host_after_build_policy_validation() {
         use crate::attach::{MultiHostRefusal, MultiHostStage};

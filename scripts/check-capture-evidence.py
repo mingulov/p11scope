@@ -3815,12 +3815,13 @@ def validate_object_canary_functions(document):
     for row in rows:
         exact_keys(row, {"names", "aliased", "target", "ordinals", "module", "module_ambiguous",
                          "module_unresolved", "calls", "errors", "pending_returns", "in_flight",
-                         "latency_ns", "rv_counts"}, "object function")
+                         "latency_ns", "rv_counts", "forwarding_layer"}, "object function")
         names = row["names"]
         require(isinstance(names, list) and len(names) == 1 and isinstance(names[0], str),
                 "object function requires one unaliased name")
         name = names[0]
         require(name not in seen_names and row["aliased"] is False, "duplicate/aliased object function")
+        require(row["forwarding_layer"] is False, "object function must not be a forwarding layer")
         seen_names.add(name)
         target = json.dumps(row["target"], sort_keys=True, separators=(",", ":"))
         require(target not in seen_targets, "duplicate object function target")
@@ -5296,7 +5297,8 @@ def self_test():
         objects["functions"] = function_items(pairs)
         for row in objects["functions"]:
             get = row["names"] == ["C_GetAttributeValue"]
-            row.update(errors=5 if get else 0, pending_returns=0, in_flight=0,
+            row.update(forwarding_layer=False,
+                       errors=5 if get else 0, pending_returns=0, in_flight=0,
                        latency_ns={"approximate": True, "p50": 1 if row["calls"] else None,
                                    "p95": 1 if row["calls"] else None,
                                    "p99": 1 if row["calls"] else None,
@@ -5319,6 +5321,8 @@ def self_test():
             lambda d: d["functions"][0].update(names=["C_Initialize"]),
             lambda d: d["functions"][0].update(calls=True),
             lambda d: d["functions"][0].update(pointer=0x1234),
+            lambda d: d["functions"][0].update(forwarding_layer=True),
+            lambda d: d["functions"][0].pop("forwarding_layer"),
             lambda d: d["functions"][0]["ordinals"][0].update(ordinal=21),
             lambda d: d["functions"][1]["target"].update(file_offset=0x1000),
             lambda d: d["functions"][4]["rv_counts"].pop("0x0000000000000011"),

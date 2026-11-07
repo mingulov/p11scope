@@ -2221,3 +2221,24 @@ fn pqc_display_label_pins_all_eighteen_display_strings() {
         assert_eq!(pqc_display_label(label), Some(display), "{label}");
     }
 }
+
+/// F16 residual (review item 8): the spotlight's rank table follows
+/// the v5 vocabulary order exactly — the eighteen PQC labels of
+/// `METADATA_LABELS_V5` in table order rank 0..18, and nothing else
+/// ranks at all.
+#[test]
+fn pqc_label_rank_matches_v5_order() {
+    use crate::key_operation_projection::contract::METADATA_LABELS_V5;
+    use crate::key_operation_projection::is_pqc_metadata_label;
+    let v5_pqc: Vec<&&str> = METADATA_LABELS_V5
+        .iter()
+        .filter(|label| is_pqc_metadata_label(label))
+        .collect();
+    assert_eq!(v5_pqc.len(), 18, "eighteen PQC labels in v5");
+    for (rank, label) in v5_pqc.iter().enumerate() {
+        assert_eq!(pqc_label_rank(label), Some(rank as u8), "{label}");
+    }
+    for label in ["rsa_2048", "unknown", "metadata_unknown", ""] {
+        assert_eq!(pqc_label_rank(label), None, "{label}");
+    }
+}

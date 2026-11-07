@@ -1336,6 +1336,34 @@ pub(crate) fn pqc_display_label(metadata_at_use: &str) -> Option<&'static str> {
     }
 }
 
+/// F16 (7.05 PQC): the v5 vocabulary rank of a PQC
+/// `metadata_at_use` label (0..18 in contract §5 table order), or
+/// `None` for every non-PQC label. The spotlight's sort authority;
+/// the rank test pins this order against `METADATA_LABELS_V5`.
+fn pqc_label_rank(metadata_at_use: &str) -> Option<u8> {
+    match metadata_at_use {
+        "ml_dsa_44" => Some(0),
+        "ml_dsa_65" => Some(1),
+        "ml_dsa_87" => Some(2),
+        "ml_kem_512" => Some(3),
+        "ml_kem_768" => Some(4),
+        "ml_kem_1024" => Some(5),
+        "slh_dsa_sha2_128s" => Some(6),
+        "slh_dsa_shake_128s" => Some(7),
+        "slh_dsa_sha2_128f" => Some(8),
+        "slh_dsa_shake_128f" => Some(9),
+        "slh_dsa_sha2_192s" => Some(10),
+        "slh_dsa_shake_192s" => Some(11),
+        "slh_dsa_sha2_192f" => Some(12),
+        "slh_dsa_shake_192f" => Some(13),
+        "slh_dsa_sha2_256s" => Some(14),
+        "slh_dsa_shake_256s" => Some(15),
+        "slh_dsa_sha2_256f" => Some(16),
+        "slh_dsa_shake_256f" => Some(17),
+        _ => None,
+    }
+}
+
 /// F16 (7.05 PQC): one proved (label, category) aggregate for the
 /// snapshot's PQC spotlight. Counts only — never object identity.
 pub(crate) struct PqcKeySegment {
@@ -1360,7 +1388,7 @@ pub(crate) fn pqc_key_breakdown(
 ) -> Vec<PqcKeySegment> {
     use std::collections::BTreeMap;
     let secondary = crate::key_operation_projection::SECONDARY_ROLE;
-    let mut by_label: BTreeMap<(usize, &str), (&str, u64, u64, u64)> = BTreeMap::new();
+    let mut by_label: BTreeMap<(u8, &str), (&str, u64, u64, u64)> = BTreeMap::new();
     for row in &observations.key_operations {
         if row.role == secondary {
             continue;
@@ -1368,10 +1396,7 @@ pub(crate) fn pqc_key_breakdown(
         let Some(display) = pqc_display_label(row.metadata_at_use) else {
             continue;
         };
-        let Some(rank) = crate::key_operation_projection::contract::METADATA_LABELS_V5
-            .iter()
-            .position(|known| *known == row.metadata_at_use)
-        else {
+        let Some(rank) = pqc_label_rank(row.metadata_at_use) else {
             continue;
         };
         let entry = by_label

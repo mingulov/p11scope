@@ -119,6 +119,7 @@ RUN = [
     ("test_key_operation_ledger.py", []),
     ("test_key_operations_fixture.py", []),
     ("test_key_operations_linked_control.py", []),
+    ("test_key_operations_shortlived.py", []),
     ("test_key_operations_system.py", []),
     ("test_kubernetes_runtime.py", []),
     ("test_kubernetes_runtime_workflow.py", []),

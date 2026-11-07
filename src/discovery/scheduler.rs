@@ -1948,4 +1948,70 @@ mod tests {
             "the restore returns the pre-service previous tick"
         );
     }
+
+    /// Sustained flood exceeding the per-tick attempts: `k` attempts per
+    /// tick but `k + 1` arrivals per tick, deferred arrivals rejoining as
+    /// backlog next tick. Every original backlog entry must be attempted,
+    /// oldest (lowest pid) first, within a bound; returns the measured
+    /// last-attempt tick and whether all served in order. Concatenating
+    /// fresh ahead of backlog instead of interleaving would attempt only
+    /// newcomers forever and strand every original.
+    fn opus_flood(k: usize, originals: u32, ticks_max: usize) -> (usize, bool) {
+        let batch = MAX_NEW_VIEWS_PER_TICK;
+        let share = MAX_NEWCOMER_ADMISSIONS_PER_TICK;
+        let mut scheduler = DiscoveryScheduler::new();
+        let mut remaining: BTreeSet<u32> = (1..=originals).collect();
+        let mut arrival = 1_000_000u32;
+        let mut served_order = Vec::new();
+        let mut last = 0usize;
+        for tick in 1..=ticks_max {
+            let mut fresh = BTreeSet::new();
+            for _ in 0..=k {
+                remaining.insert(arrival);
+                fresh.insert(arrival);
+                arrival += 1;
+            }
+            let pids: Vec<u32> = remaining.iter().copied().collect();
+            let (admitted, _) =
+                scheduler.new_view_window_newcomers_first(&pids, &fresh, batch, share);
+            for pid in admitted.iter().take(k) {
+                if fresh.contains(pid) {
+                    scheduler.note_newcomer_attempt(*pid);
+                } else {
+                    scheduler.note_backlog_attempt(*pid);
+                }
+                remaining.remove(pid);
+                if *pid <= originals {
+                    served_order.push(*pid);
+                    last = tick;
+                }
+            }
+            if !remaining.iter().any(|pid| *pid <= originals) {
+                break;
+            }
+        }
+        let all = !remaining.iter().any(|pid| *pid <= originals);
+        let ordered = served_order.windows(2).all(|w| w[0] < w[1]);
+        eprintln!(
+            "OPUS-P1 k={k} originals={originals} all_served={all} last_tick={last} oldest_first={ordered}"
+        );
+        (last, all && ordered)
+    }
+
+    /// The sustained-flood bound, pinned per attempt rate: at one attempt
+    /// per tick the owed flag alternates the lead and 200 originals serve
+    /// within 401 ticks; at two or three attempts the interleave serves
+    /// one backlog pid per tick; at eight it serves four per tick.
+    #[test]
+    fn opus_p1_sustained_flood_bounds() {
+        let (t1, ok1) = opus_flood(1, 200, 2000);
+        let (t2, ok2) = opus_flood(2, 200, 2000);
+        let (t3, ok3) = opus_flood(3, 200, 2000);
+        let (t8, ok8) = opus_flood(8, 200, 2000);
+        assert!(ok1 && ok2 && ok3 && ok8);
+        assert!(t1 <= 2 * 200 + 1, "k=1 bound {t1}");
+        assert!(t2 <= 200 + 1, "k=2 bound {t2}");
+        assert!(t3 <= 200 + 1, "k=3 bound {t3}");
+        assert!(t8 <= 200 / 4 + 1, "k=8 bound {t8}");
+    }
 }

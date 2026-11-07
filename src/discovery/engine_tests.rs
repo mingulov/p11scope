@@ -65095,9 +65095,10 @@ fn newcomer_flood_does_not_starve_marked_backlog_two_attempts() {
     eprintln!(
         "OPUS-PROBE-A ticks={TICKS} per_tick={PER_TICK} backlog_first_admitted_tick={first_admitted:?} views_after_flood={views_before_quiet} admitted_once_flood_stops={admitted_when_quiet}"
     );
-    assert!(
-        first_admitted.is_some(),
-        "the marked backlog pid was never attempted in {TICKS} flooded ticks"
+    assert_eq!(
+        first_admitted,
+        Some(1),
+        "the marked backlog pid admits on the first flooded tick at 2 attempts/tick"
     );
 }
 
@@ -65140,9 +65141,10 @@ fn newcomer_flood_does_not_starve_marked_backlog_one_attempt() {
         }
     }
     eprintln!("OPUS-PROBE-A-1 ticks={TICKS} backlog_first_admitted_tick={first_admitted:?}");
-    assert!(
-        first_admitted.is_some(),
-        "the marked backlog pid was never attempted in {TICKS} flooded ticks at 1 attempt/tick"
+    assert_eq!(
+        first_admitted,
+        Some(2),
+        "the marked backlog pid admits on the second flooded tick at 1 attempt/tick"
     );
 }
 
@@ -65247,6 +65249,63 @@ fn scarce_tick_serves_fresh_pending_newcomer_before_older_backlog() {
         "the older backlog pid completes next"
     );
     assert_eq!(engine.probationary_completions, 2);
+}
+
+/// Backlog rotation passes a persistently failing low pid: three backlog
+/// pids (all deferred unattempted on their arrival tick), the lowest one
+/// persistently unreadable, one attempt per tick. The third pid keeps the
+/// every-attempt-recorded-as-newcomer kill past the failed-newcomer sink:
+/// with a frozen backlog cursor the first two pids cycle forever while
+/// the third never admits. A shared newcomer/backlog cursor strands both
+/// followers behind the failing pid instead. Four one-permit ticks: the
+/// third is the fourth under-cap tick, whose polling round spends the
+/// permit on a retained rescan, so the last follower admits on the fourth.
+#[test]
+fn opus_r3_backlog_rotation_passes_failing_low_pid() {
+    let first = e06_spawn_sleeps(1);
+    let first_pid = first[0].pid();
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &[first_pid]);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), vec![], None);
+    let mut engine = Engine::discover(&args, &scope, None).unwrap();
+    engine.scheduler.set_tick_quantum_ns_for_test(1_000);
+    let mut more = e06_spawn_sleeps(3);
+    more.sort_by_key(SystemScopeChildGuard::pid);
+    let failed_pid = more[0].pid();
+    let mid_pid = more[1].pid();
+    let later_pid = more[2].pid();
+    more[0].reap().expect("reap the owned failed candidate");
+    e06_write_listing(scope_dir.path(), &[first_pid, failed_pid, mid_pid, later_pid]);
+    opus_probe_refresh_with_permits(&mut engine, 0);
+    assert_eq!(engine.views.len(), 1);
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let after1 = engine.views.len();
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let after2 = engine.views.len();
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let after3 = engine.views.len();
+    assert_eq!(
+        after3, 2,
+        "the fourth under-cap tick spends its permit on polling rescans"
+    );
+    assert!(
+        engine.polling_rescans_queued > 0,
+        "the third one-permit tick ran the polling round"
+    );
+    opus_probe_refresh_with_permits(&mut engine, 1);
+    let kept: BTreeSet<u32> = engine.views.iter().map(ProcessView::pid).collect();
+    eprintln!(
+        "OPUS-M16K after_tick1_views={after1} after_tick2_views={after2} after_tick3_views={after3} kept={kept:?} later={later_pid}"
+    );
+    assert!(
+        kept.contains(&mid_pid),
+        "the backlog rotation advances past the failing pid"
+    );
+    assert!(
+        kept.contains(&later_pid),
+        "the backlog rotation passes the failing pid"
+    );
 }
 
 fn opus_probe_view_pids(engine: &Engine) -> std::collections::BTreeSet<u32> {

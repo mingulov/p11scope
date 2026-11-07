@@ -14301,6 +14301,7 @@ pub(crate) mod tests {
             build_id: None,
             identity_source: Some("mountinfo"),
             note: None,
+            pre_copy_up: false,
             mappings: Vec::new(),
             observations: Vec::new(),
             admission: crate::inspect_system::AdmissionRecord::Admitted {
@@ -14398,6 +14399,7 @@ pub(crate) mod tests {
                     build_id: None,
                     identity_source: Some("mountinfo"),
                     note: None,
+                    pre_copy_up: false,
                     mappings: Vec::new(),
                     observations: vec![crate::inspect_system::Observation {
                         pid,

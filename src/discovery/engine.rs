@@ -7662,6 +7662,7 @@ fn discovery_evidence(
                 .map(|s| summary_of(s.object, &s.object_path))
                 .collect();
             let identity = summary_of(m.object, &m.path);
+            let pre_copy_up = pinned.summary(m.object).is_some_and(|pin| pin.pre_copy_up);
             render::DiscoveredModule {
                 id: m.id,
                 admission_class: m.admission_class,
@@ -7670,6 +7671,7 @@ fn discovery_evidence(
                 sha256: identity.sha256,
                 path: m.path.clone(),
                 build_id: identity.build_id,
+                layer: pre_copy_up.then_some(render::ModuleLayer::PreCopyUp),
                 objects,
                 sources: m.source.split('+').collect(),
                 corroborated: m.corroborated,

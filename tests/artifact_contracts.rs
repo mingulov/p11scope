@@ -12519,6 +12519,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
         sha256: object.sha256.clone(),
         path: object.path.clone(),
         build_id: object.build_id.clone(),
+        layer: None,
         objects: vec![object],
         sources: vec!["scan"],
         corroborated: false,

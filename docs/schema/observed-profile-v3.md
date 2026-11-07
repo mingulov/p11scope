@@ -499,6 +499,22 @@ nor does inventory; the window stays wherever any condition refuses. The
 empty list asserts only the pre-attach span; a later loss still discloses on
 `watch` (`ended_by: health_loss`) without reopening it.
 
+## Copy-up layer marker on `evidence.discovery[]`
+
+When a capture observes an overlayfs copy-up pair — the same merged path
+mapping two kernel files, the stale pre-copy-up lower file and the fresh
+upper file, with the kernel VMA witness proving which mapping runs which
+bytes — `discovery[]` carries one row per file. Both rows publish the
+merge path; each carries its own file's `{dev, ino, sha256, build_id}`.
+The lower file's row additionally carries `"layer": "pre_copy_up"`; the
+key is absent on every ordinary row. `functions[].module` joins to either
+row by identity, so stale-mapping calls count on the lower edge and fresh
+calls on the upper edge. `capture.modules[]` stays the identity-only
+projection and carries no `layer` key. The lowerdir host paths that
+produced the lower candidates are never published. Verbose text marks the
+lower file's function rows `(file before copy-up)`; concise text shows
+the same counts unmarked.
+
 ## Residual additions: terminal verdict, override, handoff, environment, PID namespace
 
 These fields are always present in every v3 profile, v3-metrics, and terminal

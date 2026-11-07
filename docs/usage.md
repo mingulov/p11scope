@@ -906,6 +906,18 @@ identity plus digest instead of failing the group. The existing overlay-only
 byte-identical collapse is the sole heuristic exception and publishes
 uncertainty that forces `PARTIAL`.
 
+When a provider file is copied up while mapped — the merged path names the
+fresh upper file but a process still runs the stale lower bytes — the kernel
+VMA witness proves which mapping runs which file, and the capture attributes
+each side separately: one module row per file, both under the merge path,
+with the lower file's row carrying `"layer": "pre_copy_up"` in JSON and
+`(file before copy-up)` in verbose text. Stale-mapping calls count on the
+lower row, fresh calls on the upper row. The lower candidates come from the
+target's already-read mount table and spend from the same per-scan witness
+budget; when the proof fails or the budget is spent, the mapping keeps the
+named `original_file_unproven` gap instead of joining. Lowerdir host paths
+are never published.
+
 **Historical pre-terminal-drain output**, `profile --mode metrics` against a
 SoftHSM2 workload (`scripts/verify-attach-e2e.sh`). Current written captures
 end `COMPLETE` only when the stop gate proves the final drain, as explained

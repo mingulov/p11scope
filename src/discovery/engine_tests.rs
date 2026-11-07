@@ -1660,6 +1660,33 @@ fn capture_fact_proof_tombstones_block_later_positive_refresh() {
     assert!(engine.discovery.manifest_object_fallbacks.is_empty());
 }
 
+/// The discovery module row carries the copy-up layer marker exactly
+/// when its pinned object is the witness-proven pre-copy-up side of
+/// the pair.
+#[test]
+fn discovery_row_marks_only_the_pre_copy_up_object() {
+    let (plan, mut pins) = plan_with_pins(2, 0);
+    let plain = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
+    assert_eq!(plain.modules.len(), 1);
+    assert_eq!(plain.modules[0].layer, None);
+    crate::discovery::identity::test_fixture::mark_pre_copy_up(&mut pins);
+    let marked = discovery_evidence(
+        &plan,
+        &pins,
+        &DiscoveryCounters::default(),
+        &crate::prearm_module::PrearmState::empty(),
+    );
+    assert_eq!(
+        marked.modules[0].layer,
+        Some(crate::render::ModuleLayer::PreCopyUp)
+    );
+}
+
 #[test]
 fn current_discovery_never_reads_an_inactive_slots_retired_pin() {
     let (mut plan, pins) = plan_with_pins(2, 0);
@@ -36921,6 +36948,7 @@ fn merged_module(sources: Vec<&'static str>) -> render::DiscoveredModule {
         sha256: Some("5f48fcc1".into()),
         path: "/tmp/freeze-provider.so".into(),
         build_id: Some("23a2c057".into()),
+        layer: None,
         objects: vec![merged_object(sources.clone())],
         sources,
         corroborated: false,

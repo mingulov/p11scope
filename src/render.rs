@@ -990,6 +990,17 @@ pub struct UnobservedWindow {
     pub reason: UnobservedReason,
 }
 
+/// Which side of a witness-proven copy-up pair a module row describes.
+/// Absent (`None`) is the ordinary case: the row describes the mapped
+/// file itself. Finite vocabulary, serialized snake_case.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModuleLayer {
+    /// The lower file's row: the merge path, the lower file's identity,
+    /// and the stale-mapping calls. JSON `"layer": "pre_copy_up"`.
+    PreCopyUp,
+}
+
 /// One module discovery found, with everything known about how it was found.
 /// Same path caveat as `ObjectSummary`.
 #[derive(Debug, Clone, Serialize, PartialEq)]
@@ -1012,6 +1023,10 @@ pub struct DiscoveredModule {
     pub sha256: Option<String>,
     pub path: String,
     pub build_id: Option<String>,
+    /// `Some` only for the witness-proven pre-copy-up lower file's row;
+    /// absent on the wire for every ordinary module.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layer: Option<ModuleLayer>,
     /// Every object this module's **planned slots** attach into — a forwarded
     /// entry lands in a dependency, not in the module that published it. An
     /// entry that never became a slot is in `skipped`, not here.
@@ -2215,6 +2230,17 @@ fn label(r: &SlotReport) -> String {
 /// `two providers` when two files claim the row, or `unknown` when no
 /// file is proven. Escaped and truncated to the column width, so long
 /// paths never break the table's alignment.
+/// Whether a function row's attributed module is the witness-proven
+/// pre-copy-up lower file's row: verbose text marks those rows so two
+/// rows sharing one merge path stay distinguishable.
+fn row_module_is_pre_copy_up(row: &SlotReport, modules: &[DiscoveredModule]) -> bool {
+    row.module.is_some_and(|id| {
+        modules
+            .iter()
+            .any(|module| module.id == id && module.layer == Some(ModuleLayer::PreCopyUp))
+    })
+}
+
 fn provider_cell(row: &SlotReport, modules: &[DiscoveredModule]) -> String {
     const WIDTH: usize = 16;
     let cell = if row.module_ambiguous {
@@ -3158,6 +3184,11 @@ pub fn live_scoped_with_verbosity(
             }
             if row_is_forwarding(r, &forwarding, &ev.discovery.modules) {
                 name.push_str(" (forwarding layer)");
+            }
+            if verbosity == crate::cli::TextVerbosity::Verbose
+                && row_module_is_pre_copy_up(r, &ev.discovery.modules)
+            {
+                name.push_str(" (file before copy-up)");
             }
             rendered.push((escape_controls(&name).into_owned(), r));
         }
@@ -6330,6 +6361,7 @@ pub(crate) mod tests {
             sha256: Some(sha.clone()),
             path: "/opt/p11.so".into(),
             build_id: Some("aabb".into()),
+            layer: None,
             objects: vec![ObjectSummary {
                 dev: (8, 1),
                 ino: 11,
@@ -7653,6 +7685,79 @@ pub(crate) mod tests {
             "interface names must not be rendered in capture output: {text}"
         );
         assert_eq!(v["evidence"]["discovery"][0]["interfaces"], 3);
+    }
+
+    /// The copy-up layer marker travels only on the lower file's module
+    /// row: ordinary rows keep their exact key set, and the marked row
+    /// carries the finite `pre_copy_up` value.
+    #[test]
+    fn module_layer_serializes_only_on_pre_copy_up_rows() {
+        let plain = discovered_fixture();
+        let value = serde_json::to_value(&plain).unwrap();
+        assert!(
+            value.get("layer").is_none(),
+            "ordinary rows carry no layer key: {value}"
+        );
+        let mut marked = plain;
+        marked.layer = Some(ModuleLayer::PreCopyUp);
+        let value = serde_json::to_value(&marked).unwrap();
+        assert_eq!(value["layer"], "pre_copy_up", "{value}");
+    }
+
+    /// Under `-v`, function rows attributed to the lower file's module
+    /// carry "(file before copy-up)" so two rows sharing one merge path
+    /// stay distinguishable; concise shows the same counts unmarked.
+    #[test]
+    fn verbose_frame_marks_file_before_copy_up_rows() {
+        let mut upper = discovered_fixture();
+        upper.id = ModuleId(0);
+        let mut lower = discovered_fixture();
+        lower.id = ModuleId(1);
+        lower.layer = Some(ModuleLayer::PreCopyUp);
+        lower.sha256 = Some("22".repeat(32));
+        let mut ev = evidence();
+        ev.discovery.modules = vec![upper, lower];
+        let mut fresh = report("C_Sign", 25, 0, false);
+        fresh.module = Some(ModuleId(0));
+        let mut stale = report("C_Sign", 7, 0, false);
+        stale.module = Some(ModuleId(1));
+        let frame = |verbosity| {
+            live_scoped_with_verbosity(
+                &[fresh.clone(), stale.clone()],
+                &ev,
+                Duration::ZERO,
+                "/opt/p11.so (+1 more)",
+                "profile",
+                CapturePolicy::Allowlisted,
+                "selected",
+                &BTreeMap::new(),
+                verbosity,
+            )
+        };
+        let verbose = frame(crate::cli::TextVerbosity::Verbose);
+        assert_eq!(
+            verbose.matches("(file before copy-up)").count(),
+            1,
+            "{verbose}"
+        );
+        assert!(
+            verbose.contains("C_Sign (file before copy-up)"),
+            "{verbose}"
+        );
+        let concise = frame(crate::cli::TextVerbosity::Concise);
+        assert!(
+            !concise.contains("file before copy-up"),
+            "concise stays unmarked: {concise}"
+        );
+        assert_eq!(
+            concise.matches("C_Sign").count(),
+            2,
+            "concise keeps both rows: {concise}"
+        );
+        assert!(
+            concise.contains("25") && concise.contains('7'),
+            "concise keeps both counts: {concise}"
+        );
     }
 
     /// F-13: the evidence line names why a verdict is PARTIAL, from the

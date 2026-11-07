@@ -61,7 +61,10 @@ and [offline CBOM export re-projection](#offline-cbom-export-re-projection-v070)
 which describes the implemented offline report and grants no capture authority,
 and [app identity hints](#app-identity-hints-owner-ruling-2026-11-08),
 which describes its development implementation pending privacy review and
-installed qualification.**
+installed qualification,
+and [copy-up layer publication](#copy-up-layer-publication-f11-2026-11-07),
+which attributes a witness-proven pre-copy-up lower file as its own
+module row with the finite `pre_copy_up` marker.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1979,3 +1982,24 @@ source wins. Counts, caller IDs, incarnation identity, joins, and
 admissions never change. A hint equal to the exe basename is dropped
 everywhere. Trace, inspect, metrics, and profile outputs are untouched
 by this section.
+
+## Copy-up layer publication (F11, 2026-11-07)
+
+**Status: IMPLEMENTED in v0.7.0 by controller ruling F11 copy-up
+(2026-11-07): when the kernel VMA witness proves a mapped range runs
+the pre-copy-up lower file rather than the merged path's current file,
+the lower file is attributed as its own module row instead of missed.
+Allowlist-v1 bytes are unchanged; the lower file's identity publishes
+under the existing v1 module-identity fields, plus one finite marker.
+No new kernel read exists: the proof reuses the ratified v2 "Kernel VMA
+identity proof" reads.** Userspace additionally parses the `lowerdir`
+option of the already-read mount table, opens the proven lower file,
+and ELF-inspects and hashes it exactly like any pinned provider file;
+each lower query spends from the existing 8/scan witness budget, and
+exhaustion keeps the named `original_file_unproven` gap. Only the
+merge path is published, never lowerdir host paths.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Lower module row (merge path plus lower identity) | The lower file the kernel VMA witness proved for the stale range: opened by descriptor, whole-file SHA-256 at pin time, `(ino, size, ctime)` re-checks, and ELF re-inspection from the lower fd — the same custody as any provider file. Upper offsets are never reused for it. The row exists only on a kernel `same_file` proof for a lower candidate; an unproven, unopenable, escaped, or budget-exhausted candidate keeps the named gap, never a join. | A second module row beside the upper file's, in `evidence.discovery[]` (profile/metrics), `inspect --pid` modules, and the `inspect --system` catalog: the merge path with the lower file's `{dev, ino, sha256, build_id}` under the existing module-identity fields. `functions[].module` joins either row by identity, so stale-mapping calls count on the lower edge and fresh calls on the upper edge. `capture.modules[]` stays the identity-only projection. | No lowerdir host path, candidate list, candidate index, range, address, verdict, PID, argv, environ, PIN, key or payload value reaches output. A genuine in-place change (no witness proof) still blocks with the existing changed-identity refusal. Required evidence: the stale-mapper acceptance with 2 witness queries, the lower/upper routing twins, the in-place-change refusal twin, the budget-exhaustion gap twin, the unopenable/escaped-candidate refusal twins, and the matching shapes in `docs/schema/observed-profile-v3.md` and `docs/schema/inspect-v1.md`. |
+| Finite layer marker (`layer: "pre_copy_up"`) | A pure projection of the pin's proven side: present exactly on rows whose pinned object is the witness-proven pre-copy-up file. One finite value; no target read happens for this key. | JSON `"layer": "pre_copy_up"` on the lower file's module row only (absent — never null — on every ordinary row); verbose text marks the row `(file before copy-up)`; concise text shows the same counts unmarked. | No second value exists; an unproven side never carries the marker. Required evidence: the marker serialization twins (profile, inspect JSON, catalog), the verbose-marker twins, and the concise-silence twins. |

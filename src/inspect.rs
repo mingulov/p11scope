@@ -357,14 +357,35 @@ pub(crate) fn table_walk_words(walk: &str, count: usize) -> String {
     }
 }
 
+/// The pin whose identity a scanned module row reports: under a
+/// witness-proven copy-up pair one maps key names two pins, so the row
+/// takes the pin whose pre-copy-up side matches the module's. Falls back
+/// to any pin under the key, preserving today's single-pin behavior.
+fn pin_for_module<'a>(
+    module: &ScannedModule,
+    pinned: &'a PinnedObjects,
+) -> Option<crate::discovery::identity::PinnedSummary<'a>> {
+    let want_pre = module.pre_copy_up.is_some();
+    pinned
+        .pinned()
+        .filter(|p| p.key == module.key)
+        .find(|p| p.pre_copy_up == want_pre)
+        .or_else(|| pinned.pinned().find(|p| p.key == module.key))
+}
+
 fn render_module(out: &mut String, module: &ScannedModule, pinned: &PinnedObjects) {
     let _ = writeln!(
         out,
-        "module  {}",
-        crate::render::escape_controls(&module.path)
+        "module  {}{}",
+        crate::render::escape_controls(&module.path),
+        if module.pre_copy_up.is_some() {
+            " (file before copy-up)"
+        } else {
+            ""
+        },
     );
 
-    let pin = pinned.pinned().find(|p| p.key == module.key);
+    let pin = pin_for_module(module, pinned);
     let sha256 = pin.map_or("-", |p| p.sha256);
     let build_id = pin.and_then(|p| p.build_id).unwrap_or("-");
     let _ = writeln!(
@@ -495,7 +516,7 @@ fn render_json_with_application(
 }
 
 fn module_json(module: &ScannedModule, pinned: &PinnedObjects) -> serde_json::Value {
-    let pin = pinned.pinned().find(|p| p.key == module.key);
+    let pin = pin_for_module(module, pinned);
     let identity = serde_json::json!({
         "sha256": pin.map(|p| p.sha256),
         "build_id": pin.and_then(|p| p.build_id),
@@ -528,7 +549,7 @@ fn module_json(module: &ScannedModule, pinned: &PinnedObjects) -> serde_json::Va
             })
         })
         .collect();
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "path": module.path,
         "device": { "major": module.key.device.major, "minor": module.key.device.minor },
         "inode": module.key.inode,
@@ -536,7 +557,13 @@ fn module_json(module: &ScannedModule, pinned: &PinnedObjects) -> serde_json::Va
         "exports": module.exports,
         "tables": tables,
         "interfaces": interfaces,
-    })
+    });
+    // The finite copy-up marker travels only on the lower file's row;
+    // ordinary rows keep their exact key set.
+    if module.pre_copy_up.is_some() {
+        row["layer"] = serde_json::json!("pre_copy_up");
+    }
+    row
 }
 
 /// Combines a scan's own skips with the ones pinning turned up — pinning skips
@@ -864,6 +891,127 @@ mod tests {
             device: Device { major: 8, minor: 1 },
             inode,
         }
+    }
+
+    fn copyup_module(key: ObjectKey, pre: Option<u32>) -> ScannedModule {
+        ScannedModule {
+            module_hint: None,
+            mapped_identity: None,
+            double_loaded: false,
+            same_file_loads: 1,
+            pre_copy_up: pre,
+            view: crate::process::ProcessViewId(0),
+            mount_namespace: crate::process::MountNamespaceId {
+                device: 1,
+                inode: 1,
+            },
+            key,
+            path: "/merge/provider.so".into(),
+            tables_scan_finished: true,
+            decoder_abi: Some(p11scope_manifest::elf::ElfAbi::Lp64),
+            exports: vec!["C_GetFunctionList".into()],
+            tables: Vec::new(),
+            interfaces: Vec::new(),
+        }
+    }
+
+    /// One maps key naming a witness-proven copy-up pair: the plain
+    /// upper pin plus the lower pin marked proven, both filed under
+    /// the merge path like production.
+    fn copyup_pair_pins(upper: &std::path::Path, lower: &std::path::Path) -> PinnedObjects {
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let mut pins = PinnedObjects::empty();
+        assert!(
+            pins.absorb(real_scan_pin(upper, None, 1, "sha-u"))
+                .is_empty()
+        );
+        let key = pins.pinned().next().unwrap().key;
+        let mut lower_pins = real_scan_pin(lower, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lower_pins);
+        repath_single_pin(&mut lower_pins, upper.to_str().unwrap());
+        assert!(pins.absorb(lower_pins).is_empty());
+        assert_eq!(pins.pinned().count(), 2);
+        pins
+    }
+
+    /// Each scanned module row reports its own side's identity under a
+    /// pair key: the pre-copy-up row the lower digest, the plain row
+    /// the upper — never the first pin filed.
+    #[test]
+    fn inspect_pin_lookup_prefers_the_matching_pre_side() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper.so");
+        let lower = dir.path().join("lower.so");
+        std::fs::write(&upper, b"upper").unwrap();
+        std::fs::write(&lower, b"lower").unwrap();
+        let pins = copyup_pair_pins(&upper, &lower);
+        let key = pins.pinned().next().unwrap().key;
+        let pre = pin_for_module(&copyup_module(key, Some(0)), &pins).unwrap();
+        assert_eq!(pre.sha256, "sha-l");
+        assert!(pre.pre_copy_up);
+        let plain = pin_for_module(&copyup_module(key, None), &pins).unwrap();
+        assert_eq!(plain.sha256, "sha-u");
+        assert!(!plain.pre_copy_up);
+    }
+
+    /// The inspect JSON row for a pre-copy-up module carries the finite
+    /// marker with the lower identity; ordinary rows keep their exact
+    /// key set.
+    #[test]
+    fn inspect_json_marks_only_the_pre_copy_up_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let upper = dir.path().join("upper.so");
+        let lower = dir.path().join("lower.so");
+        std::fs::write(&upper, b"upper").unwrap();
+        std::fs::write(&lower, b"lower").unwrap();
+        let pins = copyup_pair_pins(&upper, &lower);
+        let key = pins.pinned().next().unwrap().key;
+        let marked = module_json(&copyup_module(key, Some(0)), &pins);
+        assert_eq!(marked["layer"], "pre_copy_up", "{marked}");
+        assert_eq!(marked["identity"]["sha256"], "sha-l", "{marked}");
+        let plain = module_json(&copyup_module(key, None), &pins);
+        assert!(
+            plain.get("layer").is_none(),
+            "ordinary rows carry no layer key: {plain}"
+        );
+        assert_eq!(plain["identity"]["sha256"], "sha-u", "{plain}");
+    }
+
+    /// Verbose inspect text marks the lower file's row; the concise
+    /// one-line-per-provider summary shows the same counts unmarked.
+    #[test]
+    fn inspect_verbose_text_marks_the_file_before_copy_up() {
+        let outcome = ScanOutcome::Scanned {
+            modules: vec![copyup_module(key(11), Some(0))],
+            skipped: Vec::new(),
+            scan_ms: 1,
+        };
+        let verbose = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.contains("module  /merge/provider.so (file before copy-up)"),
+            "{verbose}"
+        );
+        let concise = render_text_with_verbosity(
+            4242,
+            &outcome,
+            &PinnedObjects::empty(),
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            !concise.contains("file before copy-up"),
+            "concise stays unmarked: {concise}"
+        );
+        assert!(
+            concise.contains("/merge/provider.so"),
+            "concise keeps the provider line: {concise}"
+        );
     }
 
     /// F-20: a soft diagnosis failure (the target changed mid-scan or

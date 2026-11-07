@@ -758,6 +758,11 @@ detail during a counter capture (`--select-endpoint`).
   remaining unrefused checks, pin-time classification from each view's
   mount table, a `STATX_MNT_ID_UNIQUE` cache key, and a wider filesystem
   test matrix in CI.
+- Overlayfs copy-up attribution (0.7.0): a process that loaded a
+  provider before a copy-up currently reads `unknown` with the
+  `original_file_unproven` gap and its later calls are missed; the
+  witness-proven lower file will be attributed as its own module row
+  (`layer: "pre_copy_up"`) with stale-mapping calls counted on it.
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

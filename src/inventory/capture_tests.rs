@@ -996,6 +996,7 @@ impl Scene {
             build_id: None,
             identity_source: Some("mountinfo"),
             note: None,
+            pre_copy_up: false,
             mappings: Vec::new(),
             observations: members
                 .iter()

@@ -382,6 +382,13 @@ and never proves an app identity. See the app identity rows of
   is correct (same file → same loaded object → one session
   namespace). The additive instance projection below separates proven
   semantic instances; physical module and entry meanings stay the same.
+  An overlayfs copy-up pair is the converse: one merged path names two
+  kernel files — the stale pre-copy-up lower file and the fresh upper
+  file — and the identity key keeps them two records, each with the
+  merge path in its path list and its own file's identity. Inventory
+  rows carry no `layer` marker; the capture profile's `discovery[]`
+  row for the lower file does (`"layer": "pre_copy_up"` — see
+  `observed-profile-v3.md`).
 - `edges[]`: one record per (caller incarnation, module instance)
   pair. `mapping` is scan evidence (state `mapped`, `ended`, or
   `uncertain`, with first/last seen and an interruption count of

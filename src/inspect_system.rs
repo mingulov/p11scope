@@ -1233,6 +1233,10 @@ pub(crate) struct CatalogObject {
     pub build_id: Option<String>,
     pub identity_source: Option<&'static str>,
     pub note: Option<String>,
+    /// The pinned object is the witness-proven pre-copy-up side of its
+    /// maps key: JSON renders `"layer": "pre_copy_up"`, verbose text
+    /// `(file before copy-up)`.
+    pub pre_copy_up: bool,
     /// `(pid, view)`: the deep-scan view that mapped it, or `None` for a
     /// member attributed by maps identity (no view was opened).
     pub mappings: Vec<(u32, Option<ProcessViewId>)>,
@@ -2439,6 +2443,7 @@ fn assemble(
                     build_id: None,
                     identity_source: None,
                     note: None,
+                    pre_copy_up: false,
                     mappings: vec![(pid, Some(view))],
                     observations: vec![observation_of(pid, &inputs[index].scanned)],
                     admission: AdmissionRecord::Unresolved {
@@ -2502,6 +2507,7 @@ fn assemble(
             build_id: pin.build_id.map(str::to_string),
             identity_source: Some(pin.identity_source),
             note: pin.note.map(str::to_string),
+            pre_copy_up: pin.pre_copy_up,
             mappings,
             observations,
             admission,
@@ -2518,6 +2524,7 @@ fn assemble(
             build_id: None,
             identity_source: None,
             note: None,
+            pre_copy_up: false,
             mappings: vec![(pid, Some(view))],
             observations: vec![observation_of(pid, &scanned)],
             admission: AdmissionRecord::Unresolved { reasons },
@@ -3244,7 +3251,7 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
         }),
     };
     admission["state"] = serde_json::Value::String(object.admission.state().to_string());
-    serde_json::json!({
+    let mut row = serde_json::json!({
         "path": object.path,
         "device": {
             "major": object.key.device.major,
@@ -3264,7 +3271,13 @@ fn object_json(object: &CatalogObject) -> serde_json::Value {
             .collect::<Vec<_>>(),
         "observations": observations,
         "admission": admission,
-    })
+    });
+    // The finite copy-up marker travels only on the lower file's row;
+    // ordinary rows keep their exact key set.
+    if object.pre_copy_up {
+        row["layer"] = serde_json::json!("pre_copy_up");
+    }
+    row
 }
 
 /// Renders the catalog as human-readable text: the same facts as the JSON
@@ -3466,8 +3479,13 @@ fn render_object(
     if verbose {
         let _ = writeln!(
             out,
-            "object[{index}]  {}",
-            crate::render::escape_controls(&object.path)
+            "object[{index}]  {}{}",
+            crate::render::escape_controls(&object.path),
+            if object.pre_copy_up {
+                " (file before copy-up)"
+            } else {
+                ""
+            },
         );
     } else {
         let _ = writeln!(
@@ -7280,6 +7298,7 @@ mod tests {
             build_id: None,
             identity_source: sha256.map(|_| "mountinfo"),
             note: None,
+            pre_copy_up: false,
             mappings: vec![(pid, Some(ProcessViewId(0)))],
             observations: vec![Observation {
                 pid,
@@ -8869,6 +8888,56 @@ mod tests {
         assert!(
             matches!(&relationships[1], Relationship::Alias { object: 0, .. }),
             "{relationships:?}"
+        );
+    }
+
+    /// The catalog row for a witness-proven pre-copy-up lower file
+    /// carries the finite marker in JSON and verbose text; ordinary
+    /// rows keep their exact shape, and concise stays unmarked.
+    #[test]
+    fn catalog_row_marks_only_the_pre_copy_up_object() {
+        let admitted = AdmissionRecord::Admitted {
+            class: "heuristic",
+            endpoints: 68,
+        };
+        let mut lower = object("/merge/prov.so", 11, Some("ll"), 100, admitted.clone());
+        lower.pre_copy_up = true;
+        let upper = object("/merge/prov.so", 11, Some("uu"), 100, admitted);
+        let row = object_json(&lower);
+        assert_eq!(row["layer"], "pre_copy_up", "{row}");
+        let row = object_json(&upper);
+        assert!(
+            row.get("layer").is_none(),
+            "ordinary rows carry no layer key: {row}"
+        );
+        let processes = std::collections::BTreeMap::new();
+        let mut verbose = String::new();
+        render_object(
+            &mut verbose,
+            0,
+            &lower,
+            &processes,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.contains("object[0]  /merge/prov.so (file before copy-up)"),
+            "{verbose}"
+        );
+        let mut concise = String::new();
+        render_object(
+            &mut concise,
+            0,
+            &lower,
+            &processes,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert!(
+            !concise.contains("file before copy-up"),
+            "concise stays unmarked: {concise}"
+        );
+        assert!(
+            concise.contains("module  /merge/prov.so"),
+            "concise keeps the provider line: {concise}"
         );
     }
 

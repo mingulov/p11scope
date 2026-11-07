@@ -973,6 +973,7 @@ mod tests {
             sha256: None,
             path: format!("/prearm/{id}.so"),
             build_id: None,
+            layer: None,
             objects: Vec::new(),
             sources,
             corroborated: false,

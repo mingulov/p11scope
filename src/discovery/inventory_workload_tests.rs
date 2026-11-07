@@ -2971,6 +2971,7 @@ mod c1b {
             build_id: None,
             identity_source: Some("mountinfo"),
             note: None,
+            pre_copy_up: false,
             mappings: callers
                 .iter()
                 .map(|pid| (*pid, (*pid == REP).then_some(ProcessViewId(0))))

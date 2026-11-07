@@ -684,7 +684,9 @@ workload reports exact counts with `PARTIAL` observation; see the
 [known limitations](known-limitations.md). Without permission to create
 the cgroup, `run` observes only the started command itself and names the
 gap; `capture.scope` reads `cgroup` for the tree scope, `pid` when
-degraded.
+degraded. The run-cgroup leaf name (random `p11scope-run-*`, never a
+PID) is published in `cgroups[].label`; the full path is printed on
+stderr only, in the retention notice.
 
 sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
   --prearm-module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -o tree.json -- \

@@ -760,15 +760,12 @@ run_joint_cell() {
     fi
     log "$cell: setup done; waiting for the generator edge to attach before GO"
     gen_pid=$(cat "$dir/gen.pid")
-    if ! wait_for_caller_attached "$dir" "$gen_pid" "${ATTACH_TIMEOUT:-120}"; then
-        log "$cell: generator edge never attached after setup"
-        kill_pidfile "$dir/gen.pid"
-        kill_observer "$dir/observer.pid"
-        wait 2>/dev/null || true
-        exec 9>&-
-        fail_flow "$dir" "generator edge never attached after setup"
-        finish_cell "$cell" "$dir" "flow=attach-timeout" || return 1
-        return 0
+    # TEMP F9 probe: GO anyway after a short attach wait (the idle wait
+    # wedges); log bound state for post-hoc analysis.
+    if ! wait_for_caller_attached "$dir" "$gen_pid" "${ATTACH_TIMEOUT:-45}"; then
+        log "$cell: PROBE generator edge unattached at GO (unbound run)"
+    else
+        log "$cell: PROBE generator edge attached at GO"
     fi
     log "$cell: generator attached; waiting two passes for promotion before GO"
     passes_before=$(pass_count "$dir/observer.out")

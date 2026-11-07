@@ -339,11 +339,12 @@ const EVER_ENUMERATED_CAP: usize = 65_536;
 /// tasks are plentiful past the cap) without stalling a pass.
 const EVER_ENUMERATED_SWEEP: usize = 4_096;
 
-/// Backstop cadence for the cross-pass deep-scan skip: every Nth applied
-/// pass withholds priors and rescans, so an in-place file swap (same
-/// maps, new bytes) surfaces within N passes. Ordinary maps changes
-/// rescan on the very next pass; the backstop only bounds the exotic
-/// same-maps swap.
+/// Rolling-backstop cadence for the cross-pass deep-scan skip: each
+/// pass withholds digest priors for one cohort (`pid % N ==
+/// passes % N`) and re-proves it, so an in-place file swap (same
+/// maps, new bytes) surfaces within N passes at uniform cost (no
+/// full-rescan pass). Ordinary maps changes rescan on the very next
+/// pass; the backstop only bounds the exotic same-maps swap.
 pub(crate) const SKIP_BACKSTOP_EVERY: u64 = 4;
 
 /// The coordinator: an Inventory-policy engine, the caller adapter, and
@@ -8661,15 +8662,21 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// The deep-scan skip priors for the next collection: the last
-    /// applied pass's per-pid digests plus its watch-feeding mapper
-    /// groups, or none on a backstop pass (every
-    /// `SKIP_BACKSTOP_EVERY`th pass rescans) and before the first pass.
+    /// applied pass's per-pid digests minus the rolling-backstop
+    /// cohort (`pid % N == passes % N`, re-proved this pass), plus
+    /// the watch-feeding mapper groups (representatives ride every
+    /// pass, so peers always confirm). Before the first pass both
+    /// maps are empty and everything scans.
     pub(crate) fn priors_for_collection(&self) -> crate::inspect_system::ScanPriors {
-        if self.passes % SKIP_BACKSTOP_EVERY == SKIP_BACKSTOP_EVERY - 1 {
-            return crate::inspect_system::ScanPriors::empty();
-        }
+        let cohort = self.passes % SKIP_BACKSTOP_EVERY;
+        let digests: BTreeMap<u32, (Option<u64>, u64)> = self
+            .maps_prior
+            .iter()
+            .filter(|(pid, _)| u64::from(**pid) % SKIP_BACKSTOP_EVERY != cohort)
+            .map(|(pid, prior)| (*pid, *prior))
+            .collect();
         crate::inspect_system::ScanPriors {
-            digests: self.maps_prior.clone(),
+            digests,
             mapper_groups: self.mapper_groups_prior.clone(),
         }
     }

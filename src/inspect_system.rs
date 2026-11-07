@@ -403,8 +403,8 @@ impl Collection {
 /// so the group's pinned object is decoded every pass and the stable
 /// peers skip into the confirm path as maps matches (confirmed
 /// mappings, no flap) instead of uncertain gaps. New mappings, pid
-/// reuse, and unreadable generations never skip; backstop passes
-/// carry no priors.
+/// reuse, and unreadable generations never skip; the rolling
+/// backstop withholds one cohort per pass (never the whole map).
 pub(crate) struct ScanPriors {
     pub(crate) digests: BTreeMap<u32, (Option<u64>, u64)>,
     pub(crate) mapper_groups: BTreeMap<usize, BTreeSet<u32>>,

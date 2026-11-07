@@ -1802,7 +1802,7 @@ disarmed captures record nothing, as today):
 | Capture | New consumer | New publication |
 | --- | --- | --- |
 | trace `--cgroup`/`--system` | Novel unmatched exits, as profile today | `gap_exe_hints` + `gap_exit_mappings` in the terminal `EVIDENCE` object (the trace lane already renders through `versioned_evidence`) |
-| `--mode metrics` `--cgroup`/`--system` (non-counter) | Novel unmatched exits, as profile today | `gap_exe_hints` + `gap_exit_mappings` in the metrics evidence object (same closed shapes as profile). Under `--mode metrics` the exit-mapping split always reads `{mapped: 0, unknown: N}` because instance hooks never attach there (refused-hooks arm); use profile/trace for `mapped` |
+| `--mode metrics` `--cgroup`/`--system` (non-counter) | Novel unmatched exits, as profile today | `gap_exe_hints` in the metrics evidence object (same closed shape as profile); `gap_exit_mappings` stays absent there because instance hooks never attach — use profile/trace for `mapped` |
 | profile/trace/metrics `--pid`, owned `run` (any lane) | Validated target execs (below) | `target_exec_hints` in that lane's evidence; the gap keys stay absent (no descendant-gap subpopulation exists under PID scope) |
 | profile/trace/metrics `--cgroup`/`--system` | — | `target_exec_hints` stays absent (no single target; per-member exec classification is out of scope) |
 

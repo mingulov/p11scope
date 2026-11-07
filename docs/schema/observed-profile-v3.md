@@ -378,9 +378,12 @@ Unvalidated execs are outside the subpopulation and add no count, not
 even `unknown`. A zero split means no validated target exec was
 observed, never "no provider use".
 
-`gap_exit_mappings` is present under the same arming rule as
-`gap_exe_hints` (extensive `--cgroup`/`--system` captures in the
-trace, profile and metrics lanes; absent, never null, otherwise). It
+`gap_exit_mappings` is present when the capture armed extensive
+mode over a `--cgroup`/`--system` scope in the trace or profile
+lane; absent, never null, otherwise. Unlike `gap_exe_hints`, it
+never publishes under `--mode metrics`: instance hooks never
+attach there, so the exit map never arms — use profile/trace for
+`mapped`. It
 splits the same novel unmatched-exit subpopulation of
 `pid_descendant_gaps` (admissions and overflow sentinels carry no
 verdict) by the kernel's exit-time answer: `mapped` (the kernel
@@ -400,10 +403,7 @@ exec and its exit) reads `unknown` for the same reason: mappings
 established before the watch are invisible. The two counts never
 feed calls, callers, shares, verdicts, or births, and an exit never
 settles a call (R57). There is no "did not map" publication: nothing
-here proves a process did not map a watched provider. Under
-`--mode metrics` the split always reads `{mapped: 0, unknown: N}`
-because instance hooks never attach there (refused-hooks arm); use
-profile/trace for `mapped`.
+here proves a process did not map a watched provider.
 
 `task_uprobe_link_losses` is a saturating u64 count of matched leader-exit
 records whose retained process generation proved that a member of the process

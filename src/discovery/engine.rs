@@ -10423,6 +10423,10 @@ impl ExitMappingState {
         self.enabled = on;
     }
 
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
     /// Record one EXEC observed during the capture. Every EXEC
     /// counts as observed (observation, not authority: no ticket
     /// gate); a re-exec overwrites, and a full table evicts the
@@ -11927,15 +11931,18 @@ impl Engine {
     /// it, the split is `None` (key omitted) unless armed.
     pub(crate) fn gap_exit_mappings(&self) -> Option<render::GapExitMappings> {
         // 7.10b: the exit-mapping split publishes with the gap
-        // consumer only. Gating on the master enable leaked a zero
-        // split under exact-PID scope, which has no gap
-        // subpopulation; the PID consumer publishes its own key.
-        self.extensive
-            .gap_active()
-            .then_some(render::GapExitMappings {
+        // consumer only, and only where its own map armed (metrics
+        // never arms it: instance hooks never attach there, so the
+        // key stays absent instead of reading zeros). Gating on the
+        // master enable leaked a zero split under exact-PID scope,
+        // which has no gap subpopulation; the PID consumer publishes
+        // its own key.
+        (self.extensive.gap_active() && self.exit_map.enabled()).then_some(
+            render::GapExitMappings {
                 mapped: self.exit_map.mapped,
                 unknown: self.exit_map.unknown,
-            })
+            },
+        )
     }
 
     #[cfg(test)]
@@ -11972,8 +11979,11 @@ impl Engine {
         self.extensive
             .set_seed_without_ticket(gap && matches!(policy, CapturePolicy::AggregateOnly));
         // 6.14 Option A: the exit-mapping split arms with the gap
-        // consumer only; `gap_exit_mappings` reads `None` unless armed.
-        self.exit_map.set_enabled(gap);
+        // consumer only, and only where instance hooks can attach;
+        // under metrics the key stays absent instead of reading an
+        // all-`unknown` split. `gap_exit_mappings` reads `None`
+        // unless armed.
+        self.exit_map.set_enabled(gap && policy.wants_instance_hooks());
         if gap || pid {
             self.extensive.snapshot_watched(&self.pinned);
         }

@@ -1618,7 +1618,9 @@ impl BoundedRecordSource for ScriptedRecords {
         aya::maps::ring_buf::RingBufPositions {
             consumer: self.taken * 8,
             producer: (self.taken + self.queue.len()) * 8,
-            capacity: 4096,
+            // Test-only wire: 8,192 records, so saturation tests can
+            // stage multi-quantum backlogs (production EVENTS is 16 MiB).
+            capacity: 65536,
         }
     }
     fn consumer(&self) -> usize {

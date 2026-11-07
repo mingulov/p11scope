@@ -70,6 +70,16 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 /// Rescan interval inside a `--duration` observation window.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+/// Running-hook Joint budget: actions and wall bound for one service
+/// hook on a live Joint lane. A full 4,096-row quantum plus its seal
+/// phases fits one hook, so the EVENTS ring drains faster than the
+/// fastest paced rate instead of fragmenting cycles across hooks: a
+/// ring-full dirties the birth marker and ends key attribution for
+/// the run. An engineering limit: it may be raised, never lowered.
+/// Finish/stop hooks keep the §8.3 1,024-action / 10 ms budget.
+pub(crate) const RUNNING_HOOK_ACTIONS: usize = 4096;
+pub(crate) const RUNNING_HOOK_DEADLINE: Duration = Duration::from_millis(40);
+
 // G21's explicit engine pilot can accelerate scans without changing the
 // production cadence, clock, native lane, coordinator, or recorder capacities.
 // Thread-local scoped custody prevents concurrent tests from changing each other.
@@ -200,6 +210,22 @@ fn gate_poll_interval_unset_is_production_default() {
     assert_eq!(
         parse_gate_poll_interval(None).unwrap(),
         Duration::from_secs(1)
+    );
+}
+
+/// The running-hook Joint budget sustains the fastest paced rate: a
+/// full 4,096-row quantum plus its seal phases fits one hook, so the
+/// EVENTS ring drains instead of fragmenting cycles across hooks. An
+/// engineering floor: it may be raised, never lowered.
+#[test]
+fn running_hook_budget_sustains_paced_rates() {
+    assert!(
+        RUNNING_HOOK_ACTIONS >= 4096,
+        "one hook carries a full quantum plus phases"
+    );
+    assert!(
+        RUNNING_HOOK_DEADLINE >= Duration::from_millis(40),
+        "one hook has wall room for the bigger quantum"
     );
 }
 
@@ -6486,8 +6512,8 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
             .is_some_and(|lane| lane.has_joint_machine())
         {
             let mut budget = crate::inventory_semantics::JointWorkBudget {
-                remaining_actions: 1024,
-                deadline: Instant::now() + Duration::from_millis(10),
+                remaining_actions: RUNNING_HOOK_ACTIONS,
+                deadline: Instant::now() + RUNNING_HOOK_DEADLINE,
             };
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
             if let Some(lane) = semantic.as_mut() {
@@ -6837,7 +6863,7 @@ impl ClassicDriver<'_> {
                 // A refused pump drained up to its share before failing,
                 // so both refusal arms charge the share: `work` never
                 // exceeds `remaining - 1`, so the machine keeps at least
-                // one action and the hook keeps the 1024-action bound.
+                // one action and the hook keeps its action bound.
                 Ok(_) => {
                     budget.remaining_actions -= work;
                     pump_refusal = Some(crate::inventory_semantics::SemanticRefusal::Unavailable);
@@ -19325,8 +19351,8 @@ mod tests {
     fn linked_hook_pump_over_work_charges_share_without_latch() {
         // Over-work: a pump that drains past its share refuses
         // `Unavailable`, yet still charges the share it was given, so
-        // the machine sees the remainder and the hook keeps the
-        // 1024-action bound. The machine is still serviced on the
+        // the machine sees the remainder and the hook keeps its
+        // action bound. The machine is still serviced on the
         // same budget, and nothing latches.
         use std::cell::Cell;
         use std::rc::Rc;

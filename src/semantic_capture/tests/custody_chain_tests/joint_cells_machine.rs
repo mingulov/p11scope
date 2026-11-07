@@ -3440,6 +3440,37 @@ fn joint_pregrant_close_reasons_counted() {
 /// disclosure, so the input stages exactly the custody refusal and
 /// reduces no S1. Same taint setup as the timeout twin.
 #[test]
+/// One running hook drains a saturated count-only cursor past its
+/// H0 close: with the production running-hook budget the 1,100-row
+/// backlog leaves Collecting in a single service call instead of
+/// fragmenting cycles across hooks (each fragment leaves the EVENTS
+/// ring undrained; a ring-full dirties the birth marker and ends key
+/// attribution for the run). The count-only rows hold the pre-grant
+/// quantum open without BEGIN-table pressure; the H0 bound closes it.
+#[test]
+fn running_hook_budget_drains_saturated_quantum_in_one_hook() {
+    let mut scene = pregrant_scene();
+    publish_empty_first_quantum(&mut scene);
+    let pid = std::process::id();
+    for seq in 1..=1100u64 {
+        push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", seq);
+    }
+    let outcome = scene.service(crate::inventory::RUNNING_HOOK_ACTIONS);
+    assert_eq!(
+        outcome,
+        Ok(
+            crate::inventory_semantics::JointServiceProgress::Published
+        ),
+        "one running hook completes the saturated quantum cycle"
+    );
+    assert_ne!(
+        phase_of(&scene),
+        "Collecting",
+        "one running hook advances the saturated quantum past collection"
+    );
+}
+
+#[test]
 fn joint_pregrant_custody_refused_input_stages_no_d1_gap() {
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);

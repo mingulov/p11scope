@@ -752,6 +752,12 @@ pub struct Engine {
     // only the scalar crosses the render boundary.
     admitted_cgroup_views: BTreeMap<ProcessViewId, CgroupAdmission>,
     unmatched_leader_exit_events: BTreeSet<(u32, u64)>,
+    /// Ledger exits already attributed to one generation (a live newcomer
+    /// mark, a pruned generation, or an admitted view by coalescing): each
+    /// exit belongs to one generation, so a later mark never claims it
+    /// again. A subset of `unmatched_leader_exit_events` (inserted only
+    /// with a ledger entry), so it shares that ledger's bound.
+    consumed_leader_exit_events: BTreeSet<(u32, u64)>,
     cgroup_ingress_overflow: bool,
     /// Extensive-mode executable dependency hints (6.14 Option B):
     /// capture-local exe stash, scan-learned paths, and hint counts.
@@ -10934,6 +10940,7 @@ impl Engine {
             multi_rebuild_gaps: 0,
             admitted_cgroup_views: BTreeMap::new(),
             unmatched_leader_exit_events: BTreeSet::new(),
+            consumed_leader_exit_events: BTreeSet::new(),
             cgroup_ingress_overflow: false,
             extensive: elf_needed::ExtensiveState::new(),
             exit_map: ExitMappingState::default(),
@@ -12383,6 +12390,8 @@ impl Engine {
                 if self.unmatched_leader_exit_events.len() < MAX_SCAN_PIDS {
                     self.unmatched_leader_exit_events
                         .insert((pid, record.hook_ts_ns));
+                    self.consumed_leader_exit_events
+                        .insert((pid, record.hook_ts_ns));
                 } else {
                     self.cgroup_ingress_overflow = true;
                     let subject = self.ingress_subject();
@@ -13538,14 +13547,17 @@ impl Engine {
         self.newcomer_first_seen.insert(pid, now_ns);
         // An exit drained before the mark, inside this generation's bound
         // (e.g. between the walk that listed the pid and this stamp), is
-        // this generation's exit: it already counted the gap.
+        // this generation's exit: it already counted the gap. An exit
+        // already attributed to another generation (an old generation that
+        // exited during the walk that pruned it) is never claimed again.
         let bound = self.newcomer_generation_bound(pid);
-        if self
+        let claimed = self
             .unmatched_leader_exit_events
             .range((pid, bound)..=(pid, u64::MAX))
-            .next()
-            .is_some()
-        {
+            .find(|exit| !self.consumed_leader_exit_events.contains(exit))
+            .copied();
+        if let Some(exit) = claimed {
+            self.consumed_leader_exit_events.insert(exit);
             self.newcomer_counted.insert(pid, NewcomerGapCount::Exit);
         }
     }
@@ -13563,11 +13575,15 @@ impl Engine {
     /// matched (no longer pending); `true` when its gap was already counted.
     /// Otherwise a pruned generation whose bounds contain the exit matches
     /// and retires (`true`: counted at prune). `false`: no counted
-    /// generation, so the exit gaps on its own.
+    /// generation, so the exit gaps on its own (and stays claimable by a
+    /// mark that the next walk takes for its generation). A matched exit is
+    /// consumed: it belongs to that one generation only. Called right after
+    /// the exit entered the ledger, so the consumed set stays a subset.
     fn match_newcomer_exit(&mut self, pid: u32, hook_ts: u64) -> bool {
         if self.newcomer_first_seen.contains_key(&pid)
             && self.newcomer_generation_bound(pid) <= hook_ts
         {
+            self.consumed_leader_exit_events.insert((pid, hook_ts));
             return self
                 .newcomer_counted
                 .insert(pid, NewcomerGapCount::Exit)
@@ -13580,6 +13596,7 @@ impl Engine {
             .copied();
         if let Some(entry) = pruned {
             self.newcomer_gap_pids.remove(&entry);
+            self.consumed_leader_exit_events.insert((pid, hook_ts));
             return true;
         }
         false

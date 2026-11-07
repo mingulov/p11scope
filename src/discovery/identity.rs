@@ -12137,6 +12137,29 @@ mod tests {
     }
 
     #[test]
+    fn inode_uniqueness_classification_counts_as_a_provider_metadata_read() {
+        // The `fstatfs` behind the uniqueness verdict reads provider
+        // metadata, so the twins' no-provider-I/O proof must observe it.
+        // (RED: unobserved before the tag.)
+        use std::cell::Cell;
+        use std::rc::Rc;
+        let file = std::fs::File::open("/bin/sh").unwrap();
+        let reads = Rc::new(Cell::new(0u32));
+        let reads_in = Rc::clone(&reads);
+        provider_metadata_read_test::observe(
+            move |_post_sample| reads_in.set(reads_in.get() + 1),
+            || {
+                let _ = file_inodes_are_unique(&file);
+            },
+        );
+        assert_eq!(
+            reads.get(),
+            1,
+            "the fstatfs classification must be observed"
+        );
+    }
+
+    #[test]
     fn overlay_canonicalization_remaps_existing_view_claims() {
         let a = module(overlay(102));
         let mut pinned = pins(&[(overlay(102), SHA, 1)]);

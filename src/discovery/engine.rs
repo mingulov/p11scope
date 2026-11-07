@@ -10684,15 +10684,22 @@ fn mapped_object(view: &ProcessView, mapping: &MapEntry, path: &Path) -> Scanned
     }
 }
 
-/// Which admission window selected one tick's pids, with the backlog
-/// class it classified for the owed ledger: free slots split fresh from
-/// backlog under two cursors, scarce slots split pending fresh from the
-/// backlog class (pending backlog plus rotation candidates) under one.
-/// Attempts on a backlog member repay the shared owed debt; attempts on
-/// any other admitted pid record as the window's fresh class.
+/// Which admission window selected one tick's pids, with the classes it
+/// classified for the owed ledger: free slots split fresh from backlog
+/// under two cursors; scarce slots split pending fresh from pending
+/// backlog under one cursor, with rotation candidates appended after
+/// both pending classes. Attempts on a backlog member repay the shared
+/// owed debt; scarce rotation attempts park the cursor bare, without
+/// touching the ledger or the newcomer-attempt set; attempts on any
+/// other admitted pid record as the window's fresh class.
 enum AdmissionLedger {
-    Free { backlog: BTreeSet<u32> },
-    Scarce { backlog: BTreeSet<u32> },
+    Free {
+        backlog: BTreeSet<u32>,
+    },
+    Scarce {
+        backlog: BTreeSet<u32>,
+        rotation: BTreeSet<u32>,
+    },
 }
 
 impl Engine {
@@ -23615,12 +23622,13 @@ impl Engine {
     /// admitted pid as an inventory new view. The tick quantum stops
     /// admissions before another scan — the current pid and the rest defer
     /// with their requests retained, never dropped. Both windows interleave
-    /// newcomers and backlog — free slots split fresh from backlog under
-    /// two cursors, scarce slots split pending fresh from the backlog class
-    /// (pending backlog plus rotation) under one — so a truncated attempt
-    /// round defers both proportionally and the backlog keeps progressing
-    /// under a steady flood. `ledger` carries the window's classification
-    /// for the owed ledger. At view capacity a pressure-selected pid evicts
+    /// their pending classes — free slots split fresh from backlog under
+    /// two cursors, scarce slots split pending fresh from pending backlog
+    /// under one and append rotation after both — so a truncated attempt
+    /// round defers pending proportionally while rotation waits, and the
+    /// backlog keeps progressing under a steady flood. `ledger` carries
+    /// the window's classification for the owed ledger. At view capacity
+    /// a pressure-selected pid evicts
     /// one guarded exploratory view and retries (Lane-A P1); as the last
     /// resort, a still-unhoused pending newcomer with no evictable view
     /// anywhere completes without a view when a complete probationary scan
@@ -23671,8 +23679,11 @@ impl Engine {
                             AdmissionLedger::Free { backlog } if backlog.contains(&pid) => {
                                 self.scheduler.note_backlog_attempt(pid);
                             }
-                            AdmissionLedger::Scarce { backlog } if backlog.contains(&pid) => {
+                            AdmissionLedger::Scarce { backlog, .. } if backlog.contains(&pid) => {
                                 self.scheduler.note_scarce_backlog_attempt(pid);
+                            }
+                            AdmissionLedger::Scarce { rotation, .. } if rotation.contains(&pid) => {
+                                self.scheduler.note_new_view_attempt(pid);
                             }
                             _ => self.scheduler.note_newcomer_attempt(pid),
                         }
@@ -23701,8 +23712,11 @@ impl Engine {
                 AdmissionLedger::Free { backlog } if backlog.contains(&pid) => {
                     self.scheduler.note_backlog_attempt(pid);
                 }
-                AdmissionLedger::Scarce { backlog } if backlog.contains(&pid) => {
+                AdmissionLedger::Scarce { backlog, .. } if backlog.contains(&pid) => {
                     self.scheduler.note_scarce_backlog_attempt(pid);
+                }
+                AdmissionLedger::Scarce { rotation, .. } if rotation.contains(&pid) => {
+                    self.scheduler.note_new_view_attempt(pid);
                 }
                 _ => self.scheduler.note_newcomer_attempt(pid),
             }
@@ -24141,12 +24155,14 @@ impl Engine {
         // previous enumeration sort ahead of backlog up to a bounded share;
         // while view slots are scarce — a reconcile pass that just evicted
         // still counts as scarce — pending pids requested after the
-        // previous tick started sort ahead of pending backlog (then
-        // rotation) up to the same share. Both windows interleave the
-        // admitted classes (leading backlog when the previous tick owed it
-        // one), so a quantum-truncated round defers both proportionally;
-        // eviction-freed slots still reach pending waiters first instead of
-        // refilling with never-touched long runners ahead of them.
+        // previous tick started sort ahead of pending backlog up to the
+        // same share, with rotation candidates appended after both
+        // pending classes. Both windows interleave their pending classes
+        // (leading backlog when the previous tick owed it one), so a
+        // quantum-truncated round defers pending proportionally while
+        // rotation waits; eviction-freed slots still reach pending waiters
+        // first instead of refilling with never-touched long runners
+        // ahead of them.
         let max_new_views = self.scheduler.max_new_views_per_tick();
         let scarce = self.views.len() >= self.max_scan_pids || reconcile_evicted;
         let (admitted, deferred, ledger) = if scarce {
@@ -24182,8 +24198,16 @@ impl Engine {
                 max_new_views,
                 MAX_NEWCOMER_ADMISSIONS_PER_TICK,
             );
-            let backlog: BTreeSet<u32> = backlog_pids.into_iter().chain(rotation).collect();
-            (admitted, deferred, AdmissionLedger::Scarce { backlog })
+            let backlog: BTreeSet<u32> = backlog_pids.into_iter().collect();
+            let rotation_set: BTreeSet<u32> = rotation.into_iter().collect();
+            (
+                admitted,
+                deferred,
+                AdmissionLedger::Scarce {
+                    backlog,
+                    rotation: rotation_set,
+                },
+            )
         } else {
             let backlog: BTreeSet<u32> = new_pids
                 .iter()

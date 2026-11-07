@@ -182,8 +182,9 @@ pub(crate) struct DiscoveryScheduler {
     tick_deadline_ns: Option<u64>,
     /// Backlog-only rotation cursor: advanced solely by free-slots
     /// backlog attempts, so a newcomer flood cannot drag backlog rotation
-    /// toward recent deferrals. Scarce ticks rotate the backlog class
-    /// after the newcomer cursor instead and leave this untouched.
+    /// toward recent deferrals. Scarce ticks rotate pending backlog (and
+    /// rotation, separately) after the newcomer cursor instead and leave
+    /// this untouched.
     backlog_cursor: Option<u32>,
     /// Whether the next admission window leads with backlog: set when a
     /// tick attempted work but no backlog while backlog waited, cleared
@@ -342,8 +343,9 @@ impl DiscoveryScheduler {
     /// attempt could not retain or scan it. Successful admission alone cannot
     /// advance fairness when lower PIDs remain unreadable on every tick.
     /// Both admission windows rotate their fresh class through this; scarce
-    /// windows rotate the backlog class through
-    /// `new_view_order_pending_first`.
+    /// windows rotate pending backlog and rotation candidates through it
+    /// too, as separate orders (see
+    /// `scarce_window_pending_newcomers_first`).
     pub(crate) fn new_view_order(&self, pids: &[u32]) -> Vec<u32> {
         Self::rotated_after(pids, self.new_view_cursor)
     }
@@ -354,9 +356,7 @@ impl DiscoveryScheduler {
     /// before exploratory rotation by design; without the priority, freed
     /// view slots refill with ascending ambient candidates while pending
     /// newcomers starve. The pending class drains, so rotation is delayed,
-    /// never starved. Scarce windows use this for the backlog class
-    /// (pending backlog, then rotation candidates). `pids` must be sorted
-    /// ascending.
+    /// never starved. `pids` must be sorted ascending.
     pub(crate) fn new_view_order_pending_first(
         &self,
         pids: &[u32],
@@ -451,21 +451,23 @@ impl DiscoveryScheduler {
         )
     }
 
-    /// One admission tick's scarce window: pending newcomers first (up to
-    /// the newcomer share), then pending backlog, then rotation
-    /// candidates. `fresh` holds the pending pids the caller classified
-    /// as newcomers (the engine: refresh requests newer than the previous
-    /// tick); the backlog class keeps the pending-first order — pending
-    /// backlog in rotation, then rotation candidates — via
-    /// `new_view_order_pending_first`, so with no fresh pending the window
-    /// is exactly today's scarce order. The admitted window interleaves
-    /// fresh with the backlog class (leading backlog when the previous
-    /// tick owed it one) under the same share and owed bound as the free
-    /// window, so a quantum-truncated round defers both proportionally
-    /// and eviction-freed slots still reach pending waiters first.
-    /// Settles the previous tick's debt and opens this tick's ledger like
-    /// the free window. Returns `(admitted, deferred)` in admission
-    /// order. Every input list must be sorted ascending.
+    /// One admission tick's scarce window: pending newcomers and pending
+    /// backlog first (up to the newcomer share), then rotation candidates.
+    /// `fresh` holds the pending pids the caller classified as newcomers
+    /// (the engine: refresh requests newer than the previous tick);
+    /// pending backlog and rotation rotate separately after the newcomer
+    /// cursor, so with no fresh pending the window is pending backlog
+    /// then rotation, exactly today's scarce order. The admitted window
+    /// interleaves fresh with pending backlog (leading backlog when the
+    /// previous tick owed it one) under the same share and owed bound as
+    /// the free window, then appends rotation into the remaining slots;
+    /// deferred rotation waits behind both pending tails. Only pending
+    /// backlog counts for the owed ledger — rotation alone never waits
+    /// nor owes — so a quantum-truncated round defers pending
+    /// proportionally and eviction-freed slots still reach pending
+    /// waiters first. Settles the previous tick's debt and opens this
+    /// tick's ledger like the free window. Returns `(admitted, deferred)`
+    /// in admission order. Every input list must be sorted ascending.
     pub(crate) fn scarce_window_pending_newcomers_first(
         &mut self,
         fresh: &[u32],
@@ -476,20 +478,20 @@ impl DiscoveryScheduler {
     ) -> (Vec<u32>, Vec<u32>) {
         self.open_attempt_window();
         let fresh_order = self.new_view_order(fresh);
-        let mut combined: Vec<u32> = Vec::with_capacity(backlog.len() + rotation.len());
-        combined.extend_from_slice(backlog);
-        combined.extend_from_slice(rotation);
-        combined.sort_unstable();
-        let pending: BTreeSet<u32> = backlog.iter().copied().collect();
-        let backlog_order = self.new_view_order_pending_first(&combined, &pending);
-        self.tick_backlog_waited = !backlog_order.is_empty();
-        Self::admit_window_orders(
+        let pending_backlog_order = self.new_view_order(backlog);
+        let rotation_order = self.new_view_order(rotation);
+        self.tick_backlog_waited = !pending_backlog_order.is_empty();
+        let (mut admitted, mut deferred) = Self::admit_window_orders(
             &fresh_order,
-            &backlog_order,
+            &pending_backlog_order,
             max_new_views,
             newcomer_share,
             self.backlog_owed,
-        )
+        );
+        let room = max_new_views.saturating_sub(admitted.len());
+        admitted.extend(rotation_order.iter().copied().take(room));
+        deferred.extend(rotation_order.iter().copied().skip(room));
+        (admitted, deferred)
     }
 
     /// Selects and orders one admission window from two ordered classes:
@@ -654,11 +656,12 @@ impl DiscoveryScheduler {
         self.note_scan_attempt(InventoryScanClass::Newcomer);
     }
 
-    /// A scarce backlog-class attempt (pending backlog or rotation
-    /// candidate): parks the newcomer cursor — scarce rotation stays
-    /// single-cursor, so the backlog cursor remains a free-slots-only
-    /// anchor — while repaying the shared owed ledger like any backlog
-    /// attempt.
+    /// A scarce pending-backlog attempt: parks the newcomer cursor —
+    /// scarce rotation stays single-cursor, so the backlog cursor remains
+    /// a free-slots-only anchor — while repaying the shared owed ledger
+    /// like any backlog attempt. Scarce rotation attempts park the same
+    /// cursor bare via `note_new_view_attempt`, without touching the
+    /// ledger.
     pub(crate) fn note_scarce_backlog_attempt(&mut self, pid: u32) {
         self.note_new_view_attempt(pid);
         self.tick_attempted_any = true;

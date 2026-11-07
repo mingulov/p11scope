@@ -56,10 +56,11 @@ pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
 
 #[cfg(test)]
 pub(crate) mod provider_metadata_read_test {
-    //! Observer for actual provider metadata reads (held-fd `fstat`
-    //! through `pin_of`/`same_kernel_file`/`InspectedFileKey::for_open_file`,
-    //! the primitives behind `check_unchanged`, target retention, identity
-    //! comparison and inspection cache keys).
+    //! Observer for actual provider metadata reads (held-fd `fstat`/`fstatfs`
+    //! through `pin_of`/`same_kernel_file`/`InspectedFileKey::for_open_file`/
+    //! `filesystem_without_unique_inodes`/`Entry::new`, the primitives behind
+    //! `check_unchanged`, target retention, identity comparison, inode
+    //! uniqueness classification and inspection cache keys).
     //! The scoped inventory transaction marks its final membership
     //! sample; the observer tags each read pre/post-sample so twins
     //! prove the permit-backed commit performs no provider I/O.
@@ -543,6 +544,8 @@ pub(crate) fn mount_super_options(mountinfo: &str, mnt_id: u64) -> Option<&str> 
 }
 
 fn filesystem_without_unique_inodes(fd: RawFd) -> Result<Option<&'static str>, String> {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
     let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
     // SAFETY: `fstatfs` fills `buf` for a valid fd and is only read on success.
     if unsafe { libc::fstatfs(fd, buf.as_mut_ptr()) } != 0 {

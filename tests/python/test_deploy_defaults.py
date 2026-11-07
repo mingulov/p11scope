@@ -37,6 +37,10 @@ class DeployDefaultsTests(unittest.TestCase):
         self.assertIn("or `SYS_PTRACE` refuses", text)
         self.assertIn("Privileges and why", text)
 
+    def test_rebuild_recipe_keeps_full_features(self):
+        self.assertNotIn("--no-default-features", DEPLOY_README.read_text(),
+                         "the published image holds the FULL binary, not P0 bytes")
+
 
 if __name__ == "__main__":
     unittest.main()

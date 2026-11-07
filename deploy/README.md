@@ -48,6 +48,6 @@ packages):
 ```sh
 CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
   cargo +"$(cat .release-rust-version)" build \
-  --locked --release --no-default-features --target x86_64-unknown-linux-musl --bin p11scope
+  --locked --release --target x86_64-unknown-linux-musl --bin p11scope
 docker build -f deploy/Dockerfile.observer -t p11scope-observer:dev .
 ```

@@ -640,6 +640,18 @@ fn bind_semantic_callers_with_q(
         return;
     }
     for attempt in coordinator.semantic_refresh_attempts(lane, None, |_| true) {
+        // TEMP F9: promotion census (sampled).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static PA: AtomicU64 = AtomicU64::new(0);
+            if PA.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                eprintln!(
+                    "promo-attempt caller={:?} module={:?}",
+                    attempt.caller,
+                    attempt.module.is_some()
+                );
+            }
+        }
         let Some(module) = attempt.module else {
             coordinator.semantic_admission_refused(attempt.caller, "provider_mapping_unproven");
             continue;
@@ -682,8 +694,20 @@ fn bind_semantic_callers_with_q(
         };
         match prepared {
             Ok(prepared) => {
-                let (receipt, _) =
+                let (receipt, result) =
                     coordinator.consume_semantic_admission(candidate, prepared, None);
+                // TEMP F9: consume census (sampled).
+                {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static PC: AtomicU64 = AtomicU64::new(0);
+                    if PC.fetch_add(1, Ordering::Relaxed) % 20 == 0 {
+                        eprintln!(
+                            "promo-consume caller={:?} result={:?}",
+                            attempt.caller,
+                            result.as_ref().map(|_| "ok").unwrap_or("err")
+                        );
+                    }
+                }
                 lane.deliver_admission_receipt(receipt);
             }
             Err(reason) => coordinator.semantic_admission_prepare_failed(attempt.caller, reason),

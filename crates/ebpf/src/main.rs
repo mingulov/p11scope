@@ -652,8 +652,14 @@ fn scope_auth() -> Option<ScopeAuth> {
                 // pause token, backstopping the owned loader arm.
                 // Unowned cgroup sessions publish no PID rows, so
                 // every other member reads zero — exactly the
-                // pre-run-tree receipt.
+                // pre-run-tree receipt. Inventory builds skip the
+                // lookup entirely (no pause there), so their
+                // objects stay byte-identical to the pre-run-tree
+                // baseline.
+                #[cfg(not(feature = "inventory-only"))]
                 let token = unsafe { PID_FILTER.get(&tgid) }.copied().unwrap_or(0);
+                #[cfg(feature = "inventory-only")]
+                let token = 0;
                 return Some(ScopeAuth {
                     flags,
                     tgid,

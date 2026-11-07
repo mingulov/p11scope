@@ -110,6 +110,10 @@ observations by recorded application path and module content; `--json` and
 `-o comparison.json` provide the [diff schema](docs/schema/inventory-diff-v1.md).
 Counts describe independent windows, and absence does not prove removal.
 See [offline comparison examples](docs/usage.md#offline-inventory-comparison).
+One saved inventory or profile converts offline to a CycloneDX 1.6
+cryptographic bill of materials with
+`p11scope inventory cbom input.json -o out.cdx.json`
+([export guide](docs/usage.md#offline-cbom-export)).
 
 Two newer capture flags: `--track-short-lived`
 (default off) is extensive mode: the kernel records exec-time executable identity

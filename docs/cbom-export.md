@@ -24,8 +24,9 @@ discovery-listed providers only). Anything else is refused with exit 1.
 report only, like the diff report's local references. `dependencies[]`
 carries only joins the input proves: application → its modules,
 application/module → mechanisms observed on their edges, key object →
-its provider module via the key-operation → instance → module join
-(when joinable, otherwise no edge and a named note).
+its provider module and caller application via the key-operation →
+instance → module/caller join (when joinable, otherwise no edge and
+a named note).
 
 ## Algorithm properties (name-determined only)
 
@@ -41,10 +42,13 @@ SHAKE extendable output); mode/padding suffixes (`_CBC`, `_ECB`,
 `_GCM`, `_CCM`, `_CTR`, `_CFB`, `_OFB`, `_OAEP`, `_PKCS`, `_PAD`) →
 `mode`/`padding`. `cryptoFunctions` comes from the input's observed
 operation categories (`sign`, `encrypt`, …), never from the name.
-Anything else — unregistered ids (no name), profile rows (names are
-not in the published JSON and are never re-resolved here), key-pair
-generation spellings, unknown categories — reads `primitive:
-unknown` (or omits the key) with the raw input kept in `properties`.
+Key-generation spellings carry their family's primitive with
+`cryptoFunctions: keygen` (the family is name-determined; only
+family-less spellings like `CKM_GENERIC_SECRET_KEY_GEN` read
+unknown). Anything else — unregistered ids (no name), profile rows
+(names are not in the published JSON and are never re-resolved
+here), unknown categories — reads `primitive: unknown` with the raw
+input kept in `properties`.
 S1 output carries no sizes, curves or parameters, so those keys are
 always absent on algorithm components; the omission is stated, not
 defaulted.

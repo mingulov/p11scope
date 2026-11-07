@@ -1778,6 +1778,61 @@ and ignored rather than copied through. Unknown clock units retain raw values.
 See the [diff schema](schema/inventory-diff-v1.md) for exact fields,
 side-local evidence references, population multiplicity and interpretation.
 
+## Offline CBOM export
+
+`inventory cbom` converts one saved [inventory v1](schema/inventory-v1.md)
+or observed-profile report into a CycloneDX 1.6 cryptographic bill of
+materials as an ordinary user. It performs no live process lookup, loads
+no provider, and requires no capture privileges. It accepts neither
+inventory-event JSONL nor diff reports.
+
+```bash
+p11scope inventory cbom inventory.json -o out.cdx.json
+p11scope inventory cbom inventory.json --json
+p11scope inventory cbom profile.json -o out.cdx.json
+# Options precede -- when the input name begins with a dash.
+p11scope inventory cbom --json -- -inventory.json
+```
+
+Default stdout is the concise conversion summary: component counts, the
+observed applications and providers, unknowns, and coverage. `-v`/`--verbose`
+lists every component with its cryptographic properties; `--quiet` prints
+only the summary head. `--json` emits one CycloneDX 1.6 JSON document plus
+newline. `-o` atomically saves that JSON regardless of stdout mode, before
+writing stdout. Output aliases of the input, including hardlinks and
+symlinks, are refused; the existing trusted-directory/final-name
+protections apply. The final check and rename are not a lock against
+replacement by a writer in that trusted directory. Stdin (`-`) and `-o -`
+are unsupported; use `--json` for JSON stdout and prefix a dash-leading
+output name with `./`.
+
+Applications map to `application` components, provider modules to
+`library` components (with their SHA-256 digest when the input carries a
+valid one), observed mechanisms to `cryptographic-asset` algorithm
+components, and observed key objects to `related-crypto-material`
+components. Only fields already present in the saved file are converted:
+mechanism properties come from the registered name and the observed
+operation categories alone, and key components carry type, size class
+and curve only from established metadata. Key values, CKA labels/IDs,
+PINs, states and dates are never emitted. Unknowns stay explicit:
+unregistered mechanism ids, unnamed primitives, keys without
+established size, callers without an executable path, and — for
+profile inputs, which publish no caller, usage-edge or key linkage —
+the missing linkage are counted in the document and named in text.
+A malformed crypto detail degrades its component to unknown with a
+named note and never stops the view. See the [CBOM design
+note](cbom-export.md) for the exact mapping.
+
+Unknown evidence exits 0; input, schema or output failures exit 1;
+usage errors exit 2. A broken stdout pipe exits 0 after any requested
+file succeeds. Another stdout error can exit 1 after that file was
+published. Malformed inputs and exceeded limits fail without a partial
+successful parse. Input limits are exactly the diff reader's: 64 MiB
+actually read, 250,000 combined rows, 16,384 decoded UTF-8 bytes per
+string or key, nesting depth 64, and 2,000,000 JSON values plus object
+keys. All apply together. Unknown additive data is bounded and
+ignored rather than copied through.
+
 ## Privileges, per environment
 
 Root UID is not an unconditional requirement: the observer can run under an

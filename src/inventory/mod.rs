@@ -6517,8 +6517,6 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                 deadline: Instant::now() + RUNNING_HOOK_DEADLINE,
             };
             let (coordinator, semantic) = (&mut *self.coordinator, &mut self.semantic);
-            // TEMP F9 DIAGNOSTIC (revert before freeze): hook rate/duration.
-            let hook_start = Instant::now();
             if let Some(lane) = semantic.as_mut() {
                 Self::service_linked_joint_hook(
                     lane,
@@ -6527,19 +6525,6 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
                     reborrow_acquisition(&mut acquisition),
                     &mut self.joint_tick_refusal,
                 );
-            }
-            {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static HN: AtomicU64 = AtomicU64::new(0);
-                let hn = HN.fetch_add(1, Ordering::Relaxed);
-                if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && hn % 100 == 0 {
-                    eprintln!(
-                        "hook-tick hn={hn} hook_ms={} spent={} t_mono={}",
-                        hook_start.elapsed().as_millis(),
-                        RUNNING_HOOK_ACTIONS.saturating_sub(budget.remaining_actions),
-                        crate::attach::monotonic_ns().unwrap_or(0),
-                    );
-                }
             }
             return;
         }
@@ -6869,8 +6854,6 @@ impl ClassicDriver<'_> {
         // hooks skip the pump and advance the machine, as in the
         // unlinked rule.
         let mut pump_refusal = None;
-        // TEMP F9 DIAGNOSTIC (revert before freeze): pump/machine split.
-        let pump_start = Instant::now();
         if budget.remaining_actions > 1 && Instant::now() < budget.deadline {
             let work = (budget.remaining_actions - 1)
                 .min(crate::discovery::engine::LIVE_DISCOVERY_DRAIN_QUANTUM);
@@ -6900,8 +6883,6 @@ impl ClassicDriver<'_> {
         // hook wins over the pump's `Unavailable`, and it names the
         // lane's stop if the lane later holds with no latched reason
         // of its own.
-        // TEMP F9 DIAGNOSTIC (revert before freeze): pump/machine split.
-        let machine_start = Instant::now();
         if let Err(reason) = lane.service_joint_for_linked_hook(
             coordinator,
             crate::inventory_semantics::JointServiceMode::Running,
@@ -6912,21 +6893,6 @@ impl ClassicDriver<'_> {
         }
         if let Some(reason) = pump_refusal {
             tick_refusal.get_or_insert(reason);
-        }
-        // TEMP F9 DIAGNOSTIC (revert before freeze): pump/machine split.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static PN: AtomicU64 = AtomicU64::new(0);
-            let pn = PN.fetch_add(1, Ordering::Relaxed);
-            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && pn % 100 == 0 {
-                let machine_ms = machine_start.elapsed().as_millis();
-                let total_ms = pump_start.elapsed().as_millis();
-                eprintln!(
-                    "split-tick pn={pn} pump_ms={} machine_ms={machine_ms} t_mono={}",
-                    total_ms.saturating_sub(machine_ms),
-                    crate::attach::monotonic_ns().unwrap_or(0),
-                );
-            }
         }
     }
 

@@ -2115,32 +2115,6 @@ impl LiveJointMachine {
         self.service_with_io_and_acquisition(lane, coordinator, io, mode, budget, None)
     }
 
-    // TEMP F9 DIAGNOSTIC (revert before freeze): phase names for timers.
-    fn diag_phase_name(phase: &Phase) -> &'static str {
-        match phase {
-            Phase::Idle => "Idle",
-            Phase::Collecting(_) => "Collecting",
-            Phase::Binding(_) => "Binding",
-            Phase::AwaitH0(_) => "AwaitH0",
-            Phase::PendingQ { .. } => "PendingQ",
-            Phase::Preparing(_) => "Preparing",
-            Phase::PreparationAttempted(_) => "PreparationAttempted",
-            Phase::FinishStopReady(_) => "FinishStopReady",
-            Phase::FinishStopReport { .. } => "FinishStopReport",
-            Phase::PreparingAdmissions(_) => "PreparingAdmissions",
-            Phase::BindingKeys { .. } => "BindingKeys",
-            Phase::Ingesting(_) => "Ingesting",
-            Phase::StagingNegative(_) => "StagingNegative",
-            Phase::Claiming { .. } => "Claiming",
-            Phase::InstallingClosure { .. } => "InstallingClosure",
-            Phase::Births { .. } => "Births",
-            Phase::Staging { .. } => "Staging",
-            Phase::Auditing { .. } => "Auditing",
-            Phase::Negative { .. } => "Negative",
-            Phase::Audited { .. } => "Audited",
-        }
-    }
-
     pub(crate) fn service_with_io_and_acquisition<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -2181,9 +2155,6 @@ impl LiveJointMachine {
         }
         while budget.available() {
             let phase = self.phase.take().expect("one original machine phase");
-            // TEMP F9 DIAGNOSTIC (revert before freeze): advance wall ms.
-            let adv_start = std::time::Instant::now();
-            let adv_name = Self::diag_phase_name(&phase);
             let (phase, result) = self.advance(
                 phase,
                 lane,
@@ -2193,41 +2164,10 @@ impl LiveJointMachine {
                 None,
                 reborrow_acquisition(&mut acquisition),
             );
-            {
-                use std::sync::atomic::{AtomicU64, Ordering};
-                static AN: AtomicU64 = AtomicU64::new(0);
-                let an = AN.fetch_add(1, Ordering::Relaxed);
-                if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && an % 200 == 0 {
-                    eprintln!(
-                        "adv-tick an={an} phase={adv_name} ms={} t_mono={}",
-                        adv_start.elapsed().as_millis(),
-                        crate::attach::monotonic_ns().unwrap_or(0),
-                    );
-                }
-            }
             self.phase = Some(phase);
             match result {
                 Ok(Step::Continue) => {}
-                Ok(Step::Yield) => {
-                    // TEMP F9 DIAGNOSTIC (revert before freeze): yield census.
-                    {
-                        use std::sync::atomic::{AtomicU64, Ordering};
-                        static YN: AtomicU64 = AtomicU64::new(0);
-                        let yn = YN.fetch_add(1, Ordering::Relaxed);
-                        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && yn % 50 == 0
-                        {
-                            let name = self
-                                .phase
-                                .as_ref()
-                                .map_or("NoPhase", Self::diag_phase_name);
-                            eprintln!(
-                                "yield-tick yn={yn} phase={name} t_mono={}",
-                                crate::attach::monotonic_ns().unwrap_or(0),
-                            );
-                        }
-                    }
-                    return Ok(JointServiceProgress::Pending);
-                }
+                Ok(Step::Yield) => return Ok(JointServiceProgress::Pending),
                 Ok(Step::Published) => return Ok(JointServiceProgress::Published),
                 Err(reason) => {
                     // This exact produced report remains the retry input.
@@ -2901,8 +2841,6 @@ impl LiveJointMachine {
                         );
                     }
                 }
-                // TEMP F9 DIAGNOSTIC (revert before freeze): collect elapsed.
-                let collect_start = std::time::Instant::now();
                 let collected = match q {
                     Some(q) => io.collect_raw_at_q(
                         lane,
@@ -2920,27 +2858,8 @@ impl LiveJointMachine {
                         work,
                     ),
                 };
-                let collect_ms = collect_start.elapsed().as_millis();
                 let (raw, poll) = retain_on_refusal!(Phase::Idle, collected);
                 let poll = poll.expect("positive initial work actually polls the original cursor");
-                // TEMP F9 DIAGNOSTIC (revert before freeze): collect cadence.
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static N: AtomicU64 = AtomicU64::new(0);
-                    static ROWS: AtomicU64 = AtomicU64::new(0);
-                    let n = N.fetch_add(1, Ordering::Relaxed);
-                    let rows = ROWS.fetch_add(poll.attempted as u64, Ordering::Relaxed)
-                        + poll.attempted as u64;
-                    if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
-                        && (n < 5 || n % 20 == 0)
-                    {
-                        eprintln!(
-                            "m-collect n={n} attempted={} rows_total={rows} t_mono={} work={work} collect_ms={collect_ms}",
-                            poll.attempted,
-                            crate::attach::monotonic_ns().unwrap_or(0),
-                        );
-                    }
-                }
                 budget.spend(poll.attempted.max(1));
                 let Some(ledger) = raw.ledger_binding() else {
                     return (
@@ -3106,24 +3025,6 @@ impl LiveJointMachine {
                 let poll = retain_on_refusal!(Phase::Collecting(original), continued);
                 original.attempted += poll.attempted;
                 original.poll = poll;
-                // TEMP F9 DIAGNOSTIC (revert before freeze): extension cadence.
-                {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static XN: AtomicU64 = AtomicU64::new(0);
-                    static XROWS: AtomicU64 = AtomicU64::new(0);
-                    let xn = XN.fetch_add(1, Ordering::Relaxed);
-                    let xrows = XROWS.fetch_add(poll.attempted as u64, Ordering::Relaxed)
-                        + poll.attempted as u64;
-                    if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
-                        && (xn < 5 || xn % 20 == 0)
-                    {
-                        eprintln!(
-                            "m-extend xn={xn} attempted={} xrows_total={xrows} t_mono={} work={work}",
-                            poll.attempted,
-                            crate::attach::monotonic_ns().unwrap_or(0),
-                        );
-                    }
-                }
                 budget.spend(poll.attempted.max(1));
                 let step = if poll.attempted == 0 {
                     Step::Yield

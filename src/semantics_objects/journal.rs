@@ -5488,12 +5488,10 @@ impl JournalAdapter {
         births: &mut impl BirthEvidenceSource,
         replay: Option<ReplayPreparation>,
     ) -> Result<SealSuccess, SealFailure> {
-        // TEMP F9 seal-phase timers.
-        let t_seal = std::time::Instant::now();
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "no_key"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         };
         if state.refused || state.tainted {
             return Err(self.failure(JournalGap::DomainTainted));
@@ -5520,7 +5518,7 @@ impl JournalAdapter {
         // once the live one ended (handled below after the ended check can
         // observe it). Anything else is a mismatched bootstrap.
         if bootstrap.proof().era != state.era {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "era"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // The receipt's own generation must be live: a birth verified
         // under a replaced endpoint set proves nothing under this one.
@@ -5533,19 +5531,13 @@ impl JournalAdapter {
                 ordinal: ConsumptionOrdinal(bootstrap.birth_cut()),
             })
         {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "birth_cut"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
         // takes again), exactly like moved native evidence.
-        // TEMP F9: birth-take cost.
-        let t_birth = std::time::Instant::now();
-        let fresh = match births.take_birth_evidence() {
-            Ok(fresh) => fresh,
-            Err(refusal) => {
-                let site: &str = &format!("evidence_take_{refusal:?}");
-                return Err(self.diag_failure(JournalGap::BootstrapMismatch, site));
-            }
+        let Ok(fresh) = births.take_birth_evidence() else {
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         };
         // Re-verify the birth with fresh Session evidence against
         // current retained truth: moved native evidence or a chain break
@@ -5566,18 +5558,15 @@ impl JournalAdapter {
                 BirthRefusal::ImageTainted => JournalGap::ImageTainted,
                 _ => JournalGap::BootstrapMismatch,
             };
-            let site: &str = &format!("verify_{refusal:?}");
-            return Err(self.diag_failure(gap, site));
+            return Err(self.failure(gap));
         }
-        // TEMP F9: report birth-take cost (sampled with seal-phase).
-        let t_birth = t_birth.elapsed();
         // The birth cut pins per key-era at first seal: a later seal for
         // the same era must carry the same cut. Rebirth above kept staged
         // history is refused — void first.
         if let Some(pinned) = state.bootstraps.get(&bootstrap.proof().era)
             && *pinned != bootstrap.birth_cut()
         {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "pinned_cut"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // The birth covers all retained staged history for the key:
         // conversion proves staged begins, so a cut at or above any of
@@ -5586,13 +5575,13 @@ impl JournalAdapter {
         let image = (key.cookie, key.exec);
         let live = self.live_keys_for_image(image);
         if !self.birth_covers_staged(key, &live, image, bootstrap.birth_cut()) {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "covers_staged"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         if frontier < state.sealed_through {
             return Err(self.failure(JournalGap::FrontierRegression));
         }
         if bootstrap.birth_cut() > frontier {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "cut_above_frontier"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Resumption below the void fence refuses: a fresh birth names
         // the fence it resumes at. At the fence is sound (the fenced
@@ -5600,7 +5589,7 @@ impl JournalAdapter {
         // above the cut). The fence covers keys created after the void
         // as well as the keys the void fenced directly.
         if bootstrap.birth_cut() < fenced_through {
-            return Err(self.diag_failure(JournalGap::BootstrapMismatch, "cut_below_fence"));
+            return Err(self.failure(JournalGap::BootstrapMismatch));
         }
         // Unclaimed staged history barriers every seal past it: an
         // entry no bound key can account for is never silently
@@ -5719,25 +5708,7 @@ impl JournalAdapter {
         if completed && !self.has_history_through(key, &live, frontier) {
             return self.seal_completed_era(key, bootstrap, frontier, replay);
         }
-        // TEMP F9: guards (all open/staged scans) vs apply split.
-        let t_guards = t_seal.elapsed();
-        let t_apply = std::time::Instant::now();
-        let open_len = self.open.len();
-        let out = self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay);
-        let t_apply = t_apply.elapsed();
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SP: AtomicU64 = AtomicU64::new(0);
-            if SP.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
-                eprintln!(
-                    "seal-phase open={open_len} guards_ms={} apply_ms={} birth_ms={}",
-                    t_guards.as_secs_f64() * 1000.0,
-                    t_apply.as_secs_f64() * 1000.0,
-                    t_birth.as_secs_f64() * 1000.0
-                );
-            }
-        }
-        out
+        self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
     }
 
     /// Whether any staged wire truth for one key sits at or below a
@@ -6220,18 +6191,6 @@ impl JournalAdapter {
             h3_voided: None,
             scope: SealFailureScope::Unqualified,
         }
-    }
-
-    // TEMP F9 DIAGNOSTIC (revert before freeze): name the seal-gap site.
-    fn diag_failure(&self, gap: JournalGap, site: &str) -> SealFailure {
-        use std::sync::atomic::{AtomicU64, Ordering};
-        static COUNT: AtomicU64 = AtomicU64::new(0);
-        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
-            && COUNT.fetch_add(1, Ordering::Relaxed) < 20
-        {
-            eprintln!("joint-timing: seal_gap site={site} gap={gap:?}");
-        }
-        self.failure(gap)
     }
 
     /// Conversion and settlement after every structural rule passed. The

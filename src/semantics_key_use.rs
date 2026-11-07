@@ -1076,20 +1076,6 @@ impl JointStaging {
             }
         }
         let loss = disposition == SealFailureDisposition::HistoryLoss;
-        // TEMP F9 DIAGNOSTIC (revert before freeze): production seal gap.
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static GCOUNT: AtomicU64 = AtomicU64::new(0);
-            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some()
-                && GCOUNT.fetch_add(1, Ordering::Relaxed) < 20
-            {
-                eprintln!(
-                    "death-gap gap={gap:?} loss={loss} t_mono={} staged_empty={}",
-                    crate::attach::monotonic_ns().unwrap_or(0),
-                    self.staged.is_empty(),
-                );
-            }
-        }
         if self.mode == FeedMode::Joint && disposition == SealFailureDisposition::Retry {
             return (
                 FailureBatchProgress::Complete(FailureApplyOutcome::Retried),
@@ -1341,14 +1327,6 @@ impl JointStaging {
                             Some(&mut *ledger),
                             assoc_fallback.as_deref_mut(),
                         );
-                        // TEMP F9 DIAGNOSTIC (revert before freeze): death timestamp.
-                        if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() {
-                            eprintln!(
-                                "death-tick gap={:?} t_mono={} replayed={replayed}",
-                                failure.gap,
-                                crate::attach::monotonic_ns().unwrap_or(0),
-                            );
-                        }
                         self.close_segment(false, segment_resumable_after(failure.gap));
                         (FailureApplyOutcome::FellBack { replayed }, refused)
                     }

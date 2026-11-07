@@ -326,28 +326,6 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         input: JointCommitInput<'_>,
     ) -> Result<JointCommitProgress> {
-        // TEMP F9 DIAGNOSTIC (revert before freeze): commit total ms.
-        let commit_start = std::time::Instant::now();
-        let commit_outcome = self.commit_joint_publication_inner_timed(input);
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static CN: AtomicU64 = AtomicU64::new(0);
-            let cn = CN.fetch_add(1, Ordering::Relaxed);
-            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && cn % 20 == 0 {
-                eprintln!(
-                    "commit-tick cn={cn} ms={} t_mono={}",
-                    commit_start.elapsed().as_millis(),
-                    crate::attach::monotonic_ns().unwrap_or(0),
-                );
-            }
-        }
-        commit_outcome
-    }
-
-    fn commit_joint_publication_inner_timed(
-        &mut self,
-        input: JointCommitInput<'_>,
-    ) -> Result<JointCommitProgress> {
         let JointCommitInput {
             continuation,
             producers,
@@ -418,67 +396,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         let mut births = BorrowedBirths(births);
         let fault = BorrowedFault(fault);
-        // TEMP F9 DIAGNOSTIC (revert before freeze): seal-loop ms.
-        let diag = std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some();
-        let diag_start = std::time::Instant::now();
-        // TEMP F9: loop iteration + piece census.
-        let mut diag_iters: u64 = 0;
-        let mut diag_ports_ms = 0.0;
-        let mut diag_finish_ms = 0.0;
         while *remaining != 0 {
-            diag_iters += 1;
             let before = *remaining;
             {
-                // TEMP F9: ports cost.
-                let t_ports = std::time::Instant::now();
                 let mut ports = self
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
-                diag_ports_ms += t_ports.elapsed().as_secs_f64() * 1000.0;
                 let held = frame.as_mut().expect("same original service frame");
-                // TEMP F9: seal vs deliver split.
-                let t_sd = std::time::Instant::now();
                 held.seal_next_bounded(&mut ports, &mut births, &fault, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
-                let t_seal = t_sd.elapsed();
                 held.deliver_next_bounded(&mut ports, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
-                if diag {
-                    use std::sync::atomic::{AtomicU64, Ordering};
-                    static SD: AtomicU64 = AtomicU64::new(0);
-                    if SD.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
-                        eprintln!(
-                            "seal-deliver seal_ms={} deliver_ms={} rem={}",
-                            t_seal.as_secs_f64() * 1000.0,
-                            t_sd.elapsed().as_secs_f64() * 1000.0 - t_seal.as_secs_f64() * 1000.0,
-                            *remaining,
-                        );
-                    }
-                }
             }
-            // TEMP F9: finish-check cost.
-            let t_finish = std::time::Instant::now();
             if let Some(disposed) =
                 self.finish_joint_frame_if_ready(frame, producers, &continuation)?
             {
                 return self.complete_joint_output(disposed, finish.as_mut(), producers);
             }
-            diag_finish_ms += t_finish.elapsed().as_secs_f64() * 1000.0;
             if *remaining == before {
                 break; // Same-frontier retry or real future-input dependency.
-            }
-        }
-        if diag {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static SN: AtomicU64 = AtomicU64::new(0);
-            let sn = SN.fetch_add(1, Ordering::Relaxed);
-            if sn % 20 == 0 {
-                eprintln!(
-                    "seal-loop-tick sn={sn} ms={} rem_after={} t_mono={} iters={diag_iters} ports_ms={diag_ports_ms:.1} finish_ms={diag_finish_ms:.1}",
-                    diag_start.elapsed().as_millis(),
-                    *remaining,
-                    crate::attach::monotonic_ns().unwrap_or(0),
-                );
             }
         }
         Ok(JointCommitProgress::Pending)
@@ -585,23 +521,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         } else if completed.is_some() {
             bail!("no original Stop association");
         }
-        // TEMP F9 DIAGNOSTIC (revert before freeze): publish ms.
-        let publish_start = std::time::Instant::now();
         let applied = self
             .registry
             .finish_joint_publication(&mut self.joint_capture, original)?;
-        {
-            use std::sync::atomic::{AtomicU64, Ordering};
-            static PUN: AtomicU64 = AtomicU64::new(0);
-            let pun = PUN.fetch_add(1, Ordering::Relaxed);
-            if std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some() && pun % 20 == 0 {
-                eprintln!(
-                    "publish-tick pun={pun} ms={} applied={applied} t_mono={}",
-                    publish_start.elapsed().as_millis(),
-                    crate::attach::monotonic_ns().unwrap_or(0),
-                );
-            }
-        }
         let pending = self
             .joint_publication
             .take()

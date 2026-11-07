@@ -2249,6 +2249,20 @@ impl RetiringDomain {
     }
 }
 
+/// Deferred scan seal settle: seat after this many consecutive identical
+/// scan-mint peeks. A pre-existing provider lets the first mint succeed
+/// while the application's provider is still arriving (demo4
+/// firefox-first: the browser's provider lands ~11s after observer
+/// start); seating at once would exclude it forever. Engineering
+/// constant with the measurement pinned by the settle tests;
+/// genuinely-late providers (past the horizon) still miss and need
+/// a re-seat follow-up.
+pub(crate) const SCAN_SEAL_STABLE_PEEKS: u32 = 8;
+/// Bounded settle horizon: seat over the current set after this many
+/// waiting passes no matter what, so a perpetually-changing provider
+/// set degrades to seating anyway instead of never seating.
+pub(crate) const SCAN_SEAL_MAX_SETTLE_PASSES: u32 = 40;
+
 struct ClassicDriver<'a> {
     coordinator: &'a mut InventoryCoordinator<OsProcessSource>,
     inventory_scope: Option<InventoryScope>,
@@ -5542,6 +5556,37 @@ mod seal_startup_test {
         START.with(|queued| queued.borrow_mut().extend(starts));
         let _restore = Restore;
         run()
+    }
+    /// One scripted settle peek per deferred-seal attempt:
+    /// `Some(set)` = the mint sees `set` complete, `None` = the mint
+    /// fails. Separate from the start queue: twins that never peek
+    /// leave it empty and drive the production mint unchanged.
+    type PeekScript =
+        Option<std::collections::BTreeSet<crate::discovery::identity::PinnedObjectId>>;
+    thread_local! {
+        static PEEK: std::cell::RefCell<VecDeque<PeekScript>> =
+            const { std::cell::RefCell::new(VecDeque::new()) };
+    }
+    pub(super) fn take_peek() -> Option<PeekScript> {
+        PEEK.with(|queued| queued.borrow_mut().pop_front())
+    }
+    /// Queue settle peeks plus one start script, consumed in order;
+    /// like `with`, leftovers are cleared.
+    pub(super) fn with_peek<R>(
+        peeks: Vec<PeekScript>,
+        prepares: Vec<Preparation>,
+        start: Option<StartVerdict>,
+        run: impl FnOnce() -> R,
+    ) -> R {
+        struct RestorePeek;
+        impl Drop for RestorePeek {
+            fn drop(&mut self) {
+                PEEK.with(|queued| queued.borrow_mut().clear());
+            }
+        }
+        PEEK.with(|queued| queued.borrow_mut().extend(peeks));
+        let _restore = RestorePeek;
+        with_start_queue(prepares, start.into_iter().collect(), run)
     }
 }
 
@@ -25994,6 +26039,203 @@ mod seal_readiness_tests {
             gaps_for_subject(&mut *driver.coordinator, "semantic subset scan-derived").len(),
             1,
             "the seated scan-derived lane discloses its provenance once"
+        );
+    }
+
+    /// DEMO-4 regression (v0.6.0 F1): a pre-existing provider lets the
+    /// first scan mint succeed while the browser's provider is still
+    /// arriving. Seating at once excludes the browser forever
+    /// (`bootstrap_unavailable`, zero rows). The seal settles: it
+    /// seats only after the minted provider set holds still, over
+    /// the grown set, and discloses the wait.
+    #[test]
+    fn deferred_scan_seal_settles_over_newcomer_provider_before_seating() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let two: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0), PinnedObjectId(1)]);
+        let mut peeks = vec![Some(one)];
+        peeks.extend(std::iter::repeat_n(
+            Some(two),
+            super::SCAN_SEAL_STABLE_PEEKS as usize,
+        ));
+        let attempts = peeks.len();
+        seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for n in 1..attempts {
+                    driver.attempt_deferred_scan_seal(scope);
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.attempt_deferred_scan_seal(scope);
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the stable grown set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        assert_eq!(
+            take_sealed_for_test(),
+            vec![SEAL_LINE.to_string()],
+            "the seating notes the seal line once"
+        );
+        assert_eq!(
+            gaps_for_subject(&mut *driver.coordinator, "semantic subset scan-derived").len(),
+            1,
+            "the seated scan-derived lane discloses its provenance once"
+        );
+        let settled = gaps_for_subject(&mut *driver.coordinator, "scan seal settled");
+        assert_eq!(
+            settled.len(),
+            1,
+            "the grown set discloses its settle: {settled:?}"
+        );
+        assert!(
+            settled[0].1.contains("waited 8 passes"),
+            "the settle names its wait: {:?}",
+            settled[0].1
+        );
+    }
+
+    /// A set change restarts the stability run: seven identical peeks
+    /// then a newcomer must not seat on the eighth attempt.
+    #[test]
+    fn deferred_scan_seal_newcomer_restarts_stability_run() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let two: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0), PinnedObjectId(1)]);
+        let mut peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize - 1];
+        peeks.extend(std::iter::repeat_n(
+            Some(two),
+            super::SCAN_SEAL_STABLE_PEEKS as usize,
+        ));
+        let attempts = peeks.len();
+        seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for n in 1..attempts {
+                    driver.attempt_deferred_scan_seal(scope);
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.attempt_deferred_scan_seal(scope);
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the re-stabilized set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        let settled = gaps_for_subject(&mut *driver.coordinator, "scan seal settled");
+        assert_eq!(
+            settled.len(),
+            1,
+            "the re-stabilized set discloses its settle: {settled:?}"
+        );
+    }
+
+    /// A perpetually-changing set still seats: after the bounded
+    /// horizon the seal takes the current set instead of waiting
+    /// forever.
+    #[test]
+    fn deferred_scan_seal_caps_perpetual_settle() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let peeks: Vec<_> = (0..super::SCAN_SEAL_MAX_SETTLE_PASSES)
+            .map(|id| Some(BTreeSet::from([PinnedObjectId(id)])))
+            .collect();
+        let attempts = peeks.len();
+        seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for n in 1..attempts {
+                    driver.attempt_deferred_scan_seal(scope);
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.attempt_deferred_scan_seal(scope);
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the capped set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        let settled = gaps_for_subject(&mut *driver.coordinator, "scan seal settled");
+        assert_eq!(
+            settled.len(),
+            1,
+            "the capped set discloses its settle: {settled:?}"
+        );
+    }
+
+    /// A set complete from the first peek seats after confirmation
+    /// without a settle gap: confirming an unchanged set is not news.
+    #[test]
+    fn deferred_scan_seal_stable_set_seats_without_settle_gap() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let peeks = vec![Some(one); super::SCAN_SEAL_STABLE_PEEKS as usize];
+        let attempts = peeks.len();
+        seal_startup_test::with_peek(
+            peeks,
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                for n in 1..attempts {
+                    driver.attempt_deferred_scan_seal(scope);
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.attempt_deferred_scan_seal(scope);
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the confirmed set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        assert!(
+            gaps_for_subject(&mut *driver.coordinator, "scan seal settled").is_empty(),
+            "an unchanged set discloses no settle"
         );
     }
 

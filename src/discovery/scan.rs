@@ -20,7 +20,7 @@ use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::sweep_attribution::is_caller_range;
 use crate::process::{MountNamespaceId, MountTableCache, PidPin, ProcessView, ProcessViewId};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot, SymbolFact};
-use p11scope_manifest::identity::{InspectedObject, open_object};
+use p11scope_manifest::identity::{InspectedObject, mapping_file_key, open_object};
 use p11scope_manifest::maps::{
     Device, MapEntry, MapIndex, MappedPath, ObjectKey, Resolved, parse_maps,
 };
@@ -6445,13 +6445,35 @@ fn scan_view_examined_mode(
                     // process runs the lower bytes, so everything
                     // file-derived is re-derived from the proven lower
                     // file — upper offsets are never reused.
-                    let lower_facts = match provider_facts_for(&proof.file, key, &wanted, budget) {
-                        Ok(lower_facts) => lower_facts,
+                    // The lower file's facts cache under the lower
+                    // file's own mapping key: the cache pin carries no
+                    // device, so the upper's maps key would collide
+                    // across lower files. The lower fd opens in the
+                    // observer namespace, hence the observer-side key.
+                    let lower_key = match mapping_file_key(&proof.file) {
+                        Ok(lower_mapping) => ObjectKey {
+                            device: Device {
+                                major: lower_mapping.device_major,
+                                minor: lower_mapping.device_minor,
+                            },
+                            inode: lower_mapping.inode,
+                        },
                         Err(reason) => {
-                            skipped.push(Skipped { subject, reason });
+                            skipped.push(Skipped {
+                                subject,
+                                reason: format!("lower mapping identity unavailable: {reason}"),
+                            });
                             continue;
                         }
                     };
+                    let lower_facts =
+                        match provider_facts_for(&proof.file, lower_key, &wanted, budget) {
+                            Ok(lower_facts) => lower_facts,
+                            Err(reason) => {
+                                skipped.push(Skipped { subject, reason });
+                                continue;
+                            }
+                        };
                     let lower_hooks: Vec<String> = lower_facts
                         .exports
                         .iter()

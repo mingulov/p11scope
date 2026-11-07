@@ -4459,18 +4459,18 @@ fn witness_refusal(outcome: &WitnessOutcome) -> Option<String> {
     }
 }
 
-/// One lower candidate the copy-up fallback refused: its index in the
-/// mount-table candidate list and the finite refusal stage. Indexes,
-/// never paths: candidate paths stay transient (design section 3e).
+/// One lower candidate the copy-up fallback refused: the finite
+/// refusal stage. Stages, never paths or indexes: candidate paths
+/// stay transient (design section 3e) and no candidate index reaches
+/// output (allowlist-v3 lower row).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct LowerSkip {
-    index: usize,
     stage: LowerSkipStage,
 }
 
 /// Why one lower candidate did not prove: the finite vocabulary behind
-/// the per-candidate refusal notes. Notes name no pids, paths,
-/// addresses or run detail.
+/// the refusal notes. Notes name no pids, paths, indexes, addresses
+/// or run detail.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LowerSkipStage {
     /// The candidate could not be opened in the observer namespace.
@@ -4511,7 +4511,8 @@ impl LowerSkipStage {
 /// kernel stack order: the first same-file verdict wins and stops the
 /// search — the proof, not the path, selects the file — with every
 /// refusal collected alongside. A spent witness budget stops the
-/// search. `None` keeps today's gap, naming each refusal.
+/// search. `None` keeps today's gap, naming the refused count and
+/// the finite stages.
 fn prove_lower_candidates(
     io: &mut impl ScanIo,
     view: &ProcessView,
@@ -4528,21 +4529,18 @@ fn prove_lower_candidates(
     {
         let Ok(candidate_index) = u32::try_from(index) else {
             skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::IndexOverflow,
             });
             continue;
         };
         let Ok(file) = io.open_lower_candidate(view, &candidate, budget) else {
             skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::OpenFailed,
             });
             continue;
         };
         let Some(mapped) = io.held_identity(&file) else {
             skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::HeldIdentityUnreadable,
             });
             continue;
@@ -4561,21 +4559,17 @@ fn prove_lower_candidates(
             }
             WitnessVerdict::Failed(WitnessFailure::BudgetExhausted) => {
                 skips.push(LowerSkip {
-                    index,
                     stage: LowerSkipStage::BudgetExhausted,
                 });
                 return (None, skips);
             }
             WitnessVerdict::OtherFile => skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::OtherFile,
             }),
             WitnessVerdict::Failed(WitnessFailure::Unavailable) => skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::Unavailable(outcome.diagnosis),
             }),
             WitnessVerdict::Failed(WitnessFailure::AnchorBindingFailed) => skips.push(LowerSkip {
-                index,
                 stage: LowerSkipStage::AnchorBindingFailed,
             }),
         }
@@ -4584,12 +4578,11 @@ fn prove_lower_candidates(
 }
 
 /// The terminal gap reason for a fallback search that proved no lower
-/// file: the held query's reason plus the bounded per-candidate refusal
-/// diagnostic. No skips (no candidates) keeps the held reason
-/// byte-identical; otherwise each refusal is named by candidate index
-/// with its finite stage (never the path), the first eight in full and
-/// any rest counted. The held prefix is untouched, so family matchers
-/// keep working.
+/// file: the held query's reason plus the refused count and the finite
+/// stage words. No skips (no candidates) keeps the held reason
+/// byte-identical; otherwise the stages are named in order, the first
+/// eight in full and any rest counted — never by candidate index or
+/// path. The held prefix is untouched, so family matchers keep working.
 fn with_lower_skips(held: &str, skips: &[LowerSkip]) -> String {
     const LISTED: usize = 8;
     if skips.is_empty() {
@@ -4598,7 +4591,7 @@ fn with_lower_skips(held: &str, skips: &[LowerSkip]) -> String {
     let mut parts: Vec<String> = skips
         .iter()
         .take(LISTED)
-        .map(|skip| format!("index {}: {}", skip.index, skip.stage.note()))
+        .map(|skip| skip.stage.note())
         .collect();
     if skips.len() > LISTED {
         parts.push(format!("and {} more", skips.len() - LISTED));
@@ -4616,8 +4609,8 @@ fn with_lower_skips(held: &str, skips: &[LowerSkip]) -> String {
 /// or proven lower), `Err` refuses with the gap reason. The fallback
 /// spends from the same per-scan witness budget as the held query; a
 /// held verdict other than other-file refuses without a fallback. No
-/// proven lower keeps the held query's reason and appends the
-/// per-candidate refusals (no candidates keeps it byte-identical).
+/// proven lower keeps the held query's reason and appends the refused
+/// count with the finite stages (no candidates keeps it byte-identical).
 #[allow(clippy::too_many_arguments)] // The join's inputs are already separate bindings at both call sites.
 pub(crate) fn witness_join_with_copyup(
     io: &mut impl ScanIo,
@@ -14914,9 +14907,9 @@ mod tests {
         assert_eq!(
             reason,
             format!(
-                "{canonical}; lower candidates refused: 1 (index 0: witness query budget exhausted)"
+                "{canonical}; lower candidates refused: 1 (witness query budget exhausted)"
             ),
-            "the exhausting candidate is named"
+            "the exhausting stage is named"
         );
         assert_eq!(io.prove_calls, 1, "only the held query runs");
         assert_eq!(
@@ -14991,9 +14984,9 @@ mod tests {
         assert_eq!(
             reason,
             format!(
-                "{canonical}; lower candidates refused: 2 (index 0: the kernel witness proved another file; index 1: the kernel witness proved another file)"
+                "{canonical}; lower candidates refused: 2 (the kernel witness proved another file; the kernel witness proved another file)"
             ),
-            "every refusal named by index"
+            "every refusal stage named"
         );
         assert_eq!(io.prove_calls, 3, "held plus two lower queries");
     }
@@ -15021,8 +15014,8 @@ mod tests {
 
     #[test]
     fn copyup_fallback_names_per_candidate_refusals() {
-        // RED: every skipped candidate is a named refusal in the terminal
-        // gap (index + finite stage, never the path), not a silent skip.
+        // Every skipped candidate is a counted refusal in the terminal
+        // gap (finite stage, never the index or path), not a silent skip.
         let dir = tempfile::tempdir().unwrap();
         let good = dir.path().join("good.so");
         std::fs::write(&good, b"good").unwrap();
@@ -15047,15 +15040,19 @@ mod tests {
             reason.contains("lower candidates refused: 2"),
             "both skips counted: {reason}"
         );
-        for (index, stage) in [
-            (0, "could not be opened"),
-            (1, "the kernel witness proved another file"),
+        for stage in [
+            "could not be opened",
+            "the kernel witness proved another file",
         ] {
             assert!(
-                reason.contains(&format!("index {index}: {stage}")),
-                "candidate {index} named: {reason}"
+                reason.contains(stage),
+                "refusal stage named: {reason}"
             );
         }
+        assert!(
+            !reason.contains("index "),
+            "no candidate index reaches output: {reason}"
+        );
         assert!(
             !reason.contains("missing.so"),
             "candidate paths never published: {reason}"
@@ -15107,7 +15104,8 @@ mod tests {
     #[test]
     fn copyup_fallback_all_unopenable_names_each_refusal() {
         // The nested-container shape: every candidate unopenable, each
-        // refusal named (design step 5: named, per-candidate, not silent).
+        // refusal counted with its finite stage (design step 5: named,
+        // not silent; never by index).
         let mut io = CopyUpScriptIo::scripted(
             vec![WitnessVerdict::OtherFile],
             vec![
@@ -15123,8 +15121,14 @@ mod tests {
             reason.contains("lower candidates refused: 2"),
             "both skips counted: {reason}"
         );
-        assert!(reason.contains("index 0"), "first refusal named: {reason}");
-        assert!(reason.contains("index 1"), "second refusal named: {reason}");
+        assert!(
+            reason.contains("could not be opened"),
+            "refusal stage named: {reason}"
+        );
+        assert!(
+            !reason.contains("index "),
+            "no candidate index reaches output: {reason}"
+        );
         assert!(
             !reason.contains("first.so") && !reason.contains("second.so"),
             "candidate paths never published: {reason}"
@@ -15156,12 +15160,16 @@ mod tests {
             other => panic!("failed candidates refuse: {other:?}"),
         };
         assert!(
-            reason.contains("index 0: kernel witness unavailable"),
+            reason.contains("kernel witness unavailable"),
             "unavailable named: {reason}"
         );
         assert!(
-            reason.contains("index 1: witness anchor binding failed"),
+            reason.contains("witness anchor binding failed"),
             "binding failure named: {reason}"
+        );
+        assert!(
+            !reason.contains("index "),
+            "no candidate index reaches output: {reason}"
         );
         assert_eq!(io.prove_calls, 3, "held plus two lower queries");
     }
@@ -15185,8 +15193,12 @@ mod tests {
             other => panic!("a diagnosed refusal refuses: {other:?}"),
         };
         assert!(
-            reason.contains("index 0: kernel witness unavailable: explicit userspace disables the kernel witness"),
+            reason.contains("kernel witness unavailable: explicit userspace disables the kernel witness"),
             "diagnosis note carried: {reason}"
+        );
+        assert!(
+            !reason.contains("index "),
+            "no candidate index reaches output: {reason}"
         );
     }
 

@@ -74,6 +74,7 @@ RUN = [
     ("test_canary_evidence.py", ["--target-bits", "32"]),
     ("test_canary_evidence.py", ["--target-bits", "64"]),
     ("test_canary_object.py", []),
+    ("test_canary_observer_verbosity.py", []),
     ("test_ci_dependency_selection.py", []),
     ("test_ci_stop_races.py", []),
     ("test_ci_test_partition.py", []),

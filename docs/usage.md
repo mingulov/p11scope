@@ -1919,11 +1919,12 @@ observer running as the unprivileged `nobody` user with exactly the
 five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `CAP_DAC_READ_SEARCH`, `CAP_PERFMON`, `CAP_SYS_PTRACE`, no
 `CAP_SYS_ADMIN`): `profile --pid` observed 120/123 completed calls with
-`attach_mechanisms: ["uprobe-multi"]` and no attach failures, and
-`inventory --system` and `run` completed the same way
-(`scripts/ci/minimal-setcap.sh`, 25/25 rows on that host after the
-root-run, handover and DaemonSet rows landed; the same cell also runs on
-the CI host and the v6.6 and 7.x guest kernels). Stated plainly: at
+`attach_mechanisms: ["uprobe-multi"]` and no attach failures,
+`inventory --system` named the SoftHSM module with a caller edge, and
+`run` counted completed calls (`scripts/ci/minimal-setcap.sh`; it has
+26 rows when the saved paranoid value is 3 or 4 and 33 otherwise, and
+runs on the CI host and the v6.6, v6.12, v6.18 and 7.3 guest kernels;
+all 33 rows passed in a local v6.6 guest on 2026-11-07). Stated plainly: at
 `perf_event_paranoid >= 3`, capturing on the default lane needs the
 minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
 keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,

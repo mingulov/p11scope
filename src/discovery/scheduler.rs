@@ -2062,4 +2062,25 @@ mod tests {
             "a rotation candidate took the owed lead ahead of a pending newcomer"
         );
     }
+
+    /// OPUS r4 S4: the failed-newcomer sink survives a zero-attempt window.
+    /// A tick that attempts nothing (an expired quantum before the first
+    /// scan) must not rotate the newcomer-attempt sets and lose the sink.
+    #[test]
+    fn opus_r4_sink_survives_zero_attempt_window() {
+        let mut s = DiscoveryScheduler::new();
+        let (a, _) = s.new_view_window_newcomers_first(&[7, 9], &BTreeSet::from([7, 9]), 1, 32);
+        assert_eq!(a, vec![7]);
+        s.note_newcomer_attempt(7);
+        let (a, _) = s.new_view_window_newcomers_first(&[7, 9], &BTreeSet::new(), 1, 32);
+        assert_eq!(a, vec![9]);
+        // Nothing attempted (quantum expired before the first scan).
+        let (a, _) = s.new_view_window_newcomers_first(&[7, 9], &BTreeSet::new(), 1, 32);
+        eprintln!("OPUS-S4 after_zero_attempt_window={a:?}");
+        assert_eq!(
+            a,
+            vec![9],
+            "the failed-newcomer sink survives a zero-attempt window"
+        );
+    }
 }

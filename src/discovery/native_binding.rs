@@ -687,6 +687,11 @@ pub(crate) struct NativeBinder {
     /// tracked generation while the pid named a live process. A host
     /// fact, shared by every domain like the census.
     reuse_ns: HashMap<u32, u64>,
+    /// Whether BPF hook stamps and admission stamps share a clock. The
+    /// coordinator syncs this on every staged batch; fail-closed false
+    /// until synced. While false the retained-identity fallback stays
+    /// off (its exec/loss orderings are meaningless).
+    exit_clocks_comparable: bool,
     /// Qualified only on the explicit metadata opt-in, never an image grant.
     metadata_clock_qualified: bool,
     #[cfg(test)]
@@ -703,10 +708,20 @@ impl NativeBinder {
             transitions: Vec::new(),
             census: BindingCensus::default(),
             reuse_ns: HashMap::new(),
+            exit_clocks_comparable: false,
             metadata_clock_qualified: false,
             #[cfg(test)]
             current_binding_clock: None,
         }
+    }
+
+    /// Sync whether BPF hook stamps and admission stamps share a clock
+    /// (the coordinator calls this on every staged batch, before any
+    /// absorption or decision, so a decision always sees the current
+    /// value — including a row read while comparable and decided after
+    /// the clocks went incomparable).
+    pub(crate) fn set_exit_clocks_comparable(&mut self, comparable: bool) {
+        self.exit_clocks_comparable = comparable;
     }
 
     /// One recorded PID reuse: reconcile retired the tracked generation
@@ -1185,7 +1200,12 @@ impl NativeBinder {
             }
             let pending = state.pending.pop_front().expect("checked front");
             self.census.pending -= 1;
-            let binding = decide(state, &pending, &mut self.transitions);
+            let binding = decide(
+                state,
+                &pending,
+                self.exit_clocks_comparable,
+                &mut self.transitions,
+            );
             self.record(pending.row, binding);
         }
     }
@@ -1195,6 +1215,7 @@ impl NativeBinder {
 fn decide(
     state: &mut DomainState,
     pending: &Pending,
+    clocks_comparable: bool,
     transitions: &mut Vec<ExecTransition>,
 ) -> Binding {
     let row = &pending.row;
@@ -1213,23 +1234,35 @@ fn decide(
     // with no live answer falls back to the one unambiguous retained
     // incarnation; anything else keeps its live-miss gap.
     let Some(sighting) = &pending.sighting else {
-        return pending
-            .retained
-            .as_ref()
-            .map_or(Binding::Unbound(UnboundReason::NoLiveCaller), |retained| {
-                decide_retained(state, pending, retained)
-            });
+        return pending.retained.as_ref().map_or(
+            Binding::Unbound(UnboundReason::NoLiveCaller),
+            |retained| {
+                decide_retained(
+                    state,
+                    pending,
+                    retained,
+                    UnboundReason::NoLiveCaller,
+                    clocks_comparable,
+                )
+            },
+        );
     };
     let answered = match &sighting.query {
         CookieQuery::Cookie(answered) => *answered,
         CookieQuery::NoCookie => return Binding::Unbound(UnboundReason::CookieMismatch),
         CookieQuery::Exited => {
-            return pending
-                .retained
-                .as_ref()
-                .map_or(Binding::Unbound(UnboundReason::CallerExited), |retained| {
-                    decide_retained(state, pending, retained)
-                });
+            return pending.retained.as_ref().map_or(
+                Binding::Unbound(UnboundReason::CallerExited),
+                |retained| {
+                    decide_retained(
+                        state,
+                        pending,
+                        retained,
+                        UnboundReason::CallerExited,
+                        clocks_comparable,
+                    )
+                },
+            );
         }
         CookieQuery::Unavailable(_) => return Binding::Unbound(UnboundReason::CookieUnavailable),
     };
@@ -1316,17 +1349,27 @@ fn decide(
 /// The retained-identity fallback for one row with no live answer whose
 /// horizons arrived: `retained` is already the exactly-one incarnation
 /// holding the row's tgid with proven scan-time identity and the row
-/// inside its lifetime (checked at read time). The remaining checks
-/// mirror rules 4 and 5 against the retained admission: exec coverage,
-/// no exec or lost lifecycle evidence at or after it, and no competing
-/// image of the ticket. A held conflicting image is ambiguous (no
-/// cookie answer exists to prove a transition, so none is emitted).
-/// Anything else binds and caches exactly like a live binding.
+/// inside its lifetime (checked at read time). `miss` is the row's
+/// live-miss gap, kept when a fallback precondition fails. The
+/// remaining checks mirror rules 4 and 5 against the retained
+/// admission: comparable exit clocks, exec coverage, no exec or lost
+/// lifecycle evidence at or after it, and no competing image of the
+/// ticket. A held conflicting image is ambiguous (no cookie answer
+/// exists to prove a transition, so none is emitted). Anything else
+/// binds and caches exactly like a live binding.
 fn decide_retained(
     state: &mut DomainState,
     pending: &Pending,
     retained: &RetainedCaller,
+    miss: UnboundReason,
+    clocks_comparable: bool,
 ) -> Binding {
+    // Without comparable clocks the exec/loss orderings below are
+    // meaningless: hook stamps and admission stamps may not share a
+    // clock. Fail closed with the live-miss gap.
+    if !clocks_comparable {
+        return Binding::Unbound(miss);
+    }
     let row = &pending.row;
     let cookie = row.cookie();
     let exec = row.exec_id();

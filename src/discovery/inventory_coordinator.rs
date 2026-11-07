@@ -47,8 +47,9 @@ use crate::discovery::inventory_attach_set::{
     InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
-    BinderLimits, Binding, BoundImage, CurrentBindingCheck, CurrentBindingRequest,
-    CurrentBindingSighting, Decision, ExecTransition, NativeBinder, NativeIdentity, UnboundReason,
+    BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
+    CurrentBindingSighting, Decision, ExecTransition, LiveCaller, NativeBinder, NativeIdentity,
+    RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
@@ -904,6 +905,30 @@ fn collapse_hint_misses(
         }
     }
     kept
+}
+
+/// The binder's caller lookup with the retained-identity fallback
+/// gated: live incarnations always resolve; retained history resolves
+/// only while the fallback is allowed (PID scope, held custody or a
+/// clean exit proof, comparable exit clocks). The gate is evaluated
+/// once per witness batch, at absorption.
+struct RetainedGate<'a, Source: ProcessSource> {
+    adapter: &'a CallerAdapter<Source>,
+    allowed: bool,
+}
+
+impl<'a, Source: ProcessSource> CallerLookup<Source::Pin> for RetainedGate<'a, Source> {
+    fn live_caller(&self, pid: u32) -> Option<LiveCaller<'_, Source::Pin>> {
+        CallerLookup::live_caller(self.adapter, pid)
+    }
+
+    fn retained_callers(&self, pid: u32) -> Vec<RetainedCaller> {
+        if self.allowed {
+            CallerLookup::retained_callers(self.adapter, pid)
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl<Source: ProcessSource> InventoryCoordinator<Source> {
@@ -5780,6 +5805,33 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
 
     /// The one native staging call (plan §3.6): witness reads, lifecycle
     /// quanta and the final flush all enter here, before `commit_batch`.
+    /// Whether this witness batch may feed the retained-identity
+    /// fallback (v0.7.0: PID scope only). The kernel binds PID-scope
+    /// entry probes to the original task, so a row read before admission
+    /// still names it even if the pid is reused later; in cgroup/system
+    /// scope probes attach to all processes and the same row is
+    /// ambiguous. The fallback also needs held custody (or a clean
+    /// exit proof: a link acquired after the original exited may name a
+    /// reused pid) and comparable exit clocks. The batch's own custody
+    /// is read here because it folds into capture coverage only after
+    /// absorption; a previously folded clean exit proof also qualifies.
+    fn retained_fallback_allowed(&self, batch: &WitnessBatch) -> bool {
+        if !matches!(self.engine.scope, Scope::Pid(_)) {
+            return false;
+        }
+        if !self.exit_clocks_comparable {
+            return false;
+        }
+        match &batch.custody {
+            ScopeCustody::PidHeld => true,
+            ScopeCustody::PidExited { proof, .. } => self.capture.as_ref().is_some_and(|capture| {
+                matches!(capture.scope, CaptureScopeCoverage::Pid(scope) if scope == proof.scope())
+                    || capture.original_pid_exit.is_some()
+            }),
+            _ => false,
+        }
+    }
+
     /// A witness read also forwards its health and custody to capture
     /// coverage (`note_witness_batch`); after `end_capture_coverage` that
     /// half stages nothing, while witnessed use — a positive fact — still
@@ -5795,6 +5847,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         identity: &mut dyn NativeIdentity<Source::Pin>,
         now_ns: u64,
     ) -> NativeReceipt {
+        // Every staged batch syncs the binder's clock comparability first,
+        // so absorption and every decision it triggers see the current
+        // value.
+        self.binder
+            .set_exit_clocks_comparable(self.exit_clocks_comparable);
         let mut hook_events = Vec::new();
         match batch {
             NativeBatch::Witness(batch) => {
@@ -5803,8 +5860,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // rows (a stamped pending row withholds the proven-clean
                 // instant). Absorption stages no registry mutation, so
                 // staging order is unchanged.
-                self.binder
-                    .absorb_witnesses(&batch, &self.adapter, &mut *identity);
+                let gate = RetainedGate {
+                    adapter: &self.adapter,
+                    allowed: self.retained_fallback_allowed(&batch),
+                };
+                self.binder.absorb_witnesses(&batch, &gate, &mut *identity);
                 self.note_witness_batch(&batch);
                 self.record_witness_integrity(&batch);
                 // Counts merge before the binder's decisions stage, so a

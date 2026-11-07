@@ -189,6 +189,9 @@ impl Run {
     fn with_limits(limits: BinderLimits) -> Self {
         let domain = NativeDomainId::mint();
         let mut binder = NativeBinder::new(limits);
+        // Scripted scenes define their own clocks: comparable here,
+        // whatever time namespace the test host runs under.
+        binder.set_exit_clocks_comparable(true);
         binder.note_exec_coverage(ExecCoverage::scripted(domain, 0));
         Self {
             binder,
@@ -202,6 +205,7 @@ impl Run {
     fn covered_from(start_ns: u64) -> Self {
         let domain = NativeDomainId::mint();
         let mut binder = NativeBinder::new(BinderLimits::default());
+        binder.set_exit_clocks_comparable(true);
         binder.note_exec_coverage(ExecCoverage::scripted(domain, start_ns));
         Self {
             binder,

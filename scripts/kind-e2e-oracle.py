@@ -8,7 +8,8 @@ if sys.argv[1:] in (["--help"], ["-h"]):
     argparse.ArgumentParser(
         description="Kubernetes (kind) e2e oracle for scripts/kind-e2e.sh. Subcommands: "
         "profile-exact FILE ITERS [MODULE_SUFFIX], trace-exact FILE ITERS, "
-        "negative FILE ENTRY_LOG, inventory FILE --caller PID... --non-caller PID..., "
+        "negative FILE ENTRY_LOG, copy-up-neg FILE S_ITERS [MODULE_SUFFIX], "
+        "inventory FILE --caller PID... --non-caller PID..., "
         "pid-refusal STDERR STATUS PID REPORT_PRESENT, pid-probe FILE ITERS "
         "(diagnostic), --self-test; --expect-observer initial|nested applies the "
         "PID-numbering rules"
@@ -159,6 +160,52 @@ def trace_exact(text, iters, expect_observer=None):
 ENTRY_VISIBLE = re.compile(r"\((\d+) visible process\(es\), (\d+) with readable memory\)")
 
 
+def copy_up_neg(document, s_iters, module_suffix="/tmp/copyup/libsofthsm2.so", expect_observer=None):
+    """The kind copy-up negative: a genuine in-place rewrite blocks.
+
+    Side S maps the staged provider and ledgers S_ITERS; one unmapped
+    byte is rewritten in place (same inode), the settle lets the
+    observer's ticks see it, then side F maps the changed file and
+    ledgers. S's exact ledger counts on the one stale row; F is never
+    admitted as a second object — never silently rejoined — and the
+    provider_changed observation cause discloses the change. No
+    pre_copy_up marker: S was admitted normally before the change (the
+    marker belongs to witness-proven lower joins, the D1 shape). PID
+    numbering still applies (exact=False: the block adds its own cause
+    beside pidns).
+    """
+    evidence = document["evidence"]
+    numbering = check_numbering(evidence, expect_observer, exact=False)
+    assert document["capture"]["scope"] == "cgroup", document["capture"]["scope"]
+    paths = [m["path"] for m in document["capture"]["modules"]]
+    assert len(paths) == 1 and paths[0].endswith(module_suffix), paths
+    rows = [row for row in evidence["discovery"] if row["path"].endswith(module_suffix)]
+    assert len(rows) == 1, (rows, "F admitted as a second object")
+    assert rows[0].get("layer") is None, (rows, "stale row carries a layer marker")
+    identity = ((rows[0]["dev"][0], rows[0]["dev"][1]), rows[0]["ino"], rows[0]["sha256"])
+    for name in sorted(LEDGER_FUNCTIONS):
+        named = [row for row in document["functions"]
+                 if row.get("names") == [name] and row["calls"]]
+        assert named, (name, "stale ledger missing")
+        assert sum(row["calls"] for row in named) == s_iters, (name, named, s_iters)
+        assert all(row["errors"] == 0 for row in named), (name, named)
+        for row in named:
+            module = row["module"]
+            assert ((module["dev"][0], module["dev"][1]), module["ino"],
+                    module["sha256"]) == identity, (name, row)
+    assert evidence["attached_probes"] > 0, evidence["attached_probes"]
+    assert evidence["event_loss"] == 0, evidence["event_loss"]
+    assert evidence["in_flight_at_end"] == 0, evidence["in_flight_at_end"]
+    assert "provider_changed" in set(evidence["gap_classes"]["observation"]["causes"]), \
+        (evidence["gap_classes"]["observation"], "in-place rewrite not disclosed")
+    return {
+        "calls": s_iters * len(LEDGER_FUNCTIONS),
+        "modules": paths,
+        "skipped_rows": len(evidence["skipped"]),
+        "pid_namespace_causes": numbering,
+    }
+
+
 def negative(document, entry_log, expect_observer=None):
     """A pod that maps no provider yields no module and no counted call, and
     its processes were provably seen: k8s-profile-entry reports at least one
@@ -291,6 +338,28 @@ def good_inventory():
     }
 
 
+def good_copy_up_neg(s_iters=400, path="/tmp/copyup/libsofthsm2.so"):
+    identity = {"dev": [0, 45], "ino": 1234, "sha256": "aa" * 32}
+    return {
+        "capture": {"scope": "cgroup", "modules": [{"path": path}]},
+        "evidence": {
+            "attached_probes": 136,
+            "event_loss": 0,
+            "in_flight_at_end": 0,
+            "verdict_detail": "concrete_gap",
+            "pid_namespace": {"observer": "nested", "kernel_pids": "initial", "proc_pids": "observer"},
+            "gap_classes": {"observation": {"causes": ["pid_namespace", "provider_changed"], "status": "lossy"}},
+            "discovery": [
+                {"path": path, **identity},
+            ],
+            "skipped": [{"name": "C_GenerateRandom", "reason": "provider file changed during capture"}],
+        },
+        "functions": [{"calls": s_iters, "errors": 0, "names": [n], "module": dict(identity)}
+                      for n in sorted(LEDGER_FUNCTIONS)]
+        + [{"calls": 0, "errors": 0, "names": ["C_Login"], "module": None}],
+    }
+
+
 def nested(document):
     """The same document as a nested observer (kind) publishes it."""
     nested_doc = copy.deepcopy(document)
@@ -406,6 +475,32 @@ def self_test():
         '"verdict_detail": "attribution_only"', '"verdict_detail": "concrete_gap"')
     trace_exact(nested_trace, 2, expect_observer="nested")
     refuses("nested trace claims initial", lambda: trace_exact(good_trace(), 2, expect_observer="nested"))
+    copy_up_neg(good_copy_up_neg(), 400, expect_observer="nested")
+    leaked = good_copy_up_neg()
+    leaked["functions"][0]["calls"] = 650  # F's ledger leaked onto the stale row
+    admitted = good_copy_up_neg()
+    admitted["evidence"]["discovery"].append(dict(admitted["evidence"]["discovery"][0]))
+    admitted["capture"]["modules"].append(dict(admitted["capture"]["modules"][0]))
+    for label, document, iters in [
+        ("fresh calls leaked", leaked, 400),
+        ("F admitted", admitted, 400),
+        ("wrong ledger", good_copy_up_neg(), 401),
+        ("no provider_changed", mutate(good_copy_up_neg(),
+            ["evidence", "gap_classes", "observation"], {"causes": ["pid_namespace"], "status": "lossy"}), 400),
+        ("stale row marked", mutate(good_copy_up_neg(),
+            ["evidence", "discovery", 0, "layer"], "pre_copy_up"), 400),
+        ("no module", mutate(good_copy_up_neg(), ["capture", "modules"], []), 400),
+        ("wrong module", mutate(good_copy_up_neg(), ["capture", "modules"],
+            [{"path": "/usr/lib/libother.so"}]), 400),
+        ("row misattributed", mutate(good_copy_up_neg(), ["functions", 0, "module", "ino"], 9999), 400),
+        ("row errors", mutate(good_copy_up_neg(), ["functions", 0, "errors"], 1), 400),
+        ("no probes", mutate(good_copy_up_neg(), ["evidence", "attached_probes"], 0), 400),
+        ("event loss", mutate(good_copy_up_neg(), ["evidence", "event_loss"], 3), 400),
+    ]:
+        refuses(label, lambda d=document, i=iters: copy_up_neg(d, i, expect_observer="nested"))
+    refuses("copy-up-neg claims initial", lambda: copy_up_neg(
+        mutate(good_copy_up_neg(), ["evidence", "pid_namespace", "observer"], "initial"), 400,
+        expect_observer="nested"))
     nested_empty = nested(empty)
     negative(nested_empty, seen, expect_observer="nested")
     refuses("nested negative without cause", lambda: negative(empty, seen, expect_observer="nested"))
@@ -456,6 +551,8 @@ def main(argv):
         elif command == "negative":
             with open(rest[0], encoding="utf-8") as handle:
                 result = negative(document, handle.read(), expect_observer)
+        elif command == "copy-up-neg":
+            result = copy_up_neg(document, int(rest[0]), *rest[1:2], expect_observer=expect_observer)
         elif command == "pid-probe":
             # Record-only: never an "ok" line, never counted as a passed check.
             print(json.dumps({"check": command, "record_only": True, **pid_probe(document, int(rest[0]))}, sort_keys=True))

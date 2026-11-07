@@ -30,6 +30,15 @@
 #             printed pid belongs to
 #   negative  the idle pod (SoftHSM2 on disk, never mapped): no module, no
 #             call, and its processes provably visible and readable
+#   copy-up-neg (F11) the ledger-c pod stages the provider into its own
+#             writable layer, side S maps and ledgers 400, one unmapped
+#             byte is rewritten in place (same inode: a genuine change,
+#             never a copy-up), and side F maps the changed file after an
+#             8 s settle and ledgers 250. The spanning capture must count
+#             exactly 6 x 400 on the one stale row, never admit F as a
+#             second object, and disclose provider_changed (the oracle
+#             subcommand is copy-up-neg; the module suffix is the staged
+#             path /tmp/copyup/libsofthsm2.so)
 #   inventory `inventory --system`: every ledger pod is a caller of the
 #             provider; the idle pod is scanned with no edge
 #   pid-probe `profile --pid <pid as the observer sees it>` is refused with
@@ -175,6 +184,51 @@ ledger_is() {
     rm -f "$ledger_tmp"
 }
 
+# Two complete gated JSON ledgers: side S ran 6x$2, side F 6x$3, in that
+# order (the copy-up negative pod runs both sides through one gate).
+ledgers2_check() {
+    python3 -I - "$1" "$2" "$3" <<'PY'
+import json, sys
+ready = 0
+ledgers = []
+for line in open(sys.argv[1]).read().splitlines():
+    if line.startswith("READY "):
+        ready += 1
+    elif line.startswith("LEDGER "):
+        ledgers.append(json.loads(line[len("LEDGER "):]))
+if ready != 2 or len(ledgers) != 2:
+    raise SystemExit(f"want 2 READY and 2 LEDGER, got {ready} and {len(ledgers)}")
+for ledger, iters in zip(ledgers, (int(sys.argv[2]), int(sys.argv[3]))):
+    if ledger.get("schema") != "p11scope/public-cli-ledger/v1":
+        raise SystemExit("bad ledger schema")
+    if ledger.get("complete") is not True:
+        raise SystemExit("ledger incomplete")
+    functions = ledger.get("functions")
+    if not isinstance(functions, list) or len(functions) != 6:
+        raise SystemExit("want 6 ledger functions")
+    for row in functions:
+        if row.get("attempts") != iters or row.get("successful") != iters:
+            raise SystemExit(f"ledger row is not 6x{iters}: {row}")
+    if len({row.get("name") for row in functions}) != 6:
+        raise SystemExit("ledger function names are not distinct")
+PY
+}
+
+ledgers2_is() {
+    ledger_tmp=$(mktemp "${TMPDIR:-/tmp}/p11scope-kind-ledger-XXXXXX") || return 1
+    kc -n "$WL_NS" logs "$1" > "$ledger_tmp" || {
+        rm -f "$ledger_tmp"
+        return 1
+    }
+    ledgers2_check "$ledger_tmp" "$2" "$3" || {
+        echo "$1 did not ledger 6x$2 then 6x$3" >&2
+        cat "$ledger_tmp" >&2
+        rm -f "$ledger_tmp"
+        return 1
+    }
+    rm -f "$ledger_tmp"
+}
+
 self_test() {
     python3 -I "$ORACLE" --self-test
     sh scripts/k8s-profile-entry.sh --self-test
@@ -190,6 +244,8 @@ self_test() {
         || { echo "deploy/k8s/00-namespace.yaml must sort first" >&2; exit 1; }
     [ "$(grep -c 'image: p11scope-holder:1$' deploy/k8s/e2e/workloads.yaml)" -eq 6 ] \
         || { echo "workloads.yaml lost an image anchor" >&2; exit 1; }
+    [ "$(grep -c 'image: p11scope-holder:1$' deploy/k8s/e2e/workloads-copyup.yaml)" -eq 1 ] \
+        || { echo "workloads-copyup.yaml lost its image anchor" >&2; exit 1; }
     for name in ok p11scope-e2e-1-2 a; do
         valid_cluster "$name" || { echo "valid_cluster rejected $name" >&2; exit 1; }
     done
@@ -299,6 +355,22 @@ self_test() {
         echo "missing tarball accepted" >&2; exit 1
     fi
     rm -rf "$tar_stub"
+    led2() {
+        printf '%s\n' "READY pid=$1" \
+            "LEDGER {\"schema\":\"p11scope/public-cli-ledger/v1\",\"pid\":$1,\"complete\":true,\"functions\":[{\"name\":\"C_GenerateRandom\",\"attempts\":$2,\"successful\":$2},{\"name\":\"C_DigestInit\",\"attempts\":$2,\"successful\":$2},{\"name\":\"C_Digest\",\"attempts\":$2,\"successful\":$2},{\"name\":\"C_FindObjectsInit\",\"attempts\":$2,\"successful\":$2},{\"name\":\"C_FindObjects\",\"attempts\":$2,\"successful\":$2},{\"name\":\"C_FindObjectsFinal\",\"attempts\":$2,\"successful\":$2}]}"
+    }
+    { led2 10 400; led2 11 250; } > "$ledger_stub/good2.log"
+    { led2 10 400; echo 'READY pid=11'; } > "$ledger_stub/half2.log"
+    { led2 10 250; led2 11 400; } > "$ledger_stub/swapped2.log"
+    LEDGER_STUB_LOG=$ledger_stub/good2.log
+    ledgers2_is stub-pod 400 250 || { echo "good double LEDGER refused" >&2; exit 1; }
+    for bad in half2 swapped2 good missing; do
+        LEDGER_STUB_LOG=$ledger_stub/$bad.log
+        if ledgers2_is stub-pod 400 250 >/dev/null 2>&1; then
+            echo "bad double LEDGER accepted: $bad" >&2
+            exit 1
+        fi
+    done
     rm -rf "$ledger_stub"
     trap - EXIT
     echo "kind-e2e self-test: OK"
@@ -453,6 +525,7 @@ cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
 cp LICENSE COPYRIGHT "$OCTX/"
 cp -r LICENSES "$OCTX/"
 cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
+cp tests/fixtures/public-cli/patch-unmapped.c "$HCTX/tests/fixtures/public-cli/"
 cp deploy/holder-entry.sh "$HCTX/deploy/"
 sha256sum "$OBSERVER_BIN" | tee "$WORK/observer.sha256"
 
@@ -500,6 +573,10 @@ grep -q "image: $OBS_IMAGE" "$DAEMONSET"
 kc apply -f "$MANIFESTS/k8s/"
 sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" deploy/k8s/e2e/workloads.yaml > "$MANIFESTS/workloads.yaml"
 kc apply -f "$MANIFESTS/workloads.yaml"
+sed "s#image: p11scope-holder:1\$#image: $HOLD_IMAGE#" deploy/k8s/e2e/workloads-copyup.yaml > "$MANIFESTS/workloads-copyup.yaml"
+[ "$(grep -c "image: $HOLD_IMAGE" "$MANIFESTS/workloads-copyup.yaml")" -eq 1 ] \
+    || { echo "workloads-copyup render lost its image anchor" >&2; exit 1; }
+kc apply -f "$MANIFESTS/workloads-copyup.yaml"
 kc -n "$OBS_NS" rollout status daemonset/p11scope-observer --timeout=240s
 kc -n "$WL_NS" wait --for=condition=Ready pod --all --timeout=240s
 
@@ -514,7 +591,7 @@ wait_log() {
     kc -n "$WL_NS" logs "$1" >&2 || true
     return 1
 }
-for pod in ledger-a ledger-b ledger-p ledger-t ledger-n; do
+for pod in ledger-a ledger-b ledger-p ledger-t ledger-n ledger-c; do
     wait_log "$pod" '^READY ' 120
 done
 
@@ -639,6 +716,7 @@ UID_B=$(pod_uid ledger-b)
 UID_P=$(pod_uid ledger-p)
 UID_T=$(pod_uid ledger-t)
 UID_IDLE=$(pod_uid idle)
+UID_C=$(pod_uid ledger-c)
 
 echo "=== doctor in the observer pod ==="
 lock_step
@@ -713,6 +791,21 @@ T_PRINTED=$(printf '%s' "$TRACE" | python3 -I -c 'import json,sys; print(json.lo
 case $T_HOST in ''|*[!0-9]*) T_HOST=null ;; esac
 if [ "$T_PRINTED" = "$T_NODE" ]; then T_NS=observer; elif [ "$T_PRINTED" = "$T_HOST" ]; then T_NS=initial; else T_NS=unknown; fi
 record "{\"check\": \"trace-pid-namespace\", \"record_only\": true, \"printed\": $T_PRINTED, \"observer_view\": $T_NODE, \"host_view\": $T_HOST, \"printed_namespace\": \"$T_NS\"}"
+
+echo "=== copy-up-neg: a genuine in-place change blocks and is disclosed ==="
+# ledger-c runs side S (400), rewrites one unmapped byte in place, settles
+# 8 s so the observer's ticks see the change, then runs side F (250) on
+# the changed file. The window must cover both ledgers plus the settle.
+lock_step
+start_capture copy-up-neg k8s-profile-entry --pod-uid "$UID_C" -- \
+    --duration 60 -o /tmp/copy-up-neg.json
+wait_ready copy-up-neg "$CAPTURE_PID"
+release ledger-c
+finish_capture copy-up-neg json "$CAPTURE_PID"
+unlock_step
+ledgers2_is ledger-c 400 250
+RESULT=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" copy-up-neg "$WORK/copy-up-neg.json" 400 /tmp/copyup/libsofthsm2.so)
+record "$RESULT"
 
 echo "=== negative: the idle pod maps no provider ==="
 lock_step

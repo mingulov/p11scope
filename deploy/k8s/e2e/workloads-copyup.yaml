@@ -1,0 +1,29 @@
+# Test-only workload for the kind copy-up negative cell (scripts/kind-e2e.sh
+# only: the shared workloads.yaml stays exactly the set every kind cell
+# applies). Side S maps the staged provider and ledgers 400, one unmapped
+# byte is rewritten in place (same inode: a genuine change, never a
+# copy-up), and side F maps the changed file after an 8 s settle and
+# ledgers 250. The spanning capture must count exactly 6 x 400 on the
+# one stale row, never admit F as a second object, and disclose
+# provider_changed.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ledger-c
+  namespace: p11scope-e2e
+  labels:
+    app.kubernetes.io/name: p11scope
+    app.kubernetes.io/component: e2e-workload
+spec:
+  restartPolicy: Never
+  automountServiceAccountToken: false
+  terminationGracePeriodSeconds: 5
+  containers:
+    - name: workload
+      image: p11scope-holder:1
+      imagePullPolicy: Never
+      args: ["copy-up", "400", "250", "8"]
+      resources:
+        limits:
+          cpu: 500m
+          memory: 128Mi

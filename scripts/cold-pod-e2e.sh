@@ -668,6 +668,7 @@ build_images() {
     cp LICENSE COPYRIGHT "$OCTX/"
     cp -r LICENSES "$OCTX/"
     cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
+cp tests/fixtures/public-cli/patch-unmapped.c "$HCTX/tests/fixtures/public-cli/"
     cp deploy/holder-entry.sh "$HCTX/deploy/"
     timeout --signal=TERM --kill-after=10s 1200s \
         docker build -q -f "$OBSERVER_DOCKERFILE" -t "$OBS_IMAGE" "$OCTX" || return 1

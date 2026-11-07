@@ -17,6 +17,17 @@
 #                               like a vendor library only its application can
 #                               read: the observer then needs CAP_DAC_READ_SEARCH
 #                               to open it through /proc/<pid>/root.
+#   holder-entry copy-up S_ITERS F_ITERS SETTLE_SECS
+#                               the kind copy-up negative: stage the provider
+#                               into the container's own writable layer, map it
+#                               (side S), and hold at /tmp/gate. After release
+#                               S ledgers, one unmapped byte is rewritten in
+#                               place (same inode: a genuine change, not a
+#                               copy-up), the settle delay lets the observer's
+#                               ticks see it, then side F maps the changed file
+#                               and ledgers. Each side's READY/LEDGER block is
+#                               printed once its ledger completes, so the pod
+#                               log carries exactly two of each.
 #   holder-entry idle           sleep forever without mapping any provider (the
 #                               negative control: SoftHSM2 is on disk, unused).
 #   holder-entry --self-test    argument checks only.
@@ -24,9 +35,10 @@ set -eu
 
 MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 GATED=${HOLDER_GATED:-/usr/local/bin/p11scope-ledger-gated}
+PATCHER=${HOLDER_PATCH_UNMAPPED:-/usr/local/bin/p11scope-patch-unmapped}
 
 usage() {
-    echo "usage: holder-entry ledger|ledger-private ITERS | holder-entry idle | holder-entry --self-test" >&2
+    echo "usage: holder-entry ledger|ledger-private ITERS | holder-entry copy-up S F SECS | holder-entry idle | holder-entry --self-test" >&2
     exit 2
 }
 
@@ -37,10 +49,20 @@ valid_iters() {
     esac
 }
 
+valid_secs() {
+    case $1 in
+        ''|*[!0-9]*|0*) return 1 ;;
+        *) [ "$1" -ge 1 ] && [ "$1" -le 120 ] ;;
+    esac
+}
+
 if [ "${1-}" = --self-test ]; then
     for bad in "" "ledger" "ledger 0" "ledger -1" "ledger 01" "ledger x" \
                "ledger 12345678" "ledger 5 extra" "idle extra" "bogus" \
-               "ledger-private" "ledger-private 0" "ledger-private 5 extra"; do
+               "ledger-private" "ledger-private 0" "ledger-private 5 extra" \
+               "copy-up" "copy-up 1" "copy-up 1 2" "copy-up 0 2 3" \
+               "copy-up 1 0 3" "copy-up 1 2 0" "copy-up 01 2 3" \
+               "copy-up 1 2 121" "copy-up 1 2 x" "copy-up 1 2 3 extra"; do
         status=0
         # shellcheck disable=SC2086
         sh "$0" $bad >/dev/null 2>&1 || status=$?
@@ -60,6 +82,15 @@ case ${1-} in
         valid_iters "$2" || usage
         ITERS=$2
         ;;
+    copy-up)
+        [ "$#" -eq 4 ] || usage
+        valid_iters "$2" || usage
+        valid_iters "$3" || usage
+        valid_secs "$4" || usage
+        S_ITERS=$2
+        F_ITERS=$3
+        SETTLE=$4
+        ;;
     *) usage ;;
 esac
 
@@ -78,5 +109,39 @@ if [ "$1" = ledger-private ]; then
     cp "$MODULE" /tmp/private/libsofthsm2.so
     chmod 0500 /tmp/private/libsofthsm2.so
     MODULE=/tmp/private/libsofthsm2.so
+fi
+if [ "$1" = copy-up ]; then
+    # A fresh upper file (not a copy-up of the lower): the later rewrite
+    # lands in place on this same inode.
+    rm -rf /tmp/copyup
+    mkdir /tmp/copyup
+    cp "$MODULE" /tmp/copyup/libsofthsm2.so
+    MODULE=/tmp/copyup/libsofthsm2.so
+    run_side() {
+        # Tee: the driver's READY/LEDGER waits read the pod log live
+        # while the entry polls the file. gated flushes every line, so
+        # no block buffering hides one; if gated dies the tee exits and
+        # the liveness check below fails the side loudly.
+        rm -f "$1"
+        "$GATED" "$MODULE" "$2" 200 /tmp/gate 2>&1 | tee "$1" &
+        side_pid=$!
+        i=0
+        while ! grep -q '^LEDGER ' "$1" 2>/dev/null; do
+            kill -0 "$side_pid" 2>/dev/null || {
+                echo "gated side died before its ledger" >&2
+                cat "$1" >&2
+                exit 1
+            }
+            i=$((i + 1))
+            [ "$i" -lt 1200 ] || { echo "gated side never ledgered" >&2; exit 1; }
+            sleep 0.5
+        done
+    }
+    run_side /tmp/s.log "$S_ITERS"
+    "$PATCHER" "$MODULE" || exit 1
+    sleep "$SETTLE"
+    run_side /tmp/f.log "$F_ITERS"
+    echo "COPYUP sides complete"
+    exec sleep infinity
 fi
 exec "$GATED" "$MODULE" "$ITERS" 200 /tmp/gate

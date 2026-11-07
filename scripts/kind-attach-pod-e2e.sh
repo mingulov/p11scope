@@ -837,6 +837,7 @@ build_holder() {
     HCTX=$WORK/context-holder
     mkdir -p "$HCTX/tests/fixtures/public-cli" "$HCTX/deploy"
     cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
+cp tests/fixtures/public-cli/patch-unmapped.c "$HCTX/tests/fixtures/public-cli/"
     cp deploy/holder-entry.sh "$HCTX/deploy/"
     timeout --signal=TERM --kill-after=10s 1200s \
         docker build -q -f "$HOLDER_DOCKERFILE" -t "$HOLD_IMAGE" "$HCTX" || return 1

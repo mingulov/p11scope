@@ -13,7 +13,9 @@ FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94c
 RUN apt-get update && apt-get install -y --no-install-recommends gcc libc6-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY tests/fixtures/public-cli/gated.c /src/gated.c
-RUN gcc -O1 -o /src/gated /src/gated.c -ldl
+COPY tests/fixtures/public-cli/patch-unmapped.c /src/patch-unmapped.c
+RUN gcc -O1 -o /src/gated /src/gated.c -ldl && \
+    gcc -O1 -o /src/patch-unmapped /src/patch-unmapped.c
 
 FROM ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e
 # hadolint ignore=DL3008 # Test holder tracks the pinned Ubuntu 26.04 repository; package versions vary by architecture.
@@ -21,8 +23,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends softhsm2 \
     && rm -rf /var/lib/apt/lists/* \
     && test -f /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 COPY --from=build /src/gated /usr/local/bin/p11scope-ledger-gated
+COPY --from=build /src/patch-unmapped /usr/local/bin/p11scope-patch-unmapped
 COPY deploy/holder-entry.sh /usr/local/bin/holder-entry
 RUN chmod 0755 /usr/local/bin/holder-entry /usr/local/bin/p11scope-ledger-gated \
+    /usr/local/bin/p11scope-patch-unmapped \
     && /usr/local/bin/holder-entry --self-test
 ENTRYPOINT ["/usr/local/bin/holder-entry"]
 CMD ["idle"]

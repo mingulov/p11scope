@@ -11,7 +11,8 @@
 # report READY, run `inventory --system --key-operations --caller-metadata
 # cgroup` on the host, print the concise output, and check that it carries
 # one caller line per demo container with its own `container <12hex>
-# (docker)` label and a positive call count. Respects DOCKER_HOST, so a
+# (docker, cgroup hint)` label and a positive call count. Respects
+# DOCKER_HOST, so a
 # private daemon works. Removes its containers afterwards unless --keep;
 # the image is kept for fast reruns. Exit 2 before any capture when a tool
 # is missing, exit 1 when the capture or the label check fails.
@@ -52,10 +53,15 @@ case $OBSERVER in
     */*) [ -x "$OBSERVER" ] \
         || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; } ;;
     *) command -v "$OBSERVER" >/dev/null 2>&1 \
-        || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; } ;;
+        || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; }
+        # Resolve a bare name now: sudo does not share our PATH, so the
+        # later sudo invocation must use the absolute path we verified.
+        OBSERVER=$(command -v "$OBSERVER") ;;
 esac
 sudo -n true >/dev/null 2>&1 \
     || { echo "demo: this demo needs passwordless sudo for the host capture" >&2; exit 2; }
+sudo -n "$OBSERVER" --version >/dev/null 2>&1 \
+    || { echo "demo: cannot run $OBSERVER via passwordless sudo; pass --observer PATH to a sudo-runnable p11scope binary" >&2; exit 2; }
 docker info >/dev/null 2>&1 \
     || { echo "demo: cannot reach the docker daemon; start Docker or set DOCKER_HOST, then rerun this script" >&2; exit 2; }
 
@@ -318,7 +324,7 @@ for ctr in "$CTR_A" "$CTR_B"; do
     id=$(docker inspect --format '{{.Id}}' "$ctr" 2>/dev/null) \
         || { echo "demo: cannot inspect $ctr" >&2; exit 1; }
     prefix=$(printf '%s' "$id" | cut -c1-12)
-    line=$(grep -F "container $prefix (docker)" "$OUT/capture.txt" | head -1) || line=
+    line=$(grep -F "container $prefix (docker, cgroup hint)" "$OUT/capture.txt" | head -1) || line=
     if [ -z "$line" ]; then
         echo "demo: no caller line for $ctr (container $prefix)" >&2
         fail=1

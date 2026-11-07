@@ -12,8 +12,9 @@
 # signing pods, wait for both to report READY, run `inventory --system
 # --key-operations --caller-metadata cgroup` on the host, print the concise
 # output, and check that it carries one caller line per demo pod with its own
-# `pod <8hex> / container <12hex>` label and a positive call count, matched
-# against live `kubectl` pod UIDs and container IDs. Respects DOCKER_HOST, so
+# `pod <8hex> / container <12hex> (cgroup hint)` label and a positive call
+# count, matched against live `kubectl` pod UIDs and container IDs. Respects
+# DOCKER_HOST, so
 # a private daemon works. Removes its cluster afterwards unless --keep; the
 # image is kept for fast reruns. Exit 2 before any capture when a tool is
 # missing, exit 1 when the capture or the label check fails.
@@ -60,10 +61,15 @@ case $OBSERVER in
     */*) [ -x "$OBSERVER" ] \
         || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; } ;;
     *) command -v "$OBSERVER" >/dev/null 2>&1 \
-        || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; } ;;
+        || { echo "demo: p11scope not found; pass --observer PATH to the p11scope binary, then rerun this script" >&2; exit 2; }
+        # Resolve a bare name now: sudo does not share our PATH, so the
+        # later sudo invocation must use the absolute path we verified.
+        OBSERVER=$(command -v "$OBSERVER") ;;
 esac
 sudo -n true >/dev/null 2>&1 \
     || { echo "demo: this demo needs passwordless sudo for the host capture" >&2; exit 2; }
+sudo -n "$OBSERVER" --version >/dev/null 2>&1 \
+    || { echo "demo: cannot run $OBSERVER via passwordless sudo; pass --observer PATH to a sudo-runnable p11scope binary" >&2; exit 2; }
 docker info >/dev/null 2>&1 \
     || { echo "demo: cannot reach the docker daemon; start Docker or set DOCKER_HOST, then rerun this script" >&2; exit 2; }
 
@@ -289,9 +295,12 @@ export KUBECONFIG="$KUBECONFIG_FILE"
 
 LOOP_SECS=$((DURATION + 120))
 echo "demo: creating kind cluster $CLUSTER ..." >&2
+# Arm cleanup before creating: the name was proven free above, so any
+# cluster with this name at cleanup time is ours, even if this create is
+# interrupted after the API accepts it.
+CLUSTER_CREATED=1
 kind create cluster --name "$CLUSTER" --kubeconfig "$KUBECONFIG_FILE" --wait 180s >&2 \
     || { echo "demo: kind create failed" >&2; exit 1; }
-CLUSTER_CREATED=1
 kind load docker-image "$IMAGE" --name "$CLUSTER" >&2 \
     || { echo "demo: kind load failed" >&2; exit 1; }
 
@@ -363,7 +372,7 @@ for pod in "$POD_A" "$POD_B"; do
     case $cid in ''|*[!0-9a-f]*) echo "demo: bad container ID for $pod" >&2; exit 1 ;; esac
     pod8=$(printf '%s' "$uid" | cut -c1-8)
     ctr12=$(printf '%s' "$cid" | cut -c1-12)
-    line=$(grep -F "pod $pod8 / container $ctr12" "$OUT/capture.txt" | head -1) || line=
+    line=$(grep -F "pod $pod8 / container $ctr12 (cgroup hint)" "$OUT/capture.txt" | head -1) || line=
     if [ -z "$line" ]; then
         echo "demo: no caller line for $pod (pod $pod8 / container $ctr12)" >&2
         fail=1

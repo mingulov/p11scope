@@ -146,7 +146,14 @@ pub(crate) fn init_slot_for_shed(
     slot_index: u32,
     endpoint: &crate::semantic_capture::Endpoint,
 ) -> bool {
-    let Some(slot) = plan.slots.iter().find(|slot| slot.index == slot_index) else {
+    // Plan slots are dense (index == position, enforced by
+    // construction), so the lookup is positional, not a scan: shed
+    // storms must not pay per-slot work per call.
+    let Some(slot) = plan
+        .slots
+        .get(slot_index as usize)
+        .filter(|slot| slot.index == slot_index)
+    else {
         return false;
     };
     if slot.object != endpoint.object || slot.file_offset != endpoint.offset {

@@ -18,7 +18,7 @@ use crate::discovery::caller_registry::instance_input::{
     RegistryInstanceId, admit_call_from_evidence, admit_registration_from_coverage,
     finalize_invalidation, tail_loss_from_negative,
 };
-use crate::discovery::caller_registry::{CallerLifecycle, ModuleLifecycle};
+use crate::discovery::caller_registry::{CallerLifecycle, ModuleLifecycle, module_init};
 use crate::discovery::instances::{MAX_INSTANCES, MAX_PENDING, Route};
 #[cfg(test)]
 use crate::discovery::native_binding::CallerLookup;
@@ -3707,6 +3707,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // Images whose shed calls proved another caller: the Joint journal
         // refuses them so their staging never holds a bound key's seal.
         let mut refuse_images: BTreeSet<(u64, u64)> = BTreeSet::new();
+        // Shed-tap module resolutions cached per batch: one registry
+        // scan per endpoint object, not per shed call.
+        let mut init_objects: BTreeMap<PinnedObjectId, Option<ModuleId>> = BTreeMap::new();
         for outcome in outcomes.into_iter().chain(validation_outcomes) {
             match outcome {
                 TickOutcome::Call(call) => {
@@ -3745,6 +3748,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     let call_image = call.image();
                     let cookie = call_image.task_cookie;
                     let call_pid = (call.record().event.pid_tgid >> 32) as u32;
+                    // A shed `C_Initialize` still proves its module
+                    // through its endpoint: read the tap facts before
+                    // the consuming conversion below.
+                    let shed_init = match (shed_reason.is_some(), call.endpoint()) {
+                        (true, Some(endpoint)) => {
+                            let event = &call.record().event;
+                            Some((endpoint, event.slot, event.rv))
+                        }
+                        _ => None,
+                    };
                     match CallEvidence::from_routed(call) {
                         Some(evidence) => {
                             if calls.len() < MAX_INSTANCES {
@@ -3759,6 +3772,24 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         // Unjoined routes never stage: their positions
                         // are undisposable, so they shed.
                         None => {
+                            // The shed tap reads the shed without
+                            // consuming its disclosure: a proven
+                            // `C_Initialize` probe counts its return on
+                            // the endpoint's module.
+                            if let Some((endpoint, slot, rv)) = shed_init
+                                && module_init::init_slot_for_shed(
+                                    lane.subset().plan(),
+                                    slot,
+                                    &endpoint,
+                                )
+                                && let Some(module) = self.init_module_for_object(
+                                    lane.subset(),
+                                    endpoint.object,
+                                    &mut init_objects,
+                                )
+                            {
+                                self.registry.note_module_init(module, rv);
+                            }
                             // JK-18: before the first binding, a positioned
                             // call with a known image is disclosed and
                             // counted as today, but only its barrier is
@@ -4092,6 +4123,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         lane.note_conversion_barrier(barrier);
         calls.sort_by_key(CallEvidence::token);
         let subset = lane.subset();
+        // Joined init taps collected across conversion, applied
+        // below: the map borrows the registry it would tap.
+        let mut init_taps: Vec<(ModuleId, u64)> = Vec::new();
         let staged: Vec<(
             Option<CallerId>,
             u64,
@@ -4127,13 +4161,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     Some(coverage) => CallStanding::Current(coverage),
                     None => CallStanding::Historical(InstanceReason::SemanticLoss),
                 };
-                (
-                    Some(caller),
-                    token,
-                    admit_call_from_evidence(evidence, binding, subset, standing, barrier),
-                )
+                let converted =
+                    admit_call_from_evidence(evidence, binding, subset, standing, barrier);
+                // A converted `C_Initialize` taps the module roll-up:
+                // conversion proved the caller binding, the attested
+                // slot name and the provider module.
+                if let Ok(admitted) = converted.as_ref()
+                    && admitted.s1_facts().function == module_init::C_INITIALIZE
+                    && let Some(module) = self.registry.module_id_for(admitted.provider_module())
+                {
+                    init_taps.push((module, admitted.s1_facts().rv));
+                }
+                (Some(caller), token, converted)
             })
             .collect();
+        for (module, rv) in init_taps {
+            self.registry.note_module_init(module, rv);
+        }
         Some(PreparedSemanticBatch::new(
             domain,
             staged.into_iter().map(PreparedAdmission::new).collect(),
@@ -4202,6 +4246,27 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// honest absence wording exist only past the seal.
     pub(crate) fn note_semantic_sealed(&mut self) {
         self.registry.set_semantic_sealed();
+    }
+
+    /// Resolve a shed endpoint's object to its registry module
+    /// through the conversion predicate (physical key plus retained
+    /// digest), cached per batch in `cache`.
+    fn init_module_for_object(
+        &self,
+        subset: &AttestedSubset,
+        object: PinnedObjectId,
+        cache: &mut BTreeMap<PinnedObjectId, Option<ModuleId>>,
+    ) -> Option<ModuleId> {
+        if let Some(known) = cache.get(&object) {
+            return *known;
+        }
+        let module = self
+            .registry
+            .modules()
+            .find(|record| subset.proves_provider_module(object, &record.key))
+            .map(|record| record.id);
+        cache.insert(object, module);
+        module
     }
 }
 

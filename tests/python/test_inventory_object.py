@@ -167,10 +167,12 @@ class ActualInventoryTests(unittest.TestCase):
                         and elf.symbols[info >> 32][0] == "PID_FILTER"):
                     self.assertEqual(info & 0xffffffff, 1)
                     locations.append(row[4] + offset + 8)
-        # Two PID_FILTER reads inside authorization: the PID arm's token
-        # plus the run-tree cgroup arm's owned-child token (scope_auth in
-        # crates/ebpf/src/main.rs). Each site redirected to USAGE must fail.
-        self.assertEqual(len(locations), 2)
+        # One PID_FILTER read inside authorization: the PID arm's
+        # token. The run-tree cgroup arm's owned-child token (scope_auth
+        # in crates/ebpf/src/main.rs) compiles only for non-inventory
+        # builds, so the inventory object keeps the single pre-run-tree
+        # site. Each site redirected to USAGE must fail.
+        self.assertEqual(len(locations), 1)
         for location in locations:
             changed = bytearray(body)
             struct.pack_into("<Q", changed, location, (usage << 32) | 1)

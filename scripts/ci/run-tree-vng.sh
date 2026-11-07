@@ -73,9 +73,27 @@ q() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+# Owned runs drop to the harness-declared invoker (the
+# qualify-public-cli.sh RUNUID/RUNGID precedent): the guest has no
+# sudo session, so bake the invoking ids into the guest script as
+# SUDO_UID/SUDO_GID. The observer still validates them against the
+# shared passwd database and refuses anything unresolvable. A root
+# invoker names no non-root account: refuse here instead of baking
+# SUDO_UID=0 for the cells to refuse.
+RUNUID=$(id -u) || exit 2
+RUNGID=$(id -g) || exit 2
+case "$RUNUID:$RUNGID" in
+    0:*|*:0)
+        echo "run-tree-vng.sh: run unprivileged so the guest cells have a non-root drop target (got $RUNUID:$RUNGID)" >&2
+        exit 2
+        ;;
+esac
+
 {
     printf '#!/bin/sh\nset -u\n'
     printf 'OUT=%s\nTESTBIN=%s\nRUNNER=%s\n' "$(q "$OUT")" "$(q "$TESTBIN")" "$(q "$RUNNER")"
+    printf '# The guest has no sudo session: the harness-baked drop target.\n'
+    printf 'export SUDO_UID=%s SUDO_GID=%s\n' "$(q "$RUNUID")" "$(q "$RUNGID")"
     cat <<'INNER_EOF'
 uname -r > "$OUT/uname.txt"
 [ "$(id -u)" = 0 ] || { echo "guest root required"; exit 2; }

@@ -17667,9 +17667,9 @@ fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
     );
 }
 
-/// Real-pipeline 1024/1025 through the owner's ledger: 1024 Joint calls
+/// Real-pipeline 4096/4097 through the owner's ledger: 4096 Joint calls
 /// observed and committed stage into the capture owner's ledger (census
-/// 1024, bytes exact, pool delta exact); the 1025th refuses Full and the
+/// 4096, bytes exact, pool delta exact); the 4097th refuses Full and the
 /// feed falls back in order (C4) — replayed S1-direct, staged charges
 /// released exactly, no residue from the refused call. An S1Only-direct
 /// twin (same facts, same order, teed under the same capture-wide latch)
@@ -17677,7 +17677,7 @@ fn joint_capture_owner_adapter_origins_survive_the_owner_bridge() {
 /// identical key-use rows, and joint observations still unavailable
 /// (no invented object facts) before and after the fallback.
 #[test]
-fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
+fn joint_capture_owner_pipeline_stages_4096_then_full_falls_back_exact() {
     use crate::discovery::caller_registry::OsProcessSource;
     use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
     use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, REDUCER_BASE_CHARGE};
@@ -17698,7 +17698,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
                 Vec::new(),
                 vec![],
                 OsProcessSource,
-                RegistryLimits::new(16, 16, 16, 1024, 1024, 16).expect("generous limits"),
+                RegistryLimits::new(16, 16, 16, 4096, 4096, 16).expect("generous limits"),
             )
             .expect("coordinator builds")
         }
@@ -17829,7 +17829,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         .semantic_resource_snapshot()
         .charged_bytes;
 
-    // Round 0 pins the per-call staged bytes; the remaining 1023
+    // Round 0 pins the per-call staged bytes; the remaining 4095
     // observations batch into one commit (loop shape is free; the
     // refusal-twin exactness below is not). Each round runs its own
     // session, so every replayed init opens genuinely (same-session
@@ -17884,7 +17884,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         - (bytes_one as usize + OWNED_ALLOCATION_PADDING);
     assert!(main_table_prepay > 0, "round 0 prepays the owner table");
 
-    for round in 1..1024 {
+    for round in 1..4096 {
         let (facts, position) = main.admit(Some(SESSION + round));
         let (twin_facts, twin_position) = twin.admit(Some(SESSION + round));
         assert_eq!(position, twin_position, "lockstep admissions agree");
@@ -17895,14 +17895,14 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     twin.commit();
     assert_eq!(
         main.coordinator.joint_capture().ledger().census(),
-        1024,
-        "1024 staged calls share one owner census"
+        4096,
+        "4096 staged calls share one owner census"
     );
-    assert_eq!(main.coordinator.joint_capture().ledger().staged(), 1024);
-    let bytes_1024 = main.coordinator.joint_capture().ledger().charged_bytes();
+    assert_eq!(main.coordinator.joint_capture().ledger().staged(), 4096);
+    let bytes_4096 = main.coordinator.joint_capture().ledger().charged_bytes();
     assert_eq!(
-        bytes_1024,
-        1024 * bytes_one,
+        bytes_4096,
+        4096 * bytes_one,
         "uniform shapes charge uniform bytes"
     );
     assert_eq!(
@@ -17911,7 +17911,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         "the full feed stays Joint: Full only fires on the next stage"
     );
     // Pool delta: round 0 paid the reducer base plus the one table
-    // prepay; the remaining 1023 staged roles add exactly one pool
+    // prepay; the remaining 4095 staged roles add exactly one pool
     // lease (bytes + 32) each — the exact S1/shared-pool interplay.
     let main_staged_pool = main
         .coordinator
@@ -17920,14 +17920,14 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         .charged_bytes;
     assert_eq!(
         main_staged_pool - main_round0_pool,
-        1023 * (bytes_one as usize + OWNED_ALLOCATION_PADDING),
+        4095 * (bytes_one as usize + OWNED_ALLOCATION_PADDING),
         "each further staged role adds exactly its pool lease"
     );
     assert_eq!(main.reducer(main_id).calls(), 0);
-    assert_eq!(twin.reducer(twin_id).calls(), 1024);
+    assert_eq!(twin.reducer(twin_id).calls(), 4096);
     assert_eq!(twin.coordinator.joint_capture().ledger().staged(), 0);
 
-    // The 1025th reuses round 0's session (a duplicate init: no new
+    // The 4097th reuses round 0's session (a duplicate init: no new
     // open, nothing held): Full refuses the stage, and the feed falls
     // back in order — the old publication below must survive that.
     let (facts, position) = main.admit(Some(SESSION));
@@ -17950,7 +17950,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
         crate::test_alloc::counted_peak_during(|| {
             main.coordinator
                 .commit_batch(false)
-                .expect("the 1025th commits through ordered fallback");
+                .expect("the 4097th commits through ordered fallback");
         });
     assert!(
         !fallback_peak.incomplete,
@@ -17960,7 +17960,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     assert_eq!(
         main.coordinator.registry().joint_direct_fallback(),
         1,
-        "the 1025th stage refused Full exactly once"
+        "the 4097th stage refused Full exactly once"
     );
     assert_eq!(
         main.coordinator.registry().feed_mode_for_test(main_id),
@@ -17969,8 +17969,8 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     );
     assert_eq!(
         main.reducer(main_id).calls(),
-        1025,
-        "every staged call replays S1-direct in order, then the 1025th reduces"
+        4097,
+        "every staged call replays S1-direct in order, then the 4097th reduces"
     );
     // The refused stage allocates nothing: every staged charge
     // released exactly once, no orphan bytes, no partial lease.
@@ -17987,8 +17987,8 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     );
     assert_eq!(
         main.coordinator.joint_capture().ledger().census(),
-        1024,
-        "1024 live associations hold the census; the refused 1025th holds nothing"
+        4096,
+        "4096 live associations hold the census; the refused 4097th holds nothing"
     );
     // Twin equality: S1 facts, pool, and key-use rows match the
     // never-staged direct reduction exactly.
@@ -18017,7 +18017,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     let main_keyuse = main.coordinator.registry().keyuse_for_test();
     let twin_keyuse = twin.coordinator.registry().keyuse_for_test();
     assert_eq!(main_keyuse.open().len(), twin_keyuse.open().len());
-    assert_eq!(main_keyuse.open().len(), 1024, "every replayed open mints");
+    assert_eq!(main_keyuse.open().len(), 4096, "every replayed open mints");
     assert_eq!(
         main_keyuse.refused_opens().len(),
         twin_keyuse.refused_opens().len()
@@ -18025,7 +18025,7 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     assert_eq!(
         main_keyuse.refused_opens().len(),
         0,
-        "the duplicate 1025th init opens nothing and refuses nothing"
+        "the duplicate 4097th init opens nothing and refuses nothing"
     );
     // The fallback invents no object facts, but its replayed calls
     // are counted, not dropped: the section turns partial under the
@@ -18033,15 +18033,15 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     assert_fallback_counts_only(
         main.coordinator.registry().joint_observations(7),
         &observations_before,
-        1025,
+        4097,
     );
     assert_no_birth_counts_only(
         twin.coordinator.registry().joint_observations(7),
         &observations_before,
-        1025,
+        4097,
     );
     println!(
-        "H3_MEM_1024_1025 {{\"staged_bytes_1024\": {bytes_1024}, \
+        "H3_MEM_4096_4097 {{\"staged_bytes_4096\": {bytes_4096}, \
          \"fallback_live_bytes\": {}, \"fallback_peak_bytes\": {}, \
          \"fallback_cumulative_requested_bytes\": {fallback_requested}, \
          \"fallback_allocation_requests\": {fallback_allocs}, \
@@ -18053,12 +18053,12 @@ fn joint_capture_owner_pipeline_stages_1024_then_full_falls_back_exact() {
     );
 }
 
-/// Ledger-level 1024/1025: 1024 staged charges fill the owner's census;
-/// the 1025th refuses Full allocating nothing — census, bytes and the
+/// Ledger-level 4096/4097: 4096 staged charges fill the owner's census;
+/// the 4097th refuses Full allocating nothing — census, bytes and the
 /// shared pool stay exactly put (preflight fails before the pool lease
 /// and the table insert, per H9 charge-before-allocation).
 #[test]
-fn joint_capture_owner_ledger_1025th_charge_refuses_without_allocating() {
+fn joint_capture_owner_ledger_4097th_charge_refuses_without_allocating() {
     use crate::semantics_edge::resources::{OWNED_ALLOCATION_PADDING, SemanticResourcePool};
     use crate::semantics_objects::journal::LedgerRefusal;
     use crate::semantics_objects::journal::joint_driver::JointCaptureOwner;
@@ -18067,33 +18067,33 @@ fn joint_capture_owner_ledger_1025th_charge_refuses_without_allocating() {
     let base = pool.snapshot().charged_bytes;
     let mut owner = JointCaptureOwner::new(JournalLimits::policy(), pool.reserver());
     owner.ledger_mut().charge(0, 40).expect("staged charges");
-    // The first charge prepays the fixed 1024-slot table once (H9
+    // The first charge prepays the fixed 4096-slot table once (H9
     // charge-before-allocation); every later charge adds exactly its
     // own pool lease. Measured, never hardcoded: the table size is a
     // layout fact, the once-only prepay is the invariant.
     let pool_after_first = pool.snapshot().charged_bytes;
     let table_prepay = pool_after_first - base - (40 + OWNED_ALLOCATION_PADDING);
     assert!(table_prepay > 0, "the first charge prepays the table");
-    for ticket in 1..1024 {
+    for ticket in 1..4096 {
         owner
             .ledger_mut()
             .charge(ticket, 40)
             .expect("staged charges");
     }
-    assert_eq!(owner.ledger().census(), 1024);
-    assert_eq!(owner.ledger().staged(), 1024);
-    assert_eq!(owner.ledger().charged_bytes(), 1024 * 40);
+    assert_eq!(owner.ledger().census(), 4096);
+    assert_eq!(owner.ledger().staged(), 4096);
+    assert_eq!(owner.ledger().charged_bytes(), 4096 * 40);
     let pool_full = pool.snapshot().charged_bytes;
     assert_eq!(
         pool_full - pool_after_first,
-        1023 * (40 + OWNED_ALLOCATION_PADDING),
+        4095 * (40 + OWNED_ALLOCATION_PADDING),
         "one pool lease per further live role, no second table prepay"
     );
     let (result, peak, allocs, requested) =
-        crate::test_alloc::counted_peak_during(|| owner.ledger_mut().charge(1024, 40));
+        crate::test_alloc::counted_peak_during(|| owner.ledger_mut().charge(4096, 40));
     assert!(
         matches!(result, Err(LedgerRefusal::Full)),
-        "the 1025th charge refuses Full"
+        "the 4097th charge refuses Full"
     );
     assert!(!peak.incomplete);
     assert_eq!(
@@ -18106,9 +18106,9 @@ fn joint_capture_owner_ledger_1025th_charge_refuses_without_allocating() {
         (0, 0),
         "the refused charge requests nothing"
     );
-    assert_eq!(owner.ledger().census(), 1024);
-    assert_eq!(owner.ledger().staged(), 1024);
-    assert_eq!(owner.ledger().charged_bytes(), 1024 * 40);
+    assert_eq!(owner.ledger().census(), 4096);
+    assert_eq!(owner.ledger().staged(), 4096);
+    assert_eq!(owner.ledger().charged_bytes(), 4096 * 40);
     assert_eq!(
         pool.snapshot().charged_bytes,
         pool_full,

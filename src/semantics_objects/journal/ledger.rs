@@ -641,14 +641,14 @@ mod tests {
     }
 
     #[test]
-    fn shared_ledger_actual_pool_holds_1024_operations_with_all_roles() {
+    fn shared_ledger_actual_pool_holds_4096_operations_with_all_roles() {
         let pool = SemanticResourcePool::default();
         let baseline = pool.snapshot().charged_bytes;
         let mut ledger = StagingLedger::with_resources(pool.reserver());
         ledger.prepare_capacity().unwrap();
         let index = pool.snapshot().charged_bytes;
         let (_, allocations, bytes) = crate::test_alloc::count_allocs_during(|| {
-            for key in 1..=1_024 {
+            for key in 1..=4_096 {
                 let id = ledger
                     .charge_role(Role::Raw, StagingLedger::key(key), None, 1)
                     .unwrap();
@@ -665,22 +665,22 @@ mod tests {
             }
         });
         assert_eq!((allocations, bytes), (0, 0));
-        assert_eq!((ledger.census(), ledger.charged_bytes()), (1_024, 15_360));
+        assert_eq!((ledger.census(), ledger.charged_bytes()), (4_096, 61_440));
         let charged = pool.snapshot().charged_bytes;
         assert_eq!(
             charged,
-            index + 15_360 + 5 * 1_024 * OWNED_ALLOCATION_PADDING
+            index + 61_440 + 5 * 4_096 * OWNED_ALLOCATION_PADDING
         );
         let (result, allocations, bytes) =
-            crate::test_alloc::count_allocs_during(|| ledger.charge_h8open(1_025, 2));
+            crate::test_alloc::count_allocs_during(|| ledger.charge_h8open(4_097, 2));
         assert_eq!(result, Err(LedgerRefusal::Full));
         assert_eq!((allocations, bytes), (0, 0));
         assert_eq!(pool.snapshot().charged_bytes, charged);
         ledger.release_all_h8open();
-        assert_eq!(ledger.census(), 1_024);
+        assert_eq!(ledger.census(), 4_096);
         assert_eq!(
             pool.snapshot().charged_bytes,
-            charged - 1_024 * (2 + OWNED_ALLOCATION_PADDING)
+            charged - 4_096 * (2 + OWNED_ALLOCATION_PADDING)
         );
         drop(ledger);
         assert_eq!(pool.snapshot().charged_bytes, baseline);

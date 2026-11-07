@@ -679,9 +679,9 @@ fn native_semantic_resource_close_all_sessions_scratch_peak() {
             before.active_machines,
             before.pending_calls
         ),
-        (1024, 2048, 256)
+        (MAX_EDGE_SESSIONS, MAX_EDGE_ACTIVE_OPS, MAX_EDGE_PENDING)
     );
-    // Distinct, disjoint raw sessions force all2304 potential owners into
+    // Distinct, disjoint raw sessions force all potential owners into
     // the actual production collect/sort/bulk-build path.
     assert_eq!(
         edge.active
@@ -690,7 +690,7 @@ fn native_semantic_resource_close_all_sessions_scratch_peak() {
             .chain(edge.pending.keys().map(|(session, _)| *session))
             .collect::<BTreeSet<_>>()
             .len(),
-        2304
+        MAX_EDGE_ACTIVE_OPS + MAX_EDGE_PENDING
     );
     let close = facts("C_CloseAllSessions", SESSION_NONE);
     let (_, peak) = crate::test_alloc::requested_peak_during(|| {
@@ -710,7 +710,7 @@ fn native_semantic_resource_close_all_sessions_scratch_peak() {
         SEMANTIC_TRANSITION_SCRATCH + REDUCER_BASE_CHARGE
     );
     eprintln!(
-        "S1_SCRATCH_ROW close_all_2304 live_peak={} realloc_overlap={} persistent_before={} persistent_after={}",
+        "S1_SCRATCH_ROW close_all_8448 live_peak={} realloc_overlap={} persistent_before={} persistent_after={}",
         peak.peak_bytes,
         peak.realloc_overlap_bytes,
         REDUCER_BASE_CHARGE

@@ -285,10 +285,18 @@ pub(crate) struct JournalLimits {
 impl JournalLimits {
     pub(crate) const fn policy() -> Self {
         Self {
-            open_calls: 1_024,
+            // One claim per staged slot: open H8 calls share the
+            // MAX_UNSETTLED_STAGED ticket space (H9 §89), so the
+            // journal holds what the staging ledger admits (raised
+            // 1,024 to 4,096 with it; refused_begins is a separate
+            // population and stays).
+            open_calls: 4_096,
             thread_floors: 16_448,
             refused_begins: 1_024,
-            domain_keys: 4_096,
+            // One domain key per occupant plus headroom: the room's
+            // 4,096 begins plus held associations exceed 4,096
+            // (raised to 8,192 with MAX_UNSETTLED_STAGED).
+            domain_keys: 8_192,
             image_sightings: 16_448,
         }
     }
@@ -14283,27 +14291,27 @@ pub(crate) mod tests {
         );
     }
 
-    /// One cost scene with `retained` staged begins: the first 1,024 fill
+    /// One cost scene with `retained` staged begins: the first 4,096 fill
     /// the open table, the rest (up to 1,024) the refused shelf. Every
     /// disposition is pinned, so the setup cannot silently degrade.
     fn keepup_scene_with_retained(retained: usize) -> Scene {
         assert!(
-            retained <= 2_048,
-            "the refused shelf refuses to taint past 2,048"
+            retained <= 5_120,
+            "the refused shelf refuses to taint past 5,120"
         );
         let mut scene = Scene::new(image_default());
         let create = function_id("C_CreateObject");
         for thread in 1..=retained as u64 {
             let begin = begin_bytes(thread, 1, create, 0);
-            let expected = if thread <= 1_024 {
+            let expected = if thread <= 4_096 {
                 JournalDisposition::BeginAdmitted
             } else {
                 JournalDisposition::BeginRefusedCapacity
             };
             assert_eq!(scene.ingest(&begin), expected);
         }
-        assert_eq!(scene.adapter.open.len(), retained.min(1_024));
-        assert_eq!(scene.adapter.refused.len(), retained.saturating_sub(1_024));
+        assert_eq!(scene.adapter.open.len(), retained.min(4_096));
+        assert_eq!(scene.adapter.refused.len(), retained.saturating_sub(4_096));
         scene
     }
 
@@ -14433,7 +14441,7 @@ pub(crate) mod tests {
             visits + 1
         }
         let low = marginal_cost(100);
-        let high = marginal_cost(2_048);
+        let high = marginal_cost(5_120);
         assert!(
             high < 4 * low,
             "per-claim scan cost must not grow with retained count: {high} vs {low}"
@@ -14441,11 +14449,11 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn joint_keepup_no_prune_step_at_2048_while_keys_live() {
-        let mut scene = keepup_scene_with_retained(2_048);
+    fn joint_keepup_no_prune_step_at_5120_while_keys_live() {
+        let mut scene = keepup_scene_with_retained(5_120);
         scene.adapter.set_prune_oracle_for_test(true);
-        keepup_attest_paired(&mut scene, 2_048);
-        assert_eq!(scene.adapter.claim_counts, 2_048);
+        keepup_attest_paired(&mut scene, 5_120);
+        assert_eq!(scene.adapter.claim_counts, 5_120);
         scene.adapter.reset_test_claim_costs_for_test();
         for index in 0..10 {
             let admitted = keepup_admit_fresh(&mut scene, 100_001 + index);
@@ -14463,24 +14471,24 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn joint_keepup_cap_boundary_twins_2047_2048_2049() {
-        let mut scene = keepup_scene_with_retained(2_048);
+    fn joint_keepup_cap_boundary_twins_5119_5120_5121() {
+        let mut scene = keepup_scene_with_retained(5_120);
         scene.adapter.set_prune_oracle_for_test(true);
-        keepup_attest_paired(&mut scene, 2_047);
-        assert_eq!(scene.adapter.claim_counts, 2_047);
+        keepup_attest_paired(&mut scene, 5_119);
+        assert_eq!(scene.adapter.claim_counts, 5_119);
         keepup_attest_paired(&mut scene, 1);
         assert_eq!(
-            scene.adapter.claim_counts, 2_048,
-            "the 2,048th claim still fits below the cap check"
+            scene.adapter.claim_counts, 5_120,
+            "the 5,120th claim still fits below the cap check"
         );
-        for (step, n) in [2_049, 2_050].into_iter().enumerate() {
+        for (step, n) in [5_121, 5_122].into_iter().enumerate() {
             let admitted = keepup_admit_fresh(&mut scene, 200_001 + step as u64);
             assert_eq!(
                 scene.adapter.attest_key(&admitted),
                 Err(AttestationRefusal::ClaimsExhausted),
                 "claim {n} refuses at the cap"
             );
-            assert_eq!(scene.adapter.claim_counts, 2_048);
+            assert_eq!(scene.adapter.claim_counts, 5_120);
         }
     }
 
@@ -15181,18 +15189,18 @@ pub(crate) mod tests {
         );
         // Grows linearly: doubling the retained calls at most doubles
         // the reservation (a quadratic bound quadruples it).
-        let half = keepup_seal_reservation(&keepup_scene_with_retained(1_024));
-        let full = keepup_seal_reservation(&keepup_scene_with_retained(2_048));
+        let half = keepup_seal_reservation(&keepup_scene_with_retained(2_560));
+        let full = keepup_seal_reservation(&keepup_scene_with_retained(5_120));
         assert!(
             full <= half.checked_mul(2).unwrap(),
-            "1,024 -> 2,048 retained calls: {half} -> {full} bytes"
+            "2,560 -> 5,120 retained calls: {half} -> {full} bytes"
         );
-        // 2,048 (full open table plus full refused shelf) is the most a
+        // 5,120 (full open table plus full refused shelf) is the most a
         // seal can ever retain: a 10k calls/s feed that falls behind
         // reaches it, and the seal still fits the pool.
         assert!(
             full <= budget,
-            "2,048 retained calls reserve {full} bytes > {budget}"
+            "5,120 retained calls reserve {full} bytes > {budget}"
         );
     }
 
@@ -15548,7 +15556,7 @@ pub(crate) mod tests {
             populated <= budget,
             "1,024 existing views reserve {populated} > {budget}"
         );
-        let full = keepup_seal_reservation(&keepup_scene_with_retained(2_048));
+        let full = keepup_seal_reservation(&keepup_scene_with_retained(5_120));
         // Existing records cost a fixed few hundred bytes each: the
         // largest model (65,536 views, 16,384 sessions) beside the full
         // retained cap still fits.

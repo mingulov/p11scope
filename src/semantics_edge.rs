@@ -67,7 +67,11 @@ struct PreparedResourceTransition {
 /// past the bound, counted in `async_evictions`.
 pub(crate) const MAX_EDGE_SESSIONS: usize = 1024;
 pub(crate) const MAX_EDGE_MECHANISMS: usize = 256;
-pub(crate) const MAX_EDGE_ACTIVE_OPS: usize = 2048;
+// One active op machine per occupant plus headroom: the room's
+// 4,096 begins plus held associations exceed 4,096 occupants
+// (raised 2,048 to 8,192 with MAX_UNSETTLED_STAGED, keeping the
+// 2x ratio).
+pub(crate) const MAX_EDGE_ACTIVE_OPS: usize = 8192;
 pub(crate) const MAX_EDGE_PENDING: usize = 256;
 pub(crate) const MAX_EDGE_PROVENANCE_FUNCTIONS: usize = 64;
 pub(crate) const MAX_EDGE_PROVENANCE_RETURNS: usize = 32;

@@ -3648,10 +3648,22 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
         .ledger_mut()
         .mint_keyassoc(0)
         .expect("one held association");
-    scene.scene.drain.source_mut().bound = 4_096;
+    scene.scene.drain.source_mut().bound = 8_192;
     let pid = std::process::id();
     push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
-    for (chunk, threads) in [1..=400, 401..=800].into_iter().enumerate() {
+    for (chunk, threads) in [
+        1..=400,
+        401..=800,
+        801..=1200,
+        1201..=1600,
+        1601..=2000,
+        2001..=2400,
+        2401..=2800,
+        2801..=3200,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         for thread in threads {
             let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
             scene.scene.drain.source_mut().push_record(begin.to_vec());
@@ -3663,7 +3675,23 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
             "chunk {chunk} extends below the ledger's room"
         );
     }
-    for thread in 801..=1_024 {
+    // The drain pulls incrementally, like production ring polls: two
+    // more 400-wide chunks extend below the room, then the final 96
+    // fill it — the room closes the quantum before refusing a begin.
+    for (chunk, threads) in [3201..=3600, 3601..=4000].into_iter().enumerate() {
+        for thread in threads {
+            let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+            scene.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        scene.service(100_000).expect("chunk collects");
+        assert_eq!(
+            phase_of(&scene),
+            "Collecting",
+            "chunk {} extends below the ledger's room",
+            chunk + 9
+        );
+    }
+    for thread in 4001..=4_096 {
         let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
         scene.scene.drain.source_mut().push_record(begin.to_vec());
     }
@@ -3681,7 +3709,7 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
     );
     assert_eq!(
         raw.invocations_for_test(),
-        1_023,
+        4_095,
         "the quantum took exactly the ledger's room"
     );
     assert_eq!(

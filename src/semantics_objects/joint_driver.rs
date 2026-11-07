@@ -2775,26 +2775,30 @@ mod tests {
     }
 
     #[test]
-    fn joint_resource_1025_refuses_before_member_allocation_and_preserves_wire_audit() {
+    fn joint_resource_4097_refuses_before_member_allocation_and_preserves_wire_audit() {
         use crate::semantics_objects::journal::tests::{
             ENTRY_NS, begin_bytes, end_bytes_absent, function_id,
         };
         let rows = publish_object_descriptors();
-        let begins: Vec<_> = (1..=1_025)
+        let begins: Vec<_> = (1..=4_097)
             .map(|thread| begin_bytes(thread, 1, function_id("C_Sign"), 0))
             .collect();
+        // Eight ends ride behind the refused begin: the drain continues
+        // past the refusal and pairs across the quantum boundary. (One
+        // quantum attempts at most 4,096 records, so the 4,097-begins
+        // intake spans two quanta.)
         let records = begins.iter().map(|begin| begin.to_vec()).chain(
-            begins[..1_024]
+            begins[..8]
                 .iter()
                 .map(|begin| end_bytes_absent(begin, 0, ENTRY_NS + 100).to_vec()),
         );
         let events = EventsDomain::test_standin(0xf102);
         let retained = producers(&events);
-        let mut drain = EventDrain::over_domain(ScriptedRecords::records(records, 2_049), events);
+        let mut drain = EventDrain::over_domain(ScriptedRecords::records(records, 4_105), events);
         let pool = SemanticResourcePool::default();
         let mut adapter = resource_adapter(&pool);
         let fault = SteadyFault(Cell::new(None));
-        let mut quantum = RawJointQuantum::collect_with_adapter(
+        let mut first = RawJointQuantum::collect_with_adapter(
             &mut drain,
             &rows,
             4_096,
@@ -2804,8 +2808,8 @@ mod tests {
             &mut adapter,
         )
         .unwrap();
-        let (_, allocations, _) = crate::test_alloc::count_allocs_during(|| {
-            quantum
+        for _ in 0..3 {
+            first
                 .continue_collect_with_adapter(
                     &mut drain,
                     &rows,
@@ -2815,26 +2819,36 @@ mod tests {
                     &mut adapter,
                 )
                 .unwrap();
-            quantum
-                .continue_collect_with_adapter(
-                    &mut drain,
-                    &rows,
-                    1,
-                    &fault,
-                    &retained,
-                    &mut adapter,
-                )
-                .unwrap();
+        }
+        assert_eq!(adapter.ledger.census(), 4_096);
+        let (_, allocations, _) = crate::test_alloc::count_allocs_during(|| {
+            let second = RawJointQuantum::collect_with_adapter(
+                &mut drain,
+                &rows,
+                4_096,
+                &fault,
+                &retained,
+                |bytes| pool.reserve(bytes),
+                &mut adapter,
+            )
+            .unwrap();
+            assert!(second.resource_refused);
+            assert_eq!(
+                second.ordinary.len(),
+                8,
+                "ends pair across the quantum boundary"
+            );
+            assert_eq!(second.audit.ingested, 9);
+            assert_eq!(second.audit.malformed_delta, 0);
+            assert_eq!(second.audit.discarded_delta, 0);
+            assert!(!second.audit.counter_error);
         });
-        assert_eq!(allocations, 0);
-        assert!(quantum.resource_refused);
-        assert_eq!(adapter.ledger.census(), 1_024);
-        assert_eq!(quantum.ordinary.len(), 1_024);
-        assert_eq!(quantum.audit.ingested, 2_049);
-        assert_eq!(quantum.audit.ordinary, 0);
-        assert_eq!(quantum.audit.malformed_delta, 0);
-        assert_eq!(quantum.audit.discarded_delta, 0);
-        assert!(!quantum.audit.counter_error);
+        // Four constructor vec reserves; the refused begin and the eight
+        // ends allocate nothing.
+        assert_eq!(allocations, 4);
+        assert_eq!(adapter.ledger.census(), 4_096);
+        assert_eq!(first.ordinary.len(), 0);
+        assert_eq!(first.audit.ingested, 4_096);
         assert_eq!(drain.source().remaining(), 0);
     }
 

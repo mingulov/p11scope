@@ -112,7 +112,11 @@ pub(super) const SCRATCH_PROVEN_BYTES: usize = 2304 * 256                       
     + 4096; // fixed padding/stack-independent slack
 const _: () = assert!(SCRATCH_PROVEN_BYTES <= SEMANTIC_TRANSITION_SCRATCH);
 
-pub(crate) const SEMANTIC_RESOURCE_LIMIT: usize = 64 * 1024 * 1024;
+// Scales with the retained-call ceiling: 5,120 retained calls ×
+// ~10 KB seal replay plus the capped model reserve ~66 MB worst
+// case (raised 64 to 160 MiB with MAX_UNSETTLED_STAGED; the
+// seal-reservation tests pin the half-rule margin).
+pub(crate) const SEMANTIC_RESOURCE_LIMIT: usize = 160 * 1024 * 1024;
 pub(crate) const SEMANTIC_TRANSITION_SCRATCH: usize = 1024 * 1024;
 pub(crate) const REDUCER_BASE_CHARGE: usize = 8192;
 pub(crate) const OPEN_BINDING_CHARGE: usize = 512;

@@ -1172,7 +1172,7 @@ fn feedless_differential_sequences(seed: u64, quanta: usize, fixed_count: Option
             // Proofs bind their own session's domain, so only the
             // result shapes compare across arms; within-arm proof
             // genuineness is pinned at claim time above.
-            if total + index < 2_048 {
+            if total + index < 5_120 {
                 assert!(
                     res_old.is_ok() && res_new.is_ok(),
                     "seed {seed} quantum {quantum}: below-cap claims succeed on both arms"
@@ -1247,13 +1247,13 @@ fn feedless_differential_sequences(seed: u64, quanta: usize, fixed_count: Option
         );
     }
     if fixed_count.is_some() {
-        assert!(total > 2_048, "the past-cap leg must cross the claim cap");
+        assert!(total > 5_120, "the past-cap leg must cross the claim cap");
     }
     // Both arms staged no journal BEGINs (genuinely feed-less) while
     // only the legacy arm filled the claim store: this pins the
     // switch live on both sides.
     for (label, arm, expect_stored) in
-        [("legacy", &legacy, total.min(2_048)), ("skip", &skipped, 0)]
+        [("legacy", &legacy, total.min(5_120)), ("skip", &skipped, 0)]
     {
         let adapter = arm.real.scene.coordinator.joint_capture().adapter();
         assert!(
@@ -1303,5 +1303,5 @@ fn joint_keepup_feedless_skip_matches_legacy_public_outputs() {
     ] {
         feedless_differential_sequences(seed, 5, None);
     }
-    feedless_differential_sequences(0xfeed_1e55_ca1c_u64, 33, Some(64));
+    feedless_differential_sequences(0xfeed_1e55_ca1c_u64, 81, Some(64));
 }

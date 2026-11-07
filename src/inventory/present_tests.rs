@@ -2039,7 +2039,7 @@ fn budgets_carry_the_inventory_attach_set_endpoints() {
         "{budgets}"
     );
     assert!(
-        budgets.contains(" | semantic 1048896/67108864B peak=1049056 refused=0 | "),
+        budgets.contains(" | semantic 1048896/167772160B peak=1049056 refused=0 | "),
         "{budgets}"
     );
     assert!(budgets.ends_with(

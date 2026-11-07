@@ -46,13 +46,15 @@ class ContainerImageCellTests(unittest.TestCase):
         # removed stub is genuinely missing (no /usr/bin leak-through).
         self.tools = self.base / "tools"
         self.tools.mkdir()
+        self.stub_texts = {}
         self.write_stub("docker", "#!/bin/sh\nexit 0\n")
         self.write_stub("gcc", "#!/bin/sh\nexit 0\n")
         self.write_stub("python3", "#!/bin/sh\nexit 0\n")
         self.write_stub("file", "#!/bin/sh\nexit 0\n")
+        self.write_stub("softhsm2-util", "#!/bin/sh\nexit 0\n")
         self.write_stub("sudo", '#!/bin/sh\n[ "${1-}" = "-n" ] && shift\nexec "$@"\n')
         self.write_stub("gnutimeout", '#!/bin/sh\necho "timeout (GNU coreutils) 9.0"\nexit 0\n')
-        for name in ("dirname", "mkdir", "head", "id", "true", "rm"):
+        for name in ("dirname", "mkdir", "head", "id", "true", "rm", "cat", "date"):
             target = shutil.which(name)
             self.assertIsNotNone(target, f"host lacks coreutil {name}")
             (self.tools / name).symlink_to(target)
@@ -80,15 +82,21 @@ class ContainerImageCellTests(unittest.TestCase):
 
     def write_stub(self, name, text):
         write_executable(self.tools / name, text)
+        self.stub_texts[name] = text
 
     def run_cell(self, *args, remove=(), env=None):
         for name in remove:
             (self.tools / name).unlink(missing_ok=True)
         merged = dict(self.env)
         merged.update(env or {})
-        return subprocess.run(
-            [self.bash, str(self.entry), *args], env=merged,
-            text=True, capture_output=True, timeout=60)
+        try:
+            return subprocess.run(
+                [self.bash, str(self.entry), *args], env=merged,
+                text=True, capture_output=True, timeout=60)
+        finally:
+            for name in remove:
+                if name in self.stub_texts:
+                    write_executable(self.tools / name, self.stub_texts[name])
 
     def test_no_args_is_a_usage_error(self):
         result = self.run_cell()
@@ -144,12 +152,14 @@ class ContainerImageCellTests(unittest.TestCase):
         self.assertIn("usage:", result.stderr)
 
     def test_root_caller_is_refused(self):
+        # Unlink first: writing through the symlink would hit /usr/bin/id.
+        (self.tools / "id").unlink()
         self.write_stub("id", "#!/bin/sh\necho 0\n")
         result = self.run_cell("--image", "img:tag", "--out", str(self.outdir))
         self.assertEqual(result.returncode, 2)
 
     def test_missing_tool_is_a_setup_failure(self):
-        for tool in ("docker", "gcc", "python3", "file", "sudo"):
+        for tool in ("docker", "gcc", "python3", "file", "softhsm2-util", "sudo"):
             with self.subTest(tool=tool):
                 result = self.run_cell("--image", "img:tag",
                                        "--out", str(self.outdir),

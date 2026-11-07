@@ -34,7 +34,7 @@ fn inventory_policy_accepts_only_one_external_scope_and_no_capture_or_pause_poli
 
 #[test]
 fn inventory_policy_accepts_exe_identity_bit_beside_one_scope() {
-    // Round 7: the extensive bit (0x100) extends the three exact
+    // Unidentified-caller executables: the extensive bit (0x100) extends the three exact
     // inventory configs; detailed objects still refuse every
     // inventory word, and the bit without a scope still refuses.
     for flags in [0x181, 0x182, 0x1c0] {

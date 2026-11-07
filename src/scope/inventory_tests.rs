@@ -383,7 +383,7 @@ fn counter_policies_refuse_track_short_lived_config() {
     assert!(p11scope_ebpf_common::valid_config(aggregate.config[0]));
 }
 
-// Round 7: the exe-identity bit arms only the captures whose EXEC
+// The exe-identity bit arms only the captures whose EXEC
 // records carry both ticket and exe — Callers flavor outside PID
 // scope. Every other combination stays on the plain config.
 #[test]
@@ -409,7 +409,7 @@ fn inventory_exe_identity_arms_caller_captures_outside_pid_scope() {
     assert!(!inventory_exe_identity_armed(false, &Scope::Pid(101)));
 }
 
-// Round 7: arming sets only the extensive bit beside the exact
+// Arming sets only the extensive bit beside the exact
 // inventory word, and the published word validates.
 #[test]
 fn inventory_scope_exe_identity_sets_only_the_extensive_bit() {
@@ -431,7 +431,7 @@ fn inventory_scope_exe_identity_sets_only_the_extensive_bit() {
     assert!(p11scope_ebpf_common::valid_inventory_config(maps.config[0]));
 }
 
-// Round 7: PID scope plus the bit is refused before any map
+// PID scope plus the bit is refused before any map
 // operation — a defense-in-depth invariant (the arming policy never
 // produces this combination).
 #[test]

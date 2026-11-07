@@ -21493,11 +21493,13 @@ fn key_operation_clean_resume_clears_loss_latch() {
     );
 }
 
-/// v0.7.0 issue 3 (fallback twin): a clean resume clears the
-/// `proof_refused_fallback` latch the same way — the replayed calls
-/// stay counted, the section reads populated.
+/// v0.7.0 issue 3 (fallback twin): a clean resume keeps the
+/// `proof_refused_fallback` latch — only the `authority_lost` latch
+/// clears (brief issue 3 and the KO-SOLE addendum cover the loss
+/// latch alone). The replayed calls stay counted under the partial
+/// section.
 #[test]
-fn key_operation_clean_resume_clears_fallback_latch() {
+fn key_operation_clean_resume_keeps_fallback_latch() {
     let instance =
         crate::discovery::caller_registry::instance_input::RegistryInstanceId::from_raw(3);
     let mut scene = JointScene::new();
@@ -21542,14 +21544,14 @@ fn key_operation_clean_resume_clears_fallback_latch() {
         "a resumable fallback resumes at a clean point"
     );
     assert!(
-        !staging.fell_back(),
-        "the clean resume clears the fallback latch"
+        staging.fell_back(),
+        "the clean resume keeps the fallback latch"
     );
     let resumed = commit(3, &[&staging], &scene.model.project(), &keyuse);
     assert_eq!(
         (resumed.status, resumed.reason),
-        (ObsStatus::Populated, "none"),
-        "resumed tracking reads populated, not refused"
+        (ObsStatus::Partial, "proof_refused_fallback"),
+        "resumed tracking still names the refused segment"
     );
     assert_eq!(
         resumed.unattributed,
@@ -21943,11 +21945,8 @@ fn key_operation_joint_resumes_at_next_clean_point() {
     );
 
     let observations = guarded.registry.joint_observations(41);
-    // v0.7.0 issue 3: the clean resume clears the latch — the
-    // section reads populated while the fallback segment stays
-    // counted below.
-    assert_eq!(observations.status, ObsStatus::Populated);
-    assert_eq!(observations.reason, "none");
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
     let completed: u64 = observations
         .unknown_key_operations
         .iter()
@@ -22061,11 +22060,8 @@ fn key_operation_degraded_window_calls_count_under_fallback_reason() {
     );
 
     let observations = guarded.registry.joint_observations(61);
-    // v0.7.0 issue 3: the clean resume clears the latch — the
-    // section reads populated while the window calls stay counted
-    // under the closed segment's reason below.
-    assert_eq!(observations.status, ObsStatus::Populated);
-    assert_eq!(observations.reason, "none");
+    assert_eq!(observations.status, ObsStatus::Partial);
+    assert_eq!(observations.reason, "proof_refused_fallback");
     assert_eq!(
         observations.unattributed,
         vec![

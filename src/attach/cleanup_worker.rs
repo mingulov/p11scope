@@ -2801,6 +2801,31 @@ mod tests {
             "stderr must say cleanup incomplete, got: {text}"
         );
     }
+
+    /// The post-setup shed reaches the worker thread: `shed_to` drops the
+    /// worker's own capabilities (per-thread `capset`) and the worker
+    /// still closes afterwards. Fails while the worker has no shed entry.
+    #[test]
+    fn shed_to_drops_the_worker_thread_without_breaking_closes() {
+        let mut worker = CleanupWorker::pre_start_with(
+            Box::new(|link, _| {
+                drop(link.take());
+                Ok(())
+            }),
+            Arc::new(|| Duration::ZERO),
+        );
+        worker.shed_to(0).expect("the worker sheds to zero");
+        worker.submit(
+            vec![(
+                OwnedLink::Multi(vec![tempfile::tempfile().unwrap().into()]),
+                ProducerProgram::UProbe("p11_return"),
+            )],
+            Arc::default(),
+            DetachOrder,
+        );
+        let receipt = worker.join();
+        assert!(receipt.completed, "the shed worker still closes");
+    }
 }
 
 #[cfg(test)]

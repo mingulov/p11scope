@@ -65312,12 +65312,75 @@ fn opus_probe_view_pids(engine: &Engine) -> std::collections::BTreeSet<u32> {
     engine.views.iter().map(|view| view.pid()).collect()
 }
 
-fn opus_spawn_static_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
+/// First existing path among candidates, in order: the static-sleeper
+/// probe takes the first installed busybox and reports none when no
+/// candidate exists.
+fn opus_first_existing(candidates: &[&Path]) -> Option<PathBuf> {
+    candidates
+        .iter()
+        .find(|path| path.is_file())
+        .map(|path| path.to_path_buf())
+}
+
+/// Builds the static-sleeper fallback: the raw-syscall fixture compiled
+/// `gcc -static -nostdlib` (no libc to link), for hosts without busybox.
+/// Panics with a named reason when the build fails.
+fn opus_build_static_sleeper(dir: &Path) -> PathBuf {
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/opus-static-sleeper.c");
+    let out = dir.join("opus-static-sleeper");
+    let status = std::process::Command::new("gcc")
+        .args([
+            "-std=c11",
+            "-O2",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-static",
+            "-nostdlib",
+            "-o",
+        ])
+        .arg(&out)
+        .arg(&source)
+        .status();
+    match status {
+        Ok(status) if status.success() => out,
+        Ok(status) => panic!(
+            "opus B4 static sleeper unavailable: no busybox at /usr/bin/busybox or /bin/busybox and the gcc static fallback failed with {status}"
+        ),
+        Err(error) => panic!(
+            "opus B4 static sleeper unavailable: no busybox at /usr/bin/busybox or /bin/busybox and gcc could not run: {error}"
+        ),
+    }
+}
+
+/// Static sleepers for the B4 waiter test: busybox where installed
+/// (probed in a fixed location order — CI runners have none), else a
+/// tiny gcc-built static sleeper. Returns the guards plus the fallback
+/// build directory when one was built (held so the binary outlives the
+/// children). `P11SCOPE_OPUS_SLEEPER=fallback` forces the gcc path.
+/// Panics with a named reason when neither backend exists.
+fn opus_spawn_static_sleeps(count: usize) -> (Vec<SystemScopeChildGuard>, Option<tempfile::TempDir>) {
+    let force_fallback =
+        std::env::var("P11SCOPE_OPUS_SLEEPER").is_ok_and(|value| value == "fallback");
+    let busybox = if force_fallback {
+        None
+    } else {
+        opus_first_existing(&[Path::new("/usr/bin/busybox"), Path::new("/bin/busybox")])
+    };
+    let (program, args, hold): (PathBuf, &[&str], Option<tempfile::TempDir>) = match busybox {
+        Some(path) => (path, &["sleep", "60"], None),
+        None => {
+            let dir = tempfile::tempdir().expect("a sleeper build directory");
+            let sleeper = opus_build_static_sleeper(dir.path());
+            (sleeper, &["60"], Some(dir))
+        }
+    };
     let guards: Vec<SystemScopeChildGuard> = (0..count)
         .map(|_| {
             SystemScopeChildGuard::new(
-                std::process::Command::new("/usr/bin/busybox")
-                    .args(["sleep", "60"])
+                std::process::Command::new(&program)
+                    .args(args)
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
@@ -65338,9 +65401,61 @@ fn opus_spawn_static_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
             }
             std::thread::sleep(std::time::Duration::from_millis(10));
         }
-        assert!(execed, "busybox child never execed");
+        assert!(execed, "static sleeper child never execed");
     }
-    guards
+    (guards, hold)
+}
+
+/// The sleeper probe takes the first installed busybox in location
+/// order, and reports none when no candidate exists.
+#[test]
+fn opus_sleeper_probe_takes_the_first_installed_busybox() {
+    let dir = tempfile::tempdir().expect("a probe directory");
+    let missing = dir.path().join("no-such-busybox");
+    let present = dir.path().join("busybox");
+    std::fs::write(&present, "x").expect("a fake busybox");
+    assert_eq!(
+        opus_first_existing(&[missing.as_path(), present.as_path()]),
+        Some(present.clone())
+    );
+    assert_eq!(
+        opus_first_existing(&[present.as_path(), missing.as_path()]),
+        Some(present.clone())
+    );
+    assert_eq!(opus_first_existing(&[missing.as_path()]), None);
+    assert_eq!(opus_first_existing(&[]), None);
+}
+
+/// The gcc static-sleeper fallback builds and runs: a raw-syscall binary
+/// that sleeps its argv seconds with the binary itself as its exe.
+#[test]
+fn opus_static_sleeper_fallback_builds_and_sleeps() {
+    let dir = tempfile::tempdir().expect("a sleeper build directory");
+    let sleeper = opus_build_static_sleeper(dir.path());
+    let mut child = std::process::Command::new(&sleeper)
+        .arg("30")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("the fallback sleeper spawns");
+    std::thread::sleep(std::time::Duration::from_secs(1));
+    assert!(
+        child
+            .try_wait()
+            .expect("poll the sleeper")
+            .is_none(),
+        "the sleeper is still asleep after a second"
+    );
+    let exe =
+        std::fs::read_link(format!("/proc/{}/exe", child.id())).expect("the sleeper exe");
+    assert_eq!(
+        std::fs::canonicalize(&exe).expect("canonical exe"),
+        std::fs::canonicalize(&sleeper).expect("canonical sleeper"),
+        "the sleeper execed the fallback binary"
+    );
+    child.kill().expect("reap the sleeper");
+    let _ = child.wait();
 }
 
 /// Opus Probe B4: 200 static (ungrouped) sleeps over a 40-view cap, so a
@@ -65350,7 +65465,7 @@ fn opus_spawn_static_sleeps(count: usize) -> Vec<SystemScopeChildGuard> {
 /// never-touched long-runners.
 #[test]
 fn reconcile_marked_waiter_vs_ungrouped_slice_settles_within_one_sweep() {
-    let sleeps = opus_spawn_static_sleeps(200);
+    let (sleeps, _sleeper_hold) = opus_spawn_static_sleeps(200);
     let mut sleep_pids: Vec<u32> = sleeps.iter().map(|guard| guard.pid()).collect();
     sleep_pids.sort_unstable();
     let cap = 40usize;

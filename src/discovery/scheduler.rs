@@ -76,8 +76,8 @@ pub(crate) const MAX_NEW_VIEWS_PER_TICK: usize = 64;
 /// interleaves both classes (leading with backlog when the previous tick
 /// owed it one), so the tick quantum defers both proportionally instead of
 /// striking the backlog tail first. Half the tick batch, so a non-empty
-/// backlog keeps at least half the batch in selection and at least one
-/// attempt per tick under sustained flood.
+/// backlog keeps at least half of each tick's attempts (rounded down),
+/// and at least one attempt in every two attempting ticks.
 /// Provisional — ratify by measurement.
 pub(crate) const MAX_NEWCOMER_ADMISSIONS_PER_TICK: usize = MAX_NEW_VIEWS_PER_TICK / 2;
 
@@ -393,7 +393,7 @@ impl DiscoveryScheduler {
     /// `max_new_views` batch, and the rest of the batch serves backlog in
     /// backlog-cursor order. Either class fills batch slots the other
     /// cannot use, so the window stays full and a missing class leaves
-    /// today's single-class order untouched. The admitted window
+    /// today's single-class rotation order untouched. The admitted window
     /// interleaves both classes — leading with backlog when the previous
     /// tick owed it one — so the tick quantum defers both proportionally
     /// and the backlog keeps progressing under a steady flood. Settles the
@@ -452,7 +452,7 @@ impl DiscoveryScheduler {
         };
         let mut admitted = Vec::with_capacity(fresh_take.len() + backlog_take.len());
         if fresh_take.is_empty() || backlog_take.is_empty() {
-            // A missing class keeps today's single-class order verbatim.
+            // A missing class keeps today's single-class rotation order verbatim.
             admitted.extend_from_slice(fresh_take);
             admitted.extend_from_slice(backlog_take);
         } else if self.backlog_owed {

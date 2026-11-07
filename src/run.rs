@@ -3869,6 +3869,13 @@ struct Owned {
     /// removed best-effort. A nonempty directory (handed-back
     /// survivors) survives the removal and is disclosed, never forced.
     run_cgroup: Option<crate::scope::RunCgroup>,
+    /// A degraded run's retired group, held for cleanup-only: it still
+    /// holds the placed child, so it drops after the reap (when the
+    /// directory is empty again) instead of leaking. Never a scope and
+    /// never a survivor source; the active group above reports those.
+    /// Never read: the `Drop` removal is the whole point.
+    #[allow(dead_code)]
+    run_cgroup_retired: Option<crate::scope::RunCgroup>,
 }
 
 /// Non-cloneable terminal authority: exact original reap AND that owner's
@@ -4531,16 +4538,23 @@ fn run_tree_gap_reason(step: &str, error: &anyhow::Error) -> String {
 }
 
 /// Builds the owned capture scope from a placed run cgroup: the cgroup
-/// scope on success, else the exact child PID with the finite
-/// scope-build gap reason (the group drops and cleans itself up on
-/// that path). The failed step prints on stderr; the report keeps
-/// the finite vocabulary.
+/// scope with the active group on success, else the exact child PID
+/// with the finite scope-build gap reason and the group retired for
+/// cleanup-only (it still holds the placed child, so dropping it here
+/// would leak the directory: the removal fails on the nonempty dir and
+/// nobody retries after the reap). The failed step prints on stderr;
+/// the report keeps the finite vocabulary.
 fn run_tree_scope_or_exact(
     child_pid: u32,
     group: crate::scope::RunCgroup,
-) -> (Scope, Option<crate::scope::RunCgroup>, Option<String>) {
+) -> (
+    Scope,
+    Option<crate::scope::RunCgroup>,
+    Option<crate::scope::RunCgroup>,
+    Option<String>,
+) {
     match crate::scope::capture_cgroup(group.path()) {
-        Ok(scope) => (scope, Some(group), None),
+        Ok(scope) => (scope, Some(group), None, None),
         Err(error) => {
             emit_capture_diagnostic(&format!(
                 "p11scope: {}",
@@ -4549,6 +4563,7 @@ fn run_tree_scope_or_exact(
             (
                 Scope::Pid(child_pid),
                 None,
+                Some(group),
                 Some(crate::render::RUN_TREE_DEGRADED.to_string()),
             )
         }
@@ -4654,21 +4669,24 @@ fn run_owned_inner_with_host(
     // Pre-spawn scope start for pre-arm windows (packet 6.13, R2-D1-5): the
     // unobserved outer bound cannot understate the spawn-to-attach gap.
     let scope_start_ns = crate::attach::monotonic_ns();
-    // The run tree scope: a dedicated cgroup the owned child is placed
-    // in before release, so every descendant is born in scope. Any
-    // failure below degrades to the exact child with a named gap —
-    // never a refusal of a runnable command.
-    let (pre_tree_group, mut run_tree_gap) =
-        match crate::scope::RunCgroup::create(std::path::Path::new("/sys/fs/cgroup")) {
-            Ok(group) => (Some(group), None),
-            Err(error) => {
-                emit_capture_diagnostic(&format!(
-                    "p11scope: {}",
-                    run_tree_gap_reason("the run cgroup could not be created", &error)
-                ));
-                (None, Some(crate::render::RUN_TREE_DEGRADED.to_string()))
-            }
-        };
+    // The run tree scope: a dedicated cgroup under the observer's own
+    // cgroup, holding the owned child before release, so every
+    // descendant is born in scope while ancestor limits and unit kill
+    // semantics stay intact. Any failure below degrades to the exact
+    // child with a named gap — never a refusal of a runnable command,
+    // and never a fallback to the filesystem root.
+    let (pre_tree_group, mut run_tree_gap) = match crate::scope::RunCgroup::create_under_observer(
+        std::path::Path::new("/sys/fs/cgroup"),
+    ) {
+        Ok(group) => (Some(group), None),
+        Err(error) => {
+            emit_capture_diagnostic(&format!(
+                "p11scope: {}",
+                run_tree_gap_reason("the run cgroup could not be created", &error)
+            ));
+            (None, Some(crate::render::RUN_TREE_DEGRADED.to_string()))
+        }
+    };
     let mut child = OwnedChild::spawn_verbose_as(
         program,
         command.collect(),
@@ -4679,13 +4697,15 @@ fn run_owned_inner_with_host(
     let pid = child.pid();
     // The barrier still holds the child: placement lands before its
     // first userspace instruction, and every failure still precedes
-    // discovery, attach and the release.
-    let (mut scope, mut run_cgroup) = match pre_tree_group {
+    // discovery, attach and the release. A group that fails after the
+    // placement write is retired for cleanup-only (it may still hold
+    // the child), never dropped while occupied.
+    let (mut scope, mut run_cgroup, mut retired_cgroup) = match pre_tree_group {
         Some(group) => match group.place(pid) {
             Ok(()) => {
-                let (scope, group, gap) = run_tree_scope_or_exact(pid, group);
+                let (scope, active, retired, gap) = run_tree_scope_or_exact(pid, group);
                 run_tree_gap = gap;
-                (scope, group)
+                (scope, active, retired)
             }
             Err(error) => {
                 emit_capture_diagnostic(&format!(
@@ -4696,10 +4716,13 @@ fn run_owned_inner_with_host(
                     )
                 ));
                 run_tree_gap = Some(crate::render::RUN_TREE_DEGRADED.to_string());
-                (Scope::Pid(pid), None)
+                // The write may have landed before the readback refused:
+                // retire for cleanup-only so a possibly occupied dir is
+                // removed after the reap, not leaked.
+                (Scope::Pid(pid), None, Some(group))
             }
         },
-        None => (Scope::Pid(pid), None),
+        None => (Scope::Pid(pid), None, None),
     };
     let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
         combine_setup_failure(anyhow!("run: opening the owned child: {error}"), &mut child)
@@ -4737,10 +4760,9 @@ fn run_owned_inner_with_host(
     // held child must be among them, or the run would capture an empty
     // tree believing it is the command. The barrier still holds the
     // child, so an unretained child degrades to the exact child with
-    // the finite gap — never a refusal of a runnable command. Dropping
-    // the group keeps the placed child inside it (the retention notice
-    // names the path, as on the scope-build degrade); the re-discovery
-    // below observes only the started command.
+    // the finite gap — never a refusal of a runnable command. The
+    // group is retired for cleanup-only (it still holds the placed
+    // child); the re-discovery below observes only the started command.
     if run_tree_unretained_gap(&scope, engine.retains_pid(pid)).is_some() {
         let stale = anyhow!("the owned child has no live member view");
         emit_capture_diagnostic(&format!(
@@ -4750,7 +4772,7 @@ fn run_owned_inner_with_host(
                 &stale
             )
         ));
-        drop(run_cgroup.take());
+        retired_cgroup = run_cgroup.take();
         scope = Scope::Pid(pid);
         run_tree_gap = Some(crate::render::RUN_TREE_DEGRADED.to_string());
         let view = ProcessView::open(ProcessViewId(0), pid).map_err(|error| {
@@ -4830,6 +4852,7 @@ fn run_owned_inner_with_host(
         prearm_scope_start_ns: scope_start_ns,
         prearm_release_ns: None,
         run_cgroup,
+        run_cgroup_retired: retired_cgroup,
     };
 
     // Arm before the barrier: the owned window has to be protected from the
@@ -14254,23 +14277,31 @@ mod tests {
     fn run_tree_scope_or_exact_degrades_off_a_non_cgroup_dir() {
         // A placed group that is not a cgroup v2 scope (here tmpfs)
         // falls back to the exact child PID with the scope-build gap;
-        // the group drops and its empty dir goes with it.
+        // the group is retired for cleanup-only (it may still hold the
+        // placed child) and its dir goes once the holder drops.
         let base = tempfile::tempdir().unwrap();
         let group = crate::scope::RunCgroup::create(base.path()).unwrap();
         let path = group.path().to_path_buf();
-        let (scope, kept, gap) = super::run_tree_scope_or_exact(4242, group);
+        let (scope, active, retired, gap) = super::run_tree_scope_or_exact(4242, group);
         assert!(
             matches!(scope, crate::attach::Scope::Pid(pid) if pid == 4242),
             "degraded scope names the child exactly"
         );
-        assert!(kept.is_none(), "no group is kept on the exact path");
+        assert!(active.is_none(), "no active group on the exact path");
+        let retired = retired.expect("the placed group is retired for cleanup");
+        assert_eq!(retired.path(), path, "the retired group is the placed one");
         let reason = gap.expect("the scope-build gap is named");
         assert_eq!(
             reason,
             crate::render::RUN_TREE_DEGRADED,
             "the scope-build gap is finite vocabulary; the step prints on stderr"
         );
-        assert!(!path.exists(), "the unused group dir is removed");
+        assert!(
+            path.exists(),
+            "the retired dir survives until its holder drops"
+        );
+        drop(retired);
+        assert!(!path.exists(), "dropping the retired group removes the dir");
     }
 
     #[test]

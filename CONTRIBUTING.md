@@ -26,7 +26,9 @@ By contributing, you agree that your contribution is made under the license
 of the files you touch (above), and that you grant the project broad rights
 to sublicense and relicense your contribution, including under future or
 additional licenses. This grant is what allows the project to relicense
-freely later; a sign-off alone does not grant it.
+freely later; a sign-off alone does not grant it. Contributors keep their
+own copyright (no copyright assignment): the sign-off submits the
+contribution under the license of the files touched.
 
 ## How to sign
 

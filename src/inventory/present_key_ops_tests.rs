@@ -2141,9 +2141,9 @@ fn pqc_display_label_covers_all_pqc_labels() {
 }
 
 /// F16 residual (review item 8): spotlight segments sort by the
-/// `metadata_at_use` label, not the display string — `ml_kem_1024`
-/// follows `ml_kem_512` even though `ML-KEM-1024` sorts before
-/// `ML-KEM-512` lexicographically.
+/// label's v5 vocabulary rank, not the display string — `ml_kem_512`
+/// precedes `ml_kem_1024` even though both the label bytes and the
+/// display bytes sort `1024` before `512` lexicographically.
 #[test]
 fn key_ops_line_pqc_spotlight_sorts_by_label() {
     let mut observations = populated(9);
@@ -2160,7 +2160,7 @@ fn key_ops_line_pqc_spotlight_sorts_by_label() {
             .map(|segment| segment.display)
             .collect::<Vec<_>>(),
         vec!["ML-KEM-512", "ML-KEM-1024"],
-        "label order, not display order"
+        "vocabulary order, not display order"
     );
     let presentation = key_ops_presentation(observations);
     let snapshot = render_snapshot(&presentation);

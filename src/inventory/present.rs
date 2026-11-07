@@ -1350,14 +1350,17 @@ pub(crate) struct PqcKeySegment {
 /// across primary-role rows only (secondary rows stand beside,
 /// never double-counted — the H9 §82 rule the tallies follow).
 /// Unknown summaries carry no key, so they contribute nothing.
-/// Segments sort by (label, category); empty when no PQC-labelled
-/// proved row exists, in which case the snapshot shows no suffix.
+/// Segments sort by (v5 vocabulary rank of the label, category)
+/// — label bytes and display bytes both sort `ML-KEM-1024` before
+/// `ML-KEM-512`, so the rank carries the table order — and name
+/// proved completions only; empty when no PQC-labelled proved
+/// completion exists, in which case the snapshot shows no suffix.
 pub(crate) fn pqc_key_breakdown(
     observations: &crate::key_operation_projection::ObjectObservations,
 ) -> Vec<PqcKeySegment> {
     use std::collections::BTreeMap;
     let secondary = crate::key_operation_projection::SECONDARY_ROLE;
-    let mut by_label: BTreeMap<(&str, &str), (u64, u64, u64)> = BTreeMap::new();
+    let mut by_label: BTreeMap<(usize, &str), (&str, u64, u64, u64)> = BTreeMap::new();
     for row in &observations.key_operations {
         if row.role == secondary {
             continue;
@@ -1365,15 +1368,24 @@ pub(crate) fn pqc_key_breakdown(
         let Some(display) = pqc_display_label(row.metadata_at_use) else {
             continue;
         };
-        let entry = by_label.entry((display, row.category)).or_insert((0, 0, 0));
-        entry.0 = entry.0.saturating_add(row.completed);
-        entry.1 = entry.1.saturating_add(row.failed);
-        entry.2 = entry.2.saturating_add(row.active);
+        let Some(rank) = crate::key_operation_projection::contract::METADATA_LABELS_V5
+            .iter()
+            .position(|known| *known == row.metadata_at_use)
+        else {
+            continue;
+        };
+        let entry = by_label
+            .entry((rank, row.category))
+            .or_insert((display, 0, 0, 0));
+        entry.1 = entry.1.saturating_add(row.completed);
+        entry.2 = entry.2.saturating_add(row.failed);
+        entry.3 = entry.3.saturating_add(row.active);
     }
     by_label
         .into_iter()
+        .filter(|(_, (_, completed, _, _))| *completed > 0)
         .map(
-            |((display, category), (completed, failed, active))| PqcKeySegment {
+            |((_, category), (display, completed, failed, active))| PqcKeySegment {
                 display,
                 category,
                 completed,

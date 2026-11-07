@@ -30,7 +30,11 @@ use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
 use std::hash::BuildHasher as _;
 use std::io::Write as _;
+use std::os::fd::{AsRawFd as _, RawFd};
 use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
+
+use crate::sink::{SINK_POLL_SLICE, StdoutInner};
 
 /// The versioned event-stream schema id. Consumers dispatch on this
 /// exact string; a new id means a new contract.
@@ -61,14 +65,110 @@ struct RetainedFile {
     covered_bytes: u64,
 }
 
+/// Where one [`EventWriter`] delivers its lines: a rotated file set,
+/// or the inherited stdout (`--event-log -`) with bounded-wait shed.
+enum EventSink {
+    File(File),
+    Stdout(StdoutEventSink),
+}
+
+/// The stdout event sink (`--event-log -`): every line goes to the
+/// inherited stdout through the descriptor-safe transport
+/// ([`crate::sink::stdout_transport_on_fd`]), never interleaved with
+/// other stdout text (the runner refuses stdout rivals and moves the
+/// human summary to stderr). A commit batch shares one bounded wait:
+/// [`StdoutEventSink::begin_batch`] opens it, every line draws from
+/// it, and a line that cannot be delivered in what remains is shed
+/// and counted — never retried, never a stall. Shed lines keep their
+/// consumed sequence numbers, so a slow or closed reader shows as seq
+/// gaps accounted by `lost_lines`/`lost_bytes` (terminal `ended` and
+/// the stderr notices), never as silent loss. A shed that leaves a
+/// partial line repairs the framing with one newline before the next
+/// line, so every delivered line still starts at a line boundary.
+struct StdoutEventSink {
+    inner: StdoutInner,
+    budget: Duration,
+    deadline: Option<Instant>,
+    mid_line: bool,
+    lost_lines: u64,
+    lost_bytes: u64,
+    reported_lines: u64,
+    reported_bytes: u64,
+    first_reason: Option<String>,
+}
+
+/// One bounded line write: delivered whole, or shed with the count of
+/// bytes that did land (a partial line needs its framing repaired).
+enum LineOutcome {
+    Delivered,
+    Shed { delivered: usize, reason: String },
+}
+
+impl StdoutEventSink {
+    fn new(inner: StdoutInner, budget: Duration) -> Self {
+        Self {
+            inner,
+            budget,
+            deadline: None,
+            mid_line: false,
+            lost_lines: 0,
+            lost_bytes: 0,
+            reported_lines: 0,
+            reported_bytes: 0,
+            first_reason: None,
+        }
+    }
+
+    /// Open the bounded wait for one commit batch: every line of the
+    /// batch draws from it, so a stalled reader stalls a batch by at
+    /// most `budget` in total before lines start shedding with
+    /// counters. Idempotent: each batch begins explicitly.
+    fn begin_batch(&mut self) {
+        // Overflow is unreachable (millisecond budgets), and fails
+        // safe if it ever happens: a zero budget sheds, never stalls.
+        let start = Instant::now();
+        self.deadline = Some(start.checked_add(self.budget).unwrap_or(start));
+    }
+
+    fn remaining(&self) -> Duration {
+        self.deadline
+            .map(|end| end.saturating_duration_since(Instant::now()))
+            .unwrap_or_default()
+    }
+
+    /// Deliver one complete line (trailing newline included), or shed
+    /// and count it. Never fails: loss is accounting, not an error.
+    fn write_line(&mut self, _line: &[u8]) {
+        // Scaffold: the bounded writer lands with the sink commit.
+        // Every stdout behavioral test fails against this no-op.
+    }
+
+    /// Loss since the last call: the per-batch stderr delta. `None`
+    /// when nothing new shed.
+    fn take_loss_delta(&mut self) -> Option<(u64, u64)> {
+        if self.lost_lines == self.reported_lines && self.lost_bytes == self.reported_bytes {
+            return None;
+        }
+        let delta = (
+            self.lost_lines.saturating_sub(self.reported_lines),
+            self.lost_bytes.saturating_sub(self.reported_bytes),
+        );
+        self.reported_lines = self.lost_lines;
+        self.reported_bytes = self.lost_bytes;
+        Some(delta)
+    }
+}
+
 /// Appendable JSONL event writer with rotation + bounded retention.
 /// All writes go through [`EventWriter::append`]; rotation checks run
 /// before every line, so no single event is ever split or silently
 /// dropped. Flushed per event (SIGKILL-safe); synced on rotation and
-/// finish.
+/// finish. The stdout sink instead shares one bounded wait per commit
+/// batch ([`EventWriter::begin_batch`]) and sheds with counters past
+/// it; it never rotates.
 pub(crate) struct EventWriter {
     path: PathBuf,
-    file: File,
+    sink: EventSink,
     current_bytes: u64,
     events_in_file: u64,
     max_bytes: u64,
@@ -103,7 +203,7 @@ impl EventWriter {
     pub(crate) fn anonymous_test_sink(file: File) -> Self {
         Self {
             path: PathBuf::from("anonymous-producer-control"),
-            file,
+            sink: EventSink::File(file),
             current_bytes: 0,
             events_in_file: 0,
             max_bytes: u64::MAX,
@@ -150,7 +250,7 @@ impl EventWriter {
         let file = open_event_live_file(path)?;
         Ok(Self {
             path: path.to_path_buf(),
-            file,
+            sink: EventSink::File(file),
             current_bytes: 0,
             events_in_file: 0,
             max_bytes,
@@ -166,6 +266,81 @@ impl EventWriter {
             #[cfg(test)]
             fault: None,
         })
+    }
+
+    /// Open the stdout event sink (`--event-log -`) over any writer
+    /// fd with an explicit batch budget: the same
+    /// `p11scope/inventory-events/v1` lines, never rotated, with one
+    /// bounded wait per commit batch and shed-with-counters past it.
+    /// Tests drive pipes here; production passes fd 1 with
+    /// [`crate::sink::SINK_TICK_BUDGET`]. Fails fast only when the fd
+    /// cannot be acquired at all (closed or an unsupported type); an
+    /// open pipe whose reader is gone (already, or mid-run) sheds
+    /// every line with broken-pipe counters instead, and capture
+    /// continues to its normal stop.
+    pub(crate) fn create_stdout_on_fd(fd: RawFd, budget: Duration) -> Result<Self, String> {
+        let inner = crate::sink::stdout_transport_on_fd(fd)
+            .map_err(|error| format!("opening inventory event stream on stdout failed: {error}"))?;
+        Ok(Self {
+            path: PathBuf::from("-"),
+            sink: EventSink::Stdout(StdoutEventSink::new(inner, budget)),
+            current_bytes: 0,
+            events_in_file: 0,
+            max_bytes: u64::MAX,
+            max_files: 1,
+            rotation_seq: 0,
+            next_seq: 0,
+            retained: VecDeque::new(),
+            rotations: 0,
+            evicted_events: 0,
+            evicted_bytes: 0,
+            live_covered_events: 0,
+            live_covered_bytes: 0,
+            #[cfg(test)]
+            fault: None,
+        })
+    }
+
+    /// Whether this writer streams to stdout (`--event-log -`).
+    pub(crate) fn is_stdout(&self) -> bool {
+        matches!(self.sink, EventSink::Stdout(_))
+    }
+
+    /// Open the bounded wait for one commit batch on the stdout sink
+    /// (a no-op for files, which flush per line). Every commit
+    /// emitter begins its batch explicitly; appends outside a batch
+    /// share one implicit single-line batch each.
+    pub(crate) fn begin_batch(&mut self) {
+        if let EventSink::Stdout(stdout) = &mut self.sink {
+            stdout.begin_batch();
+        }
+    }
+
+    /// Stdout lines and line bytes shed so far (slow or closed
+    /// reader); always zero for files.
+    pub(crate) fn stdout_lost(&self) -> (u64, u64) {
+        match &self.sink {
+            EventSink::File(_) => (0, 0),
+            EventSink::Stdout(stdout) => (stdout.lost_lines, stdout.lost_bytes),
+        }
+    }
+
+    /// The first stdout shed reason (slow reader, broken pipe, ...);
+    /// `None` for files and while nothing shed.
+    pub(crate) fn stdout_loss_reason(&self) -> Option<&str> {
+        match &self.sink {
+            EventSink::File(_) => None,
+            EventSink::Stdout(stdout) => stdout.first_reason.as_deref(),
+        }
+    }
+
+    /// Stdout loss since the last call: the per-batch stderr delta.
+    /// `None` for files and when nothing new shed.
+    pub(crate) fn take_stdout_loss_delta(&mut self) -> Option<(u64, u64)> {
+        match &mut self.sink {
+            EventSink::File(_) => None,
+            EventSink::Stdout(stdout) => stdout.take_loss_delta(),
+        }
     }
 
     /// Append one event line: `{"schema","seq","at_ns","kind","event"}`.
@@ -208,13 +383,20 @@ impl EventWriter {
         let mut bytes = serde_json::to_vec(&line)
             .map_err(|error| format!("encoding {kind} event failed: {error}"))?;
         bytes.push(b'\n');
-        self.rotate_if_needed(bytes.len() as u64)?;
-        self.file
-            .write_all(&bytes)
-            .map_err(|error| format!("writing {kind} event failed: {error}"))?;
-        self.file
-            .flush()
-            .map_err(|error| format!("flushing {kind} event failed: {error}"))?;
+        if matches!(self.sink, EventSink::File(_)) {
+            self.rotate_if_needed(bytes.len() as u64)?;
+        }
+        match &mut self.sink {
+            EventSink::File(file) => {
+                file.write_all(&bytes)
+                    .map_err(|error| format!("writing {kind} event failed: {error}"))?;
+                file.flush()
+                    .map_err(|error| format!("flushing {kind} event failed: {error}"))?;
+            }
+            // Stdout never errors on transport loss: the sink sheds
+            // and counts, and capture continues.
+            EventSink::Stdout(stdout) => stdout.write_line(&bytes),
+        }
         self.current_bytes = self.current_bytes.saturating_add(bytes.len() as u64);
         self.events_in_file = self.events_in_file.saturating_add(1);
         Ok(bytes.len() as u64)
@@ -278,7 +460,10 @@ impl EventWriter {
         (self.max_files as u64 - 1).saturating_mul(per_file)
     }
 
-    /// Write the terminal `ended` event, flush, and sync the live file.
+    /// Write the terminal `ended` event, flush, and sync the live
+    /// file. The stdout sink writes `ended` through the same
+    /// shed-with-counters path instead (itself possibly shed) and
+    /// never syncs.
     pub(crate) fn finish(&mut self, payload: serde_json::Value, at_ns: u64) -> Result<(), String> {
         let payload = self.project_ended_payload(payload, at_ns);
         self.append("ended", payload, at_ns)?;
@@ -288,12 +473,15 @@ impl EventWriter {
         {
             return Err("injected event stream sync failure".into());
         }
-        self.file.sync_all().map_err(|error| {
-            format!(
-                "syncing event stream {} failed: {error}",
-                self.path.display()
-            )
-        })
+        match &mut self.sink {
+            EventSink::File(file) => file.sync_all().map_err(|error| {
+                format!(
+                    "syncing event stream {} failed: {error}",
+                    self.path.display()
+                )
+            }),
+            EventSink::Stdout(_) => Ok(()),
+        }
     }
 
     /// Account for the one rotation an `ended` append can cause, without
@@ -371,6 +559,10 @@ impl EventWriter {
     }
 
     fn rotate_if_needed(&mut self, incoming_len: u64) -> Result<(), String> {
+        // Stdout is never rotated; its max_bytes is u64::MAX either way.
+        if matches!(self.sink, EventSink::Stdout(_)) {
+            return Ok(());
+        }
         if self.events_in_file > 0
             && self.current_bytes.saturating_add(incoming_len) > self.max_bytes
         {
@@ -380,11 +572,12 @@ impl EventWriter {
     }
 
     fn rotate(&mut self) -> Result<(), String> {
-        self.file
-            .flush()
+        let EventSink::File(file) = &mut self.sink else {
+            return Err("internal error: rotation on a stdout event stream".into());
+        };
+        file.flush()
             .map_err(|error| format!("flushing event stream before rotation failed: {error}"))?;
-        self.file
-            .sync_all()
+        file.sync_all()
             .map_err(|error| format!("syncing event stream before rotation failed: {error}"))?;
         let seq = self.rotation_seq;
         self.rotation_seq = self.rotation_seq.saturating_add(1);
@@ -400,7 +593,7 @@ impl EventWriter {
         self.live_covered_events = 0;
         self.live_covered_bytes = 0;
         self.rotations = self.rotations.saturating_add(1);
-        self.file = open_event_live_file(&self.path).map_err(|error| {
+        *file = open_event_live_file(&self.path).map_err(|error| {
             format!(
                 "opening rotated event stream {} failed: {error}",
                 self.path.display()
@@ -433,11 +626,12 @@ impl EventWriter {
         let mut bytes = serde_json::to_vec(&line)
             .map_err(|error| format!("encoding rotation marker failed: {error}"))?;
         bytes.push(b'\n');
-        self.file
-            .write_all(&bytes)
+        let EventSink::File(file) = &mut self.sink else {
+            return Err("internal error: rotation on a stdout event stream".into());
+        };
+        file.write_all(&bytes)
             .map_err(|error| format!("writing rotation marker failed: {error}"))?;
-        self.file
-            .flush()
+        file.flush()
             .map_err(|error| format!("flushing rotation marker failed: {error}"))?;
         self.current_bytes = self.current_bytes.saturating_add(bytes.len() as u64);
         self.events_in_file = self.events_in_file.saturating_add(1);
@@ -491,11 +685,12 @@ impl EventWriter {
             let mut bytes = serde_json::to_vec(&line)
                 .map_err(|error| format!("encoding retention event failed: {error}"))?;
             bytes.push(b'\n');
-            self.file
-                .write_all(&bytes)
+            let EventSink::File(file) = &mut self.sink else {
+                return Err("internal error: retention on a stdout event stream".into());
+            };
+            file.write_all(&bytes)
                 .map_err(|error| format!("writing retention event failed: {error}"))?;
-            self.file
-                .flush()
+            file.flush()
                 .map_err(|error| format!("flushing retention event failed: {error}"))?;
             self.current_bytes = self.current_bytes.saturating_add(bytes.len() as u64);
             self.events_in_file = self.events_in_file.saturating_add(1);

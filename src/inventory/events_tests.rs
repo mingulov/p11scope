@@ -1135,3 +1135,340 @@ fn the_dump_fit_bound_is_exact_at_its_boundary() {
         assert!(!fits(boundary - 1), "{files} files at {}", boundary - 1);
     }
 }
+
+/// A real pipe for stdout-sink tests: the writer acquires its own
+/// private description of the write end (like production fd 1), so
+/// the test's ends only fill, drain and observe.
+fn stdout_test_pipe() -> (std::fs::File, std::fs::File) {
+    use std::os::fd::FromRawFd as _;
+    let mut fds = [0; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: `pipe` returned two fresh owned descriptors.
+    let read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    // SAFETY: same call, the write end.
+    let write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    (read, write)
+}
+
+fn stdout_test_writer(write: &std::fs::File, budget: std::time::Duration) -> EventWriter {
+    use std::os::fd::AsRawFd as _;
+    EventWriter::create_stdout_on_fd(write.as_raw_fd(), budget).unwrap()
+}
+
+/// Read everything the writer delivered: the writer and the test's
+/// own write end must be dropped first, or the read never sees EOF.
+fn stdout_drain(mut read: std::fs::File, writer: EventWriter, write: std::fs::File) -> Vec<u8> {
+    use std::io::Read as _;
+    drop(writer);
+    drop(write);
+    let mut bytes = Vec::new();
+    read.read_to_end(&mut bytes).unwrap();
+    bytes
+}
+
+#[test]
+fn stdout_sink_streams_framed_schema_lines_with_contiguous_seq() {
+    let (read, write) = stdout_test_pipe();
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(50));
+    assert!(writer.is_stdout());
+    writer.begin_batch();
+    writer
+        .append("started", serde_json::json!({"scope": "pid:7"}), 100)
+        .unwrap();
+    writer
+        .append("pass_committed", serde_json::json!({"pass": 0}), 200)
+        .unwrap();
+    writer
+        .finish(serde_json::json!({"ended_ns": 300}), 300)
+        .unwrap();
+    assert_eq!(writer.stdout_lost(), (0, 0));
+    assert_eq!(writer.stdout_loss_reason(), None);
+    assert_eq!(writer.take_stdout_loss_delta(), None);
+    let bytes = stdout_drain(read, writer, write);
+    // One complete JSON object per line, newline-terminated, no
+    // blank lines and no joined lines.
+    assert!(bytes.ends_with(b"\n"));
+    assert!(!bytes.windows(2).any(|pair| pair == b"\n\n"));
+    let lines: Vec<&str> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 3);
+    for (index, line) in lines.iter().enumerate() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["schema"], EVENT_SCHEMA, "{line}");
+        assert_eq!(value["seq"], index as u64, "{line}");
+        assert!(value["at_ns"].is_number(), "{line}");
+    }
+    let kinds: Vec<String> = lines
+        .iter()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    assert_eq!(kinds, ["started", "pass_committed", "ended"]);
+    let ended: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(ended["event"]["stdout_lost"]["lines"], 0);
+    assert_eq!(ended["event"]["stdout_lost"]["bytes"], 0);
+}
+
+#[test]
+fn stdout_sink_opens_inherited_fd_1() {
+    // The test harness always has a stdout: acquisition there must
+    // succeed (production passes fd 1 the same way).
+    let writer = EventWriter::create_stdout_on_fd(1, std::time::Duration::from_millis(10)).unwrap();
+    assert!(writer.is_stdout());
+}
+
+#[test]
+fn stdout_creation_fails_fast_on_a_closed_fd() {
+    // An fd no open file can hold (past any fd table): acquisition
+    // fails fast instead of building a writer that could never
+    // deliver a line.
+    let Err(error) =
+        EventWriter::create_stdout_on_fd(i32::MAX, std::time::Duration::from_millis(10))
+    else {
+        panic!("a closed fd cannot be acquired");
+    };
+    assert!(error.contains("stdout"), "{error}");
+}
+
+#[test]
+fn stdout_sink_acquires_a_readerless_pipe_and_sheds_epipe() {
+    let (read, write) = stdout_test_pipe();
+    // No reader from the start: acquisition still succeeds (the pipe
+    // is open), and every line sheds with a broken-pipe reason while
+    // capture continues — the same path as a mid-run close.
+    drop(read);
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(10));
+    writer.begin_batch();
+    let len = writer
+        .append_sized("started", serde_json::json!({"scope": "pid:7"}), 100)
+        .unwrap();
+    assert_eq!(writer.stdout_lost(), (1, len));
+    let reason = writer.stdout_loss_reason().unwrap();
+    assert!(
+        reason.contains("pipe") || reason.contains("EPIPE"),
+        "{reason}"
+    );
+}
+
+#[test]
+fn stdout_sink_counts_a_closed_pipe_without_an_error() {
+    let (read, write) = stdout_test_pipe();
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(50));
+    writer.begin_batch();
+    // The reader closes mid-run (`head -c` exits): every later line
+    // sheds with counters, nothing returns an error, and capture
+    // (here: the append sequence) continues to its normal stop.
+    drop(read);
+    let mut lost_bytes = 0u64;
+    for seq in 0..3 {
+        let len = writer
+            .append_sized(
+                "pass_committed",
+                serde_json::json!({"pass": seq}),
+                100 + seq,
+            )
+            .unwrap();
+        lost_bytes += len;
+    }
+    assert_eq!(writer.stdout_lost(), (3, lost_bytes));
+    let reason = writer.stdout_loss_reason().unwrap();
+    assert!(
+        reason.contains("pipe") || reason.contains("EPIPE"),
+        "{reason}"
+    );
+    assert_eq!(writer.take_stdout_loss_delta(), Some((3, lost_bytes)));
+    assert_eq!(writer.take_stdout_loss_delta(), None);
+    // Still usable: the next batch keeps counting, never retiring.
+    writer.begin_batch();
+    let len = writer
+        .append_sized("ended", serde_json::json!({"ended_ns": 999}), 999)
+        .unwrap();
+    assert_eq!(writer.stdout_lost(), (4, lost_bytes + len));
+    assert_eq!(
+        writer.take_stdout_loss_delta(),
+        Some((1, len)),
+        "only the new loss is reported"
+    );
+}
+
+/// Fill a test pipe exactly to capacity through the test's own
+/// (blocking) write end: room exists throughout, so the fill itself
+/// never stalls.
+fn stdout_fill_pipe(write: &mut std::fs::File, capacity: usize) {
+    use std::io::Write as _;
+    let chunk = vec![0x55u8; 4096];
+    let mut filled = 0;
+    while filled < capacity {
+        let end = (filled + chunk.len()).min(capacity);
+        write.write_all(&chunk[..end - filled]).unwrap();
+        filled = end;
+    }
+}
+
+/// Blocking read of exactly `n` bytes (all present by construction).
+fn stdout_drain_exact(read: &mut std::fs::File, n: usize) -> Vec<u8> {
+    use std::io::Read as _;
+    let mut out = vec![0u8; n];
+    read.read_exact(&mut out).unwrap();
+    out
+}
+
+fn stdout_pipe_capacity(write: &std::fs::File) -> usize {
+    use std::os::fd::AsRawFd as _;
+    let capacity = unsafe { libc::fcntl(write.as_raw_fd(), libc::F_GETPIPE_SZ) };
+    assert!(capacity >= 4096, "pipe capacity {capacity}");
+    capacity as usize
+}
+
+#[test]
+fn stdout_sink_sheds_a_full_pipe_within_budget_then_recovers() {
+    let (mut read, mut write) = stdout_test_pipe();
+    let capacity = stdout_pipe_capacity(&write);
+    // Fill the pipe before the writer exists: no reader drains
+    // during the shed, so the batch must shed within its budget.
+    stdout_fill_pipe(&mut write, capacity);
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(20));
+    writer.begin_batch();
+    // A slow reader must never stall capture: the batch sheds within
+    // its budget instead of blocking for a drain. The bound below is
+    // generous (500x the budget); a blocking write would hang past
+    // any bound.
+    let start = std::time::Instant::now();
+    let len = writer
+        .append_sized("pass_committed", serde_json::json!({"pass": 0}), 100)
+        .unwrap();
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(10),
+        "shed took {elapsed:?}"
+    );
+    assert_eq!(writer.stdout_lost(), (1, len));
+    assert!(
+        writer.stdout_loss_reason().unwrap().contains("slow reader"),
+        "slow-reader reason names the condition"
+    );
+    // The reader drains everything (the shed delivered nothing: the
+    // pipe was full): the next batch delivers again, and the shed
+    // seq stays an accounted gap, never a silent renumber.
+    stdout_drain_exact(&mut read, capacity);
+    writer.begin_batch();
+    writer
+        .append("pass_committed", serde_json::json!({"pass": 1}), 200)
+        .unwrap();
+    assert_eq!(writer.stdout_lost(), (1, len), "no new loss after drain");
+    let bytes = stdout_drain(read, writer, write);
+    let lines: Vec<&str> = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect();
+    assert_eq!(lines.len(), 1);
+    let value: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(value["schema"], EVENT_SCHEMA);
+    assert_eq!(value["seq"], 1);
+    assert_eq!(value["kind"], "pass_committed");
+}
+
+#[test]
+fn stdout_sink_repairs_a_shed_partial_line() {
+    let (mut read, mut write) = stdout_test_pipe();
+    let capacity = stdout_pipe_capacity(&write);
+    stdout_fill_pipe(&mut write, capacity);
+    // Free exactly one head's worth of room: the big line below
+    // (past PIPE_BUF, so the pipe takes a partial head rather than
+    // refusing whole) lands its head and sheds its tail.
+    const HEAD: usize = 64;
+    stdout_drain_exact(&mut read, HEAD);
+    let pad = "x".repeat(8192);
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(20));
+    writer.begin_batch();
+    let len = writer
+        .append_sized(
+            "pass_committed",
+            serde_json::json!({"pass": 0, "pad": pad}),
+            100,
+        )
+        .unwrap();
+    assert!(len > 4096, "the line exceeds PIPE_BUF: {len}");
+    assert_eq!(writer.stdout_lost(), (1, len - HEAD as u64));
+    // Drain the filler but keep the partial head queued: the next
+    // batch's repair newline terminates it, so the next line parses.
+    stdout_drain_exact(&mut read, capacity - HEAD);
+    writer.begin_batch();
+    writer
+        .append("pass_committed", serde_json::json!({"pass": 1}), 200)
+        .unwrap();
+    let bytes = stdout_drain(read, writer, write);
+    // The partial head, its repair newline, then one complete line.
+    // The head cannot parse (it is counted lost); the next line
+    // parses whole with its original seq.
+    let mut parts = bytes.split(|byte| *byte == b'\n');
+    let partial = parts.next().unwrap();
+    assert_eq!(partial.len(), HEAD, "the partial head was delivered");
+    assert!(
+        serde_json::from_str::<serde_json::Value>(std::str::from_utf8(partial).unwrap()).is_err(),
+        "a partial line must not parse as an event"
+    );
+    let whole = parts.next().unwrap();
+    let value: serde_json::Value =
+        serde_json::from_str(std::str::from_utf8(whole).unwrap()).unwrap();
+    assert_eq!(value["schema"], EVENT_SCHEMA);
+    assert_eq!(value["seq"], 1);
+    assert_eq!(value["kind"], "pass_committed");
+}
+
+#[test]
+fn stdout_sink_never_rotates_and_reports_neutral_retention() {
+    let (read, write) = stdout_test_pipe();
+    let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(50));
+    writer.begin_batch();
+    writer
+        .append("started", serde_json::json!({"scope": "pid:7"}), 100)
+        .unwrap();
+    // No rotation, no retention, no eviction: the sweep accounting
+    // sees one ungenerated stream, so nothing re-sends or dumps.
+    assert_eq!(writer.generation(), 0);
+    assert_eq!(writer.oldest_generation(), 0);
+    assert_eq!(writer.rotations(), 0);
+    assert_eq!(writer.evicted_events(), 0);
+    assert_eq!(writer.evicted_bytes(), 0);
+    assert_eq!(writer.oldest_generation_after(1 << 20), 0);
+    assert_eq!(writer.contiguous_capacity(1024), 0);
+    writer.reserve(1 << 20).unwrap();
+    assert_eq!(writer.generation(), 0, "reserve never rotates stdout");
+    drop(stdout_drain(read, writer, write));
+}
+
+#[test]
+fn file_streams_carry_no_stdout_loss_object() {
+    // The file stream keeps its exact v1 shape: `stdout_lost` exists
+    // only on `--event-log -` lines, never on file lines.
+    let dir = private_tempdir();
+    let path = dir.path().join("events.jsonl");
+    let mut writer = EventWriter::create(&path, 1 << 20, 2).unwrap();
+    assert!(!writer.is_stdout());
+    assert_eq!(writer.stdout_lost(), (0, 0));
+    assert_eq!(writer.take_stdout_loss_delta(), None);
+    writer
+        .append("started", serde_json::json!({"scope": "pid:7"}), 100)
+        .unwrap();
+    writer
+        .finish(serde_json::json!({"ended_ns": 200}), 200)
+        .unwrap();
+    let body = std::fs::read_to_string(&path).unwrap();
+    for line in body.lines() {
+        let value: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(value["schema"], EVENT_SCHEMA);
+        assert!(
+            value["event"].get("stdout_lost").is_none(),
+            "file lines carry no stdout accounting: {line}"
+        );
+    }
+}

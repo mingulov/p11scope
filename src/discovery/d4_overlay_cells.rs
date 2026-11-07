@@ -175,6 +175,17 @@ impl OverlayFixture {
     /// same-fs), lower/upper/work subdirs, and the merged mount under
     /// `root`. Fails closed with the failed step named.
     fn mount(root: &std::path::Path, xino: XinoMode) -> Result<Self, String> {
+        Self::mount_with_extra(root, xino, "")
+    }
+
+    /// [`mount`](Self::mount) with one extra mount option appended
+    /// verbatim (for example `,metacopy=on`): the metacopy row mounts
+    /// the same layers with metadata-only copy-up.
+    fn mount_with_extra(
+        root: &std::path::Path,
+        xino: XinoMode,
+        extra: &str,
+    ) -> Result<Self, String> {
         let lower = Ext4Loop::new();
         let upper = match xino {
             XinoMode::SameFs => None,
@@ -196,11 +207,12 @@ impl OverlayFixture {
                 .map_err(|error| format!("overlay mkdir {}: {error}", dir.display()))?;
         }
         let opts = format!(
-            "lowerdir={},upperdir={},workdir={}{}",
+            "lowerdir={},upperdir={},workdir={}{}{}",
             lowerdir.display(),
             upperdir.display(),
             workdir.display(),
-            fixture.xino_opt()
+            fixture.xino_opt(),
+            extra
         );
         mount_overlay(&opts, &fixture.merged.mountpoint)?;
         Ok(fixture)
@@ -4709,7 +4721,18 @@ fn copyup_old_file_setup(
     mode: XinoMode,
     lane: OverlayLane,
 ) -> Result<CopyUpOldFile, String> {
-    let fixture = OverlayFixture::mount(work, mode)?;
+    copyup_old_file_setup_with(work, mode, lane, "")
+}
+
+/// [`copyup_old_file_setup`] with one extra overlay mount option (for
+/// example `,metacopy=on`).
+fn copyup_old_file_setup_with(
+    work: &std::path::Path,
+    mode: XinoMode,
+    lane: OverlayLane,
+    extra: &str,
+) -> Result<CopyUpOldFile, String> {
+    let fixture = OverlayFixture::mount_with_extra(work, mode, extra)?;
     std::fs::write(fixture.lower_path("lib.so"), vec![0xE4u8; 8192])
         .map_err(|error| format!("copyup old-file lower write: {error}"))?;
     fixture.xino_verdict("lib.so")?;
@@ -5147,7 +5170,7 @@ fn privileged_copyup_stale_mapper_joins_proven_lower_file() {
     let lane = OverlayLane::detect().expect("overlay lane detects");
     for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
         let work = tempfile::tempdir().unwrap();
-        copyup_join_row(work.path(), mode, lane)
+        copyup_join_row(work.path(), mode, lane, "", "stale-lower")
             .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
     }
     eprintln!(
@@ -5160,11 +5183,13 @@ fn copyup_join_row(
     work: &std::path::Path,
     mode: XinoMode,
     lane: OverlayLane,
+    extra: &str,
+    row: &str,
 ) -> Result<(), String> {
     use crate::discovery::overlay_witness::witness_unavailable_refusal;
     use crate::discovery::scan::CopyUpJoin;
-    eprintln!("COPYUP_JOIN start mode={mode:?} row=stale-lower lane={lane:?}");
-    let setup = copyup_old_file_setup(work, mode, lane)?;
+    eprintln!("COPYUP_JOIN start mode={mode:?} row={row} lane={lane:?}");
+    let setup = copyup_old_file_setup_with(work, mode, lane, extra)?;
     let stale_maps = setup.stale.maps();
     let key = ObjectKey::of(&find_line(
         &stale_maps,
@@ -5182,13 +5207,13 @@ fn copyup_join_row(
                 if reason.contains("names more than one file") =>
             {
                 eprintln!(
-                    "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=legacy queries={queries}"
+                    "COPYUP_JOIN mode={mode:?} row={row} lane={lane:?} verdict=legacy queries={queries}"
                 );
                 return Ok(());
             }
             CopyUpProductionOutcome::Refused(reason) if witness_unavailable_refusal(&reason) => {
                 eprintln!(
-                    "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=unavailable queries={queries}"
+                    "COPYUP_JOIN mode={mode:?} row={row} lane={lane:?} verdict=unavailable queries={queries}"
                 );
                 return Ok(());
             }
@@ -5218,7 +5243,7 @@ fn copyup_join_row(
                 ));
             }
             eprintln!(
-                "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=legacy queries={queries} attempts={attempts}"
+                "COPYUP_JOIN mode={mode:?} row={row} lane={lane:?} verdict=legacy queries={queries} attempts={attempts}"
             );
             Ok(())
         }
@@ -5252,7 +5277,7 @@ fn copyup_join_row(
                 }
             }
             eprintln!(
-                "COPYUP_JOIN mode={mode:?} row=stale-lower lane={lane:?} verdict=join-lower queries={queries} attempts={attempts}"
+                "COPYUP_JOIN mode={mode:?} row={row} lane={lane:?} verdict=join-lower queries={queries} attempts={attempts}"
             );
             Ok(())
         }
@@ -5267,4 +5292,286 @@ fn copyup_join_row(
             "copyup join legacy shape refused without the legacy reason: {reason}"
         )),
     }
+}
+
+/// Copy-up join under `metacopy=on` (privileged): the same stale-lower
+/// flow over layers mounted with metadata-only copy-up. The data write
+/// still copies the file data up; the stale mapper must join the
+/// proven lower file with exactly two queries, like the base row.
+#[test]
+#[ignore = "root: loop overlay mounts with metacopy drive the production copy-up join"]
+fn privileged_copyup_metacopy_stale_mapper_joins_lower() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        copyup_join_row(
+            work.path(),
+            mode,
+            lane,
+            ",metacopy=on",
+            "stale-lower-metacopy",
+        )
+        .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+    }
+    eprintln!(
+        "COPYUP_JOIN direction=stale-lower-metacopy lane={lane:?} modes=on,off,same-fs verdict=join-lower"
+    );
+}
+
+/// A two-layer lower stack with the provider only in the second layer:
+/// one loop ext4 carries both lowerdirs plus upper/work, and the
+/// merged mount stacks them `low0:low1`.
+struct MultiLowerFixture {
+    merged: MergedMount,
+    _fs: Ext4Loop,
+    low0: std::path::PathBuf,
+    low1: std::path::PathBuf,
+    upper: std::path::PathBuf,
+}
+
+impl MultiLowerFixture {
+    fn mount(root: &std::path::Path, mode: XinoMode) -> Result<Self, String> {
+        let fs = Ext4Loop::new();
+        let low0 = fs.mount.join("low0");
+        let low1 = fs.mount.join("low1");
+        let upperdir = fs.mount.join("upper1");
+        let workdir = fs.mount.join("work1");
+        let mountpoint = root.join("merged1");
+        for dir in [&low0, &low1, &upperdir, &workdir, &mountpoint] {
+            std::fs::create_dir_all(dir)
+                .map_err(|error| format!("overlay mkdir {}: {error}", dir.display()))?;
+        }
+        let xino = match mode {
+            XinoMode::On => ",xino=on",
+            XinoMode::Off => ",xino=off",
+            XinoMode::SameFs => "",
+        };
+        let opts = format!(
+            "lowerdir={}:{},upperdir={},workdir={}{xino}",
+            low0.display(),
+            low1.display(),
+            upperdir.display(),
+            workdir.display(),
+        );
+        mount_overlay(&opts, &mountpoint)?;
+        Ok(Self {
+            merged: MergedMount { mountpoint },
+            _fs: fs,
+            low0,
+            low1,
+            upper: upperdir,
+        })
+    }
+}
+
+/// Copy-up join across a multi-lower stack (privileged): the provider
+/// lives only in the second lower layer, so the production fallback
+/// must walk past the missing first candidate and prove index 1. The
+/// proof names the second layer's file, never the first.
+#[test]
+#[ignore = "root: loop overlay mounts with two lower layers drive the production copy-up join"]
+fn privileged_copyup_second_lower_candidate_wins() {
+    use crate::discovery::scan::CopyUpJoin;
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        eprintln!("COPYUP_JOIN start mode={mode:?} row=second-lower lane={lane:?}");
+        let fixture = MultiLowerFixture::mount(work.path(), mode)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        std::fs::write(fixture.low1.join("lib.so"), vec![0xE4u8; 8192])
+            .unwrap_or_else(|error| panic!("mode {mode:?}: lower write: {error}"));
+        assert!(
+            !fixture.low0.join("lib.so").exists(),
+            "mode {mode:?}: the first layer must not carry the provider"
+        );
+        let merged = fixture.merged.mountpoint.join("lib.so");
+        let stale = SwapChild::spawn(&merged);
+        trigger_copy_up(
+            &merged,
+            &fixture.upper.join("lib.so"),
+            &fixture.low1.join("lib.so"),
+        )
+        .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        let stale_maps = stale.maps();
+        let key = ObjectKey::of(
+            &find_line(&stale_maps, target_range(&stale), *b"r-xp")
+                .unwrap_or_else(|error| panic!("mode {mode:?}: {error}")),
+        );
+        let (outcome, queries, attempts) = copyup_production_join_retry(
+            "copyup second lower",
+            stale.pid as u32,
+            &merged,
+            key,
+            &|| stale.maps(),
+        )
+        .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        match outcome {
+            CopyUpProductionOutcome::Joined(CopyUpJoin::LowerProven(proof)) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let metadata = std::fs::metadata(fixture.low1.join("lib.so"))
+                    .unwrap_or_else(|error| panic!("mode {mode:?}: lower fstat: {error}"));
+                assert_eq!(
+                    (proof.mapped.identity.dev, proof.mapped.identity.ino),
+                    (metadata.dev(), metadata.ino()),
+                    "mode {mode:?}: the proof must name the second layer's file"
+                );
+                assert_eq!(
+                    proof.candidate, 1,
+                    "mode {mode:?}: the proof must select candidate 1"
+                );
+                // Held plus the missing first candidate (skipped without
+                // a query) plus the proven second: two queries.
+                assert_eq!(
+                    queries, 2,
+                    "mode {mode:?}: expected one held plus one lower query, spent {queries}"
+                );
+                eprintln!(
+                    "COPYUP_JOIN mode={mode:?} row=second-lower lane={lane:?} verdict=join-lower queries={queries} attempts={attempts}"
+                );
+            }
+            other => panic!(
+                "mode {mode:?}: the stale mapper did not join the second lower file: {}",
+                match other {
+                    CopyUpProductionOutcome::LegacyRefused(reason)
+                    | CopyUpProductionOutcome::Refused(reason) => reason,
+                    CopyUpProductionOutcome::Joined(_) => "a held join".to_string(),
+                }
+            ),
+        }
+    }
+    eprintln!(
+        "COPYUP_JOIN direction=second-lower lane={lane:?} modes=on,off,same-fs verdict=join-lower"
+    );
+}
+
+/// In-place upper rewrite after copy-up (privileged): the upper file is
+/// rewritten through the upperdir (same inode, new bytes) while the
+/// stale mapper still runs the lower file. The stale ranges must still
+/// join the proven lower file — upper churn must never capture stale
+/// attribution — and a mapper started after the rewrite tracks the
+/// live upper file through the K1 held path with one query.
+#[test]
+#[ignore = "root: loop overlay mounts with an in-place upper rewrite drive the production copy-up join"]
+fn privileged_copyup_upper_rewrite_keeps_stale_on_lower() {
+    use crate::discovery::scan::CopyUpJoin;
+    overlay_preflight().expect("overlay preconditions hold");
+    let lane = OverlayLane::detect().expect("overlay lane detects");
+    for mode in [XinoMode::On, XinoMode::Off, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        eprintln!("COPYUP_JOIN start mode={mode:?} row=upper-rewrite lane={lane:?}");
+        let setup = copyup_old_file_setup(work.path(), mode, lane)
+            .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        // Rewrite the upper file in place: same inode, different bytes.
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::MetadataExt as _;
+            let upper = setup.fixture.upper_path("lib.so");
+            let before = std::fs::metadata(&upper)
+                .unwrap_or_else(|error| panic!("mode {mode:?}: upper stat: {error}"));
+            let mut writer = std::fs::OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(&upper)
+                .unwrap_or_else(|error| panic!("mode {mode:?}: upper open: {error}"));
+            writer
+                .write_all(&[0x1Fu8; 8192])
+                .unwrap_or_else(|error| panic!("mode {mode:?}: upper write: {error}"));
+            drop(writer);
+            let after = std::fs::metadata(&upper)
+                .unwrap_or_else(|error| panic!("mode {mode:?}: upper restat: {error}"));
+            assert_eq!(
+                (before.dev(), before.ino()),
+                (after.dev(), after.ino()),
+                "mode {mode:?}: the rewrite must keep the upper inode"
+            );
+            let lower = std::fs::read(setup.fixture.lower_path("lib.so"))
+                .unwrap_or_else(|error| panic!("mode {mode:?}: lower read: {error}"));
+            assert!(
+                lower.iter().all(|byte| *byte == 0xE4u8),
+                "mode {mode:?}: the rewrite must not touch the lower file"
+            );
+        }
+        // The stale mapper still joins the proven lower file.
+        let stale_maps = setup.stale.maps();
+        let key = ObjectKey::of(
+            &find_line(&stale_maps, target_range(&setup.stale), *b"r-xp")
+                .unwrap_or_else(|error| panic!("mode {mode:?}: {error}")),
+        );
+        let (outcome, queries, attempts) = copyup_production_join_retry(
+            "copyup upper rewrite",
+            setup.stale.pid as u32,
+            &setup.merged,
+            key,
+            &|| setup.stale.maps(),
+        )
+        .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        match outcome {
+            CopyUpProductionOutcome::Joined(CopyUpJoin::LowerProven(proof)) => {
+                use std::os::unix::fs::MetadataExt as _;
+                let metadata = std::fs::metadata(setup.fixture.lower_path("lib.so"))
+                    .unwrap_or_else(|error| panic!("mode {mode:?}: lower fstat: {error}"));
+                assert_eq!(
+                    (proof.mapped.identity.dev, proof.mapped.identity.ino),
+                    (metadata.dev(), metadata.ino()),
+                    "mode {mode:?}: the proof must still name the lower file"
+                );
+                assert_eq!(proof.candidate, 0, "mode {mode:?}: candidate 0");
+                assert_eq!(
+                    queries, 2,
+                    "mode {mode:?}: expected one held plus one lower query, spent {queries}"
+                );
+                eprintln!(
+                    "COPYUP_JOIN mode={mode:?} row=upper-rewrite lane={lane:?} verdict=join-lower queries={queries} attempts={attempts}"
+                );
+            }
+            other => panic!(
+                "mode {mode:?}: the stale mapper left the lower file after the upper rewrite: {}",
+                match other {
+                    CopyUpProductionOutcome::LegacyRefused(reason)
+                    | CopyUpProductionOutcome::Refused(reason) => reason,
+                    CopyUpProductionOutcome::Joined(_) => "a held join".to_string(),
+                }
+            ),
+        }
+        // A mapper started after the rewrite tracks the live file: its
+        // ranges join the held (rewritten) upper through the K1 witness
+        // path with exactly one query, never the lower fallback.
+        let fresh = SwapChild::spawn(&setup.merged);
+        let fresh_maps = fresh.maps();
+        let fresh_key = ObjectKey::of(
+            &find_line(&fresh_maps, target_range(&fresh), *b"r-xp")
+                .unwrap_or_else(|error| panic!("mode {mode:?}: {error}")),
+        );
+        let (fresh_outcome, fresh_queries, fresh_attempts) = copyup_production_join_retry(
+            "copyup upper rewrite fresh",
+            fresh.pid as u32,
+            &setup.merged,
+            fresh_key,
+            &|| fresh.maps(),
+        )
+        .unwrap_or_else(|error| panic!("mode {mode:?}: {error}"));
+        match fresh_outcome {
+            CopyUpProductionOutcome::Joined(CopyUpJoin::Held) => {}
+            other => panic!(
+                "mode {mode:?}: the post-rewrite mapper did not join the held upper: {}",
+                match other {
+                    CopyUpProductionOutcome::LegacyRefused(reason)
+                    | CopyUpProductionOutcome::Refused(reason) => reason,
+                    CopyUpProductionOutcome::Joined(_) => "a lower join".to_string(),
+                }
+            ),
+        }
+        assert_eq!(
+            fresh_queries, 1,
+            "mode {mode:?}: the fresh mapper must spend one held query, spent {fresh_queries}"
+        );
+        eprintln!(
+            "COPYUP_JOIN mode={mode:?} row=upper-rewrite lane={lane:?} verdict=fresh-held queries={fresh_queries} attempts={fresh_attempts}"
+        );
+    }
+    eprintln!(
+        "COPYUP_JOIN direction=upper-rewrite lane={lane:?} modes=on,off,same-fs verdict=join-lower"
+    );
 }

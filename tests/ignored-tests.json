@@ -774,6 +774,24 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_metacopy_stale_mapper_joins_lower",
+      "reason": "root: loop overlay mounts with metacopy plus eligible BTF/task_vma identity; copy-up join under metacopy=on (the stale mapper joins the proven lower file), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_second_lower_candidate_wins",
+      "reason": "root: loop overlay mounts with two lower layers plus eligible BTF/task_vma identity; multi-lower join (the proof selects candidate 1), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_upper_rewrite_keeps_stale_on_lower",
+      "reason": "root: loop overlay mounts with an in-place upper rewrite plus eligible BTF/task_vma identity; upper-churn negative (stale stays on the lower file, fresh tracks the live file), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_population_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",

@@ -800,6 +800,9 @@ discovery::sweep_attribution::tests::d4_overlay_cells::overlay_copy_up_userspace
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_proves_stale_mapping
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_lower_anchor_refuses_fresh_mapping
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_stale_mapper_joins_proven_lower_file
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_metacopy_stale_mapper_joins_lower
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_second_lower_candidate_wins
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_upper_rewrite_keeps_stale_on_lower
 )
 
 # Expected-failure campaign cells: run only with

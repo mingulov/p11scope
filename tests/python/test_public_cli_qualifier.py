@@ -361,6 +361,25 @@ class InventoryOverlayTests(unittest.TestCase):
         self.assertIn("inventory overlay unproven signature: "
                       "0 modules, 2 unproven gaps", out)
 
+    def test_overlay_accepts_designed_collection_deadline_gap(self):
+        # A pass that starts just before the run deadline is cancelled
+        # mid-flight by the designed collection bound and honestly
+        # records 'cgroup collection deadline reached' (once per gap
+        # site, as the sibling transaction reasons). The overlay
+        # signature must survive that reason: the cell stays a
+        # recognized expected-failure instead of misclassifying as
+        # failed with 'overlay unproven extra gap'.
+        report = overlay_report()
+        report["gaps"].append(
+            {"caller": None, "module": None, "pid": None,
+             "reason": "cgroup collection deadline reached",
+             "subject": "cgroup scope transaction incomplete",
+             "repeats": 2})
+        rc, out = run_oracle(report)
+        self.assertNotEqual(rc, 0, out)
+        self.assertIn("inventory overlay unproven signature: "
+                      "0 modules, 2 unproven gaps", out)
+
     def test_overlay_branch_rejects(self):
         cases = []
         ext4 = overlay_report()

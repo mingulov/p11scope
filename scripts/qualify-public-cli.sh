@@ -552,7 +552,14 @@ if owned is None:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
     rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
-    known={'cgroup member scan was incomplete','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained'}
+    # Ruling CI-GAP-2 (proposed; owner to confirm): the collection
+    # deadline is the designed bound on cgroup transactions. A pass that
+    # starts just before the run deadline is cancelled mid-flight and
+    # honestly records this reason alongside the sibling transaction
+    # reasons; the overlay signature below still fails the cell, so this
+    # only keeps the failure classified. Full record: the v070 cli-flakes
+    # job report (inventory-cgroup deadline section).
+    known={'cgroup member scan was incomplete','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
     assert all(g.get('reason') in known for g in rest), 'overlay unproven extra gap: %r' % rest
     assert False, 'inventory overlay unproven signature: 0 modules, %d unproven gaps' % len(unproven)
 assert modules[owned].get('admission',{}).get('state')=='admitted', 'owned provider not admitted'

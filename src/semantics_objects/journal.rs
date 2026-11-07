@@ -5488,6 +5488,8 @@ impl JournalAdapter {
         births: &mut impl BirthEvidenceSource,
         replay: Option<ReplayPreparation>,
     ) -> Result<SealSuccess, SealFailure> {
+        // TEMP F9 seal-phase timers.
+        let t_seal = std::time::Instant::now();
         let frontier = frontier.0;
         let key = bootstrap.proof().key;
         let Some(state) = self.keys.get(&key) else {
@@ -5713,7 +5715,24 @@ impl JournalAdapter {
         if completed && !self.has_history_through(key, &live, frontier) {
             return self.seal_completed_era(key, bootstrap, frontier, replay);
         }
-        self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay)
+        // TEMP F9: guards (all open/staged scans) vs apply split.
+        let t_guards = t_seal.elapsed();
+        let t_apply = std::time::Instant::now();
+        let open_len = self.open.len();
+        let out = self.seal_validated(model, key, bootstrap, frontier, fence, audit, replay);
+        let t_apply = t_apply.elapsed();
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static SP: AtomicU64 = AtomicU64::new(0);
+            if SP.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
+                eprintln!(
+                    "seal-phase open={open_len} guards_ms={} apply_ms={}",
+                    t_guards.as_secs_f64() * 1000.0,
+                    t_apply.as_secs_f64() * 1000.0
+                );
+            }
+        }
+        out
     }
 
     /// Whether any staged wire truth for one key sits at or below a

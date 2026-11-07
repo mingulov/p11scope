@@ -428,10 +428,25 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
                 let held = frame.as_mut().expect("same original service frame");
+                // TEMP F9: seal vs deliver split.
+                let t_sd = std::time::Instant::now();
                 held.seal_next_bounded(&mut ports, &mut births, &fault, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
+                let t_seal = t_sd.elapsed();
                 held.deliver_next_bounded(&mut ports, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
+                if diag {
+                    use std::sync::atomic::{AtomicU64, Ordering};
+                    static SD: AtomicU64 = AtomicU64::new(0);
+                    if SD.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
+                        eprintln!(
+                            "seal-deliver seal_ms={} deliver_ms={} rem={}",
+                            t_seal.as_secs_f64() * 1000.0,
+                            t_sd.elapsed().as_secs_f64() * 1000.0 - t_seal.as_secs_f64() * 1000.0,
+                            *remaining,
+                        );
+                    }
+                }
             }
             if let Some(disposed) =
                 self.finish_joint_frame_if_ready(frame, producers, &continuation)?

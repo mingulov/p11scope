@@ -28043,7 +28043,8 @@ mod maps_skip_memory_tests {
                 .filter(|pid| *pid != reproving)
                 .collect();
             assert_eq!(
-                skip, expected,
+                skip,
+                expected,
                 "pass {pass} must re-prove pid {reproving} (cohort {}) and skip its three stable peers",
                 pass % super::SKIP_BACKSTOP_EVERY
             );

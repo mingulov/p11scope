@@ -690,7 +690,9 @@ its leaf on stderr (the full path only under `-v`) so the operator can
 remove it after its members exit; a crash can leave an empty run cgroup
 behind until the session ends. Descendants that retire between admission
 passes count `pid_descendant_gaps` like cgroup scope (same bounded
-ledger, same lossy-by-design rule), so a forking workload with prearmed
+ledger, same lossy-by-design rule, one gap per process generation), and
+an end-of-run sweep counts one more for each descendant still waiting
+for admission when the capture ends, so a forking workload with prearmed
 or already-attached providers reports exact counts with `PARTIAL`
 observation; unprearmed cold grandchildren may show missing calls; see
 the [known limitations](known-limitations.md). Without permission to

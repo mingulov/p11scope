@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 221,
+  "default_floor": 222,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -139,6 +139,7 @@
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_k1_no_route_collect_system_witness",
     "discovery::sweep_attribution::tests::privileged_a_data_only_mapper_of_an_identity_key_is_never_attributed_on_ext4",
     "discovery::sweep_attribution::tests::privileged_an_unmapped_file_whose_inode_is_reused_is_never_attributed_on_ext4",
+    "discovery::sweep_attribution::tests::privileged_tmpfs_inode32_refuses_while_inode64_merges",
     "events::runtime_tests::real_retained_consumer_keeps_one_cursor_across_all_drains",
     "events::runtime_tests::real_retained_discovery_consumer_owns_one_exact_map",
     "events::runtime_tests::real_uretprobe_hazard_self_probe_reaches_a_verdict",

@@ -35,8 +35,20 @@ mkdir -p "$OUT" || exit 2
 OUT=$(cd "$OUT" && pwd) || exit 2
 # The cell binaries run as `nobody`, so they must live outside the
 # runner-owned tree: /home/runner is not traversable by nobody (exit
-# 126 there). A 755 mktemp under /var/tmp traverses everywhere.
-CELLTMP=$(mktemp -d /var/tmp/minimal-setcap.XXXXXX) || exit 2
+# 126 there). A 755 mktemp under a suid-capable tmp traverses
+# everywhere; vng 1.41 guests mount /var/tmp nosuid,nodev (file caps
+# ignored there, every nobody row capless), so probe /var/tmp then
+# /tmp, skipping any nosuid mount.
+CELLTMP=""
+for _base in /var/tmp /tmp; do
+  [ -d "$_base" ] || continue
+  if findmnt -no OPTIONS -T "$_base" 2>/dev/null | tr ',' '\n' | grep -qx "nosuid"; then
+    continue
+  fi
+  CELLTMP=$(mktemp -d "$_base/minimal-setcap.XXXXXX" 2>/dev/null) || continue
+  break
+done
+[ -n "$CELLTMP" ] || { echo "minimal-setcap: harness error: no suid-capable tmp for CELLTMP (/var/tmp and /tmp nosuid or missing)" >&2; exit 2; }
 chmod 755 "$CELLTMP" || exit 2
 mkdir -p "$CELLTMP/bin" "$CELLTMP/nobody" "$CELLTMP/out" || exit 2
 chmod 700 "$CELLTMP/nobody" "$CELLTMP/out"
@@ -62,7 +74,7 @@ cleanup() {
   restore_paranoid
   [ -n "${NOBODYOUT:-}" ] && rm -rf "$NOBODYOUT"
   # Keep the detailed row logs beside the results for failed-run
-  # debugging (CELLTMP itself lives under /var/tmp and is removed).
+  # debugging (CELLTMP itself lives under /var/tmp or /tmp and is removed).
   if [ -n "${CELLTMP:-}" ] && [ -d "$CELLTMP/out" ]; then
     rm -rf "$OUT/logs"
     cp -r "$CELLTMP/out" "$OUT/logs" 2>/dev/null || true
@@ -110,6 +122,53 @@ int main(int argc, char **argv) {
 }
 EOF
 gcc -O1 -o "$CELLTMP/workload" "$CELLTMP/workload.c" -ldl || exit 2
+# Late-dlopen variant for the post-shed dynamic path: prints ready
+# immediately (so the observer attaches and sheds first), sleeps,
+# then dlopens. Early dlopen needs no dynamic work after the shed,
+# so it cannot prove the shed kept the fallback grant.
+cat >"$CELLTMP/workload-late.c" <<'EOF'
+#include <dlfcn.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+typedef unsigned long CK_RV;
+typedef struct CK_VERSION { unsigned char major, minor; } CK_VERSION;
+typedef void *CK_VOID_PTR;
+typedef struct CK_FUNCTION_LIST {
+    CK_VERSION version;
+    CK_RV (*C_Initialize)(CK_VOID_PTR pInitArgs);
+    CK_RV (*C_Finalize)(CK_VOID_PTR pReserved);
+} CK_FUNCTION_LIST;
+typedef CK_RV (*C_GetFunctionList)(CK_FUNCTION_LIST **);
+int main(int argc, char **argv) {
+    int iters = argc > 1 ? atoi(argv[1]) : 200;
+    int delay = argc > 2 ? atoi(argv[2]) : 5;
+    const char *paths[] = {
+        "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+        "/usr/lib64/pkcs11/libsofthsm2.so",
+        NULL,
+    };
+    printf("ready pid=%d\n", (int)getpid());
+    fflush(stdout);
+    if (delay > 0)
+        sleep((unsigned)delay);
+    void *h = NULL;
+    for (int i = 0; paths[i] && !h; i++)
+        h = dlopen(paths[i], RTLD_NOW);
+    if (!h) { fprintf(stderr, "late dlopen failed\n"); return 1; }
+    C_GetFunctionList get_list = (C_GetFunctionList)dlsym(h, "C_GetFunctionList");
+    for (int i = 0; i < iters; i++) {
+        CK_FUNCTION_LIST *f = NULL;
+        if (get_list && get_list(&f) == 0 && f) {
+            f->C_Initialize(NULL);
+            f->C_Finalize(NULL);
+        }
+        usleep(200000);
+    }
+    return 0;
+}
+EOF
+gcc -O1 -o "$CELLTMP/workload-late" "$CELLTMP/workload-late.c" -ldl || exit 2
 # Hermetic sleeper for the run-child cell: the owned child execs
 # fd-pinned (/proc/self/fd/N, so comm is the fd number, never the
 # program name), and a host uutils /bin/sleep can exit 1 under such an
@@ -141,8 +200,14 @@ cat >"$CELLTMP/dropcaps.c" <<'EOF'
 int main(int argc, char **argv) {
     if (argc < 3) { fprintf(stderr, "usage: dropcaps MASK CMD...\n"); return 2; }
     unsigned long long keep = strtoull(argv[1], 0, 0);
-    for (int cap = 0; cap <= 40; cap++) {
-        if (!(keep & (1ULL << cap))) {
+    int last = -1;
+    FILE *f = fopen("/proc/sys/kernel/cap_last_cap", "r");
+    if (!f) { perror("cap_last_cap"); return 1; }
+    if (fscanf(f, "%d", &last) != 1 || last < 0) { perror("cap_last_cap"); fclose(f); return 1; }
+    fclose(f);
+    for (int cap = 0; cap <= last; cap++) {
+        int held = cap < 64 ? !!(keep & (1ULL << cap)) : 0;
+        if (!held) {
             if (prctl(PR_CAPBSET_DROP, cap, 0, 0, 0) && errno != EINVAL)
                 { perror("PR_CAPBSET_DROP"); return 1; }
         }
@@ -194,6 +259,34 @@ runuser -u nobody -- test -x "$CELLTMP/bin/full" || {
 as_nobody() { # runs "$@" as nobody with a private TMPDIR; caller redirects
   runuser -u nobody -- env TMPDIR="$CELLTMP/nobody" "$@"
 }
+# Positive control: file capabilities must survive on CELLTMP. A nosuid
+# mount ignores them, and every nobody row would then run capless while
+# the test -x pre-check above still passes. Build a hermetic cat (a
+# /bin/cat copy breaks under uutils multicall: argv[0] selects the
+# applet), grant one cap, run as nobody on /proc/self/status (its own
+# status), and require a nonzero CapEff; anything else is a harness
+# error.
+cat >"$CELLTMP/capcheck.c" <<'EOF'
+#include <stdio.h>
+int main(int argc, char **argv) {
+    if (argc < 2) return 2;
+    FILE *f = fopen(argv[1], "r");
+    if (!f) return 1;
+    char buf[8192];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, f)) > 0) {
+        if (fwrite(buf, 1, n, stdout) != n) return 1;
+    }
+    fclose(f);
+    return 0;
+}
+EOF
+gcc -O1 -o "$CELLTMP/bin/capcheck" "$CELLTMP/capcheck.c" || exit 2
+setcap "cap_sys_ptrace=ep" "$CELLTMP/bin/capcheck" || exit 2
+if ! as_nobody "$CELLTMP/bin/capcheck" /proc/self/status 2>/dev/null | grep -qE "^CapEff:.*[1-9a-fA-F]"; then
+  echo "minimal-setcap: harness error: file capabilities ignored on $CELLTMP (nosuid?)" >&2
+  exit 2
+fi
 start_workload() { # ITERS LOG — prints the workload pid
   "$CELLTMP/workload" "$1" >"$2" 2>&1 &
   local pid=$!
@@ -202,6 +295,16 @@ start_workload() { # ITERS LOG — prints the workload pid
     sleep 0.2
   done
   grep -q "^ready pid=" "$2" || { echo "workload never became ready" >&2; return 1; }
+  echo "$pid"
+}
+start_late_workload() { # ITERS DELAY LOG — late-dlopen variant, prints pid
+  "$CELLTMP/workload-late" "$1" "$2" >"$3" 2>&1 &
+  local pid=$!
+  for _ in $(seq 1 50); do
+    grep -q "^ready pid=" "$3" 2>/dev/null && break
+    sleep 0.2
+  done
+  grep -q "^ready pid=" "$3" || { echo "late workload never became ready" >&2; return 1; }
   echo "$pid"
 }
 stop_workload() { kill "$1" 2>/dev/null || true; wait "$1" 2>/dev/null || true; }
@@ -372,7 +475,7 @@ is_descendant() {
   done
   return 1
 }
-child=""; eff=""; amb=""
+child=""; eff=""; amb=""; prm=""
 for _ in $(seq 1 300); do
   for task in /proc/[0-9]*/exe; do
     [ "$task" -ef "$CELLTMP/sleeper" ] 2>/dev/null || continue
@@ -380,7 +483,8 @@ for _ in $(seq 1 300); do
     if is_descendant "$cand" "$opid"; then
       eff=$(awk '/^CapEff:/{print $2}' /proc/"$cand"/status 2>/dev/null)
       amb=$(awk '/^CapAmb:/{print $2}' /proc/"$cand"/status 2>/dev/null)
-      if [ -n "$eff" ] && [ -n "$amb" ]; then
+      prm=$(awk '/^CapPrm:/{print $2}' /proc/"$cand"/status 2>/dev/null)
+      if [ -n "$eff" ] && [ -n "$amb" ] && [ -n "$prm" ]; then
         child=$cand
         break 2
       fi
@@ -403,15 +507,17 @@ if [ -z "$child" ]; then
   detail="no sleeper child of observer $opid appeared runexit=$runrc"
   detail="$detail err=$(tail -c 160 "$CELLTMP/out/run-child.err" 2>/dev/null | tr '\n' ';')"
 else
-  detail="child=$child CapEff=$eff CapAmb=$amb runexit=$runrc"
-  { [ "$eff" = "0000000000000000" ] && [ "$amb" = "0000000000000000" ]; } || pass=0
+  detail="child=$child CapEff=$eff CapPrm=$prm CapAmb=$amb runexit=$runrc"
+  { [ "$eff" = "0000000000000000" ] && [ "$prm" = "0000000000000000" ] && [ "$amb" = "0000000000000000" ]; } || pass=0
 fi
 [ "$runrc" -eq 0 ] || pass=0
 row run-child-drops-caps "$pass" qualified "$detail"
 # Post-setup shed: a root observer holds exactly the minimal live set
 # mid-capture (current paranoid only).
+# Late dlopen (5 s in) forces dynamic attach after the shed: early
+# dlopen would prove nothing about the post-shed grant.
 wlog=$CELLTMP/out/workload-postsetup.log
-wpid=$(start_workload 200 "$wlog") || exit 2
+wpid=$(start_late_workload 200 5 "$wlog") || exit 2
 "$CELLTMP/bin/full" profile --pid "$wpid" --duration 12s \
   >"$CELLTMP/out/postsetup.out" 2>"$CELLTMP/out/postsetup.err" &
 opid=$!
@@ -424,27 +530,33 @@ done
 if grep -q "capturing:" "$CELLTMP/out/postsetup.err" 2>/dev/null; then
   # The shed is per-thread: every task must hold the minimal set only,
   # not just the leader (the cleanup worker and its helpers predate it).
+  # Both effective and permitted must shed SYS_ADMIN: an effective-only
+  # check would miss a permitted surplus that re-grants it.
   tasks_detail=""
   tasks_bad=""
   for task in /proc/"$opid"/task/*; do
     tid=${task#/proc/"$opid"/task/}
     eff_hex=$(awk '/^CapEff:/{print $2}' "$task/status" 2>/dev/null) || continue
-    tasks_detail="$tasks_detail $tid=$eff_hex"
-    if ! python3 -I - "$eff_hex" <<'PY'; then
+    prm_hex=$(awk '/^CapPrm:/{print $2}' "$task/status" 2>/dev/null) || continue
+    tasks_detail="$tasks_detail $tid=$eff_hex/$prm_hex"
+    if ! python3 -I - "$eff_hex" "$prm_hex" <<'PY'; then
 import sys
 eff = int(sys.argv[1], 16)
+prm = int(sys.argv[2], 16)
 live = {39, 40, 2, 38, 19}
 assert all((eff >> bit) & 1 for bit in live), hex(eff)
 assert not (eff >> 21) & 1, hex(eff)
+assert all((prm >> bit) & 1 for bit in live), hex(prm)
+assert not (prm >> 21) & 1, hex(prm)
 PY
-      tasks_bad="$tasks_bad $tid=$eff_hex"
+      tasks_bad="$tasks_bad $tid=$eff_hex/$prm_hex"
     fi
   done
   if [ -z "$tasks_bad" ] && [ -n "$tasks_detail" ]; then
-    detail="CapEff minimal-set-only on all tasks:$tasks_detail"
+    detail="CapEff+CapPrm minimal-set-only on all tasks:$tasks_detail"
   else
     pass=0
-    detail="unexpected mid-run CapEff on tasks:$tasks_bad (all:$tasks_detail)"
+    detail="unexpected mid-run CapEff/CapPrm on tasks:$tasks_bad (all:$tasks_detail)"
   fi
 else
   pass=0
@@ -453,6 +565,54 @@ fi
 wait "$opid" || pass=0
 stop_workload "$wpid"
 row postsetup-drops-sysadmin "$pass" qualified "$detail"
+# Inventory capture sheds through its own native lane: a root observer
+# holds the minimal set mid-inventory too (late dlopen forces dynamic
+# work after the shed, like the profile row above).
+wlog=$CELLTMP/out/workload-postsetup-inv.log
+wpid=$(start_late_workload 200 5 "$wlog") || exit 2
+"$CELLTMP/bin/full" inventory --system --capture native --duration 12s \
+  >"$CELLTMP/out/postsetup-inv.out" 2>"$CELLTMP/out/postsetup-inv.err" &
+opid=$!
+pass=1
+detail=""
+for _ in $(seq 1 60); do
+  grep -q "native usage lane active" "$CELLTMP/out/postsetup-inv.err" 2>/dev/null && break
+  sleep 0.5
+done
+if grep -q "native usage lane active" "$CELLTMP/out/postsetup-inv.err" 2>/dev/null; then
+  tasks_detail=""
+  tasks_bad=""
+  for task in /proc/"$opid"/task/*; do
+    tid=${task#/proc/"$opid"/task/}
+    eff_hex=$(awk '/^CapEff:/{print $2}' "$task/status" 2>/dev/null) || continue
+    prm_hex=$(awk '/^CapPrm:/{print $2}' "$task/status" 2>/dev/null) || continue
+    tasks_detail="$tasks_detail $tid=$eff_hex/$prm_hex"
+    if ! python3 -I - "$eff_hex" "$prm_hex" <<'PY'; then
+import sys
+eff = int(sys.argv[1], 16)
+prm = int(sys.argv[2], 16)
+live = {39, 40, 2, 38, 19}
+assert all((eff >> bit) & 1 for bit in live), hex(eff)
+assert not (eff >> 21) & 1, hex(eff)
+assert all((prm >> bit) & 1 for bit in live), hex(prm)
+assert not (prm >> 21) & 1, hex(prm)
+PY
+      tasks_bad="$tasks_bad $tid=$eff_hex/$prm_hex"
+    fi
+  done
+  if [ -z "$tasks_bad" ] && [ -n "$tasks_detail" ]; then
+    detail="CapEff+CapPrm minimal-set-only on all tasks:$tasks_detail"
+  else
+    pass=0
+    detail="unexpected mid-run CapEff/CapPrm on tasks:$tasks_bad (all:$tasks_detail)"
+  fi
+else
+  pass=0
+  detail="inventory never reached capture state"
+fi
+wait "$opid" || pass=0
+stop_workload "$wpid"
+row postsetup-inventory-drops-sysadmin "$pass" qualified "$detail"
 # Root `run` rows: the sudo drop re-owns the child without `--user`
 # (SETUID/SETGID) and the parent signals across uids (KILL). Without
 # those keeps the child dies EPERM and the run reports "original
@@ -511,16 +671,21 @@ pass=1
 [ "$rc" -eq 0 ] || pass=0
 grep -q "capture available" "$CELLTMP/out/daemonset-doctor.out" || pass=0
 row daemonset-doctor "$pass" qualified "exit=$rc"
+# Late dlopen (3 s into a 6 s capture) forces the DaemonSet's kept
+# SYS_ADMIN to serve a post-shed dynamic attach: early dlopen would
+# pass even with the narrow-only shed that breaks it. Late dlopen
+# misses its first calls (partial coverage), so the row requires a
+# positive call count, not exact completeness (the mutant counts 0).
 wlog=$CELLTMP/out/workload-daemonset.log
-wpid=$(start_workload 120 "$wlog") || exit 2
+wpid=$(start_late_workload 120 3 "$wlog") || exit 2
 "$CELLTMP/dropcaps" "$DAEMONSET" "$CELLTMP/bin/plain" profile --pid "$wpid" --duration 6s \
   >"$CELLTMP/out/daemonset-profile.out" 2>"$CELLTMP/out/daemonset-profile.err"
 rc=$?
 stop_workload "$wpid"
 pass=1
 [ "$rc" -eq 0 ] || pass=0
-grep -q "counts complete" "$CELLTMP/out/daemonset-profile.out" || pass=0
-row daemonset-profile "$pass" qualified "exit=$rc"
+grep -qE "[1-9][0-9]* completed calls" "$CELLTMP/out/daemonset-profile.out" || pass=0
+row daemonset-profile "$pass" qualified "exit=$rc $(grep -E 'completed calls' "$CELLTMP/out/daemonset-profile.out" | head -c 120)"
 wlog=$CELLTMP/out/workload-daemonset-inv.log
 wpid=$(start_workload 200 "$wlog") || exit 2
 # The report goes beside out, not inside it: out is nobody-owned for
@@ -532,8 +697,19 @@ stop_workload "$wpid"
 cp -f "$CELLTMP/daemonset-inventory.json" "$CELLTMP/out/" 2>/dev/null || true
 pass=1
 [ "$rc" -eq 0 ] || pass=0
-python3 -I -c 'import json,sys; json.load(open(sys.argv[1]))' "$CELLTMP/out/daemonset-inventory.json" || pass=0
-row daemonset-inventory "$pass" qualified "exit=$rc"
+if python3 -I - "$CELLTMP/out/daemonset-inventory.json" <<'PY'; then
+import json, sys
+doc = json.load(open(sys.argv[1]))
+paths = [p for m in doc.get("modules", []) for p in m.get("paths", [])]
+assert any("libsofthsm2" in p for p in paths), paths
+assert len(doc.get("edges", [])) > 0, "no caller edges"
+PY
+  detail="exit=$rc module+edge present"
+else
+  pass=0
+  detail="exit=$rc module or edge missing"
+fi
+row daemonset-inventory "$pass" qualified "$detail"
 trap - EXIT
 cleanup
 if [ "$FAILED" -ne 0 ]; then

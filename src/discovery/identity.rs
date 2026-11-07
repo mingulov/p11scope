@@ -394,7 +394,6 @@ impl RetainedInventoryTarget {
 
     /// Whether this retained object is the witness-proven pre-copy-up
     /// side of its key (routing metadata, not identity).
-    #[allow(dead_code)] // The attach-set routing reads this next.
     pub(crate) fn pre_copy_up(&self) -> bool {
         self.entry.pre_copy_up
     }
@@ -8655,6 +8654,31 @@ pub(crate) mod test_fixture {
         }
     }
 
+    /// Marks the single entry of a one-object pin set as a
+    /// witness-proven pre-copy-up observation, re-filing its raw.
+    pub(crate) fn mark_pre_copy_up(pins: &mut PinnedObjects) {
+        let (mut raw, id) = pins.raw_to_id.pop_first().expect("one raw to mark");
+        raw.pre_copy_up = true;
+        let entry = pins.by_id.get_mut(&id).expect("entry for the raw");
+        entry.raw.pre_copy_up = true;
+        entry.pre_copy_up = true;
+        pins.raw_to_id.insert(raw, id);
+    }
+
+    /// Re-paths the single entry of a one-object pin set under `path`
+    /// (normalized), re-filing its raw. The fd still opens the forged
+    /// file; only the published path changes — the copy-up shape, where
+    /// both sides file under the merge path.
+    pub(crate) fn repath_single_pin(pins: &mut PinnedObjects, path: &str) {
+        let normalized = super::normalize_target_path(path).expect("absolute fixture path");
+        let (mut raw, id) = pins.raw_to_id.pop_first().expect("one raw to re-path");
+        raw.path = normalized.clone();
+        let entry = pins.by_id.get_mut(&id).expect("entry for the raw");
+        entry.raw.path = normalized.clone();
+        entry.path = normalized;
+        pins.raw_to_id.insert(raw, id);
+    }
+
     /// Records the object an open `fd` names, so a later check can prove
     /// the descriptor was closed without depending on the number staying
     /// free: parallel tests in the same process reuse fd numbers
@@ -8981,8 +9005,8 @@ pub(crate) mod test_fixture {
 #[cfg(test)]
 mod tests {
     use super::test_fixture::{
-        FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, module, overlay, pin_set, pins,
-        reback, view_pin,
+        FakeSelfMappingProbe, INODE, PATH, SHA, backing_file, mark_pre_copy_up, module, overlay,
+        pin_set, pins, reback, view_pin,
     };
     use super::*;
     use crate::discovery::scan::ScannedEntry;
@@ -10765,17 +10789,6 @@ mod tests {
         assert!(replay.rejects(key));
         assert_eq!(replay.pinned().count(), 0);
         assert_eq!(ambiguity_count(&replay_skips), 1, "{replay_skips:?}");
-    }
-
-    /// Marks the single entry of a one-object pin set as a
-    /// witness-proven pre-copy-up observation, re-filing its raw.
-    fn mark_pre_copy_up(pins: &mut PinnedObjects) {
-        let (mut raw, id) = pins.raw_to_id.pop_first().expect("one raw to mark");
-        raw.pre_copy_up = true;
-        let entry = pins.by_id.get_mut(&id).expect("entry for the raw");
-        entry.raw.pre_copy_up = true;
-        entry.pre_copy_up = true;
-        pins.raw_to_id.insert(raw, id);
     }
 
     #[test]

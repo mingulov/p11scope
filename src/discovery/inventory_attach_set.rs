@@ -237,7 +237,11 @@ pub(crate) struct InventoryAttachSet {
     endpoints: Vec<AttachEndpoint>,
     by_endpoint: BTreeMap<(AttachObjectId, u64), EndpointId>,
     objects: Vec<RetainedObject>,
-    by_raw: BTreeMap<ObjectKey, AttachObjectId>,
+    /// The retained objects filed under each raw maps key: one, or two
+    /// for a witness-proven copy-up pair (insertion order: the first
+    /// retained stays primary). Resolution routes by proof among the
+    /// members, never by key alone.
+    by_raw: BTreeMap<ObjectKey, Vec<AttachObjectId>>,
     /// Raw keys recorded in `by_raw` beyond each object's own: views of a
     /// retained object proven through the content fallback. Bounded by the
     /// endpoint budget.
@@ -308,8 +312,13 @@ impl InventoryAttachSet {
             return;
         }
         for (key, count) in counts {
-            if let Some(&object) = self.by_raw.get(key) {
-                *self.mappers.entry(object).or_default() += count;
+            // A pair key's mappers run both files in an unknown split;
+            // each side counts the whole key (an upper bound: budgets
+            // stay conservative, never optimistic).
+            if let Some(objects) = self.by_raw.get(key) {
+                for &object in objects {
+                    *self.mappers.entry(object).or_default() += count;
+                }
             }
         }
     }
@@ -637,11 +646,13 @@ impl InventoryAttachSet {
                 return Err("cgroup provider resolution interrupted".into());
             }
             let mut candidates = BTreeSet::new();
-            if let Some(object) = self.by_raw.get(&target.object_key()) {
-                if !work(1) {
-                    return Err("cgroup provider resolution interrupted".into());
+            if let Some(objects) = self.by_raw.get(&target.object_key()) {
+                for object in objects {
+                    if !work(1) {
+                        return Err("cgroup provider resolution interrupted".into());
+                    }
+                    candidates.insert(*object);
                 }
-                candidates.insert(*object);
             }
             if let Some(objects) = self.by_content.get(&target.content_key()) {
                 for &object in objects {
@@ -861,62 +872,197 @@ impl InventoryAttachSet {
                 recorded: false,
             };
         };
-        if let Some(&object) = self.by_raw.get(&summary.key) {
-            let retained = &mut self.objects[object.0 as usize];
-            // The retained fd keeps the object's own raw key from naming
-            // another file, but not an alias key from another mount: an
-            // anonymous overlay device can be recycled once its container
-            // exits. Staleness is tested first, whether or not the object is
-            // already changed: a mismatch under an alias is the object only
-            // when the fd is still the same kernel file (a real in-place
-            // rewrite); otherwise the alias is stale, it is dropped, and the
-            // pinned file is looked up by content like any unseen key.
-            let alias = retained.target.object_key() != summary.key;
-            if alias
-                && !prepared.map_or_else(
-                    || retained.target.same_object_as(pins, id),
-                    |facts| facts.relation(object, id).same_object,
-                )
-                && !prepared.map_or_else(
-                    || retained.target.same_kernel_file_as(pins, id),
-                    |facts| facts.relation(object, id).same_kernel_file,
-                )
-            {
-                self.by_raw.remove(&summary.key);
-                self.aliases = self.aliases.saturating_sub(1);
+        if let Some(objects) = self.by_raw.get(&summary.key).cloned() {
+            // A key names one object — or two for a witness-proven
+            // copy-up pair. Route by proof among the live members: an
+            // identity match wins first, so a proven companion never
+            // shadows its retained side. Stale aliases drop per member,
+            // exactly as before.
+            let mut live = Vec::with_capacity(objects.len());
+            for object in objects {
+                let same_key = self.objects[object.0 as usize].target.object_key() == summary.key;
+                if !same_key {
+                    // The retained fd keeps the object's own raw key from
+                    // naming another file, but not an alias key from another
+                    // mount: an anonymous overlay device can be recycled once
+                    // its container exits. Staleness is tested first, whether
+                    // or not the object is already changed: a mismatch under
+                    // an alias is the object only when the fd is still the
+                    // same kernel file (a real in-place rewrite); otherwise
+                    // the alias is stale and drops, and the pinned file is
+                    // looked up by content like any unseen key.
+                    let same = prepared.map_or_else(
+                        || {
+                            self.objects[object.0 as usize]
+                                .target
+                                .same_object_as(pins, id)
+                        },
+                        |facts| facts.relation(object, id).same_object,
+                    );
+                    let same_file = prepared.map_or_else(
+                        || {
+                            self.objects[object.0 as usize]
+                                .target
+                                .same_kernel_file_as(pins, id)
+                        },
+                        |facts| facts.relation(object, id).same_kernel_file,
+                    );
+                    if !same && !same_file {
+                        self.drop_raw_member(&summary.key, object);
+                        self.aliases = self.aliases.saturating_sub(1);
+                        continue;
+                    }
+                }
+                live.push(object);
+            }
+            if live.is_empty() {
                 return self.resolve_by_content(pins, id, prepared);
             }
-            if let Some(reason) = &retained.changed {
-                return Resolution::Blocked {
-                    reason: reason.clone(),
-                    recorded: true,
-                };
+            for &object in &live {
+                let same = prepared.map_or_else(
+                    || {
+                        self.objects[object.0 as usize]
+                            .target
+                            .same_object_as(pins, id)
+                    },
+                    |facts| facts.relation(object, id).same_object,
+                );
+                if same {
+                    if let Some(reason) = &self.objects[object.0 as usize].changed {
+                        return Resolution::Blocked {
+                            reason: reason.clone(),
+                            recorded: true,
+                        };
+                    }
+                    return Resolution::Known(object);
+                }
             }
-            if prepared.map_or_else(
-                || retained.target.same_object_as(pins, id),
-                |facts| facts.relation(object, id).same_object,
-            ) {
+            // No identity match among the members. Under a pair key,
+            // the same file may still be retained under another key:
+            // route it by content (single-member keys keep today's
+            // flow exactly and never reach here).
+            if live.len() > 1
+                && let Resolution::Known(object) = self.resolve_by_content(pins, id, prepared)
+            {
                 return Resolution::Known(object);
             }
-            let reason = format!(
-                "{} (device {}:{}, inode {}) changed identity since its endpoints were \
-                 retained: its digest or (inode, size, ctime) pin differs, and the attach \
-                 set never extends a changed object",
-                summary.path, summary.key.device.major, summary.key.device.minor, summary.key.inode
-            );
-            retained.changed = Some(reason.clone());
-            self.invalidate_count_memberships();
-            gaps.push(AttachGap {
-                subject: CHANGED_SUBJECT.into(),
-                reason: reason.clone(),
-                budget: None,
-            });
+            // Admit a companion only through this pass's proven copy-up
+            // pair, which names both digests under the key. The fresh
+            // proof stands on its own: a changed mark on a member
+            // vetoes nothing here (the marked object itself is still
+            // never extended).
+            for &object in &live {
+                let digest = self.objects[object.0 as usize]
+                    .target
+                    .borrowed_file_and_digest()
+                    .1;
+                if Self::copyup_pair_links(pins, summary.key, digest, summary.sha256) {
+                    return Resolution::Fresh;
+                }
+            }
+            if live.len() == 1 {
+                if let Some(reason) = &self.objects[live[0].0 as usize].changed {
+                    return Resolution::Blocked {
+                        reason: reason.clone(),
+                        recorded: true,
+                    };
+                }
+                let member_pre = self.objects[live[0].0 as usize].target.pre_copy_up();
+                if !member_pre && !summary.pre_copy_up {
+                    let retained = &mut self.objects[live[0].0 as usize];
+                    let reason = format!(
+                        "{} (device {}:{}, inode {}) changed identity since its endpoints were \
+                         retained: its digest or (inode, size, ctime) pin differs, and the attach \
+                         set never extends a changed object",
+                        summary.path,
+                        summary.key.device.major,
+                        summary.key.device.minor,
+                        summary.key.inode
+                    );
+                    retained.changed = Some(reason.clone());
+                    self.invalidate_count_memberships();
+                    gaps.push(AttachGap {
+                        subject: CHANGED_SUBJECT.into(),
+                        reason: reason.clone(),
+                        budget: None,
+                    });
+                    return Resolution::Blocked {
+                        reason,
+                        recorded: true,
+                    };
+                }
+                // A proven side is never poisoned by an unproven
+                // conflict: block the newcomer, keep the retained
+                // object extendable for a later proven pass.
+                return Resolution::Blocked {
+                    reason: format!(
+                        "{}: the witness-proven pre-copy-up observation has no proven companion \
+                         in this pass; it was not admitted",
+                        summary.path
+                    ),
+                    recorded: false,
+                };
+            }
+            // A key already naming a proven pair refuses further
+            // identities without disturbing the pair.
             return Resolution::Blocked {
-                reason,
-                recorded: true,
+                reason: format!(
+                    "{}: this key already names a witness-proven copy-up pair; the divergent pin \
+                     was not admitted",
+                    summary.path
+                ),
+                recorded: false,
             };
         }
         self.resolve_by_content(pins, id, prepared)
+    }
+
+    /// Drops one member from a raw key's routing list, removing the key
+    /// once no member names it.
+    fn drop_raw_member(&mut self, key: &ObjectKey, object: AttachObjectId) {
+        if let Some(objects) = self.by_raw.get_mut(key) {
+            objects.retain(|member| *member != object);
+            if objects.is_empty() {
+                self.by_raw.remove(key);
+            }
+        }
+    }
+
+    /// Whether this pass's aggregate pairs `retained` with `incoming`
+    /// under `key`: a pre-copy-up observation and a plain observation
+    /// naming the two digests. The aggregate admits at most one pair per
+    /// key, so the key scopes the proof.
+    fn copyup_pair_links(
+        pins: &PinnedObjects,
+        key: ObjectKey,
+        retained: &str,
+        incoming: &str,
+    ) -> bool {
+        if retained == incoming {
+            return false;
+        }
+        let (mut retained_pre, mut retained_plain, mut incoming_pre, mut incoming_plain) =
+            (false, false, false, false);
+        for summary in pins.pinned() {
+            if summary.key != key {
+                continue;
+            }
+            if summary.sha256 == retained {
+                if summary.pre_copy_up {
+                    retained_pre = true;
+                } else {
+                    retained_plain = true;
+                }
+            }
+            if summary.sha256 == incoming {
+                if summary.pre_copy_up {
+                    incoming_pre = true;
+                } else {
+                    incoming_plain = true;
+                }
+            }
+        }
+        (retained_pre && incoming_plain) || (retained_plain && incoming_pre)
     }
 
     /// The content fallback: the same file under another raw key or mount,
@@ -957,7 +1103,7 @@ impl InventoryAttachSet {
             // under this raw key reads as a changed object, never as a
             // fresh one on the same inode.
             if self.aliases < self.limit() {
-                self.by_raw.insert(summary.key, object);
+                self.by_raw.entry(summary.key).or_default().push(object);
                 self.aliases += 1;
             }
             return Resolution::Known(object);
@@ -1179,7 +1325,7 @@ impl InventoryAttachSet {
             if let Some(facts) = prepared.as_deref_mut() {
                 facts.origins.insert(id, object);
             }
-            self.by_raw.insert(target.object_key(), id);
+            self.by_raw.entry(target.object_key()).or_default().push(id);
             self.by_content
                 .entry(target.content_key())
                 .or_default()
@@ -2093,6 +2239,490 @@ pub(crate) mod tests {
                 .collect();
             assert_eq!(changed.len(), usize::from(pass == 0), "{:?}", outcome.gaps);
         }
+    }
+
+    /// One pass's pin store holding a witness-proven copy-up pair:
+    /// the upper file under its own key plus the lower file forged
+    /// under the same key and marked proven, both filed under the
+    /// merge path like production. The pins absorb silently (the pair
+    /// rule), so the caller gets the aggregate.
+    fn copyup_pair_pins(upper: &Path, lower: &Path) -> (PinnedObjects, ObjectKey) {
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let mut pins = PinnedObjects::empty();
+        assert!(
+            pins.absorb(real_scan_pin(upper, None, 1, "sha-u"))
+                .is_empty()
+        );
+        let key = pins.pinned().next().unwrap().key;
+        let mut lower_pins = real_scan_pin(lower, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lower_pins);
+        repath_single_pin(&mut lower_pins, upper.to_str().unwrap());
+        assert!(pins.absorb(lower_pins).is_empty());
+        assert_eq!(pins.pinned().count(), 2);
+        (pins, key)
+    }
+
+    fn id_of_sha(pins: &PinnedObjects, sha256: &str) -> PinnedObjectId {
+        pins.pinned()
+            .find(|summary| summary.sha256 == sha256)
+            .unwrap()
+            .id
+    }
+
+    /// A scanned module for one side of a copy-up pair, looked up by
+    /// digest (both sides share the merge path, so path lookup cannot
+    /// tell them apart). `pre` marks the module the way the scan that
+    /// proved it would.
+    fn copyup_module(
+        pins: &PinnedObjects,
+        merge: &Path,
+        sha256: &str,
+        offsets: &[u64],
+        pre: Option<u32>,
+    ) -> ReconciledModule {
+        let object = id_of_sha(pins, sha256);
+        let key = pins.summary(object).unwrap().key;
+        let merge = merge.to_str().unwrap().to_string();
+        let entries: Vec<ScannedEntry> = offsets
+            .iter()
+            .map(|file_offset| ScannedEntry {
+                name: "C_Sign",
+                object: key,
+                object_path: merge.clone(),
+                file_offset: *file_offset,
+            })
+            .collect();
+        let entry_objects = offsets.iter().map(|_| object).collect();
+        ReconciledModule {
+            exports: Default::default(),
+            getter_present: false,
+            witness_fault: false,
+            object,
+            entry_objects: vec![entry_objects],
+            scanned: ScannedModule {
+                module_hint: None,
+                mapped_identity: None,
+                double_loaded: false,
+                same_file_loads: 1,
+                pre_copy_up: pre,
+                view: ProcessViewId(0),
+                mount_namespace: MountNamespaceId {
+                    device: 1,
+                    inode: 1,
+                },
+                key,
+                path: merge,
+                tables_scan_finished: false,
+                decoder_abi: Some(ElfAbi::Lp64),
+                exports: vec!["C_GetFunctionList".into()],
+                tables: vec![ScannedTable {
+                    version: (2, 40),
+                    walk: "full",
+                    entries,
+                    null_entries: vec![],
+                    unpinned: vec![],
+                    address: 0x7000,
+                    file_offset: Some(0),
+                    live_return: false,
+                    manifest_supported: false,
+                    extension_impossible: false,
+                }],
+                interfaces: vec![],
+            },
+        }
+    }
+
+    #[test]
+    fn copyup_pair_admits_both_sides_under_one_key() {
+        // One maps key names two kernel files — the plain upper
+        // observation and the witness-proven pre-copy-up lower
+        // observation. The set admits both (routed by digest through
+        // the pass's proven pair), in either plan order, instead of
+        // blocking the second as a changed identity.
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        for lower_first in [false, true] {
+            let mut set = InventoryAttachSet::new(budget(4096));
+            let policy = AdmissionPolicy::Inventory(set.budget());
+            let (pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+            let upper_module = copyup_module(&pins, &upper_path, "sha-u", &offsets(3), None);
+            let lower_module = copyup_module(&pins, &upper_path, "sha-l", &offsets(3), Some(0));
+            let modules = if lower_first {
+                vec![lower_module, upper_module]
+            } else {
+                vec![upper_module, lower_module]
+            };
+            let outcome = set.absorb(&lower(&modules, &pins, policy), &pins);
+            assert_eq!(set.len(), 6, "lower_first={lower_first}");
+            for sha in ["sha-u", "sha-l"] {
+                let module_key = AttachModuleKey {
+                    object: key,
+                    sha256: sha.to_string(),
+                };
+                match outcome.verdicts.get(&module_key) {
+                    Some(AttachVerdict::Admitted { endpoints, .. }) => {
+                        assert_eq!(*endpoints, 3, "lower_first={lower_first}");
+                    }
+                    other => panic!("lower_first={lower_first}: {sha} must be admitted: {other:?}"),
+                }
+            }
+            assert!(
+                outcome.gaps.is_empty(),
+                "lower_first={lower_first}: no gaps: {:?}",
+                outcome.gaps
+            );
+        }
+    }
+
+    #[test]
+    fn copyup_spanning_pass_admits_upper_via_aggregate_link() {
+        // A capture spanning the copy-up: pass 1 pins the lower file
+        // plain (pre-copy-up state) and retains it; pass 2 re-pins the
+        // lower (now witness-proven pre) and the upper under the same
+        // key. The pass aggregate pairs them, so the set admits the
+        // upper as a companion instead of blocking it as a changed
+        // identity — and records no changed gap.
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let merge = upper_path.to_str().unwrap();
+        // Pass 1: the lower file, plain, under the key the merged path
+        // renders (forged onto the upper's key).
+        let key = pass_pins(&[(&upper_path, "sha-u")])
+            .pinned()
+            .next()
+            .unwrap()
+            .key;
+        let mut pins1 = PinnedObjects::empty();
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&lower_path, Some(key), 1, "sha-l"))
+                .is_empty()
+        );
+        // Re-path under the merge path like production (both passes
+        // observe the same merged path).
+        crate::discovery::identity::test_fixture::repath_single_pin(&mut pins1, merge);
+        let pass1 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins1,
+                    &upper_path,
+                    "sha-l",
+                    &offsets(3),
+                    None,
+                )],
+                &pins1,
+                policy,
+            ),
+            &pins1,
+        );
+        match pass1.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-l".to_string(),
+        }) {
+            Some(AttachVerdict::Admitted { endpoints, .. }) => assert_eq!(*endpoints, 3),
+            other => panic!("pass 1 must retain the lower file: {other:?}"),
+        }
+        // Pass 2: the aggregate pairs the re-proven lower with the upper.
+        let (pins2, key2) = copyup_pair_pins(&upper_path, &lower_path);
+        assert_eq!(key, key2, "both passes render the same key");
+        let upper_module = copyup_module(&pins2, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pins2, &upper_path, "sha-l", &offsets(3), Some(0));
+        let pass2 = set.absorb(
+            &lower(&[upper_module, lower_module], &pins2, policy),
+            &pins2,
+        );
+        assert_eq!(set.len(), 6, "both sides attach");
+        for sha in ["sha-u", "sha-l"] {
+            let module_key = AttachModuleKey {
+                object: key,
+                sha256: sha.to_string(),
+            };
+            match pass2.verdicts.get(&module_key) {
+                Some(AttachVerdict::Admitted { .. }) => {}
+                other => panic!("pass 2 must admit {sha} as a companion: {other:?}"),
+            }
+        }
+        assert!(pass2.gaps.is_empty(), "no changed gap: {:?}", pass2.gaps);
+    }
+
+    #[test]
+    fn copyup_lone_pre_without_companion_blocks_without_marking() {
+        // A pre-copy-up observation whose companion is not in this pass
+        // (the fresh side went unscanned) is refused — but the retained
+        // object is not marked changed, so a later proven pass admits
+        // both sides. The deferral keeps its own reason, never the
+        // changed-identity gap.
+        use crate::discovery::identity::test_fixture::{mark_pre_copy_up, real_scan_pin};
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        // Pass 1: the upper side alone, retained plain.
+        let mut pins1 = PinnedObjects::empty();
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&upper_path, None, 1, "sha-u"))
+                .is_empty()
+        );
+        let pass1 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins1,
+                    &upper_path,
+                    "sha-u",
+                    &offsets(3),
+                    None,
+                )],
+                &pins1,
+                policy,
+            ),
+            &pins1,
+        );
+        assert!(matches!(
+            pass1.verdicts.get(&AttachModuleKey {
+                object: key,
+                sha256: "sha-u".to_string(),
+            }),
+            Some(AttachVerdict::Admitted { .. })
+        ));
+        // Pass 2: the lone proven lower, no companion in the aggregate.
+        let mut pins2 = PinnedObjects::empty();
+        let mut lone = real_scan_pin(&lower_path, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lone);
+        crate::discovery::identity::test_fixture::repath_single_pin(
+            &mut lone,
+            upper_path.to_str().unwrap(),
+        );
+        assert!(pins2.absorb(lone).is_empty());
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-l",
+                    &offsets(3),
+                    Some(0),
+                )],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        match pass2.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-l".to_string(),
+        }) {
+            Some(AttachVerdict::Refused { reason }) => assert!(
+                reason.contains("no proven companion in this pass"),
+                "the deferral keeps its own reason: {reason}"
+            ),
+            other => panic!("the lone lower must be refused: {other:?}"),
+        }
+        assert_eq!(set.len(), 3, "nothing new attaches");
+        assert_eq!(
+            pass2.gaps.len(),
+            1,
+            "the refusal is disclosed: {:?}",
+            pass2.gaps
+        );
+        assert_eq!(pass2.gaps[0].subject, REFUSED_SUBJECT);
+        assert!(
+            !pass2.gaps.iter().any(|gap| gap.subject == CHANGED_SUBJECT),
+            "no changed gap: {:?}",
+            pass2.gaps
+        );
+        // Pass 3: the proven pair admits both — the retained upper was
+        // never poisoned.
+        let upper_module = copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0));
+        let pass3 = set.absorb(
+            &lower(&[upper_module, lower_module], &pair_pins, policy),
+            &pair_pins,
+        );
+        for sha in ["sha-u", "sha-l"] {
+            assert!(
+                matches!(
+                    pass3.verdicts.get(&AttachModuleKey {
+                        object: key,
+                        sha256: sha.to_string(),
+                    }),
+                    Some(AttachVerdict::Admitted { .. })
+                ),
+                "pass 3 admits {sha} after the deferral"
+            );
+        }
+        assert_eq!(set.len(), 6);
+        assert!(pass3.gaps.is_empty());
+    }
+
+    #[test]
+    fn copyup_third_identity_under_pair_refuses_without_disturbing_it() {
+        // A key already naming a proven pair refuses a third identity
+        // (an upper rewritten mid-capture) without marking either side:
+        // the pair keeps its endpoints, the newcomer keeps its own
+        // reason, and no changed gap is recorded.
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let third_path = provider(&dir, "third.so", "provider-third");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        let upper_module = copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0));
+        let pass1 = set.absorb(
+            &lower(&[upper_module, lower_module], &pair_pins, policy),
+            &pair_pins,
+        );
+        assert_eq!(set.len(), 6);
+        assert!(pass1.gaps.is_empty());
+        // Pass 2: only the rewritten upper, forged under the same key.
+        let mut pins2 = PinnedObjects::empty();
+        assert!(
+            pins2
+                .absorb(real_scan_pin(&third_path, Some(key), 1, "sha-t"))
+                .is_empty()
+        );
+        crate::discovery::identity::test_fixture::repath_single_pin(
+            &mut pins2,
+            upper_path.to_str().unwrap(),
+        );
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-t",
+                    &offsets(3),
+                    None,
+                )],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        match pass2.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-t".to_string(),
+        }) {
+            Some(AttachVerdict::Refused { reason }) => assert!(
+                reason.contains("already names a witness-proven copy-up pair"),
+                "the newcomer keeps its own reason: {reason}"
+            ),
+            other => panic!("the third identity must be refused: {other:?}"),
+        }
+        assert_eq!(set.len(), 6, "the pair keeps its endpoints");
+        assert_eq!(
+            pass2.gaps.len(),
+            1,
+            "the refusal is disclosed: {:?}",
+            pass2.gaps
+        );
+        assert_eq!(pass2.gaps[0].subject, REFUSED_SUBJECT);
+        assert!(
+            !pass2.gaps.iter().any(|gap| gap.subject == CHANGED_SUBJECT),
+            "no changed gap: {:?}",
+            pass2.gaps
+        );
+        // Pass 3: the pair still resolves Known — neither side was marked.
+        let upper_module = copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0));
+        let pass3 = set.absorb(
+            &lower(&[upper_module, lower_module], &pair_pins, policy),
+            &pair_pins,
+        );
+        assert_eq!(set.len(), 6);
+        assert!(pass3.gaps.is_empty());
+    }
+
+    #[test]
+    fn copyup_pair_key_routes_same_file_by_content() {
+        // Under a pair key, an observation of a file retained under
+        // another key still routes by content to its object — it is
+        // not misread as a divergent third identity.
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let other_path = provider(&dir, "other.so", "provider-other");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        // Pass 1: the pair plus the other file (under its own key),
+        // all admitted into one aggregate.
+        let mut pins1 = PinnedObjects::empty();
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&upper_path, None, 1, "sha-u"))
+                .is_empty()
+        );
+        let key = pins1.pinned().next().unwrap().key;
+        let mut lower_replay = real_scan_pin(&lower_path, Some(key), 1, "sha-l");
+        crate::discovery::identity::test_fixture::mark_pre_copy_up(&mut lower_replay);
+        crate::discovery::identity::test_fixture::repath_single_pin(
+            &mut lower_replay,
+            upper_path.to_str().unwrap(),
+        );
+        assert!(pins1.absorb(lower_replay).is_empty());
+        assert!(
+            pins1
+                .absorb(real_scan_pin(&other_path, None, 1, "sha-o"))
+                .is_empty()
+        );
+        assert_eq!(pins1.pinned().count(), 3);
+        let upper_module = copyup_module(&pins1, &upper_path, "sha-u", &offsets(3), None);
+        let lower_module = copyup_module(&pins1, &upper_path, "sha-l", &offsets(3), Some(0));
+        let other_module = copyup_module(&pins1, &other_path, "sha-o", &offsets(3), None);
+        let pass1 = set.absorb(
+            &lower(&[upper_module, lower_module, other_module], &pins1, policy),
+            &pins1,
+        );
+        assert_eq!(set.len(), 9);
+        assert!(pass1.gaps.is_empty());
+        // Pass 2: the other file observed under the pair key (a second
+        // view of the same file) routes to its retained object.
+        let mut pins2 = PinnedObjects::empty();
+        assert!(
+            pins2
+                .absorb(real_scan_pin(&other_path, Some(key), 1, "sha-o"))
+                .is_empty()
+        );
+        crate::discovery::identity::test_fixture::repath_single_pin(
+            &mut pins2,
+            upper_path.to_str().unwrap(),
+        );
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-o",
+                    &offsets(3),
+                    None,
+                )],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        match pass2.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-o".to_string(),
+        }) {
+            Some(AttachVerdict::Admitted { .. }) => {}
+            other => panic!("the same file must route by content: {other:?}"),
+        }
+        assert_eq!(set.len(), 9, "no duplicate endpoints attach");
+        assert!(pass2.gaps.is_empty(), "no gaps: {:?}", pass2.gaps);
     }
 
     #[test]

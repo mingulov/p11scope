@@ -222,6 +222,26 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         btrfs = job_body(self.yml, "privileged-btrfs")
         self.assertIn("--teardown", btrfs)
 
+    def test_btrfs_job_runs_the_discover_subvolume_cell(self):
+        # The ignored discover twin's CI cover: a second loop mount, a
+        # runner-owned subdir, the cell script as the runner user (never
+        # under sudo: the fence refuses root), and the shared judge
+        # requiring exactly its row. The cleanup step tears down both
+        # mounts, and the leak check covers the shared parent.
+        btrfs = job_body(self.yml, "privileged-btrfs")
+        self.assertIn("scripts/ci/discover-btrfs-subvol.sh", btrfs)
+        self.assertNotIn("sudo -n scripts/ci/discover-btrfs-subvol.sh",
+                         btrfs)
+        self.assertIn("discover-btrfs.img", btrfs)
+        self.assertIn("discover-btrfs-mnt", btrfs)
+        self.assertIn('install -d -m 700 -o "$(id -u)" -g "$(id -g)"',
+                      btrfs)
+        self.assertIn("scripts/ci/check-cell-results.py", btrfs)
+        self.assertIn("--require discover-btrfs-subvol", btrfs)
+        self.assertIn("discover-cell/", btrfs)
+        self.assertIn(
+            '"$out/discover-btrfs.img" "$out/discover-btrfs-mnt"', btrfs)
+
     def test_privileged_input_downloads_match_uploads(self):
         # Every privileged-inputs download must name an artifact a
         # build job uploads; a renamed producer with a stale consumer

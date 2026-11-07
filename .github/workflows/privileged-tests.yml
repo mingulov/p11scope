@@ -30,8 +30,9 @@ name: privileged-tests
 #   edit) and judges P11SCOPE_CELL_BRANCH lines against its per-environment
 #   expectation table (pending entries are allowed absent until WP-2 lands);
 # - privileged-btrfs runs the btrfs campaign (--include-btrfs) with the
-#   runner's own loop-mounted image, and privileged-overlay runs the
-#   overlay campaign (--include-overlay) plus the copy-up expected
+#   runner's own loop-mounted image, and the discover btrfs-subvolume
+#   cell on a second loop mount as the runner user; privileged-overlay
+#   runs the overlay campaign (--include-overlay) plus the copy-up expected
 #   failure; both fail on any FAIL, SKIP or leaked mount.
 # - privileged-second-flavor runs the journal-only cells (the five linked
 #   key-operations cells plus the sealed drain linkage) from the journal
@@ -538,6 +539,8 @@ jobs:
   # curated runner loop-mounts its own image for them (no ambient
   # btrfs needed) and tears it down afterwards; the cleanup step
   # re-runs the idempotent teardown so a mount never leaks past the job.
+  # The discover btrfs-subvolume cell rides the same job on a second
+  # loop mount, as the runner user (the fence refuses root).
   privileged-btrfs:
     needs: privileged-build
     runs-on: ubuntu-26.04
@@ -585,6 +588,32 @@ jobs:
             exit 1
           fi
           test "$rc" -eq 0
+      - name: Run the discover btrfs-subvolume cell as the runner user
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/privileged-inputs"
+          (cd "$in" && sha256sum --check SHA256SUMS)
+          # Artifacts do not keep the executable bit.
+          chmod +x "$in/bin/p11scope-discover"
+          out="$RUNNER_TEMP/privileged-btrfs-out"
+          cell_out="$out/discover-cell"
+          mkdir -m 700 "$cell_out"
+          img="$out/run/discover-btrfs.img"
+          mnt="$out/run/discover-btrfs-mnt"
+          cleanup() {
+            sudo -n scripts/ci/prepare-btrfs-tmpdir.sh --teardown "$img" "$mnt" || true
+          }
+          trap cleanup EXIT
+          got=$(sudo -n scripts/ci/prepare-btrfs-tmpdir.sh "$img" "$mnt")
+          test "$got" = "$mnt"
+          sub="$mnt/sub"
+          sudo -n install -d -m 700 -o "$(id -u)" -g "$(id -g)" "$sub"
+          scripts/ci/discover-btrfs-subvol.sh "$in/bin/p11scope-discover" "$sub" "$cell_out"
+          python3 -I scripts/ci/check-cell-results.py "$cell_out/results.jsonl" --require discover-btrfs-subvol
+          trap - EXIT
+          cleanup
       - name: Upload the btrfs results and logs
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -593,6 +622,7 @@ jobs:
           path: |
             ${{ runner.temp }}/privileged-btrfs-out/run/results.txt
             ${{ runner.temp }}/privileged-btrfs-out/run/logs/
+            ${{ runner.temp }}/privileged-btrfs-out/discover-cell/
           if-no-files-found: warn
           retention-days: 7
       - name: Clean up the btrfs mount
@@ -602,6 +632,7 @@ jobs:
           set -euo pipefail
           out="$RUNNER_TEMP/privileged-btrfs-out/run"
           sudo -n scripts/ci/prepare-btrfs-tmpdir.sh --teardown "$out/btrfs.img" "$out/btrfs-mnt" || true
+          sudo -n scripts/ci/prepare-btrfs-tmpdir.sh --teardown "$out/discover-btrfs.img" "$out/discover-btrfs-mnt" || true
           leaked=0
           if mount | grep -F "$out" >/dev/null; then leaked=1; fi
           if sudo -n losetup -a 2>/dev/null | grep -F "$out" >/dev/null; then leaked=1; fi

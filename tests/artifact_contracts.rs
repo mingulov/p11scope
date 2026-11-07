@@ -10277,7 +10277,13 @@ fn script_dirs() -> Vec<String> {
 fn every_admitted_script_directory_is_scanned() {
     assert_eq!(
         script_dirs(),
-        ["scripts", "scripts/ci", "scripts/matrix", "scripts/native"],
+        [
+            "scripts",
+            "scripts/ci",
+            "scripts/demo",
+            "scripts/matrix",
+            "scripts/native"
+        ],
         "every admitted non-fixture directory must participate in the lane derivations"
     );
 }

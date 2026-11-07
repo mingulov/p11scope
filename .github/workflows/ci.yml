@@ -843,6 +843,8 @@ jobs:
           UNRUN: scripts/ci/container-cells.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/minimal-setcap.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/qualify-real-providers.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/demo/container-scope.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
+          UNRUN: scripts/demo/container-scope-kind.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           EOF
           cat "$RUNNER_TEMP/lanes.txt"
           { echo '## UNRUN lanes'; echo '```'; cat "$RUNNER_TEMP/lanes.txt"; echo '```'; } >>"$GITHUB_STEP_SUMMARY"

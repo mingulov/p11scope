@@ -97,8 +97,12 @@ fn errno_name(errno: i32) -> String {
 
 /// The `Denied` refusal over explicit privilege facts: names each
 /// missing load capability with what it enables, plus the one-line
-/// recipe; when the load set is complete the refusal is other
-/// enforcement (lockdown, LSM, seccomp), never more privilege.
+/// recipe; when the load set is complete — or `CAP_SYS_ADMIN` is held,
+/// which suffices for BPF load — the refusal is other enforcement
+/// (lockdown, LSM, seccomp), never more privilege. Child-userns holders
+/// (the bit set but ignored by the kernel for BPF) also read lockdown
+/// here: this line has no userns input (the self-probe path names userns
+/// separately).
 pub(crate) fn denied_line(operation: &str, reason: &str, effective: u64, binary: &str) -> String {
     let missing = crate::caps::missing_in(effective, &crate::caps::LOAD_BITS);
     if missing.is_empty() {
@@ -107,6 +111,13 @@ pub(crate) fn denied_line(operation: &str, reason: &str, effective: u64, binary:
              CAP_PERFMON held — a kernel lockdown, an LSM policy, or a container's seccomp \
              profile is refusing BPF here. Run 'p11scope doctor' for host readiness, or use \
              'p11scope inspect --pid N' for a scan without capture."
+        )
+    } else if effective & (1u64 << crate::caps::CAP_SYS_ADMIN_BIT) != 0 {
+        format!(
+            "live capture refused: the kernel refused to {operation}{reason} with CAP_SYS_ADMIN \
+             held — a kernel lockdown, an LSM policy, or a container's seccomp profile is \
+             refusing BPF here. Run 'p11scope doctor' for host readiness, or use 'p11scope \
+             inspect --pid N' for a scan without capture."
         )
     } else {
         let needs: Vec<String> = missing

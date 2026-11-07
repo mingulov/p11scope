@@ -203,13 +203,20 @@ run_missing() { # PARANOID CAPNAME — one missing-capability line cell
     || { row "missing-cap-$lower-p$paranoid" 0 qualified "workload never became ready"; return 0; }
   as_nobody timeout 120 "$CELLTMP/bin/miss-$lower" profile --pid "$wpid" --duration 6s \
     >"$CELLTMP/out/miss-$lower-p$paranoid.out" 2>"$CELLTMP/out/miss-$lower-p$paranoid.err"
+  rc=$?
   stop_workload "$wpid"
   err=$CELLTMP/out/miss-$lower-p$paranoid.err
-  detail="paranoid=$paranoid"
+  detail="paranoid=$paranoid exit=$rc"
   pass=1
   grep -q "needs $cap" "$err" || pass=0
   case $cap in
-    CAP_BPF|CAP_PERFMON) grep -q "Grant the minimal set: sudo setcap" "$err" || pass=0 ;;
+    CAP_BPF|CAP_PERFMON)
+      grep -q "Grant the minimal set: sudo setcap" "$err" || pass=0
+      [ "$rc" -ne 0 ] || pass=0
+      ;;
+    *)
+      [ "$rc" -eq 0 ] || pass=0
+      ;;
   esac
   detail="$detail $(grep -o "needs ${cap}[^;]*" "$err" | head -1 | head -c 200)"
   row "missing-cap-$lower-p$paranoid" "$pass" qualified "$detail"

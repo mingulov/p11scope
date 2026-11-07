@@ -5538,6 +5538,8 @@ impl JournalAdapter {
         // Pull one fresh birth observation: the seal never receives a
         // reusable evidence value. A failed take refuses (the next tick
         // takes again), exactly like moved native evidence.
+        // TEMP F9: birth-take cost.
+        let t_birth = std::time::Instant::now();
         let fresh = match births.take_birth_evidence() {
             Ok(fresh) => fresh,
             Err(refusal) => {
@@ -5567,6 +5569,8 @@ impl JournalAdapter {
             let site: &str = &format!("verify_{refusal:?}");
             return Err(self.diag_failure(gap, site));
         }
+        // TEMP F9: report birth-take cost (sampled with seal-phase).
+        let t_birth = t_birth.elapsed();
         // The birth cut pins per key-era at first seal: a later seal for
         // the same era must carry the same cut. Rebirth above kept staged
         // history is refused — void first.
@@ -5726,9 +5730,10 @@ impl JournalAdapter {
             static SP: AtomicU64 = AtomicU64::new(0);
             if SP.fetch_add(1, Ordering::Relaxed) % 50 == 0 {
                 eprintln!(
-                    "seal-phase open={open_len} guards_ms={} apply_ms={}",
+                    "seal-phase open={open_len} guards_ms={} apply_ms={} birth_ms={}",
                     t_guards.as_secs_f64() * 1000.0,
-                    t_apply.as_secs_f64() * 1000.0
+                    t_apply.as_secs_f64() * 1000.0,
+                    t_birth.as_secs_f64() * 1000.0
                 );
             }
         }

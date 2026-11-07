@@ -1092,6 +1092,17 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 count.checked_add(receipt.instances().len())
             })
             .ok_or(RawQuantumRefusal::Capacity)?;
+        // TEMP F9: birth-prep census (sampled).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static BP: AtomicU64 = AtomicU64::new(0);
+            if BP.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
+                eprintln!(
+                    "birth-prep count={count} currents={}",
+                    batch.current.len()
+                );
+            }
+        }
         if count == 0 {
             batch.births_decided = true;
             return Ok(PreparedBirthDisposition { installed: 0 });
@@ -1283,6 +1294,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             installed += 1;
         }
         drop(registrations);
+        // TEMP F9: birth outcome census (sampled).
+        {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static BO: AtomicU64 = AtomicU64::new(0);
+            if BO.fetch_add(1, Ordering::Relaxed) % 10 == 0 {
+                let matched = association.iter().filter(|l| l.entry.is_some()).count();
+                let refused = association
+                    .iter()
+                    .filter_map(|l| l.refusal.map(|(_, r)| r.reason().to_string()))
+                    .collect::<Vec<_>>()
+                    .join(",");
+                eprintln!(
+                    "birth-outcome links={} matched={matched} installed={installed} refused=[{refused}]",
+                    association.len(),
+                );
+            }
+        }
         for link in &association {
             if let Some((caller, refusal)) = link.refusal {
                 disclose_s1_birth_refusal(&mut self.registry, caller, refusal.reason());

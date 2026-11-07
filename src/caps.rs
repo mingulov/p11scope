@@ -685,8 +685,13 @@ mod tests {
         // Doctor needs no SYS_ADMIN: its self-probe links on multi
         // hosts, and the perf fallback only degrades a row elsewhere.
         assert_eq!(keep_mask_for_command(&parse(&["doctor"])), live);
-        // `diff` reads two inputs and optionally writes one output.
-        let dac_read_search = 1u64 << CAP_DAC_READ_SEARCH_BIT;
+        // `diff` reads two inputs and optionally writes one output;
+        // only root keeps DAC_READ_SEARCH for unreadable ones.
+        let dac_read_search = if unsafe { libc::geteuid() } == 0 {
+            1u64 << CAP_DAC_READ_SEARCH_BIT
+        } else {
+            0
+        };
         assert_eq!(
             keep_mask_for_command(&parse(&["inventory", "diff", "a.json", "b.json"])),
             dac_read_search

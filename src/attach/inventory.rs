@@ -204,7 +204,11 @@ impl PreparedInventory {
                     )?;
                 }
                 InventoryPreparation::PublishScope => {
-                    crate::scope::publish_inventory(state.ebpf_mut()?, &scope)?;
+                    crate::scope::publish_inventory(
+                        state.ebpf_mut()?,
+                        &scope,
+                        matches!(flavor, InventoryFlavor::Callers(_)),
+                    )?;
                 }
                 InventoryPreparation::WriteUsageConfig => {
                     let mut map: Array<_, InventoryUsageConfig> = Array::try_from(

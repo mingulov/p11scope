@@ -33,6 +33,22 @@ fn inventory_policy_accepts_only_one_external_scope_and_no_capture_or_pause_poli
 }
 
 #[test]
+fn inventory_policy_accepts_exe_identity_bit_beside_one_scope() {
+    // Round 7: the extensive bit (0x100) extends the three exact
+    // inventory configs; detailed objects still refuse every
+    // inventory word, and the bit without a scope still refuses.
+    for flags in [0x181, 0x182, 0x1c0] {
+        assert!(valid_inventory_config(flags), "{flags:#x}");
+        assert!(
+            !valid_config(flags),
+            "detailed object admitted inventory flags {flags:#x}"
+        );
+    }
+    assert!(!valid_inventory_config(0x180));
+    assert!(!valid_inventory_config(0x1c0 | (1 << 63)));
+}
+
+#[test]
 fn inventory_cookie_cannot_alias_detailed_cookie_and_checks_runtime_capacity() {
     for (cookie, capacity, expected) in [
         (0, 1, None),

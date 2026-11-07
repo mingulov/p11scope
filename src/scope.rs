@@ -570,8 +570,26 @@ fn reader_timens_skews_boottime() -> Result<bool> {
     Ok(timens_boottime_offset(&text).unwrap_or(true))
 }
 
-pub(crate) fn publish_inventory(ebpf: &mut Ebpf, scope: &Scope) -> Result<()> {
-    publish_inventory_with(scope, &mut EbpfScopeIo(ebpf))
+pub(crate) fn publish_inventory(
+    ebpf: &mut Ebpf,
+    scope: &Scope,
+    callers: bool,
+) -> Result<()> {
+    publish_inventory_with(
+        scope,
+        inventory_exe_identity_armed(callers, scope),
+        &mut EbpfScopeIo(ebpf),
+    )
+}
+
+/// Round 7: the exe-identity bit arms only where the (ticket, exe)
+/// join is possible — the Callers flavor outside PID scope. The
+/// Global flavor stamps no EXEC ticket and PID scope never acquires
+/// one, so arming there would capture unjoinable, unpublished exe
+/// data; both stay on the plain config.
+pub(crate) fn inventory_exe_identity_armed(callers: bool, scope: &Scope) -> bool {
+    let _ = (callers, scope);
+    false
 }
 
 fn scope_flag(scope: &Scope) -> u64 {
@@ -654,7 +672,11 @@ fn publish_detailed_with(
     )
 }
 
-fn publish_inventory_with(scope: &Scope, io: &mut impl ScopePublicationIo) -> Result<()> {
+fn publish_inventory_with(
+    scope: &Scope,
+    _exe_identity: bool,
+    io: &mut impl ScopePublicationIo,
+) -> Result<()> {
     let config = scope_flag(scope) | FLAG_POLICY_INVENTORY;
     if !valid_inventory_config(config) {
         bail!("refusing invalid Inventory CONFIG {config:#x}");

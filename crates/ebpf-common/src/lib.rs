@@ -2899,6 +2899,27 @@ mod tests {
     }
 
     #[test]
+    fn inventory_config_accepts_exe_identity_bit_with_one_scope() {
+        // Round 7: inventory-callers captures arm the extensive bit for
+        // the EXEC exe-identity read (the EXEC ticket rides the record
+        // already, so the join needs no new kernel state). The bit stays
+        // orthogonal to scope; without a scope, or beside an unknown
+        // bit, the config still refuses.
+        for scope in [FLAG_PID_FILTER, FLAG_CGROUP_FILTER, FLAG_SYSTEM_FILTER] {
+            assert!(
+                valid_inventory_config(FLAG_POLICY_INVENTORY | scope | FLAG_TRACK_SHORT_LIVED),
+                "scope {scope:#x}"
+            );
+        }
+        assert!(!valid_inventory_config(
+            FLAG_POLICY_INVENTORY | FLAG_TRACK_SHORT_LIVED
+        ));
+        assert!(!valid_inventory_config(
+            FLAG_POLICY_INVENTORY | FLAG_SYSTEM_FILTER | FLAG_TRACK_SHORT_LIVED | FLAG_PAUSE_ENABLED
+        ));
+    }
+
+    #[test]
     fn discovery_producer_decisions_cover_the_finite_edges() {
         assert_eq!(
             discovery_table_slots(DISCOVERY_KIND_FUNCTION_LIST_RETURN, 2, 0),

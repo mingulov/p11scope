@@ -83,7 +83,7 @@ impl ScopePublicationIo for ScopeMaps {
 #[test]
 fn inventory_pid_publication_writes_its_policy_directly_and_reads_both_config_cells() {
     let mut maps = ScopeMaps::default();
-    publish_inventory_with(&Scope::Pid(101), &mut maps).unwrap();
+    publish_inventory_with(&Scope::Pid(101), false, &mut maps).unwrap();
     assert_eq!(maps.pids, BTreeMap::from([(101, 1)]));
     assert_eq!(maps.config, [0x81, 0]);
     assert_eq!(
@@ -104,7 +104,7 @@ fn inventory_pid_publication_writes_its_policy_directly_and_reads_both_config_ce
 #[test]
 fn inventory_system_publication_requires_an_empty_pid_readback_and_explicit_system_bit() {
     let mut maps = ScopeMaps::default();
-    publish_inventory_with(&Scope::System, &mut maps).unwrap();
+    publish_inventory_with(&Scope::System, false, &mut maps).unwrap();
     assert_eq!(maps.config, [0xc0, 0]);
     assert!(maps.pids.is_empty());
     assert!(maps.cgroup.is_none());
@@ -121,7 +121,7 @@ fn inventory_system_publication_requires_an_empty_pid_readback_and_explicit_syst
         pids: BTreeMap::from([(101, 1)]),
         ..ScopeMaps::default()
     };
-    let error = publish_inventory_with(&Scope::System, &mut maps).unwrap_err();
+    let error = publish_inventory_with(&Scope::System, false, &mut maps).unwrap_err();
     assert!(format!("{error:#}").contains("PID_FILTER"));
     assert_eq!(maps.operations, [Operation::ReadPids]);
 }
@@ -129,7 +129,7 @@ fn inventory_system_publication_requires_an_empty_pid_readback_and_explicit_syst
 #[test]
 fn inventory_pid_zero_reaches_no_publication_operation() {
     let mut maps = ScopeMaps::default();
-    assert!(publish_inventory_with(&Scope::Pid(0), &mut maps).is_err());
+    assert!(publish_inventory_with(&Scope::Pid(0), false, &mut maps).is_err());
     assert!(maps.operations.is_empty());
 }
 
@@ -146,7 +146,7 @@ fn inventory_pid_readback_refuses_missing_foreign_wrong_and_zero_tokens_before_p
             pid_readback: Some(actual),
             ..ScopeMaps::default()
         };
-        let error = publish_inventory_with(&Scope::Pid(101), &mut maps).unwrap_err();
+        let error = publish_inventory_with(&Scope::Pid(101), false, &mut maps).unwrap_err();
         assert!(format!("{error:#}").contains("PID_FILTER"));
         assert_eq!(
             maps.operations,
@@ -173,7 +173,7 @@ fn inventory_config_readback_rejects_detailed_pause_mixed_unknown_and_reserved_w
             config_readback: BTreeMap::from([(0, bad)]),
             ..ScopeMaps::default()
         };
-        let error = publish_inventory_with(&Scope::Pid(101), &mut maps).unwrap_err();
+        let error = publish_inventory_with(&Scope::Pid(101), false, &mut maps).unwrap_err();
         assert!(
             format!("{error:#}").contains("CONFIG"),
             "{bad:#x}: {error:#}"
@@ -185,7 +185,7 @@ fn inventory_config_readback_rejects_detailed_pause_mixed_unknown_and_reserved_w
             config_readback: BTreeMap::from([(1, reserved)]),
             ..ScopeMaps::default()
         };
-        assert!(publish_inventory_with(&Scope::Pid(101), &mut maps).is_err());
+        assert!(publish_inventory_with(&Scope::Pid(101), false, &mut maps).is_err());
         assert_eq!(maps.operations.last(), Some(&Operation::ReadConfig(1)));
     }
 }
@@ -202,7 +202,7 @@ fn inventory_cgroup_publication_clones_retained_directory_after_path_replacement
     std::fs::create_dir(&path).unwrap();
     assert_ne!(std::fs::metadata(&path).unwrap().ino(), original_inode);
     let mut maps = ScopeMaps::default();
-    publish_inventory_with(&scope, &mut maps).unwrap();
+    publish_inventory_with(&scope, false, &mut maps).unwrap();
     assert_eq!(maps.config, [0x82, 0]);
     assert_eq!(
         maps.operations,
@@ -235,7 +235,7 @@ fn inventory_scope_stops_at_each_io_failure_and_preserves_the_source_error() {
             fail_at: Some(failed),
             ..ScopeMaps::default()
         };
-        let error = publish_inventory_with(&Scope::Pid(101), &mut maps).unwrap_err();
+        let error = publish_inventory_with(&Scope::Pid(101), false, &mut maps).unwrap_err();
         assert_eq!(
             error
                 .downcast_ref::<std::io::Error>()
@@ -381,4 +381,67 @@ fn counter_policies_refuse_track_short_lived_config() {
     .unwrap();
     assert_eq!(aggregate.config[0], 1 | 16 | bit);
     assert!(p11scope_ebpf_common::valid_config(aggregate.config[0]));
+}
+
+// Round 7: the exe-identity bit arms only the captures whose EXEC
+// records carry both ticket and exe — Callers flavor outside PID
+// scope. Every other combination stays on the plain config.
+#[test]
+fn inventory_exe_identity_arms_caller_captures_outside_pid_scope() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("armed.scope");
+    std::fs::create_dir(&path).unwrap();
+    let cgroup = cgroup(&path).unwrap();
+    for scope in [&Scope::System, &cgroup] {
+        assert!(
+            inventory_exe_identity_armed(true, scope),
+            "{scope:?} callers must arm"
+        );
+        assert!(
+            !inventory_exe_identity_armed(false, scope),
+            "{scope:?} global must stay plain"
+        );
+    }
+    assert!(
+        !inventory_exe_identity_armed(true, &Scope::Pid(101)),
+        "PID scope stamps no EXEC ticket, so the bit would capture unjoinable data"
+    );
+    assert!(!inventory_exe_identity_armed(false, &Scope::Pid(101)));
+}
+
+// Round 7: arming sets only the extensive bit beside the exact
+// inventory word, and the published word validates.
+#[test]
+fn inventory_scope_exe_identity_sets_only_the_extensive_bit() {
+    let bit = p11scope_ebpf_common::FLAG_TRACK_SHORT_LIVED;
+    for (scope, base) in [(&Scope::System, 0x80 | 0x40)] {
+        let mut maps = ScopeMaps::default();
+        publish_inventory_with(scope, true, &mut maps).unwrap();
+        assert_eq!(maps.config[0] & bit, bit, "{scope:?}");
+        assert_eq!(maps.config[0] & !bit, base, "{scope:?}");
+        assert!(p11scope_ebpf_common::valid_inventory_config(maps.config[0]));
+    }
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("armed.scope");
+    std::fs::create_dir(&path).unwrap();
+    let scope = cgroup(&path).unwrap();
+    let mut maps = ScopeMaps::default();
+    publish_inventory_with(&scope, true, &mut maps).unwrap();
+    assert_eq!(maps.config, [0x82 | bit, 0]);
+    assert!(p11scope_ebpf_common::valid_inventory_config(maps.config[0]));
+}
+
+// Round 7: PID scope plus the bit is refused before any map
+// operation — a defense-in-depth invariant (the arming policy never
+// produces this combination).
+#[test]
+fn inventory_scope_exe_identity_refuses_pid_scope() {
+    let mut maps = ScopeMaps::default();
+    let error = publish_inventory_with(&Scope::Pid(101), true, &mut maps).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("PID scope"),
+        "unexpected refusal: {error:#}"
+    );
+    assert!(maps.operations.is_empty(), "published on refusal");
+    assert_eq!(maps.config, [0, 0]);
 }

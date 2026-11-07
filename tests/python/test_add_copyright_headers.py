@@ -87,6 +87,24 @@ class AddCopyrightHeadersTests(unittest.TestCase):
         self.assertEqual(action, "already")
         self.assertIsNone(after)
 
+    def test_notice_string_in_code_does_not_mark_done(self):
+        before = (b"# SPDX-License-Identifier: GPL-3.0-or-later\n"
+                  b"NOTICE = \"" + NOTICE.encode() + b"\"\n")
+        self.assertEqual(
+            changed("tool.py", before),
+            b"# SPDX-License-Identifier: GPL-3.0-or-later\n"
+            b"# " + NOTICE.encode() + b"\n"
+            b"NOTICE = \"" + NOTICE.encode() + b"\"\n",
+        )
+        quoted = (b"// SPDX-License-Identifier: GPL-3.0-or-later\n"
+                  b"const char *n = \"SPDX-FileCopyrightText: 2020 Someone Else\";\n")
+        self.assertEqual(
+            changed("src/quoted.c", quoted),
+            b"// SPDX-License-Identifier: GPL-3.0-or-later\n"
+            b"// " + NOTICE.encode() + b"\n"
+            b"const char *n = \"SPDX-FileCopyrightText: 2020 Someone Else\";\n",
+        )
+
     def test_foreign_notice_is_kept_not_duplicated(self):
         before = (b"/* SPDX-License-Identifier: Apache-2.0 */\n"
                   b"/* SPDX-FileCopyrightText: 2020 Someone Else */\nint x;\n")

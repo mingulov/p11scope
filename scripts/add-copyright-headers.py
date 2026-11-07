@@ -53,6 +53,35 @@ UPSTREAM_FIXTURE_PREFIXES = (
 # Generated manifests carry no header by convention.
 GENERATED_SUFFIXES = (".lock", ".sums")
 
+# Comment openers that may carry a copyright notice line, including the
+# continuation line of a block comment.
+NOTICE_PREFIXES = (b"//!", b"//", b"#", b"/*", b"*", b"<!--")
+
+
+def comment_notice(content):
+    """Our notice, a foreign notice, or no notice line at all.
+
+    Only real comment lines count: the string quoted in code or data
+    (this script's own NOTICE constant, a test fixture, a TOML draft)
+    must not mark a file done.
+    """
+    ours = foreign = False
+    for line in content.split(b"\n"):
+        stripped = line.strip()
+        if not stripped.startswith(NOTICE_PREFIXES):
+            continue
+        if b"SPDX-FileCopyrightText" not in stripped:
+            continue
+        if NOTICE.encode() in stripped:
+            ours = True
+        else:
+            foreign = True
+    if ours:
+        return "ours"
+    if foreign:
+        return "foreign"
+    return None
+
 
 def plan_for(path, content):
     """Decide what the pass does with one file.
@@ -72,9 +101,10 @@ def plan_for(path, content):
             return ("skip", None, "generated file")
     if b"\x00" in content:
         return ("skip", None, "binary file")
-    if NOTICE.encode() in content:
+    state = comment_notice(content)
+    if state == "ours":
         return ("already", None, "copyright line present")
-    if b"SPDX-FileCopyrightText" in content:
+    if state == "foreign":
         return ("skip", None, "keeps existing copyright notice")
     lines = content.split(b"\n")
     first = lines[0][len(BOM):] if lines[0].startswith(BOM) else lines[0]

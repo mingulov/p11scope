@@ -2525,6 +2525,19 @@ pub(crate) const DEFAULT_MAX_CALLERS: usize = 4096;
 pub(crate) const DEFAULT_MAX_MODULES: usize = 4096;
 pub(crate) const DEFAULT_MAX_EDGES: usize = 32768;
 pub(crate) const DEFAULT_MAX_GAPS: usize = 1024;
+/// Terminal/stop-time gap reservation: per-drain gaps stop at
+/// `max_gaps - TERMINAL_GAP_RESERVE`, so terminal disclosures staged
+/// last are never crowded out by a per-drain flood (a full-suite
+/// run retained 746 per-drain unrouted rows and suppressed every
+/// terminal gap). Terminal gaps (recorded after
+/// [`CallerRegistry::enter_terminal_phase`]) may fill the whole
+/// bound. No reservation when the bound itself fits inside it, so
+/// small-limit twins keep their exact behavior. Measured terminal
+/// need is ~15 rows (post-pass newcomers, short-lived count,
+/// pre-arm close, winding, terminal commits, joint finish); 64 is
+/// 4x with headroom for future terminal disclosures. This reserves
+/// slots within the unchanged bound; no limit moves (LIM-1).
+pub(crate) const TERMINAL_GAP_RESERVE: usize = 64;
 /// Hard ceiling for the `--max-gaps` CLI knob (CLI input guard only;
 /// [`RegistryLimits::new`] still accepts any non-zero bound). This caps
 /// the retained RECORD COUNT, not bytes: subjects keep full /proc paths
@@ -2767,6 +2780,15 @@ enum Mutation {
         reason: String,
         budget: Option<BudgetRefusal>,
     },
+    RecordAggregatedUnrouted {
+        /// One drain's shed calls for an aggregated per-drain
+        /// unrouted subject: summed into the (subject, bindings)
+        /// row at apply time, never one row per drain.
+        subject: String,
+        total: u64,
+        labels: Vec<(String, u64)>,
+        bindings: usize,
+    },
 }
 
 /// A publication is applied but its original frame has not finished. This
@@ -2889,6 +2911,44 @@ struct AppliedJointPublication {
     _storage: crate::semantics_edge::resources::ResourceLease,
 }
 
+/// One aggregated per-drain unrouted subject: summed shed calls
+/// and per-label counts across drains, with the retained row's
+/// index once it lands. Keyed by (subject, bindings) so
+/// pre-binding (`with 0 bindings`) sheds stay separable from
+/// bound drains for the pre-binding forgiveness accounting.
+struct UnroutedAggregate {
+    total: u64,
+    labels: BTreeMap<String, u64>,
+    gap_index: Option<usize>,
+}
+
+/// Format an aggregated unrouted reason with the exact
+/// single-drain template: `{total} calls shed without a route
+/// ({label}={count} ...) with/from ...`. Labels sort by name
+/// (BTreeMap order), matching the drain formatter. Unknown
+/// subjects fall back to the `with {N} bindings` template; only
+/// the two unrouted subjects aggregate.
+fn aggregated_unrouted_reason(
+    subject: &str,
+    total: u64,
+    labels: &BTreeMap<String, u64>,
+    bindings: usize,
+) -> String {
+    let mut parts: Vec<String> = labels
+        .iter()
+        .map(|(label, count)| format!("{label}={count}"))
+        .collect();
+    parts.sort();
+    let labels = parts.join(" ");
+    if subject == "semantic calls unrouted from other callers" {
+        format!(
+            "{total} calls shed without a route ({labels}) from callers other than the {bindings} bound callers"
+        )
+    } else {
+        format!("{total} calls shed without a route ({labels}) with {bindings} bindings")
+    }
+}
+
 /// Staged physical and semantic inputs share one publication revision.
 pub(crate) struct CallerRegistry {
     semantic_resources: crate::semantics_edge::resources::SemanticResourcePool,
@@ -2913,6 +2973,18 @@ pub(crate) struct CallerRegistry {
     /// Randomly keyed, so a target cannot steer fingerprint collisions.
     suppressed_hasher: std::hash::RandomState,
     gaps_suppressed: u64,
+    /// Aggregated per-drain unrouted sheds by (subject, bindings):
+    /// repeated drains sum into one counted row instead of one row
+    /// per distinct shed count. Bounded by distinct (subject,
+    /// bindings) pairs (two subjects, few bindings counts).
+    unrouted_aggregates: HashMap<(String, usize), UnroutedAggregate>,
+    /// Aggregated subjects already counted as suppressed: a
+    /// suppressed aggregate counts once, not once per merged drain.
+    suppressed_aggregates: HashSet<(String, usize)>,
+    /// Terminal/stop-time phase: set once the lane stops, so
+    /// terminal disclosures may use the reserved slots. Per-drain
+    /// gaps recorded before it stop at the reserve.
+    terminal_phase: bool,
     staged: Vec<Mutation>,
     /// One retained phase over the existing staging vector, never a second
     /// queue. New staged inputs belong to the next publication.
@@ -3071,6 +3143,9 @@ impl CallerRegistry {
             suppressed_seen: HashSet::new(),
             suppressed_hasher: std::hash::RandomState::new(),
             gaps_suppressed: 0,
+            unrouted_aggregates: HashMap::new(),
+            suppressed_aggregates: HashSet::new(),
+            terminal_phase: false,
             staged: Vec::new(),
             joint_publication: None,
             uncovered_reason: UnknownReason::ScanOnly,
@@ -3915,6 +3990,38 @@ impl CallerRegistry {
         self.staged.push(Mutation::RecordGap { gap });
     }
 
+    /// Stage one drain's shed calls for an aggregated per-drain
+    /// unrouted subject (`semantic calls unrouted` or `semantic
+    /// calls unrouted from other callers`). Drains sharing
+    /// (subject, bindings) sum into one counted row at apply time;
+    /// the row is lane-wide (caller, module, pid and budget are
+    /// always none for these subjects). Totals and per-label
+    /// counts saturate; the formatted reason keeps the exact
+    /// single-drain template so oracles parsing `{total} calls
+    /// shed without a route ({labels}) ...` read the sum.
+    pub(crate) fn record_aggregated_unrouted(
+        &mut self,
+        subject: String,
+        total: u64,
+        labels: Vec<(String, u64)>,
+        bindings: usize,
+    ) {
+        self.staged.push(Mutation::RecordAggregatedUnrouted {
+            subject,
+            total,
+            labels,
+            bindings,
+        });
+    }
+
+    /// Enter the terminal/stop-time phase: gaps recorded from now
+    /// on may use the [`TERMINAL_GAP_RESERVE`] slots. Idempotent;
+    /// the lane calls it once when stopping, before staging any
+    /// terminal disclosure.
+    pub(crate) fn enter_terminal_phase(&mut self) {
+        self.terminal_phase = true;
+    }
+
     /// Staged (subject, reason) gap pairs awaiting the next commit, in
     /// stage order. For twins whose disclosure cannot commit yet (an
     /// unfinished publication stands in front of it).
@@ -4341,7 +4448,16 @@ impl CallerRegistry {
             self.gap_repeats[index] = self.gap_repeats[index].saturating_add(1);
             return;
         }
-        if self.gaps.len() >= self.limits.max_gaps {
+        // Terminal reservation: per-drain gaps stop at the reserve
+        // so terminal disclosures staged last always fit. Terminal
+        // gaps (recorded after `enter_terminal_phase`) and tiny
+        // bounds (at or below the reserve) use the whole bound.
+        let cap = if self.terminal_phase || self.limits.max_gaps <= TERMINAL_GAP_RESERVE {
+            self.limits.max_gaps
+        } else {
+            self.limits.max_gaps - TERMINAL_GAP_RESERVE
+        };
+        if self.gaps.len() >= cap {
             let fingerprint = self.suppressed_hasher.hash_one(&gap);
             if self.suppressed_seen.contains(&fingerprint) {
                 return;
@@ -4355,6 +4471,95 @@ impl CallerRegistry {
         self.gap_index.insert(gap.clone(), self.gaps.len());
         self.gaps.push(gap);
         self.gap_repeats.push(1);
+    }
+
+    /// Merge one drain's shed calls into the (subject, bindings)
+    /// aggregated row: sums totals and per-label counts, then
+    /// retains or rewrites the one lane-wide row in place. The row
+    /// keeps `repeats` 1 (consumers multiply count by repeats, so
+    /// a summed row must not count drains there). A suppressed
+    /// aggregate counts once per (subject, bindings), never once
+    /// per merged drain.
+    fn push_aggregated_unrouted(
+        &mut self,
+        subject: String,
+        total: u64,
+        labels: Vec<(String, u64)>,
+        bindings: usize,
+    ) {
+        let key = (subject.clone(), bindings);
+        let (reason, retained_index) = {
+            let aggregate = self
+                .unrouted_aggregates
+                .entry(key.clone())
+                .or_insert_with(|| UnroutedAggregate {
+                    total: 0,
+                    labels: BTreeMap::new(),
+                    gap_index: None,
+                });
+            aggregate.total = aggregate.total.saturating_add(total);
+            for (label, count) in labels {
+                let entry = aggregate.labels.entry(label).or_insert(0);
+                *entry = entry.saturating_add(count);
+            }
+            let reason =
+                aggregated_unrouted_reason(&subject, aggregate.total, &aggregate.labels, bindings);
+            (reason, aggregate.gap_index)
+        };
+        // A retained row rewrites in place (the dedupe key follows
+        // the new reason); repeats stays 1.
+        if let Some(index) = retained_index
+            && let Some(retained) = self.gaps.get_mut(index)
+            && retained.subject == subject
+        {
+            let old = std::mem::replace(&mut retained.reason, reason.clone());
+            self.gap_index.remove(&RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: subject.clone(),
+                reason: old,
+                budget: None,
+            });
+            self.gap_index.insert(
+                RegistryGap {
+                    caller: None,
+                    module: None,
+                    pid: None,
+                    subject,
+                    reason,
+                    budget: None,
+                },
+                index,
+            );
+            return;
+        }
+        // First landing (or a lost index): retain one row through
+        // the budgeted path. An aggregate suppressed once stays
+        // suppressed without recounting per merged drain.
+        if self.suppressed_aggregates.contains(&key) {
+            return;
+        }
+        let gap = RegistryGap {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: subject.clone(),
+            reason,
+            budget: None,
+        };
+        let before = self.gaps.len();
+        self.push_gap(gap.clone());
+        if let Some(&index) = self.gap_index.get(&gap) {
+            if let Some(aggregate) = self.unrouted_aggregates.get_mut(&key) {
+                aggregate.gap_index = Some(index);
+            }
+            debug_assert!(self.gaps.len() == before + 1 || self.gap_repeats[index] > 1);
+        } else {
+            // `push_gap` counted this distinct suppression; later
+            // merges of the same aggregate return early above.
+            self.suppressed_aggregates.insert(key);
+        }
     }
 
     fn apply(
@@ -4686,6 +4891,12 @@ impl CallerRegistry {
                 }
             }
             Mutation::RecordGap { gap } => self.push_gap(gap),
+            Mutation::RecordAggregatedUnrouted {
+                subject,
+                total,
+                labels,
+                bindings,
+            } => self.push_aggregated_unrouted(subject, total, labels, bindings),
             Mutation::RecordKeyedGap {
                 key,
                 caller,
@@ -7046,7 +7257,11 @@ pub(crate) mod tests {
             "summed total: {}",
             gap.reason
         );
-        assert!(gap.reason.contains("NoFile=9"), "summed label: {}", gap.reason);
+        assert!(
+            gap.reason.contains("NoFile=9"),
+            "summed label: {}",
+            gap.reason
+        );
         assert!(
             gap.reason.contains("foreign=6"),
             "summed label: {}",
@@ -7132,10 +7347,7 @@ pub(crate) mod tests {
             DEFAULT_MAX_GAPS - TERMINAL_GAP_RESERVE,
             "per-drain stops at the reserve"
         );
-        assert!(
-            registry.gaps_suppressed() > 0,
-            "flood overflow suppresses"
-        );
+        assert!(registry.gaps_suppressed() > 0, "flood overflow suppresses");
         registry.enter_terminal_phase();
         for n in 0..TERMINAL_GAP_RESERVE {
             registry.record_gap(RegistryGap {
@@ -7157,8 +7369,10 @@ pub(crate) mod tests {
             "first terminal gap retained"
         );
         assert!(
-            registry.gaps().iter().any(|gap| gap.subject
-                == format!("terminal-{}", TERMINAL_GAP_RESERVE - 1)),
+            registry
+                .gaps()
+                .iter()
+                .any(|gap| gap.subject == format!("terminal-{}", TERMINAL_GAP_RESERVE - 1)),
             "last terminal gap retained"
         );
     }

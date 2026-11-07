@@ -2788,6 +2788,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.registry.disclose_joint_journal_unavailable_once();
     }
 
+    /// Enter the terminal/stop-time gap phase: gaps recorded from
+    /// now on may use the reserved slots. The lane calls it once
+    /// when stopping, before staging any terminal disclosure.
+    pub(crate) fn enter_terminal_phase(&mut self) {
+        self.registry.enter_terminal_phase();
+    }
+
     /// Whether a capture failure was staged this run (the pre-arm terminal
     /// cause reads `Stop` for failures, per 6.13).
     pub(crate) fn capture_failed(&self) -> bool {

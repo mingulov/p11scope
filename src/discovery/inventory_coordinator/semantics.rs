@@ -3682,13 +3682,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // below. A Vec scan avoids new derives on the reason enums.
         let mut shed_reasons: Vec<(&'static str, u64)> = Vec::new();
         // Unrouted sheds whose records prove a caller other than every
-        // bound Joint caller: disclosed under their own subject, and
-        // attributed to that caller when exactly one live caller owns
-        // them all.
+        // bound Joint caller: disclosed under their own subject,
+        // aggregated lane-wide across drains.
         let mut other_shed_reasons: Vec<(&'static str, u64)> = Vec::new();
-        // The one pid owning every such shed, or `Some(None)` once two
-        // differ (no allocation: attribution is a label, never a proof).
-        let mut other_pid: Option<Option<u32>> = None;
         // JK-18: before the namespace's first binding, unrouted calls with
         // a known image are held (counted now, disclosed and disposed or
         // barriered when a binding or the stop resolves them).
@@ -3834,14 +3830,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                             match (token, other_caller) {
                                 // Another caller's lost call is disposed
                                 // for the bound callers' history.
-                                (Some(at), Some(pid)) => {
+                                (Some(at), Some(_)) => {
                                     staged_positions.push(Some(at));
                                     refuse_images.insert((cookie, call_image.exec_id));
-                                    other_pid = match other_pid {
-                                        None => Some(Some(pid)),
-                                        Some(Some(seen)) if seen == pid => Some(Some(pid)),
-                                        Some(_) => Some(None),
-                                    };
                                 }
                                 // Provisionally disposed: no bound key can
                                 // seal yet, and a pending floor here would
@@ -3997,51 +3988,36 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         }
         if !shed_reasons.is_empty() {
             let total: u64 = shed_reasons.iter().map(|(_, count)| count).sum();
-            let mut parts: Vec<String> = shed_reasons
+            let labels: Vec<(String, u64)> = shed_reasons
                 .iter()
-                .map(|(label, count)| format!("{label}={count}"))
+                .map(|(label, count)| (label.to_string(), *count))
                 .collect();
-            parts.sort();
-            self.registry.record_gap(RegistryGap {
-                caller: None,
-                module: None,
-                pid: None,
-                subject: "semantic calls unrouted".into(),
-                reason: format!(
-                    "{total} calls shed without a route ({}) with {} bindings",
-                    parts.join(" "),
-                    self.semantic_bindings.len()
-                ),
-                budget: None,
-            });
+            // Aggregated: repeated drains sum into one counted row
+            // per (subject, bindings), never one row per drain.
+            self.registry.record_aggregated_unrouted(
+                "semantic calls unrouted".into(),
+                total,
+                labels,
+                self.semantic_bindings.len(),
+            );
             lane.note_shed_calls(total);
         }
         if !other_shed_reasons.is_empty() {
             let total: u64 = other_shed_reasons.iter().map(|(_, count)| count).sum();
-            let mut parts: Vec<String> = other_shed_reasons
+            let labels: Vec<(String, u64)> = other_shed_reasons
                 .iter()
-                .map(|(label, count)| format!("{label}={count}"))
+                .map(|(label, count)| (label.to_string(), *count))
                 .collect();
-            parts.sort();
-            // Attribute to the other caller when one live, unbound caller
-            // owns every such call; otherwise the gap stays lane-wide.
-            let caller = other_pid
-                .flatten()
-                .and_then(|pid| self.adapter.live_id(pid))
-                .filter(|caller| self.semantic_bindings.get(*caller).is_none());
             self.registry.note_foreign_unrouted_calls(total);
-            self.registry.record_gap(RegistryGap {
-                caller,
-                module: None,
-                pid: None,
-                subject: "semantic calls unrouted from other callers".into(),
-                reason: format!(
-                    "{total} calls shed without a route ({}) from callers other than the {} bound callers",
-                    parts.join(" "),
-                    self.semantic_bindings.len()
-                ),
-                budget: None,
-            });
+            // Aggregated lane-wide: the per-drain single-owner
+            // attribution is transient; the summed row names no
+            // caller so every drain lands in one row.
+            self.registry.record_aggregated_unrouted(
+                "semantic calls unrouted from other callers".into(),
+                total,
+                labels,
+                self.semantic_bindings.len(),
+            );
             lane.note_shed_calls(total);
         }
         // Pre-binding sheds were disclosed (and counted) when shed; the
@@ -6007,6 +5983,57 @@ mod finalizer_history_tests {
                 "cookie {cookie}"
             );
         }
+    }
+
+    #[test]
+    fn two_unrouted_drains_aggregate_into_one_counted_row() {
+        // Per-drain unrouted sheds used to land one gap row per
+        // distinct shed count; repeated drains now sum into one
+        // counted row per (subject, bindings).
+        const BOUND: u64 = 41;
+        let (mut coordinator, mut lane, domain) = drop_test_lanes();
+        coordinator
+            .semantic_bindings
+            .insert(SemanticCallerBinding::scripted(
+                CallerId(9),
+                ModuleKey::physical(7, 7, 777, None, "/bound/provider.so"),
+                domain,
+                ImageIdentity {
+                    task_cookie: BOUND,
+                    exec_id: 1,
+                },
+                Arc::new(PidPin::test_proc_only(1234)),
+            ))
+            .unwrap();
+        for (base_ns, positions) in [(130u64, vec![2u64, 3]), (140, vec![4, 5, 6])] {
+            let outcomes: Vec<TickOutcome> = positions
+                .into_iter()
+                .map(|position| unrouted_call(domain, 77, position))
+                .collect();
+            let report =
+                TickReport::scripted_with_disposition(outcomes, Vec::new(), None, None, false);
+            let batch =
+                SemanticBatch::from_tick_report(domain, report, Vec::new(), base_ns).unwrap();
+            coordinator.stage_semantic_batch(batch);
+            coordinator
+                .commit_batch_with_semantics(false, Some(&mut lane))
+                .unwrap();
+        }
+        // Both drains shed other-caller calls with one binding: one
+        // row, 2 + 3 = 5 calls.
+        let rows: Vec<_> = coordinator
+            .registry()
+            .gaps()
+            .iter()
+            .filter(|gap| gap.subject == "semantic calls unrouted from other callers")
+            .collect();
+        assert_eq!(rows.len(), 1, "{:?}", coordinator.registry().gaps());
+        assert!(
+            rows[0].reason.starts_with("5 calls shed without a route ("),
+            "summed: {}",
+            rows[0].reason
+        );
+        assert_eq!(unrouted_gap_calls(&coordinator), 5);
     }
 
     /// One unrouted call with an explicit exec id.

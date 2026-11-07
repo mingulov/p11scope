@@ -380,10 +380,11 @@ the same gap (`pending_capacity=N`). Every other
 Under `--key-operations`, such a shed call ends a caller's key-operation
 tracking (`joint_seal_h3_loss_history_loss`) only when p11scope cannot prove
 it came from a different process. A call whose kernel-assigned process
-identity differs from every caller being tracked is reported under its own
-`semantic calls unrouted from other callers` gap (attributed to that caller
-when exactly one live caller made them) and still counts in the stop line's
-shed count, but it no longer ends tracking for the other callers. A call
+identity differs from every caller being tracked is reported under the
+lane-wide `semantic calls unrouted from other callers` gap (repeated
+drains sum into one counted row per bindings count) and still counts in
+the stop line's shed count, but it no longer ends tracking for the other
+callers. A call
 without that identity, or from a tracked caller (including after its exec),
 still ends tracking as before. Calls shed before any caller is tracked are
 reported at once in the `semantic calls unrouted` gap (`with 0 bindings`),

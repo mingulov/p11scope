@@ -3021,6 +3021,7 @@ impl ClassicDriver<'_> {
     /// passes. True when anything staged, so the tail can publish it;
     /// silent runs commit nothing extra.
     fn disclose_scan_terminal_newcomers(&mut self) -> bool {
+        self.coordinator.enter_terminal_phase();
         let (live_at_stop, stop_lost) = crate::discovery::engine::scope_pids(&Scope::System);
         let staged = self
             .coordinator
@@ -6376,6 +6377,10 @@ impl PassDriver<PidPin> for ClassicDriver<'_> {
     }
 
     fn on_lane_stopped(&mut self) {
+        // Terminal gap phase first: disclosures staged from now on
+        // may use the reserved slots, never crowded out by a
+        // per-drain flood.
+        self.coordinator.enter_terminal_phase();
         // Terminal coverage disclosure first: post-last-pass newcomers
         // (exec hooks plus the stop-time diff over starters no
         // completed pass saw) stage before the final commit publishes

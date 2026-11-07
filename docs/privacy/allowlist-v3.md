@@ -1841,15 +1841,16 @@ retirement, an admission-covered unmatched exit (its view retired
 before the ring record arrived) at the covers check, a novel exit by
 consuming it, a redelivered exit like its first delivery, an
 overflow-shedded exit at the sentinel — and a removed admitted view
-drops both at admission close, so only a *lost* exit record can still
-leave a stale entry (PARTIAL via `discovery_ring_loss`),
+drops both at admission close, so, apart from the migration case
+below, only a *lost* exit record can still leave a stale entry
+(PARTIAL via `discovery_ring_loss`),
 attributing one image-correct hint to the wrong generation's count;
 the `still_the_same` gate plus the reopen re-verify bound the
 misattribution to that lost-exit case. Under `--cgroup`, a member
 that execs, migrates out and exits produces no exit record; a
 fork-only reused PID can then consume its entry without PARTIAL —
-but only for members never admitted (admitted members drop both at
-removal). Target execs before attach
+but only for members with no open admission when they exec (never
+admitted, or already evicted). Target execs before attach
 are invisible; metrics ticketless seeding trusts membership admission
 (the same admission that authorizes every other metrics lifecycle
 record). An owned `run` whose child never execs (spawn failure aside,

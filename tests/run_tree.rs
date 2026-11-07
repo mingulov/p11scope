@@ -357,8 +357,8 @@ fn assert_honest_tree_gaps(profile: &serde_json::Value, descendant_gaps: u64) {
     assert!(
         labels
             .iter()
-            .any(|label| label.starts_with("p11scope-run-")),
-        "the run cgroup scope is retained, not degraded: {labels:?}"
+            .any(|label| { label.starts_with("p11scope-run-") && !label.contains('/') }),
+        "the run cgroup scope is retained as its leaf name only, not degraded: {labels:?}"
     );
     let skipped = evidence
         .get("skipped")
@@ -696,7 +696,8 @@ fn privileged_run_tree_shell_wrapper_shows_grandchild_calls() {
     // Drain settle: the shell holds the loop open two seconds after the
     // last grandchild so its exit record lands before the terminal drain
     // fixes its read position; without the settle the last exit strands
-    // past it on some hosts (Fedora) and the gap undercounts by one.
+    // past it on some hosts (Fedora) and the gap counts via the
+    // fail-closed sweep instead of the exit ledger.
     // `exec` keeps the direct-child PID: no new process, no new exit.
     let script = format!(
         "{} {} {} 3; {} {} {} 3; exec sleep 2",

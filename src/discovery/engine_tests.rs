@@ -4589,6 +4589,78 @@ fn cgroup_pruned_newcomer_skips_an_exit_matched_birth() {
 }
 
 #[test]
+fn cgroup_finish_sweep_counts_a_never_admitted_never_exited_newcomer() {
+    // End-of-run sweep: a marked newcomer that never admits and never
+    // exit-matches still gaps at finish, so the view reads PARTIAL.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.mark_newcomer_arrival(4242, Some(100));
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    engine.settle_frame_deferrals_at_capture_end();
+    assert!(
+        engine.pid_descendant_gaps() >= 1,
+        "a remaining newcomer must gap at finish"
+    );
+}
+
+#[test]
+fn cgroup_pruned_newcomer_ignores_an_older_generation_exit() {
+    // Time-aware exit matching: an exit from before the mark (an older
+    // generation) must not suppress the new birth's gap.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(4242u32) << 32;
+    exit.hook_ts_ns = 100;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    engine.mark_newcomer_arrival(4242, Some(200));
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        2,
+        "an older exit must not match a newer birth"
+    );
+}
+
+#[test]
+fn cgroup_reused_pid_after_an_exit_match_counts_its_new_birth() {
+    // PID reuse: once an exit matches a birth, the next arrival for the
+    // same pid is a new generation with its own gap.
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: PathBuf::from("/sys/fs/cgroup/test"),
+        dir: Arc::new(File::open("/dev/null").unwrap()),
+    };
+    engine.mark_newcomer_arrival(4242, Some(100));
+    let mut exit: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    exit.kind = DISCOVERY_KIND_LEADER_EXIT;
+    exit.pid_tgid = u64::from(4242u32) << 32;
+    exit.hook_ts_ns = 200;
+    let mut pending = PendingViewRetirements::new();
+    engine.dispatch_lifecycle_record(&mut ScriptedSession::default(), &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    engine.mark_newcomer_arrival(4242, Some(300));
+    engine.close_pruned_newcomer_gaps(&BTreeSet::new());
+    assert_eq!(
+        engine.pid_descendant_gaps(),
+        2,
+        "a reused pid must gap its new birth"
+    );
+}
+
+#[test]
 fn cgroup_boundary_unavailability_latches_one_ingress_sentinel() {
     let mut engine = Engine::empty();
     engine.scope = Scope::Cgroup {

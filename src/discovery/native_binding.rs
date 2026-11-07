@@ -683,6 +683,10 @@ pub(crate) struct NativeBinder {
     decided: Vec<Decision>,
     transitions: Vec<ExecTransition>,
     census: BindingCensus,
+    /// Latest recorded PID-reuse instant per tgid: reconcile retired the
+    /// tracked generation while the pid named a live process. A host
+    /// fact, shared by every domain like the census.
+    reuse_ns: HashMap<u32, u64>,
     /// Qualified only on the explicit metadata opt-in, never an image grant.
     metadata_clock_qualified: bool,
     #[cfg(test)]
@@ -698,10 +702,21 @@ impl NativeBinder {
             decided: Vec::new(),
             transitions: Vec::new(),
             census: BindingCensus::default(),
+            reuse_ns: HashMap::new(),
             metadata_clock_qualified: false,
             #[cfg(test)]
             current_binding_clock: None,
         }
+    }
+
+    /// One recorded PID reuse: reconcile retired the tracked generation
+    /// of `tgid` at `at_ns` while the pid named a live process. The
+    /// retained-identity fallback voids any holder admitted at or before
+    /// it (the turnover window is ambiguous); the live path never
+    /// consults this (a held pin proves its generation).
+    pub(crate) fn note_pid_reuse(&mut self, tgid: u32, at_ns: u64) {
+        let latest = self.reuse_ns.entry(tgid).or_insert(at_ns);
+        *latest = (*latest).max(at_ns);
     }
 
     pub(crate) fn census(&self) -> &BindingCensus {

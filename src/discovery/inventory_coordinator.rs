@@ -27712,12 +27712,12 @@ int main(void) {
     }
 
     #[test]
-    fn a_post_admission_exit_unbound_row_says_the_caller_exited_before_it_could_be_matched() {
+    fn a_post_exit_row_past_the_observed_exit_keeps_the_before_admission_label() {
         // The caller was admitted (at 50), then exited (observed at 500);
-        // its row arrives after the exit with no unambiguous retained
-        // identity (here: past the observed exit, so the lifetime misses).
-        // The sticky downgrade keeps fail-safe unknown, but says the
-        // caller exited before it could be matched, not "before admission".
+        // its row at 1_500 falls past the observed exit, so the retired
+        // lifetime does not contain it. The exit-miss wording is limited
+        // to holders whose lifetime contains the row; this row keeps the
+        // general fail-safe label.
         let (mut native, caller) = watched_native();
         native.scene.source.kill(7);
         let observed: BTreeSet<u32> = BTreeSet::new();
@@ -27735,8 +27735,59 @@ int main(void) {
         let coverage = native.scene.coverage(caller);
         assert_eq!(
             coverage,
+            UseCoverage::Unknown(UnknownReason::UseBeforeAdmission),
+            "{coverage:?}"
+        );
+    }
+
+    #[test]
+    fn a_post_admission_exit_row_inside_the_lifetime_says_the_caller_exited_before_it_could_be_matched()
+     {
+        // The caller was admitted (at 50), then exited (observed at 500);
+        // a second holder of the pid keeps the row at 400 ambiguous (two
+        // holders), but the row falls inside the first lifetime, so the
+        // sticky downgrade says the caller exited before it could be
+        // matched, not "before admission".
+        let (mut native, caller) = watched_native();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        native.scene.source.spawn(7, 600);
+        let second = native
+            .scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 600)
+            .unwrap();
+        native.scene.project(7, 650);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.scene.source.kill(7);
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            700,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+        let coverage = native.scene.coverage(caller);
+        assert_eq!(
+            coverage,
             UseCoverage::Unknown(UnknownReason::CallerExitedBeforeMatch),
             "{coverage:?}"
+        );
+        assert!(
+            use_before_admission(&native.scene.coverage(second)),
+            "the later holder predates the row: {:?}",
+            native.scene.coverage(second)
         );
         assert_eq!(
             UnknownReason::CallerExitedBeforeMatch.text(),
@@ -27785,6 +27836,282 @@ int main(void) {
             native.scene.coverage(caller),
             UseCoverage::Unknown(UnknownReason::UseBeforeAdmission),
             "the exec void keeps the pre-admission label"
+        );
+    }
+
+    #[test]
+    fn a_short_lived_pid_caller_binds_its_in_lifetime_row_and_counts() {
+        // F4 e2e through CallerAdapter::retained_callers: the caller was
+        // admitted at 50 and exited (observed at 500); its row at 400
+        // falls inside the retired lifetime with unambiguous retained
+        // identity, so it binds and counts on the edge.
+        let (mut native, caller) = watched_native();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!((census.rows, census.bound, census.pending), (1, 1, 0));
+        let registry = &native.scene.coordinator.registry;
+        let edge = registry
+            .edges()
+            .find(|edge| edge.caller == caller)
+            .expect("the caller has an edge");
+        assert!(edge.entry_count > 0, "the bound row counts");
+        assert!(
+            matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_system_scope_retained_row_stays_unbound() {
+        // PID-scope-only fallback: the same retired caller with an
+        // in-lifetime row stays NoLiveCaller under system scope, where
+        // entry probes attach to all processes and a reused pid may have
+        // fired them. Only the engine scope differs from the bound twin.
+        let (mut native, caller) = watched_native();
+        native.scene.coordinator.engine.scope = Scope::System;
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+        assert!(
+            !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_cgroup_scope_retained_row_stays_unbound() {
+        // PID-scope-only fallback under cgroup scope: only the engine
+        // scope differs from the bound twin (production cgroup batches
+        // carry CgroupHeld custody, which also withholds the fallback).
+        let (mut native, caller) = watched_native();
+        std::fs::write(native.scene._dir.path().join("cgroup.procs"), b"").unwrap();
+        native.scene.coordinator.engine.scope =
+            crate::scope::cgroup(native.scene._dir.path()).unwrap();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+        assert!(
+            !matches!(native.scene.coverage(caller), UseCoverage::Counted { .. }),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+    }
+
+    #[test]
+    fn a_pid_row_read_without_custody_stays_unbound() {
+        // The fallback needs held custody (or a clean exit proof): a link
+        // acquired after the original exited may name a reused pid, so a
+        // row read under PidLost keeps its live-miss gap.
+        let (mut native, _) = watched_native();
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        let NativeBatch::Witness(mut batch) = native.stamps.read(native.domain, vec![row]) else {
+            unreachable!("the scripted read constructs a witness batch");
+        };
+        batch.custody = ScopeCustody::PidLost {
+            at_ns: 450,
+            reason: "scripted custody loss".into(),
+        };
+        native.stage(NativeBatch::Witness(batch));
+        native.drain();
+        native.stage(native.stamps.read(native.domain, Vec::new()));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+    }
+
+    #[test]
+    fn a_pid_retained_row_with_incomparable_exit_clocks_stays_unbound() {
+        // Without comparable exit clocks the exec/loss horizons cannot be
+        // ordered against the admission, so the fallback stays off.
+        let (mut native, _) = watched_native();
+        native.scene.coordinator.exit_clocks_comparable = false;
+        native.scene.source.kill(7);
+        let observed: BTreeSet<u32> = BTreeSet::new();
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        assert_eq!(events.len(), 1);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+    }
+
+    #[test]
+    fn a_recorded_reuse_without_an_admitted_successor_leaves_the_coordinator_row_unbound() {
+        // The pid turns over between passes (the pin dies while the pid
+        // names a live process) but the successor admission fails on the
+        // caller budget: one retained holder with an in-lifetime row, yet
+        // the recorded reuse voids it.
+        let (mut native, _) = watched_native();
+        native.scene.coordinator.adapter.set_max_callers(1);
+        native.scene.source.kill(7);
+        native.scene.source.spawn(7, 600);
+        let observed: BTreeSet<u32> = BTreeSet::from([7]);
+        let events = native.scene.coordinator.adapter.reconcile(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+        );
+        // Two refusals: the post-reuse re-admission plus the observed
+        // sweep, both over budget.
+        assert_eq!(events.len(), 2);
+        assert!(
+            events
+                .iter()
+                .all(|event| matches!(event, CallerEvent::AdmitFailed { pid: 7, .. })),
+            "{events:?}"
+        );
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 500);
+        assert!(native.scene.coordinator.adapter.live_id(7).is_none());
+        let row = native.row(41, 1, 7, 400, 0);
+        native.witness(vec![row]);
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::NoLiveCaller), Some(&1));
+    }
+
+    #[test]
+    fn a_reuse_recorded_between_read_and_settle_leaves_the_coordinator_row_unbound() {
+        // The row is read with one holder (the live pin dies during the
+        // query), then the pid turns over and the successor admits: the
+        // reuse recorded before the decision voids the retained snapshot.
+        let (mut native, _) = watched_native();
+        native.query_answer(7, 500, CookieQuery::Exited);
+        let row = native.row(41, 1, 7, 400, 0);
+        native.read(vec![row]);
+        native.scene.source.kill(7);
+        native.scene.source.spawn(7, 600);
+        let observed: BTreeSet<u32> = BTreeSet::from([7]);
+        let events = native.scene.coordinator.adapter.reconcile_detected(
+            &observed,
+            &mut |_| ImageAuthority::ScanPinned,
+            500,
+            &mut || Some(500),
+        );
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(events[0], CallerEvent::Reused { .. }),
+            "{events:?}"
+        );
+        native
+            .scene
+            .coordinator
+            .apply_reconcile_events(&events, 500);
+        native.drain();
+        native.stage(native.stamps.read(native.domain, Vec::new()));
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let census = native.scene.coordinator.registry.witness_census();
+        assert_eq!(census.bound, 0);
+        assert_eq!(census.unbound.get(&UnboundReason::CallerExited), Some(&1));
+    }
+
+    #[test]
+    fn a_counted_edge_after_a_clean_pid_exit_names_the_exit_not_dropped_records() {
+        // A clean PID-target exit ends the count: the edge reads counted
+        // (a lower bound), but the wording names the exit — no records
+        // were dropped.
+        let mut scene = CaptureScene::new(2);
+        scene.source.spawn(7, 500);
+        let caller = scene
+            .coordinator
+            .adapter
+            .admit(7, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        scene
+            .coordinator
+            .begin_capture_coverage(CaptureScopeCoverage::Pid(
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ));
+        let mut native = NativeScene::over(scene, 0);
+        native.scene.attach_all(100, ScopeCustody::PidHeld);
+        native.scene.project(7, 120);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        native.answer(7, 500, 41);
+        let row = native.row(41, 1, 7, 200, 0);
+        native.witness(vec![row]);
+        assert!(
+            matches!(
+                native.scene.coverage(caller),
+                UseCoverage::Counted { lossy: false, .. }
+            ),
+            "{:?}",
+            native.scene.coverage(caller)
+        );
+        let custody = ScopeCustody::PidExited {
+            at_ns: 600,
+            proof: crate::attach::capture::OriginalPidExit::scripted(
+                native.domain,
+                crate::attach::capture::ScopeIncarnation {
+                    pid: 7,
+                    start_time: Some(500),
+                },
+            ),
+        };
+        native.scene.coordinator.note_capture_custody(&custody);
+        native.scene.coordinator.commit_batch(false).unwrap();
+        let coverage = native.scene.coverage(caller);
+        assert!(
+            matches!(coverage, UseCoverage::Counted { lossy: true, .. }),
+            "{coverage:?}"
+        );
+        assert_eq!(
+            crate::inventory_present::coverage_label_at(&coverage, 3_000),
+            "counted until the PID target exited (lower bound)"
         );
     }
 

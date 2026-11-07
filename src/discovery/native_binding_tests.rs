@@ -37,8 +37,11 @@ impl World {
     }
 
     /// Script one retained incarnation for `pid`: the scan-time identity
-    /// (start time plus exe presence) with its monotonic lifetime
-    /// (`first_seen_ns`, and `last_seen_ns` when `retired`).
+    /// (start time, exe presence, and the exec detector) with its
+    /// monotonic lifetime (`first_seen_ns`, and `last_seen_ns` when
+    /// `retired`). Exe presence and the exec detector are independent
+    /// script inputs: an exe readable now may still have no observed
+    /// detector (admitted while unreadable).
     #[allow(clippy::too_many_arguments)]
     fn retain(
         &mut self,
@@ -49,6 +52,7 @@ impl World {
         retired: bool,
         start_time: Option<u64>,
         exe_present: bool,
+        exec_observed: bool,
         lifecycle: super::super::caller_registry::CallerLifecycle,
     ) -> CallerId {
         let id = CallerId(caller);
@@ -59,7 +63,7 @@ impl World {
             retired,
             start_time,
             exe_present,
-            exec_observed: exe_present,
+            exec_observed,
             lifecycle,
         });
         id
@@ -724,6 +728,7 @@ fn exit_before_the_poll_leaves_the_row_unbound() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
@@ -738,6 +743,7 @@ fn exit_before_the_poll_leaves_the_row_unbound() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -761,6 +767,7 @@ fn exit_before_the_poll_binds_the_unambiguous_retained_row() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
@@ -776,6 +783,7 @@ fn exit_before_the_poll_binds_the_unambiguous_retained_row() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -799,6 +807,7 @@ fn pid_reuse_leaves_the_retained_row_unbound() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.world.retain(
@@ -808,6 +817,7 @@ fn pid_reuse_leaves_the_retained_row_unbound() {
         1_600,
         true,
         Some(200),
+        true,
         true,
         CallerLifecycle::Exited,
     );
@@ -825,6 +835,7 @@ fn pid_reuse_leaves_the_retained_row_unbound() {
         true,
         Some(101),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.world.retain(
@@ -835,12 +846,94 @@ fn pid_reuse_leaves_the_retained_row_unbound() {
         false,
         Some(201),
         true,
+        true,
         CallerLifecycle::Mapped,
     );
     run.world.answer(T + 1, 2, d, CookieQuery::Exited);
     run.read(vec![row(d, 9, 1, T + 1, 1_200)]);
     run.settle();
     assert_eq!(run.verdicts(), vec![unbound(UnboundReason::CallerExited)]);
+}
+
+#[test]
+fn unproven_retained_identity_leaves_the_row_unbound_in_both_modes() {
+    // Every identity check rejects on its own, in NoLiveCaller mode (no
+    // live incarnation) and in CallerExited mode (the live pin dies
+    // during the query): no start time, no exe, exe without an observed
+    // exec detector, unknown lifecycle, exec-retired lifecycle. The
+    // lifecycle rows pin the filter exhaustively (a live mirror carries
+    // Mapped in production); the row keeps its live-miss gap.
+    let cases: [(&str, Option<u64>, bool, bool, CallerLifecycle); 5] = [
+        ("no start time", None, true, true, CallerLifecycle::Exited),
+        ("no exe", Some(100), false, false, CallerLifecycle::Exited),
+        (
+            "exe without an observed exec detector",
+            Some(100),
+            true,
+            false,
+            CallerLifecycle::Exited,
+        ),
+        (
+            "unknown lifecycle",
+            Some(100),
+            true,
+            true,
+            CallerLifecycle::Unknown,
+        ),
+        (
+            "exec-retired lifecycle",
+            Some(100),
+            true,
+            true,
+            CallerLifecycle::ExecRetired,
+        ),
+    ];
+    for (name, start_time, exe_present, exec_observed, lifecycle) in cases {
+        // NoLiveCaller mode: one retired holder with the lifetime.
+        let mut run = Run::new();
+        let d = run.domain;
+        run.world.retain(
+            T,
+            0,
+            1_000,
+            2_000,
+            true,
+            start_time,
+            exe_present,
+            exec_observed,
+            lifecycle,
+        );
+        run.read(vec![row(d, 7, 1, T, 1_500)]);
+        run.settle();
+        assert_eq!(
+            run.verdicts(),
+            vec![unbound(UnboundReason::NoLiveCaller)],
+            "{name} (no live caller)"
+        );
+        // CallerExited mode: the live incarnation's pin dies mid-query.
+        let mut run = Run::new();
+        let d = run.domain;
+        run.world.admit(T + 1, 1, 1, 1_000);
+        run.world.retain(
+            T + 1,
+            1,
+            1_000,
+            1_000,
+            false,
+            start_time,
+            exe_present,
+            exec_observed,
+            lifecycle,
+        );
+        run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+        run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+        run.settle();
+        assert_eq!(
+            run.verdicts(),
+            vec![unbound(UnboundReason::CallerExited)],
+            "{name} (caller exited)"
+        );
+    }
 }
 
 #[test]
@@ -856,6 +949,7 @@ fn exec_between_admission_and_read_leaves_the_retained_row_unbound() {
         2_000,
         true,
         Some(100),
+        true,
         true,
         CallerLifecycle::Exited,
     );
@@ -876,6 +970,7 @@ fn exec_between_admission_and_read_leaves_the_retained_row_unbound() {
         false,
         Some(101),
         true,
+        true,
         CallerLifecycle::Mapped,
     );
     run.world.answer(T + 1, 1, d, CookieQuery::Exited);
@@ -889,12 +984,13 @@ fn exec_between_admission_and_read_leaves_the_retained_row_unbound() {
 }
 
 #[test]
-fn a_reuse_recorded_after_the_read_does_not_void_the_retained_binding() {
+fn a_later_holder_without_a_recorded_reuse_does_not_void_the_retained_binding() {
     // The holder count is evaluated once, when the row is read: a second
-    // retained holder admitted after the read (PID reuse) leaves the
-    // unambiguous binding in place. Reuse requires the old task dead, and
-    // the old task was alive at the event, so the row is still its use.
-    // The reuse twin above scripts both holders before the read.
+    // holder admitted fresh after the noticed exit — no reuse recorded,
+    // the old exit was proven clean and the successor came later — leaves
+    // the unambiguous binding in place. Under PID scope the kernel binds
+    // the probes to the original task, so the row is still its use. The
+    // reuse twins below script a recorded turnover instead.
     let mut run = Run::new();
     let d = run.domain;
     let x = run.world.retain(
@@ -905,22 +1001,153 @@ fn a_reuse_recorded_after_the_read_does_not_void_the_retained_binding() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
-    // The old task exits and its pid is reused after the read.
+    // The old exit is noticed at 2_000; the pid is admitted fresh after.
     run.world.retain(
         T,
         2,
-        1_600,
-        1_600,
+        2_100,
+        2_100,
         true,
         Some(200),
+        true,
         true,
         CallerLifecycle::Exited,
     );
     run.settle();
     assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn a_recorded_reuse_without_an_admitted_successor_leaves_the_retained_row_unbound() {
+    // A PID reuse recorded at or after the retained admission voids the
+    // retained identity even when no successor was admitted (its
+    // admission failed, or the scope never admits one): the turnover
+    // window is ambiguous, so the row keeps its live-miss gap. A reuse
+    // recorded before the admission is another generation's turnover
+    // and binds.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.binder.note_pid_reuse(T, 1_600);
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    // Same for a live incarnation whose pin dies during the query.
+    run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.binder.note_pid_reuse(T + 1, 1_600);
+    run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::CallerExited)]);
+    // A reuse before the admission binds: the holder postdates it.
+    let mut run = Run::new();
+    let d = run.domain;
+    let x = run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.binder.note_pid_reuse(T, 999);
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![bound(x)]);
+}
+
+#[test]
+fn a_reuse_noted_between_read_and_settle_voids_the_retained_binding() {
+    // The holder count is fixed at the read, but a reuse recorded before
+    // the decision still voids: one holder at the read, the turnover
+    // noticed while the row waits, and the row keeps its live-miss gap.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.retain(
+        T,
+        0,
+        1_000,
+        2_000,
+        true,
+        Some(100),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.world.retain(
+        T,
+        2,
+        2_000,
+        2_000,
+        true,
+        Some(200),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.binder.note_pid_reuse(T, 2_000);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::NoLiveCaller)]);
+    // Same for a live incarnation whose pin dies during the query.
+    let mut run = Run::new();
+    let d = run.domain;
+    run.world.admit(T + 1, 1, 1, 1_000);
+    run.world.retain(
+        T + 1,
+        1,
+        1_000,
+        1_000,
+        false,
+        Some(101),
+        true,
+        true,
+        CallerLifecycle::Mapped,
+    );
+    run.world.answer(T + 1, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T + 1, 1_500)]);
+    run.world.retain(
+        T + 1,
+        3,
+        2_000,
+        2_000,
+        true,
+        Some(201),
+        true,
+        true,
+        CallerLifecycle::Exited,
+    );
+    run.binder.note_pid_reuse(T + 1, 2_000);
+    run.settle();
+    assert_eq!(run.verdicts(), vec![unbound(UnboundReason::CallerExited)]);
 }
 
 #[test]
@@ -935,6 +1162,7 @@ fn loss_at_or_after_admission_leaves_the_retained_row_unbound() {
         2_000,
         true,
         Some(100),
+        true,
         true,
         CallerLifecycle::Exited,
     );
@@ -951,6 +1179,7 @@ fn loss_at_or_after_admission_leaves_the_retained_row_unbound() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -976,6 +1205,7 @@ fn admission_predating_coverage_leaves_the_retained_row_unbound() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
@@ -984,20 +1214,25 @@ fn admission_predating_coverage_leaves_the_retained_row_unbound() {
         run.verdicts(),
         vec![unbound(UnboundReason::ExecCoverageGap)]
     );
-    // A qualifying pass that revalidates the incarnation rescues it.
+    // A qualifying pass that revalidates the live incarnation rescues it.
+    // Only a live incarnation can be revalidated: the pass compares its
+    // pin, start time and exe identity, so a retired one never qualifies.
     let mut run = Run::covered_from(2_000);
     let d = run.domain;
-    let x = run.world.retain(
+    let x = run.world.admit(T, 1, 1, 1_000);
+    run.world.retain(
         T,
-        0,
+        1,
         1_000,
-        2_000,
+        1_000,
+        false,
+        Some(101),
         true,
-        Some(100),
         true,
-        CallerLifecycle::Exited,
+        CallerLifecycle::Mapped,
     );
-    run.read(vec![row(d, 7, 1, T, 1_500)]);
+    run.world.answer(T, 1, d, CookieQuery::Exited);
+    run.read(vec![row(d, 9, 1, T, 1_500)]);
     run.revalidate(2_500, &[x]);
     run.settle();
     assert_eq!(run.verdicts(), vec![bound(x)]);
@@ -1013,6 +1248,7 @@ fn admission_predating_coverage_leaves_the_retained_row_unbound() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -1040,6 +1276,7 @@ fn a_competing_image_of_the_ticket_leaves_retained_rows_unbound() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![
@@ -1063,6 +1300,7 @@ fn a_competing_image_of_the_ticket_leaves_retained_rows_unbound() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -1096,6 +1334,7 @@ fn a_retained_row_of_a_held_image_is_ambiguous_without_a_transition() {
         true,
         Some(100),
         true,
+        true,
         CallerLifecycle::Exited,
     );
     run.read(vec![row(d, 7, 1, T, 1_500)]);
@@ -1114,6 +1353,7 @@ fn a_retained_row_of_a_held_image_is_ambiguous_without_a_transition() {
         1_000,
         false,
         Some(101),
+        true,
         true,
         CallerLifecycle::Mapped,
     );
@@ -1148,6 +1388,7 @@ fn retained_lifetime_and_void_boundaries_are_exact() {
             true,
             Some(100),
             true,
+            true,
             CallerLifecycle::Exited,
         );
         run.read(vec![row(d, 7, 1, T, event_ns)]);
@@ -1170,6 +1411,7 @@ fn retained_lifetime_and_void_boundaries_are_exact() {
             2_000,
             true,
             Some(100),
+            true,
             true,
             CallerLifecycle::Exited,
         );
@@ -1197,6 +1439,7 @@ fn retained_lifetime_and_void_boundaries_are_exact() {
             3_000,
             true,
             Some(100),
+            true,
             true,
             CallerLifecycle::Exited,
         );

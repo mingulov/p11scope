@@ -64944,7 +64944,11 @@ fn matched_exit_drops_exec_timing_so_reused_pid_reads_late_watch() {
 // the still-open admission: without the drop, a later reused-PID
 // gap consumes the dead image (a wrong-process hint with no loss
 // and no PARTIAL), and a reused-PID kind-7 exit reads timely on the
-// dead EXEC. Removing either drop re-arms the stale read.
+// dead EXEC. The first reused-PID exit is kind 7 so it pins both
+// drops at once — the hint pins the stash drop and the reason pins
+// the exec-timing drop — before any novel-path drop could mask a
+// missing covered-path drop. Removing either drop re-arms its own
+// stale read.
 #[test]
 fn covered_unmatched_exit_drops_stash_and_exec_timing_for_reused_pid() {
     let first = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
@@ -64976,21 +64980,17 @@ fn covered_unmatched_exit_drops_stash_and_exec_timing_for_reused_pid() {
     );
     assert_eq!(engine.pid_descendant_gaps(), 0);
     assert_eq!(engine.extensive.stash_len_for_test(), 0);
-    engine.dispatch_lifecycle_record(
-        &mut session,
-        &gap_exe_exit_record(pid, admitted + 30),
-        &mut pending,
-    );
+    // The first reused-PID exit is kind 7: it reads the stash entry
+    // and exec timing the covered exit should have dropped, so a
+    // missing covered-path drop surfaces here instead of being
+    // masked by an earlier novel-path drop.
+    let reused = exit_mappings_record(pid, admitted + 30);
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
     assert_eq!(engine.pid_descendant_gaps(), 1);
     let hints = engine.gap_exe_hints().expect("armed split");
     assert_eq!(hints.links_provider, 0);
     assert_eq!(hints.unknown, 1);
     assert_eq!(hints.total(), 1);
-    // The exec timing died with the covered exit too: a reused-PID
-    // kind-7 exit reads late-watch, never timely on the dead EXEC.
-    let reused = exit_mappings_record(pid, admitted + 40);
-    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
-    assert_eq!(engine.pid_descendant_gaps(), 2);
     assert_eq!(
         engine
             .gap_exit_mappings()
@@ -65001,6 +65001,155 @@ fn covered_unmatched_exit_drops_stash_and_exec_timing_for_reused_pid() {
         engine.exit_mapping_reasons_for_test(),
         &[ExitMappingReason::UnknownLateWatch]
     );
+}
+
+// A novel unmatched exit consumes its PID's stash entry and exec
+// timing: a reused-PID kind-7 exit with no EXEC of its own reads
+// unknown, never the dead generation's image or timing. The first
+// leg is the positive control (a timely EXEC plus named slots reads
+// Mapped); the second leg pins the novel-path drops.
+#[test]
+fn novel_exit_drops_stash_and_exec_timing_for_reused_pid() {
+    let pid = 7451;
+    let mut engine = armed_cgroup_engine();
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, 5, dev, ino, 7),
+        &mut pending,
+    );
+    let mut first = exit_mappings_record(pid, 11);
+    first.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &first, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+    // A reused PID with no EXEC of its own: the stash went with the
+    // first exit (consume-once) and so did the exec timing, so even
+    // named slots read late-watch unknown.
+    let mut reused = exit_mappings_record(pid, 21);
+    reused.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 2);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[
+            ExitMappingReason::Mapped,
+            ExitMappingReason::UnknownLateWatch
+        ]
+    );
+}
+
+// A redelivered exit drops like its first delivery: after a novel
+// kind-7 exit, a re-seeding EXEC and a redelivery of the first exit,
+// a reused-PID kind-7 exit reads unknown, never the re-seeded image
+// or timing. The redelivery itself counts no gap and no verdict.
+#[test]
+fn redelivered_exit_drops_reseeded_stash_and_exec_timing() {
+    let pid = 7452;
+    let mut engine = armed_cgroup_engine();
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, 5, dev, ino, 7),
+        &mut pending,
+    );
+    let mut first = exit_mappings_record(pid, 11);
+    first.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &first, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    // The PID is reused and the new generation execs, re-seeding
+    // both tables; then a duplicate delivery of the first exit
+    // arrives and drops the re-seeded entries.
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, 15, dev, ino, 7),
+        &mut pending,
+    );
+    let mut redelivery = exit_mappings_record(pid, 11);
+    redelivery.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &redelivery, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::Mapped]
+    );
+    let mut reused = exit_mappings_record(pid, 21);
+    reused.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 2);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 1);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 2);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((1, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[
+            ExitMappingReason::Mapped,
+            ExitMappingReason::UnknownLateWatch
+        ]
+    );
+}
+
+// The overflow sentinel drops its PID's entries too: with a full
+// ledger the exit counts only the lower-bound gap plus PARTIAL, and
+// the PID's stash entry and exec timing die at the sentinel rather
+// than lingering for a reused generation. Post-overflow every later
+// unmatched exit overflows as well (the ledger never shrinks), so no
+// later gap exit can observe the drop behaviorally; this pins the
+// table hygiene directly.
+#[test]
+fn overflow_sentinel_drops_stash_and_exec_timing() {
+    let mut engine = armed_cgroup_engine();
+    engine.unmatched_leader_exit_events = (0..MAX_SCAN_PIDS)
+        .map(|index| (index as u32 + 1, index as u64 + 1))
+        .collect();
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(7201, 5, dev, ino, 7),
+        &mut pending,
+    );
+    assert_eq!(engine.extensive.stash_len_for_test(), 1);
+    assert!(engine.exit_map.execs.contains_key(&7201));
+    let mut exit = exit_mappings_record(7201, MAX_SCAN_PIDS as u64 + 100);
+    exit.pointers[0] = 3;
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert!(engine.cgroup_ingress_overflow);
+    assert_eq!(engine.extensive.stash_len_for_test(), 0);
+    assert!(!engine.exit_map.execs.contains_key(&7201));
+    assert!(engine.exit_mapping_reasons_for_test().is_empty());
 }
 
 // Admitted-member migration: removing an admitted view drops its

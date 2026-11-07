@@ -8,8 +8,10 @@
 //! whose start time predates the EXEC, (b) an exe identity the scan
 //! already learned from an admitted caller, (c) a lazy bounded
 //! cached index of fixed system binary dirs, else (d) unknown with
-//! its reason. Every candidate is verified by matching `(dev, ino)`
-//! with stat. No argv, environ, key, PIN, or payload is ever read.
+//! its reason. The EXEC pair lives in the mapped-device domain, so
+//! every candidate is verified by matching `(dev, ino)` there (a
+//! private one-page mapping read back from our own maps), never by
+//! stat alone. No argv, environ, key, PIN, or payload is ever read.
 
 use crate::discovery::caller_registry::{ExeIdentity, ExeResolution, UnboundExe};
 use std::collections::HashMap;
@@ -54,14 +56,101 @@ pub(crate) struct ProcReads<'a> {
     pub tick_ns: u64,
 }
 
-/// A `(dev, ino)` probe for learned or indexed paths.
-type StatProbe<'a> = Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>;
+/// A maps-domain `(dev, ino)` probe for learned paths: the
+/// scripted closure in tests, the mapping probe in production.
+type VerifyProbe<'a> = Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>;
 
-/// Scan-learned identities for source (b): `(dev, ino)` to path,
-/// re-verified by stat at use.
+/// The maps-domain identity of one path: privately map its first
+/// page and read the mapping's `(dev, ino)` from our own maps (no
+/// capability needed for our own mappings). This is the device
+/// domain the kernel's EXEC pair lives in (`i_sb->s_dev`): on btrfs
+/// it differs from `stat`'s subvolume device, so stat alone can
+/// never confirm an EXEC pair there. Fail-closed: any failure
+/// (unreadable, empty, unmappable, unparsable) is `None`. Content
+/// is never read — the page is mapped, never touched.
+pub(crate) fn real_maps_identity(path: &str) -> Option<(u64, u64)> {
+    let file = std::fs::File::open(path).ok()?;
+    let meta = file.metadata().ok()?;
+    if !meta.is_file() || meta.len() == 0 {
+        return None;
+    }
+    let page = 4096usize;
+    // SAFETY: length is nonzero, the fd is open, the offset is 0;
+    // the mapping is never accessed, only looked up in our own maps.
+    let addr = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            page,
+            libc::PROT_READ,
+            libc::MAP_PRIVATE,
+            std::os::fd::AsRawFd::as_raw_fd(&file),
+            0,
+        )
+    };
+    if addr == libc::MAP_FAILED {
+        return None;
+    }
+    let addr = addr as u64;
+    let found = std::fs::read_to_string("/proc/self/maps")
+        .ok()
+        .and_then(|maps| maps_identity_at(&maps, addr));
+    // SAFETY: the exact pair of the mmap above.
+    unsafe {
+        libc::munmap(addr as *mut libc::c_void, page);
+    }
+    found
+}
+
+/// Parse our own maps for the mapping covering `addr`: `(dev, ino)`
+/// with the device reconstructed from the hex major:minor pair.
+/// Malformed lines are skipped, never fatal.
+fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
+    for line in maps.lines() {
+        let mut fields = line.split_whitespace();
+        let (Some(range), Some(_perms), Some(_offset), Some(dev), Some(ino)) = (
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+            fields.next(),
+        ) else {
+            continue;
+        };
+        let Some((start, end)) = range.split_once('-') else {
+            continue;
+        };
+        let (Ok(start), Ok(end)) = (
+            u64::from_str_radix(start, 16),
+            u64::from_str_radix(end, 16),
+        ) else {
+            continue;
+        };
+        if !(start <= addr && addr < end) {
+            continue;
+        }
+        let Some((major, minor)) = dev.split_once(':') else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (
+            u32::from_str_radix(major, 16),
+            u32::from_str_radix(minor, 16),
+        ) else {
+            continue;
+        };
+        let Ok(ino) = ino.parse::<u64>() else {
+            continue;
+        };
+        let dev = libc::makedev(major, minor) as u64;
+        return Some((dev, ino));
+    }
+    None
+}
+
+/// Scan-learned identities for source (b): maps-domain
+/// `(dev, ino)` to path, re-verified by the mapping probe at use.
 pub(crate) struct ScanLearned<'a> {
     pub by_identity: &'a HashMap<(u64, u64), String>,
-    pub stat: StatProbe<'a>,
+    pub verify: VerifyProbe<'a>,
 }
 
 /// Lazy system-binary index plus resolution.
@@ -81,6 +170,10 @@ pub(crate) struct ExeResolver {
     index_dirs: Option<Vec<PathBuf>>,
     #[cfg(test)]
     now_override: Option<u64>,
+    /// Scripted maps-domain answers by path (strict when set).
+    /// RED scaffolding: lookups ignore it.
+    #[cfg(test)]
+    maps_override: Option<HashMap<String, (u64, u64)>>,
 }
 
 impl ExeResolver {
@@ -96,6 +189,8 @@ impl ExeResolver {
             index_dirs: None,
             #[cfg(test)]
             now_override: None,
+            #[cfg(test)]
+            maps_override: None,
         }
     }
 
@@ -152,10 +247,11 @@ impl ExeResolver {
     }
 
     /// Source (a): the pid is alive, its start tick predates the
-    /// EXEC (boottime domain, suspend-tolerant), and its live exe
-    /// stats to the joined pair. A reused pid reads a start after
-    /// the EXEC and is never used. Only the start time and the exe
-    /// identity are read — no cwd, cmdline, or environ.
+    /// EXEC (boottime domain, suspend-tolerant), and its live
+    /// maps-domain exe identity equals the joined pair. A reused
+    /// pid reads a start after the EXEC and is never used. Only the
+    /// start time and the exe identity are read — no cwd, cmdline,
+    /// or environ.
     fn via_live_process(
         pid: u32,
         dev: u64,
@@ -192,19 +288,19 @@ impl ExeResolver {
         live.path
     }
 
-    /// Source (b): the scan already learned this `(dev, ino)` from
-    /// an admitted caller; the learned path is re-verified by stat
-    /// (a replaced file refuses).
+    /// Source (b): the scan already learned this maps-domain
+    /// `(dev, ino)` from an admitted caller; the learned path is
+    /// re-verified by the mapping probe (a replaced file refuses).
     fn via_scan_learned(dev: u64, ino: u64, scan: &ScanLearned<'_>) -> Option<String> {
         let path = scan.by_identity.get(&(dev, ino))?;
-        if (scan.stat)(path)? != (dev, ino) {
+        if (scan.verify)(path)? != (dev, ino) {
             return None;
         }
         Some(path.clone())
     }
 
-    /// Source (c): the lazy system index, verified by stat at lookup
-    /// (a deleted or replaced binary refuses).
+    /// Source (c): the lazy system index, verified by the mapping
+    /// probe at lookup (a deleted or replaced binary refuses).
     fn via_system_index(&mut self, dev: u64, ino: u64) -> Option<String> {
         self.refresh_index_if_stale();
         let path = self.entries.get(&(dev, ino))?;
@@ -320,6 +416,18 @@ impl ExeResolver {
         self.now_override = Some(now_ns);
     }
 
+    /// Test-only scripted maps-domain answers by path: the split
+    /// stat/maps devices of a btrfs-style host, or any mapped
+    /// identity. Strict when set: an unscripted path reads `None`.
+    /// RED scaffolding: lookups ignore it.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_maps_identities(
+        &mut self,
+        answers: HashMap<String, (u64, u64)>,
+    ) {
+        self.maps_override = Some(answers);
+    }
+
     /// Index builds so far.
     #[cfg(test)]
     pub(crate) fn index_builds(&self) -> u64 {
@@ -408,39 +516,40 @@ mod tests {
 
     struct ScriptedScan {
         map: HashMap<(u64, u64), String>,
-        stat_answers: HashMap<String, (u64, u64)>,
-        stat_calls: Cell<usize>,
+        verify_answers: HashMap<String, (u64, u64)>,
+        verify_calls: Cell<usize>,
     }
 
     impl ScriptedScan {
         fn empty() -> Self {
             Self {
                 map: HashMap::new(),
-                stat_answers: HashMap::new(),
-                stat_calls: Cell::new(0),
+                verify_answers: HashMap::new(),
+                verify_calls: Cell::new(0),
             }
         }
 
-        fn learned(&mut self, dev: u64, ino: u64, path: &str, stat: Option<(u64, u64)>) {
+        fn learned(&mut self, dev: u64, ino: u64, path: &str, verify: Option<(u64, u64)>) {
             self.map.insert((dev, ino), path.to_string());
-            if let Some(pair) = stat {
-                self.stat_answers.insert(path.to_string(), pair);
+            if let Some(pair) = verify {
+                self.verify_answers.insert(path.to_string(), pair);
             }
         }
 
         fn scan(&self) -> ScanLearned<'_> {
             ScanLearned {
                 by_identity: &self.map,
-                stat: Box::new(|path| {
-                    self.stat_calls.set(self.stat_calls.get() + 1);
-                    self.stat_answers.get(path).copied()
+                verify: Box::new(|path| {
+                    self.verify_calls.set(self.verify_calls.get() + 1);
+                    self.verify_answers.get(path).copied()
                 }),
             }
         }
     }
 
     /// (a): a live process whose start predates the EXEC and whose
-    /// exe stats to the joined pair resolves by its live link.
+    /// maps-domain exe identity equals the joined pair resolves by
+    /// its live link.
     #[test]
     fn live_process_with_matching_start_and_identity_resolves() {
         let mut resolver = ExeResolver::new();
@@ -572,7 +681,7 @@ mod tests {
     }
 
     /// (b): the process is gone but the scan learned the same
-    /// `(dev, ino)` from an admitted caller.
+    /// maps-domain `(dev, ino)` from an admitted caller.
     #[test]
     fn scan_learned_hit_resolves_after_exit() {
         let mut resolver = ExeResolver::new();
@@ -599,8 +708,8 @@ mod tests {
         );
     }
 
-    /// (b): a learned path whose current stat differs (the file was
-    /// replaced) is refused.
+    /// (b): a learned path whose current maps-domain identity
+    /// differs (the file was replaced) is refused.
     #[test]
     fn scan_learned_stale_path_refuses() {
         let mut resolver = ExeResolver::new();
@@ -617,18 +726,18 @@ mod tests {
             &scan.scan(),
         );
         assert_eq!(exe.resolution, ExeResolution::PathUnknown);
-        assert_eq!(scan.stat_calls.get(), 1);
+        assert_eq!(scan.verify_calls.get(), 1);
     }
 
     /// (c): the process is gone and the scan never saw the binary,
-    /// but the system index holds the joined identity.
+    /// but the system index holds the joined maps-domain identity.
     #[test]
     fn system_index_resolves_after_exit() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tool");
         std::fs::write(&path, b"tool").unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
-        let (dev, ino) = (meta.dev(), meta.ino());
+        let path_text = path.to_string_lossy().into_owned();
+        let (dev, ino) = real_maps_identity(&path_text).expect("the staged tool maps");
         let mut resolver = ExeResolver::new();
         resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
         let proc = ScriptedProc::dead();
@@ -708,14 +817,14 @@ mod tests {
     }
 
     /// A deleted binary: the index named it once, but the path no
-    /// longer stats, so the lookup-time verification refuses.
+    /// longer maps, so the lookup-time verification refuses.
     #[test]
     fn deleted_binary_stays_unknown() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("tool");
         std::fs::write(&path, b"tool").unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
-        let (dev, ino) = (meta.dev(), meta.ino());
+        let path_text = path.to_string_lossy().into_owned();
+        let (dev, ino) = real_maps_identity(&path_text).expect("the staged tool maps");
         let mut resolver = ExeResolver::new();
         resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
         let proc = ScriptedProc::dead();
@@ -769,7 +878,7 @@ mod tests {
             }
         );
         assert_eq!(proc.start_calls.get() + proc.exe_calls.get(), 0);
-        assert_eq!(scan.stat_calls.get(), 0);
+        assert_eq!(scan.verify_calls.get(), 0);
         assert_eq!(resolver.index_builds(), 0, "no pair means no index build");
     }
 
@@ -858,5 +967,136 @@ mod tests {
         resolver.resolve(7, 8, 99, 2_000_000_000, &reads(), &scan.scan());
         assert_eq!(resolver.index_builds(), 2, "a stale index rebuilds");
         assert_eq!(resolver.index_len(), 2);
+    }
+
+    /// (c) on a btrfs-style host: the EXEC's mapped device differs
+    /// from the path's stat device, but the mapped identity matches,
+    /// so the index still resolves. The scripted maps answer stands
+    /// in for the split-device host.
+    #[test]
+    fn system_index_bridges_split_stat_and_maps_devices() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"tool").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mapped_dev = meta.dev().wrapping_add(0x1_0000_0000);
+        assert_ne!(
+            mapped_dev,
+            meta.dev(),
+            "the test needs split stat/maps devices"
+        );
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        resolver.set_scripted_maps_identities(HashMap::from([(
+            path_text.clone(),
+            (mapped_dev, meta.ino()),
+        )]));
+        let proc = ScriptedProc::dead();
+        let scan = ScriptedScan::empty();
+        let exe = resolver.resolve(
+            7,
+            mapped_dev,
+            meta.ino(),
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(
+            exe,
+            UnboundExe {
+                dev: mapped_dev,
+                ino: meta.ino(),
+                path: Some(path_text),
+                resolution: ExeResolution::SystemIndex,
+            }
+        );
+    }
+
+    /// (c): a stat-domain pair that never mapped to the indexed path
+    /// (the btrfs split read backwards) stays unknown: stat alone
+    /// never confirms an EXEC pair.
+    #[test]
+    fn system_index_refuses_stat_only_pairs() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"tool").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        resolver.set_scripted_maps_identities(HashMap::from([(
+            path_text,
+            (meta.dev().wrapping_add(1), meta.ino()),
+        )]));
+        let proc = ScriptedProc::dead();
+        let scan = ScriptedScan::empty();
+        let exe = resolver.resolve(
+            7,
+            meta.dev(),
+            meta.ino(),
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::PathUnknown);
+        assert_eq!((exe.dev, exe.ino, exe.path), (meta.dev(), meta.ino(), None));
+    }
+
+    /// The mapping probe names the file's own maps identity: the ino
+    /// always matches stat (inos are not device-domain values), and
+    /// the pair is stable across calls.
+    #[test]
+    fn maps_probe_names_the_file_it_maps() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"tool").unwrap();
+        let path_text = path.to_string_lossy().into_owned();
+        let meta = std::fs::metadata(&path).unwrap();
+        let first = real_maps_identity(&path_text).expect("the staged tool maps");
+        assert_eq!(first.1, meta.ino(), "the mapped ino is the file's ino");
+        let second = real_maps_identity(&path_text).expect("the probe is repeatable");
+        assert_eq!(first, second, "the mapped identity is stable");
+    }
+
+    /// The mapping probe fails closed: missing, empty, and
+    /// non-file paths read `None`, never a guessed pair.
+    #[test]
+    fn maps_probe_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(
+            real_maps_identity(dir.path().join("absent").to_str().unwrap()),
+            None
+        );
+        let empty = dir.path().join("empty");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(
+            real_maps_identity(empty.to_str().unwrap()),
+            None,
+            "an empty file has no page to map"
+        );
+        assert_eq!(
+            real_maps_identity(dir.path().to_str().unwrap()),
+            None,
+            "a directory is not mappable"
+        );
+    }
+
+    /// The maps parser finds the covering mapping (wide major/minor
+    /// included) and skips malformed lines without failing the read.
+    #[test]
+    fn maps_parser_finds_the_covering_mapping() {
+        let maps = "\
+00400000-00401000 r--p 00000000 103:04 99 /bin/x
+malformed line without fields
+7f00-7g00 r--p 00000000 00:00 0
+7fab0000-7fab1000 r--p 00000000 00:2f 4242 /lib/y
+";
+        let expect = libc::makedev(0x103, 0x04) as u64;
+        assert_eq!(maps_identity_at(maps, 0x0040_0000), Some((expect, 99)));
+        assert_eq!(maps_identity_at(maps, 0x0040_0fff), Some((expect, 99)));
+        assert_eq!(maps_identity_at(maps, 0x0040_1000), None);
+        assert_eq!(maps_identity_at(maps, 0x7fab_0000).map(|pair| pair.1), Some(4242));
+        assert_eq!(maps_identity_at("", 0x0040_0000), None);
     }
 }

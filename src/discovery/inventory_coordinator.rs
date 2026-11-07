@@ -1312,6 +1312,16 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exe_resolver.set_index_dirs(dirs);
     }
 
+    /// Test-only scripted maps-domain answers by path (strict when
+    /// set). RED scaffolding: lookups ignore it.
+    #[cfg(test)]
+    pub(crate) fn set_scripted_maps_identities(
+        &mut self,
+        answers: std::collections::HashMap<String, (u64, u64)>,
+    ) {
+        self.exe_resolver.set_scripted_maps_identities(answers);
+    }
+
     /// Test-only EXEC-stash entry cap.
     #[cfg(test)]
     pub(crate) fn set_exec_stash_cap(&mut self, cap: usize) {
@@ -1398,7 +1408,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let scan = ScanLearned {
             by_identity: learned,
-            stat: Box::new(|path| {
+            // RED scaffolding: the stat-domain probe below becomes
+            // the mapping probe in GREEN (the field already reads
+            // `verify`, the mechanism still stats).
+            verify: Box::new(|path| {
                 std::fs::metadata(path)
                     .ok()
                     .map(|meta| (meta.dev(), meta.ino()))
@@ -29406,20 +29419,20 @@ int main(void) {
     }
 
     /// Resolution source (b): the coordinator exposes the
-    /// scan-learned exe identities of admitted callers by
-    /// `(dev, ino)` — no new reads, the scan's own records.
+    /// scan-learned exe identities of admitted callers by their
+    /// maps-domain `(dev, ino)`, probing each learned path once per
+    /// call. A caller whose path probes nothing (a placeholder or a
+    /// deleted binary) contributes nothing.
     #[test]
     fn scan_learned_exe_map_names_admitted_callers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (path, dev, ino) = staged_tool(&dir, "tool-a");
         let (mut native, _) = NativeScene::new();
-        // The fresh scene holds its default caller (pid 7).
-        let map = native.scene.coordinator.scan_learned_exe_map();
-        assert_eq!(
-            map.get(&(1, 100)),
-            Some(&"/bin/driver".to_string()),
-            "the default caller's scan-time exe is exposed by identity: {map:?}"
-        );
         native.scene.source.spawn(9, 900);
-        native.scene.source.exec(9, 101, "/bin/other");
+        native
+            .scene
+            .source
+            .exec(9, 101, path.to_str().unwrap());
         native
             .scene
             .coordinator
@@ -29428,19 +29441,24 @@ int main(void) {
             .unwrap();
         let map = native.scene.coordinator.scan_learned_exe_map();
         assert_eq!(
-            map.get(&(1, 101)),
-            Some(&"/bin/other".to_string()),
-            "a second admission adds its own identity: {map:?}"
+            map.get(&(dev, ino)),
+            Some(&path.to_string_lossy().into_owned()),
+            "the admitted caller's probed maps identity is exposed: {map:?}"
         );
-        assert_eq!(map.len(), 2);
+        assert_eq!(
+            map.len(),
+            1,
+            "the default caller's placeholder path probes nothing: {map:?}"
+        );
     }
 
     fn staged_tool(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, u64, u64) {
-        use std::os::unix::fs::MetadataExt as _;
         let path = dir.path().join(name);
         std::fs::write(&path, b"tool").unwrap();
-        let meta = std::fs::metadata(&path).unwrap();
-        (path, meta.dev(), meta.ino())
+        let (dev, ino) =
+            crate::discovery::unbound_exe::real_maps_identity(path.to_str().unwrap())
+                .expect("the staged tool maps");
+        (path, dev, ino)
     }
 
     /// The concise executable line groups unidentified callers by
@@ -29558,17 +29576,20 @@ int main(void) {
         let pb = db.join("tool");
         std::fs::write(&pa, b"a").unwrap();
         std::fs::write(&pb, b"b").unwrap();
-        use std::os::unix::fs::MetadataExt as _;
-        let ma = std::fs::metadata(&pa).unwrap();
-        let mb = std::fs::metadata(&pb).unwrap();
+        let (adev, aino) =
+            crate::discovery::unbound_exe::real_maps_identity(pa.to_str().unwrap())
+                .expect("the first tool maps");
+        let (bdev, bino) =
+            crate::discovery::unbound_exe::real_maps_identity(pb.to_str().unwrap())
+                .expect("the second tool maps");
         let (mut native, _) = NativeScene::new();
         native
             .scene
             .coordinator
             .set_exe_index_dirs(vec![da.clone(), db.clone()]);
         native.execs(vec![
-            exec_record(41, 9, 100, ma.dev(), ma.ino()),
-            exec_record(42, 10, 100, mb.dev(), mb.ino()),
+            exec_record(41, 9, 100, adev, aino),
+            exec_record(42, 10, 100, bdev, bino),
         ]);
         native.witness(vec![
             native.row(41, 1, 9, 210, 0),
@@ -29583,6 +29604,41 @@ int main(void) {
         assert!(
             text.lines().any(|candidate| candidate == line),
             "shared basenames read by full path:\n{text}"
+        );
+    }
+
+    /// End to end on a split-device host: the EXEC's mapped device
+    /// differs from the staged tool's stat device, and the concise
+    /// line still names the tool through the system index.
+    #[test]
+    fn concise_names_executables_across_split_devices() {
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, b"tool").unwrap();
+        let meta = std::fs::metadata(&path).unwrap();
+        let mapped_dev = meta.dev().wrapping_add(0x1_0000_0000);
+        assert_ne!(
+            mapped_dev,
+            meta.dev(),
+            "the test needs split stat/maps devices"
+        );
+        let path_text = path.to_string_lossy().into_owned();
+        let (mut native, _) = NativeScene::new();
+        native
+            .scene
+            .coordinator
+            .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
+        native.scene.coordinator.set_scripted_maps_identities(
+            std::collections::HashMap::from([(path_text, (mapped_dev, meta.ino()))]),
+        );
+        native.execs(vec![exec_record(41, 9, 100, mapped_dev, meta.ino())]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let (text, _) = slice_one_views(&native);
+        let line = "unidentified executables: tool (1 call, pid 9)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise names the bridged executable:\n{text}"
         );
     }
 
@@ -29654,6 +29710,35 @@ int main(void) {
                 dev: 1,
                 ino: 100,
                 path: Some("/bin/driver".to_string()),
+                resolution: ExeResolution::ProcAlive,
+            }
+        );
+    }
+
+    /// Resolution source (a) reads the maps-domain identity: the live
+    /// process's stat-domain reading differs (a split-device host),
+    /// so only the maps-domain reading joins the EXEC.
+    #[test]
+    fn live_process_resolves_through_maps_identity_not_stat() {
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        native.scene.coordinator.exit_clocks_comparable = true;
+        native.scene.source.spawn(9, 0);
+        native
+            .scene
+            .source
+            .diverge_maps_exe(9, 7, 700, "/bin/maps-driver");
+        let hook = crate::discovery::pause::boot_ns().expect("boottime reads");
+        native.execs(vec![exec_record(41, 9, hook, 7, 700)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let pids = native.scene.coordinator.registry.unidentified_pids();
+        assert_eq!(pids.len(), 1);
+        assert_eq!(
+            pids[0].exe,
+            UnboundExe {
+                dev: 7,
+                ino: 700,
+                path: Some("/bin/maps-driver".to_string()),
                 resolution: ExeResolution::ProcAlive,
             }
         );

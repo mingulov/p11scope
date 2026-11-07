@@ -195,6 +195,12 @@ pub(crate) trait ProcessSource {
     fn still_the_same(&self, pin: &Self::Pin) -> bool;
     fn start_time(&self, pid: u32) -> Option<u64>;
     fn exe_identity(&self, pid: u32) -> Option<ExeIdentity>;
+    /// The maps-domain exe identity of `pid`, for joining EXEC
+    /// records (never a bare PID). The default reads the live
+    /// process; scripted sources program their own split.
+    fn exe_maps_identity(&self, pid: u32) -> Option<ExeIdentity> {
+        read_exe_maps_identity(pid)
+    }
     /// True when `pid` names no live process: reaped, never existed, or
     /// a zombie awaiting its parent's `wait`. Zombies count as gone —
     /// the generation is dead even though `/proc` still parses — so a
@@ -231,6 +237,40 @@ pub(crate) trait ProcessSource {
     fn semantic_custody_ref<'pin>(&self, _pin: &'pin Self::Pin) -> Option<&'pin PidPin> {
         None
     }
+}
+
+/// The maps-domain exe identity of `pid`: the `/proc/<pid>/exe`
+/// link text plus the target's mapped `(dev, ino)` (a private
+/// one-page mapping read back from our own maps), or `None` when
+/// unreadable or unmappable. This is the device domain the kernel's
+/// EXEC pair lives in; the stat-domain [`read_exe_identity`] feeds
+/// the caller adapter and the C1b confirmation read instead, so the
+/// two compare like for like there and this one compares like for
+/// like with EXEC records here. Only the link and the target's
+/// metadata are read — no cwd, cmdline, or environ. RED scaffolding:
+/// the probe is ignored and the stat pair is returned.
+pub(crate) fn read_exe_maps_identity_with(
+    pid: u32,
+    _maps: impl Fn(&str) -> Option<(u64, u64)>,
+) -> Option<ExeIdentity> {
+    let path = format!("/proc/{pid}/exe");
+    let metadata = std::fs::metadata(&path).ok()?;
+    let link = std::fs::read_link(&path)
+        .ok()
+        .map(|path| path.to_string_lossy().into_owned());
+    Some(ExeIdentity {
+        dev: metadata.dev(),
+        ino: metadata.ino(),
+        mtime_secs: metadata.mtime(),
+        mtime_nanos: metadata.mtime_nsec(),
+        path: link,
+    })
+}
+
+/// The maps-domain exe identity of `pid` through the real mapping
+/// probe. RED scaffolding: the probe is ignored (see above).
+pub(crate) fn read_exe_maps_identity(pid: u32) -> Option<ExeIdentity> {
+    read_exe_maps_identity_with(pid, crate::discovery::unbound_exe::real_maps_identity)
 }
 
 /// The exe identity of `pid` (`/proc/<pid>/exe` metadata plus its link
@@ -6614,6 +6654,43 @@ impl CallerRegistry {
 pub(crate) mod tests {
     use super::*;
 
+    /// The maps-domain reader takes its `(dev, ino)` from the mapping
+    /// probe, not from stat: the scripted probe stands in for a
+    /// split-device host, and the link text still names the target.
+    #[test]
+    fn maps_exe_reader_takes_identity_from_the_probe() {
+        let pid = std::process::id();
+        let link = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+        let seen = std::cell::RefCell::new(Vec::new());
+        let exe = read_exe_maps_identity_with(pid, |path| {
+            seen.borrow_mut().push(path.to_string());
+            (path == link_text).then_some((0x0bad_1abe, 0xc0ffee))
+        })
+        .expect("our own exe reads");
+        assert_eq!((exe.dev, exe.ino), (0x0bad_1abe, 0xc0ffee));
+        assert_eq!(exe.path.as_deref(), Some(link_text.as_str()));
+        assert_eq!(
+            seen.borrow().as_slice(),
+            &[link_text],
+            "the probe reads the link target exactly once"
+        );
+    }
+
+    /// The real maps-domain reader agrees with the mapping probe on
+    /// our own process, on every filesystem.
+    #[test]
+    fn maps_exe_reader_agrees_with_the_probe_on_self() {
+        let pid = std::process::id();
+        let exe = read_exe_maps_identity(pid).expect("our own exe reads");
+        let link = std::fs::read_link(format!("/proc/{pid}/exe")).unwrap();
+        let link_text = link.to_string_lossy().into_owned();
+        assert_eq!(exe.path.as_deref(), Some(link_text.as_str()));
+        let probed = crate::discovery::unbound_exe::real_maps_identity(&link_text)
+            .expect("our own exe maps");
+        assert_eq!((exe.dev, exe.ino), probed);
+    }
+
     /// Deliver only decisions produced by the real registry, in an adversarial
     /// order or more than once. This utility manufactures no outcome/handle.
     pub(crate) fn deliver_pending_decisions(
@@ -6633,6 +6710,11 @@ pub(crate) mod tests {
         alive: bool,
         start_time: u64,
         exe: Option<ExeIdentity>,
+        /// The scripted maps-domain reading of the same process (what
+        /// `exe_maps_identity` returns). `spawn`/`exec` keep it equal
+        /// to `exe`; `diverge_maps_exe` splits them for a btrfs-style
+        /// host where stat and mapped devices differ.
+        exe_maps: Option<ExeIdentity>,
         /// False simulates an unreadable `/proc` (a race or a permission
         /// wall): liveness answers but identity reads fail.
         readable: bool,
@@ -6665,18 +6747,20 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn spawn(&self, pid: u32, start_time: u64) {
+            let exe = Some(ExeIdentity {
+                dev: 1,
+                ino: 100,
+                mtime_secs: 10,
+                mtime_nanos: 0,
+                path: Some("/bin/driver".into()),
+            });
             self.set(
                 pid,
                 ScriptedProcess {
                     alive: true,
                     start_time,
-                    exe: Some(ExeIdentity {
-                        dev: 1,
-                        ino: 100,
-                        mtime_secs: 10,
-                        mtime_nanos: 0,
-                        path: Some("/bin/driver".into()),
-                    }),
+                    exe: exe.clone(),
+                    exe_maps: exe,
                     readable: true,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
@@ -6684,12 +6768,14 @@ pub(crate) mod tests {
         }
 
         pub(crate) fn spawn_matching_process(&self, pid: u32) {
+            let exe = read_exe_identity(pid);
             self.set(
                 pid,
                 ScriptedProcess {
                     alive: true,
                     start_time: process_start_time(pid).unwrap(),
-                    exe: read_exe_identity(pid),
+                    exe: exe.clone(),
+                    exe_maps: exe,
                     readable: true,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
@@ -6721,13 +6807,30 @@ pub(crate) mod tests {
         fn hide_exe(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.exe = None;
+                process.exe_maps = None;
             }
         }
 
         pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
-                process.exe = Some(ExeIdentity {
+                let exe = Some(ExeIdentity {
                     dev: 1,
+                    ino,
+                    mtime_secs: 20,
+                    mtime_nanos: 0,
+                    path: Some(path.into()),
+                });
+                process.exe_maps = exe.clone();
+                process.exe = exe;
+            }
+        }
+
+        /// Split the scripted maps-domain reading from the stat-domain
+        /// one: a btrfs-style host where the two devices differ.
+        pub(crate) fn diverge_maps_exe(&self, pid: u32, dev: u64, ino: u64, path: &str) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.exe_maps = Some(ExeIdentity {
+                    dev,
                     ino,
                     mtime_secs: 20,
                     mtime_nanos: 0,
@@ -6792,6 +6895,15 @@ pub(crate) mod tests {
                 .get(&pid)
                 .filter(|process| process.alive && process.readable)
                 .and_then(|process| process.exe.clone())
+        }
+
+        fn exe_maps_identity(&self, pid: u32) -> Option<ExeIdentity> {
+            self.state
+                .borrow()
+                .processes
+                .get(&pid)
+                .filter(|process| process.alive && process.readable)
+                .and_then(|process| process.exe_maps.clone())
         }
 
         fn gone(&self, pid: u32) -> bool {

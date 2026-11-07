@@ -1120,4 +1120,23 @@ malformed line without fields
         );
         assert_eq!(maps_identity_at("", 0x0040_0000), None);
     }
+
+    /// Device-mapper twin: the maps `fd:01` pair decodes to the raw
+    /// kernel `s_dev` word, not the userspace `makedev` layout.
+    #[test]
+    fn maps_parser_decodes_dm_device_like_the_kernel() {
+        let maps = "00400000-00401000 r--p 00000000 fd:01 99 /bin/x\n";
+        assert_eq!(
+            maps_identity_at(maps, 0x0040_0000),
+            Some(((0xfdu64 << 20) | 1, 99))
+        );
+    }
+
+    /// Overlay twin: a big minor (`00:14d`) decodes to the raw kernel
+    /// `s_dev` word, not the userspace `makedev` layout.
+    #[test]
+    fn maps_parser_decodes_big_overlay_minor_like_the_kernel() {
+        let maps = "00400000-00401000 r--p 00000000 00:14d 99 /bin/x\n";
+        assert_eq!(maps_identity_at(maps, 0x0040_0000), Some((0x14d, 99)));
+    }
 }

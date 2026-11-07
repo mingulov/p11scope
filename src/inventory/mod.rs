@@ -71,14 +71,15 @@ const DOC_ID: &str = "p11scope/inventory/v1";
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Running-hook Joint budget: actions and wall bound for one service
-/// hook on a live Joint lane. A full 4,096-row quantum plus its seal
-/// phases fits one hook, so the EVENTS ring drains faster than the
-/// fastest paced rate instead of fragmenting cycles across hooks: a
-/// ring-full dirties the birth marker and ends key attribution for
-/// the run. An engineering limit: it may be raised, never lowered.
-/// Finish/stop hooks keep the §8.3 1,024-action / 10 ms budget.
-pub(crate) const RUNNING_HOOK_ACTIONS: usize = 4096;
-pub(crate) const RUNNING_HOOK_DEADLINE: Duration = Duration::from_millis(40);
+/// hook on a live Joint lane. A saturated quantum (collect plus
+/// extends), its ~40 ms seal and its phases fit one hook, so the
+/// EVENTS ring drains faster than the fastest paced rate instead of
+/// fragmenting cycles across hooks: a ring-full dirties the birth
+/// marker and ends key attribution for the run. An engineering
+/// limit: it may be raised, never lowered. Finish/stop hooks keep
+/// the §8.3 1,024-action / 10 ms budget.
+pub(crate) const RUNNING_HOOK_ACTIONS: usize = 8192;
+pub(crate) const RUNNING_HOOK_DEADLINE: Duration = Duration::from_millis(120);
 
 // G21's explicit engine pilot can accelerate scans without changing the
 // production cadence, clock, native lane, coordinator, or recorder capacities.
@@ -214,18 +215,18 @@ fn gate_poll_interval_unset_is_production_default() {
 }
 
 /// The running-hook Joint budget sustains the fastest paced rate: a
-/// full 4,096-row quantum plus its seal phases fits one hook, so the
+/// saturated quantum, its seal and its phases fit one hook, so the
 /// EVENTS ring drains instead of fragmenting cycles across hooks. An
 /// engineering floor: it may be raised, never lowered.
 #[test]
 fn running_hook_budget_sustains_paced_rates() {
     assert!(
-        RUNNING_HOOK_ACTIONS >= 4096,
-        "one hook carries a full quantum plus phases"
+        RUNNING_HOOK_ACTIONS >= 8192,
+        "one hook carries a saturated quantum plus its seal"
     );
     assert!(
-        RUNNING_HOOK_DEADLINE >= Duration::from_millis(40),
-        "one hook has wall room for the bigger quantum"
+        RUNNING_HOOK_DEADLINE >= Duration::from_millis(120),
+        "one hook has wall room for the seal"
     );
 }
 

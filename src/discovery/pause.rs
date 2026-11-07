@@ -10392,13 +10392,14 @@ mod tests {
     /// grandchild inside the run-tree cgroup scope, so the pause+tree
     /// follows it. The grandchild's calls land ledger-exact; the
     /// grandchild retires between admission passes, so the verdict is
-    /// honestly PARTIAL with one descendant gap. The wrapped lattice is
-    /// not strict sigstop: the grandchild's quick exit strands one late
-    /// attempt unserviced, while every live window stays protected by a
-    /// confirmed stop. The background `& wait` form forces the fork on
-    /// every shell: some shells replace themselves with a lone `sh -c`
-    /// command instead of forking. The trailing `exec sleep 2` settles
-    /// the terminal drain: without it the grandchild's exit strands past
+    /// honestly PARTIAL with one descendant gap. Only the owned child
+    /// carries a pause row: the kernel stops no grandchild, and one
+    /// late epoch goes partial (at most one; see the bound below)
+    /// while every live window stays protected by a confirmed stop.
+    /// The background `& wait` form forces the fork on every shell:
+    /// some shells replace themselves with a lone `sh -c` command
+    /// instead of forking. The trailing `exec sleep 2` settles the
+    /// terminal drain: without it the grandchild's exit can land past
     /// the drain's read position on some hosts and the gap undercounts.
     #[test]
     #[ignore = "privileged: run --pause auto through a forking sh wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)"]

@@ -308,7 +308,9 @@ pub struct InventoryArgs {
     /// honestly to snapshots/JSON on a pipe, never ANSI.
     pub dashboard: bool,
     /// `--event-log`: append the JSONL observation-event stream
-    /// (`p11scope/inventory-events/v1`) to this file, with rotation.
+    /// (`p11scope/inventory-events/v1`) to this file, with rotation;
+    /// `-` streams it to stdout instead (never rotated, never beside
+    /// `--json`/`--dashboard`/rotation options).
     pub event_log: Option<PathBuf>,
     /// `--event-rotate-bytes`: rotation threshold; None ⇒ 1 MiB default.
     pub event_rotate_bytes: Option<u64>,
@@ -763,19 +765,19 @@ const INVENTORY_HELP_HEAD: &str = "usage:
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
-                   [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
+                   [--event-log <f.jsonl|-> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>] [--event-interval <dur>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
   p11scope inventory diff BEFORE.json AFTER.json [--json] [-o DIFF.json] [-v] [--quiet]
   p11scope inventory cbom INPUT.json [--json] [-o OUT.cdx.json] [-v] [--quiet]
@@ -822,6 +824,7 @@ only; explicit use under --pid/--cgroup is refused.
 --quiet prints only the summary head (totals plus application/module edges) and silences scan progress; --json, -o and logs are unchanged.
 Default text output is concise: the summary head plus the limits line. -v, --verbose shows full detail (every gap and reason, per-caller/module/edge data, budgets, timing) plus informational stderr notes.
 --json and -o contain the same inventory facts; --event-log appends bounded JSONL history with rotation.
+--event-log - streams that history to stdout instead (no rotation; refused beside --json and --dashboard; the text summary moves to stderr). --event-interval <dur> adds periodic totals events to either sink.
 --diagnostics writes bounded native count decisions after capture stops; requires auto or native and a separate regular file.
 --diagnostics-pid selects that PID's diagnostics without changing capture scope; global health records remain included.
 A missing observation or incomplete retained history does not establish zero activity.
@@ -1860,6 +1863,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut event_log: Option<PathBuf> = None;
     let mut event_rotate_bytes: Option<u64> = None;
     let mut event_max_files: Option<usize> = None;
+    let mut event_interval: Option<Duration> = None;
     let mut diagnostics: Option<PathBuf> = None;
     let mut diagnostics_pid: Option<u32> = None;
     let mut quiet = false;
@@ -1992,6 +1996,19 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
                 }
                 event_max_files = Some(value);
             }
+            "--event-interval" => {
+                if event_interval.is_some() {
+                    return Err(usage_err("--event-interval given twice"));
+                }
+                let v = require_value(&mut args, "--event-interval")?;
+                let value = parse_duration(&v).map_err(|e| {
+                    usage_err(format!("--event-interval: invalid value {v:?}: {e}"))
+                })?;
+                if value.is_zero() {
+                    return Err(usage_err("--event-interval must be greater than zero"));
+                }
+                event_interval = Some(value);
+            }
             "--max-scan-pids" => {
                 if max_scan_pids.is_some() {
                     return Err(usage_err("--max-scan-pids given twice"));
@@ -2081,9 +2098,35 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
              the report requires a file)",
         ));
     }
-    if event_log.is_none() && (event_rotate_bytes.is_some() || event_max_files.is_some()) {
+    if event_log.is_none()
+        && (event_rotate_bytes.is_some() || event_max_files.is_some() || event_interval.is_some())
+    {
         return Err(usage_err(
-            "--event-rotate-bytes/--event-max-files require --event-log <f.jsonl>",
+            "--event-rotate-bytes/--event-max-files/--event-interval require --event-log <f.jsonl|->",
+        ));
+    }
+    // `--event-log -` owns stdout for the JSONL stream: nothing else
+    // may write there. The human text summary moves to stderr instead
+    // (the runner owns that routing); the JSON document and the
+    // dashboard have nowhere else to go, so they are refused, as are
+    // the file-only rotation options.
+    let event_stdout = event_log.as_deref() == Some(std::path::Path::new("-"));
+    if event_stdout && json {
+        return Err(usage_err(
+            "--event-log - owns stdout, so it cannot be combined with --json \
+             (the JSON document goes to stdout)",
+        ));
+    }
+    if event_stdout && dashboard {
+        return Err(usage_err(
+            "--event-log - owns stdout, so it cannot be combined with --dashboard \
+             (the dashboard needs the terminal)",
+        ));
+    }
+    if event_stdout && (event_rotate_bytes.is_some() || event_max_files.is_some()) {
+        return Err(usage_err(
+            "--event-rotate-bytes/--event-max-files cannot be combined with --event-log - \
+             (stdout is not rotated)",
         ));
     }
     if diagnostics.is_none() && diagnostics_pid.is_some() {
@@ -2146,7 +2189,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         event_log,
         event_rotate_bytes,
         event_max_files,
-        event_interval: None,
+        event_interval,
         diagnostics,
         diagnostics_pid,
         quiet,
@@ -4161,14 +4204,7 @@ mod tests {
         // `--json` and `--dashboard` also own stdout: refused beside `-`.
         for argv in [
             vec!["inventory", "--pid", "7", "--event-log", "-", "--json"],
-            vec![
-                "inventory",
-                "--pid",
-                "7",
-                "--event-log",
-                "-",
-                "--dashboard",
-            ],
+            vec!["inventory", "--pid", "7", "--event-log", "-", "--dashboard"],
         ] {
             assert!(
                 matches!(parse(args(&argv)), Err(CliError::Usage { message: m, .. })
@@ -4209,8 +4245,7 @@ mod tests {
     #[test]
     fn inventory_event_interval_parses_and_requires_a_stream() {
         // Off by default; a duration value parses beside either sink.
-        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap()
-        else {
+        let Command::Inventory(plain) = parse(args(&["inventory", "--pid", "7"])).unwrap() else {
             panic!("expected inventory")
         };
         assert_eq!(plain.event_interval, None);

@@ -804,7 +804,7 @@ release ledger-c
 finish_capture copy-up-neg json "$CAPTURE_PID"
 unlock_step
 ledgers2_is ledger-c 400 250
-RESULT=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" copy-up-neg "$WORK/copy-up-neg.json" 400 /tmp/copyup/libsofthsm2.so)
+RESULT=$(python3 -I "$ORACLE" --expect-observer "$PIDNS_OBSERVER" copy-up-neg "$WORK/copy-up-neg.json" 400 250 /tmp/copyup/libsofthsm2.so)
 record "$RESULT"
 
 echo "=== negative: the idle pod maps no provider ==="

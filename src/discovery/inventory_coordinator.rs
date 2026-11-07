@@ -8215,6 +8215,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 self.note_preadmission(row.host_tgid, &keys, reason, row.recorded_at_ns);
                 let image = UnboundImage {
                     cookie: row.cookie(),
+                    pid_host: row.host_tgid,
+                    first_call_ns: row.recorded_at_ns,
                 };
                 self.registry.note_unbound_witness_with_image(
                     modules,

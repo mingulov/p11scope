@@ -214,6 +214,13 @@ pub(super) struct UnboundUse {
     pub entries: u64,
     pub images: u64,
     pub images_saturated: bool,
+    pub pids: Vec<UnboundPid>,
+    pub pids_dropped: u64,
+}
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub(super) struct UnboundPid {
+    pub pid_host: u32,
+    pub first_call_ns: u64,
 }
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub(super) struct Module {
@@ -969,6 +976,27 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
             } else {
                 false
             };
+            // Part-C keys, absent in old captures.
+            let pids = if u.fields.contains_key("pids") {
+                u.array("pids")?
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| {
+                        let p = Object::new(v, format!("{}.pids[{i}]", u.path))?;
+                        Ok::<_, anyhow::Error>(UnboundPid {
+                            pid_host: p.uint32("pid_host")?,
+                            first_call_ns: p.uint("first_call_ns")?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?
+            } else {
+                Vec::new()
+            };
+            let pids_dropped = if u.fields.contains_key("pids_dropped") {
+                u.uint("pids_dropped")?
+            } else {
+                0
+            };
             Ok::<_, anyhow::Error>(UnboundUse {
                 first_ns: u.uint("first_ns")?,
                 rows: u.uint("rows")?,
@@ -976,6 +1004,8 @@ fn parse_module(o: &Object<'_>) -> Result<Module> {
                 entries,
                 images,
                 images_saturated,
+                pids,
+                pids_dropped,
             })
         })
         .transpose()?;

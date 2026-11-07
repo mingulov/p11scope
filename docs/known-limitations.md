@@ -1687,11 +1687,13 @@ The old bounds are measurements, not a product startup SLA.
   `modules[].unbound_use.images` per module and
   `observation.native_witnesses.unbound_images` run-wide in JSON
   (`images_saturated` / `unbound_images_saturated` mark lower bounds).
-  No caller is named: only distinct images count, never pids. An
-  exec-chain image that was never admitted (a thread exec inside one
-  pass) likewise binds nothing: the retired caller's edge reads
-  `unknown`/`use_before_admission` and the use is disclosed only via
-  `unbound_use` (see the next entry).
+  Each image also lists its historical host pid
+  (`modules[].unbound_use.pids`, up to five on the concise line):
+  never the process now holding that number, never re-read through
+  `/proc`, never a name. An exec-chain image that was never admitted
+  (a thread exec inside one pass) likewise binds nothing: the
+  retired caller's edge reads `unknown`/`use_before_admission` and
+  the use is disclosed only via `unbound_use` (see the next entry).
 - Kernels/conditions: P4/P5-style exec chains and short-lived callers.
 - Disclosure: `modules[].unbound_use` (rows/reasons/entries plus
   `images`/`images_saturated`),
@@ -1743,9 +1745,11 @@ The old bounds are measurements, not a product startup SLA.
   see DR-C3-2).
 - Disclosure: the pid-less `process view` gap ("a process in scope could
   not be retained or scanned before it changed"), `modules[].unbound_use`
-  (`rows`, `reasons`), `observation.native_witnesses.unbound_reasons`, and
-  the per-pass `unbound_rows` of the event stream. No pid is named and no
-  watch or positive claim is made for these processes.
+  (`rows`, `reasons`, `images`, `pids`), `observation.native_witnesses`
+  (`unbound_reasons`, `unbound_images`), and the per-pass `unbound_rows`
+  of the event stream. The gap names no pid; `pids` lists historical
+  host pids only (never the live holder, never re-read). No watch or
+  positive claim is made for these processes.
 - Workaround: none for complete caller coverage. Module-level observations
   describe captured rows; they do not establish coverage of an omitted group.
 - Future work: live-capture enumeration of never-before-seen zombie

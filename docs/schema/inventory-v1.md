@@ -238,7 +238,7 @@ non-null values needs a new allowlist row.
   gone; sticky in `unloaded_observed` even across a reload), or
   `unknown` (no live mapping evidence remains).
   `unbound_use` is `null`, or `{first_ns, rows, reasons, entries,
-  images, images_saturated}`:
+  images, images_saturated, pids, pids_dropped}`:
   native witness rows of this module that no caller edge carries —
   positive, monotonic module-level use, never attributed to a caller by
   pid. Only a row whose witness endpoint belongs to this one admitted
@@ -259,12 +259,21 @@ non-null values needs a new allowlist row.
   count (their caller is identified), and the cookie itself never
   publishes. `images_saturated` is true once the per-module bound
   (4096, LIM-1, never lowered) is hit: `images` is then a lower bound.
+  `pids` lists one `{pid_host, first_call_ns}` per collected image,
+  oldest first call first: the kernel tgid in host (init-namespace)
+  numbering with the earliest row's first-association instant.
+  Historical only — never the process now holding that number, never
+  re-read through `/proc`, never a name — and never deduplicated
+  (two images of one tgid list twice). `pids_dropped` counts the
+  distinct images the bound turned away; the list is complete while
+  it is zero.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records
   instead a `native witness without mapping evidence` gap naming the
   caller (once per caller and module).
-  Witness gaps never carry a `pid`: an unbound row's tgid is exactly
-  what could not be identified.
+  Witness gaps never carry a `pid`; the sole published tgid of an
+  unbound row is its image's historical `pid_host` in `pids` above —
+  the incarnation behind it is still what could not be identified.
   `initialize` (additive within v1) is the per-module `C_Initialize`
   roll-up `{calls, ok, already_initialized, last_error_rv, status,
   detail}` over observed init returns since the semantic lane sealed,

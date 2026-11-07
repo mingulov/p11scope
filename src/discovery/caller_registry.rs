@@ -2367,13 +2367,17 @@ pub(crate) struct UnboundUse {
     pub entries: u64,
     /// Distinct unidentified caller images (slice 1): one entry per
     /// (domain, task cookie) that reached this module's committed
-    /// single-module path. Cookies never publish: only the count
-    /// ([`Self::images`]) and the saturation flag reach output.
+    /// single-module path, each with its historical host pid (Part
+    /// C). Cookies never publish: only the count ([`Self::images`]),
+    /// the saturation flag, and the host-pid list reach output.
     /// `no_mapping_edge` rows never insert (their caller is known).
-    pub(crate) images: HashSet<DomainCookie>,
+    pub(crate) images: HashMap<DomainCookie, UnboundPid>,
     /// The per-module image set hit its bound: [`Self::images`] is a
     /// lower bound. Sticky.
     pub images_saturated: bool,
+    /// Distinct images (with their host pids) the per-module bound
+    /// turned away, saturating. Sticky.
+    pub pids_dropped: u64,
 }
 
 impl UnboundUse {
@@ -2382,15 +2386,38 @@ impl UnboundUse {
     pub(crate) fn images(&self) -> u64 {
         u64::try_from(self.images.len()).unwrap_or(u64::MAX)
     }
+
+    /// Every collected host pid, oldest first call first (Part C):
+    /// one entry per image, never deduplicated, complete while
+    /// [`Self::pids_dropped`] is zero.
+    pub(crate) fn pids_sorted(&self) -> Vec<UnboundPid> {
+        let mut pids: Vec<UnboundPid> = self.images.values().copied().collect();
+        pids.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
+        pids
+    }
+}
+
+/// One unidentified caller image's historical host pid (Part C):
+/// the kernel tgid (host/init-namespace numbering) of the row that
+/// named the image, with the earliest row's first-association
+/// instant. Historical only: never the process now holding that
+/// number, never re-read through `/proc`, never a name or argv/env.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct UnboundPid {
+    pub pid_host: u32,
+    pub first_call_ns: u64,
 }
 
 /// The unidentified caller image one unbound row names (slice 1):
-/// the row's domain-tagged task cookie. Cookies are equality-only
-/// and never publish; only counts (and, where the allowlist says
-/// so, host pids) reach output.
+/// the row's domain-tagged task cookie, with the row's host tgid
+/// and first-association instant (Part C). Cookies are
+/// equality-only and never publish; only counts and host pids
+/// reach output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct UnboundImage {
     pub cookie: DomainCookie,
+    pub pid_host: u32,
+    pub first_call_ns: u64,
 }
 
 /// Slice-1 bounds for unidentified caller-image sets (LIM-1: never
@@ -3134,12 +3161,17 @@ pub(crate) struct CallerRegistry {
     /// `pub(crate)` so tests shrink them; production keeps defaults.
     pub(crate) unbound_image_limits: UnboundImageLimits,
     /// Run-wide distinct unidentified caller images (slice 1): the
-    /// union of committed single-module inserts. Cookies never
-    /// publish: only the count and the saturation flag reach output.
-    unidentified_images: HashSet<DomainCookie>,
+    /// union of committed single-module inserts, each with its
+    /// historical host pid (Part C). Cookies never publish: only
+    /// the count, the saturation flag, and the host-pid list reach
+    /// output.
+    unidentified_images: HashMap<DomainCookie, UnboundPid>,
     /// The run-wide image set hit its bound: the published count is a
     /// lower bound. Sticky.
     unidentified_images_saturated: bool,
+    /// Distinct images (with their host pids) the run-wide bound
+    /// turned away, saturating. Sticky.
+    unidentified_pids_dropped: u64,
     /// Pending-count placements the last publication decided, in apply
     /// order (P3): drained by the coordinator after each publish.
     pending_count_decisions: Vec<PendingCountDecision>,
@@ -3283,8 +3315,9 @@ impl CallerRegistry {
             witness_gap_memo: BTreeSet::new(),
             witness_placement: WitnessPlacement::default(),
             unbound_image_limits: UnboundImageLimits::default(),
-            unidentified_images: HashSet::new(),
+            unidentified_images: HashMap::new(),
             unidentified_images_saturated: false,
+            unidentified_pids_dropped: 0,
             pending_count_decisions: Vec::new(),
             demoted_place_growth: HashMap::new(),
             witness_census: BindingCensus::default(),
@@ -3939,6 +3972,21 @@ impl CallerRegistry {
     /// The run-wide image set hit its bound. Sticky.
     pub(crate) fn unidentified_images_saturated(&self) -> bool {
         self.unidentified_images_saturated
+    }
+
+    /// Every collected run-wide host pid, oldest first call first
+    /// (Part C): one entry per image, never deduplicated, complete
+    /// while [`Self::unidentified_pids_dropped`] is zero.
+    pub(crate) fn unidentified_pids(&self) -> Vec<UnboundPid> {
+        let mut pids: Vec<UnboundPid> = self.unidentified_images.values().copied().collect();
+        pids.sort_by_key(|pid| (pid.first_call_ns, pid.pid_host));
+        pids
+    }
+
+    /// Distinct images (with their host pids) the run-wide bound
+    /// turned away, saturating. Sticky.
+    pub(crate) fn unidentified_pids_dropped(&self) -> u64 {
+        self.unidentified_pids_dropped
     }
 
     /// Stage one coverage note for an edge from its producer (the capture
@@ -5713,7 +5761,6 @@ impl CallerRegistry {
         };
         self.witness_placement.module += 1;
         let limits = self.unbound_image_limits;
-        let cookie = image.map(|image| image.cookie);
         {
             let module = self.modules.get_mut(&id).expect("indexed module");
             let unbound = module.unbound_use.get_or_insert(UnboundUse {
@@ -5721,29 +5768,32 @@ impl CallerRegistry {
                 rows: 0,
                 reasons: BTreeMap::new(),
                 entries: 0,
-                images: HashSet::new(),
+                images: HashMap::new(),
                 images_saturated: false,
+                pids_dropped: 0,
             });
             unbound.first_ns = unbound.first_ns.min(first_ns);
             unbound.rows = unbound.rows.saturating_add(1);
             unbound.entries = unbound.entries.saturating_add(entries);
             let count = unbound.reasons.entry(code).or_default();
             *count = count.saturating_add(1);
-            if let Some(cookie) = cookie {
+            if let Some(image) = image {
                 Self::insert_unbound_image(
                     &mut unbound.images,
                     &mut unbound.images_saturated,
+                    &mut unbound.pids_dropped,
                     limits.per_module,
-                    cookie,
+                    image,
                 );
             }
         }
-        if let Some(cookie) = cookie {
+        if let Some(image) = image {
             Self::insert_unbound_image(
                 &mut self.unidentified_images,
                 &mut self.unidentified_images_saturated,
+                &mut self.unidentified_pids_dropped,
                 limits.global,
-                cookie,
+                image,
             );
         }
         if unidentified {
@@ -5762,18 +5812,29 @@ impl CallerRegistry {
         }
     }
 
-    /// Insert `cookie` into a slice-1 image set: known images re-insert
-    /// free; a new image past the bound saturates instead of growing.
+    /// Insert `image` into a slice-1 image set: a known image keeps
+    /// the earliest call; a new image past the bound saturates and
+    /// counts as dropped instead of growing.
     fn insert_unbound_image(
-        set: &mut HashSet<DomainCookie>,
+        images: &mut HashMap<DomainCookie, UnboundPid>,
         saturated: &mut bool,
+        dropped: &mut u64,
         limit: usize,
-        cookie: DomainCookie,
+        image: UnboundImage,
     ) {
-        if set.len() < limit {
-            set.insert(cookie);
-        } else if !set.contains(&cookie) {
+        if let Some(known) = images.get_mut(&image.cookie) {
+            known.first_call_ns = known.first_call_ns.min(image.first_call_ns);
+        } else if images.len() < limit {
+            images.insert(
+                image.cookie,
+                UnboundPid {
+                    pid_host: image.pid_host,
+                    first_call_ns: image.first_call_ns,
+                },
+            );
+        } else {
             *saturated = true;
+            *dropped = dropped.saturating_add(1);
         }
     }
 

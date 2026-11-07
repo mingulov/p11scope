@@ -1288,6 +1288,8 @@ pub(crate) fn scripted_promotion_view_for_test() -> std::sync::Arc<super::Promot
         unbound_images_saturated: false,
         identity_unavailable_refused: 0,
         identity_budget_exhausted: false,
+        unbound_pids: Vec::new(),
+        unbound_pids_dropped: 0,
         caller_metadata: crate::caller_metadata::runtime::MetadataFrame::default(),
         callers: Vec::new(),
         modules: Vec::new(),

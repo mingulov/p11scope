@@ -312,6 +312,44 @@ fn native_witness_images_are_carried_when_present() {
 }
 
 #[test]
+fn unbound_use_pids_are_carried_when_present() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 2,
+        "images": 2, "images_saturated": false,
+        "pids": [{"pid_host": 9, "first_call_ns": 210},
+                 {"pid_host": 11, "first_call_ns": 220}],
+        "pids_dropped": 0
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert_eq!(
+        unbound
+            .pids
+            .iter()
+            .map(|p| (p.pid_host, p.first_call_ns))
+            .collect::<Vec<_>>(),
+        [(9, 210), (11, 220)]
+    );
+    assert_eq!(unbound.pids_dropped, 0);
+}
+
+#[test]
+fn unbound_use_pids_default_for_old_captures() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 2,
+        "reasons": {"no_live_caller": 2}, "entries": 2,
+        "images": 2, "images_saturated": false
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert!(unbound.pids.is_empty());
+    assert_eq!(unbound.pids_dropped, 0);
+}
+
+#[test]
 fn native_witness_images_default_for_old_captures() {
     let snapshot = parse_snapshot(FIXTURE).unwrap();
     let witnesses = snapshot.observation.native_witnesses.as_ref().unwrap();

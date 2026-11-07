@@ -586,6 +586,13 @@ pub(crate) struct Presentation {
     pub identity_unavailable_refused: u64,
     /// Whether the identity ticket budget spent itself.
     pub identity_budget_exhausted: bool,
+    /// Every collected run-wide host pid, oldest first call first
+    /// (Part C): one entry per unidentified image. Historical
+    /// host/init-namespace numbers, never re-read through `/proc`.
+    pub unbound_pids: Vec<crate::discovery::caller_registry::UnboundPid>,
+    /// Distinct images (with their host pids) the run-wide bound
+    /// turned away, saturating.
+    pub unbound_pids_dropped: u64,
     /// Display-only opt-in metadata shared by every consumer of this frame.
     pub caller_metadata: crate::caller_metadata::runtime::MetadataFrame,
     pub callers: Vec<CallerView>,
@@ -969,6 +976,8 @@ impl Presentation {
             unbound_images_saturated: registry.unidentified_images_saturated(),
             identity_unavailable_refused: coordinator.identity_unavailable_refused(),
             identity_budget_exhausted: coordinator.identity_budget_exhausted(),
+            unbound_pids: registry.unidentified_pids(),
+            unbound_pids_dropped: registry.unidentified_pids_dropped(),
             caller_metadata: coordinator.metadata_frame(),
             callers,
             modules,
@@ -2717,9 +2726,38 @@ fn render_snapshot_inner(
         // alone. Exactly the folded lower bound: nothing else sums
         // into N.
         if presentation.unbound_images > 0 {
+            // Part C: up to five historical host pids after the
+            // clause, always with the historical qualifier; the rest
+            // (unshown collected plus saturation-dropped) count as
+            // more. Empty only for test-direct rows without images.
+            let pids = if presentation.unbound_pids.is_empty() {
+                String::new()
+            } else {
+                let shown: Vec<String> = presentation
+                    .unbound_pids
+                    .iter()
+                    .take(5)
+                    .map(|pid| pid.pid_host.to_string())
+                    .collect();
+                let more = u64::try_from(presentation.unbound_pids.len())
+                    .unwrap_or(u64::MAX)
+                    .saturating_sub(shown.len() as u64)
+                    .saturating_add(presentation.unbound_pids_dropped);
+                if more > 0 {
+                    format!(
+                        "; pids {} (+{more} more; not running now or never scanned)",
+                        shown.join(", ")
+                    )
+                } else {
+                    format!(
+                        "; pids {} (not running now or never scanned)",
+                        shown.join(", ")
+                    )
+                }
+            };
             let _ = writeln!(
                 out,
-                "unidentified callers: at least {} call{} from {} caller process{} never identified (exited or never scanned){}",
+                "unidentified callers: at least {} call{} from {} caller process{} never identified (exited or never scanned){}{}",
                 entries,
                 if entries == 1 { "" } else { "s" },
                 presentation.unbound_images,
@@ -2728,6 +2766,7 @@ fn render_snapshot_inner(
                 } else {
                     "es"
                 },
+                pids,
                 if presentation.unbound_images_saturated {
                     "; image bound reached, more callers possible"
                 } else {
@@ -3150,6 +3189,37 @@ fn render_snapshot_inner(
                     unbound.rows,
                     if unbound.rows == 1 { "" } else { "s" }
                 );
+                // Part C: every collected host pid with its first-call
+                // time, oldest first. Historical host numbers, never
+                // re-read through `/proc`, hence always qualified.
+                let pids = unbound.pids_sorted();
+                if !pids.is_empty() {
+                    let list = pids
+                        .iter()
+                        .map(|pid| {
+                            format!(
+                                "{} (first call {} ago)",
+                                pid.pid_host,
+                                crate::render::fmt_ns(Some(
+                                    presentation.ended_ns.saturating_sub(pid.first_call_ns)
+                                ))
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    if unbound.pids_dropped > 0 {
+                        let _ = writeln!(
+                            out,
+                            "    host pids: {list} (+{} more; not running now or never scanned)",
+                            unbound.pids_dropped
+                        );
+                    } else {
+                        let _ = writeln!(
+                            out,
+                            "    host pids: {list} (not running now or never scanned)"
+                        );
+                    }
+                }
             }
         }
         // A module with observed `C_Initialize` evidence names its

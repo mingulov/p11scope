@@ -1701,6 +1701,7 @@ def check_cells(view, images_by_cell, res):
     check_positives(view, images_by_cell, mod, state, res)
     check_counted_nonzero(view, res)
     check_saturated(view, res)
+    check_unbound_pids(view, res)
     check_uncounted(view, res)
 
 
@@ -2090,6 +2091,40 @@ def check_saturated(view, res):
         res.ok(view.name, "*", "COUNT-SATURATED", ok,
                f"edge {key[0]}->{key[1]} reads count {count!r} saturated {saturated!r} cap {cap!r}: "
                "production publishes cap=u64::MAX, a u64 count, and saturated exactly at the cap")
+
+
+def check_unbound_pids(view, res):
+    """Slice 1 + Part C: module-level unidentified use is
+    production-shaped (src/inventory/mod.rs module_json) — one pid
+    entry per image, oldest first call first, saturation coherent,
+    images never outnumbering rows, and no identity on a pid entry
+    (exactly pid_host + first_call_ns). Absent `unbound_use` (no
+    rows) needs nothing."""
+    for mid in sorted(view.modules):
+        use = (view.modules[mid] or {}).get("unbound_use")
+        if use is None:
+            continue
+        images, saturated = use.get("images"), use.get("images_saturated")
+        pids, dropped, rows = use.get("pids"), use.get("pids_dropped"), use.get("rows")
+        wellformed = (
+            type(images) is int and 0 <= images <= U64_MAX
+            and type(saturated) is bool
+            and type(pids) is list
+            and type(dropped) is int and 0 <= dropped <= U64_MAX
+            and type(rows) is int and 0 <= rows <= U64_MAX
+            and all(type(p) is dict and set(p) == {"pid_host", "first_call_ns"}
+                    and type(p["pid_host"]) is int and 0 <= p["pid_host"] <= 0xFFFFFFFF
+                    and type(p["first_call_ns"]) is int and 0 <= p["first_call_ns"] <= U64_MAX
+                    for p in pids)
+        )
+        keys = [(p["first_call_ns"], p["pid_host"]) for p in pids] if wellformed else []
+        ok = (wellformed and len(pids) == images and (dropped > 0) == saturated
+              and images <= rows and keys == sorted(keys))
+        res.ok(view.name, "*", "UNBOUND-PIDS", ok,
+               f"module {mid} reads images {images!r} saturated {saturated!r} "
+               f"pids {pids!r} dropped {dropped!r} rows {rows!r}: production publishes one "
+               "pid entry per image oldest-first, saturation exactly when pids drop, "
+               "images within rows, and no identity on a pid entry")
 
 
 def check_uncounted(view, res):
@@ -4812,7 +4847,9 @@ def self_test():
             def mutate(s, d, dash):
                 drop(s, d, "P4")
                 m = next(m for m in d["modules"] if m["id"] == s.mid["A"])
-                m["unbound_use"] = {"first_ns": T0, "rows": 2, "reasons": {reason: 2}}
+                m["unbound_use"] = {"first_ns": T0, "rows": 2, "reasons": {reason: 2}, "entries": 2,
+                                    "images": 1, "images_saturated": False,
+                                    "pids": [{"pid_host": 7, "first_call_ns": T0}], "pids_dropped": 0}
                 return counted(s, d, [{"module": s.mid["A"], "reason": "no_live_caller", "rows": 2}])
             return mutate
         def p4_module_statement_retained(suppressed):
@@ -6425,6 +6462,49 @@ def self_test():
             e = _edge(d, cid(s, "P1"), s.mid["A"])
             e["entries"].update(count=True)
         case("saturated-count-bool", "COUNT-SATURATED", count_bool)
+
+        # --- Part C: unidentified-caller pid lists ----------------------
+        # Production shapes every unbound_use with images/pids
+        # (src/inventory/mod.rs module_json): one pid entry per image,
+        # oldest first call first, saturation coherent, images within
+        # rows, and no identity on a pid entry.
+        def _unbound(s, d, **kw):
+            use = {"first_ns": T0, "rows": 2, "reasons": {"no_live_caller": 2}, "entries": 2,
+                   "images": 2, "images_saturated": False,
+                   "pids": [{"pid_host": 11, "first_call_ns": T0},
+                            {"pid_host": 12, "first_call_ns": T0 + 10}],
+                   "pids_dropped": 0}
+            use.update(kw)
+            m = next(m for m in d["modules"] if m["id"] == s.mid["A"])
+            m["unbound_use"] = use
+        case("unbound-pids-valid", None, lambda s, d, dash: _unbound(s, d))
+
+        def pids_len(s, d, dash):
+            _unbound(s, d, pids=[{"pid_host": 11, "first_call_ns": T0}])
+        case("unbound-pids-len", "UNBOUND-PIDS", pids_len)
+
+        def pids_dropped(s, d, dash):
+            _unbound(s, d, pids_dropped=1)
+        case("unbound-pids-dropped", "UNBOUND-PIDS", pids_dropped)
+
+        def pids_saturated(s, d, dash):
+            _unbound(s, d, images_saturated=True)
+        case("unbound-pids-saturated", "UNBOUND-PIDS", pids_saturated)
+
+        def pids_unsorted(s, d, dash):
+            _unbound(s, d, pids=[{"pid_host": 12, "first_call_ns": T0 + 10},
+                                 {"pid_host": 11, "first_call_ns": T0}])
+        case("unbound-pids-unsorted", "UNBOUND-PIDS", pids_unsorted)
+
+        def pids_identity(s, d, dash):
+            _unbound(s, d, pids=[{"pid_host": 11, "first_call_ns": T0, "exe": "/bin/x"},
+                                 {"pid_host": 12, "first_call_ns": T0 + 10}])
+        case("unbound-pids-identity", "UNBOUND-PIDS", pids_identity)
+
+        def pids_host_bool(s, d, dash):
+            _unbound(s, d, pids=[{"pid_host": True, "first_call_ns": T0},
+                                 {"pid_host": 12, "first_call_ns": T0 + 10}])
+        case("unbound-pids-host-bool", "UNBOUND-PIDS", pids_host_bool)
 
         # --- O8: receipt boundary proof (astra A7, corrected round 2) ----
         # The C_GetFunctionList exclusion is acquisition-only AND

@@ -8499,6 +8499,11 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "entries": unbound.entries,
             "images": unbound.images(),
             "images_saturated": unbound.images_saturated,
+            "pids": unbound.pids_sorted().iter().map(|pid| serde_json::json!({
+                "pid_host": pid.pid_host,
+                "first_call_ns": pid.first_call_ns,
+            })).collect::<Vec<_>>(),
+            "pids_dropped": unbound.pids_dropped,
         })),
         // Additive (v1): observed `C_Initialize` returns since the
         // semantic lane sealed, with the judged verdict.
@@ -12108,7 +12113,7 @@ mod tests {
         let document = render_json(&coordinator, "pid:7", 90, 130, 2);
         assert_eq!(
             document["modules"][0]["unbound_use"],
-            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0, "images": 0, "images_saturated": false})
+            serde_json::json!({"first_ns": 110, "rows": 1, "reasons": {"before_admission": 1}, "entries": 0, "images": 0, "images_saturated": false, "pids": [], "pids_dropped": 0})
         );
         assert_eq!(
             document["observation"]["native_witnesses"],

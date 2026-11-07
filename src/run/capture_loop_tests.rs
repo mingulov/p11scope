@@ -2719,6 +2719,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
         unbound_images_saturated: false,
         identity_unavailable_refused: 0,
         identity_budget_exhausted: false,
+        unbound_pids: Vec::new(),
+        unbound_pids_dropped: 0,
         callers: vec![CallerView {
             id: CallerId(0),
             pid: 4242,

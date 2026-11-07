@@ -560,6 +560,8 @@ fn changing_only_times_and_local_incarnations_is_not_an_application_change() {
         entries: 0,
         images: 0,
         images_saturated: false,
+        pids: Vec::new(),
+        pids_dropped: 0,
     });
     let mut after = before.clone();
     after.observation.started_ns = 10000;

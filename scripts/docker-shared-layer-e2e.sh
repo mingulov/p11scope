@@ -183,14 +183,10 @@ self_test() {
     fi
     grep -q -- '--facts-log "\$FACT[S]"' "$0" \
         || { echo "oracle call lost --facts-log" >&2; exit 1; }
-    grep -q -- '--b-pre-round2-calls "\$((6' "$0" \
-        || { echo "oracle call lost --b-pre-round2-calls" >&2; exit 1; }
     grep -q -- '--b-pre-round2-pid "\$PID_B[3]"' "$0" \
         || { echo "oracle call lost --b-pre-round2-pid" >&2; exit 1; }
     grep -q -- '--span-profile "\$WORK/d1-span-b.jso[n]"' "$0" \
         || { echo "oracle call lost --span-profile" >&2; exit 1; }
-    grep -q -- '--b2-calls "\$((6' "$0" \
-        || { echo "oracle call lost --b2-calls" >&2; exit 1; }
     grep -q 'release_gate "\$PID_B3" "\$B3_GAT[E]"' "$0" \
         || { echo "round-2 twin gate is not released from the host" >&2; exit 1; }
     grep -q 'release_gate "\$PID_B2" "\$B2_GAT[E]"' "$0" \
@@ -1223,7 +1219,7 @@ awk '/^READY /{n++} n>=2' "$WORK/logs-b-post.txt" >"$WORK/logs-b-post-run.txt"
 ledger_is "$WORK/logs-b-post-run.txt" "$ITERS_B" || fail_cell "restarted B ledger is not 6x$ITERS_B"
 grep -h '^LEDGER ' "$WORK/logs-b-post.txt" >>"$FACTS"
 
-printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process keeps its mapped edge to the shared lower module on both identity backends (the kernel witness proves it still runs the lower file: never ended, never gapped, never edged to the new module). The second mapper in B is attributed to the new upper module with its ledgered round counted on both backends. The round-2 twin is gap-only where never deep-scanned and keeps its mapped old edge with its ledger counted where scanned. The span profile of B shows both module rows with the pre_copy_up marker on the lower one. No named identity loss is expected on any leg." >"$WORK/dc73-note.txt"
+printf '%s\n' "copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up process ends its collapsed edge and rejoins the proven lower file on B's own key module (kernel backend: mapped, deep_scan, gap-free). The second mapper and the round-2 twin are admitted under the same key but unprobed (the byte-identical collapse suppresses probing: count 0, not_attached, never a gap). Every userspace leg honestly gaps the overlay joins (no kernel witness there). The spanning profile of B keeps one stale row with the twin's exact ledger and discloses the upper miss as lossy (no second object: the named profile-spanning gap). No named identity loss is expected on any leg." >"$WORK/dc73-note.txt"
 fact "dc73-note=$(cat "$WORK/dc73-note.txt")"
 
 say "=== oracle ==="
@@ -1241,10 +1237,9 @@ if python3 -I "$ORACLE" copy-up --lane "$LANE" \
         --pid-a "$PID_A" --pid-b-pre "$PID_B_PRE" --pid-b-span "$PID_B2" \
         --pid-b-post "$PID_B_POST" \
         --iters-a "$ITERS_A" --iters-b "$ITERS_B" \
-        --b2-calls "$((6 * B2_ITERS))" \
         --dc73-note "$WORK/dc73-note.txt" \
         --facts-log "$FACTS" \
-        --b-pre-round2-calls "$((6 * ITERS_B))" --b-pre-round2-pid "$PID_B3" \
+        --b-pre-round2-pid "$PID_B3" \
         >"$WORK/oracle.json" 2>"$WORK/oracle.err"; then
     cat "$WORK/oracle.json" >>"$SUMMARY_JSONL"
     cat "$WORK/oracle.json" >>"$FACTS"

@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 """Container-cells oracle (D1 copy-up, N4 late-reported): healthy twins pass, every check refuses its mutation.
 
-D1 follows the live run-4 shape (Opus D1 identity investigation, binding):
-pre-collapse onto A's module, span with B-pre m7-ended and NO m8 edge (the
-stale mapper is unknown with the original_file_unproven gap) plus B2->m8
-exact on BOTH backends, fresh exactness. The run-4 JSON fixtures still carry
-the old misattribution and must now FAIL. N4 follows the live run-1 ruling:
-L passes via a named gap or a stated unwatched prefix
-(since_ns > first_seen_ns).
+D1 follows the live D1-extended shape (binding): pre collapses B-pre onto
+A's module on the kernel leg while the userspace leg honestly gaps both
+(no witness, no edges); the span splits honestly — A stays on its key,
+B-pre's collapsed edge ends and its stale ranges rejoin the proven lower
+on B's own key module (mapped, deep_scan, gap-free), B2 and the round-2
+twin are admitted under the same key but unprobed (count 0, not_attached)
+— and the span profile keeps one honestly lossy stale row; fresh commits
+the split. The run-4 JSON fixtures still carry the old misattribution and
+must now FAIL. N4 follows the live run-1 ruling: L passes via a named gap
+or a stated unwatched prefix (since_ns > first_seen_ns).
 """
 
 import json
@@ -35,9 +38,9 @@ ITERS_O, ITERS_L = 400, 250
 # Overlay-shaped synthetic keys: same inode, different minor (like run 4).
 KEY_A = (0, 138, 100)
 KEY_B = (0, 140, 100)
-NOTE_NEW = ("copy-up-stale-caller: after B's same-bytes copy-up, B's pre-copy-up "
-            "process keeps its mapped edge to the shared lower module on both "
-            "identity backends (resolved: no gap, no new-module edge).")
+NOTE_NEW = ("run log: copy-up-stale-caller disclosed for B-pre "
+            "(proven lower on its key, upper admitted-unprobed, "
+            "spanning profile honestly lossy)")
 NOTE_OLD = ("D-C7-3 applies: post-copy-up userspace edge to the upper mapping is "
             "backend-divergent per docs/known-limitations.md; the kernel refusal "
             "with identity_mismatch is the correct leg.")
@@ -69,17 +72,19 @@ def collapse_gap(mapping_key=KEY_B, target_key=KEY_A, path=PROVIDER):
     return (subject, reason, None)
 
 
-STALE_GAP = "original_file_unproven: the kernel witness proved another file"
+USERSPACE_GAP = ("original_file_unproven: kernel witness unavailable: "
+                 "explicit userspace disables the kernel witness")
 
 
-def stale_gap(pid):
-    """The stale mapper's refusal row (src/discovery/overlay_witness.rs)."""
-    return (PROVIDER, STALE_GAP, pid)
+def unproven_gap(pid):
+    """The honest overlay gap of a userspace leg (no witness, no edges)."""
+    return (PROVIDER, USERSPACE_GAP, pid)
 
 
 def span_gaps():
-    """Collapse plus the never-scanned twin's refusal (B-pre joined)."""
-    return [collapse_gap(), stale_gap(PID_B3)]
+    """The flip records both directions; A keeps the committed survivor."""
+    return [collapse_gap(),
+            collapse_gap(mapping_key=KEY_A, target_key=KEY_B)]
 
 
 def inventory(edges, gaps=(), observer="initial", backend="kernel",
@@ -155,33 +160,36 @@ D1_MODULES_PRE = {"m7": KEY_A}
 D1_MODULES_SPAN = {"m7": KEY_A, "m8": KEY_B}
 
 
-def span_profile(b3_iters=ITERS_B, b2_iters=1):
-    """The cgroup-B capture spanning the copy-up: twin rows, exact totals."""
+def span_profile(b3_iters=ITERS_B):
+    """The cgroup-B capture spanning the copy-up: one stale row, honestly lossy.
+
+    No second object: the upper ranges refuse as an ambiguous all-plain
+    collision (the named profile-spanning gap, disclosed in skipped), so
+    B2's in-span round is uncounted but never silent.
+    """
     identity = {"dev": [0, 140], "ino": 100, "sha256": "abc"}
-    rows = [{"path": PROVIDER, "dev": [0, 140], "ino": 100,
-             "sha256": "abc", "build_id": "bd"},
-            {"path": PROVIDER, "dev": [0, 140], "ino": 100,
-             "sha256": "abc", "build_id": "bd", "layer": "pre_copy_up"}]
-    functions = []
-    for name in NAMES:
-        for calls in (b3_iters, b2_iters):
-            functions.append({"names": [name], "calls": calls, "errors": 0,
-                              "module": dict(identity),
-                              "module_ambiguous": False})
     return {
-        "capture": {"scope": "cgroup",
-                    "modules": [{"path": PROVIDER}, {"path": PROVIDER}]},
+        "capture": {"scope": "cgroup", "modules": [{"path": PROVIDER}]},
         "evidence": {
-            "discovery": rows,
+            "discovery": [{"path": PROVIDER, "dev": [0, 140], "ino": 100,
+                           "sha256": "abc", "build_id": "bd"}],
             "attached_probes": 136,
             "event_loss": 0,
             "in_flight_at_end": 0,
-            "verdict_detail": "attribution_only",
+            "verdict_detail": "concrete_gap",
+            "skipped": [{"name": "discovery subject",
+                         "reason": ("physical identity is ambiguous; "
+                                    "the collision group was not attached")}],
             "pid_namespace": {"observer": "initial", "kernel_pids": "initial",
                               "proc_pids": "observer"},
-            "gap_classes": {"observation": {"causes": [], "status": "exact"}},
+            "gap_classes": {"observation": {"causes": ["skipped",
+                                                       "pid_descendant_gaps"],
+                                            "status": "lossy"}},
         },
-        "functions": functions,
+        "functions": [{"names": [name], "calls": b3_iters, "errors": 0,
+                       "module": dict(identity), "module_ambiguous": False}
+                      for name in NAMES]
+        + [{"calls": 0, "errors": 0, "names": ["C_Login"], "module": None}],
     }
 
 
@@ -190,52 +198,41 @@ def pre_edges():
 
 
 def span_edges():
-    # Live runs 5/6 (dev, over the deep-scan cap): the twin is gap-only
-    # (never deep-scanned, so no edge at all); B-pre keeps its mapped
-    # old edge with the join. B2 counts its ledgered round. Neither
-    # stale mapper edges the new module.
+    # The honest split. A stays on its key's module; B-pre's collapsed
+    # edge ended and its stale ranges rejoin the proven lower on B's own
+    # key module (mapped, deep_scan, gap-free: the stale join); B2 and
+    # the round-2 twin are admitted under the same key but unprobed
+    # (uncertain, count 0, not_attached — never a gap).
     return [edge(PID_A, "m7"),
-            edge(PID_B_PRE, "m7"),
-            edge(PID_B_SPAN, "m8", evidence="maps_match", count=6,
-                 cov="counted", since=3000, first_seen=2000, lossy=False)]
+            edge(PID_B_PRE, "m7", state="ended"),
+            edge(PID_B_PRE, "m8"),
+            edge(PID_B_SPAN, "m8", state="uncertain",
+                 cov_reason="not_attached"),
+            edge(PID_B3, "m8", state="uncertain",
+                 cov_reason="not_attached")]
 
 
-def span_edges_twin_mapped(b3_m7_count=1500, b3_m7_cov="counted"):
-    # Fedora d1fed1 (under the cap: every pid deep-scanned): the twin is
-    # first scanned before the collapse resolves, so it keeps its mapped
-    # old edge, deep_scan, with its ledger counted on it.
-    return [edge(PID_A, "m7"),
-            edge(PID_B_PRE, "m7"),
-            edge(PID_B_SPAN, "m8", evidence="maps_match", count=6,
-                 cov="counted", since=3000, first_seen=2000, lossy=False),
-            edge(PID_B3, "m7", count=b3_m7_count, cov=b3_m7_cov,
-                 since=3000, first_seen=2000, lossy=False)]
+def gap_only(*pids):
+    """A userspace leg: every cell pid scanned yet un-edged, honestly gapped."""
+    return inventory([], [unproven_gap(pid) for pid in pids],
+                     backend="userspace", fallback=None, modules={})
 
 
 def good_copy_up_inputs(lane="B"):
-    """Healthy D1 legs: pre collapse, the stale-join span, fresh exactness."""
-    gap = collapse_gap()
-    pre_kernel = inventory(pre_edges(), [gap], backend="kernel",
-                           fallback="anchor_not_installed",
-                           modules=dict(D1_MODULES_PRE))
-    pre_userspace = inventory(pre_edges(), [gap], backend="userspace",
-                              fallback=None, modules=dict(D1_MODULES_PRE))
-    span_kernel = inventory(span_edges(), span_gaps(), backend="kernel",
-                            fallback="anchor_not_installed",
-                            modules=dict(D1_MODULES_SPAN))
-    span_userspace = inventory(span_edges(), span_gaps(), backend="userspace",
-                               fallback=None, modules=dict(D1_MODULES_SPAN))
+    """Healthy D1 legs: pre collapse, the honest span split, fresh exactness."""
     return {
-        "pre_kernel": pre_kernel,
-        "pre_userspace": pre_userspace,
-        "span_kernel": span_kernel,
-        "span_userspace": span_userspace,
+        "pre_kernel": inventory(
+            pre_edges(), [collapse_gap()], backend="kernel",
+            fallback="anchor_not_installed", modules=dict(D1_MODULES_PRE)),
+        "pre_userspace": gap_only(PID_A, PID_B_PRE),
+        "span_kernel": inventory(
+            span_edges(), span_gaps(), backend="kernel",
+            fallback="anchor_not_installed", modules=dict(D1_MODULES_SPAN)),
+        "span_userspace": gap_only(PID_A, PID_B_PRE, PID_B_SPAN, PID_B3),
         "fresh_kernel": inventory(
             [edge(PID_A, "m7"), edge(PID_B_POST, "m8")], backend="kernel",
             fallback="anchor_not_installed", modules=dict(D1_MODULES_SPAN)),
-        "fresh_userspace": inventory(
-            [edge(PID_A, "m7"), edge(PID_B_POST, "m8")], backend="userspace",
-            fallback=None, modules=dict(D1_MODULES_SPAN)),
+        "fresh_userspace": gap_only(PID_A, PID_B_POST),
         "pre_profile_a": profile(ITERS_A),
         "pre_profile_b": profile(ITERS_B),
         "post_profile_b": profile(ITERS_B),
@@ -249,8 +246,6 @@ def good_copy_up_inputs(lane="B"):
         "lane": lane,
         "dc73_note": NOTE_NEW,
         "facts_text": facts_text(),
-        "b2_calls": 6,
-        "b_pre_round2_calls": 6 * ITERS_B,
         "b_pre_round2_pid": PID_B3,
     }
 
@@ -333,16 +328,27 @@ class CopyUpTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["lane"], "B")
         self.assertNotIn("known_issue", result)
-        self.assertEqual(result["b_pre_round2"]["twin_shape"], "gap-only")
-        self.assertEqual(result["b2_calls"], 6)
+        self.assertEqual(result["b_pre_round2"]["pid"], PID_B3)
+        self.assertEqual(result["b_pre_round2"]["new_module"], "m8")
+        self.assertEqual(result["b_pre_round2"]["twin"], "uncertain")
+        self.assertEqual(result["b_pre_round2"]["B2"], "uncertain")
+        self.assertEqual(result["span_new_module"], "m8")
         self.assertEqual(result["lower_stack_b"], 3)
         self.assertIn("no proof attempted",
                       result["kernel_proof"]["finding"])
+        self.assertIn("copy-up-stale-caller resolved",
+                      result["stale_caller"])
 
     def test_lane_a_healthy_passes(self):
         result = check_copy_up(lane="A")
         self.assertTrue(result["ok"])
         self.assertEqual(result["lane"], "A")
+
+    def test_ambient_provider_edge_ignored(self):
+        """Sequential legs: an ambient host edge is outside the cell."""
+        inputs = good_copy_up_inputs()
+        with_ambient(inputs["span_kernel"], count=3)
+        self.assertTrue(ORACLE["copy_up"](**inputs)["ok"])
 
     def test_pre_must_edge_one_shared_module(self):
         pre = inventory([edge(PID_A, "m7"), edge(PID_B_PRE, "m8")],
@@ -415,109 +421,46 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(pre_kernel=pre)
 
-    def test_backends_disagree_on_provider_edge_fails(self):
-        """Null fallback without agreement is not a pass (named)."""
-        inputs = good_copy_up_inputs()
-        for key in ("pre_kernel", "span_kernel", "fresh_kernel"):
-            inputs[key]["observation"]["identity"]["fallback"] = None
-        fedora = span_edges_twin_mapped()
-        inputs["span_kernel"] = inventory(
-            fedora, [collapse_gap()], backend="kernel", fallback=None,
+    def test_pre_userspace_edge_fails(self):
+        """Explicit userspace never edges the overlay provider: no witness."""
+        userspace = inventory(pre_edges(), [unproven_gap(PID_A),
+                                            unproven_gap(PID_B_PRE)],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_PRE))
+        with self.assertRaisesRegex(AssertionError, "edged the provider"):
+            check_copy_up(pre_userspace=userspace)
+
+    def test_pre_userspace_gap_missing_fails(self):
+        """A cell pid without the honest gap is silence, not a pass."""
+        userspace = inventory([], [unproven_gap(PID_A)],
+                              backend="userspace", fallback=None, modules={})
+        with self.assertRaisesRegex(AssertionError, "without the honest gap"):
+            check_copy_up(pre_userspace=userspace)
+
+    def test_pre_userspace_collapse_fails(self):
+        """No userspace collapse names a cell key (nothing was proven)."""
+        userspace = inventory([], [unproven_gap(PID_A), unproven_gap(PID_B_PRE),
+                                   collapse_gap()],
+                              backend="userspace", fallback=None,
+                              modules=dict(D1_MODULES_PRE))
+        with self.assertRaisesRegex(AssertionError, "names a cell key"):
+            check_copy_up(pre_userspace=userspace)
+
+    def test_span_userspace_edge_fails(self):
+        userspace = inventory(
+            [edge(PID_A, "m7"), edge(PID_B_PRE, "m8")],
+            [unproven_gap(pid) for pid in
+             (PID_A, PID_B_PRE, PID_B_SPAN, PID_B3)],
+            backend="userspace", fallback=None,
             modules=dict(D1_MODULES_SPAN))
-        split = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
-                 else edge(PID_B3, "m7", count=6 * ITERS_B, cov="unknown",
-                           since=3000, first_seen=2000, lossy=False)
-                 for item in fedora]
-        inputs["span_userspace"] = inventory(
-            split, [collapse_gap()], backend="userspace", fallback=None,
-            modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "disagree"):
-            ORACLE["copy_up"](**inputs)
-
-    def test_backends_ignore_ambient_provider_count_drift(self):
-        """Sequential legs: ambient host counts may differ without failing."""
-        inputs = good_copy_up_inputs()
-        with_ambient(inputs["pre_kernel"], count=0)
-        with_ambient(inputs["pre_userspace"], count=3)
-        self.assertTrue(ORACLE["copy_up"](**inputs)["ok"])
-
-    def test_backends_ignore_ambient_only_provider_module(self):
-        """A provider module no cell process edges is outside the cell."""
-        inputs = good_copy_up_inputs()
-        with_ambient(inputs["pre_userspace"], count=0)
-        self.assertTrue(ORACLE["copy_up"](**inputs)["ok"])
-
-    def test_backends_cell_split_fails_named_despite_ambient_drift(self):
-        """Ambient drift never masks a named cell disagreement."""
-        inputs = good_copy_up_inputs()
-        fedora = span_edges_twin_mapped()
-        inputs["span_kernel"] = with_ambient(inventory(
-            fedora, [collapse_gap()], backend="kernel",
-            fallback="anchor_not_installed", modules=dict(D1_MODULES_SPAN)),
-            count=0)
-        split = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
-                 else edge(PID_B3, "m7", count=6 * ITERS_B, cov="unknown",
-                           since=3000, first_seen=2000, lossy=False)
-                 for item in fedora]
-        inputs["span_userspace"] = with_ambient(inventory(
-            split, [collapse_gap()], backend="userspace", fallback=None,
-            modules=dict(D1_MODULES_SPAN)), count=3)
-        with self.assertRaisesRegex(
-                AssertionError, "backends disagree on provider edges.*105"):
-            ORACLE["copy_up"](**inputs)
-
-    def test_span_b2_coverage_split_fails(self):
-        """B2 ledgers after admission: a coverage split is a divergence."""
-        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
-                 else edge(PID_B_SPAN, "m8", evidence="maps_match", count=6,
-                           cov="unknown", cov_reason="use_before_admission",
-                           since=3000, first_seen=2000, lossy=False)
-                 for item in span_edges()]
-        kernel = inventory(span_edges(), span_gaps(),
-                           backend="kernel", modules=dict(D1_MODULES_SPAN))
-        userspace = inventory(split, span_gaps(), backend="userspace",
-                              fallback=None, modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(
-                AssertionError, "backends disagree on provider edges.*104"):
-            check_copy_up(span_kernel=kernel, span_userspace=userspace)
-
-    def test_span_b2_entries_short_fails(self):
-        """B2's new edge must claim exactly its ledgered round."""
-        short = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
-                 else edge(PID_B_SPAN, "m8", evidence="maps_match", count=5,
-                           cov="counted", since=3000, first_seen=2000,
-                           lossy=False)
-                 for item in span_edges()]
-        kernel = inventory(short, span_gaps(),
-                           backend="kernel", modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "wrong entries"):
-            check_copy_up(span_kernel=kernel)
-
-    def test_span_b2_count_split_fails(self):
-        """A 6 vs 5 B2 count split fails on the short leg first."""
-        split = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
-                 else edge(PID_B_SPAN, "m8", evidence="maps_match", count=5,
-                           cov="counted", since=3000, first_seen=2000,
-                           lossy=False)
-                 for item in span_edges()]
-        userspace = inventory(split, span_gaps(), backend="userspace",
-                              fallback=None, modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "wrong entries"):
+        with self.assertRaisesRegex(AssertionError, "edged the provider"):
             check_copy_up(span_userspace=userspace)
 
-    def test_span_b_pre_coverage_split_fails(self):
-        """The same coverage split on B-pre fails too."""
-        split = [item if (item["pid"], item["module"]) != (PID_B_PRE, "m7")
-                 else edge(PID_B_PRE, "m7", cov="watched_no_use",
-                           since=3000, first_seen=2000)
-                 for item in span_edges()]
-        kernel = inventory(span_edges(), span_gaps(),
-                           backend="kernel", modules=dict(D1_MODULES_SPAN))
-        userspace = inventory(split, span_gaps(), backend="userspace",
-                              fallback=None, modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(
-                AssertionError, "backends disagree on provider edges.*102"):
-            check_copy_up(span_kernel=kernel, span_userspace=userspace)
+    def test_fresh_userspace_gap_missing_fails(self):
+        userspace = inventory([], [unproven_gap(PID_A)],
+                              backend="userspace", fallback=None, modules={})
+        with self.assertRaisesRegex(AssertionError, "without the honest gap"):
+            check_copy_up(fresh_userspace=userspace)
 
     def test_pre_profile_b_wrong_count_fails(self):
         with self.assertRaises(AssertionError):
@@ -535,8 +478,7 @@ class CopyUpTest(unittest.TestCase):
             check_copy_up(pre_kernel=pre)
 
     def test_span_without_new_module_fails(self):
-        span = inventory([edge(PID_A, "m7"), edge(PID_B_PRE, "m7"),
-                          edge(PID_B_SPAN, "m7", evidence="maps_match")],
+        span = inventory([edge(PID_A, "m7"), edge(PID_B_PRE, "m7")],
                          [collapse_gap()], backend="kernel",
                          modules=dict(D1_MODULES_PRE))
         with self.assertRaises(AssertionError):
@@ -548,79 +490,121 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(pre_kernel=pre)
 
-    def test_span_collapse_gap_duplicated_fails(self):
-        span = inventory(span_edges(), [collapse_gap(), collapse_gap()],
-                         backend="kernel", modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
-            check_copy_up(span_kernel=span)
-
-    def test_span_collapse_gap_missing_fails(self):
+    def test_span_collapse_missing_fails(self):
+        """At least one collapse must name B's key in the span."""
         span = inventory(span_edges(), backend="kernel",
                          modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "no collapse names"):
             check_copy_up(span_kernel=span)
 
-    def test_span_b2_without_edge_fails(self):
-        span = inventory([item for item in span_edges()
-                          if item["pid"] != PID_B_SPAN],
-                         [collapse_gap()], backend="kernel",
-                         modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
-            check_copy_up(span_kernel=span)
-
-    def test_span_b2_edge_ended_fails(self):
-        edges = [item if item["pid"] != PID_B_SPAN
-                 else edge(PID_B_SPAN, "m8", evidence="maps_match", state="ended")
+    def test_span_b_pre_old_edge_live_fails(self):
+        """The collapsed old edge ended; a live one is the old shape."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B_PRE, "m7")
+                 else edge(PID_B_PRE, "m7")
                  for item in span_edges()]
-        span = inventory(edges, [collapse_gap()], backend="kernel",
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "stale edge"):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b_pre_old_edge_missing_fails(self):
+        """Without the ended old edge the flip is unproven."""
+        edges = [item for item in span_edges()
+                 if (item["pid"], item["module"]) != (PID_B_PRE, "m7")]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "never ended"):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b_pre_new_edge_missing_fails(self):
+        """B-pre's stale ranges must rejoin the proven lower on the new key."""
+        edges = [item for item in span_edges()
+                 if (item["pid"], item["module"]) != (PID_B_PRE, "m8")]
+        span = inventory(edges, span_gaps(), backend="kernel",
                          modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b_pre_new_edge_uncertain_fails(self):
+        """The stale join is mapped deep_scan, never merely uncertain."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B_PRE, "m8")
+                 else edge(PID_B_PRE, "m8", state="uncertain")
+                 for item in span_edges()]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b_pre_new_edge_maps_match_fails(self):
+        edges = [item if (item["pid"], item["module"]) != (PID_B_PRE, "m8")
+                 else edge(PID_B_PRE, "m8", evidence="maps_match")
+                 for item in span_edges()]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b_pre_with_gap_fails(self):
+        """Joined yet still carrying the gap is a contradiction."""
+        span = inventory(span_edges(),
+                         span_gaps() + [unproven_gap(PID_B_PRE)],
+                         backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "still carries the gap"):
             check_copy_up(span_kernel=span)
 
     def test_span_b2_with_identity_loss_fails(self):
         span = inventory(span_edges(),
-                         [collapse_gap(), ("x", "identity_mismatch: stale", PID_B_SPAN)],
+                         span_gaps() + [("x", "identity_mismatch: stale",
+                                         PID_B_SPAN)],
                          backend="kernel", modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=span)
 
-    def test_span_backends_must_agree_on_new_module(self):
-        span = inventory(span_edges(), [collapse_gap()], backend="userspace",
-                         fallback=None,
-                         modules={"m7": KEY_A, "m8": (0, 141, 100)})
+    def test_span_b2_counted_fails(self):
+        """Admitted-unprobed means zero counted entries, never a ledger."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", state="uncertain", count=6,
+                           cov="counted", since=3000, first_seen=2000,
+                           lossy=False)
+                 for item in span_edges()]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
-            check_copy_up(span_userspace=span)
-
-    def test_span_b_pre_shape_change_fails(self):
-        """m7 mapped-only with no gap is the pinned shape: any change FAILs."""
-        b2 = edge(PID_B_SPAN, "m8", evidence="maps_match", count=6,
-                  cov="counted", since=3000, first_seen=2000, lossy=False)
-        variants = {
-            "m7 ended": [edge(PID_A, "m7"),
-                         edge(PID_B_PRE, "m7", state="ended"), b2],
-            "m7 maps_match": [edge(PID_A, "m7"),
-                              edge(PID_B_PRE, "m7", evidence="maps_match"), b2],
-            "m8 mapped": [edge(PID_A, "m7"), edge(PID_B_PRE, "m7"),
-                          edge(PID_B_PRE, "m8", cov="watched_no_use",
-                               since=3000, first_seen=2000), b2],
-            "m8 ended": [edge(PID_A, "m7"), edge(PID_B_PRE, "m7"),
-                         edge(PID_B_PRE, "m8", state="ended"), b2],
-            "m7 missing": [edge(PID_A, "m7"), b2],
-        }
-        for label, edges in variants.items():
-            with self.subTest(label):
-                span = inventory(edges, span_gaps(), backend="kernel",
-                                 modules=dict(D1_MODULES_SPAN))
-                with self.assertRaises(AssertionError):
-                    check_copy_up(span_kernel=span)
-
-    def test_span_b_pre_with_gap_fails(self):
-        """The joined old edge with a refusal row is a contradiction."""
-        span = inventory(span_edges(),
-                         span_gaps() + [stale_gap(PID_B_PRE)],
-                         backend="kernel", modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "still carries the gap"):
             check_copy_up(span_kernel=span)
+
+    def test_span_b2_maps_match_fails(self):
+        """The admitted edge carries deep_scan evidence, never maps_match."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", state="uncertain",
+                           evidence="maps_match")
+                 for item in span_edges()]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b2_without_disclosure_fails(self):
+        """Admitted without not_attached is silence about the unprobed round."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B_SPAN, "m8")
+                 else edge(PID_B_SPAN, "m8", state="uncertain",
+                           cov_reason=None)
+                 for item in span_edges()]
+        span = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_kernel=span)
+
+    def test_span_b2_mapped_on_old_module_fails(self):
+        """Neither B2 nor the twin may map the old module."""
+        span = inventory(span_edges() + [edge(PID_B_SPAN, "m7")],
+                         span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "old module"):
+            check_copy_up(span_kernel=span)
+
+    def test_span_round2_pid_required(self):
+        with self.assertRaisesRegex(AssertionError, "round-2 twin pid"):
+            check_copy_up(b_pre_round2_pid=None)
 
     def test_facts_lower_stack_missing_fails(self):
         facts = facts_text().replace(" lower-stack-b=3", "")
@@ -658,189 +642,135 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "disproven"):
             check_copy_up(dc73_note=NOTE_NEW + " " + NOTE_OLD)
 
-    def test_round2_b_pre_joined_without_gap(self):
-        """B-pre's own later calls: the joined old edge, no gap."""
-        result = check_copy_up(b_pre_round2_calls=1500,
-                               b_pre_round2_pid=PID_B_PRE)
-        record = result["b_pre_round2"]
-        self.assertEqual(record["calls"], 1500)
-        self.assertEqual(record["pid"], PID_B_PRE)
-        self.assertEqual(record["span_kernel"]["gaps"], [])
-        self.assertEqual(record["span_userspace"]["gaps"], [])
-        bad = inventory(
-            span_edges() + [edge(PID_B_PRE, "m8", cov="counted", since=3000,
-                                 count=9, first_seen=2000)],
-            span_gaps(), backend="kernel", modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "only its old edge"):
-            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
-                          b_pre_round2_pid=PID_B_PRE)
+    def test_dc73_note_without_proof_facts_fails(self):
+        """The disclosure alone is not the proof: lower/upper/unprobed/lossy."""
+        with self.assertRaisesRegex(AssertionError, "proof facts"):
+            check_copy_up(dc73_note="run log: copy-up-stale-caller disclosed")
 
-    def test_round2_pid_defaults_to_b_pre(self):
-        result = check_copy_up(b_pre_round2_calls=1500,
-                               b_pre_round2_pid=None)
-        self.assertEqual(result["b_pre_round2"]["pid"], PID_B_PRE)
-
-    def test_round2_explicit_pid_passes(self):
-        """The round-2 twin (a second lower-mapper) is measured by pid."""
-        result = check_copy_up(b_pre_round2_calls=1500,
-                               b_pre_round2_pid=PID_B3)
-        self.assertTrue(result["ok"])
-        record = result["b_pre_round2"]
+    def test_round2_twin_admitted_uncertain_passes(self):
+        """B2 and the twin: admitted under the new key, unprobed."""
+        record = check_copy_up()["b_pre_round2"]
         self.assertEqual(record["pid"], PID_B3)
-        self.assertEqual(record["calls"], 1500)
-        self.assertEqual(record["span_kernel"]["gaps"], [STALE_GAP])
-        self.assertEqual(record["span_userspace"]["gaps"], [STALE_GAP])
-        self.assertEqual(record["twin_shape"], "gap-only")
+        self.assertEqual(record["new_module"], "m8")
+        self.assertEqual(record["twin"], "uncertain")
+        self.assertEqual(record["B2"], "uncertain")
 
-    def test_round2_twin_old_mapped_passes(self):
-        """Fedora twin: the mapped old edge with the ledger counted."""
-        edges = span_edges_twin_mapped()
-        kernel = inventory(edges, [collapse_gap()],
+    def test_round2_twin_mapped_passes(self):
+        """Mapped where the last pass confirmed the member: still unprobed."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B3, "m8")
+                 else edge(PID_B3, "m8", cov_reason="not_attached")
+                 for item in span_edges()]
+        kernel = inventory(edges, span_gaps(), backend="kernel",
+                           modules=dict(D1_MODULES_SPAN))
+        record = check_copy_up(span_kernel=kernel)["b_pre_round2"]
+        self.assertEqual(record["twin"], "mapped")
+
+    def test_round2_twin_gap_only_passes(self):
+        """No edge at all is honestly uncounted — with the gap."""
+        edges = [item for item in span_edges()
+                 if (item["pid"], item["module"]) != (PID_B3, "m8")]
+        kernel = inventory(edges, span_gaps() + [unproven_gap(PID_B3)],
                            backend="kernel", modules=dict(D1_MODULES_SPAN))
-        userspace = inventory(edges, [collapse_gap()],
-                              backend="userspace", fallback=None,
-                              modules=dict(D1_MODULES_SPAN))
-        record = check_copy_up(span_kernel=kernel, span_userspace=userspace,
-                               b_pre_round2_calls=1500,
-                               b_pre_round2_pid=PID_B3)["b_pre_round2"]
-        self.assertEqual(record["twin_shape"], "old-mapped")
-        self.assertEqual(record["span_kernel"]["gaps"], [])
-        self.assertEqual(record["span_userspace"]["gaps"], [])
-
-    def test_round2_twin_old_ended_fails_named(self):
-        edges = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
-                 else edge(PID_B3, "m7", state="ended", count=1500,
-                           cov="counted", since=3000, first_seen=2000,
-                           lossy=False)
-                 for item in span_edges_twin_mapped()]
-        bad = inventory(edges, [collapse_gap()], backend="kernel",
-                        modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "is not mapped"):
-            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
-                          b_pre_round2_pid=PID_B3)
-
-    def test_round2_twin_old_evidence_fails_named(self):
-        """The twin's old edge is deep_scan: maps_match fails."""
-        edges = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
-                 else edge(PID_B3, "m7", evidence="maps_match",
-                           count=1500, cov="counted", since=3000,
-                           first_seen=2000, lossy=False)
-                 for item in span_edges_twin_mapped()]
-        bad = inventory(edges, [collapse_gap()], backend="kernel",
-                        modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "deep_scan"):
-            check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
-                          b_pre_round2_pid=PID_B3)
-
-    def test_round2_twin_new_edge_fails_named(self):
-        """Any new-module edge for the stale twin refuses, whatever its shape."""
-        for label, twin_edge in (
-                ("partial count",
-                 edge(PID_B3, "m8", cov="counted", count=9, since=3000,
-                      first_seen=2000)),
-                ("full count",
-                 edge(PID_B3, "m8", evidence="maps_match", cov="counted",
-                      count=1500, since=3000, first_seen=2000))):
-            with self.subTest(label):
-                edges = span_edges_twin_mapped() + [twin_edge]
-                bad = inventory(edges, [collapse_gap()], backend="kernel",
-                                modules=dict(D1_MODULES_SPAN))
-                with self.assertRaisesRegex(AssertionError,
-                                            "mapped to the new module"):
-                    check_copy_up(span_kernel=bad, b_pre_round2_calls=1500,
-                                  b_pre_round2_pid=PID_B3)
-
-    def test_round2_twin_old_short_fails_named(self):
-        """The mapped twin edge must claim exactly its ledger."""
-        edges = span_edges_twin_mapped(b3_m7_count=1499)
-        kernel = inventory(edges, [collapse_gap()],
-                           backend="kernel", modules=dict(D1_MODULES_SPAN))
-        userspace = inventory(edges, [collapse_gap()],
-                              backend="userspace", fallback=None,
-                              modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "wrong entries"):
-            check_copy_up(
-                span_kernel=kernel, span_userspace=userspace,
-                b_pre_round2_calls=1500, b_pre_round2_pid=PID_B3)
-
-    def test_round2_twin_shape_disagree_fails(self):
-        userspace = inventory(span_edges_twin_mapped(), [collapse_gap()],
-                              backend="userspace", fallback=None,
-                              modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "twin shape"):
-            check_copy_up(span_userspace=userspace, b_pre_round2_calls=1500,
-                          b_pre_round2_pid=PID_B3)
+        record = check_copy_up(span_kernel=kernel)["b_pre_round2"]
+        self.assertEqual(record["twin"], "gap-only")
 
     def test_round2_twin_without_gap_fails_named(self):
         """A stale twin without its refusal row is silence, not a pass."""
-        twin = inventory(span_edges(), [collapse_gap()], backend="kernel",
+        edges = [item for item in span_edges()
+                 if (item["pid"], item["module"]) != (PID_B3, "m8")]
+        twin = inventory(edges, span_gaps(), backend="kernel",
                          modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "has no .* gap"):
-            check_copy_up(span_kernel=twin, b_pre_round2_calls=1500,
-                          b_pre_round2_pid=PID_B3)
+        with self.assertRaisesRegex(AssertionError, "no edge yet no gap"):
+            check_copy_up(span_kernel=twin)
 
-    def test_round2_backends_disagree_fails(self):
-        """Round 2 measured: a twin coverage split is still a divergence."""
-        fedora = span_edges_twin_mapped()
-        kernel = inventory(fedora, [collapse_gap()],
-                           backend="kernel", modules=dict(D1_MODULES_SPAN))
-        split = [item if (item["pid"], item["module"]) != (PID_B3, "m7")
-                 else edge(PID_B3, "m7", count=6 * ITERS_B, cov="unknown",
-                           since=3000, first_seen=2000, lossy=False)
-                 for item in fedora]
-        userspace = inventory(split, [collapse_gap()], backend="userspace",
-                              fallback=None, modules=dict(D1_MODULES_SPAN))
-        with self.assertRaisesRegex(AssertionError, "disagree"):
-            check_copy_up(span_kernel=kernel, span_userspace=userspace,
-                          b_pre_round2_calls=1500, b_pre_round2_pid=PID_B3)
-
-    def test_round2_pid_without_calls_fails(self):
+    def test_round2_twin_counted_fails_named(self):
+        """The admitted twin never counts through the collapse."""
+        edges = [item if (item["pid"], item["module"]) != (PID_B3, "m8")
+                 else edge(PID_B3, "m8", state="uncertain", count=9)
+                 for item in span_edges()]
+        twin = inventory(edges, span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
-            check_copy_up(b_pre_round2_pid=PID_B3,
-                          b_pre_round2_calls=None)
+            check_copy_up(span_kernel=twin)
+
+    def test_round2_twin_admitted_with_gap_fails_named(self):
+        """Admitted yet still carrying the gap is a contradiction."""
+        twin = inventory(span_edges(), span_gaps() + [unproven_gap(PID_B3)],
+                         backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError,
+                                    "admitted yet still carries the gap"):
+            check_copy_up(span_kernel=twin)
+
+    def test_round2_twin_old_mapped_fails_named(self):
+        """The twin never maps the old module."""
+        twin = inventory(span_edges() + [edge(PID_B3, "m7")], span_gaps(),
+                         backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "old module"):
+            check_copy_up(span_kernel=twin)
+
+    def test_round2_twin_unscanned_fails_named(self):
+        """The twin pid must be scanned in the span."""
+        twin = inventory(span_edges(), span_gaps(), backend="kernel",
+                         modules=dict(D1_MODULES_SPAN))
+        twin["callers"] = [c for c in twin["callers"] if c["pid"] != PID_B3]
+        twin["edges"] = [e for e in twin["edges"]
+                         if twin["callers"] and e["caller"] in
+                         {c["id"] for c in twin["callers"]}]
+        with self.assertRaisesRegex(AssertionError, "unscanned"):
+            check_copy_up(span_kernel=twin)
 
     def test_span_profile_missing_fails(self):
         with self.assertRaises(AssertionError):
             check_copy_up(span_profile=None)
 
-    def test_span_profile_single_row_fails(self):
+    def test_span_profile_twin_row_fails(self):
+        """No second object: a twin row is the unshipped shape."""
         document = span_profile()
-        document["evidence"]["discovery"] = \
-            document["evidence"]["discovery"][:1]
-        document["capture"]["modules"] = document["capture"]["modules"][:1]
-        with self.assertRaises(AssertionError):
+        document["capture"]["modules"].append({"path": PROVIDER})
+        document["evidence"]["discovery"].append(
+            dict(document["evidence"]["discovery"][0]))
+        with self.assertRaisesRegex(AssertionError, "one stale row"):
             check_copy_up(span_profile=document)
 
-    def test_span_profile_marker_missing_fails(self):
-        document = span_profile()
-        for row in document["evidence"]["discovery"]:
-            row.pop("layer", None)
-        with self.assertRaises(AssertionError):
-            check_copy_up(span_profile=document)
-
-    def test_span_profile_marker_doubled_fails(self):
+    def test_span_profile_marker_present_fails(self):
+        """The single row carries no layer marker (nothing proved it)."""
         document = span_profile()
         document["evidence"]["discovery"][0]["layer"] = "pre_copy_up"
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "no layer marker"):
             check_copy_up(span_profile=document)
 
-    def test_span_profile_identity_differs_fails(self):
-        document = span_profile()
-        document["evidence"]["discovery"][1]["sha256"] = "abd"
-        with self.assertRaises(AssertionError):
-            check_copy_up(span_profile=document)
-
-    def test_span_profile_twin_total_short_fails(self):
+    def test_span_profile_total_short_fails(self):
         document = span_profile()
         document["functions"][0]["calls"] = ITERS_B - 1
         with self.assertRaises(AssertionError):
             check_copy_up(span_profile=document)
 
-    def test_span_profile_twin_row_missing_fails(self):
+    def test_span_profile_fresh_leak_fails(self):
+        """Any fresh-side leak inflates a total and fails."""
+        document = span_profile()
+        document["functions"][0]["calls"] = ITERS_B + 1
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_profile=document)
+
+    def test_span_profile_function_row_missing_fails(self):
         document = span_profile()
         document["functions"] = [
             row for row in document["functions"]
-            if not (row["names"] == ["C_Digest"] and row["calls"] == 1)]
+            if row["names"] != ["C_Digest"]]
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_profile=document)
+
+    def test_span_profile_exact_verdict_fails(self):
+        """The spanning verdict is honestly lossy, never exact."""
+        document = span_profile()
+        document["evidence"]["verdict_detail"] = "attribution_only"
+        with self.assertRaises(AssertionError):
+            check_copy_up(span_profile=document)
+
+    def test_span_profile_undisclosed_skipped_fails(self):
+        """B2's in-span round is uncounted but never silent."""
+        document = span_profile()
+        document["evidence"]["skipped"] = []
         with self.assertRaises(AssertionError):
             check_copy_up(span_profile=document)
 
@@ -863,44 +793,51 @@ class CopyUpTest(unittest.TestCase):
         with self.assertRaises(AssertionError):
             check_copy_up(span_kernel=span)
 
-    def test_fresh_lane_b_restarted_b_without_edge_fails(self):
+    def test_fresh_restarted_b_without_edge_fails(self):
         fresh = inventory([edge(PID_A, "m7")], backend="kernel",
                           modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
+        with self.assertRaisesRegex(AssertionError, "lost its edge"):
             check_copy_up(fresh_kernel=fresh)
-
-    def test_fresh_lane_b_identity_loss_fails(self):
-        fresh = inventory([edge(PID_A, "m7"), edge(PID_B_POST, "m8")],
-                          [("x", "identity_mismatch: stale", PID_B_POST)],
-                          backend="userspace", fallback=None,
-                          modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
-            check_copy_up(fresh_userspace=fresh)
 
     def test_fresh_restarted_b_unscanned_fails(self):
         fresh = inventory([edge(PID_A, "m7")], backend="kernel",
                           modules=dict(D1_MODULES_SPAN))
         fresh["callers"] = [c for c in fresh["callers"] if c["pid"] != PID_B_POST]
+        with self.assertRaisesRegex(AssertionError, "unscanned"):
+            check_copy_up(fresh_kernel=fresh)
+
+    def test_fresh_restarted_b_wrong_key_fails(self):
+        """B-post edges B's key module after the restart, never A's."""
+        fresh = inventory([edge(PID_A, "m7"), edge(PID_B_POST, "m7")],
+                          backend="kernel", modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "B-post key"):
+            check_copy_up(fresh_kernel=fresh)
+
+    def test_fresh_collapse_survives_fails(self):
+        fresh = inventory([edge(PID_A, "m7"), edge(PID_B_POST, "m8")],
+                          [collapse_gap()], backend="kernel",
+                          modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "survives the restart"):
+            check_copy_up(fresh_kernel=fresh)
+
+    def test_fresh_restarted_b_with_gap_fails(self):
+        fresh = inventory([edge(PID_A, "m7"), edge(PID_B_POST, "m8")],
+                          [unproven_gap(PID_B_POST)], backend="kernel",
+                          modules=dict(D1_MODULES_SPAN))
+        with self.assertRaisesRegex(AssertionError, "still carries the gap"):
+            check_copy_up(fresh_kernel=fresh)
+
+    def test_fresh_identity_loss_fails(self):
+        fresh = inventory([edge(PID_A, "m7"), edge(PID_B_POST, "m8")],
+                          [("x", "identity_mismatch: stale", PID_B_POST)],
+                          backend="kernel", modules=dict(D1_MODULES_SPAN))
         with self.assertRaises(AssertionError):
             check_copy_up(fresh_kernel=fresh)
 
-    def test_fresh_lane_a_silent_restarted_b_fails(self):
-        fresh = inventory([edge(PID_A, "m7")], backend="userspace",
-                          fallback=None, modules=dict(D1_MODULES_SPAN))
-        with self.assertRaises(AssertionError):
-            check_copy_up(lane="A", fresh_userspace=fresh)
-
-    def test_fresh_lane_a_named_loss_passes(self):
-        fresh = inventory([edge(PID_A, "m7")],
-                          [("x", "identity_mismatch: stale", PID_B_POST)],
-                          backend="userspace", fallback=None,
-                          modules=dict(D1_MODULES_SPAN))
-        self.assertTrue(check_copy_up(lane="A", fresh_userspace=fresh)["ok"])
-
-    def test_fresh_after_restart_edges_both_backends(self):
+    def test_fresh_edges_committed_split(self):
         result = check_copy_up()
-        self.assertIn(PID_B_POST, result["fresh"]["kernel_edges"])
-        self.assertIn(PID_B_POST, result["fresh"]["userspace_edges"])
+        self.assertIn(PID_A, result["fresh_kernel_edges"])
+        self.assertIn(PID_B_POST, result["fresh_kernel_edges"])
 
     def test_unknown_lane_fails(self):
         with self.assertRaises(AssertionError):
@@ -1093,7 +1030,7 @@ class FixtureTest(unittest.TestCase):
     def test_d1_run4_old_shape_refused(self):
         facts = (FIXTURES / "d1-facts.txt").read_text() + "lower-stack-b=3\n"
         note = (FIXTURES / "d1-note.txt").read_text()
-        with self.assertRaisesRegex(AssertionError, "wrong entries"):
+        with self.assertRaises(AssertionError):
             ORACLE["copy_up"](
                 load_fixture("d1-pre-kernel.json"),
                 load_fixture("d1-pre-userspace.json"),
@@ -1105,7 +1042,7 @@ class FixtureTest(unittest.TestCase):
                 load_fixture("d1-pre-b.json"),
                 load_fixture("d1-post-b.json"),
                 1452406, 1452576, 1454781, 1456333, 400, 250, "B", note,
-                facts, b2_calls=6, span_profile=span_profile())
+                facts, 1454781, span_profile=span_profile())
 
     def test_d1_negative_fixtures_fail(self):
         facts = (FIXTURES / "d1-facts.txt").read_text() + "lower-stack-b=3\n"
@@ -1123,7 +1060,7 @@ class FixtureTest(unittest.TestCase):
             span_profile=span_profile(),
             pid_a=1452406, pid_b_pre=1452576, pid_b_span=1454781,
             pid_b_post=1456333, iters_a=400, iters_b=250, lane="B",
-            dc73_note=note, facts_text=facts, b2_calls=6)
+            dc73_note=note, facts_text=facts, b_pre_round2_pid=1454781)
         negatives = {
             "duplicated collapse gap":
                 {"span_kernel": load_fixture("d1-span-kernel-dup-collapse.json")},
@@ -1180,10 +1117,7 @@ class OracleCliTest(unittest.TestCase):
                 "--pid-b-post", str(inputs.pop("pid_b_post")),
                 "--iters-a", str(inputs.pop("iters_a")),
                 "--iters-b", str(inputs.pop("iters_b")),
-                "--b2-calls", str(inputs.pop("b2_calls")),
                 "--dc73-note", str(note), "--facts-log", str(facts)]
-        if "b_pre_round2_calls" in inputs:
-            args += ["--b-pre-round2-calls", str(inputs.pop("b_pre_round2_calls"))]
         if "b_pre_round2_pid" in inputs:
             args += ["--b-pre-round2-pid", str(inputs.pop("b_pre_round2_pid"))]
         for key, document in inputs.items():
@@ -1195,32 +1129,27 @@ class OracleCliTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work:
             completed = run_oracle(*self.copy_up_args(work, good_copy_up_inputs()))
             self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertTrue(json.loads(completed.stdout)["ok"])
+            result = json.loads(completed.stdout)
+            self.assertTrue(result["ok"])
+            self.assertEqual(result["b_pre_round2"]["pid"], PID_B3)
+            self.assertEqual(result["b_pre_round2"]["twin"], "uncertain")
             self.assertIn(
                 "D1 cell=D1 copy-up-stale-caller resolved: pid=102 "
-                "edge=old-module mapped (no gap, no new-module edge on either leg)",
+                "edge=new-module mapped (stale ranges rejoined the proven lower "
+                "on the cell's own key; the collapsed old edge ended; no gap)",
                 completed.stderr)
-
-    def test_copy_up_cli_round2_passes(self):
-        inputs = good_copy_up_inputs()
-        inputs["b_pre_round2_calls"] = 1500
-        with tempfile.TemporaryDirectory() as work:
-            completed = run_oracle(*self.copy_up_args(work, inputs))
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(json.loads(completed.stdout)["b_pre_round2"]["calls"], 1500)
-
-    def test_copy_up_cli_round2_pid_passes(self):
-        inputs = good_copy_up_inputs()
-        inputs["b_pre_round2_calls"] = 1500
-        inputs["b_pre_round2_pid"] = PID_B3
-        with tempfile.TemporaryDirectory() as work:
-            completed = run_oracle(*self.copy_up_args(work, inputs))
-            self.assertEqual(completed.returncode, 0, completed.stderr)
-            self.assertEqual(json.loads(completed.stdout)["b_pre_round2"]["pid"], PID_B3)
             self.assertIn(
-                "copy-up-stale-caller round2: pid=105 ledger=1500 "
-                "gap=original_file_unproven (uncounted: no edge)",
+                "D1 cell=D1 copy-up-round2-caller resolved: pid=105 "
+                "ledgered=1500 (admitted: uncertain new edge, "
+                "uncounted: not_attached)",
                 completed.stderr)
+
+    def test_copy_up_cli_requires_round2_pid(self):
+        inputs = good_copy_up_inputs()
+        del inputs["b_pre_round2_pid"]
+        with tempfile.TemporaryDirectory() as work:
+            completed = run_oracle(*self.copy_up_args(work, inputs))
+            self.assertNotEqual(completed.returncode, 0)
 
     def test_copy_up_cli_refuses_mutation(self):
         inputs = good_copy_up_inputs()
@@ -1285,8 +1214,8 @@ class OracleCliTest(unittest.TestCase):
 
     def test_help_names_new_flags(self):
         for command, markers in (
-                ("copy-up", ("--facts-log", "--b-pre-round2-calls",
-                             "--b-pre-round2-pid")),
+                ("copy-up", ("--facts-log", "--b-pre-round2-pid",
+                             "--span-profile")),
                 ("late-reported", ("--iters-l",))):
             completed = run_oracle(command, "--help")
             self.assertEqual(completed.returncode, 0, completed.stderr)

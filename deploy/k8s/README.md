@@ -162,6 +162,8 @@ Why each grant:
   attribute callers past its scan cap. The observer retains it wherever
   the narrow grant is absent (doctor, inspect, scan, and post-setup
   map_files reads); where the narrow set is complete it sheds it.
+  `doctor` reports the invoking set it started with, even though it
+  drops like every other command.
 - **CAP_SYS_PTRACE** — ptrace-mode access to other processes'
   `/proc/<pid>/mem` and `maps` (Yama scope 1, other UIDs).
 - **CAP_DAC_READ_SEARCH** — the memory scan without CAP_DAC_OVERRIDE, and

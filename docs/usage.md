@@ -1974,11 +1974,15 @@ capabilities in the unit over file caps:
 
 ```ini
 [Service]
+User=p11scope
 AmbientCapabilities=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFMON CAP_SYS_PTRACE
 CapabilityBoundingSet=CAP_BPF CAP_CHECKPOINT_RESTORE CAP_DAC_READ_SEARCH CAP_PERFMON CAP_SYS_PTRACE
 ```
 
-Treat the minimal set as root-equivalent for reading: anyone who can
+A root run under that bounding set lacks `CAP_SETUID`, `CAP_SETGID` and
+`CAP_KILL`: `run` then fails its child identity drop with `EPERM`
+instead of a needs-line (the unit above runs as `User=p11scope`, so it
+needs no identity change). Treat the minimal set as root-equivalent for reading: anyone who can
 execute a capability-carrying observer can observe other users'
 processes, so restrict execution (a dedicated group and mode `0750`).
 Inside a container or unit running as uid 0 without file caps, add the

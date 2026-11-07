@@ -19,6 +19,7 @@
 //! inventory facts cross the same batch boundary as discovery facts.
 
 pub(crate) mod instance_input;
+pub(crate) mod module_init;
 
 use instance_input::{
     AdmittedInstance, AdmittedInstanceCall, InstanceRetirement, InstanceSemanticLoss,
@@ -3000,6 +3001,13 @@ pub(crate) struct CallerRegistry {
     /// ENTRY-to-application delay. Boxed and absent by default, so
     /// the default registry pays one branch per applied call.
     settlement_latency: Option<Box<SettlementLatencyHist>>,
+    /// Per-module observed `C_Initialize` returns since the semantic
+    /// lane sealed, sparse: only modules with a tapped return hold an
+    /// entry, so the table never exceeds the admitted module count.
+    module_init: BTreeMap<ModuleId, module_init::ModuleInitRollup>,
+    /// Latched when the run's semantic lane seals: taps and the
+    /// honest absence wording exist only past the seal.
+    semantic_sealed: bool,
 }
 
 impl CallerRegistry {
@@ -3096,6 +3104,8 @@ impl CallerRegistry {
             joint_direct_fallback: 0,
             foreign_unrouted_calls: 0,
             settlement_latency: None,
+            module_init: BTreeMap::new(),
+            semantic_sealed: false,
         }
     }
 
@@ -3108,6 +3118,39 @@ impl CallerRegistry {
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn foreign_unrouted_calls(&self) -> u64 {
         self.foreign_unrouted_calls
+    }
+
+    /// Fold one observed `C_Initialize` return into a module's
+    /// roll-up. The finalizer taps joined (converted) and shed
+    /// Events; both flow only past the lane seal.
+    pub(crate) fn note_module_init(&mut self, _module: ModuleId, _rv: u64) {
+        // RED stub: replaced by the accumulating implementation.
+    }
+
+    /// One module's init roll-up: zeros when nothing tapped it.
+    pub(crate) fn module_init_rollup(&self, _module: ModuleId) -> module_init::ModuleInitRollup {
+        // RED stub: replaced by the table read.
+        module_init::ModuleInitRollup::default()
+    }
+
+    /// Latch the run's semantic seal: from now on init returns are
+    /// recorded, and a quiet module honestly reads unseen.
+    pub(crate) fn set_semantic_sealed(&mut self) {
+        // RED stub: replaced by the latch.
+    }
+
+    /// Whether the run's semantic lane sealed.
+    pub(crate) fn semantic_sealed(&self) -> bool {
+        // RED stub: replaced by the latch read.
+        false
+    }
+
+    /// Whether run-wide EVENTS loss (or an unreadable loss counter)
+    /// may have hidden init evidence: init verdicts without observed
+    /// proof read unknown then.
+    pub(crate) fn semantic_events_lossy(&self) -> bool {
+        // RED stub: replaced by the gap scan.
+        false
     }
 
     /// Enable or disable the diagnostic settlement-latency

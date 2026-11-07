@@ -4196,6 +4196,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             budget: None,
         });
     }
+
+    /// Latch the run's semantic seal on the registry: the driver
+    /// calls this on the sealed arms, so init evidence and the
+    /// honest absence wording exist only past the seal.
+    pub(crate) fn note_semantic_sealed(&mut self) {
+        // RED stub: replaced by the registry latch.
+        let _ = &mut self.registry;
+    }
 }
 
 #[cfg(test)]
@@ -7758,5 +7766,467 @@ mod promotion_lifecycle_tests {
             .err()
             .expect("retired caller refuses");
         assert_eq!(err, PromotionRefusal::CallerRetired);
+    }
+}
+
+#[cfg(test)]
+mod module_init_seam_tests {
+    //! The per-module `C_Initialize` roll-up taps joined (converted)
+    //! and shed (unrouted) Events at the finalizer: a converted OK
+    //! counts, an unrouted failure counts with its rv, and
+    //! non-init or unattributable sheds tap nothing.
+    use super::*;
+    use crate::attach::capture::NativeDomainId;
+    use crate::attach::{BackendSelection, Scope};
+    use crate::discovery::caller_registry::module_init::{C_INITIALIZE, ModuleInitRollup};
+    use crate::discovery::caller_registry::{
+        AdmissionState, ImageAuthority, ModuleInfo, RegistryLimits,
+    };
+    use crate::discovery::hooks::HookRegistry;
+    use crate::discovery::identity::PinnedObjectId;
+    use crate::discovery::instances::{InstanceId, UnknownReason};
+    use crate::inventory_semantics::SemanticBatch;
+    use crate::semantic_capture::{RoutedCall, TickReport};
+    use p11scope_ebpf_common::{Event, InstanceStamp};
+    use pkcs11_types::CkRv;
+    use std::sync::Arc;
+
+    /// A scripted subset with two authorized single-named slots over
+    /// one real pinned object: `C_Initialize` plus a `C_Sign`
+    /// negative control. The registry module key comes from the same
+    /// pin, exactly like the manifest rig, so the subset proves it.
+    struct InitFixture {
+        subset: AttestedSubset,
+        object: PinnedObjectId,
+        module: ModuleKey,
+        init_slot: u32,
+        other_slot: u32,
+        file_offset: u64,
+    }
+
+    impl InitFixture {
+        fn new() -> Self {
+            use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
+            let path = crate::discovery::identity::test_fixture::small_owned_object();
+            let file = open_object(path).unwrap();
+            let inspected = inspect_file(&file).unwrap();
+            let mapping = mapping_file_key(&file).unwrap();
+            let key = p11scope_manifest::maps::ObjectKey {
+                device: p11scope_manifest::maps::Device {
+                    major: mapping.device_major,
+                    minor: mapping.device_minor,
+                },
+                inode: mapping.inode,
+            };
+            let sha256 = inspected.identity.sha256.as_deref().unwrap().to_owned();
+            let path_str = path.to_str().unwrap().to_owned();
+            let pins = crate::discovery::identity::test_fixture::real_scan_pin(
+                path,
+                Some(key),
+                mapping.mount_id,
+                &sha256,
+            );
+            let pin = pins.pinned().next().unwrap();
+            let object = pin.id;
+            let module = ModuleKey::physical(
+                pin.key.device.major,
+                pin.key.device.minor,
+                pin.key.inode,
+                Some(pin.sha256.to_owned()),
+                pin.path,
+            );
+            let slot = |index: u32, name: &str, file_offset: u64| crate::plan::Slot {
+                index,
+                descriptor_index: crate::kinds::function_id(name).unwrap() + 1,
+                object,
+                object_path: path_str.clone(),
+                file_offset,
+                names: vec![name.into()],
+                aliased: false,
+                semantics: crate::kinds::descriptor(name).unwrap(),
+                semantic_authorized: true,
+                semantic_ambiguous: false,
+                fork_safe: true,
+                module_ids: vec![crate::plan::ModuleId(0)],
+            };
+            let plan = crate::plan::AttachPlan::from_slots(vec![
+                slot(0, C_INITIALIZE, 0x1000),
+                slot(1, "C_Sign", 0x2000),
+            ]);
+            let subset = AttestedSubset::scripted(
+                plan,
+                pins,
+                std::collections::BTreeMap::from([(object, std::collections::BTreeSet::from([0]))]),
+            );
+            Self {
+                subset,
+                object,
+                module,
+                init_slot: 0,
+                other_slot: 1,
+                file_offset: 0x1000,
+            }
+        }
+
+        fn endpoint(&self) -> Endpoint {
+            Endpoint {
+                object: self.object,
+                file_slot: 0,
+                offset: self.file_offset,
+            }
+        }
+    }
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .expect("test coordinator builds")
+    }
+
+    /// One routed call record over `slot` with return `rv`.
+    fn routed_call(
+        domain: NativeDomainId,
+        slot: u32,
+        rv: u64,
+        route: Route,
+        endpoint: Option<Endpoint>,
+        token: Option<u64>,
+    ) -> TickOutcome {
+        TickOutcome::Call(RoutedCall::scripted(
+            domain,
+            crate::events::DecodedEventRecord {
+                joint_resource: None,
+                base: crate::semantic_capture::event_record_with_routing(
+                    Event {
+                        slot,
+                        rv,
+                        image: ImageIdentity {
+                            task_cookie: 7,
+                            exec_id: 1,
+                        },
+                        ..Default::default()
+                    },
+                    InstanceStamp::default(),
+                    0x2200,
+                ),
+                object: None,
+            },
+            route,
+            endpoint,
+            token,
+        ))
+    }
+
+    /// Calls disclosed by every unrouted gap, whatever its subject.
+    fn unrouted_gap_calls(coordinator: &InventoryCoordinator<OsProcessSource>) -> u64 {
+        let registry = coordinator.registry();
+        registry
+            .gaps()
+            .iter()
+            .zip(registry.gap_repeats().iter())
+            .filter(|(gap, _)| gap.subject.starts_with("semantic calls unrouted"))
+            .map(|(gap, repeats)| {
+                let count: u64 = gap
+                    .reason
+                    .split_whitespace()
+                    .next()
+                    .and_then(|first| first.parse().ok())
+                    .expect("unrouted gaps lead with their call count");
+                count * repeats
+            })
+            .sum()
+    }
+
+    #[test]
+    fn module_init_rollup_counts_joined_initialize() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let endpoint = fixture.endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let image = ImageIdentity {
+            task_cookie: 7,
+            exec_id: 1,
+        };
+        coordinator
+            .semantic_bindings_mut()
+            .insert(SemanticCallerBinding::scripted(
+                caller,
+                module.clone(),
+                detailed,
+                image,
+                Arc::new(PidPin::test_proc_only(pid)),
+            ))
+            .unwrap();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        let routed = routed_call(
+            detailed,
+            fixture.init_slot,
+            CkRv::OK.0,
+            Route::Joined(InstanceId::from_raw(11)),
+            Some(endpoint),
+            Some(1),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup {
+                calls: 1,
+                ok: 1,
+                already_initialized: 0,
+                last_error_rv: None,
+            },
+            "a converted C_Initialize OK taps the module roll-up"
+        );
+        assert_eq!(
+            unrouted_gap_calls(&coordinator),
+            0,
+            "the joined call sheds nowhere"
+        );
+    }
+
+    #[test]
+    fn module_init_rollup_counts_shed_initialize() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let endpoint = fixture.endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        // No binding: the short-lived caller's C_Initialize sheds
+        // unrouted, but its endpoint still proves the module.
+        let routed = routed_call(
+            detailed,
+            fixture.init_slot,
+            CkRv::GENERAL_ERROR.0,
+            Route::Unknown(UnknownReason::Unobserved),
+            Some(endpoint),
+            Some(2),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup {
+                calls: 1,
+                ok: 0,
+                already_initialized: 0,
+                last_error_rv: Some(CkRv::GENERAL_ERROR.0),
+            },
+            "an unrouted C_Initialize failure taps the module roll-up"
+        );
+        assert_eq!(
+            unrouted_gap_calls(&coordinator),
+            1,
+            "the tap reads the shed without consuming its disclosure"
+        );
+    }
+
+    #[test]
+    fn module_init_rollup_ignores_shed_non_initialize() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let endpoint = fixture.endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        let routed = routed_call(
+            detailed,
+            fixture.other_slot,
+            CkRv::GENERAL_ERROR.0,
+            Route::Unknown(UnknownReason::Unobserved),
+            Some(endpoint),
+            Some(2),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup::default(),
+            "an unrouted non-init shed taps nothing"
+        );
+        assert_eq!(unrouted_gap_calls(&coordinator), 1);
+    }
+
+    #[test]
+    fn module_init_rollup_ignores_shed_unknown_object() {
+        let pid = std::process::id();
+        let mut coordinator = coordinator();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 50)
+            .unwrap();
+        let fixture = InitFixture::new();
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/init/provider.so".into(),
+                key: fixture.module.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("init-fixture".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(1),
+                admission_reasons: Vec::new(),
+            },
+            60,
+        );
+        coordinator.commit_batch(false).unwrap();
+        let mut endpoint = fixture.endpoint();
+        let module = fixture.module.clone();
+        let mut lane =
+            AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)
+                .expect("shell lane starts");
+        let detailed = lane.domain();
+        let module_id = coordinator
+            .registry()
+            .module_id_for(&module)
+            .expect("mapped module resolves");
+        endpoint.object = PinnedObjectId(999);
+        let routed = routed_call(
+            detailed,
+            fixture.init_slot,
+            CkRv::GENERAL_ERROR.0,
+            Route::Unknown(UnknownReason::Unobserved),
+            Some(endpoint),
+            Some(2),
+        );
+        let batch = SemanticBatch::from_tick_report(
+            detailed,
+            TickReport::scripted(vec![routed], Vec::new()),
+            Vec::new(),
+            130,
+        )
+        .unwrap();
+        coordinator.stage_semantic_batch(batch);
+        coordinator
+            .commit_batch_with_semantics(false, Some(&mut lane))
+            .unwrap();
+        assert_eq!(
+            coordinator.registry().module_init_rollup(module_id),
+            ModuleInitRollup::default(),
+            "a shed whose endpoint proves no module taps nothing"
+        );
+        assert_eq!(unrouted_gap_calls(&coordinator), 1);
     }
 }

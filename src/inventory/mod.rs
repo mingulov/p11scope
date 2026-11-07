@@ -26622,4 +26622,303 @@ mod seal_readiness_tests {
             );
         }
     }
+
+    #[test]
+    fn semantic_seal_latch_set_on_scripted_seal() {
+        // The sealed arm latches the run's seal on the registry, so
+        // the init roll-up knows evidence exists only past it.
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![some_preparation(), some_preparation()],
+            Some(Ok(joint_lane(WindDownIo::completing(), false))),
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    false,
+                    false,
+                )
+            },
+        );
+        assert!(lane.is_some(), "the scripted seal seats a lane");
+        assert!(
+            coordinator.registry().semantic_sealed(),
+            "the sealed arm latches the seal"
+        );
+    }
+
+    #[test]
+    fn semantic_seal_latch_absent_when_attach_subset_refused() {
+        // No subset, no seal: init verdicts read unknown, never the
+        // absence wording.
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let scope = Scope::Pid(std::process::id());
+        let lane = seal_startup_test::with(
+            vec![SubsetPreparation {
+                subset: None,
+                refusals: vec![SemanticRefusal::Unattested],
+            }],
+            None,
+            || {
+                start_semantic_lane(
+                    &mut coordinator,
+                    &scope,
+                    crate::attach::BackendSelection::Auto,
+                    false,
+                    false,
+                )
+            },
+        );
+        assert!(lane.is_none(), "a refused subset seats no lane");
+        assert!(
+            !coordinator.registry().semantic_sealed(),
+            "an unsealed run latches nothing"
+        );
+    }
+}
+
+#[cfg(test)]
+mod module_init_render_tests {
+    //! The per-module `C_Initialize` roll-up renders in JSON and
+    //! text: exact counts with the returns-shaped last error, the
+    //! honest absence wording for a sealed quiet module, `unknown`
+    //! without a seal or under event loss, and a provider-naming
+    //! line for observed failures.
+    use super::*;
+    use crate::discovery::caller_registry::{
+        AdmissionState, ImageAuthority, ModuleInfo, RegistryGap,
+    };
+    use crate::inventory_present::{Presentation, render_snapshot};
+    use pkcs11_types::CkRv;
+
+    fn coordinator() -> InventoryCoordinator<OsProcessSource> {
+        InventoryCoordinator::new(
+            Scope::Pid(std::process::id()),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap()
+    }
+
+    /// One admitted mapped module, committed; returns its id.
+    fn mapped_module(coordinator: &mut InventoryCoordinator<OsProcessSource>) -> ModuleId {
+        let pid = std::process::id();
+        let caller = coordinator
+            .adapter_mut()
+            .admit(pid, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let key = ModuleKey::physical(8, 1, 11, Some("sha0011".into()), "/lib/a.so");
+        coordinator.registry_mut().note_mapping(
+            caller,
+            pid,
+            ModuleInfo {
+                path: "/lib/a.so".into(),
+                key: key.clone(),
+                double_loaded: false,
+                build_id: None,
+                identity_source: Some("mountinfo".into()),
+                admission: AdmissionState::Admitted,
+                admission_class: Some("exact".into()),
+                admission_endpoints: Some(2),
+                admission_reasons: Vec::new(),
+            },
+            100,
+        );
+        coordinator.commit_batch(false).unwrap();
+        coordinator
+            .registry()
+            .module_id_for(&key)
+            .expect("mapped module resolves")
+    }
+
+    fn snapshot_text(coordinator: &InventoryCoordinator<OsProcessSource>) -> String {
+        let presentation = Presentation::capture(coordinator, "pid:7", 90, 120, 1);
+        render_snapshot(&presentation)
+    }
+
+    #[test]
+    fn module_initialize_json_reports_unseen_wording_when_sealed_and_quiet() {
+        // Init before seal: the app may have initialised before the
+        // lane sealed, leaving zero taps. The module must word the
+        // absence, never claim "never initialised".
+        let mut coordinator = coordinator();
+        mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+        let init = &document["modules"][0]["initialize"];
+        assert_eq!(init["calls"], 0);
+        assert_eq!(init["ok"], 0);
+        assert_eq!(init["already_initialized"], 0);
+        assert!(init["last_error_rv"].is_null());
+        assert_eq!(init["status"], "unseen");
+        assert_eq!(
+            init["detail"],
+            "no C_Initialize seen since the semantic lane started"
+        );
+        let rendered = serde_json::to_string(&document).unwrap();
+        assert!(
+            rendered.contains("no C_Initialize seen since the semantic lane started"),
+            "the absence wording reaches the document"
+        );
+        assert!(
+            !rendered.contains("never initialised"),
+            "zero taps never print a never-initialised claim: {rendered}"
+        );
+    }
+
+    #[test]
+    fn module_initialize_json_reports_unknown_without_seal() {
+        let mut coordinator = coordinator();
+        mapped_module(&mut coordinator);
+        let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+        let init = &document["modules"][0]["initialize"];
+        assert_eq!(init["calls"], 0);
+        assert_eq!(init["status"], "unknown");
+        assert_eq!(init["detail"], "semantic lane unavailable");
+    }
+
+    #[test]
+    fn module_initialize_json_reports_unknown_on_events_loss() {
+        for subject in [
+            "native capture events lost",
+            "native capture events loss unknown",
+        ] {
+            let mut coordinator = coordinator();
+            mapped_module(&mut coordinator);
+            coordinator.note_semantic_sealed();
+            coordinator.registry_mut().record_gap(RegistryGap {
+                caller: None,
+                module: None,
+                pid: None,
+                subject: subject.into(),
+                reason: "test loss".into(),
+                budget: None,
+            });
+            let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+            let init = &document["modules"][0]["initialize"];
+            assert_eq!(init["status"], "unknown", "subject {subject}");
+            assert_eq!(
+                init["detail"], "event loss may have hidden C_Initialize calls",
+                "subject {subject}"
+            );
+        }
+    }
+
+    #[test]
+    fn module_initialize_json_reports_failed_init() {
+        let mut coordinator = coordinator();
+        let module = mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::GENERAL_ERROR.0);
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::DEVICE_ERROR.0);
+        let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+        let init = &document["modules"][0]["initialize"];
+        assert_eq!(init["calls"], 2);
+        assert_eq!(init["ok"], 0);
+        assert_eq!(init["already_initialized"], 0);
+        assert_eq!(init["last_error_rv"]["rv"], CkRv::DEVICE_ERROR.0);
+        assert_eq!(
+            init["last_error_rv"]["rv_hex"],
+            format!("0x{:x}", CkRv::DEVICE_ERROR.0)
+        );
+        assert_eq!(init["last_error_rv"]["name"], "CKR_DEVICE_ERROR");
+        assert_eq!(init["status"], "failed");
+        assert_eq!(
+            init["detail"], "seen, C_Initialize failed (CKR_DEVICE_ERROR)",
+            "a failing rv names the provider with its CKR name"
+        );
+    }
+
+    #[test]
+    fn module_initialize_json_reports_already_initialized() {
+        let mut coordinator = coordinator();
+        let module = mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::CRYPTOKI_ALREADY_INITIALIZED.0);
+        let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+        let init = &document["modules"][0]["initialize"];
+        assert_eq!(init["calls"], 1);
+        assert_eq!(init["ok"], 0);
+        assert_eq!(init["already_initialized"], 1);
+        assert!(init["last_error_rv"].is_null());
+        assert_eq!(init["status"], "initialised");
+        assert!(
+            init["detail"]
+                .as_str()
+                .unwrap()
+                .contains("CKR_CRYPTOKI_ALREADY_INITIALIZED"),
+            "0x191 counts as initialised: {}",
+            init["detail"]
+        );
+    }
+
+    #[test]
+    fn module_initialize_json_reports_ok_init() {
+        let mut coordinator = coordinator();
+        let module = mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::OK.0);
+        let document = render_json(&coordinator, "pid:7", 90, 120, 1);
+        let init = &document["modules"][0]["initialize"];
+        assert_eq!(init["calls"], 1);
+        assert_eq!(init["ok"], 1);
+        assert_eq!(init["status"], "initialised");
+    }
+
+    #[test]
+    fn module_initialize_text_names_failing_provider() {
+        let mut coordinator = coordinator();
+        let module = mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::GENERAL_ERROR.0);
+        let text = snapshot_text(&coordinator);
+        assert!(
+            text.contains("  init: seen, C_Initialize failed (CKR_GENERAL_ERROR) (1 call)\n"),
+            "the text line names the failing provider: {text}"
+        );
+    }
+
+    #[test]
+    fn module_initialize_text_reports_ok_init() {
+        let mut coordinator = coordinator();
+        let module = mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        coordinator
+            .registry_mut()
+            .note_module_init(module, CkRv::OK.0);
+        let text = snapshot_text(&coordinator);
+        assert!(
+            text.contains("  init: initialised, CKR_OK observed (1 call)\n"),
+            "the text line reports the OK proof: {text}"
+        );
+    }
+
+    #[test]
+    fn module_initialize_text_stays_quiet_without_observations() {
+        let mut coordinator = coordinator();
+        mapped_module(&mut coordinator);
+        coordinator.note_semantic_sealed();
+        let text = snapshot_text(&coordinator);
+        assert!(
+            !text.contains("  init: "),
+            "a quiet module prints no init line (JSON keeps the record): {text}"
+        );
+    }
 }

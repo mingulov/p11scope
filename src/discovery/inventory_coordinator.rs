@@ -760,6 +760,13 @@ fn exit_clocks_comparable_with(
 /// complete in milliseconds at ~64 B per entry (~1 MiB at the cap).
 /// Never lowered.
 const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
+/// Scan-learned exe-probe cache: one entry per distinct caller path
+/// at most, so the retained set cannot outnumber admitted callers
+/// under the default caller bound (4,096). A full cache stops
+/// retaining (the overflow tail probes per build, still correct);
+/// the cap is never lowered.
+const DEFAULT_MAX_EXE_PROBE_CACHE_ENTRIES: usize = 4_096;
+
 
 /// One stashed EXEC exe identity: the `(dev, ino)` pair with the
 /// hook instant and pid that resolution (a) verifies against.
@@ -1473,6 +1480,34 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             };
             let Some(pair) = crate::discovery::unbound_exe::real_maps_identity(path) else {
+                continue;
+            };
+            learned.entry(pair).or_insert_with(|| path.clone());
+        }
+        learned
+    }
+
+    /// Scan-learned exe identities with the probe cache: each
+    /// distinct caller path probes once (deduped by path across
+    /// callers sharing one binary) and the answer — pair or refusal —
+    /// is retained for the capture, so later backfills and staging
+    /// batches rebuild the map without re-probing. A full cache
+    /// stops retaining: the overflow tail probes per build, still
+    /// correct. First path wins per identity.
+    fn scan_exe_identities_cached(
+        adapter: &CallerAdapter<Source>,
+        _cache: &mut HashMap<String, Option<(u64, u64)>>,
+        probe: impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> HashMap<(u64, u64), String> {
+        let mut learned = HashMap::new();
+        for record in adapter.records() {
+            let Some(exe) = record.exe.as_ref() else {
+                continue;
+            };
+            let Some(path) = exe.path.as_ref() else {
+                continue;
+            };
+            let Some(pair) = probe(path) else {
                 continue;
             };
             learned.entry(pair).or_insert_with(|| path.clone());
@@ -29445,6 +29480,85 @@ int main(void) {
             map.len(),
             1,
             "the default caller's placeholder path probes nothing: {map:?}"
+        );
+    }
+
+    /// The learned-path probe runs once per distinct caller path no
+    /// matter how many backfills rebuild the map: two callers
+    /// sharing one binary probe it once, a second build probes
+    /// nothing new, and a caller admitted later probes only its own
+    /// path.
+    #[test]
+    fn exe_probe_cache_probes_each_path_once() {
+        use std::cell::RefCell;
+        let dir = tempfile::tempdir().unwrap();
+        let (path_a, _, _) = staged_tool(&dir, "tool-a");
+        let (path_b, _, _) = staged_tool(&dir, "tool-b");
+        let (path_c, _, _) = staged_tool(&dir, "tool-c");
+        let pair_of = |path: &std::path::PathBuf| {
+            (
+                path.to_string_lossy()
+                    .bytes()
+                    .fold(0u64, |sum, byte| sum.wrapping_add(u64::from(byte))),
+                7,
+            )
+        };
+        let (mut native, _) = NativeScene::new();
+        for (pid, path) in [(9u32, &path_a), (10, &path_a), (11, &path_b)] {
+            native.scene.source.spawn(pid, 100);
+            native.scene.source.exec(pid, 101, path.to_str().unwrap());
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, 100)
+                .unwrap();
+        }
+        let counts: RefCell<HashMap<String, usize>> = RefCell::new(HashMap::new());
+        let probe = |path: &str| {
+            *counts.borrow_mut().entry(path.to_string()).or_default() += 1;
+            Some((pair_of(&PathBuf::from(path)).0, 7))
+        };
+        let mut cache = HashMap::new();
+        let build = |native: &NativeScene,
+                     cache: &mut HashMap<String, Option<(u64, u64)>>,
+                     probe: &dyn Fn(&str) -> Option<(u64, u64)>| {
+            InventoryCoordinator::scan_exe_identities_cached(
+                &native.scene.coordinator.adapter,
+                cache,
+                probe,
+            )
+        };
+        let first = build(&native, &mut cache, &probe);
+        assert_eq!(
+            first.get(&pair_of(&path_a)),
+            Some(&path_a.to_string_lossy().into_owned())
+        );
+        assert_eq!(
+            first.get(&pair_of(&path_b)),
+            Some(&path_b.to_string_lossy().into_owned())
+        );
+        native.scene.source.spawn(12, 100);
+        native.scene.source.exec(12, 101, path_c.to_str().unwrap());
+        native
+            .scene
+            .coordinator
+            .adapter
+            .admit(12, ImageAuthority::ScanPinned, 100)
+            .unwrap();
+        let second = build(&native, &mut cache, &probe);
+        assert_eq!(
+            second.get(&pair_of(&path_c)),
+            Some(&path_c.to_string_lossy().into_owned()),
+            "a caller admitted later joins the map: {second:?}"
+        );
+        for (path, count) in counts.borrow().iter() {
+            assert_eq!(*count, 1, "path {path} probes exactly once");
+        }
+        assert!(
+            counts.borrow().len() >= 3,
+            "every staged path probed: {:?}",
+            counts.borrow().keys().collect::<Vec<_>>()
         );
     }
 

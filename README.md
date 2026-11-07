@@ -59,11 +59,64 @@ available and never calls `C_Initialize`; live observation remains passive.
 
 ## First useful result
 
-After installing, start with a whole-machine inventory, then inspect a process
-you found there (`12345` below is a placeholder):
+After installing, check host readiness, then start with a whole-machine
+inventory and inspect a process you found there. Below is real output
+from the v0.6.0 release binary on Ubuntu 26.04 (kernel 7.0.0-38,
+`perf_event_paranoid=4`, lockdown `integrity`); the `--system` window
+is shortened to 15 s here and the `--pid` target is a long-lived
+SoftHSM caller:
 
 ```sh
-sudo p11scope inventory --system --duration 30s
+sudo p11scope doctor
+```
+
+```
+Doctor: requested-lane checks passed.
+verdict: capture available; run initial-set capture not in this build (run reports stay PARTIAL; run itself works)
+target loader build ............... warn  unbound
+debug-state hook .................. warn  unavailable
+loader-state live read ............ warn  unavailable
+Next: sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target).
+run with -v for details
+```
+
+```sh
+sudo p11scope inventory --system --duration 15s
+```
+
+```
+inventory system (2 passes, 179 callers, 5 provider files, 29 edges)
+coverage: PARTIAL — 304 gaps, 0 refused, 0 more not shown
+key operations: not reported (per-key tracking is off)
+libp11-kit.so.0.4.5: mapped by 1 application (snapd-desktop-integration); activity unknown
+libp11-kit.so.0.4.8: mapped by 24 applications (NetworkManager, chronyd, cups-browsed, …); activity unknown
+libp11-kit.so.0.4.8: mapped by 2 applications (cups-proxyd, cupsd); activity unknown
+opensc-pkcs11.so: mapped by 1 application (gsd-smartcard); activity unknown
+p11-kit-trust.so: mapped by 1 application (gsd-smartcard); activity unknown
+limits: 179 callers, 5 provider files, 29 edges (0 refused); 19607 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
+gaps: 26 × maps attribution — maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 × /home/user/.local/bin/muse-bin-1.4.14-R7309.1 — object is 414927192 bytes; limit is 268435456; 11 × maps attribution — maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 × unloaded libraries — mapped files were deleted (not loss); and 35 more (--json has every item)
+run with -v for details
+```
+
+```sh
+sudo p11scope inventory --pid 920308 --duration 15s
+```
+
+```
+inventory pid:920308 (15 passes, 1 caller, 1 provider file, 1 edge)
+coverage: PARTIAL — 1 gap, 0 refused, 0 more not shown
+key operations: not reported (per-key tracking is off)
+libsofthsm2.so: mapped by 1 application (python3.14); 30 entries observed
+limits: 1 caller, 1 provider file, 1 edge (0 refused); 68 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
+gaps: 1 × process identity checked from /proc (PID and start time), not by the kernel — some processes were identified from /proc only (--json has every item)
+run with -v for details
+```
+
+If a command refuses instead of capturing, see
+[troubleshooting](docs/troubleshooting.md). For a recorded profile
+instead of a live inventory (`12345` below is a placeholder):
+
+```sh
 sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 

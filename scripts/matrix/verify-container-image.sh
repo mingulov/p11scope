@@ -258,14 +258,19 @@ timeout --signal=TERM --kill-after=10s 600s docker build -q -t "$VICTIM_IMAGE" \
     exit 2
 }
 
+SE_FLAGS=()
+if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
+    # SELinux-enforcing hosts (Fedora): confinement is not what is under
+    # test, and confined test containers cannot use the bind mounts below,
+    # so both run unconfined.
+    SE_FLAGS+=(--security-opt label=disable)
+fi
 OBS_FLAGS=(--pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH)
 if [ -r /sys/module/apparmor/parameters/enabled ] \
     && grep -q Y /sys/module/apparmor/parameters/enabled 2>/dev/null; then
     OBS_FLAGS+=(--security-opt apparmor=unconfined)
 fi
-if command -v getenforce >/dev/null 2>&1 && [ "$(getenforce 2>/dev/null)" = Enforcing ]; then
-    OBS_FLAGS+=(--security-opt label=disable)
-fi
+OBS_FLAGS+=("${SE_FLAGS[@]}")
 OBS_FLAGS+=(-v /sys/fs/cgroup:/sys/fs/cgroup:ro)
 echo "observer flags: ${OBS_FLAGS[*]}"
 
@@ -386,7 +391,7 @@ leg_container() {
     log="$OUT/container-observer.log"
     wlog="$OUT/container-workload.log"
     rm -f "$WORK/shared/go-c" "$WORK/shared/fin-c" || return 1
-    timeout --signal=TERM --kill-after=10s 60s docker run -d --name "$VICTIM_NAME" \
+    timeout --signal=TERM --kill-after=10s 60s docker run -d --name "$VICTIM_NAME" "${SE_FLAGS[@]}" \
         -v "$WORK/harness:/usr/local/bin/harness:ro" -v "$WORK/shared:/shared" \
         "$VICTIM_IMAGE" >/dev/null || return 1
     local vpid

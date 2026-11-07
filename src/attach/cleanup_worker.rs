@@ -659,13 +659,13 @@ impl Drop for WorkerState {
 /// How the worker thread starts its three closer helpers: production
 /// spawns threads, tests inject failures. One starter serves both the
 /// eager start and the shed restart, so both paths share the latch.
-pub(crate) type PoolStarter =
+type PoolStarter =
     Arc<dyn Fn(CloseOperation<DetailedClose>) -> Result<ClosePool<DetailedClose>, String> + Send + Sync>;
 
 /// How the worker thread drops its own capabilities on `Shed`:
 /// production calls `caps::drop_to_keep`, tests record the thread and
 /// the mask.
-pub(crate) type ShedDropFn = Arc<dyn Fn(u64) -> std::io::Result<()> + Send + Sync>;
+type ShedDropFn = Arc<dyn Fn(u64) -> std::io::Result<()> + Send + Sync>;
 
 /// Pre-started background worker that closes submitted links in
 /// [`DetachOrder`] while the foreground prints progress.
@@ -727,7 +727,7 @@ impl CleanupWorker {
     /// Test seam: injected closer-helper starter and shed drop alongside
     /// the worker-thread spawn. Production uses [`ClosePool::start`] and
     /// [`crate::caps::drop_to_keep`] through [`pre_start_with_spawn`].
-    pub(crate) fn pre_start_with_hooks(
+    fn pre_start_with_hooks(
         closer: BoxCloser,
         clock: BoxClock,
         spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<std::thread::JoinHandle<()>>,

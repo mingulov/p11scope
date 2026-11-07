@@ -709,6 +709,17 @@ run_joint_cell() {
         finish_cell "$cell" "$dir" "flow=bind-timeout" || return 1
         return 0
     fi
+    log "$cell: waiting for the first offered Joint birth before GO"
+    if ! wait_for_line "p11scope: joint birth offered:" "$dir/observer.out" 180; then
+        log "$cell: no Joint birth offered before load"
+        kill_pidfile "$dir/gen.pid"
+        kill_observer "$dir/observer.pid"
+        wait 2>/dev/null || true
+        exec 9>&-
+        fail_flow "$dir" "no Joint birth offered before load"
+        finish_cell "$cell" "$dir" "flow=birth-timeout" || return 1
+        return 0
+    fi
     log "$cell: opening GO"
     touch "$dir/go"
     start_intruder "$dir"

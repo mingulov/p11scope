@@ -950,13 +950,18 @@ impl InventoryAttachSet {
             // pair, which names both digests under the key. The fresh
             // proof stands on its own: a changed mark on a member
             // vetoes nothing here (the marked object itself is still
-            // never extended).
+            // never extended). A pair key keeps at most two members:
+            // the companion proof admits the second side, never a
+            // third (a rewritten upper refuses below instead of
+            // joining the pair).
             for &object in &live {
                 let digest = self.objects[object.0 as usize]
                     .target
                     .borrowed_file_and_digest()
                     .1;
-                if Self::copyup_pair_links(pins, summary.key, digest, summary.sha256) {
+                if live.len() < 2
+                    && Self::copyup_pair_links(pins, summary.key, digest, summary.sha256)
+                {
                     return Resolution::Fresh;
                 }
             }
@@ -1101,8 +1106,12 @@ impl InventoryAttachSet {
         if let Some(object) = proven {
             // Record the proven view, so a later in-place change seen only
             // under this raw key reads as a changed object, never as a
-            // fresh one on the same inode.
-            if self.aliases < self.limit() {
+            // fresh one on the same inode. A pair key keeps at most two
+            // members, though: the proven routing stands, but a third
+            // alias view is not recorded (the key stays watched through
+            // the pair, and a changed file under it still refuses below).
+            let members = self.by_raw.get(&summary.key).map_or(0, Vec::len);
+            if members < 2 && self.aliases < self.limit() {
                 self.by_raw.entry(summary.key).or_default().push(object);
                 self.aliases += 1;
             }

@@ -643,7 +643,10 @@ run_joint_cell() {
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
     # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
-    sudo -n $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
+    # The drain keeps up with 10k/s only with steady CPU: run the
+    # observer (and the threads it spawns) one step above best-effort
+    # so a contended host cannot starve the ring drain.
+    sudo -n env $(observer_env) nice -n -5 "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
         $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     echo $! > "$dir/observer.pid"

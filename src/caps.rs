@@ -9,6 +9,7 @@
 //! ("Run without sudo") for the operator story.
 
 use std::io;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 /// `CAP_CHOWN` (`linux/capability.h`): hand `-o` outputs to the invoking
 /// user (root runs). Never in the file set.
@@ -265,6 +266,44 @@ pub(crate) fn read_effective_via_capget() -> io::Result<u64> {
     Ok((data[0].effective as u64) | ((data[1].effective as u64) << 32))
 }
 
+/// The invoking effective set `main` records before the startup drop
+/// for `doctor`, which reports it instead of the dropped live set.
+/// Unset for every other command and in tests unless set.
+static INVOKING_EFFECTIVE: AtomicU64 = AtomicU64::new(0);
+static INVOKING_SET: AtomicBool = AtomicBool::new(false);
+
+/// Record the invoking set before the startup drop (doctor only).
+pub fn set_invoking_effective(mask: u64) {
+    INVOKING_EFFECTIVE.store(mask, Ordering::Relaxed);
+    INVOKING_SET.store(true, Ordering::Relaxed);
+}
+
+/// The recorded invoking set, if any.
+pub(crate) fn invoking_effective() -> Option<u64> {
+    if INVOKING_SET.load(Ordering::Relaxed) {
+        Some(INVOKING_EFFECTIVE.load(Ordering::Relaxed))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+static SNAPSHOT_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Serialize the invoking-snapshot tests: the snapshot is global.
+#[cfg(test)]
+pub(crate) fn snapshot_test_guard() -> std::sync::MutexGuard<'static, ()> {
+    SNAPSHOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
+/// Clear the invoking snapshot between tests.
+#[cfg(test)]
+pub(crate) fn clear_invoking_effective_for_test() {
+    INVOKING_SET.store(false, Ordering::Relaxed);
+}
+
 /// `capget`/`capset` header (`linux/capability.h`, version 3).
 #[repr(C)]
 struct CapHeader {
@@ -346,9 +385,8 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// the whole grant surplus there; root keeps a functional subset instead
 /// of the full set. Live capture keeps the minimal set whole (dynamic
 /// attach and rescans run until the end); `doctor` needs the live set
-/// whole (it reports the invoking set, so `main` exempts it from the
-/// startup drop entirely — dropping first would warn about capabilities
-/// the operator granted); `inspect` never
+/// whole (it reports the invoking snapshot `main` records before the
+/// drop, so the drop itself still applies); `inspect` never
 /// loads BPF, and scan-only `inventory` keeps only its
 /// target-read/map-files bits; `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {

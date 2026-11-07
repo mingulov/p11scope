@@ -44,6 +44,7 @@ signal-hook = { version = "0.4.4", default-features = false }
 unicode-width = { version = "=0.2.2", default-features = false }
 
 [dev-dependencies]
+jsonschema = { version = "0.60", default-features = false }
 p11scope-discover = { version = "0.7.0", path = "crates/discover" }
 sha2 = "=0.11.0"
 tempfile = "3"

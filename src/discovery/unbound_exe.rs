@@ -13,7 +13,8 @@
 
 use crate::discovery::caller_registry::{ExeIdentity, ExeResolution, UnboundExe};
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::os::unix::fs::MetadataExt as _;
+use std::path::{Path, PathBuf};
 
 /// Fixed system binary dirs for source (c): never the user's PATH
 /// or environment. `/usr/libexec` is additionally indexed one level
@@ -28,6 +29,18 @@ pub(crate) const SYSTEM_BINARY_DIRS: [&str; 7] = [
     "/usr/libexec",
 ];
 
+/// The one root indexed an extra level below it.
+const LIBEXEC_SUBDIR_ROOT: &str = "/usr/libexec";
+
+/// LIM-1: the system index never holds more entries than this;
+/// measured 5,675 stat-able entries across the fixed roots on the
+/// build host (~60 ms to walk), so the cap carries an order of
+/// magnitude of headroom and is never lowered.
+pub(crate) const DEFAULT_MAX_SYSTEM_INDEX_ENTRIES: usize = 65_536;
+
+/// The index rebuilds at most this often.
+const INDEX_REFRESH_WINDOW_NS: u64 = 5_000_000_000;
+
 /// Live-process reads for source (a): exactly the pid's start time
 /// and exe identity, nothing else.
 pub(crate) struct ProcReads<'a> {
@@ -41,29 +54,54 @@ pub(crate) struct ProcReads<'a> {
     pub tick_ns: u64,
 }
 
+/// A `(dev, ino)` probe for learned or indexed paths.
+type StatProbe<'a> = Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>;
+
 /// Scan-learned identities for source (b): `(dev, ino)` to path,
 /// re-verified by stat at use.
 pub(crate) struct ScanLearned<'a> {
     pub by_identity: &'a HashMap<(u64, u64), String>,
-    pub stat: Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>,
+    pub stat: StatProbe<'a>,
 }
 
-/// Lazy system-binary index plus resolution. RED stub: every input
-/// reads a sentinel.
+/// Lazy system-binary index plus resolution.
 pub(crate) struct ExeResolver {
+    cap: usize,
+    entries: HashMap<(u64, u64), String>,
+    built_at: Option<u64>,
+    /// Builds so far (test-observed; production keeps the count so
+    /// the lazy-build policy stays measurable).
+    #[allow(dead_code)]
+    builds: u64,
+    /// Entries shed past the cap, sticky (test-observed).
+    #[allow(dead_code)]
+    shed: u64,
+    clock: fn() -> Option<u64>,
     #[cfg(test)]
     index_dirs: Option<Vec<PathBuf>>,
+    #[cfg(test)]
+    now_override: Option<u64>,
 }
 
 impl ExeResolver {
     pub(crate) fn new() -> Self {
         Self {
+            cap: DEFAULT_MAX_SYSTEM_INDEX_ENTRIES,
+            entries: HashMap::new(),
+            built_at: None,
+            builds: 0,
+            shed: 0,
+            clock: crate::attach::monotonic_ns,
             #[cfg(test)]
             index_dirs: None,
+            #[cfg(test)]
+            now_override: None,
         }
     }
 
-    /// Resolve one EXEC-joined `(dev, ino)` pair to a path. RED stub.
+    /// Resolve one EXEC-joined `(dev, ino)` pair to a path: a live
+    /// link, a scan record, the system index, else unknown with its
+    /// reason. A `(0, 0)` pair reads unavailable without any read.
     pub(crate) fn resolve(
         &mut self,
         pid: u32,
@@ -73,13 +111,185 @@ impl ExeResolver {
         proc: &ProcReads<'_>,
         scan: &ScanLearned<'_>,
     ) -> UnboundExe {
-        let _ = (pid, dev, ino, hook_ts_ns, proc, scan);
-        let _ = self.index_dirs();
+        if dev == 0 && ino == 0 {
+            return UnboundExe {
+                dev,
+                ino,
+                path: None,
+                resolution: ExeResolution::ExeUnavailable,
+            };
+        }
+        if let Some(path) = Self::via_live_process(pid, dev, ino, hook_ts_ns, proc) {
+            return UnboundExe {
+                dev,
+                ino,
+                path: Some(path),
+                resolution: ExeResolution::ProcAlive,
+            };
+        }
+        if let Some(path) = Self::via_scan_learned(dev, ino, scan) {
+            return UnboundExe {
+                dev,
+                ino,
+                path: Some(path),
+                resolution: ExeResolution::ScanLearned,
+            };
+        }
+        if let Some(path) = self.via_system_index(dev, ino) {
+            return UnboundExe {
+                dev,
+                ino,
+                path: Some(path),
+                resolution: ExeResolution::SystemIndex,
+            };
+        }
         UnboundExe {
-            dev: u64::MAX,
-            ino: u64::MAX,
+            dev,
+            ino,
             path: None,
-            resolution: ExeResolution::NoExecRecord,
+            resolution: ExeResolution::PathUnknown,
+        }
+    }
+
+    /// Source (a): the pid is alive, its start tick predates the
+    /// EXEC (boottime domain, suspend-tolerant), and its live exe
+    /// stats to the joined pair. A reused pid reads a start after
+    /// the EXEC and is never used. Only the start time and the exe
+    /// identity are read — no cwd, cmdline, or environ.
+    fn via_live_process(
+        pid: u32,
+        dev: u64,
+        ino: u64,
+        hook_ts_ns: u64,
+        proc: &ProcReads<'_>,
+    ) -> Option<String> {
+        if !proc.trusted {
+            return None;
+        }
+        let (mono_now, boot_now) = match (proc.mono_now, proc.boot_now) {
+            (Some(mono), Some(boot)) => (mono, boot),
+            _ => return None,
+        };
+        // The kernel floors the start tick, so `start * tick` is a
+        // lower bound on the birth; the EXEC instant is estimated in
+        // the boottime domain with the currently observed suspend
+        // slack (which only grows after the EXEC, so the estimate is
+        // conservative toward refusal). A live start provably after
+        // the EXEC is a different generation: refuse. Residual: a
+        // reuse within one tick plus later suspend, with the same
+        // binary, still alive — the `(dev, ino)` equality below is
+        // the second factor.
+        let start = (proc.start_time)(pid)?;
+        let slack = boot_now.saturating_sub(mono_now);
+        let est = hook_ts_ns.saturating_add(slack);
+        if start.saturating_mul(proc.tick_ns) > est {
+            return None;
+        }
+        let live = (proc.exe_identity)(pid)?;
+        if live.dev != dev || live.ino != ino {
+            return None;
+        }
+        live.path
+    }
+
+    /// Source (b): the scan already learned this `(dev, ino)` from
+    /// an admitted caller; the learned path is re-verified by stat
+    /// (a replaced file refuses).
+    fn via_scan_learned(dev: u64, ino: u64, scan: &ScanLearned<'_>) -> Option<String> {
+        let path = scan.by_identity.get(&(dev, ino))?;
+        if (scan.stat)(path)? != (dev, ino) {
+            return None;
+        }
+        Some(path.clone())
+    }
+
+    /// Source (c): the lazy system index, verified by stat at lookup
+    /// (a deleted or replaced binary refuses).
+    fn via_system_index(&mut self, dev: u64, ino: u64) -> Option<String> {
+        self.refresh_index_if_stale();
+        let path = self.entries.get(&(dev, ino))?;
+        let meta = std::fs::metadata(path).ok()?;
+        if (meta.dev(), meta.ino()) != (dev, ino) {
+            return None;
+        }
+        Some(path.clone())
+    }
+
+    /// Build the index on the first miss, then at most every few
+    /// seconds. Without a clock the cache is kept, never
+    /// rebuild-looped.
+    fn refresh_index_if_stale(&mut self) {
+        if self.built_at.is_some() {
+            match (self.built_at, self.now_ns()) {
+                (Some(built), Some(now)) if now.saturating_sub(built) < INDEX_REFRESH_WINDOW_NS => {
+                    return;
+                }
+                (_, None) => return,
+                _ => {}
+            }
+        }
+        self.rebuild();
+    }
+
+    fn now_ns(&self) -> Option<u64> {
+        #[cfg(test)]
+        if let Some(now) = self.now_override {
+            return Some(now);
+        }
+        (self.clock)()
+    }
+
+    /// Walk the fixed roots (sorted, so hardlinked twins resolve to
+    /// the lexicographically smallest path deterministically),
+    /// following symlinks, skipping non-files, bounded by the cap.
+    /// Unreadable roots shed silently: the index is a hint, and a
+    /// miss degrades to unknown, never to an error.
+    fn rebuild(&mut self) {
+        self.builds += 1;
+        self.entries.clear();
+        for dir in self.index_dirs() {
+            if self.entries.len() >= self.cap {
+                break;
+            }
+            self.index_dir(&dir, 0);
+        }
+        self.built_at = Some(self.now_ns().unwrap_or(0));
+    }
+
+    fn index_dir(&mut self, dir: &Path, depth: usize) {
+        let mut names: Vec<PathBuf> = match std::fs::read_dir(dir) {
+            Ok(read) => read
+                .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+                .collect(),
+            Err(_) => return,
+        };
+        names.sort();
+        for path in &names {
+            let meta = match std::fs::metadata(path) {
+                Ok(meta) => meta,
+                Err(_) => continue,
+            };
+            if !meta.is_file() {
+                continue;
+            }
+            let key = (meta.dev(), meta.ino());
+            if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
+                self.shed = self.shed.saturating_add(1);
+                continue;
+            }
+            self.entries
+                .entry(key)
+                .or_insert_with(|| path.to_string_lossy().into_owned());
+        }
+        if depth == 0 && dir == Path::new(LIBEXEC_SUBDIR_ROOT) {
+            for path in &names {
+                if self.entries.len() >= self.cap {
+                    break;
+                }
+                if path.is_dir() {
+                    self.index_dir(path, 1);
+                }
+            }
         }
     }
 
@@ -98,28 +308,34 @@ impl ExeResolver {
         self.index_dirs = Some(dirs);
     }
 
-    /// Test-only index entry cap. RED stub.
+    /// Test-only index entry cap.
     #[cfg(test)]
     pub(crate) fn set_index_cap(&mut self, cap: usize) {
-        let _ = cap;
+        self.cap = cap;
     }
 
-    /// Test-only clock override (nanoseconds, monotonic). RED stub.
+    /// Test-only clock override (nanoseconds, monotonic).
     #[cfg(test)]
     pub(crate) fn set_now(&mut self, now_ns: u64) {
-        let _ = now_ns;
+        self.now_override = Some(now_ns);
     }
 
-    /// Index builds so far. RED stub.
+    /// Index builds so far.
     #[cfg(test)]
     pub(crate) fn index_builds(&self) -> u64 {
-        0
+        self.builds
     }
 
-    /// Indexed entries. RED stub.
+    /// Indexed entries.
     #[cfg(test)]
     pub(crate) fn index_len(&self) -> usize {
-        0
+        self.entries.len()
+    }
+
+    /// Entries shed past the cap, sticky.
+    #[cfg(test)]
+    pub(crate) fn index_shed(&self) -> u64 {
+        self.shed
     }
 }
 
@@ -128,12 +344,10 @@ impl Default for ExeResolver {
         Self::new()
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::cell::Cell;
-    use std::os::unix::fs::MetadataExt as _;
 
     const TICK_NS: u64 = 10_000_000;
 
@@ -613,6 +827,14 @@ mod tests {
             &scan.scan(),
         );
         assert_eq!(resolver.index_len(), 3);
+        assert_eq!(resolver.index_shed(), 2);
+    }
+
+    /// LIM-1: the index cap is pinned from measurement (5,675
+    /// entries walked on the build host) and is never lowered.
+    #[test]
+    fn index_cap_pinned_from_measurement() {
+        assert_eq!(DEFAULT_MAX_SYSTEM_INDEX_ENTRIES, 65_536);
     }
 
     /// The index refreshes at most every few seconds.

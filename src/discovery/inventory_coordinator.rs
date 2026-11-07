@@ -38,10 +38,10 @@ use crate::attach::capture::{
 use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::{
     AdmissionState, AdmitFailure, BudgetRefusal, CallerAdapter, CallerEvent, CallerId,
-    CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ImageAuthority,
-    MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome, PendingRejection,
-    ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnboundImage, UnknownReason,
-    UseCoverage,
+    CallerRegistry, CountPublication, CoverageNote, EdgeRecord, ExeIdentity, ExeResolution,
+    ImageAuthority, MappingState, ModuleId, ModuleInfo, ModuleKey, PendingCountOutcome,
+    PendingRejection, ProcessSource, RegistryGap, RegistryLimits, ScopedOwnerProof, UnboundExe,
+    UnboundImage, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
     AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
@@ -56,6 +56,7 @@ use crate::discovery::scan::{
     InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
+use crate::discovery::unbound_exe::{ExeResolver, ProcReads, ScanLearned};
 use crate::inspect_system::inventory_cgroup::{
     CgroupAdmissionPermit, CgroupCollectRequest, CgroupCollection, CgroupFence,
     ScopedCollectionOutcome, SharedCollectionWork,
@@ -541,6 +542,22 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     /// Latest observed exec per Detailed ticket: H0-association proof
     /// for gap minting, keyed conservatively for refusal.
     proven_images: HashMap<(NativeDomainId, u64), u64>,
+    /// Latest EXEC exe identity per domain-tagged ticket: the join
+    /// table for unidentified caller images. Never keyed by bare
+    /// PID; bounded, latest wins on re-exec.
+    exec_exe: HashMap<DomainCookie, StashedExec>,
+    exec_exe_cap: usize,
+    /// EXEC records shed past the stash cap (sticky): the shed
+    /// record may be an image's EXEC, so the domain latches loss.
+    exec_exe_shed: u64,
+    /// Domains with EXEC evidence loss (binder loss or stash shed):
+    /// their still-unjoined images read `exec_record_lost`.
+    exec_loss_domains: HashSet<NativeDomainId>,
+    /// Userspace executable resolution (system-index cache).
+    exe_resolver: ExeResolver,
+    /// Cached observer-timems boottime gate for live-process reads
+    /// (the observer's time namespace never changes mid-process).
+    timens_boottime_ok: Option<bool>,
     /// The latest known count per witnessed pair (C7 C4): first-sight
     /// and refresh counts merge here (the maximum wins, with its
     /// observing read) and stage to the edge once the pair binds. One
@@ -733,6 +750,25 @@ fn exit_clocks_comparable_with(
     offsets: Option<&str>,
 ) -> bool {
     crate::attach::clock_origins_comparable_with(active, children, offsets)
+}
+
+/// LIM-1: the EXEC exe-identity stash never holds more entries
+/// than this. It mirrors the per-domain ticket budget (1..=16384):
+/// distinct joinable EXECs per domain cannot exceed minted tickets,
+/// and the stash sheds (counting, latching loss) past it. Measured
+/// (release, std map): 16,384 inserts and 16,384 lookups each
+/// complete in milliseconds at ~64 B per entry (~1 MiB at the cap).
+/// Never lowered.
+const DEFAULT_MAX_EXEC_EXE_STASH: usize = 16_384;
+
+/// One stashed EXEC exe identity: the `(dev, ino)` pair with the
+/// hook instant and pid that resolution (a) verifies against.
+#[derive(Debug, Clone, Copy)]
+struct StashedExec {
+    dev: u64,
+    ino: u64,
+    hook_ts_ns: u64,
+    pid_host: u32,
 }
 
 /// One staged native owner: all preparation I/O (fresh observation,
@@ -1027,6 +1063,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             tail_uncertain: BTreeSet::new(),
             complete_scanned: BTreeSet::new(),
             proven_images: HashMap::new(),
+            exec_exe: HashMap::new(),
+            exec_exe_cap: DEFAULT_MAX_EXEC_EXE_STASH,
+            exec_exe_shed: 0,
+            exec_loss_domains: HashSet::new(),
+            exe_resolver: ExeResolver::new(),
+            timens_boottime_ok: None,
             pair_counts: HashMap::new(),
             pair_targets: HashMap::new(),
             pending_ids: HashMap::new(),
@@ -1264,25 +1306,166 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Test-only system-index root override for executable
-    /// resolution. RED stub.
+    /// resolution (production always indexes the fixed system list).
     #[cfg(test)]
-    pub(crate) fn set_exe_index_dirs(&mut self, _dirs: Vec<std::path::PathBuf>) {}
+    pub(crate) fn set_exe_index_dirs(&mut self, dirs: Vec<std::path::PathBuf>) {
+        self.exe_resolver.set_index_dirs(dirs);
+    }
 
-    /// Test-only EXEC-stash entry cap. RED stub.
+    /// Test-only EXEC-stash entry cap.
     #[cfg(test)]
-    pub(crate) fn set_exec_stash_cap(&mut self, _cap: usize) {}
+    pub(crate) fn set_exec_stash_cap(&mut self, cap: usize) {
+        self.exec_exe_cap = cap;
+    }
 
-    /// EXEC records shed past the stash cap. RED stub.
+    /// EXEC records shed past the stash cap (sticky).
     #[cfg(test)]
     pub(crate) fn exec_exe_shed(&self) -> u64 {
-        0
+        self.exec_exe_shed
     }
 
     /// Scan-learned exe identities visible to resolution:
-    /// `(dev, ino)` to path over admitted callers. RED stub.
+    /// `(dev, ino)` to path over tracked callers — the scan's own
+    /// records, no new reads. First path wins per identity.
     #[cfg(test)]
     pub(crate) fn scan_learned_exe_map(&self) -> std::collections::HashMap<(u64, u64), String> {
-        std::collections::HashMap::new()
+        Self::scan_exe_identities(&self.adapter)
+    }
+
+    /// Stash every ticketed EXEC's exe identity, keyed by the exact
+    /// typed domain/ticket pair (never a bare PID). A re-exec keeps
+    /// its ticket, so the latest EXEC wins; new keys past the cap
+    /// shed (counting, latching domain loss). Images already staged
+    /// for the cookie backfill immediately.
+    fn stash_exec_exes(&mut self, batch: &DiscoveryBatch) {
+        for record in &batch.records {
+            if record.kind != DISCOVERY_KIND_EXEC {
+                continue;
+            }
+            let Some(ticket) = record.exec_task_ticket() else {
+                continue;
+            };
+            let cookie = DomainCookie::new(batch.domain, ticket);
+            let exec = StashedExec {
+                dev: record.pointers[0],
+                ino: record.pointers[1],
+                hook_ts_ns: record.hook_ts_ns,
+                pid_host: (record.pid_tgid >> 32) as u32,
+            };
+            if !self.exec_exe.contains_key(&cookie) && self.exec_exe.len() >= self.exec_exe_cap {
+                self.exec_exe_shed = self.exec_exe_shed.saturating_add(1);
+                self.exec_loss_domains.insert(batch.domain);
+                self.registry.flip_unbound_exec_loss(batch.domain);
+                continue;
+            }
+            self.exec_exe.insert(cookie, exec);
+            self.backfill_unbound_exe(cookie, exec);
+        }
+    }
+
+    /// The EXEC arrived after its row staged: resolve and attach the
+    /// executable to every image set holding the cookie. Images
+    /// staged later join at stage time instead.
+    fn backfill_unbound_exe(&mut self, cookie: DomainCookie, exec: StashedExec) {
+        if !self.registry.has_unbound_image(cookie) {
+            return;
+        }
+        let learned = Self::scan_exe_identities(&self.adapter);
+        let exe = self.resolve_unbound_exe(exec, &learned);
+        self.registry.attach_unbound_exe(cookie, exe);
+    }
+
+    /// Resolve one stashed EXEC to its [`UnboundExe`] verdict. The
+    /// live-process source reads exactly the start time and exe
+    /// identity through the process source — no other reads.
+    fn resolve_unbound_exe(
+        &mut self,
+        exec: StashedExec,
+        learned: &HashMap<(u64, u64), String>,
+    ) -> UnboundExe {
+        let trusted = self.proc_reads_trusted();
+        let mono_now = crate::attach::monotonic_ns();
+        let boot_now = crate::discovery::pause::boot_ns();
+        let tick_ns = crate::discovery::pause::clock_tick_ns();
+        let source = self.adapter.source();
+        let proc = ProcReads {
+            start_time: Box::new(|pid| source.start_time(pid)),
+            exe_identity: Box::new(|pid| source.exe_identity(pid)),
+            trusted,
+            mono_now,
+            boot_now,
+            tick_ns,
+        };
+        let scan = ScanLearned {
+            by_identity: learned,
+            stat: Box::new(|path| {
+                std::fs::metadata(path)
+                    .ok()
+                    .map(|meta| (meta.dev(), meta.ino()))
+            }),
+        };
+        self.exe_resolver.resolve(
+            exec.pid_host,
+            exec.dev,
+            exec.ino,
+            exec.hook_ts_ns,
+            &proc,
+            &scan,
+        )
+    }
+
+    /// Live-process reads are trusted only under agreeing pidns
+    /// numbering (else the pid names the wrong process), comparable
+    /// clocks (else the EXEC cannot be ordered), and an unskewed
+    /// observer boottime (else the start-time bridge is wrong).
+    fn proc_reads_trusted(&mut self) -> bool {
+        if self.timens_boottime_ok.is_none() {
+            self.timens_boottime_ok =
+                Some(!crate::scope::reader_timens_skews_boottime().unwrap_or(true));
+        }
+        crate::pidns::numbering().agrees()
+            && self.exit_clocks_comparable
+            && self.timens_boottime_ok.is_some_and(|ok| ok)
+    }
+
+    /// Latch EXEC evidence loss for `domain` from the binder (exec
+    /// shed, incomplete drains, ring loss, malformed records) and
+    /// flip the domain's still-unjoined images. Idempotent per
+    /// domain: the flip only touches `no_exec_record` verdicts, so
+    /// repeat calls change nothing.
+    fn note_exec_loss_from_binder(&mut self, domain: NativeDomainId) {
+        if self.exec_loss_domains.contains(&domain) {
+            return;
+        }
+        if self.binder.lifecycle_loss_noted(domain) {
+            self.exec_loss_domains.insert(domain);
+            self.registry.flip_unbound_exec_loss(domain);
+        }
+    }
+
+    /// EXEC evidence is lost for `domain` when the binder noted
+    /// lifecycle loss or the stash shed there.
+    fn exec_evidence_lost(&self, domain: NativeDomainId) -> bool {
+        self.exec_loss_domains.contains(&domain) || self.binder.lifecycle_loss_noted(domain)
+    }
+
+    /// Scan-learned exe identities over tracked callers, by
+    /// `(dev, ino)`. Callers without a recorded path contribute
+    /// nothing; first path wins per identity.
+    fn scan_exe_identities(adapter: &CallerAdapter<Source>) -> HashMap<(u64, u64), String> {
+        let mut learned = HashMap::new();
+        for record in adapter.records() {
+            let Some(exe) = record.exe.as_ref() else {
+                continue;
+            };
+            let Some(path) = exe.path.as_ref() else {
+                continue;
+            };
+            learned
+                .entry((exe.dev, exe.ino))
+                .or_insert_with(|| path.clone());
+        }
+        learned
     }
 
     /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
@@ -5999,12 +6182,22 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // Counts merge before the binder's decisions stage, so a
                 // row that binds in this batch stages with its refresh.
                 self.absorb_pair_counts(&batch);
+                // Latch EXEC evidence loss (discovery ring loss rides
+                // the witness health) before decisions stage, so rows
+                // staged below resolve against the current latch.
+                self.note_exec_loss_from_binder(batch.domain);
             }
             NativeBatch::Lifecycle(batch) => {
                 self.lifecycle_high_water_bytes = self
                     .lifecycle_high_water_bytes
                     .max(batch.drain_high_water_bytes);
                 self.binder.absorb_lifecycle(&batch);
+                // Stash EXEC exe identities before the hook loop (the
+                // join is numbering-independent: domain and ticket,
+                // never the pid) and latch any lifecycle loss first,
+                // so rows staged below resolve against it.
+                self.stash_exec_exes(&batch);
+                self.note_exec_loss_from_binder(batch.domain);
                 self.note_leader_exits(&batch);
                 // Exec hooks for callers the binder never held mint through
                 // the hook path (the lost race); held callers stay the
@@ -6370,8 +6563,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let decisions = self.binder.take_decisions();
         let decided = decisions.len();
         let mut unresolved: Vec<String> = Vec::new();
+        // Scan-learned exe identities, built at most once per call
+        // and only when an unbound image stages.
+        let mut learned: Option<HashMap<(u64, u64), String>> = None;
         for decision in decisions {
-            if let Err(reason) = self.stage_witness(decision) {
+            if let Err(reason) = self.stage_witness(decision, &mut learned) {
                 self.registry.note_unresolved_witness();
                 unresolved.push(reason);
             }
@@ -8210,7 +8406,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Stages one decided row against the modules its witness endpoint is
     /// admitted for. `Err` names a row whose endpoint resolves to no
     /// module.
-    fn stage_witness(&mut self, decision: Decision) -> Result<(), String> {
+    fn stage_witness(
+        &mut self,
+        decision: Decision,
+        learned: &mut Option<HashMap<(u64, u64), String>>,
+    ) -> Result<(), String> {
         let Decision { row, binding } = decision;
         let modules = match self.witness_modules(&row) {
             Ok(modules) => modules,
@@ -8235,19 +8435,38 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 let folded = self.drop_pair_count(&row, diagnostic_binding_reason(reason));
                 let keys: Vec<Option<ModuleKey>> = modules.iter().cloned().map(Some).collect();
                 self.note_preadmission(row.host_tgid, &keys, reason, row.recorded_at_ns);
-                let image = UnboundImage {
-                    cookie: row.cookie(),
-                    pid_host: row.host_tgid,
-                    first_call_ns: row.recorded_at_ns,
-                    calls: folded,
-                    // RED stub: the EXEC stash join lands in GREEN;
-                    // every image reads provisionally unjoined here.
-                    exe: crate::discovery::caller_registry::UnboundExe {
+                let cookie = row.cookie();
+                // The EXEC join is the exact typed pair: the row's
+                // domain-tagged cookie against the EXEC's ticket in
+                // the same domain. An arrival resolves now; without
+                // one, latched domain loss reads lost, else the
+                // image stays provisionally unjoined (a later EXEC
+                // backfills it, later loss flips it).
+                let exe = match self.exec_exe.get(&cookie).copied() {
+                    Some(stashed) => {
+                        let learned =
+                            learned.get_or_insert_with(|| Self::scan_exe_identities(&self.adapter));
+                        self.resolve_unbound_exe(stashed, learned)
+                    }
+                    None if self.exec_evidence_lost(cookie.domain()) => UnboundExe {
                         dev: 0,
                         ino: 0,
                         path: None,
-                        resolution: crate::discovery::caller_registry::ExeResolution::NoExecRecord,
+                        resolution: ExeResolution::ExecRecordLost,
                     },
+                    None => UnboundExe {
+                        dev: 0,
+                        ino: 0,
+                        path: None,
+                        resolution: ExeResolution::NoExecRecord,
+                    },
+                };
+                let image = UnboundImage {
+                    cookie,
+                    pid_host: row.host_tgid,
+                    first_call_ns: row.recorded_at_ns,
+                    calls: folded,
+                    exe,
                 };
                 self.registry.note_unbound_witness_with_image(
                     modules,
@@ -29059,6 +29278,8 @@ int main(void) {
         let other = NativeDomainId::mint();
         let endpoint = native.scene.delta.endpoints[0];
         let foreign = WitnessRow::scripted(other, 41, 1, endpoint.object, endpoint.id, 9, 210);
+        // The full read/drain/read/commit protocol per domain: the
+        // trailing empty read closes the horizons so the row decides.
         native.stage(native.stamps.read(other, vec![foreign]));
         native.stage(native.stamps.drain(other));
         native.stage(native.stamps.read(other, Vec::new()));

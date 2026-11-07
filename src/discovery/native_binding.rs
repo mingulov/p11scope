@@ -796,6 +796,16 @@ impl NativeBinder {
             .is_some_and(|index| self.domains[*index].callers.contains_key(&caller))
     }
 
+    /// Sticky lifecycle-evidence loss in `domain` (exec-table shed,
+    /// an incomplete lifecycle drain, discovery ring loss, or
+    /// malformed records): unidentified images of this domain
+    /// without a joined EXEC read `exec_record_lost`.
+    pub(crate) fn lifecycle_loss_noted(&self, domain: NativeDomainId) -> bool {
+        self.domain_indices
+            .get(&domain)
+            .is_some_and(|index| self.domains[*index].loss_ns.is_some())
+    }
+
     fn domain_index(&mut self, domain: NativeDomainId) -> usize {
         match self.domain_indices.get(&domain).copied() {
             Some(index) => index,

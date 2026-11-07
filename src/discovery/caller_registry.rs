@@ -5889,9 +5889,10 @@ impl CallerRegistry {
     }
 
     /// Insert `image` into a slice-1 image set: a known image keeps
-    /// the earliest call and accumulates its folded calls; a new
-    /// image past the bound saturates and counts as dropped instead
-    /// of growing. RED stub: calls and exe stay unwired.
+    /// the earliest call, accumulates its folded calls, and keeps
+    /// its first executable (resolve-once: only the EXEC backfill
+    /// and the loss flip update it); a new image past the bound
+    /// saturates and counts as dropped instead of growing.
     fn insert_unbound_image(
         images: &mut HashMap<DomainCookie, UnboundPid>,
         saturated: &mut bool,
@@ -5899,25 +5900,17 @@ impl CallerRegistry {
         limit: usize,
         image: UnboundImage,
     ) {
-        let _ = (&image.calls, &image.exe);
-        let sentinel = UnboundExe {
-            dev: u64::MAX,
-            ino: u64::MAX,
-            path: None,
-            resolution: ExeResolution::NoExecRecord,
-        };
         if let Some(known) = images.get_mut(&image.cookie) {
             known.first_call_ns = known.first_call_ns.min(image.first_call_ns);
-            known.calls_at_least = 0;
-            known.exe = sentinel;
+            known.calls_at_least = known.calls_at_least.saturating_add(image.calls);
         } else if images.len() < limit {
             images.insert(
                 image.cookie,
                 UnboundPid {
                     pid_host: image.pid_host,
                     first_call_ns: image.first_call_ns,
-                    calls_at_least: 0,
-                    exe: sentinel,
+                    calls_at_least: image.calls,
+                    exe: image.exe,
                 },
             );
         } else {
@@ -5926,17 +5919,59 @@ impl CallerRegistry {
         }
     }
 
+    /// Whether the run-wide image set holds `cookie`: the O(1)
+    /// backfill index. A cookie the saturated run-wide set dropped
+    /// but a module set kept misses the backfill and keeps its
+    /// provisional verdict (an honest unknown, disclosed through
+    /// the saturation accounting) — the price of never scanning
+    /// every module per EXEC.
+    pub(crate) fn has_unbound_image(&self, cookie: DomainCookie) -> bool {
+        self.unidentified_images.contains_key(&cookie)
+    }
+
     /// Backfill one joined executable into every image set holding
-    /// `cookie` (the EXEC arrived after the row staged). RED stub.
+    /// `cookie` (the EXEC arrived after the row staged). Unknown
+    /// cookies attach nowhere and refuse nothing.
     pub(crate) fn attach_unbound_exe(&mut self, cookie: DomainCookie, exe: UnboundExe) {
-        let _ = (cookie, exe);
+        if let Some(known) = self.unidentified_images.get_mut(&cookie) {
+            known.exe = exe.clone();
+        }
+        for module in self.modules.values_mut() {
+            if let Some(unbound) = module.unbound_use.as_mut()
+                && let Some(known) = unbound.images.get_mut(&cookie)
+            {
+                known.exe = exe.clone();
+            }
+        }
     }
 
     /// Lifecycle evidence was lost in `domain`: every image of that
     /// domain still without a joined EXEC reads `exec_record_lost`.
-    /// Images with a joined pair are unaffected. RED stub.
+    /// Images with a joined pair (resolved or unavailable) are
+    /// unaffected: their EXEC provably arrived.
     pub(crate) fn flip_unbound_exec_loss(&mut self, domain: NativeDomainId) {
-        let _ = domain;
+        let lost = UnboundExe {
+            dev: 0,
+            ino: 0,
+            path: None,
+            resolution: ExeResolution::ExecRecordLost,
+        };
+        for (cookie, known) in self.unidentified_images.iter_mut() {
+            if cookie.domain() == domain && known.exe.resolution == ExeResolution::NoExecRecord {
+                known.exe = lost.clone();
+            }
+        }
+        for module in self.modules.values_mut() {
+            let Some(unbound) = module.unbound_use.as_mut() else {
+                continue;
+            };
+            for (cookie, known) in unbound.images.iter_mut() {
+                if cookie.domain() == domain && known.exe.resolution == ExeResolution::NoExecRecord
+                {
+                    known.exe = lost.clone();
+                }
+            }
+        }
     }
 
     /// One module-level witness gap, once per (module, subject).

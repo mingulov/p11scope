@@ -414,7 +414,8 @@ fn inventory_exe_identity_arms_caller_captures_outside_pid_scope() {
 #[test]
 fn inventory_scope_exe_identity_sets_only_the_extensive_bit() {
     let bit = p11scope_ebpf_common::FLAG_TRACK_SHORT_LIVED;
-    for (scope, base) in [(&Scope::System, 0x80 | 0x40)] {
+    {
+        let (scope, base) = (&Scope::System, 0x80 | 0x40);
         let mut maps = ScopeMaps::default();
         publish_inventory_with(scope, true, &mut maps).unwrap();
         assert_eq!(maps.config[0] & bit, bit, "{scope:?}");

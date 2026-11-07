@@ -3245,7 +3245,7 @@ fn parse_task_start(stat: &[u8]) -> Option<u64> {
 /// The kernel clock tick in nanoseconds (`sysconf(_SC_CLK_TCK)`, USER_HZ),
 /// cached: start-time ticks floor births to this granularity. Falls back to
 /// USER_HZ 100 when the sysconf read fails.
-fn clock_tick_ns() -> u64 {
+pub(crate) fn clock_tick_ns() -> u64 {
     static TICK_NS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *TICK_NS.get_or_init(|| {
         // SAFETY: `sysconf` takes only the name constant and returns the

@@ -561,7 +561,7 @@ fn timens_boottime_offset(text: &str) -> Option<bool> {
 /// clock the PID witness reads through. An absent file (no
 /// time-namespace support) means no skew; anything unreadable fails
 /// closed toward refusal.
-fn reader_timens_skews_boottime() -> Result<bool> {
+pub(crate) fn reader_timens_skews_boottime() -> Result<bool> {
     let text = match std::fs::read_to_string("/proc/self/timens_offsets") {
         Ok(text) => text,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),

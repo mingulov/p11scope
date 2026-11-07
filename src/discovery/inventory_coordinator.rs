@@ -27956,7 +27956,7 @@ mod maps_skip_memory_tests {
             inode: 11,
             raw_path: Some(b"/usr/bin/sleep".to_vec()),
         };
-        let digest = digest_maps_snapshot(&[entry.clone()]);
+        let digest = digest_maps_snapshot(std::slice::from_ref(&entry));
         let sweep = vec![
             (10, vec![entry.clone()]),
             (11, vec![entry.clone()]),
@@ -28005,7 +28005,7 @@ mod maps_skip_memory_tests {
             inode: 11,
             raw_path: Some(b"/usr/lib/libprovider.so".to_vec()),
         };
-        let digest = digest_maps_snapshot(&[entry.clone()]);
+        let digest = digest_maps_snapshot(std::slice::from_ref(&entry));
         let sweep = vec![(42, vec![entry])];
         let mut coordinator = skip_coordinator();
         coordinator.note_applied_scan_tasks(&catalog_with_digests(
@@ -28048,7 +28048,7 @@ mod maps_skip_memory_tests {
             inode: 33,
             raw_path: Some(b"/usr/lib/softhsm/libsofthsm2.so".to_vec()),
         };
-        let digest = digest_maps_snapshot(&[before.clone()]);
+        let digest = digest_maps_snapshot(std::slice::from_ref(&before));
         let sweep = vec![(42, vec![before, after])];
         let mut coordinator = skip_coordinator();
         coordinator.note_applied_scan_tasks(&catalog_with_digests(

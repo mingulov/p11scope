@@ -628,7 +628,7 @@ mod tests {
         let live = minimal_live_mask();
         assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
         assert_eq!(post_setup_keep(true, true, live), live);
-        assert_eq!(post_setup_keep(true, true, u64::MAX), u64::MAX & !sys_admin);
+        assert_eq!(post_setup_keep(true, true, u64::MAX), !sys_admin);
         assert_eq!(
             post_setup_keep(false, false, live | sys_admin),
             live | sys_admin

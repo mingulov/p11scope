@@ -270,9 +270,11 @@ def encoded(value):
 
 def validate_owned_argv(config):
     argv = config.observer_args
-    require(len(argv) == 20, 'owned observer command has unexpected arguments')
-    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[13]), Path(argv[14])
-    require(argv == [argv[0], 'run', '--manifest', str(manifest), '--mode', 'metrics',
+    # The observer runs verbose: the post-exit tier proof needs the live
+    # frame's verbose-only privacy marker. The pin stays exact otherwise.
+    require(len(argv) == 21, 'owned observer command has unexpected arguments')
+    manifest, executable, provider = config.out_dir / 'matrix-manifest.json', Path(argv[14]), Path(argv[15])
+    require(argv == [argv[0], 'run', '-v', '--manifest', str(manifest), '--mode', 'metrics',
                     '--pause', 'never', '--duration', str(OWNED_DURATION_SECONDS),
                     '-o', f'{config.prefix}.output', '--',
                     str(executable), str(provider), 'matrix', str(config.ready),

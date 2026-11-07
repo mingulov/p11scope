@@ -924,11 +924,11 @@ root = pathlib.Path(sys.argv[0]).parent
 control = json.loads((root / 'owned-control.json').read_text())
 case = control['case']
 args = sys.argv[1:]
-assert len(args) == 19 and args[:2] == ['run', '--manifest']
-assert args[3:9] == ['--mode', 'metrics', '--pause', 'never', '--duration', '35']
-assert args[9] == '-o' and args[11] == '--'
-assert args[14] == 'matrix'
-ready, done, finish = (pathlib.Path(args[i]) for i in (15, 17, 18))
+assert len(args) == 20 and args[:3] == ['run', '-v', '--manifest']
+assert args[4:10] == ['--mode', 'metrics', '--pause', 'never', '--duration', '35']
+assert args[10] == '-o' and args[12] == '--'
+assert args[15] == 'matrix'
+ready, done, finish = (pathlib.Path(args[i]) for i in (16, 18, 19))
 def marker():
     print('p11scope: capturing: 208 probe(s) attached; stop with Ctrl-C', flush=True)
     print('fixture — privacy=aggregate-only', flush=True)
@@ -960,7 +960,7 @@ if case == 'wrong_executable':
     ready.write_text(json.dumps(dict(schema='p11scope/canary-roster/v1', mode='matrix', pid=child.pid,
         tasks=[dict(pid=child.pid, tid=child.pid, generation=generation, role='leader', call_index=None)])))
 else:
-    child = subprocess.Popen(args[12:])
+    child = subprocess.Popen(args[13:])
     record(child.pid)
 end = time.monotonic() + 3
 while not ready.exists():
@@ -1002,7 +1002,7 @@ elif case == 'handoff_child_early_exit':
     child.terminate()
     child.wait()
 if case != 'handoff_missing':
-    pathlib.Path(args[10]).write_text(json.dumps({'evidence': facts}))
+    pathlib.Path(args[11]).write_text(json.dumps({'evidence': facts}))
 sys.exit(7 if case == 'observer_bad_exit' else 0)
 '''
 
@@ -1024,7 +1024,7 @@ def owned_config(pid, directory, case, program, provider):
         **{name: Path(f'{prefix}.{suffix}') for name, suffix in (
             ('ready', 'ready'), ('go', 'go'), ('done', 'done'), ('finish', 'finish'),
             ('observer_log', 'observer.log'), ('workload_log', 'observer.log'))})
-    config.observer_args = [str(executable), 'run', '--manifest', str(directory / 'matrix-manifest.json'),
+    config.observer_args = [str(executable), 'run', '-v', '--manifest', str(directory / 'matrix-manifest.json'),
         '--mode', 'metrics', '--pause', 'never', '--duration', '35', '-o',
         str(prefix) + '.output', '--', program, provider, 'matrix', str(config.ready),
         str(config.go), str(config.done), str(config.finish)]
@@ -2008,23 +2008,27 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         self.probe('complete_metrics')
 
     def test_owned_argv_rejects_options_overrides_and_mismatched_paths_before_launch(self):
-        changes = {'command': (1, 'profile'), 'manifest': (3, '/tmp/other-manifest.json'),
-            'mode': (5, 'profile'), 'pause': (7, 'always'), 'duration': (9, '6'),
-            'output': (11, '/tmp/other-output'),
-            'separator': (12, '--pid'), 'provider': (14, 'relative-provider.so'),
-            'matrix': (15, 'blocked'), 'ready': (16, '/tmp/other-ready'),
-            'go': (17, '/tmp/other-go'), 'done': (18, '/tmp/other-done'),
-            'finish': (19, '/tmp/other-finish')}
-        for problem in (*changes, 'duplicate_pause', 'kill_timeout', 'missing_tail', 'missing_manifest'):
+        changes = {'command': (1, 'profile'), 'verbose': (2, '--verbose'),
+            'manifest': (4, '/tmp/other-manifest.json'),
+            'mode': (6, 'profile'), 'pause': (8, 'always'), 'duration': (10, '6'),
+            'output': (12, '/tmp/other-output'),
+            'separator': (13, '--pid'), 'provider': (15, 'relative-provider.so'),
+            'matrix': (16, 'blocked'), 'ready': (17, '/tmp/other-ready'),
+            'go': (18, '/tmp/other-go'), 'done': (19, '/tmp/other-done'),
+            'finish': (20, '/tmp/other-finish')}
+        for problem in (*changes, 'duplicate_pause', 'kill_timeout', 'missing_verbose',
+                        'missing_tail', 'missing_manifest'):
             with self.subTest(problem=problem), tempfile.TemporaryDirectory() as directory:
                 config = owned_config(os.getpid(), directory, 'ready_first', str(self.program), str(self.matrix))
                 if problem in changes:
                     index, value = changes[problem]
                     config.observer_args[index] = value
                 elif problem == 'duplicate_pause':
-                    config.observer_args[10:10] = ['--pause', 'never']
+                    config.observer_args[11:11] = ['--pause', 'never']
                 elif problem == 'kill_timeout':
-                    config.observer_args.insert(10, '--kill-on-timeout')
+                    config.observer_args.insert(11, '--kill-on-timeout')
+                elif problem == 'missing_verbose':
+                    config.observer_args.pop(2)
                 elif problem == 'missing_tail':
                     config.observer_args.pop()
                 else:

@@ -330,9 +330,10 @@ impl ExeResolver {
         // The kernel floors the start tick, so `start * tick` is a
         // lower bound on the birth; the EXEC instant is estimated in
         // the boottime domain with the currently observed suspend
-        // slack (which only grows after the EXEC, so the estimate is
-        // conservative toward refusal). A live start provably after
-        // the EXEC is a different generation: refuse. Residual: a
+        // slack. The slack only grows after the EXEC, so the
+        // estimate only grows with it: a start provably after the
+        // EXEC is a different generation and refuses exactly, while
+        // admission widens over a suspended capture. Residual: a
         // reuse within one tick plus later suspend, with the same
         // binary, still alive — the `(dev, ino)` equality below is
         // the second factor.

@@ -29172,7 +29172,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             1
         );
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise names the caller:\n{text}"
@@ -29192,7 +29192,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             2
         );
-        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); pids 9, 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); host pids 9, 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise names both callers:\n{text}"
@@ -29243,7 +29243,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images"],
             1
         );
-        let line = "unidentified callers: at least 2 calls from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 2 calls from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "one cookie is one caller:\n{text}"
@@ -29664,12 +29664,12 @@ int main(void) {
         native.witness(vec![first, second, third]);
         let (text, _) = slice_one_views(&native);
         let line =
-            "unidentified executables: tool-a (2 calls, pids 9, 11); tool-b (1 call, pid 10)";
+            "unidentified executables: tool-a (2 calls, host pids 9, 11); tool-b (1 call, host pid 10)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise groups by executable:\n{text}"
         );
-        let headline = "unidentified callers: at least 3 calls from 3 caller processes never identified (exited or never scanned); pids 9, 10, 11 (not running now or never scanned)";
+        let headline = "unidentified callers: at least 3 calls from 3 caller processes never identified (exited or never scanned); host pids 9, 10, 11 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == headline),
             "the count headline stays byte-identical:\n{text}"
@@ -29692,7 +29692,7 @@ int main(void) {
         native.stage(NativeBatch::Lifecycle(lost));
         let (text, _) = slice_one_views(&native);
         let line =
-            "unidentified executables: executable unknown (exec record lost) (2 calls, pids 9, 10)";
+            "unidentified executables: executable unknown (exec record lost) (2 calls, host pids 9, 10)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise counts the lost executables:\n{text}"
@@ -29701,7 +29701,7 @@ int main(void) {
         native.scene.coordinator.set_exe_index_dirs(Vec::new());
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified executables: executable unknown (no exec record) (1 call, pid 9)";
+        let line = "unidentified executables: executable unknown (no exec record) (1 call, host pid 9)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "unjoined images without loss name their reason:\n{text}"
@@ -29736,7 +29736,7 @@ int main(void) {
         native.execs(records);
         native.witness(rows);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified executables: tool-0 (6 calls, pids 9, 10, 11, 12, 13 (+1 more)); tool-1 (1 call, pid 15); tool-2 (1 call, pid 21); tool-3 (1 call, pid 27); tool-4 (1 call, pid 33) (+1 more)";
+        let line = "unidentified executables: tool-0 (6 calls, host pids 9, 10, 11, 12, 13 (+1 more)); tool-1 (1 call, host pid 15); tool-2 (1 call, host pid 21); tool-3 (1 call, host pid 27); tool-4 (1 call, host pid 33) (+1 more)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise truncates groups and pids with counts:\n{text}"
@@ -29774,7 +29774,7 @@ int main(void) {
         ]);
         let (text, _) = slice_one_views(&native);
         let line = format!(
-            "unidentified executables: {} (1 call, pid 9); {} (1 call, pid 10)",
+            "unidentified executables: {} (1 call, host pid 9); {} (1 call, host pid 10)",
             pa.display(),
             pb.display()
         );
@@ -29816,7 +29816,7 @@ int main(void) {
         native.execs(vec![exec_record(41, 9, 100, mapped_dev, meta.ino())]);
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified executables: tool (1 call, pid 9)";
+        let line = "unidentified executables: tool (1 call, host pid 9)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise names the bridged executable:\n{text}"
@@ -30095,7 +30095,7 @@ int main(void) {
             document["observation"]["native_witnesses"]["unbound_images_saturated"],
             false
         );
-        let line = "unidentified callers: at least 4097 calls from 4097 caller processes never identified (exited or never scanned); pids 9, 9, 9, 9, 9 (+4092 more; not running now or never scanned)";
+        let line = "unidentified callers: at least 4097 calls from 4097 caller processes never identified (exited or never scanned); host pids 9, 9, 9, 9, 9 (+4092 more; not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "the run-wide count stays exact:\n{text}"
@@ -30125,7 +30125,7 @@ int main(void) {
             16385 - 4096
         );
         assert!(
-            text.contains("from 16384 caller processes never identified (exited or never scanned); pids 9, 9, 9, 9, 9 (+16380 more; not running now or never scanned); image bound reached, more callers possible"),
+            text.contains("from 16384 caller processes never identified (exited or never scanned); host pids 9, 9, 9, 9, 9 (+16380 more; not running now or never scanned); image bound reached, more callers possible"),
             "saturation is disclosed:\n{text}"
         );
     }
@@ -30182,7 +30182,7 @@ int main(void) {
         let (text, document) = slice_one_views(&native);
         assert_eq!(document["edges"][0]["entries"]["count"], 9);
         assert_eq!(document["modules"][0]["unbound_use"]["entries"], 1);
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "only unidentified use counts:\n{text}"
@@ -30196,7 +30196,7 @@ int main(void) {
         let row = native.row(41, 1, 9, 210, 0);
         native.witness(vec![row]);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise lists the host pid:\n{text}"
@@ -30269,7 +30269,7 @@ int main(void) {
         let census = native.scene.coordinator.registry.witness_census().clone();
         assert_eq!((census.rows, census.bound, census.pending), (1, 0, 0));
         let (text, document) = slice_one_views(&native);
-        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); pids 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "the pid stays bare:\n{text}"
@@ -30298,7 +30298,7 @@ int main(void) {
                 {"pid_host": 9, "first_call_ns": 220},
             ])
         );
-        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); pids 9, 9 (not running now or never scanned)";
+        let line = "unidentified callers: at least 2 calls from 2 caller processes never identified (exited or never scanned); host pids 9, 9 (not running now or never scanned)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "one entry per image:\n{text}"

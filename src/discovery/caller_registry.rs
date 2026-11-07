@@ -2483,8 +2483,9 @@ pub(crate) enum ExeResolution {
     /// kernel read failed.
     ExeUnavailable,
     /// No EXEC record joined this image and no lifecycle loss was
-    /// observed: the exec predates the capture, or the ticket was
-    /// unavailable (PID scope stamps none).
+    /// observed: the exec predates the capture, the image is a fork
+    /// child that never exec'd, or the ticket was unavailable (PID
+    /// scope stamps none).
     NoExecRecord,
     /// No EXEC record joined this image while lifecycle evidence
     /// was lost in its domain: the record may be among the loss.

@@ -1699,6 +1699,7 @@ The old bounds are measurements, not a product startup SLA.
   whose EXEC never arrived reads why: `exec_record_lost` (counted)
   under lifecycle loss, `no_exec_record` when the exec predates the
   capture or the ticket was unavailable (PID scope stamps none; a
+  fork child that never exec'd has no EXEC record of its own; a
   process that exec'd before the capture, called during it, and
   exited before the first scan pass leaves no record and no loss —
   the known gap), `exe_unavailable` when the kernel read failed, or

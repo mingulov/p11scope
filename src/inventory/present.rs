@@ -2629,11 +2629,11 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
             .collect();
         let pids_more = members.len().saturating_sub(shown.len());
         let pids_text = if members.len() == 1 {
-            format!("pid {}", shown.join(", "))
+            format!("host pid {}", shown.join(", "))
         } else if pids_more > 0 {
-            format!("pids {} (+{pids_more} more)", shown.join(", "))
+            format!("host pids {} (+{pids_more} more)", shown.join(", "))
         } else {
-            format!("pids {}", shown.join(", "))
+            format!("host pids {}", shown.join(", "))
         };
         parts.push(format!(
             "{name} ({} call{}, {pids_text})",
@@ -2898,12 +2898,12 @@ fn render_snapshot_inner(
                     .saturating_add(presentation.unbound_pids_dropped);
                 if more > 0 {
                     format!(
-                        "; pids {} (+{more} more; not running now or never scanned)",
+                        "; host pids {} (+{more} more; not running now or never scanned)",
                         shown.join(", ")
                     )
                 } else {
                     format!(
-                        "; pids {} (not running now or never scanned)",
+                        "; host pids {} (not running now or never scanned)",
                         shown.join(", ")
                     )
                 }

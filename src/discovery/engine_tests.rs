@@ -4732,6 +4732,34 @@ fn cgroup_reused_pid_after_a_pruned_birth_counts_two_gaps() {
 }
 
 #[test]
+fn cgroup_overlap_exit_counts_only_its_own_generation_in_both_drain_orders() {
+    // The old generation exits during the walk that prunes it, so its exit
+    // lies inside the reused pid's bound too. One ledger exit belongs to
+    // one generation: the reused birth still gaps on its own.
+    for exit_before_mark in [true, false] {
+        let mut engine = cgroup_generation_engine();
+        walk_scope(&mut engine, &[4242], 100);
+        engine.mark_newcomer_arrival(4242, Some(110));
+        walk_scope(&mut engine, &[], 200);
+        assert_eq!(engine.pid_descendant_gaps(), 1);
+        walk_scope(&mut engine, &[4242], 300);
+        if exit_before_mark {
+            drain_newcomer_exit(&mut engine, 4242, 203);
+            engine.mark_newcomer_arrival(4242, Some(310));
+        } else {
+            engine.mark_newcomer_arrival(4242, Some(310));
+            drain_newcomer_exit(&mut engine, 4242, 203);
+        }
+        walk_scope(&mut engine, &[], 400);
+        assert_eq!(
+            engine.pid_descendant_gaps(),
+            2,
+            "exit drained before the mark: {exit_before_mark}; the reused birth must gap once"
+        );
+    }
+}
+
+#[test]
 fn cgroup_finish_sweep_adds_nothing_for_admitted_or_exit_matched_newcomers() {
     // Healthy twin of the finish sweep: an admitted newcomer and one
     // whose exit already counted its gap add nothing at finish.

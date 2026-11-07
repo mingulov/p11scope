@@ -453,6 +453,13 @@ pub struct Engine {
     max_scan_pids: usize,
     loader_registry: LoaderRegistry,
     owned_initial_exec: Option<OwnedInitialExec>,
+    /// The owned run child's PID once `start_owned_session` binds this
+    /// engine to an owned run. Its view is the one named generation:
+    /// it always arms its loader, even under the run-tree cgroup
+    /// scope, so the pause follows the direct target's exec chain as
+    /// it did when runs were exact-PID captures. Other member views
+    /// stay exploratory under the ownership gate.
+    owned_run_pid: Option<u32>,
     terminal_batch: Option<TerminalBatch>,
     terminal_journal: Option<TerminalJournal>,
     pending_discovery_records: Vec<QueuedDiscoveryRecord>,
@@ -10726,6 +10733,7 @@ impl Engine {
             max_scan_pids: MAX_SCAN_PIDS,
             loader_registry: LoaderRegistry::default(),
             owned_initial_exec: None,
+            owned_run_pid: None,
             terminal_batch: None,
             terminal_journal: None,
             pending_discovery_records: Vec::new(),
@@ -30478,6 +30486,7 @@ impl Engine {
         backend: BackendSelection,
     ) -> Result<Session> {
         self.note_graph_inputs_mutated();
+        self.owned_run_pid = Some(child.pid());
         let generation = OwnedPauseGeneration::from_owned_child(child);
         self.start_session_with(policy, Some(generation), Some(child), ring_bytes, backend)
     }

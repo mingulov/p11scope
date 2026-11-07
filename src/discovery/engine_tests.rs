@@ -15647,6 +15647,43 @@ fn engine_retains_pid_reports_live_views_only() {
 }
 
 #[test]
+fn loader_arming_gate_spares_the_owned_run_child_under_tree_scope() {
+    let mut engine = Engine::empty();
+    engine.scope = Scope::Cgroup {
+        id: 1,
+        path: "/".into(),
+        dir: std::sync::Arc::new(std::fs::File::open("/").unwrap()),
+    };
+    engine.next_view_id = 2;
+    engine
+        .views
+        .push(ProcessView::open(ProcessViewId(0), std::process::id()).expect("own view opens"));
+    let mut sleeper = std::process::Command::new("sleep")
+        .arg("30")
+        .spawn()
+        .expect("spawn sleeper");
+    engine.views.push(
+        ProcessView::open(ProcessViewId(1), sleeper.id()).expect("sleeper view opens"),
+    );
+    // Provider-free under a generation-admitting scope: both gate.
+    assert!(engine.loader_arming_gated(ProcessViewId(0)));
+    assert!(engine.loader_arming_gated(ProcessViewId(1)));
+    // The owned run child is the one named generation: it always
+    // arms, so the pause follows its exec chain; other members stay
+    // exploratory.
+    engine.owned_run_pid = Some(std::process::id());
+    assert!(!engine.loader_arming_gated(ProcessViewId(0)));
+    assert!(engine.loader_arming_gated(ProcessViewId(1)));
+    // Exact-PID scope never gates (base behavior, unaffected).
+    engine.scope = Scope::Pid(1);
+    engine.owned_run_pid = None;
+    assert!(!engine.loader_arming_gated(ProcessViewId(0)));
+    assert!(!engine.loader_arming_gated(ProcessViewId(1)));
+    sleeper.kill().expect("kill sleeper");
+    sleeper.wait().expect("reap sleeper");
+}
+
+#[test]
 fn engine_note_run_tree_gap_publishes_under_the_run_tree_subject() {
     let mut engine = Engine::empty();
     assert_eq!(engine.run_tree_handed_back(), 0);

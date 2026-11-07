@@ -121,19 +121,29 @@ const AF_NETLINK: u32 = 16;
 // Ioctl denials below: terminal-input-injection stays exact
 // (TIOCSTI/TIOCLINUX), while filesystem mutation is denied by _IOC_TYPE
 // byte (bits 8-15 of the command): btrfs subvolume/snapshot creation
-// bypasses the Landlock path hooks, and the inode mutators are reachable
-// from an O_RDONLY fd (Landlock's IOCTL_DEV does not mediate regular
-// files). Every other ioctl stays allowed.
+// and ocfs2 reflink bypass the Landlock path hooks, and the inode
+// mutators are reachable from an O_RDONLY fd (Landlock's IOCTL_DEV
+// does not mediate regular files). Every other ioctl stays allowed.
 const TIOCSTI: u32 = 0x5412;
 const TIOCLINUX: u32 = 0x541C;
 // Masked command values (cmd & 0xff00): btrfs 0x94 (incl.
-// FICLONE/FIDEDUPERANGE), 'f' 0x66 (inode flags, verity, fscrypt),
-// 'X' 0x58 (fsxattr), 'v' 0x76 (versions), f2fs 0xf5.
+// FICLONE/FIDEDUPERANGE/FICLONERANGE), 'f' 0x66 (inode flags, verity,
+// fscrypt), 'X' 0x58 (fsxattr), 'v' 0x76 (versions), f2fs 0xf5,
+// ocfs2 'o' 0x6f (reflink and group ioctls) and FAT 'r' 0x72
+// (attribute mutation). The 'o'/'r' collateral is UBI/DVB device
+// ioctls only, never needed at discovery.
+// These are the x86-64 (asm-generic) numbers: on powerpc, alpha,
+// sparc and mips FIOCLEX/FIONBIO ride 'f' instead of 'T', so the same
+// bytes would read differently there. The arch gate and the x86-64-only
+// helper admit only x86-64 callers, so these are the only numbers that
+// can arrive.
 const IOCTL_TYPE_BTRFS: u32 = 0x9400;
 const IOCTL_TYPE_FS: u32 = 0x6600;
 const IOCTL_TYPE_FSXATTR: u32 = 0x5800;
 const IOCTL_TYPE_FSVER: u32 = 0x7600;
 const IOCTL_TYPE_F2FS: u32 = 0xf500;
+const IOCTL_TYPE_OCFS2: u32 = 0x6f00;
+const IOCTL_TYPE_FAT: u32 = 0x7200;
 
 // x86-64 syscall numbers in the denylist (contract §5).
 const SYS_IOCTL: u32 = 16;
@@ -383,23 +393,25 @@ impl FilterBuilder {
         // ioctl(fd, cmd, ...): TIOCSTI/TIOCLINUX inject input into the
         // operator's terminal and stay exact; filesystem mutation is
         // denied by type byte (cmd & 0xff00), because btrfs
-        // subvolume/snapshot creation bypasses the Landlock path hooks
-        // and the inode ioctls mutate flags, xattr, version, encryption
-        // policy or verity from an O_RDONLY fd. Every other ioctl stays
-        // allowed.
+        // subvolume/snapshot creation and ocfs2 reflink bypass the
+        // Landlock path hooks, and the inode/FAT ioctls mutate flags,
+        // attributes, xattr, version, encryption policy or verity from
+        // an O_RDONLY fd. Every other ioctl stays allowed.
         let ioctl_check = self.emit(stmt(BPF_LD_W_ABS, ARG1_LO_OFFSET));
         let mut ioctl_jumps = Vec::with_capacity(2);
         for cmd in [TIOCSTI, TIOCLINUX] {
             ioctl_jumps.push(self.jeq(cmd));
         }
         let ioctl_mask = self.emit(stmt(BPF_ALU_AND_K, 0xff00));
-        let mut ioctl_type_jumps = Vec::with_capacity(5);
+        let mut ioctl_type_jumps = Vec::with_capacity(7);
         for masked in [
             IOCTL_TYPE_BTRFS,
             IOCTL_TYPE_FS,
             IOCTL_TYPE_FSXATTR,
             IOCTL_TYPE_FSVER,
             IOCTL_TYPE_F2FS,
+            IOCTL_TYPE_OCFS2,
+            IOCTL_TYPE_FAT,
         ] {
             ioctl_type_jumps.push(self.jeq(masked));
         }

@@ -548,10 +548,11 @@ is writable. IP networking, socket connect/bind, and
 exec/mount/ptrace/BPF/io_uring/file-metadata syscalls fail with `EACCES`,
 as do the terminal-input-injection ioctls `TIOCSTI`/`TIOCLINUX` and the
 filesystem-mutation ioctl types: btrfs (`0x94`, including subvolume,
-snapshot, `FICLONE`/`FIDEDUPERANGE`), `f` (`0x66`: inode flags, verity,
-fscrypt), `X` (`0x58`: fsxattr), `v` (`0x76`: versions) and f2fs
-(`0xf5`). Reads in those types (such as `FS_IOC_GETFLAGS`) are denied
-along with the mutations. The fence needs Landlock ABI 5 or newer and an
+snapshot, `FICLONE`/`FIDEDUPERANGE`/`FICLONERANGE`), `f` (`0x66`:
+inode flags, verity, fscrypt), `X` (`0x58`: fsxattr), `v` (`0x76`:
+versions), f2fs (`0xf5`), ocfs2 (`0x6f`: reflink) and FAT (`0x72`:
+attributes). Reads in those types (such as `FS_IOC_GETFLAGS`) are
+denied along with the mutations. The fence needs Landlock ABI 5 or newer and an
 x86-64 helper; when either is unavailable the helper refuses before
 loading rather than running weaker. A provider that needs a denied access
 at discovery time fails plainly (a loader or getter error, or an

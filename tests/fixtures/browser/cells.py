@@ -239,6 +239,143 @@ def wait_for_mapping(pid: int, needles: tuple[str, ...], timeout_seconds: float 
     return False
 
 
+class SoftCallProcess:
+    """A running background SoftHSM slot-listing caller (test-owned)."""
+
+    def __init__(self, proc: subprocess.Popen, log: Path) -> None:
+        self._proc = proc
+        self.log = log
+
+    def stop(self, timeout_seconds: float = 10.0) -> None:
+        """SIGTERM, escalate to SIGKILL past the timeout; always reaped."""
+        proc = self._proc
+        if proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait(timeout=timeout_seconds)
+
+
+def start_soft_call(module: Path, workdir: Path, *,
+                    interval_seconds: float = 1.0,
+                    max_calls: int = 900,
+                    env: dict | None = None) -> SoftCallProcess:
+    """Start a background 1-call/s SoftHSM slot-listing caller.
+
+    Keeps a provider-active process on ``module`` (v0.6.0 F1): an
+    observer-first seal must still cover a browser that arrives later.
+    ``env`` (notably ``SOFTHSM2_CONF``) rides into the caller. Waits
+    for its READY line; ``max_calls`` self-limits the caller when the
+    test dies without stopping it.
+    """
+    workdir.mkdir(parents=True, exist_ok=True)
+    log = workdir / "soft-call.log"
+    script = Path(__file__).resolve().parent / "soft_call_1s.py"
+    child_env = dict(os.environ)
+    child_env.update(env or {})
+    with open(log, "w", encoding="utf-8") as handle:
+        proc = subprocess.Popen(
+            [sys.executable, "-I", str(script), str(module),
+             str(interval_seconds), str(max_calls)],
+            env=child_env, stdin=subprocess.DEVNULL,
+            stdout=handle, stderr=subprocess.STDOUT,
+            start_new_session=True)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise CellError(
+                f"soft-call exited during startup: {log.read_text()[-500:]}")
+        if "READY " in log.read_text():
+            return SoftCallProcess(proc, log)
+        time.sleep(0.2)
+    proc.kill()
+    proc.wait()
+    raise CellError(f"soft-call never became ready: {log.read_text()[-500:]}")
+
+
+def observe_first_system(name: str, browser: str, workdir: Path, *,
+                         plain_url: str, cc_url: str, nss_credential,
+                         duration_seconds: int = 90,
+                         extra_prefs: dict | None = None) -> CellResult:
+    """Observer-first ``inventory --system --key-operations`` browser cell.
+
+    Starts the observer before the browser (v0.6.0 F1): the scan seal
+    must settle over the browser's provider even when another
+    provider-active process predates the observer. Drives a plain
+    visit plus a PIN-less client-cert visit (the browser signs with
+    its own seeded NSS token) after the seal, then asserts nothing
+    itself — the caller owns the oracle over the written report.
+    """
+    _trusted_dir(workdir)
+    report = workdir / "inventory.json"
+    observer_out = workdir / "observer.out"
+    observer_err = workdir / "observer.err"
+    binary = p11scope_bin()
+    check_sudo()
+    with open(observer_out, "w", encoding="utf-8") as out, \
+            open(observer_err, "w", encoding="utf-8") as err:
+        observer = subprocess.Popen(
+            [str(binary), "inventory", "--system", "--key-operations",
+             "--duration", str(duration_seconds), "-o", str(report)],
+            stdin=subprocess.DEVNULL, stdout=out, stderr=err,
+            start_new_session=True)
+    facts: dict = {}
+    try:
+        # Import here so collection never requires playwright before preflight.
+        from playwright.sync_api import sync_playwright  # noqa: PLC0415
+        from flows import make_client_cert_visit, make_visit  # noqa: PLC0415
+
+        with sync_playwright() as pw:
+            context, _match, _profile = launch_browser_context(
+                pw, browser, workdir, register_module=None,
+                extra_prefs=extra_prefs, flow_url=cc_url,
+                nss_credential=nss_credential)
+            try:
+                _wait_for_seal(observer_err, observer, timeout_seconds=300.0)
+                page = context.pages[0] if context.pages else context.new_page()
+                try:
+                    facts["plain"] = make_visit(plain_url)(page, context)
+                except Exception as exc:  # noqa: BLE001 - flow failure is cell evidence
+                    facts["plain"] = {"flow_error": f"{type(exc).__name__}: {exc}".split("\n")[0]}
+                try:
+                    facts["cc"] = make_client_cert_visit(cc_url)(page, context)
+                except Exception as exc:  # noqa: BLE001 - flow failure is cell evidence
+                    facts["cc"] = {"flow_error": f"{type(exc).__name__}: {exc}".split("\n")[0]}
+            finally:
+                context.close()
+    finally:
+        try:
+            observer.wait(timeout=duration_seconds + 120)
+        except subprocess.TimeoutExpired:
+            observer.kill()
+            observer.wait(timeout=30)
+    _reown_report(report)
+    return CellResult(
+        name=name, report_path=report,
+        browser_exit=None,
+        flow={"observer_exit": observer.returncode, **facts},
+        observer_stderr_tail=_tail(observer_err.read_text()),
+    )
+
+
+def _wait_for_seal(observer_err: Path, observer: subprocess.Popen,
+                   timeout_seconds: float) -> None:
+    """Block until the observer's scan seal seats (demo4's wait_seal)."""
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if observer.poll() is not None:
+            raise CellError(
+                f"observer exited {observer.returncode} before the seal: "
+                f"{observer_err.read_text()[-1000:]}")
+        if "semantic lane ready" in observer_err.read_text():
+            return
+        time.sleep(1.0)
+    raise CellError("observer never sealed before the timeout")
+
+
 def _parse_capture_ready(line: str) -> int | None:
     """Parse ``p11scope: capturing: N probe`` / ``N probes attached``; None otherwise."""
     prefix = "p11scope: capturing: "

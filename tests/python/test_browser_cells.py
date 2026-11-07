@@ -447,6 +447,64 @@ class BrowserCells(unittest.TestCase):
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
                           s1={})
 
+    @gate("firefox")
+    def test_ff_first_with_background_provider_covers_browser(self):
+        """FF-FIRST-BG (v0.6.0 F1): observer-first key operations beside a
+        pre-existing SoftHSM caller; the late browser's key rows populate
+        (the scan seal settles over the newcomer instead of seating over
+        the background provider alone)."""
+        store, cred = self.seed()
+        bg = cells.start_soft_call(store.lib, self.work / "bg", env=store.env)
+        self.addCleanup(bg.stop)
+        key, cert = tls_server.make_server_credential(self.work / "srv")
+        with tls_server.FlowServer(cert=cert, key=key) as plain, \
+                tls_server.FlowServer(cert=cert, key=key, require_client_cert=True,
+                                      client_ca=cred.cert_pem) as cc:
+            result = cells.observe_first_system(
+                "FF-FIRST-BG", "firefox", self.work / "cell",
+                plain_url=plain.url, cc_url=cc.url, nss_credential=cred,
+                duration_seconds=90, extra_prefs=FIREFOX_STABLE_PREFS)
+            self.assertGreaterEqual(
+                plain.requests_served, 1, "plain flow saw no request")
+            self.assertGreaterEqual(
+                cc.handshakes_ok, 1, "client-cert flow never handshook")
+            self.assertGreaterEqual(
+                cc.client_certs_presented, 1, "client cert never presented")
+        self.assertEqual(result.flow.get("observer_exit"), 0,
+                         f"observer failed: {result.observer_stderr_tail}")
+        report = oracle.load_report(result.report_path)
+        observations = report.get("object_observations") or {}
+        self.assertEqual(
+            observations.get("status"), "populated",
+            f"late browser never covered: {observations.get('reason')}")
+        rows = observations.get("key_operations") or []
+        self.assertGreater(len(rows), 0, "no key-operation rows at all")
+        browser_modules = {
+            module.get("id")
+            for module in report.get("modules") or []
+            if any(str(path).endswith("libsoftokn3.so")
+                   for path in (module.get("paths") or []))
+        }
+        self.assertGreater(
+            len(browser_modules), 0, "browser softokn module missing")
+        browser_instances = {
+            instance.get("id")
+            for instance in report.get("instances") or []
+            if instance.get("module") in browser_modules
+        }
+        browser_rows = [row for row in rows
+                        if row.get("instance") in browser_instances]
+        self.assertGreater(
+            len(browser_rows), 0,
+            "no key-operation rows on the browser instance")
+        capture = (report.get("observation") or {}).get("semantic_capture") or {}
+        self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
+        subjects = {gap.get("subject") for gap in report.get("gaps") or []
+                    if isinstance(gap, dict)}
+        self.assertIn(
+            "scan seal settled", subjects,
+            "the seal seated without settling over the newcomer")
+
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #
     # Each twin drives a real seam (the common oracle, a named predicate,

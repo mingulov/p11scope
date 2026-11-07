@@ -1313,7 +1313,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Test-only scripted maps-domain answers by path (strict when
-    /// set). RED scaffolding: lookups ignore it.
+    /// set).
     #[cfg(test)]
     pub(crate) fn set_scripted_maps_identities(
         &mut self,
@@ -1335,8 +1335,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Scan-learned exe identities visible to resolution:
-    /// `(dev, ino)` to path over tracked callers — the scan's own
-    /// records, no new reads. First path wins per identity.
+    /// maps-domain `(dev, ino)` to path over tracked callers, each
+    /// learned path probed once per call. First path wins per
+    /// identity.
     #[cfg(test)]
     pub(crate) fn scan_learned_exe_map(&self) -> std::collections::HashMap<(u64, u64), String> {
         Self::scan_exe_identities(&self.adapter)
@@ -1386,8 +1387,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Resolve one stashed EXEC to its [`UnboundExe`] verdict. The
-    /// live-process source reads exactly the start time and exe
-    /// identity through the process source — no other reads.
+    /// live-process source reads exactly the start time and the
+    /// maps-domain exe identity through the process source — no
+    /// other reads. Both identity probes compare in the mapped
+    /// device domain, like for like with the EXEC pair.
     fn resolve_unbound_exe(
         &mut self,
         exec: StashedExec,
@@ -1400,7 +1403,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let source = self.adapter.source();
         let proc = ProcReads {
             start_time: Box::new(|pid| source.start_time(pid)),
-            exe_identity: Box::new(|pid| source.exe_identity(pid)),
+            exe_identity: Box::new(|pid| source.exe_maps_identity(pid)),
             trusted,
             mono_now,
             boot_now,
@@ -1408,14 +1411,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         };
         let scan = ScanLearned {
             by_identity: learned,
-            // RED scaffolding: the stat-domain probe below becomes
-            // the mapping probe in GREEN (the field already reads
-            // `verify`, the mechanism still stats).
-            verify: Box::new(|path| {
-                std::fs::metadata(path)
-                    .ok()
-                    .map(|meta| (meta.dev(), meta.ino()))
-            }),
+            verify: Box::new(crate::discovery::unbound_exe::real_maps_identity),
         };
         self.exe_resolver.resolve(
             exec.pid_host,
@@ -1463,8 +1459,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     }
 
     /// Scan-learned exe identities over tracked callers, by
-    /// `(dev, ino)`. Callers without a recorded path contribute
-    /// nothing; first path wins per identity.
+    /// probed maps-domain `(dev, ino)`: each learned path is probed
+    /// once per call, so the keys compare like for like with EXEC
+    /// pairs. Callers without a recorded path, or whose path probes
+    /// nothing, contribute nothing; first path wins per identity.
     fn scan_exe_identities(adapter: &CallerAdapter<Source>) -> HashMap<(u64, u64), String> {
         let mut learned = HashMap::new();
         for record in adapter.records() {
@@ -1474,9 +1472,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             let Some(path) = exe.path.as_ref() else {
                 continue;
             };
-            learned
-                .entry((exe.dev, exe.ino))
-                .or_insert_with(|| path.clone());
+            let Some(pair) = crate::discovery::unbound_exe::real_maps_identity(path) else {
+                continue;
+            };
+            learned.entry(pair).or_insert_with(|| path.clone());
         }
         learned
     }
@@ -29429,10 +29428,7 @@ int main(void) {
         let (path, dev, ino) = staged_tool(&dir, "tool-a");
         let (mut native, _) = NativeScene::new();
         native.scene.source.spawn(9, 900);
-        native
-            .scene
-            .source
-            .exec(9, 101, path.to_str().unwrap());
+        native.scene.source.exec(9, 101, path.to_str().unwrap());
         native
             .scene
             .coordinator
@@ -29455,9 +29451,8 @@ int main(void) {
     fn staged_tool(dir: &tempfile::TempDir, name: &str) -> (std::path::PathBuf, u64, u64) {
         let path = dir.path().join(name);
         std::fs::write(&path, b"tool").unwrap();
-        let (dev, ino) =
-            crate::discovery::unbound_exe::real_maps_identity(path.to_str().unwrap())
-                .expect("the staged tool maps");
+        let (dev, ino) = crate::discovery::unbound_exe::real_maps_identity(path.to_str().unwrap())
+            .expect("the staged tool maps");
         (path, dev, ino)
     }
 
@@ -29576,12 +29571,10 @@ int main(void) {
         let pb = db.join("tool");
         std::fs::write(&pa, b"a").unwrap();
         std::fs::write(&pb, b"b").unwrap();
-        let (adev, aino) =
-            crate::discovery::unbound_exe::real_maps_identity(pa.to_str().unwrap())
-                .expect("the first tool maps");
-        let (bdev, bino) =
-            crate::discovery::unbound_exe::real_maps_identity(pb.to_str().unwrap())
-                .expect("the second tool maps");
+        let (adev, aino) = crate::discovery::unbound_exe::real_maps_identity(pa.to_str().unwrap())
+            .expect("the first tool maps");
+        let (bdev, bino) = crate::discovery::unbound_exe::real_maps_identity(pb.to_str().unwrap())
+            .expect("the second tool maps");
         let (mut native, _) = NativeScene::new();
         native
             .scene
@@ -29629,9 +29622,13 @@ int main(void) {
             .scene
             .coordinator
             .set_exe_index_dirs(vec![dir.path().to_path_buf()]);
-        native.scene.coordinator.set_scripted_maps_identities(
-            std::collections::HashMap::from([(path_text, (mapped_dev, meta.ino()))]),
-        );
+        native
+            .scene
+            .coordinator
+            .set_scripted_maps_identities(std::collections::HashMap::from([(
+                path_text,
+                (mapped_dev, meta.ino()),
+            )]));
         native.execs(vec![exec_record(41, 9, 100, mapped_dev, meta.ino())]);
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let (text, _) = slice_one_views(&native);

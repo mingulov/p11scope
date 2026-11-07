@@ -119,10 +119,8 @@ fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
         let Some((start, end)) = range.split_once('-') else {
             continue;
         };
-        let (Ok(start), Ok(end)) = (
-            u64::from_str_radix(start, 16),
-            u64::from_str_radix(end, 16),
-        ) else {
+        let (Ok(start), Ok(end)) = (u64::from_str_radix(start, 16), u64::from_str_radix(end, 16))
+        else {
             continue;
         };
         if !(start <= addr && addr < end) {
@@ -156,7 +154,12 @@ pub(crate) struct ScanLearned<'a> {
 /// Lazy system-binary index plus resolution.
 pub(crate) struct ExeResolver {
     cap: usize,
-    entries: HashMap<(u64, u64), String>,
+    /// Candidates by ino (walk order per bucket): the lookup
+    /// confirms each candidate's mapped `(dev, ino)`, so a host
+    /// whose stat and mapped devices differ still resolves.
+    entries: HashMap<u64, Vec<String>>,
+    /// Indexed paths (the unit the cap bounds).
+    paths: usize,
     built_at: Option<u64>,
     /// Builds so far (test-observed; production keeps the count so
     /// the lazy-build policy stays measurable).
@@ -171,7 +174,6 @@ pub(crate) struct ExeResolver {
     #[cfg(test)]
     now_override: Option<u64>,
     /// Scripted maps-domain answers by path (strict when set).
-    /// RED scaffolding: lookups ignore it.
     #[cfg(test)]
     maps_override: Option<HashMap<String, (u64, u64)>>,
 }
@@ -181,6 +183,7 @@ impl ExeResolver {
         Self {
             cap: DEFAULT_MAX_SYSTEM_INDEX_ENTRIES,
             entries: HashMap::new(),
+            paths: 0,
             built_at: None,
             builds: 0,
             shed: 0,
@@ -299,16 +302,33 @@ impl ExeResolver {
         Some(path.clone())
     }
 
-    /// Source (c): the lazy system index, verified by the mapping
-    /// probe at lookup (a deleted or replaced binary refuses).
+    /// Source (c): the lazy system index. Same-ino candidates
+    /// are confirmed one by one against the joined pair in the
+    /// mapped device domain (a deleted or replaced binary refuses,
+    /// as does a stat-only pair on a split-device host).
     fn via_system_index(&mut self, dev: u64, ino: u64) -> Option<String> {
         self.refresh_index_if_stale();
-        let path = self.entries.get(&(dev, ino))?;
-        let meta = std::fs::metadata(path).ok()?;
-        if (meta.dev(), meta.ino()) != (dev, ino) {
-            return None;
+        let candidates = self.entries.get(&ino)?;
+        for path in candidates {
+            if self
+                .maps_identity_of(path)
+                .is_some_and(|pair| pair == (dev, ino))
+            {
+                return Some(path.clone());
+            }
         }
-        Some(path.clone())
+        None
+    }
+
+    /// The maps-domain identity of one indexed path: the scripted
+    /// answer in tests when set (strict: an unscripted path reads
+    /// `None`), else the mapping probe.
+    fn maps_identity_of(&self, path: &str) -> Option<(u64, u64)> {
+        #[cfg(test)]
+        if let Some(answers) = &self.maps_override {
+            return answers.get(path).copied();
+        }
+        real_maps_identity(path)
     }
 
     /// Build the index on the first miss, then at most every few
@@ -335,16 +355,17 @@ impl ExeResolver {
         (self.clock)()
     }
 
-    /// Walk the fixed roots (sorted, so hardlinked twins resolve to
-    /// the lexicographically smallest path deterministically),
+    /// Walk the fixed roots (sorted, so same-ino candidates keep
+    /// walk order and the first mapped match wins deterministically),
     /// following symlinks, skipping non-files, bounded by the cap.
     /// Unreadable roots shed silently: the index is a hint, and a
     /// miss degrades to unknown, never to an error.
     fn rebuild(&mut self) {
         self.builds += 1;
         self.entries.clear();
+        self.paths = 0;
         for dir in self.index_dirs() {
-            if self.entries.len() >= self.cap {
+            if self.paths >= self.cap {
                 break;
             }
             self.index_dir(&dir, 0);
@@ -368,18 +389,19 @@ impl ExeResolver {
             if !meta.is_file() {
                 continue;
             }
-            let key = (meta.dev(), meta.ino());
-            if self.entries.len() >= self.cap && !self.entries.contains_key(&key) {
+            if self.paths >= self.cap {
                 self.shed = self.shed.saturating_add(1);
                 continue;
             }
+            self.paths += 1;
             self.entries
-                .entry(key)
-                .or_insert_with(|| path.to_string_lossy().into_owned());
+                .entry(meta.ino())
+                .or_default()
+                .push(path.to_string_lossy().into_owned());
         }
         if depth == 0 && dir == Path::new(LIBEXEC_SUBDIR_ROOT) {
             for path in &names {
-                if self.entries.len() >= self.cap {
+                if self.paths >= self.cap {
                     break;
                 }
                 if path.is_dir() {
@@ -419,12 +441,8 @@ impl ExeResolver {
     /// Test-only scripted maps-domain answers by path: the split
     /// stat/maps devices of a btrfs-style host, or any mapped
     /// identity. Strict when set: an unscripted path reads `None`.
-    /// RED scaffolding: lookups ignore it.
     #[cfg(test)]
-    pub(crate) fn set_scripted_maps_identities(
-        &mut self,
-        answers: HashMap<String, (u64, u64)>,
-    ) {
+    pub(crate) fn set_scripted_maps_identities(&mut self, answers: HashMap<String, (u64, u64)>) {
         self.maps_override = Some(answers);
     }
 
@@ -437,7 +455,7 @@ impl ExeResolver {
     /// Indexed entries.
     #[cfg(test)]
     pub(crate) fn index_len(&self) -> usize {
-        self.entries.len()
+        self.paths
     }
 
     /// Entries shed past the cap, sticky.
@@ -1096,7 +1114,10 @@ malformed line without fields
         assert_eq!(maps_identity_at(maps, 0x0040_0000), Some((expect, 99)));
         assert_eq!(maps_identity_at(maps, 0x0040_0fff), Some((expect, 99)));
         assert_eq!(maps_identity_at(maps, 0x0040_1000), None);
-        assert_eq!(maps_identity_at(maps, 0x7fab_0000).map(|pair| pair.1), Some(4242));
+        assert_eq!(
+            maps_identity_at(maps, 0x7fab_0000).map(|pair| pair.1),
+            Some(4242)
+        );
         assert_eq!(maps_identity_at("", 0x0040_0000), None);
     }
 }

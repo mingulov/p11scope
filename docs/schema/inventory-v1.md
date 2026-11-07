@@ -143,9 +143,11 @@ from the kernel `(dev, ino)` of the exec image joined by (domain, ticket)
 plus three narrowly scoped userspace resolution sources (a live
 `/proc/<pid>/exe` with a start-time generation check, scan-learned
 identities, and a lazy index of the fixed system binary dirs), each
-verified by stat — still no argv, environ, key, PIN, payload, `comm`,
-cwd, or cmdline. See the unidentified caller executables row of
-[privacy allowlist v3](../privacy/allowlist-v3.md).
+confirmed in the mapped device domain (a private one-page mapping
+read back from the observer's own maps — the page is never
+touched), never by stat alone — still no argv, environ, key, PIN,
+payload, `comm`, cwd, or cmdline. See the unidentified caller
+executables row of [privacy allowlist v3](../privacy/allowlist-v3.md).
 `callers[].image.task_cookie` and `.exec_id` are always null in v0.2.0
 (`owner_image` returns `None` everywhere in production); only a future
 lane returning exact owner images would fill them, and publishing

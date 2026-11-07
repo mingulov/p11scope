@@ -247,28 +247,26 @@ pub(crate) trait ProcessSource {
 /// the caller adapter and the C1b confirmation read instead, so the
 /// two compare like for like there and this one compares like for
 /// like with EXEC records here. Only the link and the target's
-/// metadata are read — no cwd, cmdline, or environ. RED scaffolding:
-/// the probe is ignored and the stat pair is returned.
+/// metadata are read — no cwd, cmdline, or environ.
 pub(crate) fn read_exe_maps_identity_with(
     pid: u32,
-    _maps: impl Fn(&str) -> Option<(u64, u64)>,
+    maps: impl Fn(&str) -> Option<(u64, u64)>,
 ) -> Option<ExeIdentity> {
-    let path = format!("/proc/{pid}/exe");
-    let metadata = std::fs::metadata(&path).ok()?;
-    let link = std::fs::read_link(&path)
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned());
+    let link = std::fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+    let link_text = link.to_string_lossy().into_owned();
+    let metadata = std::fs::metadata(&link_text).ok()?;
+    let (dev, ino) = maps(&link_text)?;
     Some(ExeIdentity {
-        dev: metadata.dev(),
-        ino: metadata.ino(),
+        dev,
+        ino,
         mtime_secs: metadata.mtime(),
         mtime_nanos: metadata.mtime_nsec(),
-        path: link,
+        path: Some(link_text),
     })
 }
 
 /// The maps-domain exe identity of `pid` through the real mapping
-/// probe. RED scaffolding: the probe is ignored (see above).
+/// probe.
 pub(crate) fn read_exe_maps_identity(pid: u32) -> Option<ExeIdentity> {
     read_exe_maps_identity_with(pid, crate::discovery::unbound_exe::real_maps_identity)
 }

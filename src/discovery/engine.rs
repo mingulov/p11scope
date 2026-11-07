@@ -21506,6 +21506,11 @@ impl Engine {
             }
             let mut refreshed_serial = None;
             if cause == RetirementCause::ExpectedRemoval {
+                // A matched leader exit ends its generation: the PID's
+                // pending exe identity and exec timing are dead, so drop
+                // them before a reused PID can consume them as a gap.
+                self.extensive.drop_stash_for_pid(pid);
+                self.exit_map.drop_exec_for_pid(pid);
                 self.queue_leader_exit_assessment(view, Some(record.hook_ts_ns));
             } else {
                 if let Some(admission) = self.admitted_cgroup_views.get_mut(&view) {

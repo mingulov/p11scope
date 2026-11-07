@@ -4561,8 +4561,12 @@ fn run_tree_scope_or_exact(
 /// cgroup scope with no live view degrades (exact-PID scopes never
 /// consult discovery membership); the caller drops the group,
 /// re-discovers the exact child, and files the finite gap.
-fn run_tree_unretained_gap(_scope: &Scope, _retained: bool) -> Option<&'static str> {
-    None
+fn run_tree_unretained_gap(scope: &Scope, retained: bool) -> Option<&'static str> {
+    if matches!(scope, Scope::Cgroup { .. }) && !retained {
+        Some(crate::render::RUN_TREE_DEGRADED)
+    } else {
+        None
+    }
 }
 
 /// Turns a run-end membership read into the published fact and gap: the

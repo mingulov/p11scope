@@ -233,7 +233,7 @@ pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) 
 
 /// This process's effective capabilities, from `/proc/self/status`
 /// `CapEff`; `None` when unreadable or unparsable.
-pub(crate) fn read_effective() -> Option<u64> {
+pub fn read_effective() -> Option<u64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
     parse_cap_eff(&status)
 }

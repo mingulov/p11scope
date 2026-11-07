@@ -1203,6 +1203,7 @@ impl NativeBinder {
             let binding = decide(
                 state,
                 &pending,
+                &self.reuse_ns,
                 self.exit_clocks_comparable,
                 &mut self.transitions,
             );
@@ -1215,6 +1216,7 @@ impl NativeBinder {
 fn decide(
     state: &mut DomainState,
     pending: &Pending,
+    reuse_ns: &HashMap<u32, u64>,
     clocks_comparable: bool,
     transitions: &mut Vec<ExecTransition>,
 ) -> Binding {
@@ -1242,6 +1244,7 @@ fn decide(
                     pending,
                     retained,
                     UnboundReason::NoLiveCaller,
+                    reuse_ns,
                     clocks_comparable,
                 )
             },
@@ -1259,6 +1262,7 @@ fn decide(
                         pending,
                         retained,
                         UnboundReason::CallerExited,
+                        reuse_ns,
                         clocks_comparable,
                     )
                 },
@@ -1352,16 +1356,18 @@ fn decide(
 /// inside its lifetime (checked at read time). `miss` is the row's
 /// live-miss gap, kept when a fallback precondition fails. The
 /// remaining checks mirror rules 4 and 5 against the retained
-/// admission: comparable exit clocks, exec coverage, no exec or lost
-/// lifecycle evidence at or after it, and no competing image of the
-/// ticket. A held conflicting image is ambiguous (no cookie answer
-/// exists to prove a transition, so none is emitted). Anything else
-/// binds and caches exactly like a live binding.
+/// admission: comparable exit clocks, no recorded PID reuse at or
+/// after it, exec coverage, no exec or lost lifecycle evidence at or
+/// after it, and no competing image of the ticket. A held conflicting
+/// image is ambiguous (no cookie answer exists to prove a transition,
+/// so none is emitted). Anything else binds and caches exactly like a
+/// live binding.
 fn decide_retained(
     state: &mut DomainState,
     pending: &Pending,
     retained: &RetainedCaller,
     miss: UnboundReason,
+    reuse_ns: &HashMap<u32, u64>,
     clocks_comparable: bool,
 ) -> Binding {
     // Without comparable clocks the exec/loss orderings below are
@@ -1371,6 +1377,17 @@ fn decide_retained(
         return Binding::Unbound(miss);
     }
     let row = &pending.row;
+    // A recorded PID reuse at or after the retained admission voids the
+    // retained identity even with no admitted successor: the turnover
+    // window is ambiguous (which generation fired the row is unknown),
+    // so the row keeps its live-miss gap. A reuse before the admission
+    // is another generation's turnover.
+    if reuse_ns
+        .get(&row.host_tgid)
+        .is_some_and(|&at_ns| at_ns >= retained.first_seen_ns)
+    {
+        return Binding::Unbound(miss);
+    }
     let cookie = row.cookie();
     let exec = row.exec_id();
     let caller = retained.id;

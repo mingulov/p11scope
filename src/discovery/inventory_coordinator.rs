@@ -4311,6 +4311,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// workload harness reuses this after scripted reconciles so staged
     /// facts follow the same path as scanned ones.
     pub(crate) fn apply_reconcile_events(&mut self, events: &[CallerEvent], now_ns: u64) {
+        // Forward recorded PID reuses first: every reconcile (scan,
+        // scoped, or empty pass) funnels through here, so the binder
+        // learns each turnover whether or not a successor admitted.
+        for (pid, at_ns) in self.adapter.take_pid_reuses() {
+            self.binder.note_pid_reuse(pid, at_ns);
+        }
         let mut failed: Vec<(u32, &str, Option<BudgetRefusal>)> = Vec::new();
         for event in events {
             let id = match event {

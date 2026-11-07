@@ -591,6 +591,11 @@ pub(crate) struct CallerAdapter<Source: ProcessSource> {
     /// coordinator takes the gap fallback explicitly. Sticky until
     /// taken.
     detection_clock_failed: bool,
+    /// (pid, at_ns) retired for PID reuse since the last take: the pin
+    /// died while the pid named a live process. The coordinator
+    /// forwards these to the binder, whose retained-identity fallback
+    /// voids holders admitted at or before them.
+    pid_reuses: Vec<(u32, u64)>,
 }
 
 /// Why one admission attempt failed: an honest pin failure, or a budget
@@ -723,6 +728,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             admit_refused: 0,
             scoped_retire_cursor: None,
             detection_clock_failed: false,
+            pid_reuses: Vec::new(),
         }
     }
 
@@ -732,6 +738,13 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
     /// true, never a silent pass-start stamp.
     pub(crate) fn take_detection_clock_failed(&mut self) -> bool {
         std::mem::take(&mut self.detection_clock_failed)
+    }
+
+    /// Take and clear the PID reuses reconcile retired since the last
+    /// take, as (pid, at_ns). The coordinator forwards them to the
+    /// binder whether or not a successor admitted.
+    pub(crate) fn take_pid_reuses(&mut self) -> Vec<(u32, u64)> {
+        std::mem::take(&mut self.pid_reuses)
     }
 
     /// The caller budget this adapter enforces at admission. The
@@ -1801,6 +1814,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     ),
                 };
                 self.retire(id, lifecycle, reason, now_ns);
+                // A recorded turnover whatever the successor does (even
+                // unproven, even denied): the binder voids retained
+                // holders admitted at or before it.
+                self.pid_reuses.push((pid, now_ns));
                 if matches!(admission, SuccessorAdmission::ScopedDenied) {
                     events.push(self.retired_event(id));
                     continue;

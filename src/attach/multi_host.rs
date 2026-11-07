@@ -490,6 +490,41 @@ mod tests {
         assert!(line.len() < 1_024, "{line}");
     }
 
+    /// `CAP_SYS_ADMIN` suffices for BPF load, so its holder is never
+    /// told to grant more privilege: a DaemonSet-like mask (SYS_ADMIN
+    /// without BPF/PERFMON) reads as other enforcement, like the
+    /// complete set.
+    #[test]
+    fn denied_line_with_sys_admin_blames_lockdown_not_privilege() {
+        use crate::caps;
+        let binary = "/usr/bin/p11scope";
+        let sys_admin = 1u64 << caps::CAP_SYS_ADMIN_BIT;
+        for effective in [
+            sys_admin,
+            sys_admin | (1u64 << caps::CAP_BPF_BIT),
+            sys_admin | (1u64 << caps::CAP_PERFMON_BIT),
+        ] {
+            let line = super::denied_line(
+                "load p11scope's BPF programs",
+                " (Operation not permitted)",
+                effective,
+                binary,
+            );
+            assert!(
+                line.contains("the kernel refused to load p11scope's BPF programs"),
+                "{line}"
+            );
+            assert!(line.contains("lockdown"), "{line}");
+            assert!(line.contains("CAP_SYS_ADMIN"), "{line}");
+            assert!(!line.contains("needs CAP_"), "{line}");
+            assert!(!line.contains("needs root"), "{line}");
+            assert!(!line.contains("Grant the minimal set"), "{line}");
+            assert!(line.contains("p11scope inspect --pid N"), "{line}");
+            assert_eq!(line.lines().count(), 1);
+            assert!(line.len() < 1_024, "{line}");
+        }
+    }
+
     #[test]
     fn unproven_or_unavailable_guidance_does_not_guess_privilege_or_kernel_age() {
         for (stage, errno) in [

@@ -566,6 +566,61 @@ mod tests {
         assert_eq!(keep_mask_for_command(&parse(&["--version"])), 0);
     }
 
+    /// Scan-only inventory loads no BPF and links nothing, so it keeps
+    /// only the target-read/map-files bits plus `-o` extras, never the
+    /// BPF pair or the singles `SYS_ADMIN` transient.
+    #[test]
+    fn scan_inventory_drops_load_and_sys_admin_it_never_uses() {
+        let live = minimal_live_mask();
+        let scan_keep = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
+        let file_out = (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT);
+        let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
+        // Scan in every scope keeps only target-read/map-files.
+        for argv in [
+            vec!["inventory", "--system", "--capture", "scan"],
+            vec!["inventory", "--pid", "1", "--capture", "scan"],
+            vec![
+                "inventory",
+                "--cgroup",
+                "/sys/fs/cgroup/test.slice",
+                "--capture",
+                "scan",
+            ],
+        ] {
+            let mask = keep_mask_for_command(&parse(&argv));
+            assert_eq!(mask, scan_keep, "{argv:?}");
+            assert_eq!(
+                mask & ((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | sys_admin),
+                0,
+                "{argv:?} must not keep load or sys_admin"
+            );
+        }
+        // Scan with `-o` adds only file extras.
+        assert_eq!(
+            keep_mask_for_command(&parse(&[
+                "inventory",
+                "--system",
+                "--capture",
+                "scan",
+                "-o",
+                "out.json"
+            ])),
+            scan_keep | file_out
+        );
+        // Auto/native still need live plus the transient.
+        for argv in [
+            vec!["inventory", "--system", "--capture", "auto"],
+            vec!["inventory", "--system", "--capture", "native"],
+            vec!["inventory", "--pid", "1", "--capture", "native"],
+        ] {
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                live | sys_admin,
+                "{argv:?}"
+            );
+        }
+    }
+
     #[test]
     fn read_effective_matches_proc_self_status() {
         let status = std::fs::read_to_string("/proc/self/status").unwrap();

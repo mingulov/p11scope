@@ -9930,6 +9930,29 @@ mod tests {
         }
     }
 
+    /// The native lane sheds the transient startup grant once attach
+    /// completes, mirroring the profile/trace/run post-setup drop: a
+    /// multi lane drops `CAP_SYS_ADMIN`, a singles lane keeps it for
+    /// dynamic perf re-attach. Fails while the preparation success
+    /// path never drops.
+    #[test]
+    fn inventory_native_lane_sheds_transient_sys_admin_after_attach() {
+        let body = pin_body(include_str!("mod.rs"), "fn open_native_lane_with(", "\n}\n")
+            .expect("open_native_lane_with body");
+        assert!(
+            body.contains("post_setup_keep"),
+            "the native lane must shed via post_setup_keep after attach"
+        );
+        assert!(
+            body.contains("drop_to_keep"),
+            "the shed must drop via drop_to_keep"
+        );
+        assert!(
+            body.contains("AttachBackend::Multi") || body.contains("backend.backend"),
+            "the shed must use the lane's actual backend (multi sheds, singles keeps)"
+        );
+    }
+
     /// Item 6: an auto PID run passes the host preflight on a host-wide
     /// BPF refusal (no root) and falls back to the scan lane with a named
     /// gap instead of failing. System scope stays fatal (see

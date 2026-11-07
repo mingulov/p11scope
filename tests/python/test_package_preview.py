@@ -499,7 +499,7 @@ else:
         bodies = "\n".join(item.get("run", "") for item in image["steps"])
         for marker in ("sha256sum --check SHA256SUMS",
                        "p11scope-*-x86_64-linux-musl.tar.gz",
-                       "statically linked",
+                       "static-pie linked",
                        "deploy/Dockerfile.observer",
                        "docker pull",
                        "docker build --network=none"):

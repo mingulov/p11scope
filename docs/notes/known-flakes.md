@@ -39,3 +39,43 @@ The quarantine lane runs these selectors once, serially, after any failed
 check job (`lint`, `audit`, `tests`, a `contracts-N` shard or `scripts`).
 It is supporting evidence only: a green quarantine result
 never makes the failed workflow pass.
+
+## Live-cell signatures
+
+These failures come from Docker live cells
+(`scripts/docker-*-e2e.sh` with `scripts/container-cells-oracle.py`),
+not from the Cargo suites, so they carry no test selector or
+quarantine entry. The triage protocol above still applies: preserve
+the failed evidence directory, rerun the exact cell serially, compare
+a pristine-base run with the same selector, and match the mechanism
+before calling a rerun green.
+
+### `D1-span-flip-race` (D1 shared-layer cell, span loss gate)
+
+- Signature: the span-kernel evidence carries a pid-less
+  `maps attribution` gap,
+  `processes mapping pinned provider objects were not attributed to
+  them: N identity_mismatch ...` with repeats=P (observed N=2,
+  P in 8..13), and the exact span gate
+  (`assert not has_identity_loss(span_kernel["gaps"])`,
+  `identity loss in span`) refuses it.
+- Mechanism: the overlay collapse direction inverts between span
+  passes (both `(98 -> 82)` and `(82 -> 98)` collapse gaps in one
+  span); a fraction of inverted spans also lose per-process
+  attribution for pinned providers. The direction inversion is
+  proven pre-existing (base spans r2/r4/r5 invert with zero loss);
+  the loss trip tracks run conditions, not the lane's code (the
+  gate is identical in force on base and tip; the lane made zero
+  changes to the sweep, collapse, aggregate, or attach paths in D1).
+- Rates (2026-11-07, dev Docker,
+  `--iters-a 400 --iters-b 250 --duration 30 --span 90`): tip
+  Saturday-morning 3/7 spans trip (all 7 invert); tip
+  Saturday-evening 0/2 (stable direction); base Saturday 0/14
+  spans trip, 3/14 invert (evening base 0/8, stable, exact parity
+  with tip-evening).
+- Base-hit status: PENDING-MORNING-BATCH (4 quiet-window base runs
+  Sun 2026-11-08 ~06:30 UTC; outcome lands in the R2 report).
+- Disposition: named flake; the span gate stays exact. A rerun that
+  trips must be preserved and retried serially, never averaged away.
+  Future work (out of scope): collapse-order determinism across span
+  passes.

@@ -507,6 +507,65 @@ If you installed the optional helper, also run
   Full quickstart, real command output, and `trace` mode:
   [docs/usage.md](docs/usage.md#quickstart).
 
+## Why not just pkcs11-spy?
+
+Use a shim when you own the application's launch; use p11scope when
+you need to watch software you cannot restart or reconfigure. The
+trade-offs are structural:
+
+| | pkcs11-spy / pkcs11-logger / vendor loggers | ltrace / `LD_PRELOAD` interposition | p11scope |
+| --- | --- | --- | --- |
+| How it sees calls | A logging module the application must load instead of (or in front of) the real provider | ptrace/`LD_PRELOAD` tracing of one process tree | eBPF uprobes on the providers already mapped, attached from outside |
+| App restart / config change | Yes: point the app at the shim and restart it | Yes: start under the tracer (or ptrace-attach per PID) | No: attaches to running processes and containers, with a whole-system view |
+| Scope | That app's calls through that module only | That process tree only | Whole machine, cgroup, or PID, including containers sharing the provider file |
+| Secrets in output | The log records call arguments, so PINs, buffers and key material can land in the log | Same: full argument capture | Never read: no PIN/key/payload decoder in the capture path ([what it does NOT decode](#what-it-does-not-intentionally-decode)) |
+| Per-key use (which key, how) | Hand-correlate log lines | Same | Opt-in per-key rows (`inventory --key-operations`); Firefox/Chromium tested end to end, see [tested providers and applications](#tested-providers-and-applications) |
+
+The costs of the p11scope side are real: live capture needs root or
+the [listed capabilities](docs/usage.md#privileges-per-environment)
+on Linux 6.6+ x86-64, and probes add about 3.3 µs per call —
+roughly a 5x wall-clock slowdown on the worst-case SoftHSM2 hammer
+workload, negligible against millisecond-scale HSM calls
+([measured overhead](docs/usage.md#overhead-measured)). The shims
+stay the right tool for single-app debugging on any kernel as an
+ordinary user — p11scope's own real-provider harness judges its
+reports against pkcs11-spy logs as the independent ledger
+(`tests/fixtures/real-providers/README.md`).
+
+## Tested providers and applications
+
+Tested means a recorded run on the named version, not "should work".
+Anything else is marked honestly; point p11scope at it and report
+what you see.
+
+| Provider | Status | Evidence |
+| --- | --- | --- |
+| SoftHSM2 2.6 | Tested | Real-provider cells (`pkcs11-tool`, `p11tool`, `certutil` workloads under `run`; Fedora + Ubuntu pins in `tests/fixtures/real-providers/expected-causes.json`) and the live `inventory --pid` run in [First useful result](#first-useful-result) |
+| SoftHSM2 2.7 | Should work | Same `C_GetFunctionList`-only exports as 2.6 (`nm -D`; `tests/fixtures/real-providers/README.md`); compat wave pending |
+| Kryoptic | Tested | `run` and `profile --pid` sign flows PASS on Fedora 7.2.9 ([qualification](CHANGELOG.md#qualification-of-this-release)) |
+| p11-kit-trust | Tested | Real-provider `trust list` cell, Fedora + Ubuntu pins |
+| p11-kit proxy | Should work | Forwarding-layer accounting is implemented and documented in the [operator's guide](docs/usage.md); dedicated transparency cells are not in the release qualification |
+| OpenSC with a token | Not yet | No reader or virtual-reader path (W3-2 finding 4, `scripts/qualify-real-providers.sh`) |
+| opencryptoki | Not yet | Cells exist but carry no pins yet |
+| tpm2-pkcs11, NSS softoken, wolfPKCS11, BouncyHsm, FreeHSM, Haskoki, cloud/hardware HSMs | Not yet | No recorded runs; compat waves pending |
+
+| Application | Status | Evidence |
+| --- | --- | --- |
+| Firefox, Chromium (Playwright 1.64.0 pinned builds) | Tested | 48/48 strict browser cells plus the demo in both orders ([qualification](CHANGELOG.md#qualification-of-this-release)) |
+| pkcs11-tool (OpenSC 0.27.1-2.fc44, 0.27.0~rc1-1) | Tested | Real-provider cell plus metrics twin, pins in `expected-causes.json` |
+| p11tool (GnuTLS 3.8.13-1.fc44, 3.8.12-2ubuntu1.1) | Tested | Same |
+| certutil (NSS 3.130.0-1.fc44, 2:3.120-1ubuntu2.2) | Tested | Same |
+| `trust list` (p11-kit 0.26.5-1.fc44, 0.26.2-2) | Tested | Same |
+| OpenSSH, Java SunPKCS11, OpenVPN, curl, Thunderbird, systemd-cryptenroll, git signing, Vault/K8s integrations | Not yet | No recorded runs |
+
+Pins are version-specific: a new tool release needs a new pin before
+it counts as tested (`expected-causes.json`: the ratchet). Several
+pins are provisional (single-sample, awaiting quiet-host
+confirmation); the ratchet still applies in full. One-shot
+CLI use under `inventory --system` stays degraded in v0.6.0 —
+short-lived callers may never bind to a caller row; see
+[known limitations](docs/known-limitations.md#known-limitations-in-060).
+
 ## What it does NOT intentionally decode
 
 There is no decoder or dump switch for PINs, key material, `CKA_VALUE`, labels,

@@ -64809,6 +64809,80 @@ fn aggregate_arm_classifies_ticketless_gap_hints_end_to_end() {
     assert_eq!(hints.total(), 1);
 }
 
+// A matched leader exit drops its PID's exe-identity stash entry, so a
+// later reused-PID gap exit cannot consume the dead generation's
+// identity: the gap counts `unknown`, never the stale image's hint.
+#[test]
+fn opusrv_gap_stash_orphaned_by_matched_exit_never_binds_a_reused_pid() {
+    let first = ProcessView::open(ProcessViewId(0), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::AggregateOnly, None);
+    let dir = tempfile::tempdir().unwrap();
+    let (dev, ino) = gap_exe_hint_fixture(&mut engine, &dir, b"libgap.so.1", &[b"libgap.so.1"]);
+    let mut pending = PendingViewRetirements::new();
+    let mut session = ScriptedSession::default();
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exec_record(pid, admitted + 10, dev, ino, 0),
+        &mut pending,
+    );
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(pid, admitted + 20),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    engine.dispatch_lifecycle_record(
+        &mut session,
+        &gap_exe_exit_record(pid, admitted + 30),
+        &mut pending,
+    );
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    let hints = engine.gap_exe_hints().expect("armed split");
+    assert_eq!(hints.links_provider, 0);
+    assert_eq!(hints.unknown, 1);
+    assert_eq!(hints.total(), 1);
+}
+
+// A matched leader exit drops its PID's exec timing behind the
+// late-watch rule, so a later reused-PID kind-7 exit reads
+// `UnknownLateWatch`, never timely on the dead generation's EXEC.
+#[test]
+fn matched_exit_drops_exec_timing_so_reused_pid_reads_late_watch() {
+    let first = ProcessView::open(ProcessViewId(1), std::process::id()).unwrap();
+    let pid = first.pid();
+    let admitted = first.admitted_ns();
+    let (mut engine, _scope) = engine_over_cgroup_naming(&[pid]);
+    engine.views.push(first);
+    engine.seed_initial_cgroup_views();
+    engine.arm_extensive(true, CapturePolicy::Allowlisted, None);
+    let mut session = ScriptedSession::default();
+    session.instance_hooks_live.set(true);
+    let mut pending = PendingViewRetirements::new();
+    let exec = observed_exec_record(pid, admitted + 10);
+    engine.dispatch_lifecycle_record(&mut session, &exec, &mut pending);
+    let exit = exit_mappings_record(pid, admitted + 20);
+    engine.dispatch_lifecycle_record(&mut session, &exit, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 0);
+    let reused = exit_mappings_record(pid, admitted + 30);
+    engine.dispatch_lifecycle_record(&mut session, &reused, &mut pending);
+    assert_eq!(engine.pid_descendant_gaps(), 1);
+    assert_eq!(
+        engine
+            .gap_exit_mappings()
+            .map(|split| (split.mapped, split.unknown)),
+        Some((0, 1))
+    );
+    assert_eq!(
+        engine.exit_mapping_reasons_for_test(),
+        &[ExitMappingReason::UnknownLateWatch]
+    );
+}
+
 /// Build knobs of the stamped legacy-only fixture
 /// (`crates/discover/tests/fixture/legacy3x_provider.c`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -1284,6 +1284,44 @@ mod tests {
     }
 
     #[test]
+    fn apply_isolated_refuses_without_fence_context_in_a_child() {
+        // Wiring: apply_isolated must refuse when the calling context is
+        // weak. The test runner has no_new_privs unset, so the child
+        // must return the fence-context refusal. Fork so a successful
+        // fence (or a mutant that skips the check and fences) cannot
+        // affect the runner. The child prints nothing and exits 0 only
+        // on the expected refusal.
+        let parent = read_fence_context().unwrap();
+        if parent.no_new_privs == 1 && parent.euid != 0 {
+            eprintln!("SKIP: test runner is already fence-ready");
+            return;
+        }
+        let pid = unsafe { libc::fork() };
+        assert!(pid >= 0, "fork failed");
+        if pid == 0 {
+            // _exit directly in each arm: no drop in the child after fork.
+            match apply_isolated(None) {
+                Err(error) if error.contains("refusing to fence") => unsafe { libc::_exit(0) },
+                Err(_) => unsafe { libc::_exit(2) },
+                Ok(()) => unsafe { libc::_exit(3) },
+            }
+        }
+        let mut status = 0;
+        let waited = loop {
+            let waited = unsafe { libc::waitpid(pid, &mut status, 0) };
+            if waited < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EINTR) {
+                continue;
+            }
+            break waited;
+        };
+        assert_eq!(waited, pid, "waitpid failed");
+        assert!(
+            libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+            "child must refuse with fence-context wording, status={status}"
+        );
+    }
+
+    #[test]
     fn terminal_injection_ioctls_evaluate_to_eacces() {
         let insns = FilterBuilder::new().build().unwrap();
         let denied = SECCOMP_RET_ERRNO | libc::EACCES as u32;

@@ -7866,6 +7866,7 @@ mod module_init_seam_tests {
         init_slot: u32,
         other_slot: u32,
         file_offset: u64,
+        other_offset: u64,
     }
 
     impl InitFixture {
@@ -7929,6 +7930,7 @@ mod module_init_seam_tests {
                 init_slot: 0,
                 other_slot: 1,
                 file_offset: 0x1000,
+                other_offset: 0x2000,
             }
         }
 
@@ -7937,6 +7939,17 @@ mod module_init_seam_tests {
                 object: self.object,
                 file_slot: 0,
                 offset: self.file_offset,
+            }
+        }
+
+        /// The endpoint matching the `C_Sign` slot exactly: the
+        /// non-init negative differs from a tapping shed by name
+        /// alone.
+        fn other_endpoint(&self) -> Endpoint {
+            Endpoint {
+                object: self.object,
+                file_slot: 0,
+                offset: self.other_offset,
             }
         }
     }
@@ -8193,7 +8206,9 @@ mod module_init_seam_tests {
             60,
         );
         coordinator.commit_batch(false).unwrap();
-        let endpoint = fixture.endpoint();
+        // A fully matching `C_Sign` endpoint: only the name refuses
+        // the tap.
+        let endpoint = fixture.other_endpoint();
         let module = fixture.module.clone();
         let mut lane =
             AttestedSemanticLane::start(fixture.subset, &Scope::Pid(pid), BackendSelection::Auto)

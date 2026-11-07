@@ -24,8 +24,9 @@
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
-    ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId, ModuleLifecycle,
-    ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
+    CallerRegistry, ExeIdentity, ImageAuthority, JointPublicationPending, MappingState, ModuleId,
+    ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnknownReason,
+    UseCoverage, module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -277,6 +278,55 @@ pub(crate) struct ModuleView {
     pub unloaded_observed: bool,
     /// Natively witnessed use no caller edge carries (Task 6 C4).
     pub unbound_use: Option<crate::discovery::caller_registry::UnboundUse>,
+    /// Observed `C_Initialize` returns since the semantic lane
+    /// sealed, with the judged verdict.
+    pub init: ModuleInitView,
+}
+
+/// One module's `C_Initialize` evidence (S1-adjacent), owned for
+/// rendering: exact observed counts, the returns-shaped last error,
+/// and the judged status with its detail line.
+#[derive(Debug, Clone)]
+pub(crate) struct ModuleInitView {
+    pub calls: u64,
+    pub ok: u64,
+    pub already_initialized: u64,
+    pub last_error_rv: Option<InitErrorView>,
+    pub status: &'static str,
+    pub detail: String,
+}
+
+/// The last observed init error, shaped like a `returns` row: the
+/// verbatim rv, its hex, and the registered `CKR_*` name (or `None`
+/// for unregistered codes — never guessed).
+#[derive(Debug, Clone)]
+pub(crate) struct InitErrorView {
+    pub rv: u64,
+    pub rv_hex: String,
+    pub name: Option<String>,
+}
+
+impl ModuleInitView {
+    fn capture(registry: &CallerRegistry, module: ModuleId) -> Self {
+        let rollup = registry.module_init_rollup(module);
+        let judged = module_init::verdict(
+            &rollup,
+            registry.semantic_sealed(),
+            registry.semantic_events_lossy(),
+        );
+        Self {
+            calls: rollup.calls,
+            ok: rollup.ok,
+            already_initialized: rollup.already_initialized,
+            last_error_rv: rollup.last_error_rv.map(|rv| InitErrorView {
+                rv,
+                rv_hex: format!("0x{rv:x}"),
+                name: crate::semantics_edge::rv_name(rv),
+            }),
+            status: judged.status.label(),
+            detail: judged.detail,
+        }
+    }
 }
 
 /// One mechanism id's published facts (S1), owned for rendering.
@@ -726,6 +776,7 @@ impl Presentation {
                 lifecycle: record.lifecycle,
                 unloaded_observed: record.unloaded_observed,
                 unbound_use: record.unbound_use.clone(),
+                init: ModuleInitView::capture(registry, *id),
             });
         }
         let mut edge_keys: Vec<(CallerId, ModuleId)> = registry
@@ -2876,6 +2927,18 @@ fn render_snapshot_inner(
                     if unbound.rows == 1 { "" } else { "s" }
                 );
             }
+        }
+        // A module with observed `C_Initialize` evidence names its
+        // init verdict on its own detail line. Quiet modules print
+        // nothing here; JSON keeps the per-module record either way.
+        if module.init.calls > 0 {
+            let _ = writeln!(
+                out,
+                "  init: {} ({} call{})",
+                module.init.detail,
+                module.init.calls,
+                if module.init.calls == 1 { "" } else { "s" }
+            );
         }
     }
     for edge in &presentation.edges {

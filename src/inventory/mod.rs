@@ -5256,6 +5256,7 @@ fn start_semantic_lane(
         match seal_start_live(attach_subset, convert_subset, scope, backend, Some(&spec)) {
             Ok(lane) => {
                 note_semantic_lane_sealed();
+                coordinator.note_semantic_sealed();
                 return Some(lane);
             }
             Err(journal_refusal) => {
@@ -5280,6 +5281,7 @@ fn start_semantic_lane(
     match seal_start_live(attach_subset, convert_subset, scope, backend, None) {
         Ok(lane) => {
             note_semantic_lane_sealed();
+            coordinator.note_semantic_sealed();
             Some(lane)
         }
         Err(refusal) => {
@@ -8300,6 +8302,20 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
             "reasons": unbound.reasons,
             "entries": unbound.entries,
         })),
+        // Additive (v1): observed `C_Initialize` returns since the
+        // semantic lane sealed, with the judged verdict.
+        "initialize": {
+            "calls": record.init.calls,
+            "ok": record.init.ok,
+            "already_initialized": record.init.already_initialized,
+            "last_error_rv": record.init.last_error_rv.as_ref().map(|error| serde_json::json!({
+                "rv": error.rv,
+                "rv_hex": error.rv_hex,
+                "name": error.name,
+            })),
+            "status": record.init.status,
+            "detail": record.init.detail,
+        },
     })
 }
 
@@ -26692,7 +26708,7 @@ mod module_init_render_tests {
     use crate::discovery::caller_registry::{
         AdmissionState, ImageAuthority, ModuleInfo, RegistryGap,
     };
-    use crate::inventory_present::{Presentation, render_snapshot};
+    use crate::inventory_present::Presentation;
     use pkcs11_types::CkRv;
 
     fn coordinator() -> InventoryCoordinator<OsProcessSource> {
@@ -26739,8 +26755,9 @@ mod module_init_render_tests {
     }
 
     fn snapshot_text(coordinator: &InventoryCoordinator<OsProcessSource>) -> String {
+        use crate::inventory_present::render_snapshot_with_verbosity;
         let presentation = Presentation::capture(coordinator, "pid:7", 90, 120, 1);
-        render_snapshot(&presentation)
+        render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose)
     }
 
     #[test]
@@ -26801,6 +26818,7 @@ mod module_init_render_tests {
                 reason: "test loss".into(),
                 budget: None,
             });
+            coordinator.registry_mut().publish();
             let document = render_json(&coordinator, "pid:7", 90, 120, 1);
             let init = &document["modules"][0]["initialize"];
             assert_eq!(init["status"], "unknown", "subject {subject}");

@@ -36,9 +36,21 @@ pub(crate) struct ModuleInitRollup {
 }
 
 impl ModuleInitRollup {
-    /// Fold one observed init return into the roll-up.
-    pub(crate) fn note(&mut self, _rv: u64) {
-        // RED stub: replaced by the counting implementation.
+    /// Fold one observed init return into the roll-up: `CKR_OK`
+    /// counts ok, `CKR_CRYPTOKI_ALREADY_INITIALIZED` counts
+    /// already-initialized, and anything else refreshes the last
+    /// error. Saturating: the table is observation evidence, never
+    /// an overflow panic.
+    pub(crate) fn note(&mut self, rv: u64) {
+        use pkcs11_types::CkRv;
+        self.calls = self.calls.saturating_add(1);
+        if rv == CkRv::OK.0 {
+            self.ok = self.ok.saturating_add(1);
+        } else if rv == CkRv::CRYPTOKI_ALREADY_INITIALIZED.0 {
+            self.already_initialized = self.already_initialized.saturating_add(1);
+        } else {
+            self.last_error_rv = Some(rv);
+        }
     }
 }
 
@@ -55,9 +67,12 @@ pub(crate) enum InitStatus {
 impl InitStatus {
     /// The serialized status word.
     pub(crate) const fn label(self) -> &'static str {
-        // RED stub: replaced by the real vocabulary.
-        let _ = self;
-        "stub"
+        match self {
+            Self::Initialised => "initialised",
+            Self::Failed => "failed",
+            Self::Unseen => "unseen",
+            Self::Unknown => "unknown",
+        }
     }
 }
 
@@ -73,11 +88,51 @@ pub(crate) struct InitVerdict {
 /// loss), then the lane/loss gates fail closed, then observed
 /// failures, and finally the honest absence wording. `sealed` is the
 /// run's semantic-seal latch, `loss` the run's EVENTS-loss signal.
-pub(crate) fn verdict(_rollup: &ModuleInitRollup, _sealed: bool, _loss: bool) -> InitVerdict {
-    // RED stub: replaced by the real precedence.
+pub(crate) fn verdict(rollup: &ModuleInitRollup, sealed: bool, loss: bool) -> InitVerdict {
+    if rollup.ok > 0 {
+        return InitVerdict {
+            status: InitStatus::Initialised,
+            detail: "initialised, CKR_OK observed".into(),
+        };
+    }
+    if rollup.already_initialized > 0 {
+        return InitVerdict {
+            status: InitStatus::Initialised,
+            detail: "initialised, CKR_CRYPTOKI_ALREADY_INITIALIZED observed".into(),
+        };
+    }
+    if !sealed {
+        return InitVerdict {
+            status: InitStatus::Unknown,
+            detail: "semantic lane unavailable".into(),
+        };
+    }
+    if loss {
+        return InitVerdict {
+            status: InitStatus::Unknown,
+            detail: "event loss may have hidden C_Initialize calls".into(),
+        };
+    }
+    if rollup.calls > 0 {
+        // Calls without ok or already-initialized left a last error;
+        // `None` is unreachable, and reads failed without a name.
+        let name = rollup
+            .last_error_rv
+            .map(|rv| crate::semantics_edge::rv_name(rv).unwrap_or_else(|| format!("0x{rv:x}")));
+        return match name {
+            Some(name) => InitVerdict {
+                status: InitStatus::Failed,
+                detail: format!("seen, C_Initialize failed ({name})"),
+            },
+            None => InitVerdict {
+                status: InitStatus::Failed,
+                detail: "seen, C_Initialize failed".into(),
+            },
+        };
+    }
     InitVerdict {
         status: InitStatus::Unseen,
-        detail: "stub".into(),
+        detail: "no C_Initialize seen since the semantic lane started".into(),
     }
 }
 
@@ -87,12 +142,23 @@ pub(crate) fn verdict(_rollup: &ModuleInitRollup, _sealed: bool, _loss: bool) ->
 /// slot's. Mirrors the conversion slot checks, minus the caller
 /// binding a shed call never has.
 pub(crate) fn init_slot_for_shed(
-    _plan: &crate::plan::AttachPlan,
-    _slot_index: u32,
-    _endpoint: &crate::semantic_capture::Endpoint,
+    plan: &crate::plan::AttachPlan,
+    slot_index: u32,
+    endpoint: &crate::semantic_capture::Endpoint,
 ) -> bool {
-    // RED stub: replaced by the real predicate.
-    false
+    let Some(slot) = plan.slots.iter().find(|slot| slot.index == slot_index) else {
+        return false;
+    };
+    if slot.object != endpoint.object || slot.file_offset != endpoint.offset {
+        return false;
+    }
+    if !slot.semantic_authorized || slot.aliased || slot.semantic_ambiguous {
+        return false;
+    }
+    if slot.names.len() != 1 || slot.names[0] != C_INITIALIZE {
+        return false;
+    }
+    plan.effective_semantics(slot) != p11scope_ebpf_common::SlotSemantics::COUNT_ONLY
 }
 
 #[cfg(test)]

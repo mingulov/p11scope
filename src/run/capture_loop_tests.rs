@@ -2752,6 +2752,14 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             lifecycle: ModuleLifecycle::Mapped,
             unloaded_observed: false,
             unbound_use: None,
+            init: crate::inventory_present::ModuleInitView {
+                calls: 0,
+                ok: 0,
+                already_initialized: 0,
+                last_error_rv: None,
+                status: "unknown",
+                detail: "semantic lane unavailable".into(),
+            },
         }],
         edges: vec![EdgeView {
             caller: CallerId(0),

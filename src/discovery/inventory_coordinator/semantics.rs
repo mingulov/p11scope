@@ -4201,8 +4201,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// calls this on the sealed arms, so init evidence and the
     /// honest absence wording exist only past the seal.
     pub(crate) fn note_semantic_sealed(&mut self) {
-        // RED stub: replaced by the registry latch.
-        let _ = &mut self.registry;
+        self.registry.set_semantic_sealed();
     }
 }
 

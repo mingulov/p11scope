@@ -3123,34 +3123,34 @@ impl CallerRegistry {
     /// Fold one observed `C_Initialize` return into a module's
     /// roll-up. The finalizer taps joined (converted) and shed
     /// Events; both flow only past the lane seal.
-    pub(crate) fn note_module_init(&mut self, _module: ModuleId, _rv: u64) {
-        // RED stub: replaced by the accumulating implementation.
+    pub(crate) fn note_module_init(&mut self, module: ModuleId, rv: u64) {
+        self.module_init.entry(module).or_default().note(rv);
     }
 
     /// One module's init roll-up: zeros when nothing tapped it.
-    pub(crate) fn module_init_rollup(&self, _module: ModuleId) -> module_init::ModuleInitRollup {
-        // RED stub: replaced by the table read.
-        module_init::ModuleInitRollup::default()
+    pub(crate) fn module_init_rollup(&self, module: ModuleId) -> module_init::ModuleInitRollup {
+        self.module_init.get(&module).copied().unwrap_or_default()
     }
 
     /// Latch the run's semantic seal: from now on init returns are
     /// recorded, and a quiet module honestly reads unseen.
     pub(crate) fn set_semantic_sealed(&mut self) {
-        // RED stub: replaced by the latch.
+        self.semantic_sealed = true;
     }
 
     /// Whether the run's semantic lane sealed.
     pub(crate) fn semantic_sealed(&self) -> bool {
-        // RED stub: replaced by the latch read.
-        false
+        self.semantic_sealed
     }
 
     /// Whether run-wide EVENTS loss (or an unreadable loss counter)
     /// may have hidden init evidence: init verdicts without observed
     /// proof read unknown then.
     pub(crate) fn semantic_events_lossy(&self) -> bool {
-        // RED stub: replaced by the gap scan.
-        false
+        self.gaps.iter().any(|gap| {
+            gap.subject == module_init::NATIVE_EVENTS_LOST
+                || gap.subject == module_init::NATIVE_EVENTS_LOSS_UNKNOWN
+        })
     }
 
     /// Enable or disable the diagnostic settlement-latency

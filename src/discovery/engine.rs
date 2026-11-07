@@ -19602,6 +19602,18 @@ impl Engine {
     /// unarmed: in a multi-process scope, a view that owns no provider module
     /// and no pin claim stays exploratory.
     fn loader_arming_gated(&self, view_id: ProcessViewId) -> bool {
+        // The owned run child is the one named generation: it always
+        // arms, even provider-free under the run-tree cgroup scope, so
+        // the pause follows its exec chain as it did when runs were
+        // exact-PID captures. Every other provider-free member view
+        // stays exploratory.
+        if self.owned_run_pid.is_some_and(|owned| {
+            self.views
+                .iter()
+                .any(|view| view.id() == view_id && view.pid() == owned)
+        }) {
+            return false;
+        }
         self.admits_generations()
             && !self
                 .modules
@@ -19625,8 +19637,9 @@ impl Engine {
         // provider is owned. Provider-free views stay unarmed and
         // exploratory: rotation polls them within the exploration bound,
         // and a polling rescan that finds a provider upgrades the view to
-        // owned and arms it then. Pid scope (including owned runs) always
-        // arms: the one named generation is the capture, not exploration.
+        // owned and arms it then. Pid scope always arms: the one named
+        // generation is the capture, not exploration. So does the owned
+        // run child's view under any scope (see `loader_arming_gated`).
         // The skip is silent like NotArmable — the exploration envelope is
         // stated, not a per-capture loss — and unrecorded, so gated views
         // never inflate the `unavailable` aggregate.

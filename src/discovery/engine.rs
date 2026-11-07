@@ -12185,11 +12185,11 @@ impl Engine {
         if !self.admits_generations() {
             return;
         }
-        // A removed admitted view's generation is gone (dead or
-        // migrated out of the scope cgroup), so its pending exe
-        // identity and exec timing die with it, exactly like a
-        // matched exit. Under --cgroup a member that migrates out
-        // produces no exit record at all (the BPF exit hook only
+        // A removed admitted view is gone from the ledger (dead,
+        // migrated out of the scope cgroup, or evicted), so its
+        // pending exe identity and exec timing die with it, exactly
+        // like a matched exit. Under --cgroup a member that migrates
+        // out produces no exit record at all (the BPF exit hook only
         // emits for tasks in the scope cgroup at exit); without this
         // drop a fork-only reused PID would consume the dead image
         // with no loss and no PARTIAL.

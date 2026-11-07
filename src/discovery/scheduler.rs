@@ -1551,4 +1551,88 @@ mod tests {
             "the restored ledger sinks the ordinary attempt"
         );
     }
+
+    /// At a 1-pid batch with both classes waiting, the owed flag chooses
+    /// the single slot: the newcomer takes it when nothing is owed, the
+    /// waiting backlog pid takes the owed tick, and the repaid tick
+    /// returns to the newcomer. Without the choice the flood takes every
+    /// tick and the owed lead has no backlog slot to lead with.
+    #[test]
+    fn batch_1_owed_flag_alternates_the_single_slot() {
+        let mut scheduler = DiscoveryScheduler::new();
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &[1, 1000],
+            &BTreeSet::from([1000]),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![1000]);
+        scheduler.note_newcomer_attempt(1000);
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &[1, 1001],
+            &BTreeSet::from([1001]),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(
+            admitted,
+            vec![1],
+            "the owed tick serves the backlog pid"
+        );
+        scheduler.note_backlog_attempt(1);
+        let (admitted, _) = scheduler.new_view_window_newcomers_first(
+            &[1002],
+            &BTreeSet::from([1002]),
+            1,
+            MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+        );
+        assert_eq!(admitted, vec![1002]);
+    }
+
+    /// Small batches under sustained flood still serve the backlog: at
+    /// batch 1, 2 and 4 with a full batch of fresh arrivals per tick, the
+    /// lone backlog pid is attempted within two ticks. The newcomer share
+    /// leaves a backlog slot below the production batch; at batch 1 the
+    /// owed flag alternates the single slot.
+    #[test]
+    fn small_batch_sustained_flood_still_serves_backlog() {
+        for batch in [1usize, 2, 4] {
+            let mut scheduler = DiscoveryScheduler::new();
+            let mut remaining: BTreeSet<u32> = BTreeSet::from([1]);
+            let mut arrival = 1_000u32;
+            let mut served = None;
+            for tick in 1..=10 {
+                let mut fresh = BTreeSet::new();
+                for _ in 0..batch {
+                    remaining.insert(arrival);
+                    fresh.insert(arrival);
+                    arrival += 1;
+                }
+                let pids: Vec<u32> = remaining.iter().copied().collect();
+                let (admitted, _) = scheduler.new_view_window_newcomers_first(
+                    &pids,
+                    &fresh,
+                    batch,
+                    MAX_NEWCOMER_ADMISSIONS_PER_TICK,
+                );
+                for pid in &admitted {
+                    if fresh.contains(pid) {
+                        scheduler.note_newcomer_attempt(*pid);
+                    } else {
+                        scheduler.note_backlog_attempt(*pid);
+                    }
+                    remaining.remove(pid);
+                    if *pid == 1 && served.is_none() {
+                        served = Some(tick);
+                    }
+                }
+            }
+            let expected = if batch == 1 { 2 } else { 1 };
+            assert_eq!(
+                served,
+                Some(expected),
+                "batch {batch}: the lone backlog pid serves on tick {expected}"
+            );
+        }
+    }
 }

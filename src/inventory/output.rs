@@ -35,6 +35,13 @@ pub(crate) type StdoutResult = Result<usize, StdoutFailure>;
 pub(crate) trait FinalStdout {
     fn begin_finalization(&mut self);
     fn write_document(&mut self, bytes: &[u8]) -> StdoutResult;
+    /// Writes the final document to another descriptor (the stderr summary
+    /// move) under this writer's own signal counter and finalization
+    /// baseline. The default suits doubles that never take the move path.
+    fn write_document_to(&mut self, fd: RawFd, bytes: &[u8]) -> StdoutResult {
+        let _ = fd;
+        self.write_document(bytes)
+    }
 }
 
 /// Borrows an inherited descriptor and a delivered-signal counter. Construction
@@ -82,6 +89,10 @@ impl FinalStdout for FdStdout<'_> {
 
     fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
         let fd = self.fd;
+        self.write_document_with_transport(bytes, || stdout_transport_on_fd(fd))
+    }
+
+    fn write_document_to(&mut self, fd: RawFd, bytes: &[u8]) -> StdoutResult {
         self.write_document_with_transport(bytes, || stdout_transport_on_fd(fd))
     }
 }
@@ -186,31 +197,58 @@ fn write_document<W: Write + AsRawFd>(
 pub(crate) struct WriterStdout<'a>(pub(crate) &'a mut dyn Write);
 
 #[cfg(test)]
+fn write_fully(writer: &mut dyn Write, bytes: &[u8]) -> StdoutResult {
+    let total = bytes.len();
+    let mut accepted = 0;
+    while accepted < total {
+        let end = accepted + (total - accepted).min(SINK_BUFFER_BYTES);
+        match writer.write(&bytes[accepted..end]) {
+            Ok(0) => {
+                return Err(failure(
+                    accepted,
+                    total,
+                    StdoutFailureReason::Io(io::ErrorKind::WriteZero.into()),
+                ));
+            }
+            Ok(wrote) => accepted += wrote,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(failure(accepted, total, StdoutFailureReason::Io(error))),
+        }
+    }
+    writer
+        .flush()
+        .map_err(|error| failure(accepted, total, StdoutFailureReason::Io(error)))?;
+    Ok(accepted)
+}
+
+#[cfg(test)]
 impl FinalStdout for WriterStdout<'_> {
     fn begin_finalization(&mut self) {}
 
     fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
-        let total = bytes.len();
-        let mut accepted = 0;
-        while accepted < total {
-            let end = accepted + (total - accepted).min(SINK_BUFFER_BYTES);
-            match self.0.write(&bytes[accepted..end]) {
-                Ok(0) => {
-                    return Err(failure(
-                        accepted,
-                        total,
-                        StdoutFailureReason::Io(io::ErrorKind::WriteZero.into()),
-                    ));
-                }
-                Ok(wrote) => accepted += wrote,
-                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-                Err(error) => return Err(failure(accepted, total, StdoutFailureReason::Io(error))),
-            }
-        }
-        self.0
-            .flush()
-            .map_err(|error| failure(accepted, total, StdoutFailureReason::Io(error)))?;
-        Ok(accepted)
+        write_fully(self.0, bytes)
+    }
+}
+
+/// The in-memory move seam: stdout writes land in the first buffer, the
+/// stderr move in the second, so tests never touch the runner's real fd 2.
+#[cfg(test)]
+pub(crate) struct WriterStdoutWithStderr<'a>(
+    pub(crate) &'a mut dyn Write,
+    pub(crate) &'a mut dyn Write,
+);
+
+#[cfg(test)]
+impl FinalStdout for WriterStdoutWithStderr<'_> {
+    fn begin_finalization(&mut self) {}
+
+    fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+        write_fully(self.0, bytes)
+    }
+
+    fn write_document_to(&mut self, fd: RawFd, bytes: &[u8]) -> StdoutResult {
+        let _ = fd;
+        write_fully(self.1, bytes)
     }
 }
 

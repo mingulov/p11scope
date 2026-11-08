@@ -362,6 +362,44 @@ fn begin_finalization_never_recaptures_signal_count() {
     assert_eq!((failure.accepted, failure.total), (0, 7));
 }
 
+#[test]
+fn moved_write_reuses_the_baseline_signal_check() {
+    // The stderr move cancels on a later signal exactly like the stdout
+    // write: the same counter, the same frozen baseline.
+    let count = AtomicUsize::new(0);
+    let signals = || count.load(Ordering::SeqCst);
+    let mut stdout = FdStdout::new(-1, &signals);
+    stdout.begin_finalization();
+    count.store(1, Ordering::SeqCst);
+    let failure = stdout.write_document_to(-1, b"pending").unwrap_err();
+    assert!(matches!(failure.reason, StdoutFailureReason::Cancelled));
+    assert_eq!((failure.accepted, failure.total), (0, 7));
+    // Without a later signal the move writes through the given fd.
+    let destination = File::options().write(true).open("/dev/null").unwrap();
+    let count = AtomicUsize::new(0);
+    let signals = || count.load(Ordering::SeqCst);
+    let mut stdout = FdStdout::new(-1, &signals);
+    stdout.begin_finalization();
+    assert_eq!(
+        stdout
+            .write_document_to(destination.as_raw_fd(), b"complete")
+            .unwrap(),
+        8
+    );
+}
+
+#[test]
+fn memory_move_seam_routes_stdout_and_stderr_apart() {
+    let mut stdout = Vec::new();
+    let mut stderr = Vec::new();
+    let mut writer = WriterStdoutWithStderr(&mut stdout, &mut stderr);
+    writer.begin_finalization();
+    assert_eq!(writer.write_document(b"out").unwrap(), 3);
+    assert_eq!(writer.write_document_to(2, b"err").unwrap(), 3);
+    assert_eq!(stdout, b"out");
+    assert_eq!(stderr, b"err");
+}
+
 fn flags(fd: RawFd) -> i32 {
     // SAFETY: only querying an owned, open descriptor.
     let value = unsafe { libc::fcntl(fd, libc::F_GETFL) };

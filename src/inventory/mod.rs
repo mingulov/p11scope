@@ -51,9 +51,9 @@ use crate::inventory_events::{
     TotalsCadence, caller_event_payload, combined_dump_fits, ended_payload, pass_payload,
     settle_ended_combined, started_payload,
 };
-#[cfg(test)]
-use crate::inventory_output::WriterStdout;
 use crate::inventory_output::{FdStdout, FinalStdout, StdoutFailureReason, StdoutResult};
+#[cfg(test)]
+use crate::inventory_output::{WriterStdout, WriterStdoutWithStderr};
 use crate::inventory_present::{DASHBOARD_ACTIVITY_WINDOW_NS, Presentation, render_snapshot};
 use crate::output::AtomicFile;
 use crate::process::PidPin;
@@ -7364,8 +7364,10 @@ pub(crate) fn finish_output(
     // `--event-log -` owns stdout for the event stream: the human
     // document moves to stderr instead, verbatim, so stdout stays
     // pure JSONL. The move uses stdout's own rule (give up only
-    // after 5 s without progress, counting accepted bytes); a failed
-    // or partial move fails the command like a stdout failure.
+    // after 5 s without progress, counting accepted bytes) under the
+    // run's own signal counter and finalization baseline, so a later
+    // delivered signal cancels it exactly like a stdout write; a
+    // failed or partial move fails the command like a stdout failure.
     // `--json` beside `-` is refused before the run; a programmatic
     // caller that still combines them gets the document on stderr
     // too, never interleaved onto the stream.
@@ -7378,8 +7380,7 @@ pub(crate) fn finish_output(
             text = render_snapshot(presentation);
             text.as_bytes()
         };
-        let mut stderr = FdStdout::new(2, &|| 0);
-        if let Err(error) = stderr.write_document(bytes) {
+        if let Err(error) = stdout.write_document_to(2, bytes) {
             let reason = match &error.reason {
                 StdoutFailureReason::NoProgress => "no progress for 5 seconds".to_string(),
                 StdoutFailureReason::Cancelled => "cancelled by a later signal".to_string(),
@@ -11545,6 +11546,7 @@ mod tests {
         coordinator.commit_batch(false).unwrap();
         let view = super::Presentation::capture(&coordinator, "system", 1, 2, 1);
         let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
         let outcome = super::finish_output(
             None,
             &mut stream,
@@ -11552,13 +11554,18 @@ mod tests {
             &view,
             false,
             false,
-            &mut super::WriterStdout(&mut stdout),
+            &mut super::WriterStdoutWithStderr(&mut stdout, &mut stderr),
             None,
             None,
         );
         assert!(
             stdout.is_empty(),
             "stdout carries events only, never the human summary"
+        );
+        assert_eq!(
+            stderr,
+            super::render_snapshot(&view).as_bytes(),
+            "the moved summary is the verbatim text document"
         );
         assert_eq!(outcome.exit_code(), 0);
         // The stream itself completed: `ended` reached the pipe with
@@ -11576,6 +11583,69 @@ mod tests {
         let ended: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).unwrap();
         assert_eq!(ended["kind"], "ended");
         assert_eq!(ended["event"]["stdout_lost"]["lines"], 0);
+    }
+
+    #[test]
+    fn event_stdout_move_failure_is_reported_like_stdout() {
+        use crate::inventory_output::StdoutFailure;
+        use std::os::fd::AsRawFd as _;
+        struct CancelledMove;
+        impl FinalStdout for CancelledMove {
+            fn begin_finalization(&mut self) {}
+            fn write_document(&mut self, bytes: &[u8]) -> StdoutResult {
+                Err(StdoutFailure {
+                    accepted: 3,
+                    total: bytes.len(),
+                    reason: StdoutFailureReason::Cancelled,
+                })
+            }
+        }
+        // The default `write_document_to` delegates to `write_document`,
+        // so this double cancels the move exactly like a counted signal.
+        let (_read, write) = event_stdout_test_pipe();
+        let mut writer = super::EventWriter::create_stdout_on_fd(
+            write.as_raw_fd(),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        writer.begin_batch();
+        let mut stream = super::EventLogState::new(Some(writer));
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let view = super::Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let outcome = super::finish_output(
+            None,
+            &mut stream,
+            &mut super::StreamState::new(),
+            &view,
+            false,
+            false,
+            &mut CancelledMove,
+            None,
+            None,
+        );
+        assert_eq!(outcome.exit_code(), 1);
+        let total = super::render_snapshot(&view).len();
+        assert!(
+            outcome
+                .failures()
+                .iter()
+                .any(|failure| failure
+                    .contains("inventory stderr failed: cancelled by a later signal")),
+            "the cancel names its reason: {:?}",
+            outcome.failures()
+        );
+        assert!(
+            outcome
+                .failures()
+                .iter()
+                .any(|failure| failure.contains(&format!(
+                    "accepted 3 of {total} bytes; remaining {} not written",
+                    total - 3
+                ))),
+            "the cancel counts exact bytes: {:?}",
+            outcome.failures()
+        );
     }
 
     /// One fake-clock pass through the real commit path, for totals

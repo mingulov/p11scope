@@ -1470,9 +1470,7 @@ fn pty_a_saved_stdio_copy_does_not_bypass_the_stderr_capture() {
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
             "--exact",
-            &format!(
-                "{module}::pty_a_saved_stdio_copy_does_not_bypass_the_stderr_capture"
-            ),
+            &format!("{module}::pty_a_saved_stdio_copy_does_not_bypass_the_stderr_capture"),
             "--nocapture",
         ])
         .env(STDIO_CAPTURE_CHILD, "1")

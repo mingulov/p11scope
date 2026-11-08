@@ -11085,9 +11085,11 @@ impl Session {
 /// session, or a multi session whose dynamics stay on perf (an unproven
 /// pid filter), keeps it for dynamic perf re-attach. An owned `run`
 /// session (`owned`) never sheds when it holds `CAP_SYS_ADMIN`; a
-/// setcap `run` needs none (bisected to be50cad25: the shed broke owned
-/// pause_auto, and the gated operation is not yet identified; controller
-/// ruling 2026-11-08, F1). The sets come from
+/// setcap `run` needs none (bisected to be50cad25: after the shed the
+/// first attach reruns the return-probe safety check's uretprobe
+/// self-probe, keyed on the thread's effective capabilities; controller
+/// ruling 2026-11-08, F1; re-keying the stored approval to the
+/// post-shed context is a 0.7.x follow-up). The sets come from
 /// `capget`, never `/proc` (a broken `/proc` must not zero the shed).
 /// The shed is per-thread, so the pre-spawned cleanup worker sheds to
 /// the same keep. Sets already at keep skip the drop entirely (no

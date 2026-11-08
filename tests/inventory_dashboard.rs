@@ -525,7 +525,8 @@ fn dashboard_keeps_its_stderr_lines_in_a_file_and_on_the_terminal() {
 /// capture: the non-root `script` reproduction — `inventory --system
 /// --capture scan --dashboard` on a terminal, where a capability note
 /// is written while the capture runs. It must be captured and replayed
-/// after the restore — never drawn on the alternate screen. Needs a
+/// after the restore — never drawn raw on the alternate screen (framed
+/// log-tail lines are the capture showing its lines live). Needs a
 /// caller with at least one unreadable process (any non-root user on a
 /// normal host or CI runner), so the note fires at all.
 #[test]
@@ -564,13 +565,36 @@ fn dashboard_capture_holds_diagnostics_written_while_it_runs() {
         "a capability note fired during the run: {}",
         text.chars().take(3000).collect::<String>()
     );
-    // Nothing reached the screen: the note stayed in the capture.
+    // Nothing bypassed the capture onto the screen: every on-screen
+    // note is a framed log-tail line (the capture shows its lines live
+    // and replays them), never a raw write through the saved copy — a
+    // raw write carries no frame line-end after it on its line.
     let screen = &output[entered..left];
+    let needle = b"p11scope: needs";
+    let line_end = b"\x1b[K";
+    let mut raw = 0;
+    let mut at = 0;
+    while let Some(found) = screen[at..]
+        .windows(needle.len())
+        .position(|bytes| bytes == needle)
+    {
+        let start = at + found;
+        let line = &screen[start..];
+        let end = line
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(line.len(), |found| found + 1);
+        if !line[..end]
+            .windows(line_end.len())
+            .any(|bytes| bytes == line_end)
+        {
+            raw += 1;
+        }
+        at = start + needle.len();
+    }
     assert!(
-        !screen
-            .windows(b"p11scope: needs".len())
-            .any(|bytes| bytes == b"p11scope: needs"),
-        "no capability note on the alternate screen"
+        raw == 0,
+        "{raw} capability notes bypassed the capture onto the alternate screen"
     );
     // ... and was replayed after the restore, at least one line.
     let tail: String = text
@@ -589,6 +613,7 @@ fn dashboard_capture_holds_diagnostics_written_while_it_runs() {
     let digits: Vec<u8> = output[..at]
         .iter()
         .rev()
+        .skip_while(|byte| **byte == b' ')
         .take_while(|byte| byte.is_ascii_digit())
         .copied()
         .collect();

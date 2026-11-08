@@ -185,6 +185,16 @@ fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
     Ok(SinkWriter::without_flag_change(stdout_transport_on_fd(fd)?))
 }
 
+/// A saved stdio file plus the identity of the fd it was saved from
+/// (`st_dev`/`st_ino`): the dashboard's stderr capture replaces fd 2
+/// with its own pipe, so the copy is only valid while the fd still
+/// names the same file.
+struct PreservedFd {
+    file: std::fs::File,
+    dev: u64,
+    ino: u64,
+}
+
 /// Private stdout/stderr descriptions preserved before the startup
 /// capability shed: under `sudo … | cat` (or a user-owned terminal with
 /// old sudo) fds 1 and 2 are pipes the invoking user owns, while the
@@ -192,10 +202,11 @@ fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
 /// `/proc/self/fd/N` reopen fails EACCES. Opening the private
 /// descriptions once, while the full grant still holds, needs no extra
 /// capability for the run. The files stay open for the process's life;
-/// every transport clones them instead of reopening.
+/// every transport clones them instead of reopening, while its fd still
+/// names the saved file (see [`preserved_stdio_file`]).
 struct PreservedStdio {
-    stdout: Option<std::fs::File>,
-    stderr: Option<std::fs::File>,
+    stdout: Option<PreservedFd>,
+    stderr: Option<PreservedFd>,
 }
 
 static PRESERVED_STDIO: OnceLock<PreservedStdio> = OnceLock::new();
@@ -206,18 +217,30 @@ static PRESERVED_STDIO: OnceLock<PreservedStdio> = OnceLock::new();
 /// the preserved files never reach an owned child across exec).
 /// Anything else — not a FIFO/terminal, or an open that fails — is
 /// `None`, and the transports keep their reopen fallback.
-fn private_description(fd: RawFd) -> Option<std::fs::File> {
+fn private_description(fd: RawFd) -> Option<PreservedFd> {
     // SAFETY: `fstat` only reads the fd's metadata.
     let mut stat: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
         return None;
     }
     match stat.st_mode & libc::S_IFMT {
-        libc::S_IFIFO | libc::S_IFCHR => std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
-            .open(format!("/proc/self/fd/{fd}"))
-            .ok(),
+        libc::S_IFIFO | libc::S_IFCHR => {
+            let file = std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+                .open(format!("/proc/self/fd/{fd}"))
+                .ok()?;
+            // SAFETY: `fstat` only reads the saved file's metadata.
+            let mut saved: libc::stat = unsafe { std::mem::zeroed() };
+            if unsafe { libc::fstat(file.as_raw_fd(), &raw mut saved) } != 0 {
+                return None;
+            }
+            Some(PreservedFd {
+                file,
+                dev: saved.st_dev as u64,
+                ino: saved.st_ino as u64,
+            })
+        }
         _ => None,
     }
 }
@@ -235,17 +258,29 @@ pub(crate) fn preserve_stdio_private_descriptions() {
     });
 }
 
-/// A preserved private description for `fd` (1 or 2) when one exists:
-/// a `try_clone` of the startup file, so no reopen — and no extra
-/// capability — is needed to write the observer's own stdio.
+/// A preserved private description for `fd` (1 or 2) when one exists
+/// **and the fd still names the saved file**: a `try_clone` of the
+/// startup file, so no reopen — and no extra capability — is needed
+/// to write the observer's own stdio. When the fd was replaced after
+/// the save (the dashboard's capture pipe takes over fd 2), there is
+/// no preserved file and the transports fall back to their reopen —
+/// the replacement is ours, so it needs no capability either.
 pub(crate) fn preserved_stdio_file(fd: RawFd) -> Option<std::fs::File> {
     let preserved = PRESERVED_STDIO.get()?;
-    let file = match fd {
+    let saved = match fd {
         1 => preserved.stdout.as_ref()?,
         2 => preserved.stderr.as_ref()?,
         _ => return None,
     };
-    file.try_clone().ok()
+    // SAFETY: `fstat` only reads the fd's metadata.
+    let mut current: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut current) } != 0 {
+        return None;
+    }
+    if current.st_dev as u64 != saved.dev || current.st_ino as u64 != saved.ino {
+        return None;
+    }
+    saved.file.try_clone().ok()
 }
 
 /// Acquires the unbuffered transport without mutating inherited status flags.
@@ -1295,8 +1330,7 @@ mod tests {
                 // SAFETY: `dup2` of our own pipe end onto fd 1.
                 assert_eq!(unsafe { libc::dup2(write.as_raw_fd(), 1) }, 1);
                 drop(write);
-                let mut transport =
-                    stdout_transport_on_fd(1).expect("retargeted stdout must open");
+                let mut transport = stdout_transport_on_fd(1).expect("retargeted stdout must open");
                 transport.write_all(PRESERVED_LINE).unwrap();
                 transport.flush().unwrap();
                 drop(transport);
@@ -1318,11 +1352,7 @@ mod tests {
                     match read.read(&mut chunk) {
                         Ok(0) => break,
                         Ok(read) => got.extend_from_slice(&chunk[..read]),
-                        Err(error)
-                            if error.kind() == io::ErrorKind::WouldBlock =>
-                        {
-                            break
-                        }
+                        Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
                         Err(error) => panic!("new pipe read failed: {error}"),
                     }
                 }

@@ -1536,6 +1536,83 @@ mod tests {
     }
 
     #[test]
+    fn sampler_refuses_a_generation_other_than_the_admitted_one() {
+        use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::process_start_time;
+        use std::process::{Command, Stdio};
+        // python3 is a documented test prerequisite
+        // (docs/development.md), resolved like the console-script CLI
+        // cell.
+        let python = {
+            let out = Command::new("sh")
+                .args(["-c", "command -v python3"])
+                .output()
+                .expect("sh runs");
+            assert!(out.status.success(), "python3 is required for this test");
+            String::from_utf8(out.stdout)
+                .expect("utf8 path")
+                .trim()
+                .to_string()
+        };
+        assert!(python.starts_with('/'), "python3 path: {python}");
+        let script = std::env::temp_dir().join(format!(
+            "p11scope-app-hint-admitted-{}.py",
+            std::process::id()
+        ));
+        let script_name = script
+            .file_name()
+            .expect("script file name")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::write(&script, "import time\ntime.sleep(30)\n").expect("write script");
+        let mut child = Command::new(&python)
+            .arg(&script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn python sleeper");
+        let pid = child.id();
+        // Readiness is state, not time: wait until the script name is
+        // in the child's cmdline, so the sample below cannot race the
+        // exec.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let cmdline = std::fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
+            if cmdline
+                .windows(script_name.len())
+                .any(|window| window == script_name.as_bytes())
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "python sleeper never execed its script"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        let exe = read_exe_identity(pid).expect("child exe identity");
+        let admitted = process_start_time(pid).ok().expect("child start time");
+        let hint = sample_for_pid(pid, Some(&exe), Some(admitted))
+            .expect("the admitted generation keeps its argv hint");
+        assert_eq!(hint.value, script_name);
+        assert_eq!(hint.source, AppHintSource::Argv);
+        assert_eq!(
+            sample_for_pid(pid, Some(&exe), Some(admitted.wrapping_add(1))),
+            None,
+            "a generation other than the admitted one drops the hint"
+        );
+        assert_eq!(
+            sample_for_pid(pid, Some(&exe), None),
+            None,
+            "an unknown admitted generation drops the hint"
+        );
+        child.kill().ok();
+        let _ = child.wait();
+        std::fs::remove_file(&script).ok();
+    }
+
+    #[test]
     fn sampler_needs_an_exe_and_a_matching_identity() {
         use crate::discovery::caller_registry::read_exe_identity;
         use crate::process::process_start_time;

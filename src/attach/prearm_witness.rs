@@ -233,6 +233,12 @@ pub(crate) enum Unavailable {
     Ftrace(String),
     Pidns(String),
     TooManyFiles,
+    /// A calibration step refused: per-file calibration (mmap, calib
+    /// slot read, identity match) or the departure calibration. Kept
+    /// separate from BTF problems so the diagnostic names the step —
+    /// an observer in its own mount namespace fails here when its
+    /// mount table cannot resolve the layer files, fail closed.
+    Calibration(String),
 }
 
 impl Unavailable {
@@ -244,6 +250,7 @@ impl Unavailable {
             Unavailable::Ftrace(_) => "ftrace",
             Unavailable::Pidns(_) => "pidns",
             Unavailable::TooManyFiles => "too-many-files",
+            Unavailable::Calibration(_) => "calibration",
         }
     }
 }
@@ -741,7 +748,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
         cfg.calib_index = index as u32;
         backend
             .write_cfg(&cfg)
-            .map_err(|error| Unavailable::Btf(format!("witness calib cfg: {error:?}")))?;
+            .map_err(|error| Unavailable::Calibration(format!("witness calib cfg: {error:?}")))?;
         use std::os::unix::io::AsRawFd as _;
         // SAFETY: fresh private read-only mapping of an open regular file.
         let addr = unsafe {
@@ -755,7 +762,9 @@ pub(crate) fn start_with<B: WitnessBackend>(
             )
         };
         if addr == libc::MAP_FAILED {
-            return Err(Unavailable::Btf("witness calibration mmap failed".into()));
+            return Err(Unavailable::Calibration(
+                "witness calibration mmap failed".into(),
+            ));
         }
         let start = addr as u64;
         // Prefer the mapped-range identity (as instance calibrate does);
@@ -766,9 +775,11 @@ pub(crate) fn start_with<B: WitnessBackend>(
         unsafe { libc::munmap(addr, 4096) };
         let slot = backend
             .read_calib(index as u32)
-            .map_err(|error| Unavailable::Btf(format!("witness calib read: {error:?}")))?;
+            .map_err(|error| Unavailable::Calibration(format!("witness calib read: {error:?}")))?;
         if slot.hits != 1 || slot.i_ino == 0 {
-            return Err(Unavailable::Btf("witness calibration mismatch".into()));
+            return Err(Unavailable::Calibration(
+                "witness calibration mismatch".into(),
+            ));
         }
         // Note: s_dev is not compared (Btrfs st_dev differs from the
         // mapped s_dev); the inode plus the held fd identify the file,
@@ -778,7 +789,9 @@ pub(crate) fn start_with<B: WitnessBackend>(
         // so a direct mismatch falls back to backing-vs-backing
         // through the layer candidates — never fstat against maps.
         if slot.i_ino != identity.1 && !calibration_backing_accepted(&path, slot.i_ino, None) {
-            return Err(Unavailable::Btf("witness calibration mismatch".into()));
+            return Err(Unavailable::Calibration(
+                "witness calibration mismatch".into(),
+            ));
         }
         files.push(WitnessFile {
             fd,
@@ -794,13 +807,15 @@ pub(crate) fn start_with<B: WitnessBackend>(
     // Departure calibration: one thread exit must self-depart.
     let departed = std::thread::spawn(|| {}).join().is_ok();
     if !departed {
-        return Err(Unavailable::Btf("witness departure thread failed".into()));
+        return Err(Unavailable::Calibration(
+            "witness departure thread failed".into(),
+        ));
     }
     let self_departs = backend
         .read_self_departs()
-        .map_err(|error| Unavailable::Btf(format!("witness departs read: {error:?}")))?;
+        .map_err(|error| Unavailable::Calibration(format!("witness departs read: {error:?}")))?;
     if self_departs < 1 {
-        return Err(Unavailable::Btf(
+        return Err(Unavailable::Calibration(
             "witness departure calibration missed".into(),
         ));
     }
@@ -1768,6 +1783,10 @@ mod tests {
         assert_eq!(Unavailable::Ftrace("detail".into()).class(), "ftrace");
         assert_eq!(Unavailable::Pidns("detail".into()).class(), "pidns");
         assert_eq!(Unavailable::TooManyFiles.class(), "too-many-files");
+        assert_eq!(
+            Unavailable::Calibration("detail".into()).class(),
+            "calibration"
+        );
     }
 
     /// Privileged: the cgroup id from `Scope::Cgroup` (directory inode)

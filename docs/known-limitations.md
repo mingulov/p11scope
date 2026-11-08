@@ -683,7 +683,10 @@ line only with `--prearm-module`: about 0.2 s extrapolated on a 300k-VMA
 desktop (the pre-measurement estimate was 0.1 s), 0.71 s
 measured at 1M VMAs in a guest. Limits: at most 64 watched files, the
 observer must run in the initial pid namespace, LTO kernels are refused, and
-the walk fails closed past its 10 s deadline.
+the walk fails closed past its 10 s deadline. Overlay files calibrate only
+when the observer's mount table names and can stat the layer directories; a
+metadata-only upper additionally needs a readable
+`trusted.overlay.metacopy` xattr.
 Inventory accepts and retains pre-arm inputs, attaches proved offsets
 through the inventory lane, and reports one interval row per input in
 `prearm[]`. An in-place rewrite that preserves `(ino, size, ctime)`

@@ -1834,6 +1834,19 @@ fn event_interval_adds_periodic_totals_to_the_file_stream() {
         assert_eq!(line["schema"], "p11scope/inventory-events/v1");
         let pass = line["event"]["pass"].as_u64().unwrap();
         assert!(pass > last_pass, "totals passes increase: {line}");
+        // A totals trails its pass marker: it carries that pass's
+        // number, not the completed-pass count.
+        let position = lines.iter().position(|row| row == *line).unwrap();
+        let marker = lines[..position]
+            .iter()
+            .rev()
+            .find(|row| row["kind"] == "pass_committed")
+            .expect("a totals trails its pass marker");
+        assert_eq!(
+            marker["event"]["pass"].as_u64().unwrap(),
+            pass,
+            "totals.pass trails its pass_committed: {line} vs {marker}"
+        );
         last_pass = pass;
         let at_ns = line["at_ns"].as_u64().unwrap();
         if last_at != 0 {

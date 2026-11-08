@@ -8508,6 +8508,14 @@ fn attach_note_text(note: &crate::discovery::inventory_attach_set::AttachDecisio
     text
 }
 
+/// The dashboard sink of [`progress_lines`]: the headline plus events
+/// and gaps always; the attach-decision tail only when verbose, so a
+/// large scope's admission notes cannot evict real gap warnings from
+/// the replay buffer at default verbosity.
+fn dashboard_visible_lines(lines: &[String], _verbose: bool) -> Vec<&String> {
+    lines.iter().collect()
+}
+
 /// Per-pass progress lines (stdout stays parseable): what the pass
 /// scanned, which caller incarnations turned over, and what the pass
 /// cost — gaps, budget refusals, and suppressed gaps are reported, so a
@@ -14644,6 +14652,84 @@ mod tests {
         assert!(
             !quiet.iter().any(|line| line.contains("attach ")),
             "{quiet:?}"
+        );
+    }
+
+    #[test]
+    fn dashboard_progress_hides_attach_notes_unless_verbose() {
+        // The dashboard replays pass lines into a capped stderr
+        // buffer: the attach-decision tail stays verbose-only there,
+        // while the headline (and every non-attach line) always shows.
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        use crate::discovery::inventory_attach_set::{AttachDecisionNote, DecisionLog};
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let mut staged = coordinator();
+        let mut decisions = DecisionLog::default();
+        decisions.push(AttachDecisionNote {
+            key: ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 84,
+                },
+                inode: 42,
+            },
+            path: "/upper/libsofthsm2.so".into(),
+            branch: "blocked-no-companion",
+            retained: Some("sha-s".into()),
+            incoming: "sha-s".into(),
+            incoming_pre: false,
+            direction: None,
+            endpoints: None,
+        });
+        decisions.push(AttachDecisionNote {
+            key: ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 84,
+                },
+                inode: 42,
+            },
+            path: "/upper/libsofthsm2.so".into(),
+            branch: "verdict-admitted",
+            retained: None,
+            incoming: "sha-s".into(),
+            incoming_pre: true,
+            direction: None,
+            endpoints: Some(68),
+        });
+        decisions.dropped = 1;
+        staged.stage_decisions_for_test(decisions);
+        let report = PassReport {
+            pass: 6,
+            scanned: 128,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 128,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&staged, &report);
+        assert!(
+            lines.iter().any(|line| line.contains(": attach ")),
+            "the fixture must carry attach lines: {lines:?}"
+        );
+        let concise = dashboard_visible_lines(&lines, false);
+        assert!(
+            !concise.iter().any(|line| line.contains(": attach ")),
+            "concise dashboard drops the attach tail: {concise:?}"
+        );
+        assert_eq!(
+            concise.first().copied(),
+            lines.first(),
+            "the headline always shows"
+        );
+        let verbose = dashboard_visible_lines(&lines, true);
+        assert_eq!(
+            verbose.len(),
+            lines.len(),
+            "verbose dashboard keeps every line"
         );
     }
 

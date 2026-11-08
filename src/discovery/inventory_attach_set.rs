@@ -3461,6 +3461,17 @@ pub(crate) mod tests {
         assert_eq!(refused.retained.as_deref(), Some("sha-s"));
         assert_eq!(refused.incoming, "sha-s");
         assert!(!refused.incoming_pre);
+        assert_eq!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .filter(|note| note.branch == "blocked-no-companion")
+                .count(),
+            1,
+            "one refusal note per plain object, not one per endpoint: {:?}",
+            pass1.decisions.notes
+        );
         // The joint pass admits the module: the pre side's admission
         // stands with the plain side's refusal disclosed beside it
         // (after-1 showed the refusal overwriting the admission).
@@ -3532,6 +3543,17 @@ pub(crate) mod tests {
         assert_eq!(refused.key, key);
         assert_eq!(refused.retained.as_deref(), Some("sha-s"));
         assert_eq!(refused.incoming, "sha-s");
+        assert_eq!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .filter(|note| note.branch == "blocked-no-companion")
+                .count(),
+            1,
+            "one refusal note per plain object, not one per endpoint: {:?}",
+            pass1.decisions.notes
+        );
         // Same merged verdict the other plan order reports: the
         // admission stands with the refusal disclosed.
         match pass1.verdicts.get(&AttachModuleKey {

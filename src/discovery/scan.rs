@@ -4372,7 +4372,9 @@ fn overlay_row_for(mountinfo: &str, merged: &std::path::Path) -> Option<(String,
 /// table: the overlay mount with the longest mountpoint prefix of the
 /// path contributes its `lowerdir` stack in order, each joined with the
 /// path's remainder. fsconfig rows (`lowerdir+=` per layer) contribute
-/// in entry order; a row naming any `datadir` layer refuses outright.
+/// in entry order; a row naming any `datadir` layer refuses outright,
+/// as does a `lowerdir` stack with an empty element between non-empty
+/// ones (the legacy data-only separator).
 /// Empty when no overlay row covers the path, the row names no
 /// lowerdir, or the remainder escapes (fail closed): the caller keeps
 /// the named gap. Mountinfo escapes are decoded on both sides; the
@@ -4397,11 +4399,24 @@ pub(crate) fn lower_candidates_from_mountinfo(
             return Vec::new();
         }
         if let Some(stack) = opt.strip_prefix("lowerdir=") {
+            let layers: Vec<&str> = stack.split(':').collect();
+            // The legacy data-only separator (`lowerdir=/a::/b`): the
+            // kernel prints the user's colon string verbatim, and an
+            // empty element between non-empty ones names a layer this
+            // reader cannot resolve — the row refuses like `datadir`.
+            let data_only_gap = layers.iter().enumerate().any(|(at, layer)| {
+                layer.is_empty()
+                    && layers[..at].iter().any(|peer| !peer.is_empty())
+                    && layers[at + 1..].iter().any(|peer| !peer.is_empty())
+            });
+            if data_only_gap {
+                return Vec::new();
+            }
             lowers.extend(
-                stack
-                    .split(':')
+                layers
+                    .iter()
                     .filter(|layer| !layer.is_empty())
-                    .map(unescape_mountinfo_field),
+                    .map(|layer| unescape_mountinfo_field(layer)),
             );
         } else if let Some(dir) = opt.strip_prefix("lowerdir+=") {
             // fsconfig mounts print one lowerdir+= per layer, in kernel

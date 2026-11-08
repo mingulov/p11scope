@@ -5866,12 +5866,46 @@ fn privileged_witness_calibration_accepts_xino_overlay_files() {
     let scope = crate::attach::Scope::System;
     let mut refused = Vec::new();
     for (tag, path) in &rows {
+        // Each row's expected backing identity, read straight from its
+        // layer file: the lower row from the lower layer, the upper
+        // and copied-up rows from the upper layer.
+        let layer_path = match *tag {
+            "lower" => fixture.lower_path("lower.so"),
+            "upper" => fixture.upper_path("upper.so"),
+            _ => fixture.upper_path("cup.so"),
+        };
+        let layer = std::fs::metadata(&layer_path).expect("layer direct stat");
+        let merged_meta = std::fs::metadata(path).expect("merged stat for the row");
+        // The layer file's kernel device: the BPF slot reports the raw
+        // `s_dev` (kdev_t: 12-bit major at bits 20-31, 20-bit minor),
+        // not the userspace `st_dev` encoding (instance.rs precedent).
+        let layer_kdev =
+            (u64::from(libc::major(layer.dev())) << 20) | u64::from(libc::minor(layer.dev()));
+        // Non-vacuity premise: the layer identity differs from the
+        // merged overlay identity on distinct-fs xino layers, so the
+        // key asserts below cannot pass on the wrong identity.
+        assert_ne!(
+            (layer.dev(), layer.ino()),
+            (merged_meta.dev(), merged_meta.ino()),
+            "{tag}: the twin needs split layer/merged identities"
+        );
         match crate::attach::prearm_witness::start(std::slice::from_ref(path), &scope, true) {
             Ok(witness) => {
                 assert_eq!(witness.files.len(), 1, "{tag}: one calibrated file");
+                let key = &witness.files[0].key;
                 eprintln!(
                     "WITNESS_XINO {tag} calibrated key=({},{})",
-                    witness.files[0].key.s_dev, witness.files[0].key.i_ino
+                    key.s_dev, key.i_ino
+                );
+                assert_eq!(
+                    (key.s_dev, key.i_ino),
+                    (layer_kdev, layer.ino()),
+                    "{tag}: the calibration key must be the layer file's (kdev, ino)"
+                );
+                assert_eq!(
+                    witness.files[0].ino,
+                    merged_meta.ino(),
+                    "{tag}: the witness fd ino must equal the merged stat ino"
                 );
             }
             Err(reason) => {

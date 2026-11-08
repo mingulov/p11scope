@@ -117,6 +117,16 @@ before calling a rerun green.
 - Mechanism: unknown; the entries-observation path attaches to B2's
   edge mid-span on some runs and then counts nothing. Lineage-neutral
   (R3 A/B: tip 3/10, base edges affected too). Pass timing identical
-  to passing runs (B2 ready at passes 6,7; ledger at 8,9).
+  to passing runs (B2 ready at passes 6,7; ledger at 8,9). R5
+  analysis of the R3 `ab-spans` narrows it: on the tripped tips
+  (3,4,6) all three edges on B2's module (B-pre, twin, B2) are
+  `watched_no_use`, while on passing tips all three are
+  `not_attached` — the flip is module-wide, not B2-specific. Base
+  B2 edges are `watched_no_use` 10/10, but structurally (no pair:
+  B-pre edges the old module only), not the race. Lead: the
+  byte-identical collapse usually suppresses probing on the pair
+  module, yet on 3/10 tips the endpoints attach mid-span
+  (`since_ns` ≈ first-mapping + 13–20 s, counting nothing either
+  way); the exact attach trigger is still unknown.
 - Disposition: named flake; the span gate stays exact. Needs a root
   cause before the D1 cell can go green reliably.

@@ -62,7 +62,8 @@ jobs:
           )"
           test "$(git -C "$GITHUB_WORKSPACE" rev-parse "$GITHUB_SHA^{tree}")" = "$release_tree"
           git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$release_head" "$GITHUB_SHA"
-          test "$release_version" = "${GITHUB_REF_NAME#v}"
+          tag_version="${GITHUB_REF_NAME#v}"
+          test "$release_version" = "${tag_version%%-*}"
           echo "RELEASE ok: version $release_version, tree ${release_tree:0:12}, head ${release_head:0:12}"
           set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
           test "$#" -eq 1

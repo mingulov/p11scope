@@ -187,12 +187,12 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   emitter deferred queues still waiting after the commit, and the
   writer accounting (`stdout_lost` reads zero on file streams, which
   never shed; `ended` carries it on stdout streams only). At most one
-  per pass, trailing its `pass_committed`; the cadence is phase-locked
-  to actual emissions (a late pass moves the next due date by one
-  interval instead of bursting catch-ups), rides the existing pass
-  ticks with no new thread, and never delays stop. The stop commit
-  emits none: `ended` and the final report already carry the final
-  counts.
+  per pass, trailing its `pass_committed`; the cadence is
+  phase-locked to actual emissions (a late pass moves the next due
+  date by one interval instead of bursting catch-ups), rides the
+  existing pass ticks with no new thread, and never delays stop. The
+  stop commit emits none: `ended` and the final report already carry
+  the final counts.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,

@@ -1144,14 +1144,13 @@ mod tests {
                 "{argv:?} without CAP_BPF must keep SYS_ADMIN for the witness (F2)"
             );
         }
-        for argv in [vec!["inventory", "--system", "--capture", "scan"]] {
-            let command = parse(&argv);
-            assert_eq!(
-                keep_mask_for_command_in(no_bpf, &command) & sys_admin,
-                0,
-                "{argv:?} without CAP_BPF must not keep SYS_ADMIN (map_files held)"
-            );
-        }
+        let argv = vec!["inventory", "--system", "--capture", "scan"];
+        let command = parse(&argv);
+        assert_eq!(
+            keep_mask_for_command_in(no_bpf, &command) & sys_admin,
+            0,
+            "{argv:?} without CAP_BPF must not keep SYS_ADMIN (map_files held)"
+        );
         // Live `--system` capture keeps SYS_ADMIN either way (the singles
         // fallback), so the DaemonSet twin pins the kept bit.
         for argv in [

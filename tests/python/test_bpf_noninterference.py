@@ -6,6 +6,7 @@ The Git snapshots and filesystem operations are real. Only the expensive
 external compiler/Cargo commands use tiny command fixtures.
 """
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -342,6 +343,220 @@ class CanonicalBtfTests(unittest.TestCase):
             self.driver.compare_objects(left, right, dump_c=dump)
 
 
+class AllowedChangeTests(unittest.TestCase):
+    """The reviewed allowed-change record: strict load, content matching."""
+
+    def setUp(self):
+        self.assertTrue(SCRIPT.is_file(), "the noninterference driver is missing")
+        self.driver = load_path(SCRIPT)
+        self.temporary = tempfile.TemporaryDirectory(prefix="bpf-allowed-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+        self.repo = self.root / "repo"
+        self.repo.mkdir()
+        self.baseline = self.objects("baseline", b"baseline bytes")
+        self.candidate = self.objects("candidate", b"candidate bytes")
+
+    def objects(self, directory, payload):
+        parent = self.root / directory
+        parent.mkdir()
+        result = {}
+        for index, name in enumerate(NAMES):
+            result[name] = parent / name
+            result[name].write_bytes(payload + bytes([index]))
+        return result
+
+    def triple(self, objects):
+        return {name: {"sha256": hashlib.sha256(objects[name].read_bytes()).hexdigest(),
+                       "size": objects[name].stat().st_size}
+                for name in NAMES}
+
+    def entry(self, **overrides):
+        record = {"baseline": self.triple(self.baseline),
+                  "candidate": self.triple(self.candidate),
+                  "lane": "fixture lane",
+                  "rationale": "fixture rationale",
+                  "baseline_revision": "v0.6.0",
+                  "candidate_revision": "fixture candidate"}
+        record.update(overrides)
+        return record
+
+    def write_record(self, document):
+        path = self.repo / "allowed.json"
+        path.write_text(json.dumps(document), encoding="utf-8")
+        return path
+
+    def load(self, document):
+        return self.driver.load_allowed_changes(self.write_record(document), self.repo)
+
+    def test_valid_record_loads_transitions(self):
+        transitions = [self.entry(), self.entry(lane="second lane")]
+        self.assertEqual(self.load({"version": 1, "transitions": transitions}), transitions)
+
+    def test_missing_record_file_fails(self):
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.load_allowed_changes(self.repo / "absent.json", self.repo)
+
+    def test_symlinked_record_is_refused(self):
+        target = self.root / "real.json"
+        target.write_text(json.dumps({"version": 1, "transitions": [self.entry()]}),
+                          encoding="utf-8")
+        link = self.repo / "allowed.json"
+        link.symlink_to(target)
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.load_allowed_changes(link, self.repo)
+
+    def test_record_outside_repo_is_refused(self):
+        outside = self.root / "outside.json"
+        outside.write_text(json.dumps({"version": 1, "transitions": [self.entry()]}),
+                           encoding="utf-8")
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.load_allowed_changes(outside, self.repo)
+
+    def test_relative_record_path_is_refused(self):
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.load_allowed_changes(Path("allowed.json"), self.repo)
+
+    def test_malformed_json_is_refused(self):
+        path = self.repo / "allowed.json"
+        path.write_text("{not json", encoding="utf-8")
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.load_allowed_changes(path, self.repo)
+
+    def test_top_level_shape_violations_are_refused(self):
+        documents = [{"version": 1, "transitions": [self.entry()], "extra": 1},
+                     {"transitions": [self.entry()]},
+                     {"version": 1},
+                     [self.entry()]]
+        for document in documents:
+            with self.subTest(document=document):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load(document)
+
+    def test_wrong_version_is_refused(self):
+        for version in (0, 2, "1", True, None):
+            with self.subTest(version=version):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": version, "transitions": [self.entry()]})
+
+    def test_empty_or_unlisted_transitions_are_refused(self):
+        for transitions in ([], {}, "entry"):
+            with self.subTest(transitions=transitions):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": transitions})
+
+    def test_entry_shape_violations_are_refused(self):
+        valid = self.entry()
+        entries = [{key: value for key, value in valid.items() if key != "lane"},
+                   {**valid, "extra": 1},
+                   "entry"]
+        for entry in entries:
+            with self.subTest(entry=entry):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [entry]})
+
+    def test_object_map_violations_are_refused(self):
+        valid = self.triple(self.baseline)
+        dropped = {key: value for key, value in valid.items() if key != NAMES[0]}
+        sides = [({"baseline": dropped, "candidate": self.triple(self.candidate)}),
+                 ({"baseline": valid, "candidate": {**self.triple(self.candidate), "extra": valid[NAMES[0]]}}),
+                 ({"baseline": "triple", "candidate": self.triple(self.candidate)}),
+                 ({"baseline": {**valid, NAMES[0]: "object"}, "candidate": self.triple(self.candidate)}),
+                 ({"baseline": {**valid, NAMES[0]: {"sha256": valid[NAMES[0]]["sha256"]}},
+                   "candidate": self.triple(self.candidate)}),
+                 ({"baseline": {**valid, NAMES[0]: {**valid[NAMES[0]], "extra": 1}},
+                   "candidate": self.triple(self.candidate)})]
+        for sides in sides:
+            with self.subTest(sides=sides):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [self.entry(**sides)]})
+
+    def test_digest_and_size_violations_are_refused(self):
+        valid = self.triple(self.baseline)[NAMES[0]]
+        digests = ["0" * 63, valid["sha256"].upper(), "z" * 64, 123]
+        sizes = [0, -5, True, "12"]
+        for digest in digests:
+            with self.subTest(digest=digest):
+                triple = self.triple(self.baseline)
+                triple[NAMES[0]] = {"sha256": digest, "size": valid["size"]}
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [self.entry(baseline=triple)]})
+        for size in sizes:
+            with self.subTest(size=size):
+                triple = self.triple(self.baseline)
+                triple[NAMES[0]] = {"sha256": valid["sha256"], "size": size}
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [self.entry(baseline=triple)]})
+
+    def test_text_violations_are_refused(self):
+        for entry in (self.entry(lane=""),
+                      self.entry(rationale="first\nsecond"),
+                      self.entry(baseline_revision="x" * 2001),
+                      self.entry(candidate_revision=123)):
+            with self.subTest(entry=entry):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [entry]})
+
+    def test_noop_transition_is_refused(self):
+        triple = self.triple(self.baseline)
+        with self.assertRaises(self.driver.CheckError):
+            self.load({"version": 1, "transitions": [self.entry(baseline=triple, candidate=triple)]})
+
+    def test_duplicate_transitions_are_refused(self):
+        with self.assertRaises(self.driver.CheckError):
+            self.load({"version": 1, "transitions": [self.entry(), self.entry()]})
+
+    def test_matching_triple_returns_the_entry(self):
+        entry = self.entry()
+        self.assertEqual(self.driver.match_allowed_change([entry], self.baseline, self.candidate),
+                         entry)
+
+    def test_mismatched_triples_return_none(self):
+        entry = self.entry()
+        original = self.candidate[NAMES[0]].read_bytes()
+        try:
+            self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
+            self.assertIsNone(self.driver.match_allowed_change([entry], self.baseline, self.candidate))
+        finally:
+            self.candidate[NAMES[0]].write_bytes(original)
+        self.assertIsNone(self.driver.match_allowed_change([entry], self.candidate, self.baseline))
+
+    def test_strict_pass_ignores_an_empty_record(self):
+        identical = self.objects("identical", b"baseline bytes")
+        verdicts, matched = self.driver.compare_with_allowed_changes(self.baseline, identical, [])
+        self.assertEqual(verdicts, {name: "exact" for name in NAMES})
+        self.assertIsNone(matched)
+
+    def test_matching_record_labels_only_the_differing_object(self):
+        same = self.objects("same", b"baseline bytes")
+        same[NAMES[0]].write_bytes(same[NAMES[0]].read_bytes() + b"recorded")
+        entry = self.entry(candidate=self.triple(same))
+        verdicts, matched = self.driver.compare_with_allowed_changes(self.baseline, same, [entry])
+        self.assertEqual(matched, entry)
+        self.assertEqual(verdicts, {NAMES[0]: "allowed-change",
+                                    NAMES[1]: "exact", NAMES[2]: "exact"})
+
+    def test_nonmatching_record_reraises_the_strict_failure(self):
+        entry = self.entry()
+        original = self.candidate[NAMES[0]].read_bytes()
+        self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
+        try:
+            with self.assertRaisesRegex(self.driver.CheckError,
+                                        "default object differs: p11scope-ebpf"):
+                self.driver.compare_with_allowed_changes(self.baseline, self.candidate, [entry])
+        finally:
+            self.candidate[NAMES[0]].write_bytes(original)
+
+    def test_empty_transition_list_cannot_allow_a_difference(self):
+        original = self.candidate[NAMES[0]].read_bytes()
+        self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
+        try:
+            with self.assertRaises(self.driver.CheckError):
+                self.driver.compare_with_allowed_changes(self.baseline, self.candidate, [])
+        finally:
+            self.candidate[NAMES[0]].write_bytes(original)
+
+
 class BuildDriverTests(unittest.TestCase):
     def setUp(self):
         self.assertTrue(SCRIPT.is_file(), "the noninterference driver is missing")
@@ -412,7 +627,7 @@ class BuildDriverTests(unittest.TestCase):
             f'pub const COMMIT: &str = "{commit}";\n', encoding="utf-8")
 
     def invoke(self, repeat=False, work=None, payloads=(), script=None,
-               transition=False):
+               transition=False, record=None):
         self.work = work or self.root / "work"
         command = [sys.executable, "-I", str(script or SCRIPT), "--repo", str(self.repo),
                    "--baseline", self.baseline, "--candidate", self.baseline if repeat else self.candidate,
@@ -422,6 +637,8 @@ class BuildDriverTests(unittest.TestCase):
         if transition:
             # The removed transition option: argparse must refuse it.
             command.append("--host-compiler-transition")
+        if record is not None:
+            command += ["--allowed-change-record", str(record)]
         for flag, payload in zip(("--baseline-offline-payload", "--candidate-offline-payload"), payloads):
             command += [flag, str(payload)]
         return subprocess.run(command, env=self.environment, text=True, capture_output=True, timeout=30)
@@ -920,6 +1137,61 @@ class BuildDriverTests(unittest.TestCase):
                 self.assertIn(name, result.stderr)
                 self.assertTrue((self.work / "candidate" / "sections.txt").is_file())
 
+    def built_triple(self, objects):
+        return {name: {"sha256": hashlib.sha256((objects / name).read_bytes()).hexdigest(),
+                       "size": (objects / name).stat().st_size}
+                for name in NAMES}
+
+    def mutate_first_flavor(self):
+        self.configure(mutate_flavor=NAMES[0])
+        (self.repo / "object-source").write_text("changed " + NAMES[0], encoding="utf-8")
+        self.git("add", ".")
+        self.candidate = self.commit("mutated " + NAMES[0])
+
+    def test_allowed_change_record_covers_a_real_flavor_difference(self):
+        self.mutate_first_flavor()
+        result = self.invoke(work=self.root / "unrecorded")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(NAMES[0], result.stderr)
+        record = {"version": 1, "transitions": [{
+            "baseline": self.built_triple(self.root / "unrecorded" / "baseline" / "objects"),
+            "candidate": self.built_triple(self.root / "unrecorded" / "candidate" / "objects"),
+            "lane": "fixture recorded change",
+            "rationale": "fixture: the first flavor gains source bytes",
+            "baseline_revision": self.baseline,
+            "candidate_revision": self.candidate}]}
+        path = self.repo / "allowed.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.invoke(work=self.root / "recorded", record=path)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        receipt = json.loads((self.root / "recorded" / "comparison.json").read_text())
+        self.assertEqual(receipt["verdicts"], {NAMES[0]: "allowed-change",
+                                               NAMES[1]: "exact", NAMES[2]: "exact"})
+        self.assertEqual(receipt["allowed_change"]["lane"], "fixture recorded change")
+        self.assertIn("ALLOWED CHANGE", result.stdout)
+
+    def test_unrecorded_difference_with_a_nonmatching_record_still_fails(self):
+        self.mutate_first_flavor()
+        wrong = {name: {"sha256": hashlib.sha256(b"wrong baseline").hexdigest(), "size": 5}
+                 for name in NAMES}
+        also_wrong = {name: {"sha256": hashlib.sha256(b"wrong candidate").hexdigest(), "size": 6}
+                      for name in NAMES}
+        record = {"version": 1, "transitions": [{"baseline": wrong, "candidate": also_wrong,
+                                                 "lane": "fixture", "rationale": "fixture",
+                                                 "baseline_revision": "a", "candidate_revision": "b"}]}
+        path = self.repo / "allowed.json"
+        path.write_text(json.dumps(record), encoding="utf-8")
+        result = self.invoke(record=path)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(NAMES[0], result.stderr)
+        self.assertFalse((self.work / "comparison.json").exists())
+
+    def test_repeat_baseline_refuses_an_allowed_change_record(self):
+        result = self.invoke(repeat=True, record=self.root / "nonexistent.json")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("strict self-check", result.stderr)
+        self.assertFalse(self.work.exists())
+
     def test_tracked_source_change_during_build_fails(self):
         self.configure(change_source=True)
         result = self.invoke()
@@ -1037,6 +1309,7 @@ p=argparse.ArgumentParser()
 for key in ("repo", "baseline", "candidate", "work"):
     p.add_argument("--"+key, required=True)
 p.add_argument("--repeat-baseline", action="store_true")
+p.add_argument("--allowed-change-record", default=None)
 a=p.parse_args()
 with Path(os.environ["CI_FIXTURE_LOG"]).open("a") as log:
     log.write(json.dumps(vars(a))+"\\n")
@@ -1049,6 +1322,12 @@ work.mkdir()
 if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
     (work/"comparison.json").write_text("{}\\n")
 ''', encoding="utf-8")
+        self.git("init", "-q")
+        self.git("add", ".")
+        self.git("-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid",
+                 "commit", "-qm", "fixture")
+        self.git("tag", "v0.6.0")
+        self.tag_commit = self.git("rev-parse", "v0.6.0^{commit}")
         self.env = dict(os.environ, RUNNER_TEMP=str(self.root), GITHUB_WORKSPACE=str(repo),
                         GITHUB_SHA="b" * 40, CI_FIXTURE_LOG=str(self.root / "calls.jsonl"))
         ci = (ROOT / ".github/workflows/ci.yml").read_text()
@@ -1057,6 +1336,11 @@ if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
         step = job.split("      - name: Compare complete default objects\n", 1)[1]
         body = step.split("        run: |\n", 1)[1].split("\n      - ", 1)[0]
         self.command = "\n".join(line[10:] for line in body.splitlines() if line.startswith("          "))
+
+    def git(self, *args):
+        return subprocess.run(["git", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
+                               "-C", str(self.root / "repo"), *args],
+                              check=True, capture_output=True, text=True).stdout.strip()
 
     def invoke(self, command=None, **environment):
         return subprocess.run(["bash", "-c", command or self.command],
@@ -1070,14 +1354,46 @@ if os.environ.get("CI_FIXTURE_MISSING_RECEIPT") != "true":
         result = self.invoke()
         self.assertEqual(result.returncode, 0, result.stderr)
         control, integration = self.calls()
-        baseline = "3681a1ab75f4cb79e8432378589aeb0a0a0e2f81"
+        baseline = self.tag_commit
+        self.assertIn("v0.6.0", self.command, "the comparison must pin the release tag")
         self.assertEqual((control["baseline"], control["candidate"], control["repeat_baseline"]),
                          (baseline, baseline, True))
         self.assertEqual((integration["baseline"], integration["candidate"], integration["repeat_baseline"]),
                          (baseline, "b" * 40, False))
+        self.assertIsNone(control["allowed_change_record"])
+        self.assertEqual(integration["allowed_change_record"],
+                         str(Path(self.env["GITHUB_WORKSPACE"]) / "scripts/bpf-noninterference-allowed.json"))
         self.assertNotIn("host_compiler_transition", control)
         self.assertNotIn("host_compiler_transition", integration)
         self.assertNotEqual(control["work"], integration["work"])
+
+    def test_tag_baseline_resolution_is_printed(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("v0.6.0", result.stdout)
+        self.assertIn(self.tag_commit, result.stdout)
+
+    def test_candidate_equal_to_baseline_on_the_tag_skips_integration(self):
+        result = self.invoke(GITHUB_SHA=self.tag_commit, GITHUB_REF_TYPE="tag",
+                             GITHUB_REF_NAME="v0.6.0")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.calls()), 1)
+        self.assertIn("equals baseline", result.stdout)
+
+    def test_candidate_equal_to_baseline_off_the_tag_fails_loudly(self):
+        log = self.root / "calls.jsonl"
+        refs = ({"GITHUB_REF_TYPE": "branch", "GITHUB_REF_NAME": "tmp/ci/x"},
+                {"GITHUB_REF_TYPE": "", "GITHUB_REF_NAME": ""})
+        for index, ref in enumerate(refs):
+            with self.subTest(ref=ref):
+                if log.exists():
+                    log.unlink()
+                temp = self.root / f"off-tag-{index}"
+                temp.mkdir()
+                result = self.invoke(GITHUB_SHA=self.tag_commit, RUNNER_TEMP=str(temp), **ref)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(len(self.calls()), 1)
+                self.assertIn("vacuous", result.stderr)
 
     def test_revived_transition_flag_fails_the_sequence(self):
         revived = self.command.replace(

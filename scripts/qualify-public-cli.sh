@@ -14,7 +14,8 @@
 # evidence (including unexpected passes), 2 means valid smoke/nonqualifying or
 # expected-failure evidence, 0 qualifies the subset with no caveats.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
-# runner noise on the system cell only; default 0 keeps every cell strict.
+# runner noise on the system cells (`system`, `mt-system`) only; default 0
+# keeps every cell strict.
 set -u
 _SRC=${BASH_SOURCE[0]:-$0}
 HERE=$(cd "$(dirname "$_SRC")" && pwd) || exit 64
@@ -268,8 +269,9 @@ emit_judged() {
 }
 judge() {
   # Ruling CI-GAP-1: P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 discloses hosted
-  # runner noise on the system cell only. Every other cell stays strict,
-  # and unset/0 keeps the system cell strict (fedora, sm1, vng guests).
+  # runner noise on the system cells (`system`, `mt-system`) only. Every
+  # other cell stays strict, and unset/0 keeps the system cells strict
+  # (fedora, sm1, vng guests).
   local -a extra=()
   if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)

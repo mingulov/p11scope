@@ -26,6 +26,12 @@ MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal
             "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
 MT_CELLS = {"mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace", "mt-system",
             "counter-latency-mt"}
+# Live per-cell session shape from qualify-public-cli.sh: the sessions-mode
+# cells open one session per thread, mt-shared runs 32 threads on one shared
+# session, mt-churn runs two 32-thread generations, mt-system runs 4
+# processes x 8 sessions-mode threads.
+MT_SCAFFOLD_OPENS = {"mt-metrics": 8, "mt-errors": 8, "mt-shared": 1, "mt-churn": 64,
+                     "mt-trace": 8, "counter-latency-mt": 8, "mt-system": 32}
 COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
                "names-pid", "verdict-pid",
                "run-short", "run-cover", "run-ia32", "sigint",
@@ -213,7 +219,7 @@ def terminal(evidence, *, profile):
 
 
 def fixture(text, receipt, cell):
-    targets, ledgers, ready = [], [], []
+    targets, ledgers, ready, children, scaffolds = [], [], [], [], []
     for line in text.splitlines():
         if line.startswith("TARGET "):
             require(not ready and not ledgers, "fixture target emitted after readiness or ledger")
@@ -221,10 +227,17 @@ def fixture(text, receipt, cell):
         elif line.startswith("LEDGER "):
             require(len(ready) == 1, "fixture ledger emitted before workload READY")
             ledgers.append(parse(line[7:]))
+        elif line.startswith("SCAFFOLD "):
+            require(len(ready) == 1, "fixture scaffold emitted before workload READY")
+            scaffolds.append(parse(line[9:]))
         elif line.startswith("READY "):
             match = re.fullmatch(r"READY pid=([0-9]+)", line)
             require(match is not None, "invalid workload READY")
             ready.append(int(match[1]))
+        elif line.startswith("CHILD "):
+            match = re.fullmatch(r"CHILD pid=([0-9]+)", line)
+            require(match is not None, "invalid workload CHILD")
+            children.append(int(match[1]))
     pid = receipt.get("launched_pid")
     require(integer(pid) and pid > 0 and ready == [pid] and receipt.get("ready_pid") == pid,
             "workload READY does not match launched PID")
@@ -240,6 +253,9 @@ def fixture(text, receipt, cell):
                 "invalid fixture ledger schema")
     require(ledger.get("pid") == pid and ledger.get("complete") is True,
             "invalid or incomplete fixture ledger")
+    if cell == "mt-system":
+        require(len(children) == 4 and len(set(children)) == 4 and pid not in children,
+                "multi-process workload did not report 4 distinct children")
     names = {NAMES[0]} if cell == "mt-exact" else (set(MT_NAMES) if mt else set(NAMES))
     functions = ledger.get("functions")
     require(isinstance(functions, list), "missing ledger functions")
@@ -268,6 +284,24 @@ def fixture(text, receipt, cell):
             require(attempts == 500, "strict SYSTEM requires 500 successful calls per target: " + name)
         expected[name] = attempts
     require(set(expected) == names, "missing fixture ledger function")
+    if mt:
+        # The LEDGER totals alone cannot tell sessions/shared/churn apart
+        # (mt-shared and mt-churn both total 8000 per function live), so the
+        # SCAFFOLD session shape pins the declared workload scenario.
+        require(len(scaffolds) == 1, "missing or duplicate SCAFFOLD record")
+        scaffold = scaffolds[0]
+        for key in ("opens_attempted", "opens_ok", "closes", "finalizes"):
+            require(integer(scaffold.get(key)), "invalid scaffold " + key)
+        require(scaffold["opens_attempted"] >= scaffold["opens_ok"] and
+                scaffold["closes"] == scaffold["opens_ok"] and scaffold["finalizes"] == 1,
+                "inconsistent scaffold record: %r" % (scaffold,))
+        want_opens = MT_SCAFFOLD_OPENS[cell]
+        require(scaffold["opens_ok"] == want_opens,
+                "fixture scaffolding diverges from the declared cell: opens_ok=%d, want %d" %
+                (scaffold["opens_ok"], want_opens))
+    if cell == "mt-errors":
+        require(errinfo["C_GenerateRandom"][0] > 0,
+                "mt-errors ledger has no failed C_GenerateRandom probes")
     physical, seen = {}, set()
     provider = identity(receipt.get("provider_before"))
     for row in targets:
@@ -663,7 +697,7 @@ def main(argv=None):
     for option in ("report", "ledger", "receipt", "cell"):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--allow-pid-descendant-gaps", action="store_true",
-                        help="CI-GAP-1: on the system cell only, disclose nonzero "
+                        help="CI-GAP-1: on the system cells (`system`, `mt-system`) only, disclose nonzero "
                              "pid_descendant_gaps as runner noise instead of failing")
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}

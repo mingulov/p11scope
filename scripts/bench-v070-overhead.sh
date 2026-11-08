@@ -812,7 +812,11 @@ start_observer_timeout() {
             return 1
         fi
         SPID=
-        if [ "$attempt" = 1 ]; then attempt=2; sleep 5; continue; fi
+        if [ "$attempt" = 1 ]; then
+            attempt=2
+            wait_for_no_foreign_observer "$tag" "$FOREIGN_WAIT_S" || return 1
+            continue
+        fi
         echo "$tag: attach gate failed" >&2; return 1
     done
     if grep -q "attach failed" "$WORK/$tag.obs.log"; then

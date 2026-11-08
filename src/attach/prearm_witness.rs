@@ -617,15 +617,11 @@ fn upper_is_metacopy_with(
 /// match under an existing upper is allowed only for a metacopy
 /// upper, which still backs reads from the lower file. Layer files
 /// are read with `symlink_metadata` and must be regular files.
-/// `mountinfo` overrides the live observer table for tests; `None`
-/// reads `/proc/self/mountinfo`. Fail closed: unreadable tables,
+/// `table` is the observer mount table, read once per start through
+/// the capture budget by the caller. Fail closed: unreadable tables,
 /// unstatable candidates, escapes and non-overlay paths all refuse.
-fn calibration_backing_accepted(
-    merged: &std::path::Path,
-    slot_ino: u64,
-    mountinfo: Option<&str>,
-) -> bool {
-    calibration_backing_accepted_with(merged, slot_ino, mountinfo, upper_is_metacopy)
+fn calibration_backing_accepted(merged: &std::path::Path, slot_ino: u64, table: &str) -> bool {
+    calibration_backing_accepted_with(merged, slot_ino, table, upper_is_metacopy)
 }
 
 /// [`calibration_backing_accepted`] with an injectable metacopy probe
@@ -634,17 +630,9 @@ fn calibration_backing_accepted(
 fn calibration_backing_accepted_with(
     merged: &std::path::Path,
     slot_ino: u64,
-    mountinfo: Option<&str>,
+    table: &str,
     is_metacopy: impl Fn(&std::path::Path) -> bool,
 ) -> bool {
-    let owned;
-    let table = match mountinfo {
-        Some(text) => text,
-        None => {
-            owned = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
-            &owned
-        }
-    };
     let merged = std::fs::canonicalize(merged).unwrap_or_else(|_| merged.to_path_buf());
     // One layer entry's backing inode: `Ok(None)` when the layer holds
     // no entry at all, `Ok(Some)` for a regular file, `Err` for a
@@ -885,7 +873,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
             });
             let accepted = cached
                 .as_deref()
-                .is_some_and(|table| calibration_backing_accepted(&path, slot.i_ino, Some(table)));
+                .is_some_and(|table| calibration_backing_accepted(&path, slot.i_ino, table));
             if !accepted {
                 return Err(Unavailable::Calibration(
                     "witness calibration mismatch".into(),
@@ -2295,7 +2283,7 @@ mod tests {
             super::calibration_backing_accepted(
                 &merged_root.join("lib.so"),
                 backing_ino_of(&layer_file),
-                Some(&table),
+                &table,
             ),
             "the lower backing inode must match the slot"
         );
@@ -2329,7 +2317,7 @@ mod tests {
             super::calibration_backing_accepted(
                 &merged_root.join("lib.so"),
                 backing_ino_of(&upper_file),
-                Some(&table),
+                &table,
             ),
             "the upper backing inode must match the slot"
         );
@@ -2360,11 +2348,7 @@ mod tests {
         );
         let table = overlay_table_for(&merged_root, &upper, &lower);
         assert!(
-            !super::calibration_backing_accepted(
-                &merged_root.join("lib.so"),
-                other_ino,
-                Some(&table),
-            ),
+            !super::calibration_backing_accepted(&merged_root.join("lib.so"), other_ino, &table,),
             "a different backing inode must refuse"
         );
     }
@@ -2386,31 +2370,23 @@ mod tests {
         let table = overlay_table_for(&merged_root, &upper, &lower);
         // No table, no cover.
         assert!(
-            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, Some("")),
+            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, ""),
             "an empty table names no layer"
         );
         let plain = "10 1 8:1 / /var/tmp/x rw,relatime - ext4 /dev/sda3 rw\n".to_string();
         assert!(
-            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, Some(&plain),),
+            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, &plain,),
             "a non-overlay table names no layer"
         );
         // A remainder escaping the mount never resolves.
         assert!(
-            !super::calibration_backing_accepted(
-                &merged_root.join("../evil.so"),
-                slot,
-                Some(&table),
-            ),
+            !super::calibration_backing_accepted(&merged_root.join("../evil.so"), slot, &table,),
             "an escaping remainder must refuse"
         );
         // A layer path that stats nothing (copied-up file whose lower
         // was cleaned, or a container-hidden host lowerdir) refuses.
         assert!(
-            !super::calibration_backing_accepted(
-                &merged_root.join("absent.so"),
-                slot,
-                Some(&table),
-            ),
+            !super::calibration_backing_accepted(&merged_root.join("absent.so"), slot, &table,),
             "unstatable layer files must refuse"
         );
     }
@@ -2441,7 +2417,7 @@ mod tests {
             super::calibration_backing_accepted(
                 &link.join("lib.so"),
                 backing_ino_of(&layer_file),
-                Some(&table),
+                &table,
             ),
             "a symlinked merged path must resolve to its layers"
         );
@@ -2476,7 +2452,7 @@ mod tests {
             !super::calibration_backing_accepted(
                 &merged_root.join("lib.so"),
                 backing_ino_of(&lower_file),
-                Some(&table),
+                &table,
             ),
             "a lower slot under an existing upper copy must refuse"
         );
@@ -2504,11 +2480,11 @@ mod tests {
         let merged = merged_root.join("lib.so");
         let slot = backing_ino_of(&lower_file);
         assert!(
-            super::calibration_backing_accepted_with(&merged, slot, Some(&table), |_| true),
+            super::calibration_backing_accepted_with(&merged, slot, &table, |_| true),
             "a lower slot under a metacopy upper must accept"
         );
         assert!(
-            !super::calibration_backing_accepted_with(&merged, slot, Some(&table), |_| false),
+            !super::calibration_backing_accepted_with(&merged, slot, &table, |_| false),
             "a lower slot under a full upper copy must refuse"
         );
     }
@@ -2534,22 +2510,14 @@ mod tests {
         let table = overlay_table_for(&merged_root, &upper, &lower);
         let merged = merged_root.join("lib.so");
         assert!(
-            !super::calibration_backing_accepted(
-                &merged,
-                backing_ino_of(&lower_file),
-                Some(&table),
-            ),
+            !super::calibration_backing_accepted(&merged, backing_ino_of(&lower_file), &table,),
             "a symlinked upper over a lower file must refuse"
         );
         // A directory upper refuses the same way.
         std::fs::remove_file(&upper_link).expect("remove");
         std::fs::create_dir(&upper_link).expect("dir");
         assert!(
-            !super::calibration_backing_accepted(
-                &merged,
-                backing_ino_of(&lower_file),
-                Some(&table),
-            ),
+            !super::calibration_backing_accepted(&merged, backing_ino_of(&lower_file), &table,),
             "a directory upper over a lower file must refuse"
         );
     }
@@ -2582,7 +2550,7 @@ mod tests {
             !super::calibration_backing_accepted(
                 &merged_root.join("lib.so"),
                 backing_ino_of(&deep_file),
-                Some(&table),
+                &table,
             ),
             "a symlinked higher lower over a deeper file must refuse"
         );

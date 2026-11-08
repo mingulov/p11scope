@@ -105,6 +105,9 @@ cp "$OUT/kernel-config" "/boot/config-$(uname -r)" || exit 2
 grep -q CONFIG_LTO "/boot/config-$(uname -r)" || exit 2
 T=/tmp/runtree-work
 mkdir -p "$T" && mount -t tmpfs -o mode=700,size=2G tmpfs "$T" || exit 2
+# The owned child runs as the baked drop target, not as root: hand it
+# the workdir or every workload exec fails with EACCES.
+chown "$SUDO_UID:$SUDO_GID" "$T" || exit 2
 df -T "$T" | tail -n 1
 TMPDIR="$T" "$RUNNER" "$TESTBIN" "$OUT/cells" > "$OUT/run.log" 2>&1
 rc=$?

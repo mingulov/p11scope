@@ -1007,7 +1007,7 @@ impl InventoryAttachSet {
                     endpoints,
                 });
             }
-            outcome.verdicts.insert(key, verdict);
+            Self::insert_verdict(&mut outcome.verdicts, key, verdict);
         }
         // Admitted by the lowering: decided in plan order against the
         // capture-lifetime budget.
@@ -1031,7 +1031,7 @@ impl InventoryAttachSet {
                 prepared.as_deref_mut(),
                 &pair_keys,
             );
-            outcome.verdicts.insert(key, verdict);
+            Self::insert_verdict(&mut outcome.verdicts, key, verdict);
         }
         outcome
     }
@@ -1286,6 +1286,59 @@ impl InventoryAttachSet {
             "{path}: the witness-proven pre-copy-up observation has no proven companion \
              in this pass; it was not admitted"
         )
+    }
+
+    /// Inserts a module verdict, merging same-key collisions so an
+    /// admission is never overwritten by a refusal: the joint pair's
+    /// pre and plain modules share one module key, and the pre
+    /// side's admission must stand with the plain side's refusal
+    /// disclosed — like the sequential passes, where the refusal
+    /// arrives a pass later and is noted beside the standing
+    /// admission. Same-kind collisions keep today's last-wins.
+    fn insert_verdict(
+        verdicts: &mut BTreeMap<AttachModuleKey, AttachVerdict>,
+        key: AttachModuleKey,
+        verdict: AttachVerdict,
+    ) {
+        match verdicts.entry(key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(verdict);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let merged = match (entry.get(), &verdict) {
+                    (
+                        AttachVerdict::Admitted { endpoints, reasons },
+                        AttachVerdict::Refused { reason },
+                    ) => {
+                        let mut reasons = reasons.clone();
+                        reasons.push(format!(
+                            "a same-pass verdict read refused ({reason}) and was not applied: \
+                             the admitted verdict stands"
+                        ));
+                        AttachVerdict::Admitted {
+                            endpoints: *endpoints,
+                            reasons,
+                        }
+                    }
+                    (
+                        AttachVerdict::Refused { reason },
+                        AttachVerdict::Admitted { endpoints, reasons },
+                    ) => {
+                        let mut reasons = reasons.clone();
+                        reasons.push(format!(
+                            "a same-pass verdict read refused ({reason}) and was not applied: \
+                             the admitted verdict stands"
+                        ));
+                        AttachVerdict::Admitted {
+                            endpoints: *endpoints,
+                            reasons,
+                        }
+                    }
+                    _ => verdict,
+                };
+                entry.insert(merged);
+            }
+        }
     }
 
     /// Whether this pass's aggregate pairs `retained` with `incoming`
@@ -3408,6 +3461,24 @@ pub(crate) mod tests {
         assert_eq!(refused.retained.as_deref(), Some("sha-s"));
         assert_eq!(refused.incoming, "sha-s");
         assert!(!refused.incoming_pre);
+        // The joint pass admits the module: the pre side's admission
+        // stands with the plain side's refusal disclosed beside it
+        // (after-1 showed the refusal overwriting the admission).
+        match pass1.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-s".to_string(),
+        }) {
+            Some(AttachVerdict::Admitted { endpoints, reasons }) => {
+                assert_eq!(*endpoints, 3);
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("same-pass verdict read refused")),
+                    "the joint refusal is disclosed beside the admission: {reasons:?}"
+                );
+            }
+            other => panic!("the joint pass must admit the module: {other:?}"),
+        }
         // The next pass converges to the sequential steady shape.
         let pass2 = set.absorb(&plan, &pins);
         assert_eq!(set.len(), 3, "the plain side stays refused");
@@ -3461,6 +3532,23 @@ pub(crate) mod tests {
         assert_eq!(refused.key, key);
         assert_eq!(refused.retained.as_deref(), Some("sha-s"));
         assert_eq!(refused.incoming, "sha-s");
+        // Same merged verdict the other plan order reports: the
+        // admission stands with the refusal disclosed.
+        match pass1.verdicts.get(&AttachModuleKey {
+            object: key,
+            sha256: "sha-s".to_string(),
+        }) {
+            Some(AttachVerdict::Admitted { endpoints, reasons }) => {
+                assert_eq!(*endpoints, 3);
+                assert!(
+                    reasons
+                        .iter()
+                        .any(|reason| reason.contains("same-pass verdict read refused")),
+                    "the joint refusal is disclosed beside the admission: {reasons:?}"
+                );
+            }
+            other => panic!("the joint pass must admit the module: {other:?}"),
+        }
     }
 
     #[test]

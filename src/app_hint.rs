@@ -1535,6 +1535,30 @@ mod tests {
     }
 
     #[test]
+    fn torn_cmdline_samples_are_refused() {
+        let sample = b"perl\x00tool.pl\x00".to_vec();
+        assert_eq!(
+            stable_cmdline_sample(Some(sample.clone()), Some(sample.clone())),
+            Some(sample.clone()),
+            "byte-equal samples are usable"
+        );
+        assert_eq!(
+            stable_cmdline_sample(
+                Some(b"perl\x00tool.pl\x00".to_vec()),
+                Some(b"perl\x00toxic --pin 1\x00".to_vec()),
+            ),
+            None,
+            "a title rewrite between the two reads tears the sample"
+        );
+        assert_eq!(stable_cmdline_sample(None, Some(sample.clone())), None);
+        assert_eq!(
+            stable_cmdline_sample(Some(sample), None),
+            None,
+            "a failed second read is no agreement"
+        );
+    }
+
+    #[test]
     fn readers_sample_the_test_process_itself() {
         let pid = std::process::id();
         let comm = read_comm(pid).expect("own comm is readable");

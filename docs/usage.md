@@ -1237,8 +1237,13 @@ Limits that matter in pods:
   `entries.coverage` below). Text snapshots begin with an application/module
   overview, followed by detailed retained paths, identities, states and
   coverage. The application label is the observed executable's basename,
-  not a desktop or package identity: an interpreter remains `python3`,
-  `java`, etc. Caller/module IDs and PID/incarnation are secondary detail;
+  not a desktop or package identity. When the observer can prove an app
+  identity for an interpreter — a script, module, service unit, or snap
+  name — the label appends it in brackets (`python3 [pkcs11-check]`,
+  `java [app.jar]`), with the source named in `-v` and JSON
+  (`app_hint: {value, source}`); otherwise an interpreter remains
+  `python3`, `java`, etc. Counts and caller identity never change.
+  Caller/module IDs and PID/incarnation are secondary detail;
   equal basenames remain separate rows for their existing identities.
   Under `--capture auto` or `native`, repeatable `--manifest <m.json>` inputs
   that match a provider mapped in the selected scope and pass identity/ABI

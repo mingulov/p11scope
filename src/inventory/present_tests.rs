@@ -4283,6 +4283,27 @@ fn app_hint_appends_a_bracketed_label_and_json_value() {
 }
 
 #[test]
+fn app_hint_source_shows_in_verbose_only() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/python3".into());
+    presentation.callers[0].app_hint = Some(crate::app_hint::AppHint {
+        value: "pkcs11-check".into(),
+        source: crate::app_hint::AppHintSource::Argv,
+    });
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("app hint \"pkcs11-check\" via argv"),
+        "{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("python3 [pkcs11-check]") && !concise.contains("via argv"),
+        "{concise}"
+    );
+}
+
+#[test]
 fn missing_app_hint_renders_no_brackets_and_no_key() {
     let harness = varied_harness();
     let mut presentation = capture_for(&harness, &harness.render());

@@ -1351,13 +1351,20 @@ fn retained_path_label(path: Option<&str>, unknown: &str) -> String {
 }
 
 /// Executable name from the retained caller ID; labels are not identity keys.
+/// A retained app hint appends in brackets (`python3 [tool]`); the hint is
+/// display-only and never changes counts, joins, or identity.
 pub(crate) fn application_label(presentation: &Presentation, caller: CallerId) -> String {
-    retained_path_label(
+    let base = retained_path_label(
         retained_caller(presentation, caller)
             .and_then(|caller| caller.exe.as_ref())
             .and_then(|exe| exe.path.as_deref()),
         "Unknown executable",
-    )
+    );
+    let hint = retained_caller(presentation, caller).and_then(|caller| caller.app_hint.as_ref());
+    match hint {
+        Some(hint) => format!("{base} [{}]", escape_controls(&hint.value)),
+        None => base,
+    }
 }
 
 /// Module name from its first retained path, keeping physical IDs separate.
@@ -3325,6 +3332,15 @@ fn render_snapshot_inner(
         {
             caller_line.push_str(", ");
             caller_line.push_str(&label);
+        }
+        // This detail block is verbose-only by position (concise and
+        // quiet return above), so the source rides `-v` text only.
+        if let Some(hint) = caller.app_hint.as_ref() {
+            caller_line.push_str(&format!(
+                ", app hint \"{}\" via {}",
+                escape_controls(&hint.value),
+                hint.source.label()
+            ));
         }
         let _ = writeln!(out, "{caller_line}");
         if let Some(metadata) = metadata {

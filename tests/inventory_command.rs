@@ -2627,7 +2627,10 @@ fn inventory_snapshot_labels_a_console_script_and_never_its_pin_value() {
         assert!(
             !surface.contains(pin),
             "pin value leaked into {name}: {}",
-            surface.lines().find(|line| line.contains(pin)).unwrap_or("")
+            surface
+                .lines()
+                .find(|line| line.contains(pin))
+                .unwrap_or("")
         );
     }
     let exe = caller["image"]["exe"]["path"].as_str().unwrap();

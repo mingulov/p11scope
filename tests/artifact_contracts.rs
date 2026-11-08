@@ -9795,9 +9795,7 @@ fn allowlist_v3_names_the_app_identity_hint_rows() {
         "allowlist-v3 lost the app identity hints section"
     );
     assert!(
-        text.contains(
-            "[app identity hints](#app-identity-hints-owner-ruling-2026-11-08)"
-        ),
+        text.contains("[app identity hints](#app-identity-hints-owner-ruling-2026-11-08)"),
         "the status paragraph must list the app identity hints section"
     );
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");

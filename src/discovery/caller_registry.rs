@@ -204,6 +204,11 @@ pub(crate) trait ProcessSource {
     fn exe_maps_identity(&self, pid: u32) -> Option<ExeIdentity> {
         read_exe_maps_identity(pid)
     }
+    /// Display-only app hint beside the already-read `exe`. The default
+    /// samples nothing: scripted sources gain no process authority here.
+    fn app_hint(&self, _pid: u32, _exe: Option<&ExeIdentity>) -> Option<crate::app_hint::AppHint> {
+        None
+    }
     /// True when `pid` names no live process: reaped, never existed, or
     /// a zombie awaiting its parent's `wait`. Zombies count as gone —
     /// the generation is dead even though `/proc` still parses — so a
@@ -335,6 +340,10 @@ impl ProcessSource for OsProcessSource {
 
     fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
         read_exe_identity(pid)
+    }
+
+    fn app_hint(&self, pid: u32, exe: Option<&ExeIdentity>) -> Option<crate::app_hint::AppHint> {
+        crate::app_hint::sample_for_pid(pid, exe)
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -973,6 +982,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
+        let app_hint = self.source.app_hint(pid, exe.as_ref());
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
@@ -989,7 +999,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: exe.is_some(),
                     exe,
-                    app_hint: None,
+                    app_hint,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1143,6 +1153,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             prepared.generation.exe.is_some(),
             "scoped admission gates carry an exe identity to the mint"
         );
+        let app_hint = self
+            .source
+            .app_hint(prepared.pid, prepared.generation.exe.as_ref());
         self.callers.insert(
             id,
             TrackedCaller {
@@ -1152,7 +1165,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     pid: prepared.pid,
                     start_time: prepared.generation.start_time,
                     exe: prepared.generation.exe,
-                    app_hint: None,
+                    app_hint,
                     incarnation,
                     exec_observed,
                     authority: ImageAuthority::ScanPinned,
@@ -1250,6 +1263,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             .map_err(|_| failed("caller ID space exhausted"))?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
+        let app_hint = self.source.app_hint(pid, generation.exe.as_ref());
         self.callers.insert(
             id,
             TrackedCaller {
@@ -1261,7 +1275,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: generation.exe.is_some(),
                     exe: generation.exe,
-                    app_hint: None,
+                    app_hint,
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1646,6 +1660,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = self.source.exe_identity(pid);
+        let app_hint = self.source.app_hint(pid, exe.as_ref());
         // Per-incarnation detection (F7a): after the validation above.
         let admitted_ns = match detected() {
             Some(stamp) => stamp.max(now_ns),
@@ -1671,7 +1686,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: exe.is_some(),
                     exe,
-                    app_hint: None,
+                    app_hint,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,

@@ -8639,6 +8639,12 @@ fn caller_json(
     if let Some(metadata) = metadata.metadata(record.id) {
         value["metadata"] = serde_json::to_value(metadata).expect("finite metadata");
     }
+    if let Some(hint) = record.app_hint.as_ref() {
+        value["app_hint"] = serde_json::json!({
+            "value": hint.value,
+            "source": hint.source.label(),
+        });
+    }
     value
 }
 

@@ -58,7 +58,10 @@ which partitions each mechanism row's calls/errors by provider module,
 and [short-lived tracking widened to trace, metrics, `--pid` and owned run (7.10b)](#short-lived-tracking-widened-to-trace-metrics---pid-and-owned-run-710b),
 which approves the widened read/retention contract below,
 and [offline CBOM export re-projection](#offline-cbom-export-re-projection-v070),
-which describes the implemented offline report and grants no capture authority.**
+which describes the implemented offline report and grants no capture authority,
+and [app identity hints](#app-identity-hints-owner-ruling-2026-11-08),
+which describes its development implementation pending privacy review and
+installed qualification.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -1949,3 +1952,27 @@ ID, executable hash, command line, argument, buffer, handle, or raw
 address capture. Its output remains subject to the input
 publication's privacy contract; it is not a secret scrubber for
 fabricated or otherwise untrusted saved input.
+
+## App identity hints (owner ruling 2026-11-08)
+
+**Status: development implementation on this branch; pending Opus privacy
+review, owner approval, and installed qualification (v0.7.0 if approved by
+2026-11-09 00:20, else v0.7.1).** Owner ruling recorded in
+`docs/superpowers/decisions/2026-11-06-schedule-dl10.md`: interpreter
+basenames (`python3`, `sh`, `java`, `node`) do not tell the operator who
+called; a narrow app-identity extension is authorized. It supersedes the
+FB-PRIV 2026-10-03 no-comm/no-argv rule in part, for the three rows below
+only. v1 and v2 bytes and exclusions are unchanged: metrics and profile
+gain nothing, and no BPF, provider-memory, or target-memory read is added.
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Caller app hint from comm | `/proc/<pid>/comm` (16 bytes, trailing newline trimmed) of an admitted caller whose exe basename is a tabled python/sh interpreter (`python`, `python3`, `python3.<N>` digits-only, `sh`, `dash`, `bash`) and whose comm is nonempty and differs from that basename. Node and java are excluded (both rename their tasks); non-interpreter exes get no read. Sampled beside the admission exe read under the same pin; the exe identity is re-read after sampling and must match. | `app_hint: {"value", "source": "comm"}` in `p11scope/inventory/v1` (`callers[]`, absent when unknown); concise `[value]` label beside the interpreter basename; `-v` names the source. Label only: never identity, admission, or a join key. | Unreadable, empty, equal-to-basename, excluded, overlong, or identity-mismatched: no hint, bare basename. |
+| Caller app hint from argv | Bounded 4096-byte prefix of `/proc/<pid>/cmdline` of an admitted caller whose exe basename is a tabled interpreter (python, `sh`/`dash`/`bash`, `java`, `node`/`nodejs`), parsed by that interpreter's recognize-or-bail grammar: only the grammar-proven script/module/jar/class token is ever captured — python script/`-m` module (dotted ident, `-W`/`-X` values skipped, `--` honored), direct `sh script`, java `-jar` jar (`.jar` suffix) or dotted main class (classpath-style values skipped), node script (script suffix or `/`). No environ read; no `-c`/`-e` text; no flag value; a token cut by the prefix cap is unusable; non-interpreter exes get no read. Basename or validated identifier only, at most 255 bytes, controls escaped. Same admission sampling and exe revalidation as comm. | `app_hint: {"value", "source": "argv"}`; concise `[value]` label; `-v`/JSON name the source. | Any unrecognized shape, truncation, or validation failure: no hint. Required evidence: `--pin`-value negative controls at the parser seam plus a live CLI cell with a real console script and a `--pin`-style argument proving the value is nowhere in the outputs. |
+| Caller app hint from cgroup leaf | Leaf component of a new bounded `/proc/<pid>/cgroup` read at admission (DR04 reads only under its opt-in): exact `snap.<snap>.<app>-<id>.scope` with `[a-z0-9-]` words yields `snap <snap>`; `*.service` yields the unit name (`user@*` excluded); `app-*.scope` yields the opaque scope name. Generic `session-*.scope`, slices, `init.scope`, and container/pod-shaped leaves (`docker-*`, `crio-*`, `cri-*`, `containerd-*`, `*kubepods*`, `*libpod*`, `*podman*`) yield nothing: DR04 owns that display under its opt-in. Same admission sampling and exe revalidation; a value equal to the exe basename is dropped. | `app_hint: {"value", "source": "unit"` or `"snap"}`; concise `[value]` label; `-v`/JSON name the source. | Unparseable, excluded, overlong, or identity-mismatched: no hint. |
+
+Precedence is argv, then comm, then the cgroup leaf; the first proven
+source wins. Counts, caller IDs, incarnation identity, joins, and
+admissions never change. A hint equal to the exe basename is dropped
+everywhere. Trace, inspect, metrics, and profile outputs are untouched
+by this section.

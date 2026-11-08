@@ -788,10 +788,13 @@ mod tests {
     }
 
     /// Per-command keep sets: live capture keeps the minimal set plus
-    /// the root-functional extras (`-o` anywhere needs DAC_OVERRIDE and
-    /// CHOWN for the handoff, the singles fallback needs SYS_ADMIN,
-    /// `run` always keeps SETUID/SETGID/KILL for the sudo-drop identity
-    /// change and signalling its re-owned child);
+    /// the root-functional extras (file outputs anywhere need
+    /// DAC_OVERRIDE, CHOWN and FOWNER for the handoff: `-o` on every
+    /// capture lane plus inventory `--event-log`/`--diagnostics`, which
+    /// share the same sudo handover and rotation reopen; the singles
+    /// fallback needs SYS_ADMIN, `run` always keeps SETUID/SETGID/KILL
+    /// for the sudo-drop identity change and signalling its re-owned
+    /// child);
     /// `inspect` keeps the full live set including the BPF pair: it
     /// loads the kernel identity witness for overlay/9p proofs
     /// (controller ruling 2026-11-08, F2; dropping CAP_BPF broke every
@@ -861,6 +864,71 @@ mod tests {
             assert_eq!(
                 keep_mask_for_command(&parse(&argv)),
                 run_keep | file_out,
+                "{argv:?}"
+            );
+        }
+        // Inventory file sinks share the `-o` sudo handover
+        // (`create_private_stream`/`AtomicFile::create` plus `fchown`),
+        // and event-log rotation reopens mid-run, so the bits last the
+        // whole run: `--event-log` (scan and auto) and `--diagnostics`
+        // (auto) need the file-output bits even without `-o`.
+        for argv in [
+            vec![
+                "inventory",
+                "--pid",
+                "1",
+                "--capture",
+                "scan",
+                "--event-log",
+                "events.jsonl",
+            ],
+            vec![
+                "inventory",
+                "--system",
+                "--capture",
+                "scan",
+                "--event-log",
+                "events.jsonl",
+            ],
+        ] {
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                live | file_out,
+                "{argv:?}"
+            );
+        }
+        for argv in [
+            vec![
+                "inventory",
+                "--system",
+                "--capture",
+                "auto",
+                "--event-log",
+                "events.jsonl",
+            ],
+            vec![
+                "inventory",
+                "--system",
+                "--capture",
+                "auto",
+                "--diagnostics",
+                "diag.jsonl",
+            ],
+            vec![
+                "inventory",
+                "--pid",
+                "1",
+                "--capture",
+                "auto",
+                "--duration",
+                "2s",
+                "--diagnostics",
+                "diag.jsonl",
+            ],
+        ] {
+            assert_eq!(
+                keep_mask_for_command(&parse(&argv)),
+                live | sys_admin | file_out,
                 "{argv:?}"
             );
         }

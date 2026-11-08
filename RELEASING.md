@@ -409,10 +409,15 @@ must remain separately labeled: each is dynamically linked and must match the
 provider's ABI and C library. Generate and verify the notices from the actual
 locked dependency graph, including the statically linked Rust crates and musl
 libc. Retain license texts in the bundle even though the source export also
-contains them. The package directory also contains the versioned source
-archive, top-level `RELEASE.json` and `SHA256SUMS` (which covers the four
-archives, the `.deb`, the `.rpm` and `RELEASE.json`); those metadata
-files accompany the archives and packages on GitHub.
+contains them. The packager also builds the system packages
+`p11scope_0.5.0_amd64.deb` and `p11scope-0.5.0-1.x86_64.rpm` from the exact
+tarball bytes (the static musl observer plus the glibc helper, which matches
+the target distributions; no second build, no maintainer scripts, no file
+capabilities or set-id bits); `dpkg-deb` and `rpmbuild` must be on `PATH`.
+The package directory also contains the versioned source
+archive, top-level `RELEASE.json` and `SHA256SUMS` (which covers the three
+tarballs, the source archive, the `.deb`, the `.rpm` and `RELEASE.json`);
+those metadata files accompany the six archives on GitHub.
 
 Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.99.1 static target
 builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r13). Both pins
@@ -453,8 +458,9 @@ export. A separately assembled full offline export is documented in
 [docs/build-offline.md](docs/build-offline.md). GitHub's automatic source
 archive lacks even the two embedded Aya archives.
 
-Verify `SHA256SUMS` against the four versioned `.tar.gz` assets, the `.deb`,
-the `.rpm` and top-level `RELEASE.json`:
+Verify `SHA256SUMS` against the three versioned `.tar.gz` observer/helper
+assets, the versioned source archive, the `.deb`, the `.rpm`, and top-level
+`RELEASE.json`:
 
 ```sh
 (cd /var/tmp/p11scope-release/v0.5.0-public-assets && sha256sum --check SHA256SUMS)

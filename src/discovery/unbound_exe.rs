@@ -416,9 +416,9 @@ impl ExeResolver {
 
     /// Walk the fixed roots (sorted, so same-ino candidates keep
     /// walk order and the first mapped match wins deterministically),
-    /// following symlinks, skipping non-files, bounded by the cap.
-    /// Unreadable roots shed silently: the index is a hint, and a
-    /// miss degrades to unknown, never to an error.
+    /// skipping final-component symlinks and non-files, bounded by
+    /// the cap. Unreadable roots shed silently: the index is a hint,
+    /// and a miss degrades to unknown, never to an error.
     fn rebuild(&mut self) {
         self.builds += 1;
         self.entries.clear();
@@ -441,6 +441,15 @@ impl ExeResolver {
         };
         names.sort();
         for path in &names {
+            // Final-component symlinks are never indexed: the
+            // confirmation probe opens with O_NOFOLLOW and would
+            // refuse them, so indexing them only spends cap and
+            // probes on dead candidates.
+            match std::fs::symlink_metadata(path) {
+                Ok(link) if link.is_symlink() => continue,
+                Ok(_) => {}
+                Err(_) => continue,
+            }
             let meta = match std::fs::metadata(path) {
                 Ok(meta) => meta,
                 Err(_) => continue,
@@ -1025,6 +1034,29 @@ mod tests {
         );
         assert_eq!(resolver.index_len(), 3);
         assert_eq!(resolver.index_shed(), 2);
+    }
+
+    /// A final-component symlink is never indexed: the
+    /// confirmation probe would refuse it, so it must not spend cap.
+    #[test]
+    fn index_skips_final_component_symlinks() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tool");
+        std::fs::write(&target, b"tool").unwrap();
+        std::os::unix::fs::symlink(&target, dir.path().join("link")).unwrap();
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        let proc = ScriptedProc::dead();
+        let scan = ScriptedScan::empty();
+        resolver.resolve(
+            7,
+            8,
+            99,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(resolver.index_len(), 1);
     }
 
     /// LIM-1: the index cap is pinned from measurement (5,675

@@ -344,7 +344,8 @@ timing — plus the informational stderr notes. `--quiet` prints only the
 summary head, for scripts. `--json` and `-o` are always complete at every
 verbosity. Gap names in default text are plain words; the machine names stay
 in JSON, and in `-v` beside the plain words. `trace` streams one line per
-event at every level and ends with the same totals and coverage lines;
+event at every level and ends with the same totals and coverage lines plus,
+when calls failed, a per-caller error-reason roll-up (below);
 `-v` pairs machine names beside the plain reasons and adds its stderr notes.
 
 Default stderr keeps the readiness line (`p11scope: capturing:`, which says
@@ -373,6 +374,17 @@ header says so once instead of marking every row. Previously printed rows
 are not renamed later. See the [trace privacy contract](privacy/allowlist-v3.md#trace-executable-labels-p5u-2026-10-09)
 for the sampling and retention limits. Installed cgroup naming checks for v0.4
 are still in progress.
+
+When traced calls fail, the trace tail says why per caller: a `CALLER ERROR
+REASONS:` section after the coverage line lists each failing caller-and-function
+pair with its return codes by name and count (`"firefox" (PID 1234)
+exe="/usr/bin/firefox": C_Login: CKR_PIN_INCORRECT x3`). Concise output keeps
+the top three reasons per row with an `and N more` tail; `-v` lists every
+distinct code. Rows name callers exactly as the trace lines do (verified or
+owned labels, otherwise `Unknown executable` with the PID); unregistered codes
+keep the trace `CKR_UNKNOWN` spelling. The roll-up counts rendered lines only:
+a truncated trace says so, and counted errors with no failure reasons among
+the rendered lines name that gap instead of printing an empty section.
 
 > **`run` safety boundary:** `sudo p11scope run` requires valid non-root
 > `SUDO_UID` and `SUDO_GID` values naming one existing non-root account and

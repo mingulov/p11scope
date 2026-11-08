@@ -15,8 +15,8 @@ use crate::attach::Scope;
 use crate::capacity::{InventoryBudget, inventory_endpoint_budget};
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
-    CallerEvent, ImageAuthority, LAUNCHER_GAP_EXE_UNREADABLE, ModuleId, OsProcessSource,
-    ProcessSource, RegistryLimits, UseCoverage, collapse_launcher_chain, now_ns,
+    CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
+    UseCoverage, collapse_launcher_chain, now_ns,
 };
 #[cfg(test)]
 use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
@@ -8708,8 +8708,8 @@ fn caller_json(
             if let Some(label) = ancestor.label.as_deref() {
                 item["label"] = serde_json::Value::from(label);
             }
-            if ancestor.exe_unreadable {
-                item["exe_gap"] = serde_json::Value::from(LAUNCHER_GAP_EXE_UNREADABLE);
+            if let Some(reason) = ancestor.exe_gap {
+                item["exe_gap"] = serde_json::Value::from(reason);
             }
             if *folded > 0 {
                 item["folded"] = serde_json::Value::from(*folded);

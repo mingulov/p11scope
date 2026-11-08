@@ -171,6 +171,21 @@ pub fn classify_proc_view(
     ProcView::Own
 }
 
+/// Parsed `NSpid` values (outermost first) of a
+/// `/proc/<pid>/status` text, or `None` when the line is missing, empty
+/// or unparsable (kernels before 4.1 have no `NSpid`). The single
+/// `NSpid` parser: the proc-view check and the launcher walk share it.
+pub(crate) fn parse_nspid(_status: &str) -> Option<Vec<u32>> {
+    None
+}
+
+/// True when parsed `NSpid` values name a container init: more than one
+/// level with an innermost 1, while the outermost is not 1 (the
+/// observer's own pid 1 is caught by number, never here).
+pub(crate) fn nspid_is_container_init(_nspid: &[u32]) -> bool {
+    false
+}
+
 /// The view of the procfs mounted at `proc_root` (normally `/proc`).
 fn read_proc_view_at(proc_root: &std::path::Path) -> ProcView {
     let own_pid = std::process::id();
@@ -632,6 +647,32 @@ mod tests {
         assert!(matches!(&no_nspid, ProcView::Foreign(text) if text.contains("no NSpid")));
         assert_eq!(ProcView::Own.label(), "observer");
         assert_eq!(ProcView::Foreign(String::new()).label(), "foreign");
+    }
+
+    #[test]
+    fn nspid_parses_levels_and_detects_container_init() {
+        assert_eq!(
+            parse_nspid("Name:\ttini\nNSpid:\t5000\t1\n"),
+            Some(vec![5000, 1])
+        );
+        assert_eq!(parse_nspid("Name:\tsh\nNSpid:\t900\n"), Some(vec![900]));
+        assert_eq!(
+            parse_nspid("Name:\tsh\nNSpid:\t900\t42\n"),
+            Some(vec![900, 42])
+        );
+        assert_eq!(parse_nspid("Name:\tsh\n"), None);
+        assert_eq!(parse_nspid("Name:\tsh\nNSpid:\n"), None);
+        assert_eq!(parse_nspid("Name:\tsh\nNSpid:\tnope\n"), None);
+        assert!(
+            nspid_is_container_init(&[5000, 1]),
+            "innermost NSpid 1 is a container init"
+        );
+        assert!(!nspid_is_container_init(&[900]));
+        assert!(!nspid_is_container_init(&[900, 42]));
+        assert!(
+            !nspid_is_container_init(&[1]),
+            "the observer's own pid 1 is caught by number"
+        );
     }
 
     /// A foreign `/proc` under an initial observer is a mismatch: refused

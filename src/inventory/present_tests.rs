@@ -607,14 +607,14 @@ fn launcher_chain_renders_verbose_chain_and_concise_hop() {
             start_time: Some(90),
             exe: Some("sh".into()),
             label: None,
-            exe_unreadable: false,
+            exe_gap: None,
         },
         LauncherAncestor {
             pid: 800,
             start_time: Some(80),
             exe: Some("cron".into()),
             label: None,
-            exe_unreadable: false,
+            exe_gap: None,
         },
     ];
     presentation.callers[0].launcher_gap = None;
@@ -665,21 +665,21 @@ fn launcher_chain_collapses_wrappers_and_shows_init_parent_units() {
             start_time: Some(90),
             exe: Some("sh".into()),
             label: None,
-            exe_unreadable: false,
+            exe_gap: None,
         },
         LauncherAncestor {
             pid: 890,
             start_time: Some(89),
             exe: Some("sh".into()),
             label: None,
-            exe_unreadable: false,
+            exe_gap: None,
         },
         LauncherAncestor {
             pid: 800,
             start_time: Some(80),
             exe: Some("cron".into()),
             label: None,
-            exe_unreadable: false,
+            exe_gap: None,
         },
     ];
     presentation.callers[0].launcher_gap = None;
@@ -735,7 +735,7 @@ fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
         start_time: Some(90),
         exe: None,
         label: None,
-        exe_unreadable: true,
+        exe_gap: Some(LAUNCHER_GAP_EXE_UNREADABLE),
     }];
     presentation.callers[0].launcher_gap = Some(LauncherGap {
         subject: LAUNCHER_GAP_SUBJECT,

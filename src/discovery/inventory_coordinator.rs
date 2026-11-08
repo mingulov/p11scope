@@ -7526,9 +7526,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         recovery.deferred_count = predecessor && protected;
         if !predecessor {
             // No surviving allocation candidate remains after genuine revocation.
-            recovery.withheld_through = recovery.withheld_through.max(recovery.discarded_through);
-            recovery.discarded_through = recovery.watermark;
-            self.flush_withheld_prefix(key, recovery);
+            // The held read is classified first: flushing first would fold a
+            // retained read into the unknown prefix and suppress this emit.
+            // The flush below then discloses only the remainder beyond held.
+            let flushed = recovery.withheld_through.max(recovery.discarded_through);
             if let Some(held) = held {
                 self.diagnostic_withheld(
                     key,
@@ -7544,8 +7545,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     held.count,
                 );
                 recovery.watermark = recovery.watermark.max(held.count);
-                recovery.withheld_through = recovery.watermark;
             }
+            recovery.withheld_through = recovery.watermark.max(flushed);
+            recovery.discarded_through = recovery.watermark;
+            self.flush_withheld_prefix(key, recovery);
             self.suspend_recovery(key, recovery);
         }
     }

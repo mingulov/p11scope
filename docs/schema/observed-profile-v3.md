@@ -508,8 +508,11 @@ bytes — `discovery[]` carries one row per file. Both rows publish the
 merge path and the shared merge-view key `{dev, ino}`; `sha256`
 and `build_id` are read from each row's own file, and only the
 lower file's row carries `"layer": "pre_copy_up"` — digest and
-layer tell the two rows apart. The key is absent on every
-ordinary row. `functions[].module` joins to either
+layer tell the two rows apart whenever the copy-up changed a byte.
+A copy-up that changes no bytes still admits the pair on the
+pre-copy-up marker alone: the two rows then share path, key,
+digest, and build id, and differ only by `layer`. The key is
+absent on every ordinary row. `functions[].module` joins to either
 row by identity, so stale-mapping calls count on the lower edge and fresh
 calls on the upper edge. `capture.modules[]` stays the identity-only
 projection and carries no `layer` key. The lowerdir host paths that

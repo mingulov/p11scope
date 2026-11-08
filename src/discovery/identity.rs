@@ -11140,6 +11140,41 @@ mod tests {
         }
     }
 
+    /// A copy-up that changes no bytes still admits the pair on the
+    /// pre-copy-up marker alone: two rows sharing path identity, key,
+    /// and digest, differing only by layer downstream.
+    #[test]
+    fn byte_identical_copyup_pair_admits_two_rows_sharing_the_digest() {
+        let key = ObjectKey {
+            device: Device { major: 8, minor: 1 },
+            inode: INODE,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper = backing_file(&dir, "upper.so");
+        let lower = backing_file(&dir, "lower.so");
+        // The same digest on both sides: chmod/touch semantics.
+        let mut plain = image_pins(&[(key, "dddddddd", 1)]);
+        reback(&mut plain, &upper);
+        let mut acc = PinnedObjects::empty();
+        assert!(acc.absorb(plain).is_empty());
+        let mut pre = image_pins(&[(key, "dddddddd", 2)]);
+        reback(&mut pre, &lower);
+        mark_pre_copy_up(&mut pre);
+        assert!(acc.absorb(pre).is_empty());
+        let kept: Vec<_> = acc.pinned().collect();
+        assert_eq!(kept.len(), 2, "the byte-identical pair admits both rows");
+        assert!(
+            kept.iter().all(|pin| pin.sha256 == "dddddddd"),
+            "both rows share the digest"
+        );
+        assert_eq!(
+            kept.iter().filter(|pin| pin.pre_copy_up).count(),
+            1,
+            "exactly one row is the proven pre"
+        );
+        assert!(!acc.rejects(key), "the shared digest poisons nothing");
+    }
+
     /// A key rejected in one view (a same-digest collision) still
     /// files a witness-proven pre observation from another view, in
     /// both absorb orders: the carried rejection refuses plains but

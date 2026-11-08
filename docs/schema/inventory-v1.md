@@ -387,7 +387,11 @@ and never proves an app identity. See the app identity rows of
   file — and the identity key keeps them two records, each with the
   merge path in its path list. Both records publish the shared
   merge-view key `{dev, ino}`; each record's `sha256` is its own
-  file's digest, which tells the two files apart. Inventory
+  file's digest, which tells the two files apart whenever the
+  copy-up changed a byte. A copy-up that changes no bytes (chmod,
+  touch, an unwritten write handle) still admits the pair on the
+  pre-copy-up marker alone, so the two records then share path,
+  key, and digest with nothing to separate them. Inventory
   rows carry no `layer` marker; the capture profile's `discovery[]`
   row for the lower file does (`"layer": "pre_copy_up"` — see
   `observed-profile-v3.md`).

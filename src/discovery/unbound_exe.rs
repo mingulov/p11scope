@@ -313,12 +313,11 @@ impl ExeResolver {
             };
         }
         // Sources (b) and (c) pool their verified spellings: the
-        // shown path is the first learned spelling when the scan
-        // taught the pair (an admitted caller proved that spelling
-        // executes), else the first index spelling; every distinct
-        // canonical spelling lists as a candidate, sorted. One
-        // candidate reads unambiguous; two or more keep the shown
-        // path and read ambiguous, never unknown.
+        // shown path is the sorted-first verified spelling, learned
+        // preferred over index; every distinct canonical spelling
+        // lists as a candidate, sorted. One candidate reads
+        // unambiguous; two or more keep the shown path and read
+        // ambiguous, never unknown.
         let learned = Self::scan_learned_hits(dev, ino, scan);
         let indexed = self.system_index_hits(dev, ino);
         let mut seen = std::collections::HashSet::new();

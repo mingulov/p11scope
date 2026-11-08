@@ -34,9 +34,11 @@ run with -v for details
 The python script shows as its launcher, `python3.14`: p11scope names
 the executable, never the script path or arguments. The one-shot sign
 tools exit too fast to be scanned alive, so their calls group under
-"unidentified executables" with exact counts. Other providers on the
-machine get their own lines; anything else using SoftHSM at the same
-time appears beside python3.14.
+"unidentified executables" with per-executable call counts. Counts are
+exact when the capture saw every call, as under `p11scope run --pause auto`;
+under partial coverage the same figures are lower bounds, and the product
+prints them as "at least". Other providers on the machine get their own
+lines; anything else using SoftHSM at the same time appears beside python3.14.
 
 `sudo p11scope profile --pid <python-pid>` (trimmed):
 

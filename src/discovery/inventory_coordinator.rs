@@ -1352,9 +1352,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// distinct path probed once per capture through the sticky
     /// cache. First path wins per identity.
     #[cfg(test)]
-    pub(crate) fn scan_learned_exe_map(
-        &mut self,
-    ) -> std::collections::HashMap<(u64, u64), String> {
+    pub(crate) fn scan_learned_exe_map(&mut self) -> std::collections::HashMap<(u64, u64), String> {
         Self::scan_exe_identities_cached(
             &self.adapter,
             &mut self.exe_probe_cache,
@@ -29603,11 +29601,10 @@ int main(void) {
             let map = InventoryCoordinator::scan_exe_identities_cached(
                 &native.scene.coordinator.adapter,
                 &mut cache,
-                &probe,
+                probe,
             );
             assert!(
-                map.values()
-                    .any(|path| path == path_a.to_str().unwrap()),
+                map.values().any(|path| path == path_a.to_str().unwrap()),
                 "the overflow path still joins the map: {map:?}"
             );
         }
@@ -29663,8 +29660,7 @@ int main(void) {
         let third = native.row(43, 1, 11, 230, 0);
         native.witness(vec![first, second, third]);
         let (text, _) = slice_one_views(&native);
-        let line =
-            "unidentified executables: tool-a (2 calls, host pids 9, 11); tool-b (1 call, host pid 10)";
+        let line = "unidentified executables: tool-a (2 calls, host pids 9, 11); tool-b (1 call, host pid 10)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise groups by executable:\n{text}"
@@ -29691,8 +29687,7 @@ int main(void) {
         lost.failure = Some("scripted lifecycle loss".into());
         native.stage(NativeBatch::Lifecycle(lost));
         let (text, _) = slice_one_views(&native);
-        let line =
-            "unidentified executables: executable unknown (exec record lost) (2 calls, host pids 9, 10)";
+        let line = "unidentified executables: executable unknown (exec record lost) (2 calls, host pids 9, 10)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "concise counts the lost executables:\n{text}"
@@ -29701,7 +29696,8 @@ int main(void) {
         native.scene.coordinator.set_exe_index_dirs(Vec::new());
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let (text, _) = slice_one_views(&native);
-        let line = "unidentified executables: executable unknown (no exec record) (1 call, host pid 9)";
+        let line =
+            "unidentified executables: executable unknown (no exec record) (1 call, host pid 9)";
         assert!(
             text.lines().any(|candidate| candidate == line),
             "unjoined images without loss name their reason:\n{text}"

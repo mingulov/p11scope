@@ -3389,8 +3389,7 @@ fn render_snapshot_inner(
                                 Some(path) => escape_controls(path).into_owned(),
                                 None => unknown_exe_label(&pid.exe),
                             };
-                            let device =
-                                p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
+                            let device = p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
                             format!(
                                 "{} pid {} (first call {} ago; dev {}:{} ino {}; {})",
                                 name,

@@ -138,6 +138,65 @@ pub(crate) enum QuantumSealProgress {
     Complete,
 }
 
+/// Diagnostic-only deliver-side telemetry: active-seal delivery
+/// outcomes with progress sums plus entry snapshots that separate
+/// budget starvation (zero at entry) from a stale seal (effects
+/// already exhausted at entry). Counts only; disclosed beside the
+/// stop line while stage timings are requested, never a contract.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct DeliverDiagnosis {
+    pub(crate) complete: u64,
+    pub(crate) yielded: u64,
+    pub(crate) held: u64,
+    pub(crate) replayed: u64,
+    pub(crate) disposed: u64,
+    pub(crate) entry_zero: u64,
+    pub(crate) entry_exhausted: u64,
+}
+
+impl DeliverDiagnosis {
+    pub(crate) fn record(
+        &mut self,
+        outcome: &crate::semantics_key_use::SealBatchProgress,
+        entry_zero: bool,
+        entry_exhausted: bool,
+    ) {
+        use crate::semantics_key_use::SealBatchProgress;
+        if entry_zero {
+            self.entry_zero = self.entry_zero.saturating_add(1);
+        }
+        if entry_exhausted {
+            self.entry_exhausted = self.entry_exhausted.saturating_add(1);
+        }
+        match outcome {
+            SealBatchProgress::Complete { replayed, disposed } => {
+                self.complete = self.complete.saturating_add(1);
+                self.replayed = self.replayed.saturating_add(*replayed as u64);
+                self.disposed = self.disposed.saturating_add(*disposed as u64);
+            }
+            SealBatchProgress::Yielded { replayed, disposed } => {
+                self.yielded = self.yielded.saturating_add(1);
+                self.replayed = self.replayed.saturating_add(*replayed as u64);
+                self.disposed = self.disposed.saturating_add(*disposed as u64);
+            }
+            SealBatchProgress::Held => {
+                self.held = self.held.saturating_add(1);
+            }
+        }
+    }
+
+    /// Fold one service-slice-local record into the run total.
+    pub(crate) fn absorb(&mut self, other: &Self) {
+        self.complete = self.complete.saturating_add(other.complete);
+        self.yielded = self.yielded.saturating_add(other.yielded);
+        self.held = self.held.saturating_add(other.held);
+        self.replayed = self.replayed.saturating_add(other.replayed);
+        self.disposed = self.disposed.saturating_add(other.disposed);
+        self.entry_zero = self.entry_zero.saturating_add(other.entry_zero);
+        self.entry_exhausted = self.entry_exhausted.saturating_add(other.entry_exhausted);
+    }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum ConsumerState {
     Pending,
@@ -1639,6 +1698,7 @@ impl IngestedJointQuantum {
         &mut self,
         ports: &mut JointPublicationPorts<'_>,
         remaining: &mut usize,
+        diagnosis: &mut DeliverDiagnosis,
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         self.preflight(ports)?;
         if !self.bound {
@@ -1663,15 +1723,19 @@ impl IngestedJointQuantum {
             let active = self.active.as_mut().expect("selected actual result");
             let seal = active.outcome.as_ref().expect("positive original result");
             let mut batch = SealBatchDelivery::new(seal, &mut active.replay);
+            let entry_zero = *remaining == 0;
+            let entry_exhausted = batch.effects_complete();
             let (registry, owner, _, _, _) = ports.split();
             let (adapter, model) = owner.parts();
-            return match registry.deliver_joint_seal(
+            let outcome = registry.deliver_joint_seal(
                 target.id(),
                 &mut batch,
                 model,
                 adapter.ledger_mut(),
                 remaining,
-            ) {
+            );
+            diagnosis.record(&outcome, entry_zero, entry_exhausted);
+            return match outcome {
                 SealBatchProgress::Complete { .. } => {
                     self.active = None;
                     self.advance_consumer(ConsumerState::Delivered);
@@ -1840,9 +1904,11 @@ impl IngestedJointQuantum {
     ) -> Result<QuantumSealProgress, RawQuantumRefusal> {
         let mut remaining = super::MAX_UNSETTLED_STAGED;
         let selected = self.cursor;
+        // Diagnostic-only; existing controls assert progress, not telemetry.
+        let mut diagnosis = DeliverDiagnosis::default();
         loop {
             let before = remaining;
-            let progress = self.deliver_next_bounded(ports, &mut remaining)?;
+            let progress = self.deliver_next_bounded(ports, &mut remaining, &mut diagnosis)?;
             if progress != QuantumSealProgress::DeliveryReady
                 || remaining == 0
                 || before == remaining

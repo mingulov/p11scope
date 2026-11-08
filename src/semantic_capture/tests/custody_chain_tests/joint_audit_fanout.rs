@@ -11400,7 +11400,11 @@ fn finish_reserved_birth_frame(
                 let held = frame.as_mut().unwrap();
                 held.seal_next(&mut ports, &mut births, &fault).unwrap();
                 let mut work = 1;
-                if held.deliver_next_bounded(&mut ports, &mut work).unwrap()
+                let mut diagnosis =
+                    crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+                if held
+                    .deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+                    .unwrap()
                     == QuantumSealProgress::Complete
                 {
                     complete = true;
@@ -12050,8 +12054,12 @@ fn finish_original_negative_frame<Source: crate::discovery::caller_registry::Pro
         frame.seal_next(&mut ports, &mut births, fault).unwrap();
         assert!(frame.active_seal_for_test().is_none());
         let mut work = 1;
+        let mut diagnosis =
+            crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
         if matches!(
-            frame.deliver_next_bounded(&mut ports, &mut work).unwrap(),
+            frame
+                .deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+                .unwrap(),
             QuantumSealProgress::Complete | QuantumSealProgress::AwaitFutureInput
         ) {
             finished = true;
@@ -12871,7 +12879,11 @@ fn joint_raw_disposition_quiet_and_pending_paths_are_finite() {
             held.seal_next(&mut ports, &mut births, &BirthFault)
                 .unwrap();
             let mut work = 1;
-            if held.deliver_next_bounded(&mut ports, &mut work).unwrap()
+            let mut diagnosis =
+                crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
+            if held
+                .deliver_next_bounded(&mut ports, &mut work, &mut diagnosis)
+                .unwrap()
                 == QuantumSealProgress::AwaitFutureInput
             {
                 future = true;
@@ -20477,8 +20489,10 @@ impl CanonicalFanoutScene {
                 .coordinator
                 .joint_frame_ports(&self.scene.producers)
                 .unwrap();
+            let mut diagnosis =
+                crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
             frame
-                .deliver_next_bounded(&mut ports, &mut remaining)
+                .deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis)
                 .unwrap()
         };
         let after: u64 = self
@@ -20938,6 +20952,8 @@ fn key_operation_joint_batch_bounded_loss_keeps_exact_admission_head() {
                 // cannot authorize either loss disposal or actual-End replay.
                 let mut foreign = CanonicalFanoutScene::prior_sealed();
                 let mut remaining = 1;
+                let mut diagnosis =
+                    crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
                 {
                     let mut ports = foreign
                         .scene
@@ -20947,7 +20963,7 @@ fn key_operation_joint_batch_bounded_loss_keeps_exact_admission_head() {
                         .joint_frame_ports(&foreign.scene.producers)
                         .unwrap();
                     assert_eq!(
-                        frame.deliver_next_bounded(&mut ports, &mut remaining),
+                        frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
                         Err(RawQuantumRefusal::ForeignCapture)
                     );
                 }
@@ -22566,6 +22582,7 @@ fn fallback_history_then_later_loss(next_frame: bool) {
     let mut foreign = CanonicalFanoutScene::prior_sealed();
     let before = fixture.feeds();
     let mut remaining = 1;
+    let mut diagnosis = crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
     {
         let mut ports = foreign
             .scene
@@ -22575,7 +22592,7 @@ fn fallback_history_then_later_loss(next_frame: bool) {
             .joint_frame_ports(&foreign.scene.producers)
             .unwrap();
         assert_eq!(
-            frame.deliver_next_bounded(&mut ports, &mut remaining),
+            frame.deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis),
             Err(RawQuantumRefusal::ForeignCapture)
         );
     }

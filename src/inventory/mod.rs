@@ -3195,6 +3195,13 @@ fn disclose_semantic_stop(
             seals.complete,
             seals.refused,
             seals.last_refusal,
+            seals.deliver.complete,
+            seals.deliver.yielded,
+            seals.deliver.held,
+            seals.deliver.replayed,
+            seals.deliver.disposed,
+            seals.deliver.entry_zero,
+            seals.deliver.entry_exhausted,
         ));
     }
 }

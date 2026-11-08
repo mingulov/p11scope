@@ -1578,9 +1578,11 @@ pub(crate) fn admitted_mints_line(reported: u64, attached: u64, feeds: u64) -> S
 
 /// One stderr line for the diagnostic joint-seal summary: seal
 /// attempts by progress kind plus refusal count and the latest
-/// refusal label. Counts and one frozen label only; no identities,
-/// paths or payloads. Diagnostic-only: printed beside the stop
-/// line only while stage timings are requested, never a contract.
+/// refusal label, with the deliver-side record (active-seal
+/// delivery outcomes, progress sums, entry snapshots). Counts and
+/// one frozen label only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only while stage
+/// timings are requested, never a contract.
 #[allow(clippy::too_many_arguments)] // One line, one call site, like semantic_stop_line.
 pub(crate) fn joint_seals_line(
     attempts: u64,
@@ -1590,11 +1592,21 @@ pub(crate) fn joint_seals_line(
     complete: u64,
     refused: u64,
     last_refusal: &str,
+    d_complete: u64,
+    d_yielded: u64,
+    d_held: u64,
+    d_replayed: u64,
+    d_disposed: u64,
+    d_entry_zero: u64,
+    d_entry_exhausted: u64,
 ) -> String {
     format!(
         "p11scope: joint seals: attempts={attempts} local_pending={local_pending} \
          await_future_input={await_future_input} delivery_ready={delivery_ready} \
-         complete={complete} refused={refused} last_refusal={last_refusal}"
+         complete={complete} refused={refused} last_refusal={last_refusal} \
+         d_complete={d_complete} d_yielded={d_yielded} d_held={d_held} \
+         d_replayed={d_replayed} d_disposed={d_disposed} \
+         d_entry_zero={d_entry_zero} d_entry_exhausted={d_entry_exhausted}"
     )
 }
 

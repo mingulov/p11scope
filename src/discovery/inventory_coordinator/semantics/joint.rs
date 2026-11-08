@@ -7,7 +7,8 @@ use crate::attach::SessionDrainProducers;
 use crate::discovery::caller_registry::CallerRegistry;
 use crate::inventory_semantics::{JointCommitIo, JointContinuationView, RetainedJointBirths};
 use crate::semantics_objects::journal::joint_audit::{
-    DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource, QuantumSealProgress,
+    DeliverDiagnosis, DisposedJointQuantum, IngestedJointQuantum, JointBirthEvidenceSource,
+    QuantumSealProgress,
 };
 use crate::semantics_objects::journal::joint_driver::{
     IngestedRaw, JointCaptureOwner, RawJointQuantum, RawQuantumRefusal,
@@ -28,7 +29,8 @@ pub(in crate::discovery::engine::inventory_coordinator) struct JointCommitInput<
 }
 
 /// Diagnostic-only joint-seal telemetry: attempts by progress kind
-/// plus refusal count and the latest refusal label. Counts and one
+/// plus refusal count and the latest refusal label, with the
+/// deliver-side record folded in per service slice. Counts and one
 /// frozen label only; disclosed beside the stop line while stage
 /// timings are requested, never a contract.
 #[derive(Debug, Clone, Copy)]
@@ -40,6 +42,7 @@ pub(crate) struct SealDiagnosis {
     pub(crate) complete: u64,
     pub(crate) refused: u64,
     pub(crate) last_refusal: &'static str,
+    pub(crate) deliver: DeliverDiagnosis,
 }
 
 impl Default for SealDiagnosis {
@@ -52,6 +55,7 @@ impl Default for SealDiagnosis {
             complete: 0,
             refused: 0,
             last_refusal: "none",
+            deliver: DeliverDiagnosis::default(),
         }
     }
 }
@@ -468,8 +472,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
                 let held = frame.as_mut().expect("same original service frame");
-                held.deliver_next_bounded(&mut ports, remaining)
+                // Stack-local: the ports borrow the coordinator while the
+                // slice records, so the run total folds in after they drop.
+                let mut deliver = DeliverDiagnosis::default();
+                held.deliver_next_bounded(&mut ports, remaining, &mut deliver)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
+                self.seal_diagnosis.deliver.absorb(&deliver);
             }
             if let Some(disposed) =
                 self.finish_joint_frame_if_ready(frame, producers, &continuation)?

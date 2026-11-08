@@ -250,13 +250,17 @@ fn admitted_mints_line_format_is_exact() {
 #[test]
 fn joint_seals_line_format_is_exact() {
     assert_eq!(
-        joint_seals_line(0, 0, 0, 0, 0, 0, "none"),
+        joint_seals_line(0, 0, 0, 0, 0, 0, "none", 0, 0, 0, 0, 0, 0, 0),
         "p11scope: joint seals: attempts=0 local_pending=0 await_future_input=0 \
-         delivery_ready=0 complete=0 refused=0 last_refusal=none"
+         delivery_ready=0 complete=0 refused=0 last_refusal=none \
+         d_complete=0 d_yielded=0 d_held=0 d_replayed=0 d_disposed=0 \
+         d_entry_zero=0 d_entry_exhausted=0"
     );
     assert_eq!(
-        joint_seals_line(12, 3, 7, 1, 1, 2, "Capacity"),
+        joint_seals_line(12, 3, 7, 1, 1, 2, "Capacity", 4, 5, 6, 70, 8, 9, 10),
         "p11scope: joint seals: attempts=12 local_pending=3 await_future_input=7 \
-         delivery_ready=1 complete=1 refused=2 last_refusal=Capacity"
+         delivery_ready=1 complete=1 refused=2 last_refusal=Capacity \
+         d_complete=4 d_yielded=5 d_held=6 d_replayed=70 d_disposed=8 \
+         d_entry_zero=9 d_entry_exhausted=10"
     );
 }

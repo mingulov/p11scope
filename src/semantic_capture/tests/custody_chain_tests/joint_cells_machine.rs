@@ -2429,8 +2429,10 @@ fn mixed_image_and_exact_refusal_pending(scenario: MixedRefusalControl) {
             break;
         }
         let mut remaining = 1;
+        let mut diagnosis =
+            crate::semantics_objects::journal::joint_audit::DeliverDiagnosis::default();
         frame
-            .deliver_next_bounded(&mut ports, &mut remaining)
+            .deliver_next_bounded(&mut ports, &mut remaining, &mut diagnosis)
             .unwrap();
     }
     assert_eq!(

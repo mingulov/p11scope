@@ -4322,3 +4322,60 @@ fn missing_app_hint_renders_no_brackets_and_no_key() {
         "absent hint stays absent: {rendered}"
     );
 }
+
+#[test]
+fn app_hints_change_labels_only_never_counts_or_identity() {
+    // Twin: the same presentation rendered with hints on every caller
+    // versus no hints. Labels must differ (the toggle really applied);
+    // the JSON documents must then agree exactly once the display-only
+    // `app_hint` keys are removed — same ids, joins, counts, edges.
+    let harness = varied_harness();
+    let document = harness.render();
+    let plain = capture_for(&harness, &document);
+    let mut hinted = capture_for(&harness, &document);
+    assert!(!hinted.callers.is_empty(), "the twin needs callers");
+    for caller in &mut hinted.callers {
+        caller.app_hint = Some(crate::app_hint::AppHint {
+            value: "hint-probe".into(),
+            source: crate::app_hint::AppHintSource::Unit,
+        });
+    }
+    let plain_labels: Vec<String> = plain
+        .callers
+        .iter()
+        .map(|caller| application_label(&plain, caller.id))
+        .collect();
+    let hinted_labels: Vec<String> = hinted
+        .callers
+        .iter()
+        .map(|caller| application_label(&hinted, caller.id))
+        .collect();
+    assert_ne!(
+        plain_labels, hinted_labels,
+        "the hint toggle must show in labels"
+    );
+    for (base, labeled) in plain_labels.iter().zip(hinted_labels.iter()) {
+        assert_eq!(labeled, &format!("{base} [hint-probe]"), "label twin");
+    }
+    let plain_doc = crate::inventory::render_json_from_presentation(&plain);
+    let mut hinted_doc = crate::inventory::render_json_from_presentation(&hinted);
+    assert!(
+        plain_doc["callers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|row| row.get("app_hint").is_none()),
+        "plain twin carries no hint keys"
+    );
+    for row in hinted_doc["callers"].as_array_mut().unwrap() {
+        assert!(
+            row.get("app_hint").is_some(),
+            "hinted twin carries the key: {row}"
+        );
+        row.as_object_mut().unwrap().remove("app_hint");
+    }
+    assert_eq!(
+        plain_doc, hinted_doc,
+        "counts, edges, joins and ids are identical ± hints"
+    );
+}

@@ -614,6 +614,14 @@ mod tests {
     }
 
     #[test]
+    fn python_r_flag_takes_no_value() {
+        // -R (hash randomization) takes no value: `python3 -R -c`
+        // runs the program (verified live, probes-r2.txt).
+        assert_eq!(argv("/usr/bin/python3", &["-R", "app.py"]).value, "app.py");
+        assert_eq!(argv("/usr/bin/python3", &["-BR", "app.py"]).value, "app.py");
+    }
+
+    #[test]
     fn python_dashdash_ends_options() {
         assert_eq!(
             argv("/usr/bin/python3", &["--", "app.py", "-x"]).value,
@@ -707,17 +715,22 @@ mod tests {
     }
 
     #[test]
-    fn sh_direct_script_but_never_c_text_or_flags() {
-        assert_eq!(
-            argv("/bin/sh", &["deploy.sh", "--pin", "1"]).value,
-            "deploy.sh"
-        );
-        assert_eq!(argv("/usr/bin/dash", &["x.sh"]).value, "x.sh");
-        assert_eq!(argv("/usr/bin/bash", &["y.sh"]).value, "y.sh");
-        let mut cmd = b"sh\x00-c\x00echo hi\x00".to_vec();
+    fn shells_never_get_hints_not_even_for_direct_scripts() {
+        // Owner correction 2026-11-08: a shell cannot load a PKCS#11
+        // provider, so sh/bash/dash get no labels at all — no argv,
+        // no comm, no cgroup read. "Which script launched the tool"
+        // is the parent-chain lane's question, not this one.
+        for exe in ["/bin/sh", "/usr/bin/dash", "/usr/bin/bash"] {
+            let mut cmd = exe.as_bytes().to_vec();
+            cmd.extend_from_slice(b"\x00deploy.sh\x00");
+            no_hint(Some(exe), None, Some(&cmd), None);
+        }
+        let cmd = b"sh\x00-c\x00echo hi\x00".to_vec();
         no_hint(Some("/bin/sh"), None, Some(&cmd), None);
-        cmd = b"sh\x00-x\x00deploy.sh\x00".to_vec();
-        no_hint(Some("/bin/sh"), None, Some(&cmd), None);
+        // Not even a script-shaped comm or a service cgroup.
+        no_hint(Some("/bin/sh"), Some("deploy.sh"), None, None);
+        let svc = "0::/system.slice/backup-agent.service\n";
+        no_hint(Some("/bin/sh"), None, None, Some(svc));
     }
 
     #[test]
@@ -787,6 +800,74 @@ mod tests {
     }
 
     #[test]
+    fn node_eval_equals_forms_bail_and_eval_twins_use_scriptish_payloads() {
+        // `--eval=<code>` / `--print=<code>` are real (verified live:
+        // rc=0), and no script runs after them — after `--print=` the
+        // next token is itself evaluated as code. The walker must bail
+        // instead of capturing a later token as "the script".
+        let mut cmd = b"node\x00--eval=console.log(1)\x00app.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00--print=1+1\x00app.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        // Scriptish payloads: these kill an abort→skip mutant (the eval
+        // text itself would be captured as the "script").
+        cmd = b"node\x00-e\x00script.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00--eval\x00script.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00--print\x00script.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00-p\x00script.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+    }
+
+    #[test]
+    fn perl_and_ruby_direct_scripts_but_only_direct() {
+        // Measured (perl, probes-r2.txt): the direct shebang and the
+        // explicit `perl script` shape both put the script at argv[1];
+        // ruby is the same shape by construction (no ruby on the probe
+        // hosts). Direct shape only: any flag bails to a safe miss —
+        // comm and cgroup still apply, and flagged argv grammars are a
+        // documented later step, not a guess.
+        assert_eq!(
+            argv("/usr/bin/perl", &["tool.pl", "--pin", "1"]).value,
+            "tool.pl"
+        );
+        assert_eq!(argv("/usr/bin/ruby", &["app.rb"]).value, "app.rb");
+        let mut cmd = b"perl\x00-w\x00tool.pl\x00".to_vec();
+        no_hint(Some("/usr/bin/perl"), None, Some(&cmd), None);
+        cmd = b"ruby\x00-w\x00app.rb\x00".to_vec();
+        no_hint(Some("/usr/bin/ruby"), None, Some(&cmd), None);
+        // Versioned spellings are a known safe miss (deferred, not guessed).
+        cmd = b"ruby3.2\x00app.rb\x00".to_vec();
+        no_hint(Some("/usr/bin/ruby3.2"), None, Some(&cmd), None);
+    }
+
+    #[test]
+    fn perl_and_ruby_never_eval_text() {
+        let mut cmd = b"perl\x00-e\x00script.pl\x00".to_vec();
+        no_hint(Some("/usr/bin/perl"), None, Some(&cmd), None);
+        cmd = b"perl\x00-E\x00script.pl\x00".to_vec();
+        no_hint(Some("/usr/bin/perl"), None, Some(&cmd), None);
+        cmd = b"ruby\x00-e\x00script.rb\x00".to_vec();
+        no_hint(Some("/usr/bin/ruby"), None, Some(&cmd), None);
+    }
+
+    #[test]
+    fn comm_names_direct_shebang_perl_and_ruby_apps() {
+        // Direct shebang launches keep the script name in comm
+        // (measured: `direct-tool` for perl).
+        let hint = app_hint_for(Some("/usr/bin/perl"), Some("direct-tool"), None, None)
+            .expect("perl comm hint");
+        assert_eq!(hint.value, "direct-tool");
+        assert_eq!(hint.source, AppHintSource::Comm);
+        let hint =
+            app_hint_for(Some("/usr/bin/ruby"), Some("myapp"), None, None).expect("ruby comm hint");
+        assert_eq!(hint.value, "myapp");
+        assert_eq!(hint.source, AppHintSource::Comm);
+    }
+
+    #[test]
     fn pin_values_are_never_captured_in_any_position() {
         for (exe, args, script) in [
             (
@@ -799,7 +880,8 @@ mod tests {
                 vec!["-m", "job", "--pin", "1234"],
                 "job",
             ),
-            ("/bin/sh", vec!["job.sh", "--pin", "1234"], "job.sh"),
+            ("/usr/bin/perl", vec!["job.pl", "--pin", "1234"], "job.pl"),
+            ("/usr/bin/ruby", vec!["job.rb", "--pin", "1234"], "job.rb"),
             (
                 "/usr/bin/java",
                 vec!["-jar", "job.jar", "--pin", "1234"],
@@ -854,18 +936,23 @@ mod tests {
     }
 
     #[test]
-    fn cgroup_leaf_names_snaps_units_and_scopes() {
+    fn cgroup_leaf_names_snaps_units_and_scopes_for_runtimes_only() {
+        // Native executables keep the plain name: no packaging hints
+        // (owner ruling 2026-11-08 — snap firefox stays `firefox`).
         let snap = "0::/user.slice/user-1000.slice/user@1000.service/app.slice/snap.firefox.firefox-uuid.scope\n";
-        let hint = app_hint_for(
+        no_hint(
             Some("/snap/firefox/9057/usr/lib/firefox/firefox"),
             None,
             None,
             Some(snap),
-        )
-        .expect("snap hint");
+        );
+        let svc = "0::/system.slice/backup-agent.service\n";
+        no_hint(Some("/usr/bin/pkcs11-tool"), None, None, Some(svc));
+        // A label ON a runtime is allowed: the same snap shape under node.
+        let hint =
+            app_hint_for(Some("/usr/bin/node"), None, None, Some(snap)).expect("snap hint on node");
         assert_eq!(hint.value, "snap firefox");
         assert_eq!(hint.source, AppHintSource::Snap);
-        let svc = "0::/system.slice/backup-agent.service\n";
         let hint =
             app_hint_for(Some("/usr/bin/python3"), None, None, Some(svc)).expect("unit hint");
         assert_eq!(hint.value, "backup-agent");
@@ -900,6 +987,42 @@ mod tests {
     fn hint_equal_to_basename_carries_no_information() {
         let svc = "0::/system.slice/colord.service\n";
         no_hint(Some("/usr/sbin/colord"), None, None, Some(svc));
+    }
+
+    #[test]
+    fn cgroup_value_equal_to_runtime_basename_is_dropped() {
+        let svc = "0::/system.slice/python3.service\n";
+        no_hint(Some("/usr/bin/python3"), None, None, Some(svc));
+    }
+
+    #[test]
+    fn overlong_values_are_refused_at_every_source() {
+        // argv tokens already refuse >255 bytes; comm and the cgroup
+        // leaf enforce the same bound. An overlong comm falls through
+        // to the cgroup leaf like an empty one.
+        let long_comm = "c".repeat(HINT_VALUE_MAX_BYTES + 1);
+        no_hint(Some("/usr/bin/python3"), Some(&long_comm), None, None);
+        let svc = "0::/system.slice/backup-agent.service\n";
+        let hint = app_hint_for(Some("/usr/bin/python3"), Some(&long_comm), None, Some(svc))
+            .expect("cgroup wins after an overlong comm");
+        assert_eq!(hint.value, "backup-agent");
+        assert_eq!(hint.source, AppHintSource::Unit);
+        let leaf = format!("0::/system.slice/{}.service\n", "u".repeat(300));
+        no_hint(Some("/usr/bin/python3"), None, None, Some(&leaf));
+    }
+
+    #[test]
+    fn longest_valid_snap_label_stays_within_the_bound() {
+        // `snap.<snap>.<app>-<id>.scope` needs 15 bytes besides the
+        // snap name, so a 255-byte leaf holds at most a 240-char snap;
+        // the composed `snap <snap>` value must still fit NAME_MAX.
+        let snap = "s".repeat(240);
+        let leaf = format!("0::/app.slice/snap.{snap}.a-b.scope\n");
+        assert_eq!(leaf.trim().rsplit('/').next().unwrap().len(), 255);
+        let hint = app_hint_for(Some("/usr/bin/python3"), None, None, Some(&leaf))
+            .expect("longest snap hint");
+        assert_eq!(hint.value, format!("snap {snap}"));
+        assert!(hint.value.len() <= HINT_VALUE_MAX_BYTES);
     }
 
     #[test]

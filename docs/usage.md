@@ -1424,7 +1424,25 @@ Limits that matter in pods:
   trusted) and is truncated when the stream opens; a rotation rename
   never replaces an entry planted at its target. After `started`, a returned
   event write, rotation, flush or sync error disables that writer while
-  observation continues to its ordinary stop. Final event completion,
+  observation continues to its ordinary stop.
+  `--event-log -` streams the same JSONL lines to stdout instead —
+  one complete object per line, flushed per commit batch, never
+  interleaved — for container runtimes (`docker logs`, Fluent Bit,
+  Loki) with no file mount. The stdout stream is never rotated (the
+  rotation options are refused beside `-`), `--json` and `--dashboard`
+  are refused beside it as fellow stdout owners, and
+  the text summary moves to stderr. A stdout that stops reading or is
+  closed never stalls capture: each commit batch waits bounded, then sheds lines
+  with counters reported on stderr, in `totals`/`ended`, and the exit
+  status, while capture continues to its normal stop. Only an stdout
+  that cannot be acquired at all fails fast before scanning.
+  `--event-interval <dur>` (off by default; e.g. `10s`) adds a periodic
+  `totals` snapshot of the current report counts to either sink, at most
+  one per pass and never on the stop commit. For example, an observer
+  beside the workload container streams live events to the log driver
+  with a 30 s heartbeat and no mounted file:
+  `docker run ... p11scope inventory --system --event-log - --event-interval 30s`.
+  Final event completion,
   atomic `-o` commit and stdout are attempted independently; any returned
   sink error gives exit 1 with sink-specific diagnostics. The event file
   may contain a partial line, and `ended` is never fabricated or retried.

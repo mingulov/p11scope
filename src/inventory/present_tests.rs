@@ -2005,6 +2005,35 @@ fn event_doc_pins_activity_precedence_and_last_seen_presence() {
     );
 }
 
+// v070-event-stdout pins: `docs/schema/inventory-events-v1.md` states the
+// `--event-log -` stdout transport (same lines, no rotation, bounded
+// shed with counters, summary to stderr) and the additive `totals`
+// kind (`--event-interval`) with its `stdout_lost` accounting.
+#[test]
+fn event_doc_pins_stdout_transport_and_totals_kind() {
+    const DOC: &str = include_str!("../../docs/schema/inventory-events-v1.md");
+    assert!(
+        DOC.contains("`--event-log -` streams")
+            && DOC.contains("never rotated")
+            && DOC.contains("shed with counters"),
+        "the stdout transport contract is stated"
+    );
+    assert!(
+        DOC.contains("the text summary moves to stderr"),
+        "the stdout ownership rule is stated"
+    );
+    assert!(
+        DOC.contains("`totals`")
+            && DOC.contains("`--event-interval`")
+            && DOC.contains("`stdout_lost`"),
+        "the additive totals kind and its loss accounting are stated"
+    );
+    assert!(
+        DOC.contains("phase-locked to actual emissions"),
+        "the no-burst cadence rule is stated"
+    );
+}
+
 #[test]
 fn f7_snapshot_baseline_preserves_interleaved_children() {
     // Catch a renderer that attaches children to the wrong physical pair,

@@ -5978,6 +5978,25 @@ mod tests {
         }
     }
 
+    // v070-event-stdout pin: `docs/usage.md` documents the `--event-log -`
+    // stdout stream and `--event-interval` totals next to the file
+    // stream, with the container example.
+    #[test]
+    fn usage_doc_documents_event_stdout_and_interval() {
+        const USAGE_MD: &str = include_str!("../docs/usage.md");
+        for statement in [
+            "--event-log -",
+            "--event-interval",
+            "docker run",
+            "the text summary moves to stderr",
+        ] {
+            assert!(
+                USAGE_MD.contains(statement),
+                "missing usage text: {statement}"
+            );
+        }
+    }
+
     // SYSPLAN residual F-17 (RED): the hidden 10M default trace cap is
     // surfaced in help, rendered from the live constant.
     #[test]

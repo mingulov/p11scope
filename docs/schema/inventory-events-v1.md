@@ -169,6 +169,24 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   below it), `object_status` (that publication's status) and the
   additive `object_version` (that publication's H9 section version;
   absent means 1). Consumers refuse unknown versions.
+- `totals` (additive): `{pass, callers, modules, edges, instances,
+  semantic_edges, gaps, gaps_suppressed, refusals, entries: {logical,
+  forwarding}, key_operations: {revision, status, objects, known_rows,
+  unknown_rows}, deferred: {edge_events, instance_events,
+  semantic_edge_events, key_operation_events}, stream: {rotations,
+  evicted_events, evicted_bytes}, stdout_lost: {lines, bytes}}` — a
+  periodic snapshot of the current report-summary counts, emitted
+  behind `--event-interval` (off by default) on file and stdout
+  sinks alike. Every count mirrors a value the report already
+  carries: the section lengths, the coverage line, the layer entry
+  totals, the key-operation row counts, the emitter deferred queues
+  still waiting after the commit, and the writer accounting. At most
+  one per pass, trailing its `pass_committed`; the cadence is
+  phase-locked to actual emissions (a late pass moves the next due
+  date by one interval instead of bursting catch-ups), rides the
+  existing pass ticks with no new thread, and never delays stop. The
+  stop commit emits none: `ended` and the final report already carry
+  the final counts.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,
@@ -273,7 +291,8 @@ Every line carries the same envelope plus its `kind`-specific `event`:
     existing semantic payload. Use actual line sizes when choosing retention.
   - The producer keeps one digest per edge, bounded by the edge limit.
   - Order: a commit writes its `caller_event` lines, its gap lines, its
-    `edge_observed` records, then its `pass_committed`; at the end the
+    `edge_observed` records, then its `pass_committed`, then at most
+    one `totals` when `--event-interval` is due; at the end the
     exact gap flush precedes the edge sweep, which precedes `ended`.
   Its `entries` object is the snapshot's verbatim, including the additive
   `entries.coverage` (see `inventory-v1.md`). `capture` is `armed`
@@ -367,6 +386,9 @@ never sum successive cumulative records for an edge.
   The semantic resource budget uses this terminal presentation's current
   charges, peak charges, refusals and occupancy; it never recomputes live
   registry state while serializing the event.
+  On stdout streams (`--event-log -`, below) `ended` also carries the
+  additive `stdout_lost: {lines, bytes}` — the lines and line bytes shed
+  before it (a slow or closed reader). File streams never carry it.
 
 ## Transport and rotation
 
@@ -389,6 +411,26 @@ stream may end with a partial line; a failed record and `ended` are never
 retried or fabricated. A visible `ended` does not prove successful sync:
 the append may have succeeded before sync returned an error. Event-file
 creation and the initial `started` append remain fail-fast.
+
+Stdout transport: `--event-log -` streams the same
+`p11scope/inventory-events/v1` JSONL lines to stdout — same schema,
+same envelope, same sequence space, same kinds — for container
+runtimes (`docker logs`, Fluent Bit, Loki) with no file mount. The
+stdout stream is never rotated, and the rotation options are refused
+beside `-`. One complete JSON object per line, flushed per commit
+batch, never interleaved with other stdout text: `--json` and
+`--dashboard` (which also own stdout) are refused beside `-`, and
+the text summary moves to stderr. A stdout that stops reading or is
+closed (EPIPE, slow reader) never stalls capture: each commit batch
+shares one bounded wait, past which lines shed with counters — never
+retried, never silent. Shed lines keep their consumed sequence
+numbers, so a slow or closed reader shows as seq gaps accounted by
+`stdout_lost` (in `totals` and the terminal `ended`, plus the stderr
+notices and the nonzero exit), and a shed that leaves a partial line
+is terminated before the next line so every delivered line still
+starts at a line boundary. Capture continues to its normal stop;
+only an stdout that cannot be acquired at all (closed or
+unsupported) fails fast before scanning.
 
 ## Privacy and loss accounting
 

@@ -9,6 +9,11 @@ versioned separately and are opaque, exact dispatch keys.
 
 ### Added
 
+- `inventory --event-log -` streams the versioned JSONL event lines to
+  stdout (same schema, never interleaved; the text summary moves to
+  stderr), and `--event-interval <dur>` adds periodic `totals`
+  snapshots to file and stdout streams alike.
+
 ### Changed
 
 ### Fixed

@@ -5195,6 +5195,29 @@ fn lower_candidates_ignore_outer_lowerdir_under_nested_upper_only_mount() {
     );
 }
 
+#[test]
+fn lower_candidates_parse_ordered_lowerdir_plus_entries() {
+    // fsconfig mounts print one lowerdir+= per layer, in kernel order:
+    // each entry is one layer, not a colon stack.
+    let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir+=/l1,lowerdir+=/l2,upperdir=/u,workdir=/w\n";
+    assert_eq!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")),
+        vec![
+            std::path::PathBuf::from("/l1/a.so"),
+            std::path::PathBuf::from("/l2/a.so"),
+        ]
+    );
+}
+
+#[test]
+fn lower_candidates_refuse_datadir_mounts() {
+    // A data-only lower layer the reader cannot resolve: the candidate
+    // list would be incomplete, so the row refuses instead of serving
+    // a partial stack.
+    let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,datadir+=/d1,upperdir=/u,workdir=/w\n";
+    assert!(lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")).is_empty());
+}
+
 /// What the copy-up join mirror concluded over live inputs: the guard
 /// refused before any witness work (the legacy shape), the join proved
 /// (held or proven lower), or the join refused with the gap reason.

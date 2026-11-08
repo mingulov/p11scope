@@ -87,11 +87,12 @@ and finite, never fast) all still apply — see
 [Known limitations in 0.6.0](#known-limitations-in-060). The v0.7.0
 measurements on those kernels follow.
 
-Public CLI vng cells at rc `79108a1c7` (stripped release observer and
-helper) on 5.15.221, 6.1.188 and 6.6.157, with a 7.3.1 control run. No
-6.9 kernel was cached, so 6.9.12 was not run and the fixed-filter
-boundary there stays unverified; 6.7, 6.8, 6.10 and 6.11 were not run
-either. Each edge below names its measured kernel range.
+Guest-suite runs of the 0.7.0 development build at commit
+`79108a1c7` on kernels 5.15.221, 6.1.188 and 6.6.157, with a 7.3.1
+control run. The guests are virtme-ng virtual machines. No 6.9 kernel
+was available in the test cache, so 6.9.12 was not run and the
+fixed-filter boundary there stays unverified; 6.7, 6.8, 6.10 and 6.11
+were not run either. Each item below names its measured kernel range.
 
 #### 5.15 and 6.1 refuse live capture
 
@@ -105,17 +106,21 @@ either. Each edge below names its measured kernel range.
 
   Inventory scopes prefix the command (`p11scope: inventory --system:
   live capture did not start: ...`, same for `--cgroup`). A `run`
-  workload never starts: a guarded `touch` file was never created on
-  the 5.15 probe, and 6.1 exits the same refusal with no report.
-- Kernels/conditions: 5.15.221 and 6.1.188 measured, identically: all
-  27 live cells of the public CLI campaign refuse this way on both.
+  workload never starts: a guarded `touch` file was never created in
+  the 5.15 test run, and on 6.1 the suite recorded the same failing
+  checks with no report file either (the stderr text above is the
+  retained 5.15 sample).
+- Kernels/conditions: 5.15.221 and 6.1.188 behaved identically: all
+  26 live-capture checks of the guest suite refuse this way on both,
+  plus the `doctor` unready diagnosis (exit 1).
 - Why: the functional host probe cannot link uprobe-multi (`Invalid
   argument`), so admission refuses before capture, output changes or
   workload start.
 - Workaround: capture on a 6.6+ host with usable uprobe-multi, or stay
   with the scan-only paths below. The historical 5.15/6.1 startup
-  figures in [Quickstart](usage.md#quickstart) predate host admission;
-  current builds refuse before any `capturing:` line.
+  figures in [Discovery timing](usage.md#discovery-timing-and-optional-offline-discovery)
+  predate host admission; current builds refuse before any
+  `capturing:` line.
 
 #### 5.15 and 6.1 keep scan-only paths
 
@@ -123,11 +128,16 @@ either. Each edge below names its measured kernel range.
   exits 0 with a PARTIAL scan report carrying the gap `native usage
   feed unavailable` (`p11scope: native usage feed unavailable,
   continuing with the scan lane: live capture refused (...)`);
-  `inventory --capture scan`, help, version, discovery and saved-report
-  read/diff work; `doctor` exits 1 with the honest unready diagnosis
+  `doctor` exits 1 with the honest unready diagnosis
   (`Doctor: requested lane unavailable.` and `Next: use a host with
   uprobe-multi (normally Linux 6.6+) for live capture; ...`).
-- Kernels/conditions: 5.15.221 and 6.1.188 measured.
+  [Live host capability](usage.md#live-host-capability-and-unsupported-environments)
+  documents that `inventory --capture scan`, help, version, discovery
+  and saved-report read/diff remain usable without live capture; that
+  list was not re-measured here.
+- Kernels/conditions: stderr samples captured on 5.15.221; 6.1.188
+  recorded the same suite outcomes (`doctor` exit 1, same refusal
+  set). No 6.1 stderr samples were retained.
 - Why: these paths need no live probes; `doctor` capability-tests the
   host instead of admitting by version.
 - Workaround: none needed. Gate order to be aware of: refusal shapes
@@ -137,12 +147,15 @@ either. Each edge below names its measured kernel range.
 
 #### 6.6 runs live; one transient honest gap observed
 
-- What the user sees: the 30-cell public CLI campaign passes (23–24
-  pass, `trace-pid` smoke, the 5 declared expected-failures, and a
-  passing minimal-setcap leg). `--pid` captures used uprobe-multi with
-  the kernel pid filter (`scope_filter: "kernel-pid+bpf"`); the
-  per-offset fallback was not needed on 6.6.157. In one of two runs a
-  25 s `--system` capture reported PARTIAL with exact counts and `1
+- What the user sees: live capture works. The 30-check guest suite
+  passed 23 of 24 runnable checks in the first 6.6.157 run and 24 of
+  24 in the rerun (one smoke-only check plus five checks excluded for
+  unrelated reasons — three cgroup checks with known product gaps and
+  two 32-bit checks missing their guest prerequisite — sit outside
+  the runnable set, identically on the 7.3.1 control). The `--pid`
+  checks passed; which attach backend the probe selected was not
+  retained in the saved reports. In one of the two runs a 25 s
+  `--system` capture reported PARTIAL with exact counts and `1
   discovery step unavailable` (observation `lossy`/`skipped`); the
   rerun was exact.
 - Kernels/conditions: 6.6.157 measured twice; 7.3.1 control clean.
@@ -160,8 +173,9 @@ These pre-existing entries also speak for kernels before 6.12 and are
 not re-measured here: the pre-6.8 overlayfs maps-key split
 (`provider's maps rendering unproven`) and the pre-6.8 pre-arm join
 disclosures, the 5.15 key-operation coverage note, the 6.6 to 6.9.11
-thread-exact pid filter with its automatic per-offset fallback (probe
-outcome on 6.6.157 above: filter proven), and the historical 5.15
+thread-exact pid filter with its automatic per-offset fallback (the
+6.6.157 probe verdict was not retained in the saved reports, so the
+fallback entry stands as written), and the historical 5.15
 physical-identity and non-leader-exec qualifications under
 [Kernels and backends](#kernels-and-backends).
 

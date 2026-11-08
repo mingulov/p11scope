@@ -161,6 +161,13 @@ def inputs_for_evidence():
 MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal",
             "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
 MT_BOGUS_RV = 0xB3  # CKR_SESSION_HANDLE_INVALID from a bogus session handle
+# Live per-cell workload shape from qualify-public-cli.sh: mt-metrics/mt-errors/
+# mt-trace/counter-latency-mt run 8 sessions-mode threads, mt-shared runs 32
+# threads on one shared session, mt-churn runs two 32-thread generations,
+# mt-system runs 4 processes x 8 sessions-mode threads.
+MT_SCAFFOLD_OPENS = {"mt-metrics": 8, "mt-errors": 8, "mt-shared": 1, "mt-churn": 64,
+                     "mt-trace": 8, "counter-latency-mt": 8, "mt-system": 32}
+MT_SYSTEM_CHILDREN = (124, 125, 126, 127)
 
 
 def mt_rv_key(rv):
@@ -229,10 +236,15 @@ def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
         for key in PROFILE_FIELDS:
             del report["evidence"][key]
     ledger = ["TARGET " + json.dumps(row) for row in targets]
+    if cell == "mt-system":
+        ledger += ["CHILD pid=%d" % pid for pid in MT_SYSTEM_CHILDREN]
     ledger += ["READY pid=123", "LEDGER " + json.dumps({
         "schema": "p11scope/public-cli-ledger/v2", "pid": 123, "complete": True,
         "functions": [mt_row_ledger(name, calls, errors if i == 0 else 0)
                       for i, name in enumerate(MT_NAMES)]})]
+    opens = MT_SCAFFOLD_OPENS[cell]
+    ledger += ["SCAFFOLD " + json.dumps({"opens_attempted": opens, "opens_ok": opens,
+                                        "closes": opens, "finalizes": 1})]
     receipt = {"schema": "p11scope/public-cli-receipt/v1", "cell": cell,
                "scope": scope, "count_domain": "owned-provider",
                "launched_pid": 123, "generation": 456,
@@ -244,7 +256,12 @@ def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
 
 
 def mutate_mt_ledger(ledger, index, *, attempts=None, successful=None, rv_counts=None):
-    payload = json.loads(ledger[-1][len("LEDGER "):])
+    for pos, line in enumerate(ledger):
+        if line.startswith("LEDGER "):
+            break
+    else:
+        raise AssertionError("no LEDGER record to mutate")
+    payload = json.loads(ledger[pos][len("LEDGER "):])
     row = payload["functions"][index]
     if attempts is not None:
         row["attempts"] = attempts
@@ -252,7 +269,24 @@ def mutate_mt_ledger(ledger, index, *, attempts=None, successful=None, rv_counts
         row["successful"] = successful
     if rv_counts is not None:
         row["rv_counts"] = rv_counts
-    ledger[-1] = "LEDGER " + json.dumps(payload)
+    ledger[pos] = "LEDGER " + json.dumps(payload)
+
+
+def mutate_mt_scaffold(ledger, **fields):
+    for pos, line in enumerate(ledger):
+        if line.startswith("SCAFFOLD "):
+            break
+    else:
+        raise AssertionError("no SCAFFOLD record to mutate")
+    payload = json.loads(ledger[pos][len("SCAFFOLD "):])
+    payload.update(fields)
+    ledger[pos] = "SCAFFOLD " + json.dumps(payload)
+
+
+def drop_mt_lines(ledger, prefix):
+    kept = [line for line in ledger if not line.startswith(prefix)]
+    assert len(kept) < len(ledger), "no %s record to drop" % prefix
+    ledger[:] = kept
 
 
 def trace_stream_mt(*, calls_per_function=8, lost=0, event_loss=0, semantic_failures=0,
@@ -1098,11 +1132,12 @@ class MtOracleTests(unittest.TestCase):
     def test_mt_v1_ledger_without_rv_proof_fails(self):
         # MT cells require ledger v2: per-function return maps, not bare totals.
         def mutate(d, l, r):
-            payload = json.loads(l[-1][len("LEDGER "):])
+            pos = next(i for i, line in enumerate(l) if line.startswith("LEDGER "))
+            payload = json.loads(l[pos][len("LEDGER "):])
             payload["schema"] = "p11scope/public-cli-ledger/v1"
             for row in payload["functions"]:
                 row.pop("rv_counts", None)
-            l[-1] = "LEDGER " + json.dumps(payload)
+            l[pos] = "LEDGER " + json.dumps(payload)
         self.run_case_mt(mutate, cell="mt-shared", want=1)
 
     def test_mt_ledger_rv_sum_mismatch_fails(self):
@@ -1113,7 +1148,8 @@ class MtOracleTests(unittest.TestCase):
     def test_mt_trace_loss_identity_passes_as_smoke(self):
         text = trace_stream_mt(calls_per_function=3)
         report, ledger, _ = inputs_mt(scope="pid", calls=3, cell="mt-trace")
-        payload = json.loads(ledger[-1][len("LEDGER "):])
+        line = next(item for item in ledger if item.startswith("LEDGER "))
+        payload = json.loads(line[len("LEDGER "):])
         self.assertEqual(payload["functions"][0]["attempts"], 3)
         self.run_case_mt(cell="mt-trace", want=2, calls=3, report_text=text)
 
@@ -1141,6 +1177,61 @@ class MtOracleTests(unittest.TestCase):
             d["evidence"]["gap_classes"]["observation"] = {
                 "status": "lossy", "causes": ["pid_descendant_gaps"]}
         self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+
+    def test_mt_system_missing_children_fails(self):
+        # A self-consistent merged LEDGER with no CHILD lines proves no
+        # multi-process shape: PROCS=1 (or silent children) must not pass.
+        result = self.run_case_mt(lambda d, l, r: drop_mt_lines(l, "CHILD "),
+                                  cell="mt-system", calls=40, want=1)
+        self.assertIn("did not report 4 distinct children", result["detail"])
+
+    def test_mt_system_duplicate_child_fails(self):
+        def mutate(d, l, r):
+            drop_mt_lines(l, "CHILD ")
+            pos = next(i for i, line in enumerate(l) if line.startswith("READY "))
+            l[pos:pos] = ["CHILD pid=124", "CHILD pid=124",
+                      "CHILD pid=125", "CHILD pid=126"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("did not report 4 distinct children", result["detail"])
+
+    def test_mt_system_child_matching_ready_fails(self):
+        def mutate(d, l, r):
+            drop_mt_lines(l, "CHILD ")
+            pos = next(i for i, line in enumerate(l) if line.startswith("READY "))
+            l[pos:pos] = ["CHILD pid=123", "CHILD pid=125",
+                      "CHILD pid=126", "CHILD pid=127"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("did not report 4 distinct children", result["detail"])
+
+    def test_mt_errors_zero_errors_fails(self):
+        # The error-probe cell with a clean ledger ran no failing probes:
+        # ERRORS=0 must not pass as mt-errors.
+        result = self.run_case_mt(cell="mt-errors", errors=0, want=1)
+        self.assertIn("no failed C_GenerateRandom probes", result["detail"])
+
+    def test_mt_shared_sessions_scaffold_fails(self):
+        # mt-shared runs 32 threads on one shared session; a sessions-mode
+        # scaffold (8 opens) with identical per-function totals is the
+        # wrong scenario and must not pass.
+        result = self.run_case_mt(lambda d, l, r: mutate_mt_scaffold(l, opens_ok=8, closes=8,
+                                                                    opens_attempted=8),
+                                  cell="mt-shared", want=1)
+        self.assertIn("scaffolding diverges from the declared cell", result["detail"])
+
+    def test_mt_churn_single_generation_scaffold_fails(self):
+        # mt-churn runs two 32-thread generations (64 opens); a single
+        # generation (32 opens) never churned and must not pass.
+        result = self.run_case_mt(lambda d, l, r: mutate_mt_scaffold(l, opens_ok=32, closes=32,
+                                                                    opens_attempted=32),
+                                  cell="mt-churn", want=1)
+        self.assertIn("scaffolding diverges from the declared cell", result["detail"])
+
+    def test_mt_missing_scaffold_fails(self):
+        # Without the SCAFFOLD record the session mode is unpinned: a
+        # totals-only ledger must not pass any MT cell.
+        result = self.run_case_mt(lambda d, l, r: drop_mt_lines(l, "SCAFFOLD "),
+                                  cell="mt-shared", want=1)
+        self.assertIn("SCAFFOLD", result["detail"])
 
 
 if __name__ == "__main__":

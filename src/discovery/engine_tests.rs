@@ -1077,6 +1077,39 @@ fn live_candidate_reuses_an_exact_provider_id_after_an_empty_interval() {
 }
 
 #[test]
+fn unchanged_rebuild_after_module_removal_keeps_retired_history_without_aborting() {
+    let (mut engine, _, _, _) = engine_with_overlay(70);
+    engine
+        .capture_facts
+        .bind_plan_module_ids(&mut engine.plan, &engine.modules, &[], &engine.pinned)
+        .unwrap();
+    let view = engine.modules[0].scanned.view;
+    let removed: BTreeSet<ProcessViewId> = BTreeSet::from([view]);
+    let empty: BTreeSet<ProcessViewId> = BTreeSet::new();
+    let retired = engine
+        .inventory_candidate(&removed, &[], &[], Vec::new(), &empty)
+        .unwrap();
+    assert!(
+        !retired.plan.is_active(0),
+        "the exited provider retires its slot"
+    );
+    assert!(
+        retired.plan.modules.is_empty(),
+        "no modules survive the exit"
+    );
+    engine.plan = retired.plan;
+    engine.pinned = retired.pinned;
+    engine.modules = retired.modules;
+    engine.plan_rebuild_stable = true;
+    let result = engine.inventory_candidate(&empty, &[], &[], Vec::new(), &empty);
+    assert!(
+        result.is_ok(),
+        "retired history must not abort the capture: {:?}",
+        result.err()
+    );
+}
+
+#[test]
 fn accepted_capture_facts_survive_empty_and_deduplicate_exact_reload() {
     let (mut engine, _, _, _) = engine_with_overlay(40);
     engine

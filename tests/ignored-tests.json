@@ -1216,6 +1216,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/inventory/manifest_e2e_tests.rs",
+      "path": "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
+      "reason": "privileged: mt per-key sign rows plus named race buckets equal the ledger exactly",
+      "cell": "privileged"
+    },
+    {
       "file": "src/inventory/privileged_tests.rs",
       "path": "inventory::privileged_tests::privileged_native_lane_dashboard_slow_pty_lp64",
       "reason": "root-owned live BPF lane; native lane under the dashboard on a stalled pty",

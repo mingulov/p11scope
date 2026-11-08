@@ -10,7 +10,9 @@
 #   3. the userspace saturation gap fired: "joint events staging
 #      saturated" is recorded in the report gaps.
 # The oracle is expected to fail (saturation breaks Gate 1/2); its
-# verdict is reported, never the cell verdict.
+# verdict is reported, never the cell verdict. Exit 2 when the cell
+# never finished (missing evidence); exit 1 when it finished but an
+# assertion failed.
 #
 # Usage: joint-saturating.sh P11SCOPE OUTDIR
 #   P11SCOPE  observer binary (p11scope-discover must sit beside it)
@@ -18,10 +20,12 @@
 #   joint-saturating.sh --assert-only CELLDIR re-checks a finished
 #   cell directory (the joint-10k-single evidence subdirectory).
 #
-# Environment: RATE (default 100k), DURATION (default 20), CELLS
+# Environment: RATE (default 100k), DURATION (default 6), CELLS
 # (default joint-10k-single; asserts always read joint-10k-single),
 # plus the joint-throughput.sh environment (SOFTHSM_LIB, JOINT_NICE,
-# SETTLEMENT_LAT=1 and STAGE_TIMINGS=1 by default here).
+# SETTLEMENT_LAT=1 and STAGE_TIMINGS=1 by default here). RATE times
+# DURATION must stay under the generator's 700,000-call ledger
+# ceiling (100k x 6s = 600,000).
 set -u
 
 assert_cell() {
@@ -32,19 +36,23 @@ import sys
 
 celldir = sys.argv[1]
 
+def incomplete(name, exc):
+    print("saturating: cell incomplete, %s: %s" % (name, exc),
+          file=sys.stderr)
+    sys.exit(2)
+
 def load(name):
-    with open("%s/%s" % (celldir, name), encoding="utf-8") as stream:
-        return json.load(stream)
+    try:
+        with open("%s/%s" % (celldir, name), encoding="utf-8") as stream:
+            return json.load(stream)
+    except OSError as exc:
+        incomplete("%s unreadable" % name, exc)
+    except ValueError as exc:
+        incomplete("%s is not JSON" % name, exc)
 
 failures = []
-try:
-    evidence = load("bpftool-evidence.json")
-except (OSError, ValueError) as exc:
-    sys.exit("saturating: cannot read bpftool-evidence.json: %s" % exc)
-try:
-    report = load("report.json")
-except (OSError, ValueError) as exc:
-    sys.exit("saturating: cannot read report.json: %s" % exc)
+evidence = load("bpftool-evidence.json")
+report = load("report.json")
 try:
     with open("%s/oracle.json" % celldir, encoding="utf-8") as stream:
         oracle = stream.read().strip()
@@ -90,7 +98,7 @@ fi
 P11SCOPE=$1
 OUTDIR=${2:?usage: joint-saturating.sh P11SCOPE OUTDIR}
 ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/../.." && pwd)
-RATE=${RATE:-100k} DURATION=${DURATION:-20} CELLS=${CELLS:-joint-10k-single} \
+RATE=${RATE:-100k} DURATION=${DURATION:-6} CELLS=${CELLS:-joint-10k-single} \
     SETTLEMENT_LAT=${SETTLEMENT_LAT:-1} STAGE_TIMINGS=${STAGE_TIMINGS:-1} \
     "$ROOT/scripts/ci/joint-throughput.sh" "$P11SCOPE" "$OUTDIR"
 cell_rc=$?

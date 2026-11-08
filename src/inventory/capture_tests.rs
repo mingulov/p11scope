@@ -6617,8 +6617,8 @@ mod publication_progress_tests {
         }
 
         // P2: a failed publication over an unapplied collection discards that
-        // collection exactly like the synchronous mid-pass stop, then reports
-        // the failure gap.
+        // collection (the failure path still drops unapplied work), then
+        // reports the failure gap.
         #[test]
         fn retained_block_p2_resolves_like_sync() {
             let log = Log::default();
@@ -7396,10 +7396,13 @@ mod publication_progress_tests {
             assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
         }
 
-        // C1: an unapplied collection is discarded exactly like the
-        // synchronous mid-pass stop, then the zero-pass gap accounts it.
+        // C1: an unapplied collection on the retained path is still
+        // discarded, then the zero-pass gap accounts it — while the
+        // synchronous zero-pass stop keeps its collection scan-only
+        // instead (P1-2). The twin below pins that divergence: the
+        // retained path needs its own lifecycle design for a kept pass.
         #[test]
-        fn retained_block_c1_resolves_like_sync() {
+        fn retained_block_c1_discards_while_sync_keeps_scan_only() {
             let log = Log::default();
             let mut driver = Driver::new(&log, false, &[Poll::Pending]);
             driver.pending_on_collect = true;
@@ -7447,22 +7450,32 @@ mod publication_progress_tests {
             assert_eq!(zero.discarded, 1);
             assert_eq!(gap_subjects(&log), [format!("gap:{ZERO_PASS_GAP_SUBJECT}")]);
 
+            // The synchronous twin keeps its collection scan-only
+            // instead of discarding: it publishes one pass and names
+            // stopped-before-attach, never the zero-pass gap.
             let twin_log = Log::default();
             let mut twin = Driver::new(&twin_log, false, &[]);
             twin.stop_in_collector = true;
             let twin = drive(&mut twin, ScriptedLane::new(&twin_log), windows());
             assert!(
                 twin.retained.is_none(),
-                "the mid-pass stop discards synchronously"
+                "the mid-pass stop still finalizes synchronously"
             );
-            assert_eq!(twin.zero_pass.as_ref().unwrap().discarded, 1);
-            assert_eq!(gap_subjects(&log), gap_subjects(&twin_log));
-            assert_eq!(error_text(&outcome), error_text(&twin));
-            assert_eq!(zero.cause, twin.zero_pass.as_ref().unwrap().cause);
+            assert!(
+                twin.zero_pass.is_none(),
+                "the sync twin keeps its pass instead"
+            );
             assert_eq!(
-                outcome.stopped.as_ref().unwrap().events,
-                twin.stopped.as_ref().unwrap().events
+                twin.stopped.as_ref().unwrap().summary.passes,
+                1,
+                "the sync twin publishes its kept pass"
             );
+            assert_eq!(
+                gap_subjects(&twin_log),
+                [format!("gap:{STOPPED_BEFORE_ATTACH_SUBJECT}")],
+                "the sync twin names stopped-before-attach, not zero-pass"
+            );
+            assert_eq!(error_text(&outcome), error_text(&twin));
         }
 
         const STOP_DISCARD_GAP_SUBJECT: &str = "live inventory transaction";

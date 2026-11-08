@@ -502,12 +502,12 @@ pub(crate) trait LaneHost<Pin> {
     /// when a PID/System stop latches before new apply/commit work,
     /// otherwise right after the driver's own prompt gate.
     fn stop_coordinator(&mut self) {}
-    /// A collection the stop discarded before apply (the sync mid-pass
-    /// stop, the retained P2/C1 disposals): account the dropped catalog's
-    /// unadmitted provider newcomers, so a newcomer dropped while the
-    /// capture stops leaves a named gap instead of vanishing silently.
-    /// Read-only over admission; records at most one scope gap, only for
-    /// provider newcomers. Default: ignore.
+    /// A collection the stop discarded before apply (the sync trailing
+    /// mid-pass stop, the retained P2/C1 disposals): account the dropped
+    /// catalog's unadmitted provider newcomers, so a newcomer dropped
+    /// while the capture stops leaves a named gap instead of vanishing
+    /// silently. Read-only over admission; records at most one scope gap,
+    /// only for provider newcomers. Default: ignore.
     fn note_discarded_collection(&mut self, _collected: &CollectedPass) {}
 }
 
@@ -1701,6 +1701,11 @@ pub(crate) enum ZeroPassCause {
 /// staying silent (exit 0 and schemas unchanged).
 pub(crate) const ZERO_PASS_GAP_SUBJECT: &str = "no complete collection pass";
 
+/// The subject of the scope gap a run with a live lane stages when its
+/// pass-0 collection completed past the stop and applied scan-only
+/// (P1-2): modules and callers are shown, counts never attached.
+pub(crate) const STOPPED_BEFORE_ATTACH_SUBJECT: &str = "stopped before attach";
+
 /// A run that ended with zero completed passes by stop/deadline (not
 /// error): the latched cause, how many completed collections were
 /// discarded past the stop, and the loop's elapsed time. Both the
@@ -1714,7 +1719,12 @@ pub(crate) struct ZeroPassStop {
 
 impl ZeroPassStop {
     fn event(&self) -> &'static str {
-        match (self.cause, self.discarded > 0) {
+        Self::cause_event(self.cause, self.discarded > 0)
+    }
+    /// The cause half of a stop-mid-pass gap reason, shared with the
+    /// kept-pass scan-only gap (P1-2), whose collection always completed.
+    pub(crate) fn cause_event(cause: ZeroPassCause, discarded: bool) -> &'static str {
+        match (cause, discarded) {
             (ZeroPassCause::Deadline, true) => "deadline exceeded during pass-0 collection",
             (ZeroPassCause::OperatorStop, true) => "operator stop during pass-0 collection",
             (ZeroPassCause::Deadline, false) => "deadline already passed before pass 0 started",
@@ -3347,27 +3357,63 @@ where
                         }
                     }
                 }
+                // P1-2: the stop landed during this pass's collection on
+                // a run with no completed pass yet. The completed
+                // collection still applies — scan-only, below — instead
+                // of discarding into an empty view.
+                let mut stopped_before_apply: Option<ZeroPassCause> = None;
                 if control.is_none()
                     && let Some(cause) = clock.stop_cause()
                 {
-                    // The stop landed mid-pass: gate the host before
-                    // apply/commit, so nothing collected after the stop is
-                    // applied, attached, or minted a successor (F9). The
-                    // owned stop drain still runs after the loop. The
-                    // completed collection is discarded; the diagnostic
-                    // counts it when no pass completed, and the dropped
-                    // catalog's unadmitted provider newcomers leave a
-                    // named gap.
-                    stop_cause.get_or_insert(cause);
-                    discarded_collections += 1;
-                    driver.host().note_discarded_collection(&collected);
-                    driver.host().stop_coordinator();
-                    stop_latched = true;
-                    break;
+                    if passes == 0 {
+                        // Owner rule 2026-11-09: a completed collection is
+                        // scan-valid data (modules + callers shown, counts
+                        // never attached). Attaching after the stop stays
+                        // blocked (F9): the pass applies through
+                        // ScanOnlyIdentity, the host gates right after
+                        // apply (stopped_in_apply), the stopped native
+                        // half stages no new extension, and the loop
+                        // breaks after this pass publishes.
+                        stop_cause.get_or_insert(cause);
+                        stopped_before_apply = Some(cause);
+                    } else {
+                        // The ordinary trailing discard: results exist, so
+                        // the stopped pass stays silent. The diagnostic
+                        // counts discards only when no pass completed, and
+                        // the dropped catalog's unadmitted provider
+                        // newcomers leave a named gap.
+                        stop_cause.get_or_insert(cause);
+                        discarded_collections += 1;
+                        driver.host().note_discarded_collection(&collected);
+                        driver.host().stop_coordinator();
+                        stop_latched = true;
+                        break;
+                    }
                 }
-                let mut report = match lane.as_mut() {
-                    Some(lane) => driver.apply(collected, lane.identity(), now)?,
-                    None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
+                let mut report = if let Some(cause) = stopped_before_apply {
+                    // The kept pass-0 collection: scan-only, so no native
+                    // binding can stage from it (ScanOnlyIdentity yields
+                    // no images and no cookies). A live lane that never
+                    // attached names that in the gap beside the rows; a
+                    // scan run's pass needs no marker (it never attaches
+                    // by design).
+                    if lane.is_some() {
+                        driver.host().note_scope_gap(
+                            STOPPED_BEFORE_ATTACH_SUBJECT.into(),
+                            format!(
+                                "{} ({} elapsed); the completed collection applied scan-only: \
+                                 modules and callers shown, counts not attached",
+                                ZeroPassStop::cause_event(cause, true),
+                                elapsed_secs_2dp(loop_start.elapsed()),
+                            ),
+                        );
+                    }
+                    driver.apply(collected, &mut ScanOnlyIdentity, now)?
+                } else {
+                    match lane.as_mut() {
+                        Some(lane) => driver.apply(collected, lane.identity(), now)?,
+                        None => driver.apply(collected, &mut ScanOnlyIdentity, now)?,
+                    }
                 };
                 // A stop that landed during apply latches before the
                 // pass's native half: the already-applied owned drain
@@ -4415,7 +4461,11 @@ mod stop_latch_tests {
     }
 
     #[test]
-    fn mid_pass_stop_discards_the_collection_under_a_terminal_marker() {
+    fn mid_pass_stop_keeps_the_collection_as_the_single_pass() {
+        // P1-2 (owner rule 2026-11-09): the stop lands mid-pass on a run
+        // with no completed pass, so the completed collection applies
+        // scan-only and publishes as the run's single pass — no
+        // zero-pass diagnostic, no terminal marker.
         let mut driver = F9Driver::new();
         let stop_flag = Rc::new(Cell::new(false));
         driver.arm_stop_on_collect = Some(Rc::clone(&stop_flag));
@@ -4441,21 +4491,30 @@ mod stop_latch_tests {
         assert!(outcome.stopped.is_none());
         assert_eq!(driver.collects, 1, "the in-flight collection already ran");
         assert_eq!(
-            driver.applies, 0,
-            "no apply after the stop, so no successor is minted"
+            driver.applies, 1,
+            "the completed collection applies once, scan-only"
+        );
+        assert_eq!(driver.commits, 1, "the kept pass commits once");
+        assert_eq!(
+            pass_publications, 1,
+            "the completed collection publishes as one pass"
         );
         assert_eq!(
-            driver.commits, 1,
-            "only the zero-pass diagnostic gap publishes"
-        );
-        assert_eq!(pass_publications, 0, "no pass was published");
-        assert_eq!(
-            stop_publications, 1,
-            "the diagnostic gap streams under one terminal marker"
+            stop_publications, 0,
+            "a kept pass needs no terminal diagnostic marker"
         );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
+        );
+        assert!(
+            outcome.zero_pass.is_none(),
+            "a kept pass is not a zero-pass run"
+        );
+        assert!(
+            driver.host.gaps.is_empty(),
+            "a scan run's kept pass needs no marker: {:?}",
+            driver.host.gaps
         );
     }
 
@@ -4533,7 +4592,13 @@ mod stop_latch_tests {
     }
 
     #[test]
-    fn mid_first_pass_stop_with_a_lane_drains_without_apply() {
+    fn mid_first_pass_stop_with_a_lane_keeps_the_pass_scan_only() {
+        // P1-2 (owner rule 2026-11-09): the stop lands mid-pass-0 on a
+        // live run, so the completed collection applies scan-only and
+        // publishes as the run's single pass, with the stopped-before-
+        // attach gap beside it. Attaching after the stop stays blocked:
+        // the stopped native half stages no new extension, and the
+        // owned stop still drains exactly once.
         let mut driver = F9Driver::new();
         let started =
             NativeLane::start(F9Lane::new(), driver.host(), LaneWindows::PROVISIONAL, None)
@@ -4553,17 +4618,36 @@ mod stop_latch_tests {
             });
         assert!(outcome.error.is_none());
         let stopped = outcome.stopped.expect("the owned stop still drains");
-        assert_eq!(stopped.summary.passes, 0);
+        assert_eq!(stopped.summary.passes, 1, "the kept pass is the run");
         assert_eq!(driver.collects, 1, "the in-flight collection already ran");
         assert_eq!(
-            driver.applies, 0,
-            "no apply after the stop, so no successor is minted"
+            driver.applies, 1,
+            "the completed collection applies once, scan-only"
         );
-        assert_eq!(driver.commits, 1, "only the stop's terminal commit runs");
-        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(
+            driver.commits, 2,
+            "the kept pass commits, then the stop's terminal commit runs"
+        );
+        assert_eq!(
+            pass_publications, 1,
+            "the completed collection publishes as one pass"
+        );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
+        );
+        assert!(
+            outcome.zero_pass.is_none(),
+            "a kept pass is not a zero-pass run"
+        );
+        assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
+        assert_eq!(driver.host.gaps[0].0, STOPPED_BEFORE_ATTACH_SUBJECT);
+        assert!(
+            driver.host.gaps[0]
+                .1
+                .contains("the completed collection applied scan-only"),
+            "{:?}",
+            driver.host.gaps[0].1
         );
         assert!(driver.host.stages > 0, "the terminal sweep still stages");
         assert_eq!(stopped.capture.begin_stops, 1, "retirement still begins");
@@ -4819,10 +4903,13 @@ mod stop_latch_tests {
     }
 
     #[test]
-    fn deadline_during_pass0_collection_reports_zero_pass_gap_and_line() {
-        // The G30 shape: pass-0 collection outlasts the deadline, so the
-        // completed collection is discarded with no apply — but the run
-        // now says so (gap + line), still exiting 0. The loop clock is
+    fn deadline_during_pass0_collection_keeps_the_completed_collection_scan_only() {
+        // P1-2 (owner rule 2026-11-09): pass-0 collection outlasts the
+        // deadline, so the stop lands mid-pass on a run with no
+        // completed pass. The completed collection is scan-valid data:
+        // it applies once (scan-only — the probe has no native lane),
+        // publishes as the run's single pass, and the run ends 0 with
+        // one pass instead of the zero-pass gap. The loop clock is
         // controlled: it reads before the deadline until the collection
         // itself advances it past, so expiry-during-collection is
         // established by construction. The pre-pass gate runs before the
@@ -4867,44 +4954,31 @@ mod stop_latch_tests {
         assert!(outcome.error.is_none(), "exit 0 is preserved");
         assert!(outcome.stopped.is_none());
         assert_eq!(driver.collects, 1, "the pass-0 collection already ran");
-        assert_eq!(driver.applies, 0, "no apply after the deadline");
         assert_eq!(
-            driver.commits, 1,
-            "only the zero-pass diagnostic gap publishes"
+            driver.applies, 1,
+            "the completed collection applies once, scan-only"
         );
-        assert_eq!(pass_publications, 0, "no pass was published");
+        assert_eq!(driver.commits, 1, "the kept pass commits once");
         assert_eq!(
-            stop_publications, 1,
-            "the diagnostic gap streams under one terminal marker"
+            pass_publications, 1,
+            "the completed collection publishes as one pass"
+        );
+        assert_eq!(
+            stop_publications, 0,
+            "a kept pass needs no terminal diagnostic marker"
         );
         assert_eq!(
             driver.host.stops, 1,
             "the latch stops the host exactly once"
         );
-        let zero = outcome.zero_pass.expect("a zero-pass stop is reported");
-        assert_eq!(zero.cause, ZeroPassCause::Deadline);
-        assert_eq!(zero.discarded, 1);
-        assert_eq!(driver.host.gaps.len(), 1, "{:?}", driver.host.gaps);
-        let (subject, reason) = &driver.host.gaps[0];
-        assert_eq!(subject, ZERO_PASS_GAP_SUBJECT);
         assert!(
-            reason.contains("deadline exceeded during pass-0 collection"),
-            "{reason:?}"
+            outcome.zero_pass.is_none(),
+            "a kept pass is not a zero-pass run"
         );
         assert!(
-            reason.contains("1 completed collection discarded"),
-            "{reason:?}"
-        );
-        assert!(reason.contains("elapsed"), "{reason:?}");
-        let line = zero.stderr_line();
-        assert_eq!(
-            line,
-            "p11scope: stopped with 0 completed passes (deadline exceeded during \
-             pass-0 collection; 1 completed collection discarded)"
-        );
-        assert!(
-            !line.to_lowercase().contains("success"),
-            "no success claims on stderr: {line:?}"
+            driver.host.gaps.is_empty(),
+            "a scan run's kept pass needs no marker: {:?}",
+            driver.host.gaps
         );
     }
 

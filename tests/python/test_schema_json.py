@@ -891,13 +891,14 @@ class SchemaOracleAgreement(unittest.TestCase):
         """Schema evidence properties are exactly the oracle's closed key
         universe: base keys + profile-only keys + run-only child flag +
         the optional additive envelopes (counter, selection, excludes,
-        legacy, short-lived splits)."""
+        forwarding, legacy, short-lived splits)."""
         wanted = (
             set(CHECKER["BASE_EVIDENCE_KEYS"])
             | set(CHECKER["PROFILE_V3_FIELDS"])
             | {"child_still_running", "counter_collection", "selected_detail",
                "excluded_modules", "unmatched_excludes", "legacy_collection",
-               "gap_exe_hints", "target_exec_hints", "gap_exit_mappings"}
+               "gap_exe_hints", "target_exec_hints", "gap_exit_mappings",
+               "unmatched_forwarding"}
         )
         self.assertEqual(set(evidence_schema()["properties"]), wanted)
 
@@ -923,6 +924,18 @@ class SchemaOracleAgreement(unittest.TestCase):
                 invalid = copy.deepcopy(document)
                 invalid["evidence"]["excluded_modules"] = excluded
                 invalid["evidence"]["unmatched_excludes"] = unmatched
+                with self.assertRaises(AssertionError):
+                    CHECKER["exact_metrics_schema"](invalid)
+
+    def test_unmatched_forwarding_shape_twins(self):
+        document = self.metrics_document()
+        valid = copy.deepcopy(document)
+        valid["evidence"]["unmatched_forwarding"] = ["nope.so"]
+        CHECKER["exact_metrics_schema"](valid)
+        for unmatched in (["nope.so", 42], "nope.so", [None]):
+            with self.subTest(unmatched=unmatched):
+                invalid = copy.deepcopy(document)
+                invalid["evidence"]["unmatched_forwarding"] = unmatched
                 with self.assertRaises(AssertionError):
                     CHECKER["exact_metrics_schema"](invalid)
 

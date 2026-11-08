@@ -2378,6 +2378,24 @@ fn unmatched_forwarding_inputs_are_named() {
     );
 }
 
+/// The inventory JSON twin of the unmatched-forwarding text line: a
+/// declaration that matched nothing is machine-readable, omitted when
+/// empty.
+#[test]
+fn unmatched_forwarding_inputs_are_serialized() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.unmatched_forwarding = vec!["nope.so".into()];
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    assert_eq!(out["unmatched_forwarding"][0], "nope.so");
+    presentation.unmatched_forwarding = Vec::new();
+    let empty = crate::inventory::render_json_from_presentation(&presentation);
+    assert!(
+        empty.get("unmatched_forwarding").is_none(),
+        "empty unmatched_forwarding is omitted"
+    );
+}
+
 /// The inventory forwarding line states the counting rule honestly:
 /// provider edges are the logical totals, self-answered layer entries
 /// stay in the forwarding line, and multi-provider layer entries count

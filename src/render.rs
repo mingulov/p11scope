@@ -9936,6 +9936,24 @@ pub(crate) mod tests {
         );
     }
 
+    /// The JSON twin of the unmatched-forwarding text line: a declaration
+    /// that matched nothing is machine-readable, omitted when empty.
+    #[test]
+    fn unmatched_forwarding_inputs_are_serialized() {
+        let mut ev = evidence();
+        ev.discovery.unmatched_forwarding = vec!["nope.so".into()];
+        ev.verdict();
+        let json = serde_json::to_value(&ev).unwrap();
+        assert_eq!(json["unmatched_forwarding"][0], "nope.so");
+        let mut empty = evidence();
+        empty.verdict();
+        let empty_json = serde_json::to_value(&empty).unwrap();
+        assert!(
+            empty_json.get("unmatched_forwarding").is_none(),
+            "empty unmatched_forwarding is omitted"
+        );
+    }
+
     /// Ownership-gap lines explain headline attribution gaps, so they
     /// count logical rows only: unattributed forwarding rows are already
     /// stated in the forwarding line, never summed here.
@@ -10262,6 +10280,25 @@ pub(crate) mod tests {
         let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
         assert!(matched.is_empty());
         assert_eq!(unmatched.len(), 1);
+    }
+
+    #[test]
+    fn forwarding_match_deleted_input_stays_unmatched() {
+        // Fail closed: a declared path that no longer resolves at report
+        // time matches nothing, even when a mapped module keeps the same
+        // spelling and the pre-deletion inode — path spelling alone never
+        // corroborates.
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libshim.so.1");
+        std::fs::write(&target, b"fake-shim").unwrap();
+        let ino = std::fs::metadata(&target).unwrap().ino();
+        let spelling = target.display().to_string();
+        std::fs::remove_file(&target).unwrap();
+        let modules = vec![(ModuleId(3), spelling.clone(), (8, 1), ino)];
+        let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
+        assert!(matched.is_empty(), "deleted input matches nothing");
+        assert_eq!(unmatched, vec![spelling]);
     }
 
     #[test]

@@ -3171,10 +3171,11 @@ impl ClassicDriver<'_> {
     /// consecutive identical peeks) or the bounded horizon passes
     /// (`SCAN_SEAL_MAX_SETTLE_PASSES` waiting passes). A failed peek
     /// resets the run and falls through to the ordinary start below,
-    /// which discloses its refusals exactly as before.
+    /// which discloses its refusals exactly as before; it keeps the
+    /// last set, so a change across the failure still discloses the
+    /// settle the seal outlasted.
     fn settle_scan_seal(&mut self) -> bool {
         let Some(sets) = scan_seal_peek_sets(self.coordinator) else {
-            self.scan_seal_last_sets = None;
             self.scan_seal_stable_runs = 0;
             return true;
         };

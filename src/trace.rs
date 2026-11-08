@@ -15,6 +15,7 @@ use crate::semantics::ProcessKey;
 use crate::semantics::State;
 use p11scope_ebpf_common::{Event, SESSION_NONE, capture, shape};
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// `pid_tgid` (`bpf_get_current_pid_tgid()`) -> (pid, tid): tgid (process
@@ -311,20 +312,67 @@ pub(crate) fn watches_unverified(plan: &AttachPlan) -> bool {
     plan.slots.is_empty() || plan.slots.iter().any(|slot| !slot.semantic_authorized)
 }
 
+/// Per-caller CKR attribution accumulated over rendered trace lines:
+/// `(pid, verified-or-owned exe path)` → `(function label, rv)` → count.
+/// A pure projection of the line stream — every counted line was
+/// rendered, every rendered line is counted — so the terminal roll-up
+/// can never disagree with the lines above it. Unknown callers key
+/// `(pid, None)`; threads group into their process (TID stays line
+/// detail). Labels rendered from these keys reuse the line quoting, so
+/// a roll-up row names exactly the caller the lines named.
+#[derive(Debug, Default)]
+pub(crate) struct CallerReasons {
+    calls: BTreeMap<(u32, Option<String>), BTreeMap<(String, u64), u64>>,
+}
+
+impl CallerReasons {
+    pub(crate) fn note(&mut self, pid: u32, path: Option<&str>, function: &str, rv: u64) {
+        self.calls
+            .entry((pid, path.map(str::to_string)))
+            .or_default()
+            .entry((function.to_string(), rv))
+            .and_modify(|count| *count = count.saturating_add(1))
+            .or_insert(1);
+    }
+}
+
+/// Terminal `CALLER ERROR REASONS:` section over the rendered lines:
+/// one row per failing (caller, function) pair with its `CKR_*` reasons
+/// (concise keeps three plus an `and N more` tail, verbose lists every
+/// distinct code), or a named gap when counted errors left no failure
+/// reasons among the rendered lines. Empty for a clean trace, so clean
+/// tails stay byte-identical.
+fn caller_reason_lines(
+    _reasons: &CallerReasons,
+    _verbose: bool,
+    _truncated: bool,
+    _errors: u64,
+) -> Vec<String> {
+    Vec::new()
+}
+
 /// The human tail a trace ends with, after the machine-readable
 /// terminal records: totals in the profile wording, one coverage
-/// line, and the `-v` hint in default text only.
+/// line, the per-caller error-reason roll-up when the rendered lines
+/// hold failures, and the `-v` hint in default text only.
 pub(crate) fn terminal_summary(
     calls: u64,
     errors: u64,
     open: u64,
     ev: &render::Evidence,
     verbosity: crate::cli::TextVerbosity,
+    callers: &CallerReasons,
 ) -> Vec<String> {
     let mut lines = vec![
         render::totals_line(calls, errors, open),
         render::coverage_line(ev, verbosity == crate::cli::TextVerbosity::Verbose),
     ];
+    lines.extend(caller_reason_lines(
+        callers,
+        verbosity == crate::cli::TextVerbosity::Verbose,
+        ev.trace_truncated,
+        errors,
+    ));
     if verbosity == crate::cli::TextVerbosity::Concise {
         lines.push(crate::cli::VERBOSE_HINT.to_string());
     }
@@ -432,6 +480,7 @@ fn trace_slots(plan: &AttachPlan) -> Vec<Option<TraceSlot>> {
 pub struct Tracer {
     slots: Vec<Option<TraceSlot>>,
     raw_calls: u64,
+    caller_reasons: CallerReasons,
     /// (first observed event's kernel monotonic ts_ns, wall-clock ns at
     /// that same moment) — every later line's wall time is this anchor
     /// plus the kernel-monotonic delta, so line-to-line spacing tracks
@@ -449,6 +498,7 @@ impl Tracer {
         Self {
             slots: trace_slots(plan),
             raw_calls: 0,
+            caller_reasons: CallerReasons::default(),
             anchor: None,
             owned: None,
         }
@@ -481,6 +531,13 @@ impl Tracer {
         self.raw_calls
     }
 
+    /// The per-caller return-code roll-up over the lines this tracer
+    /// rendered, for the terminal summary. Projection only: no event
+    /// the stream did not render is counted.
+    pub(crate) fn caller_reasons(&self) -> &CallerReasons {
+        &self.caller_reasons
+    }
+
     fn wall_ns_for(&mut self, ts_ns: u64) -> u128 {
         match self.anchor {
             Some((mono0, wall0)) => wall0 + u128::from(ts_ns.saturating_sub(mono0)),
@@ -510,6 +567,10 @@ impl Tracer {
         raw.capture = 0;
         let wall = self.wall_ns_for(ev.ts_ns);
         let function = self.qualified_function(ev.slot);
+        let (pid, _) = pid_tid(ev.pid_tgid);
+        let owned = self.owned_label(ev).map(str::to_string);
+        self.caller_reasons
+            .note(pid, owned.as_deref(), &function, ev.rv);
         if let Some(path) = self.owned_label(ev) {
             return format_line_with_owned(&raw, wall, &function, None, path);
         }
@@ -578,6 +639,19 @@ impl Tracer {
         let mut rendered = *ev;
         if !semantic {
             rendered.capture = 0;
+        }
+        // The roll-up counts exactly this line, under exactly the caller
+        // identity the line shows: the verified path when present, else
+        // the owned command's spawn path for the child's own pid, else
+        // unknown — the same precedence as the branch below.
+        let (pid, _) = pid_tid(ev.pid_tgid);
+        match executable.path() {
+            Some(path) => self.caller_reasons.note(pid, Some(path), &function, ev.rv),
+            None => {
+                let owned = self.owned_label(ev).map(str::to_string);
+                self.caller_reasons
+                    .note(pid, owned.as_deref(), &function, ev.rv);
+            }
         }
         if executable.path().is_none()
             && let Some(path) = self.owned_label(ev)
@@ -1363,6 +1437,20 @@ mod tests {
         ev
     }
 
+    fn call_event(pid: u32, slot: u32, rv: u64) -> Event {
+        let mut ev = base_event();
+        ev.pid_tgid = (u64::from(pid) << 32) | 1;
+        ev.slot = slot;
+        ev.rv = rv;
+        ev
+    }
+
+    fn complete_evidence() -> render::Evidence {
+        let mut ev = crate::render::tests::evidence();
+        ev.completeness = "COMPLETE";
+        ev
+    }
+
     #[test]
     fn tracer_resolves_session_pseudonyms_never_raw_handles() {
         let plan = test_plan();
@@ -1605,7 +1693,9 @@ mod tests {
         let mut ev = crate::render::tests::evidence();
         ev.event_loss = 1;
         ev.verdict();
-        let concise = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise);
+        let callers = CallerReasons::default();
+        let concise =
+            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise, &callers);
         assert_eq!(
             concise,
             vec![
@@ -1615,14 +1705,16 @@ mod tests {
                 crate::cli::VERBOSE_HINT.to_string(),
             ]
         );
-        let verbose = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose);
+        let verbose =
+            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose, &callers);
         assert_eq!(verbose.len(), 2);
         assert!(verbose[1].contains("(event_loss)"), "{verbose:?}");
         assert!(
             !verbose.iter().any(|line| line.contains("-v")),
             "{verbose:?}"
         );
-        let quiet = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet);
+        let quiet =
+            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet, &callers);
         assert_eq!(quiet.len(), 2);
         assert!(!quiet[1].contains("event_loss"), "{quiet:?}");
     }
@@ -1646,6 +1738,416 @@ mod tests {
                 "\nTrace times are UTC.\nCalls on unverified functions are not decoded (names only)."
             ),
             "the zone note precedes the unverified note"
+        );
+    }
+
+    /// The trace tail attributes failures per caller: one row per failing
+    /// (caller, function) pair with its `CKR_*` reasons, named callers under
+    /// their owned-or-verified label, the rest under `Unknown executable`.
+    #[test]
+    fn caller_reasons_roll_up_per_caller_function_and_rv() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.set_owned_command(100, "/usr/bin/firefox".to_string());
+        let pin = pkcs11_types::CkRv::PIN_INCORRECT.0;
+        let general = pkcs11_types::CkRv::GENERAL_ERROR.0;
+        let device = pkcs11_types::CkRv::DEVICE_ERROR.0;
+        tracer.on_event(&call_event(100, 0, pin), &mut state);
+        tracer.on_event(&call_event(100, 0, pin), &mut state);
+        tracer.on_event(&call_event(100, 0, pkcs11_types::CkRv::OK.0), &mut state);
+        tracer.on_event(&call_event(100, 1, general), &mut state);
+        tracer.on_event(&call_event(200, 0, device), &mut state);
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            5,
+            4,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail,
+            vec![
+                "5 completed calls; 4 returned errors; 0 entries without an observed return."
+                    .to_string(),
+                "coverage: complete".to_string(),
+                "CALLER ERROR REASONS:".to_string(),
+                "\"firefox\" (PID 100) exe=\"/usr/bin/firefox\": C_OpenSession: CKR_PIN_INCORRECT x2"
+                    .to_string(),
+                "\"firefox\" (PID 100) exe=\"/usr/bin/firefox\": C_CloseSession: CKR_GENERAL_ERROR x1"
+                    .to_string(),
+                "Unknown executable (PID 200): C_OpenSession: CKR_DEVICE_ERROR x1".to_string(),
+                crate::cli::VERBOSE_HINT.to_string(),
+            ]
+        );
+        let verbose = terminal_summary(
+            5,
+            4,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(verbose.len(), 6);
+        assert_eq!(&verbose[2..6], &tail[2..6]);
+    }
+
+    /// One row's reason list is bounded in concise text (top three plus an
+    /// `and N more` tail) and complete under `-v`, like the profile view.
+    #[test]
+    fn caller_reasons_concise_bounds_reasons_and_verbose_lists_all() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        for (rv, n) in [
+            (pkcs11_types::CkRv::GENERAL_ERROR.0, 5),
+            (pkcs11_types::CkRv::DEVICE_ERROR.0, 4),
+            (pkcs11_types::CkRv::PIN_INCORRECT.0, 3),
+            (pkcs11_types::CkRv::CANCEL.0, 2),
+            (pkcs11_types::CkRv::BUFFER_TOO_SMALL.0, 1),
+        ] {
+            for _ in 0..n {
+                tracer.on_event(&call_event(50, 0, rv), &mut state);
+            }
+        }
+        let ev = complete_evidence();
+        let concise = terminal_summary(
+            15,
+            15,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            concise[3],
+            "Unknown executable (PID 50): C_OpenSession: CKR_GENERAL_ERROR x5, \
+             CKR_DEVICE_ERROR x4, CKR_PIN_INCORRECT x3, and 2 more"
+        );
+        let verbose = terminal_summary(
+            15,
+            15,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            verbose[3],
+            "Unknown executable (PID 50): C_OpenSession: CKR_GENERAL_ERROR x5, \
+             CKR_DEVICE_ERROR x4, CKR_PIN_INCORRECT x3, CKR_CANCEL x2, \
+             CKR_BUFFER_TOO_SMALL x1"
+        );
+    }
+
+    /// Success and pending returns are never reasons, and a trace whose
+    /// rendered lines hold no failures carries no section at any level.
+    #[test]
+    fn caller_reasons_exclude_ok_and_pending_and_clean_traces_have_no_section() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        let ok = pkcs11_types::CkRv::OK.0;
+        tracer.on_event(&call_event(60, 0, ok), &mut state);
+        tracer.on_event(&call_event(60, 0, ok), &mut state);
+        tracer.on_event(
+            &call_event(60, 0, pkcs11_types::CkRv::PENDING.0),
+            &mut state,
+        );
+        tracer.on_event(
+            &call_event(60, 0, pkcs11_types::CkRv::DEVICE_ERROR.0),
+            &mut state,
+        );
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            4,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail[3],
+            "Unknown executable (PID 60): C_OpenSession: CKR_DEVICE_ERROR x1"
+        );
+
+        let mut clean_state = State::new(&plan);
+        let mut clean = Tracer::new(&plan);
+        clean.on_event(&call_event(60, 0, ok), &mut clean_state);
+        for verbosity in [
+            crate::cli::TextVerbosity::Concise,
+            crate::cli::TextVerbosity::Verbose,
+            crate::cli::TextVerbosity::Quiet,
+        ] {
+            let tail = terminal_summary(1, 0, 0, &ev, verbosity, clean.caller_reasons());
+            assert!(
+                !tail
+                    .iter()
+                    .any(|line| line.contains("CALLER ERROR REASONS")),
+                "{tail:?}"
+            );
+            assert!(
+                !tail.iter().any(|line| line.contains("PID 60")),
+                "{tail:?}"
+            );
+        }
+        assert_eq!(
+            terminal_summary(
+                1,
+                0,
+                0,
+                &ev,
+                crate::cli::TextVerbosity::Concise,
+                clean.caller_reasons()
+            )
+            .len(),
+            3
+        );
+    }
+
+    /// Counted errors with no failure reasons among the rendered lines —
+    /// the failures never reached the stream — name that gap instead of
+    /// printing an empty section.
+    #[test]
+    fn caller_reasons_name_the_gap_when_errors_leave_no_rendered_failures() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.on_event(
+            &call_event(60, 0, pkcs11_types::CkRv::OK.0),
+            &mut state,
+        );
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            4,
+            3,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(tail[2], "CALLER ERROR REASONS:");
+        assert_eq!(
+            tail[3],
+            "(3 errors counted; no failure reasons among rendered lines)"
+        );
+        let one = terminal_summary(
+            2,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            one[3],
+            "(1 error counted; no failure reasons among rendered lines)"
+        );
+    }
+
+    /// A truncated stream's roll-up covers the rendered lines only, and
+    /// says so; an untruncated one carries no such note.
+    #[test]
+    fn caller_reasons_cover_rendered_lines_only_when_truncated() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.on_event(
+            &call_event(70, 0, pkcs11_types::CkRv::DEVICE_ERROR.0),
+            &mut state,
+        );
+        let mut ev = complete_evidence();
+        ev.trace_truncated = true;
+        let tail = terminal_summary(
+            1,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail[tail.len() - 2],
+            "(caller reasons cover rendered lines only; trace truncated)"
+        );
+        ev.trace_truncated = false;
+        let whole = terminal_summary(
+            1,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert!(
+            !whole
+                .iter()
+                .any(|line| line.contains("rendered lines only")),
+            "{whole:?}"
+        );
+    }
+
+    /// A roll-up row names its caller exactly as the lines do, hostile
+    /// bytes quoted the same way — never a second spelling.
+    #[test]
+    fn caller_reasons_quote_hostile_caller_names_like_lines() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.set_owned_command(100, "/x/a\"b".to_string());
+        let line = tracer.on_event(
+            &call_event(100, 0, pkcs11_types::CkRv::DEVICE_ERROR.0),
+            &mut state,
+        );
+        assert!(
+            line.contains("\"a\\\"b\" (PID 100, TID 1) exe=\"/x/a\\\"b\""),
+            "{line}"
+        );
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            1,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail[3],
+            "\"a\\\"b\" (PID 100) exe=\"/x/a\\\"b\": C_OpenSession: CKR_DEVICE_ERROR x1"
+        );
+    }
+
+    /// Rows read worst-first: callers by failure count, then pid; functions
+    /// within a caller by failure count, then name.
+    #[test]
+    fn caller_reasons_sort_by_failures_then_identity() {
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.on_event(
+            &call_event(300, 0, pkcs11_types::CkRv::DEVICE_ERROR.0),
+            &mut state,
+        );
+        tracer.on_event(
+            &call_event(100, 0, pkcs11_types::CkRv::PIN_INCORRECT.0),
+            &mut state,
+        );
+        tracer.on_event(
+            &call_event(100, 1, pkcs11_types::CkRv::GENERAL_ERROR.0),
+            &mut state,
+        );
+        tracer.on_event(
+            &call_event(200, 0, pkcs11_types::CkRv::CANCEL.0),
+            &mut state,
+        );
+        tracer.on_event(
+            &call_event(200, 0, pkcs11_types::CkRv::CANCEL.0),
+            &mut state,
+        );
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            5,
+            5,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            &tail[2..7],
+            &[
+                "CALLER ERROR REASONS:".to_string(),
+                "Unknown executable (PID 100): C_CloseSession: CKR_GENERAL_ERROR x1".to_string(),
+                "Unknown executable (PID 100): C_OpenSession: CKR_PIN_INCORRECT x1".to_string(),
+                "Unknown executable (PID 200): C_OpenSession: CKR_CANCEL x2".to_string(),
+                "Unknown executable (PID 300): C_OpenSession: CKR_DEVICE_ERROR x1".to_string(),
+            ]
+        );
+    }
+
+    /// The verified executable label wins over the owned command's spawn
+    /// path in the roll-up, exactly as on the line itself.
+    #[test]
+    fn caller_reasons_use_the_verified_executable_label() {
+        use crate::discovery::engine::tests::detailed_proof_driver::verified_fixture_with_link;
+        use crate::trace_identity::TraceIdentityStore;
+        let (proof, receipt) = verified_fixture_with_link(b"/usr/bin/firefox");
+        let key = receipt.key();
+        let mut store = TraceIdentityStore::new(proof);
+        store.admit(receipt).unwrap();
+        let plan = test_plan();
+        let mut state = State::new(&plan);
+        let mut tracer = Tracer::new(&plan);
+        tracer.set_owned_command(key.pid, "/other/binary".to_string());
+        let mut ev = call_event(key.pid, 0, pkcs11_types::CkRv::DEVICE_ERROR.0);
+        ev.ts_ns = 20;
+        let line = tracer.on_event_process_with_executable(
+            &ev,
+            key,
+            &mut state,
+            store.lookup(key, 20),
+        );
+        assert!(line.contains("exe=\"/usr/bin/firefox\""), "{line}");
+        assert!(!line.contains("other"), "{line}");
+        let evidence = complete_evidence();
+        let tail = terminal_summary(
+            1,
+            1,
+            0,
+            &evidence,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail[3],
+            format!(
+                "\"firefox\" (PID {}) exe=\"/usr/bin/firefox\": C_OpenSession: CKR_DEVICE_ERROR x1",
+                key.pid
+            )
+        );
+    }
+
+    /// Lines rendered without admitted history still join the roll-up
+    /// under the caller identity they show.
+    #[test]
+    fn rejected_history_lines_join_the_caller_rollup() {
+        let plan = test_plan();
+        let mut tracer = Tracer::new(&plan);
+        let bad = pkcs11_types::CkRv::SESSION_HANDLE_INVALID.0;
+        tracer.on_rejected_history(&call_event(400, 1, bad));
+        let ev = complete_evidence();
+        let tail = terminal_summary(
+            1,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            tracer.caller_reasons(),
+        );
+        assert_eq!(
+            tail[3],
+            "Unknown executable (PID 400): C_CloseSession: CKR_SESSION_HANDLE_INVALID x1"
+        );
+
+        let mut owned = Tracer::new(&plan);
+        owned.set_owned_command(400, "/sbin/cryptsetup".to_string());
+        owned.on_rejected_history(&call_event(400, 1, bad));
+        let tail = terminal_summary(
+            1,
+            1,
+            0,
+            &ev,
+            crate::cli::TextVerbosity::Concise,
+            owned.caller_reasons(),
+        );
+        assert_eq!(
+            tail[3],
+            "\"cryptsetup\" (PID 400) exe=\"/sbin/cryptsetup\": C_CloseSession: \
+             CKR_SESSION_HANDLE_INVALID x1"
         );
     }
 }

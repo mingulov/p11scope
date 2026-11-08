@@ -8477,6 +8477,7 @@ fn emit_trace_terminal_accounted<W: Write>(
         sum(|row| row.in_flight),
         evidence,
         verbosity,
+        tracer.caller_reasons(),
     );
     for line in &tail {
         emit_trace_line(line, stdout, stdout_open, &mut None::<std::io::Sink>)?;

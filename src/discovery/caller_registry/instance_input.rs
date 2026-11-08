@@ -1706,6 +1706,35 @@ impl CallerRegistry {
         }
     }
 
+    /// Whether a staged registration row could mint at the drain:
+    /// identified module, proven image, in-domain boundary, live
+    /// caller with an edge. Mirrors the drain's refusal checks in
+    /// [`Self::apply_instance`]; ordering-only, never authority
+    /// (the drain re-checks everything at apply time).
+    fn staged_row_could_mint(&self, at: usize) -> bool {
+        let Mutation::NoteInstance(input) = &self.staged[at] else {
+            return false;
+        };
+        if matches!(input.key.module, ModuleKey::Unidentified { .. })
+            || input.key.image.task_cookie == 0
+        {
+            return false;
+        }
+        if self.retired.contains_key(&input.caller) {
+            return false;
+        }
+        let Some(module) = self.modules_by_key.get(&input.key.module).copied() else {
+            return false;
+        };
+        if !self.edges.contains_key(&(input.caller, module)) {
+            return false;
+        }
+        if input.boundary.is_some_and(|p| p.domain != input.key.domain) {
+            return false;
+        }
+        true
+    }
+
     pub(crate) fn joint_registration_plan(
         &mut self,
     ) -> Result<JointRegistrationPlan<'_>, JointReceiptInstallRefusal> {
@@ -1787,7 +1816,22 @@ impl CallerRegistry {
             }
         }
         rows.truncate(written);
-        rows.sort_unstable_by_key(|row| row.registration.unwrap_or(usize::MAX));
+        // Drain-mintable rows take slots first: drain-refused churn
+        // (unbound or unproven rows the drain will refuse) must not
+        // wall a genuine birth behind it. Count-neutral: the same
+        // rows are counted in the same number of slots, only the
+        // slot priority changes (registration order within each
+        // class, as before). Rows the drain will refuse keep
+        // fits=false exactly when oversubscribed, as before.
+        rows.sort_by(|a, b| {
+            let key = |row: &JointRegistrationSlot| {
+                let mintable = row
+                    .registration
+                    .is_some_and(|at| self.staged_row_could_mint(at));
+                (!mintable, row.registration.unwrap_or(usize::MAX))
+            };
+            key(a).cmp(&key(b))
+        });
         let mut occupied = self.instance_state.records.len();
         for row in &mut rows {
             if row.registration.is_some()
@@ -4847,6 +4891,155 @@ mod journal_unavailable_tests {
         let kept = scene.registry.first_birth_capacity().expect("latch sticks");
         assert_eq!(kept.arm, "fits");
         assert_eq!((kept.records, kept.grants, kept.negatives), (1, 0, 0));
+    }
+
+    /// P6 wall: eight staged junk rows ahead of one genuine row
+    /// must not wall the genuine birth's fits assignment.
+    /// Scaled-down wall (limit 8, genuine ninth): same code path
+    /// as the live 4095-row wall. The drain fate per flavor is
+    /// pinned to document the accounting: bound churn mints
+    /// (real cap), drain-refused flavors (unbound caller,
+    /// unidentified module, zero cookie) must neither mint nor
+    /// consume a genuine row's slot.
+    #[test]
+    fn p6_genuine_birth_behind_churn_still_registers() {
+        #[derive(Clone, Copy)]
+        enum Flavor {
+            BoundChurn,
+            UnboundCaller,
+            UnidentifiedModule,
+            CookieZero,
+        }
+        impl Flavor {
+            fn name(self) -> &'static str {
+                match self {
+                    Self::BoundChurn => "bound_churn",
+                    Self::UnboundCaller => "unbound_caller",
+                    Self::UnidentifiedModule => "unidentified_module",
+                    Self::CookieZero => "cookie_zero",
+                }
+            }
+            fn junk(self, scene: &UnlinkedScene, i: u64) -> (InstanceKey, CallerId) {
+                let image = |task_cookie| ImageIdentity {
+                    task_cookie,
+                    exec_id: 1,
+                };
+                match self {
+                    Self::BoundChurn => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(777),
+                            InstanceId::from_raw(i),
+                            scene.module.clone(),
+                        ),
+                        scene.caller,
+                    ),
+                    Self::UnboundCaller => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(777),
+                            InstanceId::from_raw(1000 + i),
+                            scene.module.clone(),
+                        ),
+                        CallerId(99),
+                    ),
+                    Self::UnidentifiedModule => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(777),
+                            InstanceId::from_raw(2000 + i),
+                            ModuleKey::Unidentified {
+                                path: format!("/junk/{i}"),
+                            },
+                        ),
+                        scene.caller,
+                    ),
+                    Self::CookieZero => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(0),
+                            InstanceId::from_raw(3000 + i),
+                            scene.module.clone(),
+                        ),
+                        scene.caller,
+                    ),
+                }
+            }
+        }
+        for flavor in [
+            Flavor::BoundChurn,
+            Flavor::UnboundCaller,
+            Flavor::UnidentifiedModule,
+            Flavor::CookieZero,
+        ] {
+            let name = flavor.name();
+            let mut scene = UnlinkedScene::new();
+            scene.registry.reference_instance_limit(8);
+            for i in 0..8u64 {
+                let (key, caller) = flavor.junk(&scene, i);
+                scene
+                    .registry
+                    .note_instance(AdmittedInstance::scripted(key, caller));
+            }
+            let genuine = InstanceKey::scripted(
+                scene.domain,
+                ImageIdentity {
+                    task_cookie: 999,
+                    exec_id: 1,
+                },
+                InstanceId::from_raw(99999),
+                scene.module.clone(),
+            );
+            scene
+                .registry
+                .note_instance(AdmittedInstance::scripted(genuine.clone(), scene.caller));
+            let input = AdmittedInstanceCall::scripted(
+                genuine,
+                scene.caller,
+                1,
+                s1_call("C_Sign", RV_OK, MECHANISM),
+            );
+            // The wall bites in position() (fits assignment), which
+            // needs no origin; the full reserve path also demands a
+            // collected origin that scripted inputs cannot carry.
+            let mut plan = scene
+                .registry
+                .joint_registration_plan()
+                .expect("plan builds");
+            let window = JointRegistrationWindow {
+                start: 0,
+                end: plan.staged_len,
+            };
+            let fit = plan.position(&input, &window);
+            if name == "bound_churn" {
+                // Control: eight bound rows are a real cap; the
+                // genuine ninth stays refused (over-commit
+                // prevention preserved).
+                assert!(
+                    matches!(fit, Err(JointReceiptInstallRefusal::Capacity)),
+                    "{name}: real cap still refuses"
+                );
+            } else {
+                match fit {
+                    Ok(_) => {}
+                    Err(refusal) => {
+                        panic!("{name}: genuine birth behind churn must fit, got {refusal:?}")
+                    }
+                }
+            }
+            drop(plan);
+            scene.registry.publish();
+            let records = scene.registry.instance_state.records.len();
+            if name == "bound_churn" {
+                // Real cap: eight bound rows mint, the genuine ninth
+                // is refused at the drain by the same limit.
+                assert_eq!(records, 8, "{name}: bound rows mint");
+            } else {
+                // Drain-refused junk never mints; only the genuine
+                // row becomes a record.
+                assert_eq!(records, 1, "{name}: junk never mints");
+            }
+        }
     }
 }
 

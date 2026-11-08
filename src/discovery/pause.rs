@@ -10498,6 +10498,72 @@ mod tests {
         assert_eq!(outcome.evidence.pause_attempts, 0);
     }
 
+    /// First-contact default: `run` with no `--pause` flag counts a fast
+    /// child that dlopens SoftHSM exactly. The oracle is the same workload
+    /// under explicit `--pause auto`; the `--pause never` twin completes
+    /// with the neutral lattice and at most the oracle's calls (an
+    /// unpaused child misses the early burst, never invents calls).
+    #[test]
+    #[ignore = "privileged: run with default flags counts a fast SoftHSM child exactly (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_pause_default_flags_count_fast_child_exact_lp64() {
+        let dir = wrapper_work_dir("default");
+        let conf = wrapper_token(&dir);
+        let _env = WrapperEnvGuard::set(&conf);
+        let module = wrapper_softhsm_lib();
+        // The audit's first-contact shape: list slots and exit fast.
+        let tool: Vec<std::ffi::OsString> = vec![
+            "/usr/bin/pkcs11-tool".into(),
+            "--module".into(),
+            module.into(),
+            "-L".into(),
+        ];
+        // Default flags: parsed exactly as the operator types them, with
+        // no --pause flag, so the CLI default is what the run exercises.
+        let mut argv: Vec<std::ffi::OsString> = vec![
+            "run".into(),
+            "-o".into(),
+            dir.join("default.json").into(),
+            "--".into(),
+        ];
+        argv.extend(tool.clone());
+        let parsed = crate::cli::parse(argv).expect("the default run parses");
+        let crate::cli::Command::Run(default_args) = parsed else {
+            panic!("expected an owned run");
+        };
+        assert_eq!(default_args.pause, PausePolicy::Auto, "omission is auto");
+        let (oracle_outcome, oracle_doc) = wrapper_profile(
+            PausePolicy::Auto,
+            tool.clone(),
+            &dir.join("oracle.json"),
+        );
+        assert_eq!(oracle_outcome.child_exit_code, Some(0));
+        let oracle = wrapper_total_calls(&oracle_doc);
+        assert!(oracle > 0, "the oracle workload must observe calls");
+        assert_sigstop_lattice(&oracle_outcome.evidence);
+        let default_outcome =
+            crate::run::run_owned(&default_args).expect("the default run completes");
+        assert_eq!(default_outcome.child_exit_code, Some(0));
+        let default_doc: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.join("default.json")).expect("report exists"),
+        )
+        .expect("valid JSON");
+        assert_eq!(
+            wrapper_total_calls(&default_doc),
+            oracle,
+            "default flags must count the fast child exactly"
+        );
+        assert_sigstop_lattice(&default_outcome.evidence);
+        let (never_outcome, never_doc) =
+            wrapper_profile(PausePolicy::Never, tool, &dir.join("never.json"));
+        assert_eq!(never_outcome.child_exit_code, Some(0));
+        assert_eq!(never_outcome.evidence.pause, "none");
+        assert_eq!(never_outcome.evidence.pause_attempts, 0);
+        assert!(
+            wrapper_total_calls(&never_doc) <= oracle,
+            "an unpaused run misses calls, never invents them"
+        );
+    }
+
     /// A second exec after the provider already loads: the owned task maps
     /// SoftHSM under its first image (via `LD_PRELOAD`) and then execs the
     /// workload. The exec refresh keeps the observation exact and confirmed.

@@ -941,6 +941,12 @@
     },
     {
       "file": "src/discovery/pause.rs",
+      "path": "discovery::pause::tests::privileged_pause_default_flags_count_fast_child_exact_lp64",
+      "reason": "privileged: run with default flags counts a fast SoftHSM child exactly (root, BPF, SoftHSM, pkcs11-tool)",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/pause.rs",
       "path": "discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64",
       "reason": "privileged: run --pause auto through a preload-then-exec wrapper with a SoftHSM workload (root, BPF, SoftHSM, pkcs11-tool)",
       "cell": "privileged"

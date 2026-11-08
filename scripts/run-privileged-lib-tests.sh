@@ -345,12 +345,15 @@ discovery::inventory_workload::tests::privileged_inventory_attach_projection_n81
 # Pause exec-wrapper cells: run --pause auto/never through env, sh -c exec,
 # a forking sh wrapper and a preload-then-exec wrapper with a SoftHSM
 # workload (root, BPF, SoftHSM, pkcs11-tool); each wrapper run compares
-# against the direct run's exact call count or neutral lattice.
+# against the direct run's exact call count or neutral lattice. The
+# default-flags cell pins the omitted --pause default end to end on a
+# fast child, with a never twin.
 discovery::pause::tests::privileged_pause_auto_env_wrapper_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64
 discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64
+discovery::pause::tests::privileged_pause_default_flags_count_fast_child_exact_lp64
 # Short-lived naming cell: one pkcs11-tool run under inventory --system
 # must NAME the tool (its EXEC-joined pair resolved to the exact path,
 # not just its pid) in modules[].unbound_use.executables and on the

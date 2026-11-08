@@ -5458,12 +5458,12 @@ mod tests {
     }
 
     #[test]
-    fn run_trace_selects_the_trace_kind_and_omitted_pause_is_never() {
+    fn run_trace_selects_the_trace_kind_and_omitted_pause_is_auto() {
         let Command::Run(a) = parse(args(&["run", "--trace", "--", "/bin/true"])).unwrap() else {
             panic!("expected run")
         };
         assert_eq!(a.kind, Kind::Trace);
-        assert_eq!(a.pause, PausePolicy::Never);
+        assert_eq!(a.pause, PausePolicy::Auto);
         assert!(!a.kill_on_timeout);
         assert!(!a.metrics);
         assert_eq!(a.command, ["/bin/true"]);

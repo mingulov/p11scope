@@ -1882,18 +1882,14 @@ mod tests {
 
     #[test]
     fn unproven_member_gap_degrades_per_caller_without_incompleting_transaction() {
-        use crate::discovery::overlay_witness::{
-            GAP_ANCHOR_BINDING_FAILED, GAP_BUDGET_EXHAUSTED, GAP_WITNESS_REFUSED,
-            GAP_WITNESS_UNAVAILABLE,
-        };
-        // Every original-file proof refusal is a disclosed per-caller
-        // outcome: the member scan ran to completion, so none marks the
-        // shared transaction incomplete (JK-22: degrade, never stop).
+        use crate::discovery::overlay_witness::GAP_WITNESS_UNAVAILABLE;
+        // Only the diagnosed Unavailable family is producible in scoped
+        // collection (the witness early-outs before any query there):
+        // the member scan ran to completion, so it degrades per caller
+        // (JK-22: degrade, never stop) instead of marking the shared
+        // transaction incomplete.
         for reason in [
             GAP_WITNESS_UNAVAILABLE,
-            GAP_WITNESS_REFUSED,
-            GAP_BUDGET_EXHAUSTED,
-            GAP_ANCHOR_BINDING_FAILED,
             // The diagnosed scoped-collection variant from the failing
             // inventory-cgroup cell (overlay provider, witness deactivated).
             "original_file_unproven: kernel witness unavailable: scoped collection deactivates the kernel proof",
@@ -1907,16 +1903,26 @@ mod tests {
 
     #[test]
     fn cut_short_member_gaps_still_incomplete_their_transaction() {
+        use crate::discovery::overlay_witness::{
+            GAP_ANCHOR_BINDING_FAILED, GAP_BUDGET_EXHAUSTED, GAP_WITNESS_REFUSED,
+        };
         use crate::discovery::scan::{
             IO_CEILING_REASON, MAPPING_CHANGED_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON,
         };
         // Twin: scans cut short (ceilings, deadlines, changed mappings,
-        // guard mismatches, unknown reasons) keep failing closed.
+        // guard mismatches, unknown reasons) keep failing closed, as do
+        // the unproven outcomes scoped collection cannot produce today
+        // (proven-stale, spent budget, failed anchor): if the witness
+        // ever runs there, those outcomes must truncate, never silently
+        // degrade.
         for reason in [
             IO_CEILING_REASON,
             WORK_CEILING_REASON,
             SCAN_DEADLINE_REASON,
             MAPPING_CHANGED_REASON,
+            GAP_WITNESS_REFUSED,
+            GAP_BUDGET_EXHAUSTED,
+            GAP_ANCHOR_BINDING_FAILED,
             "opened object identity 1:2 inode 3 does not match mapped object 1:2 inode 4",
             "some future unknown omission",
         ] {

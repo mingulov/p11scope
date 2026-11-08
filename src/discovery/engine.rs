@@ -21,7 +21,7 @@ use crate::discovery::elf_needed;
 use crate::discovery::hooks::{HookAbi, HookRegistry};
 use crate::discovery::identity::{
     ConservativePinSelection, GraphStep, InstalledModulesBacking, InstalledPinsBacking,
-    KernelSelfMappingProbe, ManifestStaleReason, PinnedConservativeCursor, PinnedObjectId,
+    KernelSelfMappingProbe, ManifestStaleReason, Pin, PinnedConservativeCursor, PinnedObjectId,
     PinnedObjects, PinnedTimingKey, PrearmPinnedInput, ReconciledModule, RetainedScannedInputs,
     RetiredFileHandoff, ScannedInputMeasure, ScannedRebindCursor, SelfMappingProbe,
     StaleManifestObject, bind_scanned_modules, canonicalize_scanned_overlays,
@@ -397,6 +397,8 @@ pub(crate) struct WitnessProof {
     pub(crate) walk_started_ns: u64,
     pub(crate) fd_dev: u64,
     pub(crate) fd_ino: u64,
+    /// The witness fd's open-time pin, for the condition-4 baseline join.
+    pub(crate) pin: Pin,
 }
 
 pub struct Engine {
@@ -30606,7 +30608,7 @@ impl Engine {
             if input.scope_start_ns != Some(scope_start) {
                 continue;
             }
-            if !Self::witness_pin_matches(input.fd_dev, input.fd_ino, *object, pins) {
+            if !Self::witness_pin_matches(input.fd_dev, input.fd_ino, input.pin, *object, pins) {
                 continue;
             }
             // Declared-set attached_at, the same rule as `assemble`.
@@ -30640,14 +30642,21 @@ impl Engine {
     }
 
     /// Condition 4: the witness fd's `(st_dev, st_ino)` equals the pin's
-    /// own held fd identity. Same-domain by construction: raw keys are
-    /// maps-visible identities, which live in a different device domain
-    /// than fd stats on split filesystems (btrfs: fd `0:37` vs maps
-    /// `00:23` for the same file), so comparing the witness fd against
-    /// raw keys would refuse every proof there.
+    /// own held fd identity, and the witness fd's open-time
+    /// `(ino, size, ctime)` equals the pin's held baseline.
+    /// Same-domain by construction: raw keys are maps-visible
+    /// identities, which live in a different device domain than fd
+    /// stats on split filesystems (btrfs: fd `0:37` vs maps `00:23`
+    /// for the same file), so comparing the witness fd against raw
+    /// keys would refuse every proof there. The pin half closes the
+    /// copy-up race: a copy-up between the witness start and the
+    /// pre-arm pin keeps the overlay `(dev, ino)` stable while
+    /// rewriting size/ctime, so the fd identity alone would join the
+    /// lower watch to the copied-up pin.
     pub(crate) fn witness_pin_matches(
         fd_dev: u64,
         fd_ino: u64,
+        witness_pin: Pin,
         object: PinnedObjectId,
         pins: &PinnedObjects,
     ) -> bool {
@@ -30655,7 +30664,9 @@ impl Engine {
         pins.file_for(object).is_some_and(|file| {
             file.metadata()
                 .is_ok_and(|meta| meta.dev() == fd_dev && meta.ino() == fd_ino)
-        })
+        }) && pins
+            .pin_for(object)
+            .is_some_and(|baseline| baseline == witness_pin)
     }
 
     /// Finalizes the live witness after a successful start (§6.2): the
@@ -30679,7 +30690,8 @@ impl Engine {
 
     /// Keys a driver verdict's input-ordered slots to watched objects by
     /// pin identity (condition 4): a slot names every object whose pin's
-    /// held fd has the witness fd's `(st_dev, st_ino)`. Identities no
+    /// held fd has the witness fd's `(st_dev, st_ino)` and whose held
+    /// baseline equals the witness fd's open-time pin. Identities no
     /// object pins are dropped, never attributed.
     fn map_verdict_slots_to_objects(
         watches: &BTreeMap<PinnedObjectId, crate::prearm_module::PrearmWatch>,
@@ -30689,7 +30701,7 @@ impl Engine {
         let mut map = BTreeMap::new();
         for slot in &verdict.slots {
             for object in watches.keys() {
-                if Self::witness_pin_matches(slot.fd_dev, slot.fd_ino, *object, pins) {
+                if Self::witness_pin_matches(slot.fd_dev, slot.fd_ino, slot.pin, *object, pins) {
                     map.insert(
                         *object,
                         WitnessProof {
@@ -30699,6 +30711,7 @@ impl Engine {
                             walk_started_ns: verdict.walk_started_ns,
                             fd_dev: slot.fd_dev,
                             fd_ino: slot.fd_ino,
+                            pin: slot.pin,
                         },
                     );
                 }

@@ -5914,11 +5914,12 @@ fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
         let matched = crate::discovery::engine::Engine::witness_pin_matches(
             witness_dev,
             witness_ino,
+            witness.files[0].pin,
             object,
             &pins,
         );
         eprintln!(
-            "WITNESS_RACE mode={mode:?} pre=({},{}) witness=({},{}) post=({},{}) pin=({},{}) matched={matched}",
+            "WITNESS_RACE mode={mode:?} pre=({},{}) witness=({},{}) post=({},{}) pin=({},{}) matched={matched} witness_pin={:?} baseline={:?}",
             pre.dev(),
             pre.ino(),
             witness_dev,
@@ -5927,6 +5928,8 @@ fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
             post.ino(),
             pin_meta.dev(),
             pin_meta.ino(),
+            witness.files[0].pin,
+            pins.pin_for(object),
         );
         if matched {
             joined.push(mode);
@@ -5960,7 +5963,6 @@ fn privileged_witness_pin_without_copyup_keeps_proof() {
         ),
         "witness needs the initial PID namespace"
     );
-    use std::os::unix::fs::MetadataExt as _;
     let mut refused = Vec::new();
     for mode in [XinoMode::On, XinoMode::SameFs] {
         let work = tempfile::tempdir().unwrap();
@@ -5986,11 +5988,14 @@ fn privileged_witness_pin_without_copyup_keeps_proof() {
         let matched = crate::discovery::engine::Engine::witness_pin_matches(
             witness_dev,
             witness_ino,
+            witness.files[0].pin,
             object,
             &pins,
         );
         eprintln!(
-            "WITNESS_STEADY mode={mode:?} witness=({witness_dev},{witness_ino}) matched={matched}"
+            "WITNESS_STEADY mode={mode:?} witness=({witness_dev},{witness_ino}) matched={matched} witness_pin={:?} baseline={:?}",
+            witness.files[0].pin,
+            pins.pin_for(object),
         );
         if !matched {
             refused.push(mode);

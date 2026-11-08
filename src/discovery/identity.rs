@@ -54,6 +54,25 @@ pub(crate) fn pin_of(file: &std::fs::File) -> Result<Pin, String> {
     Ok(pin_from_metadata(&md))
 }
 
+/// `pin_of` for a borrowed descriptor (the pre-arm witness holds
+/// `OwnedFd`s, not `File`s): the same `(ino, size, ctime)` identity
+/// from the same fstat domain.
+pub(crate) fn pin_of_fd(fd: std::os::fd::BorrowedFd<'_>) -> Result<Pin, String> {
+    #[cfg(test)]
+    provider_metadata_read_test::metadata_read();
+    use std::os::unix::io::AsRawFd as _;
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: fstat only reads; `fd` is borrowed, hence open.
+    if unsafe { libc::fstat(fd.as_raw_fd(), &mut stat) } != 0 {
+        return Err(format!("fstat failed: {}", std::io::Error::last_os_error()));
+    }
+    Ok(Pin {
+        ino: stat.st_ino,
+        size: stat.st_size as u64,
+        ctime: (stat.st_ctime, stat.st_ctime_nsec),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod provider_metadata_read_test {
     //! Observer for actual provider metadata reads (held-fd `fstat`/`fstatfs`
@@ -1489,6 +1508,12 @@ impl PinnedObjects {
     /// recomputing the pin's identity digest.
     pub(crate) fn file_for(&self, id: PinnedObjectId) -> Option<&std::fs::File> {
         self.by_id.get(&id).map(|entry| entry.file.as_ref())
+    }
+
+    /// The pin's held `(ino, size, ctime)` baseline: the condition-4
+    /// join domain for the pre-arm witness's open-time pin.
+    pub(crate) fn pin_for(&self, id: PinnedObjectId) -> Option<Pin> {
+        self.by_id.get(&id).map(|entry| entry.pin)
     }
 
     /// Every maps-visible key this capture-local object is retained under
@@ -10130,6 +10155,18 @@ mod tests {
             charged_second >= file_len,
             "rotated file is read again: {charged_second} >= {file_len}"
         );
+    }
+
+    #[test]
+    fn borrowed_fd_pin_matches_file_pin() {
+        // The witness finalize re-check stats a borrowed fd: the same
+        // `(ino, size, ctime)` identity `pin_of` reads from the File.
+        use std::os::unix::io::AsFd as _;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("fd-pin.so");
+        std::fs::write(&path, [0x7fu8, b'E', b'L', b'F']).unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        assert_eq!(pin_of_fd(file.as_fd()).unwrap(), pin_of(&file).unwrap());
     }
 
     #[test]

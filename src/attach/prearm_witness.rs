@@ -498,6 +498,11 @@ pub(crate) struct WitnessFile {
     pub dev: u64,
     #[allow(dead_code)]
     pub ino: u64,
+    /// The witness fd's open-time `(ino, size, ctime)`: condition 4
+    /// requires it to equal the pre-arm pin's held baseline (a copy-up
+    /// between the witness start and the pin rewrites size/ctime while
+    /// the overlay `(dev, ino)` stays stable), and finalize re-checks it.
+    pub pin: crate::discovery::identity::Pin,
     pub key: PwWatchedKey,
 }
 
@@ -526,10 +531,24 @@ impl<B: FinalizeBackend> StartupWitness<B> {
         let slots = verdicts
             .into_iter()
             .zip(self.files.iter())
-            .map(|(verdict, file)| WitnessSlot {
-                verdict,
-                fd_dev: file.dev,
-                fd_ino: file.ino,
+            .map(|(verdict, file)| {
+                // The witness fd's own pin re-check: a change between
+                // startup and finalize (a copy-up rewrites size/ctime)
+                // voids the calibration-time key, so the slot keeps its
+                // window even when the walk was clean.
+                use std::os::unix::io::AsFd as _;
+                let unchanged = crate::discovery::identity::pin_of_fd(file.fd.as_fd())
+                    .is_ok_and(|current| current == file.pin);
+                WitnessSlot {
+                    verdict: if unchanged {
+                        verdict
+                    } else {
+                        FileVerdict::Keep(KeepReason::Calibration)
+                    },
+                    fd_dev: file.dev,
+                    fd_ino: file.ino,
+                    pin: file.pin,
+                }
             })
             .collect();
         Some(WitnessVerdict {
@@ -605,7 +624,13 @@ pub(crate) fn start_with<B: WitnessBackend>(
     }
     // Open each path, require a regular file, keep fd + fstat.
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut opened: Vec<(std::path::PathBuf, std::os::fd::OwnedFd, u64, u64)> = Vec::new();
+    let mut opened: Vec<(
+        std::path::PathBuf,
+        std::os::fd::OwnedFd,
+        u64,
+        u64,
+        crate::discovery::identity::Pin,
+    )> = Vec::new();
     for path in paths {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -621,13 +646,17 @@ pub(crate) fn start_with<B: WitnessBackend>(
                 path.display()
             )));
         }
+        // The open-time pin condition 4 joins against the pre-arm pin's
+        // held baseline: recorded here, before any copy-up can land.
+        let open_pin = crate::discovery::identity::pin_of(&file)
+            .map_err(|_| Unavailable::Btf("witness fstat failed".into()))?;
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
         let (dev, ino) = (meta.dev(), meta.ino());
         let raw = file.into_raw_fd();
         // SAFETY: owned fd from an open File.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        opened.push((path.clone(), fd, dev, ino));
+        opened.push((path.clone(), fd, dev, ino, open_pin));
     }
     // Inactive cfg, then attach.
     let mut cfg = PwCfg {
@@ -649,7 +678,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
     // SAFETY: gettid has no preconditions.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     let mut files: Vec<WitnessFile> = Vec::new();
-    for (index, (path, fd, dev, ino)) in opened.into_iter().enumerate() {
+    for (index, (path, fd, dev, ino, open_pin)) in opened.into_iter().enumerate() {
         cfg.calib_tid = tid;
         cfg.calib_index = index as u32;
         backend
@@ -697,6 +726,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
             fd,
             dev,
             ino,
+            pin: open_pin,
             key: PwWatchedKey {
                 s_dev: slot.s_dev,
                 i_ino: slot.i_ino,
@@ -1107,6 +1137,8 @@ pub(crate) struct WitnessSlot {
     pub(crate) verdict: FileVerdict,
     pub(crate) fd_dev: u64,
     pub(crate) fd_ino: u64,
+    /// The witness fd's open-time pin, for the condition-4 baseline join.
+    pub(crate) pin: crate::discovery::identity::Pin,
 }
 
 /// The driver's finalize product (§6.1): stamps plus one slot per input
@@ -2347,6 +2379,31 @@ mod tests {
         assert!(key_pos < active_pos, "keys before active: {ops:?}");
     }
 
+    #[test]
+    fn start_records_open_time_pin_for_condition_4() {
+        // Condition 4 joins the witness fd's open-time pin against the
+        // pre-arm pin's held baseline: the recorded pin must equal the
+        // file's pin at startup.
+        let (_dir, path) = temp_prearm_file("libpin.so");
+        let backend = ScriptBackend::new(calib_for(&path), 1);
+        let witnessed = super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+        )
+        .expect("clean start succeeds");
+        assert_eq!(witnessed.files.len(), 1);
+        let expected =
+            crate::discovery::identity::pin_of(&std::fs::File::open(&path).expect("open"))
+                .expect("pin");
+        assert_eq!(witnessed.files[0].pin, expected);
+    }
+
     fn probe_softhsm_path() -> std::path::PathBuf {
         for candidate in [
             "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
@@ -2692,24 +2749,28 @@ mod tests {
     }
 
     /// One-file started witness over a scripted clean backend, for the
-    /// driver `finalize` twins.
-    fn scripted_started_witness() -> super::StartupWitness<ScriptFinalize> {
+    /// driver `finalize` twins. The dir outlives the witness: dropping it
+    /// would unlink the file and rotate ctime, which the finalize pin
+    /// re-check must (and does) flag.
+    fn scripted_started_witness() -> (tempfile::TempDir, super::StartupWitness<ScriptFinalize>) {
         use std::os::unix::fs::MetadataExt as _;
         use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("witness-assembly.so");
         std::fs::write(&path, [0x7fu8, b'E', b'L', b'F']).expect("write");
         let meta = std::fs::metadata(&path).expect("fstat");
-        let raw = std::fs::File::open(&path).expect("open").into_raw_fd();
+        let file = std::fs::File::open(&path).expect("open");
+        let pin = crate::discovery::identity::pin_of(&file).expect("pin");
+        let raw = file.into_raw_fd();
         // SAFETY: owned fd from an open File.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        // The dir drops here; the held fd keeps the file alive.
-        super::StartupWitness {
+        let witnessed = super::StartupWitness {
             backend: ScriptFinalize::clean(),
             files: vec![super::WitnessFile {
                 fd,
                 dev: meta.dev(),
                 ino: meta.ino(),
+                pin,
                 key: super::PwWatchedKey {
                     s_dev: meta.dev(),
                     i_ino: meta.ino(),
@@ -2717,18 +2778,19 @@ mod tests {
             }],
             active_ns: 40,
             scope_start_ns: Some(50),
-        }
+        };
+        (dir, witnessed)
     }
 
     #[test]
     fn driver_finalize_owned_drops_without_verdict() {
-        let witnessed = scripted_started_witness();
+        let (_dir, witnessed) = scripted_started_witness();
         assert_eq!(witnessed.finalize(true), None);
     }
 
     #[test]
     fn driver_finalize_assembles_verdict_from_clean_close() {
-        let witnessed = scripted_started_witness();
+        let (_dir, witnessed) = scripted_started_witness();
         let (dev, ino) = (witnessed.files[0].dev, witnessed.files[0].ino);
         let verdict = witnessed.finalize(false).expect("clean close verdict");
         assert_eq!(verdict.active_ns, 40);
@@ -2754,7 +2816,9 @@ mod tests {
         let path = dir.path().join("witness-recheck.so");
         std::fs::write(&path, [0x7fu8, b'E', b'L', b'F']).expect("write");
         let meta = std::fs::metadata(&path).expect("fstat");
-        let raw = std::fs::File::open(&path).expect("open").into_raw_fd();
+        let file = std::fs::File::open(&path).expect("open");
+        let pin = crate::discovery::identity::pin_of(&file).expect("pin");
+        let raw = file.into_raw_fd();
         // SAFETY: owned fd from an open File.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
         let witnessed = super::StartupWitness {
@@ -2763,6 +2827,7 @@ mod tests {
                 fd,
                 dev: meta.dev(),
                 ino: meta.ino(),
+                pin,
                 key: super::PwWatchedKey {
                     s_dev: meta.dev(),
                     i_ino: meta.ino(),

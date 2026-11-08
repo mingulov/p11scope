@@ -62,6 +62,7 @@ fn clean_proof(
         walk_started_ns: attached_at + 1,
         fd_dev: meta.dev(),
         fd_ino: meta.ino(),
+        pin: engine.pinned.pin_for(object).expect("pin holds a baseline"),
     }
 }
 
@@ -458,6 +459,7 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
         .metadata()
         .expect("fstat the held fd");
     let (dev, ino) = (meta.dev(), meta.ino());
+    let baseline = engine.pinned.pin_for(object).expect("pin holds a baseline");
     let verdict = WitnessVerdict {
         active_ns: 40,
         scope_start_ns: Some(50),
@@ -467,12 +469,14 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
                 verdict: FileVerdict::Clear,
                 fd_dev: dev,
                 fd_ino: ino,
+                pin: baseline,
             },
             // An identity no object pins: dropped, never attributed.
             WitnessSlot {
                 verdict: FileVerdict::Clear,
                 fd_dev: dev ^ 0x79b9,
                 fd_ino: ino ^ 0x9e37,
+                pin: baseline,
             },
         ],
     };
@@ -486,6 +490,70 @@ fn witness_verdict_slots_key_to_objects_by_pin_identity() {
     assert_eq!(proof.walk_started_ns, 1000);
     assert_eq!(proof.fd_dev, dev);
     assert_eq!(proof.fd_ino, ino);
+}
+
+#[test]
+fn witness_slot_with_stale_open_pin_keys_to_no_object() {
+    // A copy-up between the witness start and the pre-arm pin leaves the
+    // fd identity matching while the open-time pin is stale: the slot
+    // must key to no object, so no proof can be assembled for it.
+    use crate::attach::prearm_witness::{WitnessSlot, WitnessVerdict};
+    let (_fixture, engine, _session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    let object = watched_object(&engine);
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = engine
+        .pinned
+        .file_for(object)
+        .expect("pin holds an fd")
+        .metadata()
+        .expect("fstat the held fd");
+    let (dev, ino) = (meta.dev(), meta.ino());
+    let stale = stale_open_pin(&engine, object);
+    let verdict = WitnessVerdict {
+        active_ns: 40,
+        scope_start_ns: Some(50),
+        walk_started_ns: 1000,
+        slots: vec![WitnessSlot {
+            verdict: FileVerdict::Clear,
+            fd_dev: dev,
+            fd_ino: ino,
+            pin: stale,
+        }],
+    };
+    let map =
+        Engine::map_verdict_slots_to_objects(engine.prearm.watches(), &engine.pinned, &verdict);
+    assert!(map.is_empty(), "a stale open pin keys nowhere");
+}
+
+#[test]
+fn witness_stale_open_pin_with_matching_fd_identity_keeps_window() {
+    // The proof-level consequence of the race twin: the fd identity
+    // matches the pin, but the witness opened before a change the pin
+    // already sees, so the pre-attach window must stay.
+    let (_fixture, mut engine, session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    let object = watched_object(&engine);
+    let mut proof = clean_proof(&engine, object, 50, 900);
+    proof.pin = stale_open_pin(&engine, object);
+    plant(&mut engine, object, proof);
+    finish(&mut engine, &session, false);
+    let record = watched_prearm_record(&engine);
+    assert_eq!(record.unobserved_windows, Some(pre_attach_window_50_900()));
+}
+
+/// An open-time pin no pin in this engine holds: another file's pin
+/// stands in for the pre-copy-up state the witness recorded.
+fn stale_open_pin(engine: &Engine, object: PinnedObjectId) -> crate::discovery::identity::Pin {
+    let dir = tempfile::tempdir().expect("stale pin dir");
+    let other = dir.path().join("other-provider.so");
+    std::fs::write(&other, [0x7fu8, b'E', b'L', b'F']).expect("write");
+    let file = std::fs::File::open(&other).expect("open");
+    let stale = crate::discovery::identity::pin_of(&file).expect("pin the other file");
+    let baseline = engine.pinned.pin_for(object).expect("pin holds a baseline");
+    assert_ne!(
+        stale, baseline,
+        "the twin needs a pin the engine never held"
+    );
+    stale
 }
 
 #[test]
@@ -579,6 +647,7 @@ fn witness_sentinel_values_reach_no_render_or_stderr() {
         walk_started_ns: u64::MAX - 202,
         fd_dev: u64::MAX - 303,
         fd_ino: u64::MAX - 404,
+        pin: engine.pinned.pin_for(object).expect("pin holds a baseline"),
     };
     plant(&mut engine, object, sentinel);
     let dir = tempfile::tempdir().expect("sentinel dir");

@@ -220,10 +220,8 @@ pub(crate) const JOINT_FINISH_SETTLE_TIMEOUT: Duration =
 /// ring still holding records. The ring keeps the rest and kernel ring
 /// loss counts any overflow; the repeats count how many services
 /// observed saturation. Recorded by the service step.
-#[allow(dead_code)]
 pub(crate) const EVENTS_STAGE_SATURATED_SUBJECT: &str = "joint events staging saturated";
 /// Named saturation gap, reason half of [`EVENTS_STAGE_SATURATED_SUBJECT`].
-#[allow(dead_code)]
 pub(crate) const EVENTS_STAGE_SATURATED_REASON: &str = "the staged events queue is full while the kernel ring still holds records; the ring keeps the rest and kernel ring loss counts any overflow";
 
 pub(crate) struct JointWorkBudget {
@@ -458,7 +456,6 @@ pub(crate) trait JointMachineIo {
     /// or a binding never wedges the ring behind it; collection consumes
     /// the queue first. The default stages nothing (existing scripted
     /// drivers keep their direct reads); the Session driver overrides it.
-    #[allow(dead_code)]
     fn stage_events(
         &mut self,
         _lane: &mut AttestedSemanticLane,
@@ -1745,6 +1742,7 @@ impl LiveJointMachine {
                 return Ok(JointCommitProgress::Pending);
             }
         }
+        stage_events_ahead(io, lane, coordinator, budget, Some(q.events_stop()));
         while budget.available() {
             // The owned Finish guard above permits only its first genuine
             // Raw-minted grant after an observed None. Q itself stays
@@ -2140,7 +2138,38 @@ impl LiveJointMachine {
     ) -> Result<JointServiceProgress, SemanticRefusal> {
         self.service_with_io_and_acquisition(lane, coordinator, io, mode, budget, None)
     }
+}
 
+/// Drain the kernel EVENTS ring into the lane's staging queue ahead of
+/// collection, on every service whatever the seal state. Collection
+/// consumes the queue first, so a seal awaiting future input or a
+/// binding no longer wedges the ring behind it. Bounded by the live
+/// poll quantum with one action reserved for the phase advance; a
+/// queue stopped at its bounds with the ring still holding records
+/// stages the named saturation gap (identical gaps aggregate by
+/// repeats) instead of losing anything silently.
+fn stage_events_ahead<I: JointMachineIo>(
+    io: &mut I,
+    lane: &mut AttestedSemanticLane,
+    coordinator: &mut InventoryCoordinator<OsProcessSource>,
+    budget: &mut JointWorkBudget,
+    stop: Option<usize>,
+) {
+    if !budget.available() || budget.remaining_actions <= 1 {
+        return;
+    }
+    let quantum = (budget.remaining_actions - 1).min(crate::events::LIVE_POLL_QUANTUM);
+    let outcome = io.stage_events(lane, quantum, stop);
+    budget.spend(outcome.staged);
+    if outcome.saturated {
+        coordinator.note_scope_gap(
+            EVENTS_STAGE_SATURATED_SUBJECT.to_string(),
+            EVENTS_STAGE_SATURATED_REASON.to_string(),
+        );
+    }
+}
+
+impl LiveJointMachine {
     pub(crate) fn service_with_io_and_acquisition<I: JointMachineIo>(
         &mut self,
         lane: &mut AttestedSemanticLane,
@@ -2164,6 +2193,7 @@ impl LiveJointMachine {
         if let RunState::DispositionRequired(reason) = self.state {
             return Err(reason);
         }
+        stage_events_ahead(io, lane, coordinator, budget, None);
         // Production v0.5.0 installs this machine with no journal producer.
         // Service its own DISCOVERY even while a raw/audited original waits,
         // leaving linked Joint's records and every Finish-Q bound untouched.
@@ -3927,6 +3957,25 @@ impl SessionMachineIo {
 impl JointMachineIo for SessionMachineIo {
     fn producers(&self) -> &SessionDrainProducers {
         &self.producers
+    }
+
+    fn stage_events(
+        &mut self,
+        lane: &mut AttestedSemanticLane,
+        quantum: usize,
+        stop: Option<usize>,
+    ) -> crate::events::EventsStageOutcome {
+        // Gated, finished or foreign lanes keep today's direct reads:
+        // the queue only ever moves bytes the collector would read.
+        let live = match self.live(lane) {
+            Ok(live) => live,
+            Err(_) => return crate::events::EventsStageOutcome::default(),
+        };
+        let drain = match live.session.event_drain() {
+            Ok(drain) => drain,
+            Err(_) => return crate::events::EventsStageOutcome::default(),
+        };
+        drain.stage_events(quantum, stop)
     }
 
     fn service_unlinked_discovery(

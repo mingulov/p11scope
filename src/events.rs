@@ -479,7 +479,6 @@ pub(crate) struct EventsStageOutcome {
 /// One staged queue entry: a verbatim ring-record copy with its exact
 /// ring span, or a kernel-discard count observed while pulling.
 #[derive(Debug)]
-#[allow(dead_code)]
 enum StagedItem {
     Bytes { span: usize, bytes: Vec<u8> },
     Discarded { count: u64 },
@@ -540,7 +539,6 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
     /// overrun them by at most one record (plus its discard marker,
     /// which carries no bytes); the positions capacity below carries a
     /// full byte-cap margin for that overrun.
-    #[allow(dead_code)]
     pub(crate) fn stage(&mut self, quantum: usize, stop: Option<usize>) -> EventsStageOutcome {
         let stop = stop.unwrap_or(usize::MAX);
         let mut staged = 0;
@@ -709,6 +707,19 @@ impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
             OwnedRead::Pending => Ok(BoundedRecord::Pending),
             OwnedRead::Reached => Ok(BoundedRecord::Reached),
         }
+    }
+}
+
+#[allow(private_bounds)] // Staging stays crate-private; only the public drain names this queue.
+impl<S: BoundedRecordSource> EventDrain<StagedEvents<S>> {
+    /// Production staging entry: move up to `quantum` records off the
+    /// ring into the queue, never past `stop` when bounded.
+    pub(crate) fn stage_events(
+        &mut self,
+        quantum: usize,
+        stop: Option<usize>,
+    ) -> EventsStageOutcome {
+        self.source.stage(quantum, stop)
     }
 }
 

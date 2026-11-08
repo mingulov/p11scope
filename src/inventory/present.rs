@@ -2457,6 +2457,14 @@ fn gap_plain_reason(reason: &str) -> &str {
     if let Some(_suffix) = reason.strip_prefix("joint_fallback_") {
         return "per-key tracking fell back to plain counts";
     }
+    // Exited-process races surface as file errors on present system
+    // files; word them as the race, not a missing library. Verbose
+    // keeps the machine error beside the plain words, JSON verbatim.
+    if reason.starts_with("opening object within retained target root: No such file or directory")
+        || reason.starts_with("opening object within retained target root: No such process")
+    {
+        return "process exited during scan (file gone before it could be read)";
+    }
     // The overlay-witness unavailable family (canonical plus every
     // enriched `: <stage>` suffix) folds to one plain clause; verbose
     // keeps the machine token beside it, JSON keeps it verbatim.

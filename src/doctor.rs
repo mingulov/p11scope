@@ -3968,6 +3968,25 @@ mod tests {
         assert!(!line.contains("run capture available"), "{line}");
     }
 
+    /// Concise verdict uses plain words and one partial spelling:
+    /// "startup capture", lowercase "partial" like the coverage lines.
+    #[test]
+    fn verdict_line_uses_plain_words_for_run_startup_capture() {
+        let limited = vec![Check {
+            name: "run initial-set capture".into(),
+            status: Status::NotApplicable("not in this build".into()),
+        }];
+        let line = verdict_line(&limited);
+        assert!(
+            line.contains(
+                "run startup capture not in this build (run reports stay partial; run itself works)"
+            ),
+            "{line}"
+        );
+        assert!(!line.contains("initial-set"), "{line}");
+        assert!(!line.contains("PARTIAL"), "{line}");
+    }
+
     /// A degraded timing value is a warning: it makes complete timing
     /// unavailable without making every capture lane fatal. A requested lane
     /// that is genuinely unavailable stays nonzero.

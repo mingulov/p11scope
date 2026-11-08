@@ -15,7 +15,10 @@
 # expected-failure evidence, 0 qualifies the subset with no caveats.
 # P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 (ruling CI-GAP-1) discloses hosted
 # runner noise on the system cells (`system`, `mt-system`) only; default 0
-# keeps every cell strict.
+# keeps every cell strict. Ruling U1: on `mt-system` only, the same flag
+# also discloses the named {discovery subject, discovery unavailable}
+# skips; each named cause prints its count, owned counts stay exact, and
+# any other cause still fails.
 set -u
 _SRC=${BASH_SOURCE[0]:-$0}
 HERE=$(cd "$(dirname "$_SRC")" && pwd) || exit 64
@@ -271,7 +274,9 @@ judge() {
   # Ruling CI-GAP-1: P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 discloses hosted
   # runner noise on the system cells (`system`, `mt-system`) only. Every
   # other cell stays strict, and unset/0 keeps the system cells strict
-  # (fedora, sm1, vng guests).
+  # (fedora, sm1, vng guests). Ruling U1 extends the `mt-system`
+  # allowance to the named discovery-skip pair; `system` keeps the
+  # CI-GAP-1 cause set.
   local -a extra=()
   if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)

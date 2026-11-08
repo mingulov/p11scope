@@ -70,6 +70,12 @@ LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unm
                  "rv_update_failures", "cgroup_scope_failures", "abi_refusals", "malformed_records",
                  "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures",
                  "discovery_truncated", "task_uprobe_link_losses")
+# Ruling U1 (controller): the one discovery-skip pair the mt-system cell may
+# disclose as runner noise alongside pid_descendant_gaps. The render layer
+# projects every internal discovery partial that is not a named limit to
+# this generic redacted pair; any other skip (entry loss, another
+# discovery reason) is a different family and still fails.
+DISCLOSABLE_DISCOVERY_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
 # Keep verdict policy in the existing canonical reader; it recomputes classes
 # from published counters rather than trusting a report's claimed statuses.
 VERDICT = runpy.run_path(str(Path(__file__).with_name("check-capture-evidence.py")))
@@ -546,6 +552,10 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     require(cell in COUNT_CELLS | SMOKE_CELLS, "undeclared cell")
     # Ruling CI-GAP-1: only the hosted-runner host system cells may disclose
     # short-lived descendant exits as runner noise, via an explicit flag.
+    # Ruling U1 (controller): on `mt-system` only, the same flag also
+    # discloses the named discovery-skip pair above. Each named cause may
+    # be present or absent with its count printed; owned counts stay
+    # exact and any other cause still fails.
     relaxed = cell in {"system", "mt-system"} and allow_pid_descendant_gaps is True
     common(receipt, cell)
     expected, physical, errinfo = fixture(ledger_text, receipt, cell)
@@ -570,7 +580,16 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         ok_exact = observation.get("status") == "exact" and observation.get("causes") == []
         ok_noise = (observation.get("status") == "lossy" and
                     observation.get("causes") == ["pid_descendant_gaps"])
-        require(ok_exact or ok_noise, "lossy or unknown observation gap class")
+        ok_skip_family = (
+            cell == "mt-system"
+            and observation.get("status") == "lossy"
+            and isinstance(observation.get("causes"), list)
+            and "skipped" in observation["causes"]
+            and set(observation["causes"]) <= {"skipped", "pid_descendant_gaps"}
+            and all(skip == DISCLOSABLE_DISCOVERY_SKIP or
+                    (isinstance(skip, dict) and skip.get("reason") == "null pointer")
+                    for skip in evidence.get("skipped", [])))
+        require(ok_exact or ok_noise or ok_skip_family, "lossy or unknown observation gap class")
     else:
         require(observation.get("status") == "exact" and observation.get("causes") == [],
                 "lossy or unknown observation gap class")
@@ -679,14 +698,20 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
         return "semantic-names", "six independent physical targets carry expected semantic names"
     if relaxed:
         gaps = evidence.get("pid_descendant_gaps", 0)
-        if gaps > 0:
+        skips = sum(1 for skip in evidence.get("skipped", [])
+                    if skip == DISCLOSABLE_DISCOVERY_SKIP)
+        if cell == "mt-system":
+            noise = f"pid_descendant_gaps={gaps}; discovery_skips={skips}"
+        else:
+            noise = f"pid_descendant_gaps={gaps}"
+        if gaps > 0 or skips > 0:
             return "owned-provider-counts-with-runner-noise", (
                 "owned physical-provider counts match independent successful ledger; "
-                f"disclosed runner noise: pid_descendant_gaps={gaps}; "
+                f"disclosed runner noise: {noise}; "
                 "per-caller attribution is not established")
         return "owned-provider-counts", (
             "owned physical-provider counts match independent successful ledger; "
-            "disclosed runner noise: pid_descendant_gaps=0; "
+            f"disclosed runner noise: {noise}; "
             "per-caller attribution is not established")
     return "owned-provider-counts", ("owned physical-provider counts match independent successful ledger; "
                                      "per-caller attribution is not established")
@@ -698,7 +723,9 @@ def main(argv=None):
         parser.add_argument("--" + option, required=True)
     parser.add_argument("--allow-pid-descendant-gaps", action="store_true",
                         help="CI-GAP-1: on the system cells (`system`, `mt-system`) only, disclose nonzero "
-                             "pid_descendant_gaps as runner noise instead of failing")
+                             "pid_descendant_gaps as runner noise instead of failing; "
+                             "ruling U1: on `mt-system` only, also disclose the named "
+                             "{discovery subject, discovery unavailable} skips")
     args = parser.parse_args(argv)
     result = {"cell": args.cell, "pass": False, "detail": "", "qualification": "failed"}
     try:

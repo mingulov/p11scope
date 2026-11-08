@@ -57,6 +57,12 @@ class CheckCellResultsTests(unittest.TestCase):
                                   "counts match; disclosed runner noise")])
         self.assertEqual(result.returncode, 0, result.stderr)
 
+    def test_66_discovery_gap_qualification_accepted(self):
+        result = run_checker([row("select-endpoint-system", True,
+                                  "owned-provider-counts-with-66-discovery-gap",
+                                  "counts match; disclosed 6.6 discovery gap")])
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_qualified_failure_fails(self):
         result = run_checker([row("a", True), row("b", False, "command-contract")])
         self.assertNotEqual(result.returncode, 0)

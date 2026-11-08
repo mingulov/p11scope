@@ -579,5 +579,62 @@ class HandoffPairTests(unittest.TestCase):
                 self.assertIn(line, text)
 
 
+STUB_ORACLE = """\
+import json, os, sys
+argv = sys.argv[1:]
+open(os.environ["STUB_ARGS"], "w").write("\\n".join(argv))
+cell = argv[argv.index("--cell") + 1]
+print(json.dumps({"cell": cell, "pass": True, "detail": "stub",
+                  "qualification": "owned-provider-counts"}))
+"""
+
+
+def run_judge_case(cell, release):
+    """Run the real judge() with a stub oracle and stub uname; return argv seen."""
+    with tempfile.TemporaryDirectory() as raw:
+        tmp = Path(raw)
+        stub = tmp / "stub-oracle.py"
+        stub.write_text(STUB_ORACLE)
+        bindir = tmp / "bin"
+        bindir.mkdir()
+        fake_uname = bindir / "uname"
+        fake_uname.write_text('#!/bin/sh\necho "$FAKE_RELEASE"\n')
+        fake_uname.chmod(0o755)
+        args_file = tmp / "argv.txt"
+        funcs = extract_functions("result", "emit_judged", "judge")
+        script = (funcs + "\n"
+                  f'export ORACLE="{stub}" STUB_ARGS="{args_file}"\n'
+                  f'export PATH="{bindir}:$PATH" FAKE_RELEASE="{release}"\n'
+                  f'judge report.json ledger.wl receipt.json "{cell}"; echo JUDGE_RC=$?\n')
+        proc = subprocess.run(["bash", "-u", "-c", script],
+                              capture_output=True, text=True, timeout=10,
+                              cwd=str(tmp))
+        assert "JUDGE_RC=0" in proc.stdout, proc.stdout + proc.stderr
+        return args_file.read_text().splitlines()
+
+
+class JudgeFlagTests(unittest.TestCase):
+    """judge() passes --allow-66-discovery-gap only for its cell on 6.6."""
+
+    FLAG = "--allow-66-discovery-gap"
+
+    def test_flag_passed_for_select_endpoint_on_66(self):
+        argv = run_judge_case("select-endpoint-system", "6.6.157-0606157-generic")
+        self.assertIn(self.FLAG, argv)
+
+    def test_flag_not_passed_for_select_endpoint_off_66(self):
+        for release in ("7.3.1-070301-generic", "6.12.111-0612111-generic",
+                        "6.1.188-0601188-generic"):
+            with self.subTest(release=release):
+                argv = run_judge_case("select-endpoint-system", release)
+                self.assertNotIn(self.FLAG, argv)
+
+    def test_flag_not_passed_for_other_cells_on_66(self):
+        for cell in ("counter-counts-system", "system", "select-endpoint-pid"):
+            with self.subTest(cell=cell):
+                argv = run_judge_case(cell, "6.6.157-0606157-generic")
+                self.assertNotIn(self.FLAG, argv)
+
+
 if __name__ == "__main__":
     unittest.main()

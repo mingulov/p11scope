@@ -325,7 +325,8 @@ def trace_stream_mt(*, calls_per_function=8, lost=0, event_loss=0, semantic_fail
 
 
 class BreadthTests(unittest.TestCase):
-    def run_case(self, mutate=None, *, cell, want=0, report_text=None):
+    def run_case(self, mutate=None, *, cell, want=0, report_text=None,
+                 allow_66_discovery_gap=False):
         metrics = cell in {"metrics-pid", "metrics-cgroup"} or cell.startswith("counter-") or cell.startswith("select-endpoint-")
         scope = "system" if cell.endswith("-system") or cell == "system" else ("cgroup" if "cgroup" in cell else "pid")
         # Run-tree (v0.7.0): owned runs capture at cgroup scope; sigint
@@ -396,10 +397,12 @@ class BreadthTests(unittest.TestCase):
                 paths[key].write_text(text)
             paths["ledger"] = tmp / "ledger"
             paths["ledger"].write_text("\n".join(ledger) + "\n")
-            proc = subprocess.run([sys.executable, "-I", str(ORACLE),
-                                   "--cell", cell, *sum((["--" + key, str(path)]
-                                                        for key, path in paths.items()), [])],
-                                  capture_output=True, text=True, timeout=5)
+            args = [sys.executable, "-I", str(ORACLE),
+                    "--cell", cell, *sum((["--" + key, str(path)]
+                                         for key, path in paths.items()), [])]
+            if allow_66_discovery_gap:
+                args.append("--allow-66-discovery-gap")
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
         self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
         result = json.loads(proc.stdout)
         self.assertEqual(result["cell"], cell)
@@ -584,6 +587,83 @@ class BreadthTests(unittest.TestCase):
     def test_trace_cgroup_broken_loss_identity_fails(self):
         text = trace_stream(calls_per_function=7, event_loss=1, lost=0)
         self.run_case(cell="trace-cgroup", want=1, report_text=text)
+
+
+GAP_66_RECORD = {"name": "discovery subject", "reason": "discovery unavailable"}
+
+
+def gap_66(report, ledger, receipt):
+    """The exact 6.6 transient shape: exact counts plus one named honest gap."""
+    report["evidence"]["gap_classes"]["observation"] = {
+        "status": "lossy", "causes": ["skipped"]}
+    report["evidence"]["skipped"] = [dict(GAP_66_RECORD)]
+    report["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+
+
+class SelectEndpoint66GapTests(unittest.TestCase):
+    """6.6 select-endpoint-system transient: disclose exactly the named gap.
+
+    The 6.6 vng leg rarely reports PARTIAL with one redacted discovery
+    skip while every count stays exact; the harness passes
+    --allow-66-discovery-gap on 6.6 kernels only. The oracle must accept
+    exactly that record and fail anything else.
+    """
+    run_case = BreadthTests.run_case
+
+    def test_exact_gap_passes_with_disclosure_when_allowed(self):
+        result = self.run_case(gap_66, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True)
+        self.assertEqual(result["qualification"],
+                         "owned-provider-counts-with-66-discovery-gap")
+        self.assertIn("disclosed 6.6 discovery gap", result["detail"])
+        self.assertIn("discovery subject/discovery unavailable", result["detail"])
+
+    def test_exact_gap_fails_in_strict_mode(self):
+        result = self.run_case(gap_66, cell="select-endpoint-system", want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_second_gap_record_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["evidence"]["skipped"].append(dict(GAP_66_RECORD))
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_other_gap_reason_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["evidence"]["skipped"] = [
+                {"name": "discovery subject", "reason": "manifest object unavailable"}]
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_extra_cause_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["evidence"]["gap_classes"]["observation"]["causes"].append("event_loss")
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_count_drift_with_gap_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["functions"][0]["calls"] = 499
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertIn("owned target count differs", result["detail"])
+
+    def test_gap_flag_ignored_on_other_system_cells(self):
+        result = self.run_case(gap_66, cell="counter-counts-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_clean_cell_keeps_plain_qualification_when_allowed(self):
+        result = self.run_case(cell="select-endpoint-system",
+                               allow_66_discovery_gap=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts")
 
 
 PROVIDER = r'''

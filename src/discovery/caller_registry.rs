@@ -624,12 +624,9 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
         };
     };
     if ppid == 0 {
-        return CapturedLauncherChain {
-            ancestors: Vec::new(),
-            gap: None,
-            origin: LauncherOrigin::Chain,
-            unit: None,
-        };
+        // No parent in this pid namespace: a boundary like init, never
+        // an empty chain.
+        return init_parent();
     }
     if ppid == 1 {
         return init_parent();
@@ -637,17 +634,6 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
     let mut ancestors = Vec::new();
     let mut child_start_time = caller_start_time;
     loop {
-        if ancestors.len() >= LAUNCHER_CHAIN_DEPTH {
-            // The fourth ancestor's own stat line (already read) names a
-            // parent above it — otherwise the loop would have stopped
-            // cleanly — so the truncation is read evidence, not a guess.
-            return CapturedLauncherChain {
-                ancestors,
-                gap: Some(gap(LAUNCHER_GAP_TRUNCATED)),
-                origin: LauncherOrigin::Chain,
-                unit: None,
-            };
-        }
         if ppid == 0 {
             return CapturedLauncherChain {
                 ancestors,
@@ -702,6 +688,18 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
             return CapturedLauncherChain {
                 ancestors,
                 gap: None,
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
+        }
+        // The fifth link was statted, start-time checked and classified
+        // as a real ancestor above: more above is read evidence, not a
+        // guess, so keeping four truncates with the named gap.
+        // Boundaries stop before this check, so they never truncate.
+        if ancestors.len() >= LAUNCHER_CHAIN_DEPTH {
+            return CapturedLauncherChain {
+                ancestors,
+                gap: Some(gap(LAUNCHER_GAP_TRUNCATED)),
                 origin: LauncherOrigin::Chain,
                 unit: None,
             };

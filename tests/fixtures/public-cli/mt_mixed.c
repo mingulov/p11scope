@@ -5,6 +5,8 @@
  *   MODE: sessions (per-thread session) | shared (one session, mutex per
  *         iteration) | churn (two thread generations of ITERS/2 and
  *         ERRORS/2 each; both must be even)
+ *   MT_MIXED_HOLD=1: after LEDGER, hold for SIGTERM/SIGINT instead of
+ *         exiting (inventory capture windows; like cgroup-fork).
  *   GATE: path to wait for, or "-" for no wait (self-tests only)
  *   ERRORS: deliberate bogus-handle C_GenerateRandom calls per thread
  *
@@ -22,7 +24,10 @@
  * opens, i.e. after the observer attaches. Any unexpected return (a
  * should-succeed call failing, an error probe succeeding, an
  * inconsistent error code) exits nonzero with no LEDGER, so a sample
- * that did not run exactly as scripted can never count.
+ * that did not run exactly as scripted can never count. C_Finalize runs
+ * before LEDGER so the SCAFFOLD line (session open/close/finalize
+ * attempts, entry-side exact) completes the record inventory edge
+ * totals need.
  *
  * Reuse: mt_fork.c compiles this file with MT_MIXED_AS_LIB to run the
  * same workload in forked children; main() is skipped then.
@@ -30,6 +35,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -58,6 +64,13 @@ struct mt_counts {
     unsigned long ok[FNS];
     unsigned long err_rv;
     unsigned long err_n;
+    /* Session scaffolding, entry-side exact (retries included): the
+     * inventory edge totals count every through-table call, so the
+     * SCAFFOLD line reports these alongside the LEDGER. */
+    unsigned long opens_attempted;
+    unsigned long opens_ok;
+    unsigned long closes;
+    unsigned long finalizes;
 };
 
 struct mt_ctx {
@@ -186,27 +199,31 @@ static void mt_error_probes(struct mt_ctx *ctx, struct mt_counts *out, int error
     }
 }
 
-static CK_SESSION_HANDLE mt_open(struct mt_ctx *ctx)
+static CK_SESSION_HANDLE mt_open(struct mt_ctx *ctx, struct mt_counts *out)
 {
     CK_SESSION_HANDLE session = 0;
     /* Bounded retry: concurrent opens from many threads/processes on one
-     * token are occasionally refused; a retry only re-runs the unverified
-     * session scaffolding, never the ledgered calls. */
+     * token are occasionally refused. Every attempt is entry-side counted
+     * by observers, so every attempt is recorded, never just successes. */
     for (int i = 0; i < 200; i++) {
         CK_RV rv = F(ctx->fns, 12,
                      CK_RV (*)(CK_SLOT_ID, CK_ULONG, void *, void *, CK_SESSION_HANDLE *))(
             ctx->slot, CKF_SERIAL_SESSION | CKF_RW_SESSION, NULL, NULL, &session);
-        if (rv == CKR_OK)
+        out->opens_attempted++;
+        if (rv == CKR_OK) {
+            out->opens_ok++;
             return session;
+        }
         usleep(10000);
     }
     mt_die("C_OpenSession", 0);
     return 0;
 }
 
-static void mt_close(struct mt_ctx *ctx, CK_SESSION_HANDLE session)
+static void mt_close(struct mt_ctx *ctx, CK_SESSION_HANDLE session, struct mt_counts *out)
 {
     CK_RV rv = F(ctx->fns, 13, CK_RV (*)(CK_SESSION_HANDLE))(session);
+    out->closes++;
     if (rv != CKR_OK)
         mt_die("C_CloseSession", rv);
 }
@@ -226,7 +243,7 @@ static void *mt_worker(void *arg)
     CK_SESSION_HANDLE session = 0;
     int own = !wa->use_shared;
     if (own)
-        session = mt_open(ctx);
+        session = mt_open(ctx, wa->out);
     else
         session = ctx->shared;
     for (int i = 0; i < wa->iters; i++) {
@@ -241,7 +258,7 @@ static void *mt_worker(void *arg)
      * entry/return interleave. */
     mt_error_probes(ctx, wa->out, wa->errors);
     if (own)
-        mt_close(ctx, session);
+        mt_close(ctx, session, wa->out);
     return NULL;
 }
 
@@ -251,6 +268,10 @@ static void mt_add(struct mt_counts *sum, const struct mt_counts *add)
         sum->attempts[i] += add->attempts[i];
         sum->ok[i] += add->ok[i];
     }
+    sum->opens_attempted += add->opens_attempted;
+    sum->opens_ok += add->opens_ok;
+    sum->closes += add->closes;
+    sum->finalizes += add->finalizes;
     if (add->err_n > 0) {
         if (sum->err_n > 0 && sum->err_rv != add->err_rv)
             mt_die("inconsistent error code across threads", add->err_rv);
@@ -293,9 +314,9 @@ static void mt_run(struct mt_ctx *ctx, int mode, struct mt_counts *sum)
     if (mode == 1) {
         if (pthread_mutex_init(&ctx->lock, NULL) != 0)
             mt_die("mutex_init", 0);
-        ctx->shared = mt_open(ctx);
+        ctx->shared = mt_open(ctx, sum);
         mt_run_threads(ctx, ctx->iters, ctx->errors, 1, sum);
-        mt_close(ctx, ctx->shared);
+        mt_close(ctx, ctx->shared, sum);
     } else if (mode == 2) {
         if (ctx->iters % 2 != 0 || ctx->errors % 2 != 0)
             mt_die("churn needs even ITERS and ERRORS", 0);
@@ -309,7 +330,8 @@ static void mt_run(struct mt_ctx *ctx, int mode, struct mt_counts *sum)
 }
 
 static void mt_verify(const struct mt_counts *sum, unsigned long threads, unsigned long iters,
-                      unsigned long errors_per_thread)
+                      unsigned long errors_per_thread, unsigned long opens_ok_want,
+                      unsigned long finalizes_want)
 {
     for (int i = 0; i < FNS; i++) {
         unsigned long want = threads * iters + (i == 0 ? threads * errors_per_thread : 0);
@@ -325,6 +347,13 @@ static void mt_verify(const struct mt_counts *sum, unsigned long threads, unsign
     }
     if (sum->err_n != threads * errors_per_thread) {
         fprintf(stderr, "mt_mixed: errors=%lu want=%lu\n", sum->err_n, threads * errors_per_thread);
+        exit(1);
+    }
+    if (sum->opens_ok != opens_ok_want || sum->closes != opens_ok_want ||
+        sum->opens_attempted < opens_ok_want || sum->finalizes != finalizes_want) {
+        fprintf(stderr,
+                "mt_mixed: scaffolding inconsistent: attempted=%lu ok=%lu closes=%lu finalizes=%lu\n",
+                sum->opens_attempted, sum->opens_ok, sum->closes, sum->finalizes);
         exit(1);
     }
 }
@@ -348,6 +377,11 @@ static void mt_emit_ledger(const struct mt_counts *sum)
         printf("}}");
     }
     printf("]}\n");
+    /* Scaffolding is a separate line (not LEDGER functions): the profile
+     * oracle matches LEDGER rows to TARGETs exactly, while the inventory
+     * edge totals need every through-table call including scaffolding. */
+    printf("SCAFFOLD {\"opens_attempted\":%lu,\"opens_ok\":%lu,\"closes\":%lu,\"finalizes\":%lu}\n",
+           sum->opens_attempted, sum->opens_ok, sum->closes, sum->finalizes);
     fflush(stdout);
 }
 
@@ -380,9 +414,14 @@ static void mt_setup(void ***fns_out, CK_SLOT_ID *slot_out, const char *module)
     *slot_out = slots[0];
 }
 
-static void mt_finalize(void **fns)
+static void mt_finalize(void **fns, struct mt_counts *out)
 {
-    CK_RV rv = F(fns, 1, CK_RV (*)(void *))(NULL);
+    CK_RV rv;
+    /* Recorded before the call: a failure dies with no LEDGER, so an
+     * emitted count always matches the observer's entry-side count. */
+    if (out)
+        out->finalizes++;
+    rv = F(fns, 1, CK_RV (*)(void *))(NULL);
     if (rv != CKR_OK)
         mt_die("C_Finalize", rv);
 }
@@ -393,6 +432,24 @@ static void mt_wait_gate(const char *gate)
         return;
     while (access(gate, F_OK) != 0)
         usleep(10000);
+}
+
+static void mt_hold_if_asked(void)
+{
+    const char *hold = getenv("MT_MIXED_HOLD");
+    if (!hold || strcmp(hold, "1"))
+        return;
+    {
+        sigset_t mask, old;
+        int sig = 0;
+        sigemptyset(&mask);
+        sigaddset(&mask, SIGTERM);
+        sigaddset(&mask, SIGINT);
+        pthread_sigmask(SIG_BLOCK, &mask, &old);
+        while (sig != SIGTERM && sig != SIGINT)
+            sigwait(&mask, &sig);
+        pthread_sigmask(SIG_SETMASK, &old, NULL);
+    }
 }
 
 #ifndef MT_MIXED_AS_LIB
@@ -434,9 +491,13 @@ int main(int argc, char **argv)
     fflush(stdout);
     mt_wait_gate(argv[4]);
     mt_run(&ctx, mode, &sum);
-    mt_verify(&sum, (unsigned long)threads, (unsigned long)iters, (unsigned long)errors);
+    /* Finalize before LEDGER so the SCAFFOLD line carries the complete
+     * entry-side record; the hold keeps the mapping (not the session). */
+    mt_finalize(ctx.fns, &sum);
+    mt_verify(&sum, (unsigned long)threads, (unsigned long)iters, (unsigned long)errors,
+              mode == 1 ? 1 : (unsigned long)threads * (mode == 2 ? 2 : 1), 1);
     mt_emit_ledger(&sum);
-    mt_finalize(ctx.fns);
+    mt_hold_if_asked();
     return 0;
 }
 #endif

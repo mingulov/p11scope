@@ -12,6 +12,7 @@ import os
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -821,7 +822,17 @@ def parse_mt_output(text):
     targets = [json.loads(line[7:]) for line in lines if line.startswith("TARGET ")]
     ready = [line for line in lines if line.startswith("READY pid=")]
     ledgers = [json.loads(line[7:]) for line in lines if line.startswith("LEDGER ")]
-    return targets, ready, ledgers
+    scaffolds = [json.loads(line[9:]) for line in lines if line.startswith("SCAFFOLD ")]
+    return targets, ready, ledgers, scaffolds
+
+
+def check_mt_scaffold(testcase, scaffolds, opens_ok):
+    testcase.assertEqual(len(scaffolds), 1)
+    row = scaffolds[0]
+    testcase.assertEqual(row["opens_ok"], opens_ok)
+    testcase.assertEqual(row["closes"], opens_ok)
+    testcase.assertEqual(row["finalizes"], 1)
+    testcase.assertGreaterEqual(row["opens_attempted"], opens_ok)
 
 
 def check_mt_ledger(testcase, ledger, pid, calls, errors):
@@ -876,25 +887,28 @@ class MtFixtureTests(unittest.TestCase):
     def test_sessions_mode_ledgers_exact_totals(self):
         proc = self.run_mixed(self.module, "8", "50", str(self.gate), "sessions", "3")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        targets, ready, ledgers = parse_mt_output(proc.stdout)
+        targets, ready, ledgers, scaffolds = parse_mt_output(proc.stdout)
         self.assertEqual({row["name"] for row in targets}, set(MT_NAMES))
         self.assertEqual(len(ready), 1)
         self.assertEqual(len(ledgers), 1)
         check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 8 * 3)
+        check_mt_scaffold(self, scaffolds, 8)
 
     def test_shared_mode_ledgers_exact_totals(self):
         proc = self.run_mixed(self.module, "8", "50", str(self.gate), "shared", "0")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        _, ready, ledgers = parse_mt_output(proc.stdout)
+        _, ready, ledgers, scaffolds = parse_mt_output(proc.stdout)
         self.assertEqual(len(ledgers), 1)
         check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 0)
+        check_mt_scaffold(self, scaffolds, 1)
 
     def test_churn_mode_ledgers_exact_totals(self):
         proc = self.run_mixed(self.module, "8", "50", str(self.gate), "churn", "2")
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        _, ready, ledgers = parse_mt_output(proc.stdout)
+        _, ready, ledgers, scaffolds = parse_mt_output(proc.stdout)
         self.assertEqual(len(ledgers), 1)
         check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 8 * 2)
+        check_mt_scaffold(self, scaffolds, 16)
 
     def test_churn_rejects_odd_iterations(self):
         proc = self.run_mixed(self.module, "8", "51", str(self.gate), "churn", "0")
@@ -912,18 +926,64 @@ class MtFixtureTests(unittest.TestCase):
         self.assertNotEqual(proc.returncode, 0)
         self.assertNotIn("LEDGER ", proc.stdout)
 
+    def test_hold_waits_for_sigterm_after_ledger(self):
+        env = dict(os.environ, MT_MIXED_HOLD="1")
+        proc = subprocess.Popen([str(self.tmp / "mt_mixed"), str(self.module),
+                                 "4", "10", str(self.gate), "sessions", "0"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        try:
+            stdout, _ = proc.communicate(timeout=3)
+            self.fail("held workload exited without a signal: rc=%d" % proc.returncode)
+        except subprocess.TimeoutExpired:
+            pass
+        self.assertIsNone(proc.poll(), "held workload exited without a signal")
+        proc.terminate()
+        stdout, _ = proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, ready, ledgers, scaffolds = parse_mt_output(stdout)
+        self.assertEqual(len(ledgers), 1)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 4 * 10, 0)
+        check_mt_scaffold(self, scaffolds, 4)
+
+    def test_fork_hold_keeps_children_alive_for_passes(self):
+        env = dict(os.environ, MT_MIXED_HOLD="1")
+        proc = subprocess.Popen([str(self.tmp / "mt_fork"), str(self.module),
+                                 "2", "4", "25", str(self.gate), "2"],
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                text=True, env=env)
+        try:
+            time.sleep(2)
+            self.assertIsNone(proc.poll(), "held fork parent exited without a signal")
+            kids = set()
+            for task in Path("/proc/%d/task" % proc.pid).iterdir():
+                kids.update((task / "children").read_text().split())
+            self.assertEqual(len(kids), 2, "held children are not both alive")
+            proc.terminate()
+            stdout, _ = proc.communicate(timeout=10)
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+                proc.communicate(timeout=10)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, ready, ledgers, scaffolds = parse_mt_output(stdout)
+        self.assertEqual(len(ledgers), 1)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 2 * 4 * 25, 2 * 4 * 2)
+        check_mt_scaffold(self, scaffolds, 2 * 4)
+
     def test_fork_merges_multiprocess_totals(self):
         proc = subprocess.run([str(self.tmp / "mt_fork"), str(self.module),
                                "2", "4", "25", str(self.gate), "2"],
                               capture_output=True, text=True, timeout=60)
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        targets, ready, ledgers = parse_mt_output(proc.stdout)
+        targets, ready, ledgers, scaffolds = parse_mt_output(proc.stdout)
         self.assertEqual({row["name"] for row in targets}, set(MT_NAMES))
         self.assertEqual(len(ready), 1)
         self.assertEqual(len(ledgers), 1)
         children = [line for line in proc.stdout.splitlines() if line.startswith("CHILD pid=")]
         self.assertEqual(len(children), 2)
         check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 2 * 4 * 25, 2 * 4 * 2)
+        check_mt_scaffold(self, scaffolds, 2 * 4)
 
 
 class MtOracleTests(unittest.TestCase):

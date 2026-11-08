@@ -642,6 +642,78 @@ class BrowserCells(unittest.TestCase):
         strays = [p for p in (caller_home / ".pki", caller_home / ".local") if p.exists()]
         self.assertEqual(strays, [], f"browser NSS state leaked into caller HOME: {strays}")
 
+    def _capture_launch_env(self, browser, register_module):
+        """Launch ``browser`` against a fake Playwright; return its env.
+
+        No browser, profiler, policy install (``auto_select_cert=False``),
+        or NSS seeding (``nss_credential=None``): only the profile/HOME
+        setup and the ``env=`` the real browser would inherit.
+        """
+        captured: dict = {}
+
+        class FakeContext:
+            def close(self):
+                pass
+
+        class FakeBrowserType:
+            def launch_persistent_context(self, *args, **kwargs):
+                captured["env"] = dict(kwargs.get("env") or {})
+                return FakeContext()
+
+        class FakePlaywright:
+            def __init__(self):
+                self.firefox = FakeBrowserType()
+                self.chromium = FakeBrowserType()
+
+        context, _match, _profile = cells.launch_browser_context(
+            FakePlaywright(), browser, self.work / "cell",
+            register_module=register_module, auto_select_cert=False,
+            nss_credential=None)
+        context.close()
+        return captured["env"]
+
+    def test_launch_without_registered_module_scrubs_store_env(self):
+        """Twin: an unregistered launch must not leak SOFTHSM2_CONF.
+
+        Chromium always maps the system-registered SoftHSM module via
+        p11-kit; when the browser inherits SOFTHSM2_CONF pointing at a
+        store whose token holds a client certificate, that PIN-locked
+        cert joins the selection set and auto-presentation stalls
+        (fedora: presented=0 with the variable exported, presented>=1
+        without, identical harness). A launch with no registered
+        module needs no store pointer, so both browsers must scrub it.
+        """
+        sentinel = str(self.work / "bg-store" / "softhsm.conf")
+        with patch.dict(os.environ, {"SOFTHSM2_CONF": sentinel}):
+            for browser in ("firefox", "chromium"):
+                with self.subTest(browser=browser):
+                    env = self._capture_launch_env(browser, None)
+                    # Fixed message: never echo the captured env (values).
+                    if "SOFTHSM2_CONF" in env:
+                        self.fail(
+                            f"{browser} inherits a store pointer with no "
+                            f"module registered (client-cert selection "
+                            f"poisoned)")
+
+    def test_launch_with_registered_module_keeps_store_env(self):
+        """Guard: a registered launch keeps its SOFTHSM2_CONF (no over-scrub).
+
+        The attach-drive PKCS#11 cells register the SoftHSM module in
+        the fresh profile and point the browser at its store on
+        purpose; the scrub must only apply to unregistered launches.
+        """
+        sentinel = str(self.work / "cell-store" / "softhsm.conf")
+        module = self.work / "cell-store" / "libsofthsm2.so"
+        with patch.dict(os.environ, {"SOFTHSM2_CONF": sentinel}):
+            for browser in ("firefox", "chromium"):
+                with self.subTest(browser=browser):
+                    env = self._capture_launch_env(browser, module)
+                    # Fixed message: never echo the captured env (values).
+                    if env.get("SOFTHSM2_CONF") != sentinel:
+                        self.fail(
+                            f"{browser} lost the store pointer its "
+                            f"registered module needs")
+
     def _run_readiness_probe(self, marker_delay, grace_seconds=2):
         """Run attach_drive against a scripted profiler.
 

@@ -8,19 +8,19 @@ use crate::attach::capture::{
     AttachedEndpoint, CallerCountUpdate, CaptureHealth, CapturePhase, DomainCookie, ExecCoverage,
     WitnessRow,
 };
+use crate::capacity::InventoryBudget;
 use crate::discovery::caller_registry::tests::ScriptedSource;
 use crate::discovery::caller_registry::{CallerId, ExeIdentity, RegistryLimits, UseCoverage};
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory::image_guard::{ImageAcquisition, ScriptedAcquisition};
 use crate::discovery::hooks::HookRegistry;
-use crate::capacity::InventoryBudget;
 use crate::discovery::inventory_attach_set::AttachEndpoint;
 use crate::discovery::inventory_attach_set::InventoryAttachSet;
 use crate::discovery::inventory_attach_set::tests as fx;
-use crate::plan::AdmissionPolicy;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::native_binding::UnboundReason;
 use crate::fixture_guard::DieWithParent as _;
+use crate::plan::AdmissionPolicy;
 use p11scope_ebpf_common::ImageIdentity;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -1511,7 +1511,7 @@ impl LaneHost<Pin> for ReverseOrderHost {
     fn note_native_lane(&mut self) {}
     fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
     fn note_refresh_loss(&mut self, _reason: String) {}
-    fn order_drain_targets(&self, endpoints: &mut Vec<AttachEndpoint>) {
+    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint]) {
         endpoints.reverse();
     }
 }
@@ -1531,10 +1531,9 @@ fn extend_sends_the_host_drain_order() {
         set,
         delta: absorbed.delta,
     };
-    let mut lane =
-        NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
-            .map_err(|(_, reason)| reason)
-            .unwrap();
+    let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
     lane.after_pass(&mut host);
     let log_entries = entries(&log);
     assert!(

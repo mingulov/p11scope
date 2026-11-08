@@ -476,7 +476,7 @@ pub(crate) trait LaneHost<Pin> {
     /// the deferred backlog plus the fresh delta, merged. Defaults to
     /// the merged (ID) order; the coordinator sorts smallest-module-first
     /// so a late small provider is not stuck behind a huge plan.
-    fn order_drain_targets(&self, _endpoints: &mut Vec<AttachEndpoint>) {}
+    fn order_drain_targets(&self, _endpoints: &mut [AttachEndpoint]) {}
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(
         &mut self,
@@ -532,7 +532,7 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
         InventoryCoordinator::take_target_delta(self)
     }
 
-    fn order_drain_targets(&self, endpoints: &mut Vec<AttachEndpoint>) {
+    fn order_drain_targets(&self, endpoints: &mut [AttachEndpoint]) {
         self.attach_set().sort_drain_order(endpoints);
     }
 
@@ -823,6 +823,7 @@ impl<L> NativeLane<L> {
     {
         let mut delta = std::mem::take(&mut self.backlog);
         delta.append(host.take_target_delta());
+        host.order_drain_targets(&mut delta.endpoints);
         let receipt = self
             .capture
             .extend(delta, host.capture_targets(), self.windows.extend());

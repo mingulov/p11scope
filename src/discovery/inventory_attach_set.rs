@@ -202,8 +202,9 @@ impl TargetDelta {
         self.endpoints.is_empty() && self.objects.is_empty()
     }
 
-    /// Appends a later pass's delta. IDs only grow, so the result stays in
-    /// ID order.
+    /// Appends a later pass's delta. IDs only grow; the merged window's
+    /// attempt order is decided at extend time (`sort_drain_order`), not
+    /// by this concatenation.
     pub(crate) fn append(&mut self, mut later: TargetDelta) {
         self.endpoints.append(&mut later.endpoints);
         self.objects.append(&mut later.objects);
@@ -595,7 +596,16 @@ impl InventoryAttachSet {
     /// module claims drain last. This decides only the attempt order
     /// within one window, never what attaches: deferred tails keep their
     /// relative order and merge ahead of new arrivals upstream.
-    pub(crate) fn sort_drain_order(&self, _endpoints: &mut Vec<AttachEndpoint>) {}
+    pub(crate) fn sort_drain_order(&self, endpoints: &mut [AttachEndpoint]) {
+        endpoints.sort_by_key(|endpoint| {
+            let size = self
+                .modules_with_member(endpoint.id)
+                .filter_map(|module| self.module_endpoints(module))
+                .min()
+                .unwrap_or(usize::MAX);
+            (size, endpoint.id.0)
+        });
+    }
 }
 
 // Private preparation ceilings. Existing state remains bounded by InventoryBudget.
@@ -2301,18 +2311,12 @@ pub(crate) mod tests {
             "discovery order keeps the big module first"
         );
         set.sort_drain_order(&mut endpoints);
-        let ids: Vec<u32> = endpoints
-            .iter()
-            .map(|endpoint| endpoint.id.0)
-            .collect();
+        let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
         let small_ids: Vec<u32> = (40..42).collect();
         let big_ids: Vec<u32> = (0..40).collect();
         assert_eq!(
             ids,
-            small_ids
-                .into_iter()
-                .chain(big_ids)
-                .collect::<Vec<_>>(),
+            small_ids.into_iter().chain(big_ids).collect::<Vec<_>>(),
             "the small module drains first, ID order holds within each module"
         );
     }

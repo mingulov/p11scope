@@ -338,6 +338,12 @@ pub(crate) struct InventoryAttachSet {
     /// is admitted for. Exactly the recorded memberships, so bounded the
     /// same way.
     by_member: BTreeMap<EndpointId, BTreeSet<AttachModuleKey>>,
+    /// Per-endpoint smallest admitting-module size, by endpoint ID: the
+    /// drain-order key independent of the membership bound (`record_module`
+    /// keeps the minimum every admission saw, even one it cannot record).
+    /// Exactly one entry per endpoint (`usize::MAX` until first admitted),
+    /// so bounded by the endpoint budget like `endpoints`.
+    drain_hint: Vec<usize>,
     /// `(module, refusal kind)` pairs already recorded as a gap, bounded
     /// by the endpoint budget; past the bound one overflow gap is
     /// recorded and further refusals live in module verdicts only.
@@ -368,6 +374,7 @@ impl InventoryAttachSet {
             modules: BTreeMap::new(),
             memberships: 0,
             by_member: BTreeMap::new(),
+            drain_hint: Vec::new(),
             reported: BTreeSet::new(),
             reported_overflow: false,
             endpoint_refusals: 0,
@@ -594,14 +601,23 @@ impl InventoryAttachSet {
     /// Drain order for one extend window: smallest-module-first
     /// (shortest-job-first), endpoint-ID tiebreak. Endpoints no admitted
     /// module claims drain last. This decides only the attempt order
-    /// within one window, never what attaches: deferred tails keep their
-    /// relative order and merge ahead of new arrivals upstream.
+    /// within one window, never what attaches: the backlog merges ahead
+    /// of the fresh delta as sort input, and the sort then interleaves
+    /// both by (size, id), so a fresh small module sorts ahead of an old
+    /// giant tail.
     pub(crate) fn sort_drain_order(&self, endpoints: &mut [AttachEndpoint]) {
         endpoints.sort_by_key(|endpoint| {
-            let size = self
-                .modules_with_member(endpoint.id)
-                .filter_map(|module| self.module_endpoints(module))
-                .min()
+            let hinted = self
+                .drain_hint
+                .get(endpoint.id.0 as usize)
+                .copied()
+                .filter(|hint| *hint != usize::MAX);
+            let size = hinted
+                .or_else(|| {
+                    self.modules_with_member(endpoint.id)
+                        .filter_map(|module| self.module_endpoints(module))
+                        .min()
+                })
                 .unwrap_or(usize::MAX);
             (size, endpoint.id.0)
         });
@@ -1771,6 +1787,7 @@ impl InventoryAttachSet {
                 .insert((retained, file_offset), endpoint.id);
             self.invalidate_count_memberships();
             self.endpoints.push(endpoint);
+            self.drain_hint.push(usize::MAX);
             delta.endpoints.push(endpoint);
         }
         Ok(())
@@ -1803,7 +1820,13 @@ impl InventoryAttachSet {
 
     /// Replaces one module's record. Past the membership bound the module
     /// stays admitted with its count, but its membership is unrecorded.
+    /// The drain hint still learns this admission's size, so an unrecorded
+    /// small module keeps its SJF priority.
     fn record_module(&mut self, key: &AttachModuleKey, endpoints: usize, members: Vec<EndpointId>) {
+        for member in &members {
+            let hint = &mut self.drain_hint[member.0 as usize];
+            *hint = (*hint).min(endpoints);
+        }
         let previous = self
             .modules
             .get(key)
@@ -2318,6 +2341,59 @@ pub(crate) mod tests {
             ids,
             small_ids.into_iter().chain(big_ids).collect::<Vec<_>>(),
             "the small module drains first, ID order holds within each module"
+        );
+    }
+
+    #[test]
+    fn drain_order_keeps_a_small_module_first_past_the_membership_bound() {
+        // Budget 16: membership bound 64. P holds 8 endpoints; seven
+        // forwarders each target all eight (64 memberships, exactly the
+        // bound); then a 1-endpoint module S is admitted but unrecorded.
+        let dir = tempfile::tempdir().unwrap();
+        let p = provider(&dir, "p.so", "provider-p");
+        let forwarders: Vec<PathBuf> = (0..7)
+            .map(|index| provider(&dir, &format!("f{index}.so"), &format!("forwarder-{index}")))
+            .collect();
+        let s = provider(&dir, "s.so", "provider-s");
+        let mut set = InventoryAttachSet::new(budget(16));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let mut files: Vec<(&Path, String)> = vec![(p.as_path(), "sha-p".into())];
+        files.extend(
+            forwarders
+                .iter()
+                .enumerate()
+                .map(|(index, path)| (path.as_path(), format!("sha-f{index}"))),
+        );
+        files.push((s.as_path(), "sha-s".into()));
+        let borrowed: Vec<(&Path, &str)> = files
+            .iter()
+            .map(|(path, sha)| (*path, sha.as_str()))
+            .collect();
+        let pins = pass_pins(&borrowed);
+        let targets: Vec<(&Path, u64)> = offsets(8).into_iter().map(|o| (p.as_path(), o)).collect();
+        let mut modules = vec![module(&pins, &p, &offsets(8))];
+        modules.extend(
+            forwarders
+                .iter()
+                .map(|path| module_with_targets(&pins, path, &targets)),
+        );
+        modules.push(module(&pins, &s, &[0x3000]));
+        let absorbed = set.absorb(&lower_named(&modules, &pins, policy), &pins);
+        assert_eq!(set.len(), 9, "P holds 8 endpoints, S holds 1");
+        assert_eq!(set.memberships, 64, "the bound is exactly saturated");
+        assert_eq!(
+            set.module_members(&key_in(&pins, &s)),
+            Some(ModuleMembers::Unrecorded),
+            "S is admitted past the bound, so its membership is unrecorded"
+        );
+        let mut endpoints = absorbed.delta.endpoints;
+        assert_eq!(endpoints.len(), 9);
+        set.sort_drain_order(&mut endpoints);
+        let ids: Vec<u32> = endpoints.iter().map(|endpoint| endpoint.id.0).collect();
+        assert_eq!(
+            ids,
+            vec![8, 0, 1, 2, 3, 4, 5, 6, 7],
+            "the 1-endpoint module drains first even though it is unrecorded: {ids:?}"
         );
     }
 

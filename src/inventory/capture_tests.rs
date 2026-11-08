@@ -1486,6 +1486,7 @@ fn activation_extend_carries_pending_prearm_delta() {
 struct ReverseOrderHost {
     set: InventoryAttachSet,
     delta: TargetDelta,
+    start_pending: bool,
 }
 
 impl LaneHost<Pin> for ReverseOrderHost {
@@ -1493,6 +1494,9 @@ impl LaneHost<Pin> for ReverseOrderHost {
     fn abandon_capture_coverage(&mut self) {}
     fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
     fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+    fn has_pending_targets(&self) -> bool {
+        self.start_pending
+    }
     fn take_target_delta(&mut self) -> TargetDelta {
         std::mem::take(&mut self.delta)
     }
@@ -1530,6 +1534,7 @@ fn extend_sends_the_host_drain_order() {
     let mut host = ReverseOrderHost {
         set,
         delta: absorbed.delta,
+        start_pending: false,
     };
     let mut lane = NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
         .map_err(|(_, reason)| reason)
@@ -1539,6 +1544,82 @@ fn extend_sends_the_host_drain_order() {
     assert!(
         log_entries.iter().any(|entry| entry == "extend[3,2,1,0]"),
         "the pass extend carries the host-ordered endpoints: {log_entries:?}"
+    );
+}
+
+/// The activation extend carries the host's drain order over its pending
+/// pre-arm delta, not endpoint-ID order: a big pre-arm must not delay
+/// smallest-module-first by a window.
+#[test]
+fn activation_extend_uses_the_host_drain_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fx::provider(&dir, "a.so", "provider-a");
+    let pins = fx::pass_pins(&[(&a, "sha-a")]);
+    let mut set = InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap());
+    let policy = AdmissionPolicy::Inventory(set.budget());
+    let modules = [fx::module(&pins, &a, &[0x1000, 0x1010, 0x1020, 0x1030])];
+    let absorbed = set.absorb(&fx::lower_named(&modules, &pins, policy), &pins);
+    assert_eq!(absorbed.delta.endpoints.len(), 4);
+    let log = Log::default();
+    let mut host = ReverseOrderHost {
+        set,
+        delta: absorbed.delta,
+        start_pending: true,
+    };
+    NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    let log_entries = entries(&log);
+    assert!(
+        log_entries.iter().any(|entry| entry == "extend[3,2,1,0]"),
+        "the activating extend carries the host-ordered pending delta: {log_entries:?}"
+    );
+}
+
+/// A workload born mid-run sorts into the merged window: the pass extend
+/// orders the deferred backlog plus the fresh delta together, not the
+/// fresh arrivals behind the whole old backlog.
+#[test]
+fn mid_run_arrivals_merge_with_the_deferred_backlog_in_host_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fx::provider(&dir, "a.so", "provider-a");
+    let pins = fx::pass_pins(&[(&a, "sha-a")]);
+    let mut set = InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap());
+    let policy = AdmissionPolicy::Inventory(set.budget());
+    let modules = [fx::module(&pins, &a, &[0x1000, 0x1010, 0x1020, 0x1030])];
+    let absorbed = set.absorb(&fx::lower_named(&modules, &pins, policy), &pins);
+    assert_eq!(absorbed.delta.endpoints.len(), 4);
+    let mut first = absorbed.delta.endpoints;
+    let fresh = first.split_off(2);
+    let log = Log::default();
+    let mut host = ReverseOrderHost {
+        set,
+        delta: TargetDelta {
+            endpoints: first,
+            objects: Vec::new(),
+        },
+        start_pending: false,
+    };
+    let mut scripted = ScriptedLane::new(&log);
+    scripted.defer_next = 1;
+    let mut lane = NativeLane::start(scripted, &mut host, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    lane.after_pass(&mut host);
+    assert!(
+        entries(&log).iter().any(|entry| entry == "extend[1,0]"),
+        "the first pass orders its window and defers one endpoint: {:?}",
+        entries(&log)
+    );
+    host.delta = TargetDelta {
+        endpoints: fresh,
+        objects: Vec::new(),
+    };
+    lane.after_pass(&mut host);
+    let log_entries = entries(&log);
+    assert!(
+        log_entries.iter().any(|entry| entry == "extend[3,2,0]"),
+        "the second pass orders the deferred backlog and fresh arrivals together: {log_entries:?}"
     );
 }
 

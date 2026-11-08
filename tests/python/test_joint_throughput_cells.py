@@ -31,7 +31,7 @@ def run_script(argv, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
                            "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS",
-                           "JOINT_KEYOPS", "INTRUDER_AT", "INTRUDER_INIT",
+                           "JOINT_KEYOPS", "JOINT_NICE", "INTRUDER_AT", "INTRUDER_INIT",
                            "INTRUDER_HOLD", "INTRUDER_COUNT", "INTRUDER_COPY")}
     if env:
         base.update(env)
@@ -47,7 +47,7 @@ def run_sourced(shell, env=None, timeout=60):
     base = {key: value for key, value in os.environ.items()
             if key not in ("RATE", "DURATION", "MIN_RATE", "CELLS",
                            "SOFTHSM_LIB", "OBS_MARGIN", "SETTLEMENT_LAT", "STAGE_TIMINGS",
-                           "JOINT_KEYOPS", "INTRUDER_AT", "INTRUDER_INIT",
+                           "JOINT_KEYOPS", "JOINT_NICE", "INTRUDER_AT", "INTRUDER_INIT",
                            "INTRUDER_HOLD", "INTRUDER_COUNT", "INTRUDER_COPY")}
     if env:
         base.update(env)
@@ -157,6 +157,18 @@ class CellScriptLibrary(unittest.TestCase):
         self.assertEqual(proc.stdout.strip().splitlines(),
                          ["P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1",
                           "P11SCOPE_STAGE_TIMINGS=1"])
+
+    def test_observer_nice_flags_default_override_and_empty(self):
+        proc = run_sourced('observer_nice_flags', env={})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "-n -5")
+        proc = run_sourced('observer_nice_flags',
+                           env={"JOINT_NICE": "-n 0"})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "-n 0")
+        proc = run_sourced('observer_nice_flags', env={"JOINT_NICE": ""})
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        self.assertEqual(proc.stdout.strip(), "")
 
     def test_start_intruder_is_off_unless_requested(self):
         with tempfile.TemporaryDirectory(prefix="jtp-intr-") as tmp:

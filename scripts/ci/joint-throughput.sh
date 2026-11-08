@@ -45,6 +45,10 @@
 #             =1 enables stage-timing telemetry in the observer,
 #             including the lifecycle ring high-water mark on the
 #             stop line (default unset records nothing)
+#   JOINT_NICE
+#             nice flags for the joint observer (default "-n -5";
+#             empty runs at default priority for without-nice
+#             control cells). The S1 twin always runs unniced.
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -133,6 +137,12 @@ observer_env() {
     if [ "${STAGE_TIMINGS:-0}" = "1" ]; then
         echo "P11SCOPE_STAGE_TIMINGS=1"
     fi
+}
+
+# Nice flags for the joint observer: JOINT_NICE overrides the level
+# (empty runs at default priority for without-nice control cells).
+observer_nice_flags() {
+    printf '%s\n' "${JOINT_NICE--n -5}"
 }
 
 # Print the provider path, or nothing when no candidate exists.
@@ -642,11 +652,13 @@ run_joint_cell() {
     # The lock fd is inherited; run sudo directly under the held lock.
     # Stdout stays unprivileged by design (the -o outputs are chmodded
     # after the run); shellcheck SC2024 does not apply.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line.
     # The drain keeps up with 10k/s only with steady CPU: run the
     # observer (and the threads it spawns) one step above best-effort
-    # so a contended host cannot starve the ring drain.
-    sudo -n env $(observer_env) nice -n -5 "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
+    # so a contended host cannot starve the ring drain. JOINT_NICE
+    # overrides the level (empty runs at default priority); without-nice
+    # control cells compare against this default.
+    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line; observer_nice_flags is empty or nice flags.
+    sudo -n env $(observer_env) nice $(observer_nice_flags) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
         $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
         --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
     echo $! > "$dir/observer.pid"

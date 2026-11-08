@@ -69,7 +69,13 @@ NATIVE = ("no settled expected native image for this caller in the "
 
 
 def overlay_report():
-    """The exact 0-module overlay signature (CI guest shape)."""
+    """The exact 0-module overlay signature (CI guest shape).
+
+    Post-fix shape: the unproven member gaps no longer incomplete
+    the shared transaction, so 'cgroup member scan was incomplete'
+    is NOT part of the signature — its reappearance must fail loudly
+    as an extra gap, never hide inside expected-failure.
+    """
     return {
         "schema": "p11scope/inventory/v1",
         "scope": "cgroup",
@@ -79,10 +85,6 @@ def overlay_report():
         "gaps": [
             {"caller": "c0", "module": None, "pid": 100,
              "reason": UNPROVEN_DIAGNOSED, "subject": MODPATH, "repeats": 12},
-            {"caller": None, "module": None, "pid": None,
-             "reason": "cgroup member scan was incomplete",
-             "subject": "cgroup scope transaction incomplete",
-             "repeats": 24},
             {"caller": "c0", "module": None, "pid": 100,
              "reason": NATIVE, "subject": "native owner activation refused",
              "repeats": 11},
@@ -407,6 +409,18 @@ class InventoryOverlayTests(unittest.TestCase):
                              "reason": "something new",
                              "subject": "novel gap", "repeats": 1})
         cases.append(("extra-gap", extra, "overlayfs",
+                      "overlay unproven extra gap"))
+        # The pre-fix truncation symptom: unproven member gaps used to
+        # incomplete the shared transaction. Post-fix they degrade per
+        # caller, so this reason must fail loudly here (a regression
+        # signal for the cgroup-scan lane), never classify as
+        # expected-failure.
+        trunc = overlay_report()
+        trunc["gaps"].append({"caller": None, "module": None, "pid": None,
+                             "reason": "cgroup member scan was incomplete",
+                             "subject": "cgroup scope transaction incomplete",
+                             "repeats": 24})
+        cases.append(("truncated-transaction", trunc, "overlayfs",
                       "overlay unproven extra gap"))
         subject = overlay_report()
         subject["gaps"][0]["subject"] = "/some/other/path.so"

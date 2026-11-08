@@ -550,6 +550,42 @@ fn map_file_identity(start: u64, end: u64) -> std::result::Result<(u64, u64), St
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Backing-vs-backing acceptance for an overlay split: the BPF slot
+/// carries the backing inode while the mapped-range identity carries
+/// the overlay (xino) inode, so direct equality can never hold there.
+/// Every layer file (upper first, then the lower stack) is a backing
+/// file, so its fstat inode is directly comparable to the slot —
+/// like-for-like kernel identities, never fstat against maps.
+/// `mountinfo` overrides the live observer table for tests; `None`
+/// reads `/proc/self/mountinfo`. Fail closed: unreadable tables,
+/// unstatable candidates, escapes and non-overlay paths all refuse.
+fn calibration_backing_accepted(
+    merged: &std::path::Path,
+    slot_ino: u64,
+    mountinfo: Option<&str>,
+) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+    let owned;
+    let table = match mountinfo {
+        Some(text) => text,
+        None => {
+            owned = std::fs::read_to_string("/proc/self/mountinfo").unwrap_or_default();
+            &owned
+        }
+    };
+    let merged = std::fs::canonicalize(merged).unwrap_or_else(|_| merged.to_path_buf());
+    let mut layers = Vec::new();
+    if let Some(upper) = crate::discovery::scan::upper_candidate_from_mountinfo(table, &merged) {
+        layers.push(upper);
+    }
+    layers.extend(crate::discovery::scan::lower_candidates_from_mountinfo(
+        table, &merged,
+    ));
+    layers
+        .iter()
+        .any(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.ino() == slot_ino))
+}
+
 /// Start the witness: open + calibrate each file, departure calibration,
 /// insert keys, activate. Pure over the backend seam; file syscalls are
 /// real (temp files in tests, provider paths in production).
@@ -569,7 +605,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
     }
     // Open each path, require a regular file, keep fd + fstat.
     use std::os::unix::fs::OpenOptionsExt as _;
-    let mut opened: Vec<(std::os::fd::OwnedFd, u64, u64)> = Vec::new();
+    let mut opened: Vec<(std::path::PathBuf, std::os::fd::OwnedFd, u64, u64)> = Vec::new();
     for path in paths {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -591,7 +627,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
         let raw = file.into_raw_fd();
         // SAFETY: owned fd from an open File.
         let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-        opened.push((fd, dev, ino));
+        opened.push((path.clone(), fd, dev, ino));
     }
     // Inactive cfg, then attach.
     let mut cfg = PwCfg {
@@ -613,7 +649,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
     // SAFETY: gettid has no preconditions.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
     let mut files: Vec<WitnessFile> = Vec::new();
-    for (index, (fd, dev, ino)) in opened.into_iter().enumerate() {
+    for (index, (path, fd, dev, ino)) in opened.into_iter().enumerate() {
         cfg.calib_tid = tid;
         cfg.calib_index = index as u32;
         backend
@@ -644,10 +680,17 @@ pub(crate) fn start_with<B: WitnessBackend>(
         let slot = backend
             .read_calib(index as u32)
             .map_err(|error| Unavailable::Btf(format!("witness calib read: {error:?}")))?;
-        if slot.hits != 1 || slot.i_ino == 0 || slot.i_ino != identity.1 {
-            // Note: s_dev is not compared (Btrfs st_dev differs from the
-            // mapped s_dev); the inode plus the held fd identify the file,
-            // and the kernel key below carries the true s_dev for BPF.
+        if slot.hits != 1 || slot.i_ino == 0 {
+            return Err(Unavailable::Btf("witness calibration mismatch".into()));
+        }
+        // Note: s_dev is not compared (Btrfs st_dev differs from the
+        // mapped s_dev); the inode plus the held fd identify the file,
+        // and the kernel key below carries the true s_dev for BPF.
+        // On xino overlay files the slot carries the backing inode
+        // while the mapped-range identity carries the overlay inode,
+        // so a direct mismatch falls back to backing-vs-backing
+        // through the layer candidates — never fstat against maps.
+        if slot.i_ino != identity.1 && !calibration_backing_accepted(&path, slot.i_ino, None) {
             return Err(Unavailable::Btf("witness calibration mismatch".into()));
         }
         files.push(WitnessFile {
@@ -1995,6 +2038,198 @@ mod tests {
                 || 100
             )
             .is_err()
+        );
+    }
+
+    /// One-row overlay table over `merged_root` with the given layers.
+    fn overlay_table_for(
+        merged_root: &std::path::Path,
+        upper: &std::path::Path,
+        lower: &std::path::Path,
+    ) -> String {
+        format!(
+            "31 23 0:27 / {} rw,relatime - overlay overlay rw,lowerdir={},upperdir={}\n",
+            merged_root.display(),
+            lower.display(),
+            upper.display(),
+        )
+    }
+
+    fn backing_ino_of(path: &std::path::Path) -> u64 {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::metadata(path).expect("layer file stat").ino()
+    }
+
+    #[test]
+    fn backing_accepts_lower_candidate_on_xino_split() {
+        // The BPF slot carries the lower backing inode while the
+        // merged view carries a huge xino inode: backing vs backing
+        // through the lower candidate must accept.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let layer_file = lower.join("lib.so");
+        std::fs::write(&layer_file, [0xA1u8; 64]).expect("write");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&layer_file),
+                Some(&table),
+            ),
+            "the lower backing inode must match the slot"
+        );
+    }
+
+    #[test]
+    fn backing_accepts_upper_candidate_after_copy_up() {
+        // After copy-up the merged view keeps the stable overlay inode
+        // while new mappings back onto the upper file: the upper
+        // candidate must match the slot even though the lower file
+        // (same remainder, different inode) does not.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        std::fs::write(lower.join("lib.so"), [0xA2u8; 64]).expect("write");
+        let upper_file = upper.join("lib.so");
+        std::fs::write(&upper_file, [0xA3u8; 64]).expect("write");
+        assert_ne!(
+            backing_ino_of(&lower.join("lib.so")),
+            backing_ino_of(&upper_file),
+            "the twin needs distinct layer inodes"
+        );
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&upper_file),
+                Some(&table),
+            ),
+            "the upper backing inode must match the slot"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_different_backing_file_with_same_overlay_shape() {
+        // Negative twin: the same merged path and table, but the slot
+        // names another file's backing inode — never accepted, even
+        // though the overlay view would render the same merged file.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let layer_file = lower.join("lib.so");
+        std::fs::write(&layer_file, [0xA4u8; 64]).expect("write");
+        let other = root.path().join("other.so");
+        std::fs::write(&other, [0xA5u8; 64]).expect("write");
+        let (layer_ino, other_ino) = (backing_ino_of(&layer_file), backing_ino_of(&other));
+        assert_ne!(
+            layer_ino, other_ino,
+            "the twin needs two distinct backing inodes"
+        );
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                other_ino,
+                Some(&table),
+            ),
+            "a different backing inode must refuse"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_without_cover_escapes_and_missing_layers() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let layer_file = lower.join("lib.so");
+        std::fs::write(&layer_file, [0xA6u8; 64]).expect("write");
+        let slot = backing_ino_of(&layer_file);
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        // No table, no cover.
+        assert!(
+            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, Some("")),
+            "an empty table names no layer"
+        );
+        let plain = "10 1 8:1 / /var/tmp/x rw,relatime - ext4 /dev/sda3 rw\n".to_string();
+        assert!(
+            !super::calibration_backing_accepted(&merged_root.join("lib.so"), slot, Some(&plain),),
+            "a non-overlay table names no layer"
+        );
+        // A remainder escaping the mount never resolves.
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("../evil.so"),
+                slot,
+                Some(&table),
+            ),
+            "an escaping remainder must refuse"
+        );
+        // A layer path that stats nothing (copied-up file whose lower
+        // was cleaned, or a container-hidden host lowerdir) refuses.
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("absent.so"),
+                slot,
+                Some(&table),
+            ),
+            "unstatable layer files must refuse"
+        );
+    }
+
+    #[test]
+    fn backing_accepts_symlinked_merged_path_via_canonical_form() {
+        // The merged path may reach the mount through a symlink (a
+        // symlinked TMPDIR or operator path): canonicalization must
+        // still land the remainder under the table mountpoint.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let layer_file = lower.join("lib.so");
+        std::fs::write(&layer_file, [0xA7u8; 64]).expect("write");
+        // The merged view itself exists (as on a live mount), so the
+        // symlinked path canonicalizes instead of falling back.
+        std::fs::write(merged_root.join("lib.so"), [0xA7u8; 64]).expect("write");
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&merged_root, &link).expect("symlink");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            super::calibration_backing_accepted(
+                &link.join("lib.so"),
+                backing_ino_of(&layer_file),
+                Some(&table),
+            ),
+            "a symlinked merged path must resolve to its layers"
         );
     }
 

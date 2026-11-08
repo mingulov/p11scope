@@ -5079,6 +5079,83 @@ fn lower_candidates_refuses_escapes_and_missing_lowerdir() {
     assert!(lower_candidates_from_mountinfo("", std::path::Path::new("/mnt/r/a.so")).is_empty());
 }
 
+#[test]
+fn upper_candidate_serves_the_upper_remainder() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1:/l2,upperdir=/u,workdir=/w\n";
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")),
+        Some(std::path::PathBuf::from("/u/a.so"))
+    );
+    // The lower stack never leaks into the upper answer.
+    let lowers = lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so"));
+    assert_eq!(
+        lowers,
+        vec![
+            std::path::PathBuf::from("/l1/a.so"),
+            std::path::PathBuf::from("/l2/a.so"),
+        ]
+    );
+}
+
+#[test]
+fn upper_candidate_prefers_the_longest_covering_prefix() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    let table = concat!(
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n",
+        "32 23 0:28 / /mnt/r/sub rw,relatime - overlay overlay rw,lowerdir=/l2,upperdir=/u2,workdir=/w2\n",
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/sub/a.so")),
+        Some(std::path::PathBuf::from("/u2/a.so"))
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")),
+        Some(std::path::PathBuf::from("/u/a.so"))
+    );
+}
+
+#[test]
+fn upper_candidate_decodes_mountinfo_escapes() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    let table = "31 23 0:27 / /var/tmp/my\\040x/merged1 rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/var/tmp/my\\040x/upper,workdir=/w\n";
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/var/tmp/my x/merged1/lib.so"),),
+        Some(std::path::PathBuf::from("/var/tmp/my x/upper/lib.so"))
+    );
+}
+
+#[test]
+fn upper_candidate_refuses_missing_upperdir_escapes_and_siblings() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    let no_upper = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,workdir=/w\n";
+    assert_eq!(
+        upper_candidate_from_mountinfo(no_upper, std::path::Path::new("/mnt/r/a.so")),
+        None
+    );
+    let table =
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n";
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/../evil.so")),
+        None
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/rbin/a.so")),
+        None
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo("", std::path::Path::new("/mnt/r/a.so")),
+        None
+    );
+    // An empty upperdir names no layer, even beside a valid stack.
+    let empty_upper =
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=,workdir=/w\n";
+    assert_eq!(
+        upper_candidate_from_mountinfo(empty_upper, std::path::Path::new("/mnt/r/a.so")),
+        None
+    );
+}
+
 /// What the copy-up join mirror concluded over live inputs: the guard
 /// refused before any witness work (the legacy shape), the join proved
 /// (held or proven lower), or the join refused with the gap reason.

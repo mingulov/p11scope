@@ -4298,31 +4298,38 @@ pub(crate) enum GuardOutcome {
     UnprovenOverlay { range: (u64, u64) },
 }
 
-/// Lower-layer candidates for a merged path, read back from a mount
-/// table: the overlay mount with the longest mountpoint prefix of the
-/// path contributes its `lowerdir` stack in order, each joined with the
-/// path's remainder. Empty when no overlay row covers the path, the row
-/// names no lowerdir, or the remainder escapes (fail closed): the caller
-/// keeps the named gap. Mountinfo escapes are decoded on both sides;
-/// the stack splits on `:` exactly like the kernel mount parser.
-///
-/// The scan and the pin both compute this list — the scan to prove one
-/// candidate, the pin to reopen the proven index — so both must feed it
-/// the same normalized merged path and the target's mount table. A
-/// non-UTF-8 table or path yields no candidates: the gap, never a join.
-pub(crate) fn lower_candidates_from_mountinfo(
+/// Which overlay layer a mountinfo reader needs: the single upper dir
+/// or the lower stack. The row scan only considers rows naming it.
+#[derive(Clone, Copy)]
+enum OverlayLayer {
+    Upper,
+    Lower,
+}
+
+/// One mountinfo escape group decoded, shared by the overlay layer
+/// readers: spaces, tabs, newlines and backslashes in mountpoints and
+/// layer paths.
+fn unescape_mountinfo_field(field: &str) -> String {
+    field
+        .replace("\\040", " ")
+        .replace("\\011", "\t")
+        .replace("\\012", "\n")
+        .replace("\\134", "\\")
+}
+
+/// Best overlay row for `merged`: the longest mountpoint prefix among
+/// rows naming the wanted layer, with its superblock options and the
+/// path's remainder. `None` when no overlay row covers the path, no
+/// covering row names the layer, or the remainder escapes (fail
+/// closed). The lower and upper readers share this scan so the
+/// prefix, escape and traversal rules cannot diverge.
+fn overlay_row_for(
     mountinfo: &str,
     merged: &std::path::Path,
-) -> Vec<std::path::PathBuf> {
-    fn unescape(field: &str) -> String {
-        field
-            .replace("\\040", " ")
-            .replace("\\011", "\t")
-            .replace("\\012", "\n")
-            .replace("\\134", "\\")
-    }
+    layer: OverlayLayer,
+) -> Option<(String, String)> {
     let merged_str = merged.to_string_lossy();
-    let mut best: Option<(usize, Vec<String>, String)> = None;
+    let mut best: Option<(usize, String, String)> = None;
     for line in mountinfo.lines() {
         let Some((pre, post)) = line.split_once(" - ") else {
             continue;
@@ -4335,7 +4342,7 @@ pub(crate) fn lower_candidates_from_mountinfo(
         if *fstype != "overlay" {
             continue;
         }
-        let mountpoint = unescape(mountpoint);
+        let mountpoint = unescape_mountinfo_field(mountpoint);
         let rest = match merged_str.strip_prefix(mountpoint.as_str()) {
             Some(rest) => rest,
             None => continue,
@@ -4359,18 +4366,17 @@ pub(crate) fn lower_candidates_from_mountinfo(
             continue;
         }
         let super_opts = post_fields.get(2).unwrap_or(&"");
-        let mut lowers = Vec::new();
-        for opt in super_opts.split(',') {
-            if let Some(stack) = opt.strip_prefix("lowerdir=") {
-                lowers.extend(
-                    stack
-                        .split(':')
-                        .filter(|layer| !layer.is_empty())
-                        .map(unescape),
-                );
-            }
-        }
-        if lowers.is_empty() {
+        let names_layer = match layer {
+            OverlayLayer::Lower => super_opts.split(',').any(|opt| {
+                opt.strip_prefix("lowerdir=")
+                    .is_some_and(|stack| stack.split(':').any(|dir| !dir.is_empty()))
+            }),
+            OverlayLayer::Upper => super_opts.split(',').any(|opt| {
+                opt.strip_prefix("upperdir=")
+                    .is_some_and(|dir| !dir.is_empty())
+            }),
+        };
+        if !names_layer {
             continue;
         }
         let len = mountpoint.len();
@@ -4380,11 +4386,44 @@ pub(crate) fn lower_candidates_from_mountinfo(
         {
             continue;
         }
-        best = Some((len, lowers, rel.to_string()));
+        best = Some((len, (*super_opts).to_string(), rel.to_string()));
     }
-    let Some((_, lowers, rel)) = best else {
+    best.map(|(_, opts, rel)| (opts, rel))
+}
+
+/// Lower-layer candidates for a merged path, read back from a mount
+/// table: the overlay mount with the longest mountpoint prefix of the
+/// path contributes its `lowerdir` stack in order, each joined with the
+/// path's remainder. Empty when no overlay row covers the path, the row
+/// names no lowerdir, or the remainder escapes (fail closed): the caller
+/// keeps the named gap. Mountinfo escapes are decoded on both sides;
+/// the stack splits on `:` exactly like the kernel mount parser.
+///
+/// The scan and the pin both compute this list — the scan to prove one
+/// candidate, the pin to reopen the proven index — so both must feed it
+/// the same normalized merged path and the target's mount table. A
+/// non-UTF-8 table or path yields no candidates: the gap, never a join.
+pub(crate) fn lower_candidates_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Vec<std::path::PathBuf> {
+    let Some((super_opts, rel)) = overlay_row_for(mountinfo, merged, OverlayLayer::Lower) else {
         return Vec::new();
     };
+    let mut lowers = Vec::new();
+    for opt in super_opts.split(',') {
+        if let Some(stack) = opt.strip_prefix("lowerdir=") {
+            lowers.extend(
+                stack
+                    .split(':')
+                    .filter(|layer| !layer.is_empty())
+                    .map(unescape_mountinfo_field),
+            );
+        }
+    }
+    if lowers.is_empty() {
+        return Vec::new();
+    }
     let mut out = Vec::new();
     for lower in lowers {
         let candidate = std::path::Path::new(&lower).join(&rel);
@@ -4393,6 +4432,26 @@ pub(crate) fn lower_candidates_from_mountinfo(
         }
     }
     out
+}
+
+/// Upper-layer candidate for a merged path, read back from a mount
+/// table: the overlay mount with the longest mountpoint prefix of the
+/// path contributes its `upperdir` joined with the path's remainder.
+/// `None` when no overlay row covers the path, the row names no
+/// upperdir, or the remainder escapes (fail closed). Shares the row
+/// scan with [`lower_candidates_from_mountinfo`], so the same caller
+/// rules apply: the same normalized merged path and mount table on
+/// both sides of a comparison.
+pub(crate) fn upper_candidate_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    let (super_opts, rel) = overlay_row_for(mountinfo, merged, OverlayLayer::Upper)?;
+    let upper = super_opts
+        .split(',')
+        .find_map(|opt| opt.strip_prefix("upperdir="))
+        .filter(|dir| !dir.is_empty())?;
+    Some(std::path::Path::new(&unescape_mountinfo_field(upper)).join(&rel))
 }
 
 /// Prove one witness-requiring provider file with the original-file

@@ -5218,6 +5218,24 @@ fn lower_candidates_refuse_datadir_mounts() {
     assert!(lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")).is_empty());
 }
 
+#[test]
+fn lower_candidates_refuse_legacy_data_only_separator() {
+    // The legacy data-only separator (`lowerdir=/l1::/l2`): the kernel
+    // prints the user's colon string verbatim, and an empty element
+    // between non-empty ones names a layer this reader cannot resolve —
+    // the row refuses like `datadir`. Leading/trailing colons stay
+    // tolerated (no layer between).
+    let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1::/l2,upperdir=/u,workdir=/w\n";
+    assert!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")).is_empty()
+    );
+    let trailing = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1:,upperdir=/u,workdir=/w\n";
+    assert_eq!(
+        lower_candidates_from_mountinfo(trailing, std::path::Path::new("/mnt/r/a.so")),
+        vec![std::path::PathBuf::from("/l1/a.so")]
+    );
+}
+
 /// What the copy-up join mirror concluded over live inputs: the guard
 /// refused before any witness work (the legacy shape), the join proved
 /// (held or proven lower), or the join refused with the gap reason.

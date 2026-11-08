@@ -2515,6 +2515,58 @@ mod tests {
     }
 
     #[test]
+    fn start_calibration_mismatch_reports_calibration_class() {
+        // A file the witness cannot calibrate (here: nothing backs the
+        // slot inode) refuses with the calibration class, not btf.
+        let (_dir, path) = temp_prearm_file("libcal.so");
+        let good = calib_for(&path);
+        let backend = ScriptBackend::new(
+            super::PwCalibSlot {
+                hits: 1,
+                s_dev: good.s_dev,
+                i_ino: good.i_ino.wrapping_add(1),
+            },
+            1,
+        );
+        let err = match super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+        ) {
+            Ok(_) => panic!("a calibration mismatch must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.class(), "calibration");
+    }
+
+    #[test]
+    fn start_departure_miss_reports_calibration_class() {
+        // A missed departure calibration refuses with the calibration
+        // class, not btf.
+        let (_dir, path) = temp_prearm_file("libdep.so");
+        let backend = ScriptBackend::new(calib_for(&path), 0);
+        let err = match super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+        ) {
+            Ok(_) => panic!("a missed departure calibration must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.class(), "calibration");
+    }
+
+    #[test]
     fn start_records_open_time_pin_for_condition_4() {
         // Condition 4 joins the witness fd's open-time pin against the
         // pre-arm pin's held baseline: the recorded pin must equal the

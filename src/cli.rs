@@ -225,7 +225,9 @@ pub struct RunArgs {
 /// What `p11scope inspect` scans: one named process, or every process on
 /// the machine. System scope reuses the capture two-phase scan (enumerate,
 /// sweep, rarity-selected deep scans) with a published cap record, but stays
-/// scan-only: no BPF, no manifest reads, no capture state.
+/// scan-only: no live capture, no manifest reads, no capture state. It loads
+/// a short-lived kernel identity check for overlay/9p original-file proofs;
+/// without `CAP_BPF`/`CAP_PERFMON` those providers become named gaps.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InspectScope {
     Pid(u32),
@@ -378,7 +380,10 @@ pub enum CaptureMode {
     /// Native when it can start; otherwise the scan lane plus a named gap
     /// (`native usage feed unavailable`).
     Auto,
-    /// The scan lane only: no BPF, usage stays `unknown (scan only)`.
+    /// The scan lane only: usage stays `unknown (scan only)`. It loads a
+    /// short-lived kernel identity check for overlay/9p original-file
+    /// proofs; without `CAP_BPF`/`CAP_PERFMON` those providers become
+    /// named gaps.
     Scan,
     /// The native usage lane or a hard error (exit 1) naming why not.
     Native,
@@ -739,7 +744,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 Inspect reports mapped providers and discovery evidence; a mapping does not prove a call.
 Choose --pid or --system. --json preserves the same discovery facts for scripts.
 Unreadable or unexamined identities remain unknown.
-Inspect reads mappings without live capture and needs no BPF capability.
+Inspect reads mappings without live capture; it loads a short-lived kernel identity check for overlay/9p original-file proofs, and without CAP_BPF/CAP_PERFMON those providers become named gaps.
 Default text output is concise: the mapped providers, one coverage line, and a hint. -v, --verbose shows every gap and reason with per-table data. --quiet prints only the summary head.
 exit codes: 0 ok (partial results still exit 0); 1 the target could not be read; 2 wrong arguments.
 ";

@@ -220,8 +220,9 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// A singles session, or a multi session whose dynamics stay on perf
 /// (an unproven pid filter on 6.6-6.9 without the backport), keeps it
 /// for dynamic perf re-attach. An owned `run` session (`owned`) always
-/// keeps it: attach/confirm/discovery work after multi setup still
-/// needs it there (controller ruling 2026-11-08, F1).
+/// keeps it when held and never sheds it; a setcap `run` needs none
+/// (bisected to be50cad25: the shed broke owned runs, and the gated
+/// operation is not yet identified; controller ruling 2026-11-08, F1).
 pub(crate) fn post_setup_keep(
     multi: bool,
     dynamic_multi: bool,
@@ -417,11 +418,14 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// The capabilities one command keeps after startup: everything it can
 /// need later, nothing else. That is the minimal live set plus the
 /// root-functional extras, each conditioned on the flags that need it:
-/// `-o` anywhere needs DAC_OVERRIDE, CHOWN and FOWNER (the handover
-/// plus the post-handover chmod), the singles fallback needs
-/// SYS_ADMIN, `run` always needs SETUID/SETGID/KILL (the sudo drop runs
-/// without `--user`, and the parent signals the re-owned child across
-/// uids). A setcap user never holds the extras, so the same masks shed
+/// File outputs anywhere need DAC_OVERRIDE, CHOWN and FOWNER (the
+/// handover plus the post-handover chmod): `-o` on every lane plus
+/// inventory `--event-log` and `--diagnostics`, which share the sudo
+/// handover and reopen mid-run, so the bits last the whole run. The
+/// singles fallback needs SYS_ADMIN, `run` always needs
+/// SETUID/SETGID/KILL (the sudo drop runs without `--user`, and the
+/// parent signals the re-owned child across uids). A setcap user never
+/// holds the extras, so the same masks shed
 /// the whole grant surplus there; root keeps a functional subset instead
 /// of the full set. Live capture keeps the minimal set whole (dynamic
 /// attach and rescans run until the end); `doctor` needs the live set
@@ -446,8 +450,12 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
         // like inspect: the shared scan loads the kernel identity
         // witness (BPF) for overlay/9p original-file proofs
         // (controller ruling 2026-11-08, r2 F1).
-        Command::Inventory(a) if a.capture == crate::cli::CaptureMode::Scan => live | out(&a.out),
-        Command::Inventory(a) => live | sys_admin | out(&a.out),
+        Command::Inventory(a) if a.capture == crate::cli::CaptureMode::Scan => {
+            live | out(&a.out) | out(&a.event_log) | out(&a.diagnostics)
+        }
+        Command::Inventory(a) => {
+            live | sys_admin | out(&a.out) | out(&a.event_log) | out(&a.diagnostics)
+        }
         Command::Run(a) => {
             // Always: the sudo drop re-owns the child without `--user`
             // (setgroups/setresgid/setresuid need SETGID/SETUID), and the
@@ -671,10 +679,10 @@ mod tests {
     /// transient `CAP_SYS_ADMIN`, singles keeps it, multi with perf
     /// dynamics (an unproven pid filter) keeps it for re-attach, and a
     /// setcap process without it is untouched either way. An owned `run`
-    /// always keeps it: its attach/confirm/discovery work after multi
-    /// setup still needs it (controller ruling 2026-11-08: the shed
-    /// broke owned pause_auto, F1; least privilege must never behave
-    /// worse than v0.6.0).
+    /// always keeps it when held and never sheds it; a setcap `run`
+    /// needs none (bisected to be50cad25: the shed broke owned
+    /// pause_auto, F1, and the gated operation is not yet identified;
+    /// least privilege must never behave worse than v0.6.0).
     #[test]
     fn post_setup_keep_sheds_only_the_transient_sys_admin() {
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;

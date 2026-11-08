@@ -1124,11 +1124,12 @@ Limits that matter in pods:
   directory created under Ubuntu's default umask (0775) needs
   `chmod g-w,o-w` first. Under `sudo`, when `SUDO_UID`/`SUDO_GID` name
   the invoking account and the output directory belongs to that user,
-  newly created report, trace and event-log files are handed to that
-  user (still private `0600`), so the report stays readable without
-  `sudo cat`; pre-existing files keep their owner, and anywhere else
-  the files stay root-owned as before. A second run reuses and
-  truncates an invoker-owned stream file it previously refused.
+  newly created report, trace, event-log and diagnostics files are
+  handed to that user (still private `0600`), so the report stays
+  readable without `sudo cat`; pre-existing files keep their owner,
+  and anywhere else the files stay root-owned as before. A second run
+  reuses and truncates an invoker-owned stream file it previously
+  refused.
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
@@ -1990,7 +1991,7 @@ roles, and the exact set depends on the target, attach backend and host policy:
 | `CAP_SYS_PTRACE` | Read a target's memory when ptrace/Yama or cross-UID checks require it. |
 | `CAP_DAC_READ_SEARCH` | Open provider files or traverse target paths otherwise unreadable to the observer. |
 | `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` | Follow target `map_files` for Inventory's past-scan-cap identity proof. |
-| `CAP_SYS_ADMIN` | The `--attach-backend singles` fallback on restrictive `perf_event_paranoid >= 3` hosts (per-probe `perf_event` uprobes); owned `run` sessions, which keep it for post-setup attach/confirm/discovery; and the DaemonSet-style fallback where the narrow BPF/perf/map_files grants are absent. The default non-owned uprobe-multi lane sheds it after setup. Also covers the BPF/perf checks. |
+| `CAP_SYS_ADMIN` | The `--attach-backend singles` fallback on restrictive `perf_event_paranoid >= 3` hosts (per-probe `perf_event` uprobes); owned `run` keeps it when held and never sheds it (a setcap `run` needs none); and the DaemonSet-style fallback where the narrow BPF/perf/map_files grants are absent. The default non-owned uprobe-multi lane sheds it after setup. Also covers the BPF/perf checks. |
 
 This is a conditional roles list, not one portable minimum or a reason to grant
 all listed capabilities. Offline processing needs no BPF privileges. Capabilities

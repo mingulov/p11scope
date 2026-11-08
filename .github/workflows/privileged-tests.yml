@@ -1063,6 +1063,7 @@ jobs:
             --require postsetup-inventory-drops-sysadmin \
             --require run-sudo --require run-user-nobody \
             --require run-kill-on-timeout --require trace-sudo-out \
+            --require inventory-sudo-event-log \
             --require daemonset-doctor --require daemonset-profile \
             --require daemonset-inventory
           # The wrapper translates the documented nonqualifying-smoke exit 2

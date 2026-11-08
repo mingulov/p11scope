@@ -771,6 +771,27 @@ pass=1
 [ "$(stat -c %a "$SUDODIR/trace.txt")" = "600" ] || pass=0
 row trace-sudo-out "$pass" qualified "exit=$rc owner=$(stat -c %U:%a "$SUDODIR/trace.txt" 2>/dev/null)"
 rm -rf "$SUDODIR"
+# Sudo `inventory --event-log` without `-o` into an invoker-owned
+# directory: the event stream shares the `-o` sudo handover (CHOWN to
+# the invoker, then FOWNER to chmod it private), so the keep must carry
+# the file-output bits for `--event-log` too — without them the open
+# fails with EPERM. Scan keeps the run short and deterministic.
+SUDODIR=$(mktemp -d /tmp/inventory-sudo-event-log.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+wlog=$CELLTMP/out/workload-invsudo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory --pid "$wpid" --capture scan --event-log "$SUDODIR/events.jsonl" \
+  >"$CELLTMP/out/inventory-sudo-event-log.out" 2>"$CELLTMP/out/inventory-sudo-event-log.err"
+rc=$?
+stop_workload "$wpid"
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+[ -s "$SUDODIR/events.jsonl" ] || pass=0
+[ "$(stat -c %U "$SUDODIR/events.jsonl")" = "nobody" ] || pass=0
+[ "$(stat -c %a "$SUDODIR/events.jsonl")" = "600" ] || pass=0
+row inventory-sudo-event-log "$pass" qualified "exit=$rc owner=$(stat -c %U:%a "$SUDODIR/events.jsonl" 2>/dev/null)"
+rm -rf "$SUDODIR"
 # DaemonSet rows: root with exactly the shipped grant (SYS_ADMIN,
 # SYS_PTRACE, DAC_READ_SEARCH). The observer must retain SYS_ADMIN as
 # the only BPF/map_files grant instead of dropping to an unusable set.

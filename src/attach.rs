@@ -11084,9 +11084,10 @@ impl Session {
 /// links need `CAP_BPF`+`CAP_PERFMON`, never sysadmin); a singles
 /// session, or a multi session whose dynamics stay on perf (an unproven
 /// pid filter), keeps it for dynamic perf re-attach. An owned `run`
-/// session (`owned`) never sheds: its attach/confirm/discovery work
-/// after multi setup still needs `CAP_SYS_ADMIN` (controller ruling
-/// 2026-11-08, F1; the shed broke owned pause_auto). The sets come from
+/// session (`owned`) never sheds when it holds `CAP_SYS_ADMIN`; a
+/// setcap `run` needs none (bisected to be50cad25: the shed broke owned
+/// pause_auto, and the gated operation is not yet identified; controller
+/// ruling 2026-11-08, F1). The sets come from
 /// `capget`, never `/proc` (a broken `/proc` must not zero the shed).
 /// The shed is per-thread, so the pre-spawned cleanup worker sheds to
 /// the same keep. Sets already at keep skip the drop entirely (no
@@ -11128,11 +11129,15 @@ mod post_setup_shed_tests {
     /// unprivileged minimal set holds no `CAP_SYS_ADMIN` to shed) must
     /// skip the shed entirely, including the worker drop: no `capset`
     /// runs and no post-shed hook fires for a capture that never shed.
-    /// Fails while the shed runs unconditionally.
+    /// Fails while the shed runs unconditionally. The expectation is
+    /// derived from `post_setup_shed_needed` on the live sets, so the
+    /// twin holds as root too: a root test thread holds `CAP_SYS_ADMIN`
+    /// to shed, so the worker drop runs once with the keep there.
     #[test]
     fn post_setup_shed_skips_the_worker_drop_when_sets_are_already_at_keep() {
-        // Test threads hold no capabilities, so keep equals effective
-        // (both zero) and the shed is a no-op by construction.
+        let sets = crate::caps::read_sets_via_capget().expect("capget succeeds");
+        let keep = crate::caps::post_setup_keep(true, true, false, sets.effective);
+        let needed = crate::caps::post_setup_shed_needed(keep, sets);
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
         let seen_clone = Arc::clone(&seen);
         let worker = CleanupWorker::pre_start_with_drop_fn(Arc::new(move |keep: u64| {
@@ -11140,19 +11145,29 @@ mod post_setup_shed_tests {
             Ok(())
         }));
         drop_post_setup_capabilities_for(AttachBackend::Multi, true, false, Some(&worker))
-            .expect("a no-op shed succeeds");
-        assert!(
-            seen.lock().unwrap().is_empty(),
-            "the worker drop must not run when the shed changes nothing"
-        );
+            .expect("the shed succeeds");
+        let seen = seen.lock().unwrap().clone();
+        if needed {
+            assert_eq!(
+                seen,
+                vec![keep],
+                "the worker drop must run once with the keep when the shed changes the live sets"
+            );
+        } else {
+            assert!(
+                seen.is_empty(),
+                "the worker drop must not run when the shed changes nothing"
+            );
+        }
     }
 
     /// An owned `run` session never sheds, including the worker drop:
-    /// its attach/confirm/discovery work after multi setup still needs
-    /// `CAP_SYS_ADMIN` (controller ruling 2026-11-08, F1; the shed
-    /// broke owned pause_auto, so owned keeps the full set like
-    /// v0.6.0). Non-vacuous as root (a root test thread holds
-    /// `CAP_SYS_ADMIN` to shed); unprivileged threads skip either way.
+    /// it keeps `CAP_SYS_ADMIN` when held (bisected to be50cad25: the
+    /// shed broke owned pause_auto, and the gated operation is not yet
+    /// identified; controller ruling 2026-11-08, F1, so owned keeps the
+    /// full set like v0.6.0); a setcap `run` needs none. Non-vacuous
+    /// as root (a root test thread holds `CAP_SYS_ADMIN` to shed);
+    /// unprivileged threads skip either way.
     #[test]
     fn post_setup_shed_skips_owned_runs_entirely() {
         let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));

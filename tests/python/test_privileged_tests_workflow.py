@@ -569,6 +569,7 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "postsetup-inventory-drops-sysadmin",
                      "run-sudo", "run-user-nobody",
                      "run-kill-on-timeout", "trace-sudo-out",
+                     "inventory-sudo-event-log",
                      "daemonset-doctor", "daemonset-profile",
                      "daemonset-inventory"):
             with self.subTest(cell=cell):

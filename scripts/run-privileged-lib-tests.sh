@@ -467,6 +467,13 @@ inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_
 # target up to 8192 for the full-scale run. Prints SCALE2_E2E lines
 # (a few minutes).
 inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64
+# MT per-key accounting: inventory --pid --capture native
+# --key-operations --manifest over 8 threads x 50 C_Sign calls in
+# one process attributes every sign to a key row or to a named MT
+# race bucket (key_join_lost, unbound): rows plus unknown equal
+# the LEDGER exactly. A build without the journal pins the
+# journal_unavailable refusal. Prints MTKEY lines (about a minute).
+inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact
 # Reload-disclosure cells: installed inventory captures over the owned
 # fixture pair. The churn run publishes the disclosure naming the
 # churned identity with exact counts; the clean control omits the key

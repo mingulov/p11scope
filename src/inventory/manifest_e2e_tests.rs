@@ -53,8 +53,26 @@ const MECH_FUNCTIONS: &[&str] = &[
     "C_Finalize",
 ];
 
+/// PKCS#11 functions the `mt_sign` cell calls (setup keygen after
+/// the gate, per-worker sessions with SignInit/Sign, teardown): the
+/// cell manifest resolves exactly these.
+const MT_SIGN_FUNCTIONS: &[&str] = &[
+    "C_Initialize",
+    "C_GetSlotList",
+    "C_OpenSession",
+    "C_Login",
+    "C_GenerateKeyPair",
+    "C_SignInit",
+    "C_Sign",
+    "C_CloseSession",
+];
+
 fn ledger_source() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-cli/inventory-ledger.c")
+}
+
+fn mt_sign_source() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/public-cli/mt_sign.c")
 }
 
 fn capacity_matrix_source() -> PathBuf {
@@ -112,22 +130,26 @@ enum E2eLifetime {
 
 impl E2eWorkload {
     fn build(module: &str) -> Result<Self> {
+        Self::build_with(module, &ledger_source(), "ledger", "man1e2e")
+    }
+
+    fn build_with(module: &str, source: &Path, bin: &str, label: &str) -> Result<Self> {
         ensure!(
             Path::new(module).exists(),
             "SoftHSM2 provider {module} is missing"
         );
-        ensure!(ledger_source().exists(), "ledger fixture is missing");
+        ensure!(source.exists(), "fixture {} is missing", source.display());
         let dir = tempfile::tempdir()?;
-        let ledger = dir.path().join("ledger");
+        let ledger = dir.path().join(bin);
         let status = Command::new("cc")
             .args(["-std=c11", "-O2", "-Wall", "-Wextra", "-Werror"])
-            .arg(ledger_source())
+            .arg(source)
             .arg("-o")
             .arg(&ledger)
             .args(["-ldl", "-lpthread"])
             .status()
             .context("running cc")?;
-        ensure!(status.success(), "ledger build failed");
+        ensure!(status.success(), "{bin} build failed");
         let tokens = dir.path().join("tokens");
         std::fs::create_dir(&tokens)?;
         let conf = dir.path().join("softhsm2.conf");
@@ -139,7 +161,7 @@ impl E2eWorkload {
             ),
         )?;
         let status = Command::new("softhsm2-util")
-            .args(["--init-token", "--free", "--label", "man1e2e"])
+            .args(["--init-token", "--free", "--label", label])
             .args(["--so-pin", "5678", "--pin", "1234"])
             .env("SOFTHSM2_CONF", &conf)
             .stdout(Stdio::null())
@@ -199,6 +221,54 @@ impl E2eWorkload {
             .die_with_parent()
             .spawn()
             .context("spawning ledger")?;
+        Ok(E2eProcess {
+            child,
+            out: out.to_path_buf(),
+            stderr,
+        })
+    }
+
+    /// Spawn the `mt_sign` fixture (8 threads x 50 signs by
+    /// default): `mt_sign MODULE THREADS SIGNS GATE PIN LABEL`. The
+    /// fixture prints TARGET/READY, waits on the gate file, then
+    /// keygens and signs after the cell opens the gate, and holds
+    /// after LEDGER under MT_MIXED_HOLD=1 for the capture window.
+    fn spawn_mt_sign(
+        &self,
+        out: &Path,
+        module: &str,
+        gate: &Path,
+        threads: u32,
+        signs: u32,
+    ) -> Result<E2eProcess> {
+        use std::os::unix::fs::OpenOptionsExt as _;
+
+        ensure!(!gate.exists(), "gate {} pre-exists", gate.display());
+        let private_log = |path: &Path| {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(path)
+        };
+        let stderr = out.with_extension("stderr");
+        let child = Command::new(&self.ledger)
+            .args([
+                module,
+                &threads.to_string(),
+                &signs.to_string(),
+                gate.to_str().context("gate path")?,
+                "1234",
+                "mt-sign-key",
+            ])
+            .env("SOFTHSM2_CONF", &self.conf)
+            .env("MT_MIXED_HOLD", "1")
+            .stdin(Stdio::null())
+            .stdout(private_log(out)?)
+            .stderr(private_log(&stderr)?)
+            .die_with_parent()
+            .spawn()
+            .context("spawning mt_sign")?;
         Ok(E2eProcess {
             child,
             out: out.to_path_buf(),
@@ -460,6 +530,18 @@ fn headline_workload_reports_early_exit_status_and_private_diagnostics() -> Resu
 /// the live provider file (offsets read from the ELF, identity and
 /// provenance from the held object), shaped like the discover output.
 fn mech_manifest(workload: &E2eWorkload, module: &str) -> Result<PathBuf> {
+    live_manifest(workload, module, MECH_FUNCTIONS, "mech-live.json")
+}
+
+/// A manifest resolving exactly `names` against the live provider
+/// file (offsets read from the ELF, identity and provenance from
+/// the held object), shaped like the discover output.
+fn live_manifest(
+    workload: &E2eWorkload,
+    module: &str,
+    names: &[&str],
+    filename: &str,
+) -> Result<PathBuf> {
     use p11scope_manifest::identity::{inspect_file, mapping_file_key, open_object};
     use p11scope_manifest::manifest::*;
     let path = Path::new(module);
@@ -469,7 +551,7 @@ fn mech_manifest(workload: &E2eWorkload, module: &str) -> Result<PathBuf> {
     let elf = std::fs::File::open(path)?;
     let snapshot = p11scope_manifest::elf::ElfSnapshot::read(&elf).map_err(anyhow::Error::msg)?;
     let mut offsets = std::collections::BTreeMap::new();
-    for name in MECH_FUNCTIONS {
+    for name in names {
         let fact = snapshot
             .defined_symbol(name)
             .map_err(anyhow::Error::msg)?
@@ -534,9 +616,9 @@ fn mech_manifest(workload: &E2eWorkload, module: &str) -> Result<PathBuf> {
     };
     ensure!(
         crate::manifest_input::validate_structure(&manifest).is_empty(),
-        "the mech manifest is well-formed"
+        "the {filename} manifest is well-formed"
     );
-    let manifest_path = workload.path("mech-live.json");
+    let manifest_path = workload.path(filename);
     std::fs::write(&manifest_path, serde_json::to_vec(&manifest)?)?;
     Ok(manifest_path)
 }
@@ -1576,4 +1658,401 @@ fn scale4097_inner(
     );
     println!("SCALE2_E2E edges={} rc=0", edges.len());
     Ok(())
+}
+
+/// Judge `object_observations` against the `mt_sign` LEDGER sign
+/// total. Populated: attributed rows plus the named unknown sign
+/// buckets must equal the ledger exactly, every unknown sign
+/// reason must be a known MT race bucket, and at least one sign
+/// must land in a row (an all-unknown run would be vacuous). A
+/// build without the journal pins the `journal_unavailable`
+/// refusal instead of exact rows. Anything else fails as silently
+/// wrong. Returns a one-line summary.
+fn judge_mt_key_observations(
+    observations: &serde_json::Value,
+    ledger_signs: u64,
+) -> Result<String> {
+    let status = observations
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .context("object_observations status")?;
+    if status == "unavailable" {
+        let reason = observations
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .context("object_observations reason")?;
+        ensure!(
+            reason == "journal_unavailable",
+            "key rows refused with {reason}, want the pinned journal_unavailable refusal"
+        );
+        return Ok(format!("refused={reason}"));
+    }
+    ensure!(
+        status == "populated",
+        "object_observations status is {status}, want populated or the pinned refusal"
+    );
+    let rows = observations
+        .get("key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("key_operations rows")?;
+    let rows_done: u64 = rows
+        .iter()
+        .filter(|row| row.get("category").and_then(serde_json::Value::as_str) == Some("sign"))
+        .map(|row| {
+            row.get("completed")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0)
+        })
+        .sum();
+    let unknown = observations
+        .get("unknown_key_operations")
+        .and_then(serde_json::Value::as_array)
+        .context("unknown_key_operations")?;
+    let mut unknown_done = 0u64;
+    for bucket in unknown
+        .iter()
+        .filter(|bucket| bucket.get("category").and_then(serde_json::Value::as_str) == Some("sign"))
+    {
+        let reason = bucket
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .context("unknown sign reason")?;
+        ensure!(
+            reason == "key_join_lost" || reason == "unbound",
+            "unknown sign bucket {reason} is not a known MT race bucket"
+        );
+        unknown_done += bucket
+            .get("completed")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+    }
+    ensure!(
+        rows_done + unknown_done == ledger_signs,
+        "observer-vs-ledger sign mismatch: rows {rows_done} + unknown {unknown_done} != ledger {ledger_signs}"
+    );
+    ensure!(
+        rows_done > 0,
+        "no sign landed in a key row: rows 0 + unknown {unknown_done} is vacuous"
+    );
+    Ok(format!(
+        "rows={rows_done} unknown={unknown_done} total={ledger_signs} nrows={}",
+        rows.len()
+    ))
+}
+
+/// Parse the `mt_sign` LEDGER line: the `key_operations.signs`
+/// total, cross-checked against the C_Sign function attempts.
+fn mt_sign_ledger_signs(transcript: &str) -> Result<u64> {
+    for line in transcript.lines() {
+        let Some(payload) = line.strip_prefix("LEDGER ") else {
+            continue;
+        };
+        let ledger: serde_json::Value = serde_json::from_str(payload).context("LEDGER json")?;
+        ensure!(
+            ledger.get("complete").and_then(serde_json::Value::as_bool) == Some(true),
+            "LEDGER is incomplete"
+        );
+        let signs = ledger
+            .pointer("/key_operations/signs")
+            .and_then(serde_json::Value::as_u64)
+            .context("LEDGER key_operations.signs")?;
+        let attempts: u64 = ledger
+            .get("functions")
+            .and_then(serde_json::Value::as_array)
+            .context("LEDGER functions")?
+            .iter()
+            .filter(|entry| entry.get("name").and_then(serde_json::Value::as_str) == Some("C_Sign"))
+            .map(|entry| {
+                entry
+                    .get("attempts")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0)
+            })
+            .sum();
+        ensure!(
+            attempts == signs,
+            "LEDGER signs {signs} disagree with C_Sign attempts {attempts}"
+        );
+        return Ok(signs);
+    }
+    anyhow::bail!("no LEDGER line in the workload transcript")
+}
+
+/// Wait until the workload edge is native-matched in the event
+/// stream: an `edge_observed` record for the workload pid and the
+/// TARGET provider identity whose coverage is `counted` or
+/// `watched_no_use`. Inventory counts only post-match calls, so
+/// the cell opens the workload gate only after the match.
+fn mt_key_wait_matched(event_log: &Path, transcript: &str, pid: u32) -> Result<()> {
+    let mut identity = None;
+    for line in transcript.lines() {
+        if let Some(payload) = line.strip_prefix("TARGET ") {
+            let target: serde_json::Value = serde_json::from_str(payload).context("TARGET json")?;
+            let dev = target.get("dev").context("TARGET dev")?;
+            identity = Some((
+                dev.get(0)
+                    .and_then(serde_json::Value::as_u64)
+                    .context("dev major")?,
+                dev.get(1)
+                    .and_then(serde_json::Value::as_u64)
+                    .context("dev minor")?,
+                target
+                    .get("ino")
+                    .and_then(serde_json::Value::as_u64)
+                    .context("TARGET ino")?,
+            ));
+            break;
+        }
+    }
+    let (major, minor, ino) = identity.context("no TARGET line in the workload transcript")?;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let text = std::fs::read_to_string(event_log).unwrap_or_default();
+        for line in text.lines() {
+            let record: serde_json::Value = match serde_json::from_str(line) {
+                Ok(record) => record,
+                Err(_) => continue,
+            };
+            if record.get("kind").and_then(serde_json::Value::as_str) != Some("edge_observed") {
+                continue;
+            }
+            let event = record.get("event").context("edge_observed event")?;
+            let context = event.get("identity_context").context("identity_context")?;
+            let caller = context.get("caller").context("caller")?;
+            if caller.get("pid").and_then(serde_json::Value::as_u64) != Some(u64::from(pid)) {
+                continue;
+            }
+            let module = context.get("module").context("module")?;
+            if module
+                .get("device_major")
+                .and_then(serde_json::Value::as_u64)
+                != Some(major)
+                || module
+                    .get("device_minor")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(minor)
+                || module.get("inode").and_then(serde_json::Value::as_u64) != Some(ino)
+            {
+                continue;
+            }
+            let state = event
+                .pointer("/entries/coverage/state")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("");
+            if state == "counted" || state == "watched_no_use" {
+                return Ok(());
+            }
+        }
+        ensure!(
+            Instant::now() < deadline,
+            "workload edge for pid {pid} never native-matched"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Multi-threaded per-key accounting: `inventory --pid --capture
+/// native --key-operations --manifest` over 8 threads x 50
+/// C_Sign calls in one `mt_sign` process attributes every sign
+/// either to a key row or to a named MT race bucket
+/// (`key_join_lost`, `unbound`): rows plus unknown equal the
+/// LEDGER exactly, never silently wrong. The single-thread
+/// control lands all signs in one row with zero unknown; under 8
+/// threads the attributed/unknown split varies run to run while
+/// the total stays exact. A build without the journal pins the
+/// `journal_unavailable` refusal. Needs an observer binary via
+/// `P11SCOPE_E2E_OBSERVER` or a `p11scope` sibling of this test
+/// binary. Prints MTKEY lines. Root BPF lane, serial, about a
+/// minute.
+#[test]
+#[ignore = "privileged: mt per-key sign rows plus named race buckets equal the ledger exactly"]
+fn privileged_inventory_pid_key_operations_mt_sign_rows_exact() -> Result<()> {
+    let module = softhsm_path()?;
+    let observer = observer_binary()?;
+    let workload = E2eWorkload::build_with(&module, &mt_sign_source(), "mt_sign", "mtkey")?;
+    let outcome = mt_key_inner(&workload, &module, &observer);
+    keep_workload_on_failure(workload, outcome, "MTKEY")
+}
+
+fn mt_key_inner(workload: &E2eWorkload, module: &str, observer: &Path) -> Result<()> {
+    let manifest = live_manifest(workload, module, MT_SIGN_FUNCTIONS, "mtkey-live.json")?;
+    let out = workload.path("inv.json");
+    let event_log = workload.path("events.jsonl");
+    let gate = workload.path("gate");
+    let workload_out = workload.path("mt_sign.out");
+    let observer_out = workload.path("observer.out");
+    let mut target = workload.spawn_mt_sign(&workload_out, module, &gate, 8, 50)?;
+    target.wait_for("READY ", Duration::from_secs(30))?;
+    let pid = target.child.id();
+    println!("MTKEY workload spawned pid={pid} gate={}", gate.display());
+    let observer_log = std::fs::File::create(&observer_out)?;
+    let mut child = Command::new(observer)
+        .args([
+            "inventory",
+            "--pid",
+            &pid.to_string(),
+            "--capture",
+            "native",
+            "--key-operations",
+            "--manifest",
+            manifest.to_str().context("manifest path")?,
+            "--event-log",
+            event_log.to_str().context("event log path")?,
+            "--duration",
+            "30",
+            "--json",
+            "-o",
+            out.to_str().context("out path")?,
+        ])
+        .stdin(Stdio::null())
+        .stdout(observer_log.try_clone()?)
+        .stderr(observer_log)
+        .die_with_parent()
+        .spawn()
+        .context("spawning observer")?;
+    println!("MTKEY observer spawned pid={}", child.id());
+    let needle_deadline = Instant::now() + Duration::from_secs(60);
+    loop {
+        let active = std::fs::read_to_string(&observer_out).is_ok_and(|text| {
+            text.lines()
+                .any(|line| line.contains("native usage lane active"))
+        });
+        if active {
+            break;
+        }
+        if let Some(status) = child.try_wait()? {
+            anyhow::bail!(
+                "the observer exited before the usage lane activated: {}",
+                observer_evidence(&observer_out, &out, &format!("exited {status}"))
+            );
+        }
+        target.ensure_alive("before the usage lane activated")?;
+        ensure!(
+            Instant::now() < needle_deadline,
+            "usage lane never activated (observer pid={}): {}",
+            child.id(),
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    mt_key_wait_matched(&event_log, &transcript, pid)?;
+    std::fs::write(&gate, b"open\n")?;
+    println!("MTKEY gate opened");
+    target.wait_for("LEDGER ", Duration::from_secs(120))?;
+    let transcript = std::fs::read_to_string(&workload_out)?;
+    let ledger_signs = mt_sign_ledger_signs(&transcript)?;
+    target.ensure_alive("after LEDGER before the observer stopped")?;
+    let stop_deadline = Instant::now() + Duration::from_secs(120);
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
+        }
+        ensure!(
+            Instant::now() < stop_deadline,
+            "the observer did not stop: {}",
+            observer_evidence(&observer_out, &out, "still running")
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    ensure!(
+        status.success(),
+        "the observer exited with {status}: {}",
+        observer_evidence(&observer_out, &out, &format!("exited {status}"))
+    );
+    let report: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&out)?).context("observer report json")?;
+    let observations = report
+        .get("object_observations")
+        .context("object_observations")?;
+    let verdict = judge_mt_key_observations(observations, ledger_signs)?;
+    println!("MTKEY {verdict} ledger={ledger_signs}");
+    Ok(())
+}
+
+#[test]
+fn mt_key_judge_accepts_exact_populated_rows() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [
+            {"category": "sign", "completed": 378, "object": 3},
+            {"category": "sign", "completed": 0, "object": 4},
+        ],
+        "unknown_key_operations": [
+            {"category": "sign", "completed": 13, "reason": "key_join_lost"},
+            {"category": "sign", "completed": 9, "reason": "unbound"},
+            {"category": "generate_key_pair", "completed": 1, "reason": "not_applicable"},
+        ],
+    });
+    assert_eq!(
+        judge_mt_key_observations(&observations, 400).unwrap(),
+        "rows=378 unknown=22 total=400 nrows=2"
+    );
+}
+
+#[test]
+fn mt_key_judge_rejects_ledger_plus_one() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [{"category": "sign", "completed": 400}],
+        "unknown_key_operations": [],
+    });
+    let error = judge_mt_key_observations(&observations, 401).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("observer-vs-ledger sign mismatch"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn mt_key_judge_rejects_unknown_reason_outside_the_race_buckets() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [{"category": "sign", "completed": 390}],
+        "unknown_key_operations": [
+            {"category": "sign", "completed": 10, "reason": "mystery"},
+        ],
+    });
+    let error = judge_mt_key_observations(&observations, 400).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("not a known MT race bucket"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn mt_key_judge_rejects_all_unknown_rows() {
+    let observations = serde_json::json!({
+        "status": "populated",
+        "key_operations": [],
+        "unknown_key_operations": [
+            {"category": "sign", "completed": 400, "reason": "unbound"},
+        ],
+    });
+    let error = judge_mt_key_observations(&observations, 400).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("vacuous"),
+        "unexpected error: {error:#}"
+    );
+}
+
+#[test]
+fn mt_key_judge_pins_the_journal_refusal() {
+    let observations =
+        serde_json::json!({"status": "unavailable", "reason": "journal_unavailable"});
+    assert_eq!(
+        judge_mt_key_observations(&observations, 400).unwrap(),
+        "refused=journal_unavailable"
+    );
+}
+
+#[test]
+fn mt_key_judge_rejects_a_different_refusal() {
+    let observations =
+        serde_json::json!({"status": "unavailable", "reason": "bootstrap_unavailable"});
+    let error = judge_mt_key_observations(&observations, 400).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("pinned journal_unavailable refusal"),
+        "unexpected error: {error:#}"
+    );
 }

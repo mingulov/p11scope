@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 225,
+  "default_floor": 226,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -166,6 +166,7 @@
     "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
     "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_e2e_softhsm_edges_lp64",
     "inventory::manifest_e2e_tests::privileged_inventory_system_manifest_scale4097_softsm_edges_lp64",
+    "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_lists_churned_identity",
     "inventory_present::reload_disclosure_privileged_tests::privileged_inventory_reload_disclosure_omits_key_without_churn",
     "metrics::counter_reader::tests::counter_reader_native_maps_match_all_modes",
@@ -270,7 +271,8 @@
       "inventory::privileged_tests::privileged_key_operations_seal_generation_gated_by_flag",
       "inventory::privileged_tests::privileged_key_operations_linked_fault_fails_coverage_without_latching",
       "inventory::privileged_tests::privileged_key_operations_linked_healthy_routes_without_coverage_failed",
-      "attach::tests::sealed_session_drain_linkage_is_behavioral"
+      "attach::tests::sealed_session_drain_linkage_is_behavioral",
+      "inventory::manifest_e2e_tests::privileged_inventory_pid_key_operations_mt_sign_rows_exact"
     ]
   },
   "journal_proof": {

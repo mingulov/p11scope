@@ -1744,6 +1744,90 @@ fn mid_apply_cancellation_skips_extension_and_successor_mint_but_preserves_appli
     );
 }
 
+/// P1-2: a stop that lands after pass-0 collection completes keeps the
+/// completed collection as scan-only data — modules and callers are
+/// shown, counts read "not attached", and the gap names the stop —
+/// instead of discarding into "0 callers" plus `no complete
+/// collection pass`. Only attaching after the stop stays blocked: no
+/// target extension, no successor collection.
+#[test]
+fn stop_latched_after_pass0_collection_keeps_scan_only_modules_and_callers() {
+    let log = Log::default();
+    let mut scene = Scene::new(&log);
+    let lane = ScriptedLane::new(&log);
+    let started = NativeLane::start(lane, &mut scene, windows(), None)
+        .map_err(|(_, reason)| reason)
+        .unwrap();
+    // The stop fires once pass-0 collection has started ("collect" is
+    // noted on the loop thread before the worker runs): after the
+    // collection completes, before any apply — the busy-host shape.
+    let seen_collect = {
+        let log = Rc::clone(&log);
+        move || log.borrow().iter().any(|entry| entry == "collect")
+    };
+    let stop = move || seen_collect();
+    let clock = LoopClock {
+        deadline: None,
+        stop: &stop,
+        now: &Instant::now,
+        interval: Duration::ZERO,
+        tick: Duration::from_millis(1),
+        collection_tick: NO_COLLECTION_TICK,
+    };
+    let mut pass_publications = 0;
+    let outcome = run_classic_finalizing(
+        &mut scene,
+        Some(started),
+        &clock,
+        None,
+        &mut |scene: &mut Scene, point| {
+            if matches!(point, Publish::Pass { .. }) {
+                scene.note("publish:pass");
+                pass_publications += 1;
+            }
+            Ok(())
+        },
+    );
+    assert!(outcome.error.is_none(), "exit 0 is preserved");
+    assert_eq!(
+        pass_publications, 1,
+        "the completed collection publishes once"
+    );
+    assert!(
+        outcome.zero_pass.is_none(),
+        "a kept pass is not a zero-pass run"
+    );
+    assert_eq!(
+        scene.coordinator.adapter().len(),
+        1,
+        "the caller is shown, not 0"
+    );
+    assert!(
+        scene.coordinator.registry().modules().count() >= 1,
+        "modules are shown"
+    );
+    assert_eq!(
+        scene.coverage(),
+        UseCoverage::Unknown(UnknownReason::NotAttached),
+        "counts read not attached"
+    );
+    assert!(
+        scene
+            .gap_subjects()
+            .iter()
+            .any(|subject| subject == "stopped before attach"),
+        "the gap names the stop: {:?}",
+        scene.gap_subjects()
+    );
+    // Only attaching after the stop stays blocked.
+    let captured = entries(&log);
+    assert!(
+        !captured.iter().any(|entry| entry == "take_target_delta"),
+        "no target delta is taken after the stop: {captured:?}"
+    );
+    assert_eq!(scene.scans, 1, "no successor collection starts");
+}
+
 #[test]
 fn cgroup_lane_startup_and_terminal_reads_preserve_explicit_coverage() {
     let log = Log::default();

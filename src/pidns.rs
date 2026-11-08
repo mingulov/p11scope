@@ -337,6 +337,20 @@ pub fn require_numbering_agrees(numbering: &PidNumbering, what: &str) -> Result<
     ))))
 }
 
+/// DR-K8S-5: refuses a non-PID capture that found zero modules when the
+/// observer runs in a nested PID namespace with its own `/proc`. Host
+/// processes are not visible there, so an empty result cannot mean
+/// "nothing uses PKCS#11". Call only when the plan is empty; any
+/// modules found are in-namespace data and proceed with the warning
+/// [`nested_warning`] already emitted. (RED stub: always proceeds.)
+pub fn refuse_nested_empty_capture(
+    _numbering: &PidNumbering,
+    _what: &str,
+    _modules_empty: bool,
+) -> Result<()> {
+    Ok(())
+}
+
 /// Refuses every capture when the mounted `/proc` has no entry for this
 /// process ([`ProcView::Unserved`]). `what` names the request. The observer
 /// reads its own `/proc/self` (the uretprobe self-probe, a trace `-o` link)
@@ -539,6 +553,60 @@ mod tests {
         assert_eq!(ObserverPidNs::Unknown(String::new()).label(), "unknown");
         assert!(ObserverPidNs::Initial.numbering_agrees());
         assert!(!ObserverPidNs::Nested.numbering_agrees());
+    }
+
+    /// DR-K8S-5: a nested observer with its own `/proc` that found zero
+    /// modules refuses by name — host processes are not visible, so the
+    /// empty result cannot mean "nothing uses PKCS#11" — instead of
+    /// exiting 0 over an empty view. Modules found proceed (they are
+    /// in-namespace data, already warned about); so does every
+    /// numbering where host invisibility cannot be named.
+    #[test]
+    fn a_nested_observer_without_host_view_refuses_an_empty_capture_by_name() {
+        let nested_own = PidNumbering {
+            observer: ObserverPidNs::Nested,
+            proc_view: ProcView::Own,
+        };
+        let error = refuse_nested_empty_capture(&nested_own, "a --system capture", true)
+            .expect_err("nested observer, own /proc, zero modules must refuse");
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("pid-namespace-mismatch: refusing a --system capture:"),
+            "{text}"
+        );
+        assert!(text.contains("host processes are not visible"), "{text}");
+        assert!(text.contains("hostPID"), "{text}");
+        // Modules found: in-namespace data proceeds.
+        refuse_nested_empty_capture(&nested_own, "a --system capture", false)
+            .expect("modules found proceed");
+        // Every other numbering proceeds: nothing to name.
+        for (name, numbering) in [
+            ("agreeing", PidNumbering::agreeing()),
+            (
+                "nested with a foreign /proc",
+                PidNumbering {
+                    observer: ObserverPidNs::Nested,
+                    proc_view: ProcView::Foreign("/proc/self: gone".into()),
+                },
+            ),
+            (
+                "unknown observer",
+                PidNumbering {
+                    observer: ObserverPidNs::Unknown("gone".into()),
+                    proc_view: ProcView::Own,
+                },
+            ),
+            (
+                "initial observer with a foreign /proc",
+                PidNumbering {
+                    observer: ObserverPidNs::Initial,
+                    proc_view: ProcView::Foreign("/proc/self: gone".into()),
+                },
+            ),
+        ] {
+            refuse_nested_empty_capture(&numbering, "a --system capture", true)
+                .unwrap_or_else(|error| panic!("{name} with zero modules proceeds: {error:#}"));
+        }
     }
 
     #[test]

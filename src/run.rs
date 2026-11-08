@@ -5064,6 +5064,13 @@ fn pid_namespace_preflight(
     Ok(crate::pidns::nested_warning(numbering))
 }
 
+/// P1-3: the empty-plan line. A plan with zero modules but provider
+/// skips names what was found and why it cannot be counted, instead
+/// of claiming nothing was found. (RED stub: always the old hint.)
+fn empty_plan_hint(scope: &ScopeArg, _plan: &crate::plan::AttachPlan) -> String {
+    no_modules_hint(scope)
+}
+
 /// Zero modules is not an error; point the operator at the discovery diagnostics.
 fn no_modules_hint(scope: &ScopeArg) -> String {
     match scope {
@@ -23893,6 +23900,149 @@ mod tests {
         assert!(hint.contains("p11scope inspect --system"), "{hint}");
         assert!(hint.contains("p11scope inspect --pid"), "{hint}");
         assert!(hint.contains("p11scope doctor"), "{hint}");
+    }
+
+    fn empty_profile_plan_for_test() -> crate::plan::AttachPlan {
+        crate::plan::AttachPlan::from_slots_with_policy(
+            Vec::new(),
+            crate::plan::AdmissionPolicy::Detailed,
+        )
+        .expect("an empty profile plan builds")
+    }
+
+    /// P1-3: a plan with zero modules and one `original_file_unproven`
+    /// skip (a provider the scan found and the witness refused) names
+    /// the found-but-refused provider instead of claiming none found.
+    #[test]
+    fn an_empty_plan_with_a_refused_provider_names_it_instead_of_claiming_none_found() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        assert!(plan.modules.is_empty());
+        plan.skipped.push(Skipped {
+            subject: "/opt/provider/libx.so".into(),
+            reason: "original_file_unproven: kernel witness unavailable: no BTF".into(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(hint.contains("found 1 PKCS#11 provider"), "{hint}");
+        assert!(hint.contains("could not count calls"), "{hint}");
+        assert!(hint.contains("original_file_unproven"), "{hint}");
+        assert!(
+            !hint.contains("no PKCS#11 modules discovered"),
+            "{hint}"
+        );
+        assert!(hint.contains("p11scope doctor"), "{hint}");
+    }
+
+    /// P1-3 twin: a deleted mapping was never opened, so provider-ness
+    /// is exactly what cannot be determined — the line names the
+    /// unexamined file and its reason instead of a bare nothing-found.
+    #[test]
+    fn an_empty_plan_with_an_unexaminable_mapping_names_it_as_unexamined() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "/opt/provider/libx.so (deleted)".into(),
+            reason: "deleted mapping".into(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::Pid(42), &plan);
+        assert!(hint.contains("could not be examined"), "{hint}");
+        assert!(hint.contains("deleted mapping"), "{hint}");
+        assert!(hint.contains("p11scope inspect --pid 42"), "{hint}");
+    }
+
+    /// P1-3 twin: a refused whole module is a confirmed provider by
+    /// construction (it was admitted, then refused), so it counts as
+    /// found-but-refused too.
+    #[test]
+    fn an_empty_plan_with_a_refused_whole_module_counts_it_as_found() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.modules_skipped.push(Skipped {
+            subject: "/opt/provider/libx.so".into(),
+            reason: "whole refusal: needs 12 slots, 4 free".into(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(hint.contains("found 1 PKCS#11 provider"), "{hint}");
+        assert!(hint.contains("could not count calls"), "{hint}");
+        assert!(
+            !hint.contains("no PKCS#11 modules discovered"),
+            "{hint}"
+        );
+    }
+
+    /// P1-3 guard: verified absence (an examined file with no table)
+    /// keeps the nothing-found hint — only real refusals change it.
+    #[test]
+    fn an_empty_plan_with_only_verified_absence_keeps_the_nothing_found_hint() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.skipped.push(Skipped {
+            subject: "/lib/libc.so.6".into(),
+            reason: crate::discovery::scan::NO_TABLE_FOUND_MARKER.to_string(),
+        });
+        plan.skipped.push(Skipped {
+            subject: "--module /opt/missing.so".into(),
+            reason: crate::discovery::scan::HINT_NOT_MAPPED_REASON.to_string(),
+        });
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(hint.contains("no PKCS#11 modules discovered"), "{hint}");
+        assert!(hint.contains("p11scope inspect --system"), "{hint}");
+    }
+
+    /// P1-3 guard: a proxy closure still awaiting publication reads
+    /// like nothing mapped yet (the start gate's own rule), not like
+    /// a refused provider.
+    #[test]
+    fn an_empty_plan_with_only_an_awaiting_closure_keeps_the_nothing_found_hint() {
+        use crate::discovery::scan::Skipped;
+        let mut plan = empty_profile_plan_for_test();
+        plan.modules_skipped.push(Skipped {
+            subject: "/opt/proxy/libproxy.so".into(),
+            reason: "(a proxy closure array is admitted whole, but no table is published yet)"
+                .into(),
+        });
+        assert!(
+            crate::plan::is_closure_awaiting_publication(
+                &plan.modules_skipped[0].reason
+            ),
+            "the fixture must carry the awaiting-publication marker"
+        );
+        let hint = empty_plan_hint(&ScopeArg::System, &plan);
+        assert!(hint.contains("no PKCS#11 modules discovered"), "{hint}");
+    }
+
+    /// P1-3 JSON half: a refused-provider skip lands in the document
+    /// as a named gap (flattened per the closed vocabulary, which
+    /// never names paths), PARTIAL, with the `skipped` cause — the
+    /// same refusal the stderr line names in full.
+    #[test]
+    fn refused_provider_skips_land_in_json_as_named_gaps() {
+        use crate::discovery::scan::Skipped;
+        let internal = Skipped {
+            subject: "/opt/provider/libx.so".into(),
+            reason: "original_file_unproven: kernel witness unavailable: no BTF".into(),
+        };
+        let projected = crate::render::capture_skipped_out(&internal);
+        assert_eq!(projected.name, "discovery subject", "{projected:?}");
+        let mut ev = crate::render::tests::evidence();
+        ev.table_entries = 0;
+        ev.slots = 0;
+        ev.active_slots = 0;
+        ev.attached_probes = 0;
+        ev.discovery.modules = Vec::new();
+        ev.skipped = vec![projected];
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        for cause in ["discovery", "slots", "skipped"] {
+            assert!(
+                ev.gap_classes.observation.causes.contains(&cause),
+                "{:?}",
+                ev.gap_classes.observation.causes
+            );
+        }
+        let json = serde_json::to_value(&ev).expect("evidence serializes");
+        assert_eq!(json["skipped"][0]["name"], "discovery subject");
+        assert_eq!(json["completeness"], "PARTIAL");
     }
 
     /// `inspect` propagates a hard error for a pid that names nothing; it must reach

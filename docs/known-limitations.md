@@ -822,9 +822,16 @@ one call writes up to two records (its journal BEGIN and its END, or
 an ABANDON in place of the END), so one lost call can count up to
 twice. A linked capture therefore loads a 16 MiB EVENTS ring (about
 1.9 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
-12 MiB more locked kernel memory while that lane is active. The ring is
-read only between seals of the key-operation lane, so a seal longer than
-the ring's headroom still loses records, disclosed as above. Prompt saturated-tick commits apply to
+12 MiB more locked kernel memory while that lane is active. The Joint
+service drains EVENTS into a bounded userspace staging queue on every
+service regardless of seal state, so a seal awaiting future input no
+longer wedges the ring behind it; the queue holds at most 131,072
+records and 48 MiB of ring spans (about 54 MiB worst case with
+per-entry overhead). When the queue fills while the ring still holds
+records, the service records the named `joint events staging
+saturated` gap (identical gaps aggregate by repeats) and the ring
+keeps the rest; kernel ring loss still counts any overflow, disclosed
+as above. Prompt saturated-tick commits apply to
 legacy lanes only; joint-machine lanes service the machine instead
 and disclose loss at each publish. Measured sustained rate (one
 busy 12-CPU development host, release observer): without

@@ -1712,8 +1712,11 @@ primary_substr() {
 
 # sample_spy <tag> <config> <cov> <threads>
 # config: plain|inv-pid|metrics|trace|spy-file|spy-null. Observed configs
-# STOP-start p11perftest so the observer covers the whole run; coverage
-# is proven post-hoc (C_Initialize observed / edge counted).
+# STOP-start preloaded p11perftest so the observer covers the whole run;
+# coverage is proven post-hoc (tool completeness verdict / edge counted).
+# C_Initialize itself sneaks through before the STOP lands (µs-scale
+# startup vs ms-scale poll) and is not a coverage signal; init_seen and
+# init= stay in the notes as information only.
 sample_spy() {
     iters=$(iters_for_cov "$3") || return 1
     skip=$(( iters / 10 ))
@@ -1825,7 +1828,7 @@ sample_spy() {
             info=$(python3 -I "$WORK/validate.py" proftotals "$WORK/$1.json") \
                 || { echo "$1: proftotals failed" >&2; return 1; }
             notes="$notes :: obs $info"
-            case "$info" in *"init=0 "*) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
+            case "$info" in *"completeness=COMPLETE "*) ;; *) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
             ;;
         trace)
             reclaim_root_output "$WORK/$1.txt"
@@ -1837,7 +1840,7 @@ sample_spy() {
                 head -c 1048576 "$WORK/$1.txt" > "$WORK/$1.txt.head"; rm -f "$WORK/$1.txt"
             fi
             notes="$notes :: obs $info bytes=$bytes init_seen=$init_seen"
-            if [ "$init_seen" = 0 ]; then exact=0; notes="$notes PARTIAL-COVERAGE"; fi
+            case "$info" in *"completeness=COMPLETE") ;; *) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
             ;;
     esac
     record "spy" "spy-$3-t$4" "$(basename "$mod")" "$2" 1 "$headline_n" "$headline_wall" \

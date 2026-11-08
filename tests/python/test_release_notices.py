@@ -161,10 +161,47 @@ class ReleaseNoticesTests(unittest.TestCase):
             self.assertIn("LICENSE", self.mod.run(["git", "status", "--porcelain"], self.root))
 
     def test_clarification_version_drift_is_rejected(self):
-        recipe = {"clarifications": {"example": {"version": "9.0", "license": self.package["license"],
-                                                 "source": self.package["source"], "files": []}}}
+        recipe = {"clarifications": {"example": {"license": self.package["license"],
+                                                 "source": self.package["source"],
+                                                 "versions": [{"version": "9.0", "files": []}]}}}
         with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
             self.mod.make_config(self.metadata, self.root, recipe)
+
+    def clarification_fixture(self):
+        inputs = self.root / "third-party/licenses"
+        inputs.mkdir(parents=True)
+        bodies = {"one.txt": b"first version terms\n", "two.txt": b"second version terms\n"}
+        for name, body in bodies.items():
+            (inputs / name).write_bytes(body)
+        recipe = {"clarifications": {"example": {
+            "license": self.package["license"], "source": self.package["source"],
+            "versions": [{"version": version,
+                          "files": [{"license": "MIT", "path": path}]}
+                         for version, path in (("1.0", "one.txt"), ("2.0", "two.txt"))]}},
+            "files": {name: {"sha256": hashlib.sha256(body).hexdigest()}
+                      for name, body in bodies.items()}}
+        second = dict(self.package, id="registry+https://example.test#example@2.0", version="2.0")
+        return recipe, {"packages": [self.package, second]}, bodies
+
+    def test_clarification_accepts_each_pinned_version_once(self):
+        recipe, metadata, bodies = self.clarification_fixture()
+        config = self.mod.make_config(metadata, self.root, recipe)
+        self.assertEqual(config.count("\n[example.clarify]\n"), 1)
+        for body in bodies.values():
+            self.assertIn(hashlib.sha256(body).hexdigest(), config)
+
+    def test_clarification_unpinned_version_is_rejected(self):
+        recipe, metadata, _bodies = self.clarification_fixture()
+        metadata["packages"].append(dict(
+            self.package, id="registry+https://example.test#example@3.0", version="3.0"))
+        with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
+            self.mod.make_config(metadata, self.root, recipe)
+
+    def test_clarification_expression_drift_is_rejected(self):
+        recipe, metadata, _bodies = self.clarification_fixture()
+        metadata["packages"][1]["license"] = "MIT"
+        with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
+            self.mod.make_config(metadata, self.root, recipe)
 
     def test_recipe_input_hash_is_checked(self):
         (self.root / "third-party/licenses").mkdir(parents=True)

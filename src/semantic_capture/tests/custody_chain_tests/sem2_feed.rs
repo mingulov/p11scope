@@ -14,8 +14,8 @@ use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
-    image_query_refusal_label, joint_seals_line, joint_taints_line, scan_refusals_gap_reason,
-    semantic_stop_line,
+    image_query_refusal_label, joint_births_line, joint_seals_line, joint_taints_line,
+    scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -339,5 +339,17 @@ fn joint_taints_line_format_is_exact() {
          negative_only_invalidated=12 sighting_failure=13 \
          other_caller_refused=14 claim_ambiguity=15 claim_unmatched=16 \
          unclaimed_invalidation=17 events=104 first_cause=duplicate_begin"
+    );
+}
+
+#[test]
+fn joint_births_line_format_is_exact() {
+    assert_eq!(
+        joint_births_line("none", 0, 0, 0),
+        "p11scope: joint births: first_capacity_arm=none records=0 grants=0 negatives=0"
+    );
+    assert_eq!(
+        joint_births_line("fits", 4096, 1, 2),
+        "p11scope: joint births: first_capacity_arm=fits records=4096 grants=1 negatives=2"
     );
 }

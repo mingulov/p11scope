@@ -3016,6 +3016,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.joint_capture.adapter().contradiction_diagnosis()
     }
 
+    /// First birth-registration `Capacity` arm and table sizes
+    /// (diagnostics).
+    pub(crate) fn first_birth_capacity(
+        &self,
+    ) -> Option<crate::discovery::caller_registry::instance_input::BirthCapacityLatch> {
+        self.registry().first_birth_capacity()
+    }
+
     /// Applied Joint-mode feeds (diagnostics).
     pub(crate) fn joint_feeds(&self) -> usize {
         self.registry.joint_feeds()

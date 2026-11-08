@@ -1591,6 +1591,24 @@ pub(crate) fn admitted_mints_line(
     )
 }
 
+/// One stderr line for the diagnostic birth-capacity summary:
+/// the first birth-registration `Capacity` arm plus the table
+/// sizes then (`none`/0 when no registration ever refused
+/// capacity). One frozen label and counts only; no identities,
+/// paths or payloads. Diagnostic-only: printed beside the stop
+/// line only while stage timings are requested, never a contract.
+pub(crate) fn joint_births_line(
+    first_arm: &str,
+    records: u64,
+    grants: u64,
+    negatives: u64,
+) -> String {
+    format!(
+        "p11scope: joint births: first_capacity_arm={first_arm} \
+         records={records} grants={grants} negatives={negatives}"
+    )
+}
+
 /// One stderr line for the diagnostic ingest-taint summary:
 /// contradiction counts by kind, other taint causes, total
 /// events, and the first taint's cause. Counts and one frozen

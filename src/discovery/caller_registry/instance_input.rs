@@ -177,7 +177,7 @@ pub(crate) struct JointRegistrationPlan<'a> {
 
 impl JointRegistrationPlan<'_> {
     fn position(
-        &self,
+        &mut self,
         input: &AdmittedInstanceCall,
         window: &JointRegistrationWindow,
     ) -> Result<usize, JointReceiptInstallRefusal> {
@@ -215,6 +215,7 @@ impl JointRegistrationPlan<'_> {
             }
         }
         if !row.fits {
+            self.registry.latch_birth_capacity("fits");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
         Ok(position)
@@ -230,7 +231,41 @@ impl JointRegistrationPlan<'_> {
     }
 }
 
+impl crate::discovery::caller_registry::CallerRegistry {
+    /// Record the first birth-registration `Capacity` arm plus the
+    /// table sizes then. Diagnostics only: set once, never read by
+    /// any admission, grant or seal decision.
+    fn latch_birth_capacity(&mut self, arm: &'static str) {
+        if self.instance_state.first_birth_capacity.is_none() {
+            self.instance_state.first_birth_capacity = Some(BirthCapacityLatch {
+                arm,
+                records: self.instance_state.records.len(),
+                grants: self.joint_grants.len(),
+                negatives: self.instance_state.negatives.len(),
+            });
+        }
+    }
+
+    /// First birth-registration `Capacity` arm and table sizes
+    /// (diagnostics).
+    pub(crate) fn first_birth_capacity(&self) -> Option<BirthCapacityLatch> {
+        self.instance_state.first_birth_capacity
+    }
+}
+
 type JointGrantEntry = (InstanceKey, PendingJointGrant);
+
+/// Diagnostic-only latch: which birth-registration `Capacity`
+/// arm fired first, and the table sizes at that instant. Counts
+/// only — no keys, callers or modules. Disclosed beside the stop
+/// line while stage timings are requested, never a contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct BirthCapacityLatch {
+    pub(crate) arm: &'static str,
+    pub(crate) records: usize,
+    pub(crate) grants: usize,
+    pub(crate) negatives: usize,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum JointReceiptInstallRefusal {
@@ -1498,6 +1533,9 @@ pub(super) struct InstanceState {
     /// Bounded by the caller population: marks name admitted
     /// callers only, one entry each.
     registration_refused_callers: BTreeSet<CallerId>,
+    /// First birth-registration `Capacity` arm plus the table sizes
+    /// then (diagnostics only; set once, never authority).
+    first_birth_capacity: Option<BirthCapacityLatch>,
 }
 
 impl Default for InstanceState {
@@ -1527,6 +1565,7 @@ impl Default for InstanceState {
             joint_backstop_routed: 0,
             instance_calls_refused: BTreeMap::new(),
             registration_refused_callers: BTreeSet::new(),
+            first_birth_capacity: None,
         }
     }
 }
@@ -1699,13 +1738,15 @@ impl CallerRegistry {
                 })
             })
             .and_then(|bytes| bytes.checked_add(std::mem::size_of::<JointRegistrationPlan<'_>>()))
-            .ok_or(JointReceiptInstallRefusal::Capacity)?;
+            .ok_or(JointReceiptInstallRefusal::Capacity)
+            .inspect_err(|_| self.latch_birth_capacity("plan_bytes"))?;
         let storage = self
             .reserve_semantic_storage(bytes)
             .map_err(|_| JointReceiptInstallRefusal::Storage)?;
         let mut rows = Vec::new();
         rows.try_reserve_exact(count)
-            .map_err(|_| JointReceiptInstallRefusal::Capacity)?;
+            .map_err(|_| JointReceiptInstallRefusal::Capacity)
+            .inspect_err(|_| self.latch_birth_capacity("plan_reserve"))?;
         assert!(
             rows.capacity() <= count,
             "actual original index capacity was prepaid"
@@ -1760,7 +1801,8 @@ impl CallerRegistry {
                 // a later-refused physical row is conservative, never a grant.
                 occupied = occupied
                     .checked_add(1)
-                    .ok_or(JointReceiptInstallRefusal::Capacity)?;
+                    .ok_or(JointReceiptInstallRefusal::Capacity)
+                    .inspect_err(|_| self.latch_birth_capacity("plan_occupied"))?;
             }
         }
         rows.sort_unstable_by_key(|row| row.hash);
@@ -1781,7 +1823,7 @@ impl CallerRegistry {
         &mut self,
         input: &AdmittedInstanceCall,
     ) -> Result<JointReceiptReservation<'_>, JointReceiptInstallRefusal> {
-        let plan = self.joint_registration_plan()?;
+        let mut plan = self.joint_registration_plan()?;
         let window = JointRegistrationWindow {
             start: 0,
             end: plan.staged_len,
@@ -1813,21 +1855,47 @@ impl CallerRegistry {
         if self.joint_grants.contains_key(&input.key) {
             return Err(JointReceiptInstallRefusal::AlreadyReserved);
         }
-        if self.instance_state.negative_exhausted
-            || self.instance_state.identity_exhausted
-            || self.instance_state.records.len() >= self.instance_state.limit
-            || self.joint_grants.len() >= self.instance_state.limit.min(MAX_REGISTRY_INSTANCES)
-        {
+        // One `Capacity` arm per condition (same disjunction as
+        // before, split only to name the firing arm for the
+        // diagnostic latch; every arm returns the same error).
+        if self.instance_state.negative_exhausted {
+            self.latch_birth_capacity("reserve_negatives");
+            return Err(JointReceiptInstallRefusal::Capacity);
+        }
+        if self.instance_state.identity_exhausted {
+            self.latch_birth_capacity("reserve_identity");
+            return Err(JointReceiptInstallRefusal::Capacity);
+        }
+        if self.instance_state.records.len() >= self.instance_state.limit {
+            self.latch_birth_capacity("reserve_records");
+            return Err(JointReceiptInstallRefusal::Capacity);
+        }
+        if self.joint_grants.len() >= self.instance_state.limit.min(MAX_REGISTRY_INSTANCES) {
+            self.latch_birth_capacity("reserve_grants");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
         let reserve = self.semantic_storage_reserver();
-        let key_storage = reserve_joint_grant_storage(
+        let key_bytes = match copied_key_bytes(&input.key) {
+            Some(bytes) => bytes,
+            None => {
+                self.latch_birth_capacity("grant_key_bytes");
+                return Err(JointReceiptInstallRefusal::Capacity);
+            }
+        };
+        let key_storage = match reserve_joint_grant_storage(
             &mut self.joint_grants,
             &mut self.joint_grant_allocation,
             &mut self.joint_grant_storage,
             &reserve,
-            copied_key_bytes(&input.key).ok_or(JointReceiptInstallRefusal::Capacity)?,
-        )?;
+            key_bytes,
+        ) {
+            Ok(storage) => storage,
+            Err(refusal @ JointReceiptInstallRefusal::Capacity) => {
+                self.latch_birth_capacity("grant_growth");
+                return Err(refusal);
+            }
+            Err(refusal) => return Err(refusal),
+        };
         Ok(JointReceiptReservation {
             key: Some(input.key.clone()),
             registry: self,
@@ -4733,6 +4801,52 @@ mod journal_unavailable_tests {
             !production.contains("false"),
             "linkage derives from the linked flag, not a literal: {production}"
         );
+    }
+
+    /// The birth-capacity latch names the first `Capacity` arm and
+    /// freezes its table sizes: a later refusal at new sizes must
+    /// not overwrite it. Diagnostics only; the errors are unchanged.
+    #[test]
+    fn birth_capacity_latch_freezes_first_arm() {
+        let mut scene = UnlinkedScene::new();
+        assert!(scene.registry.first_birth_capacity().is_none());
+        scene.registry.reference_instance_limit(1);
+        scene.register(0);
+        // Stage a second key without draining: the one record fills
+        // the limit, so the new row cannot fit.
+        let key1 = scene.key(1);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key1.clone(), scene.caller));
+        let input1 = AdmittedInstanceCall::scripted(key1, scene.caller, 1, s1_call("C_Sign", 0, 0));
+        assert!(matches!(
+            scene.registry.reserve_admitted_joint_receipt(&input1),
+            Err(JointReceiptInstallRefusal::Capacity)
+        ));
+        let latched = scene
+            .registry
+            .first_birth_capacity()
+            .expect("fits refusal latches");
+        assert_eq!(latched.arm, "fits");
+        assert_eq!(
+            (latched.records, latched.grants, latched.negatives),
+            (1, 0, 0)
+        );
+        // A second refusal at new sizes keeps the first snapshot.
+        scene.registry.reference_instance_limit(2);
+        scene.register(1);
+        let key2 = scene.key(2);
+        scene
+            .registry
+            .note_instance(AdmittedInstance::scripted(key2.clone(), scene.caller));
+        let input2 = AdmittedInstanceCall::scripted(key2, scene.caller, 2, s1_call("C_Sign", 0, 0));
+        assert!(matches!(
+            scene.registry.reserve_admitted_joint_receipt(&input2),
+            Err(JointReceiptInstallRefusal::Capacity)
+        ));
+        let kept = scene.registry.first_birth_capacity().expect("latch sticks");
+        assert_eq!(kept.arm, "fits");
+        assert_eq!((kept.records, kept.grants, kept.negatives), (1, 0, 0));
     }
 }
 

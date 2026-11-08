@@ -3222,6 +3222,13 @@ fn disclose_semantic_stop(
             taints.events,
             taints.first_cause,
         ));
+        let births = coordinator.first_birth_capacity();
+        warn.emit(&crate::inventory_semantics::joint_births_line(
+            births.map_or("none", |latched| latched.arm),
+            births.map_or(0, |latched| latched.records as u64),
+            births.map_or(0, |latched| latched.grants as u64),
+            births.map_or(0, |latched| latched.negatives as u64),
+        ));
         let seals = coordinator.seal_diagnosis();
         warn.emit(&crate::inventory_semantics::joint_seals_line(
             seals.attempts,

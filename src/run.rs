@@ -3570,6 +3570,20 @@ pub(crate) fn extensive_effective(track_short_lived: bool, policy: CapturePolicy
     track_short_lived && policy.allows_track_short_lived()
 }
 
+/// 7.10b: the owned-`run` extensive-arm decision: whether the flag is
+/// effective under this policy, plus the direct child as the explicit
+/// owned target (which arms the PID target-exec consumer for the child
+/// even under the run-tree cgroup scope; it never arms the gap
+/// consumer). The run arm site passes both through to
+/// `engine.arm_extensive` unchanged.
+fn owned_extensive_arm(
+    track_short_lived: bool,
+    policy: CapturePolicy,
+    pid: u32,
+) -> (bool, Option<u32>) {
+    (extensive_effective(track_short_lived, policy), Some(pid))
+}
+
 pub(crate) fn capture_policy(
     kind: Kind,
     metrics: bool,
@@ -4784,11 +4798,8 @@ fn run_owned_inner_with_host(
     // explicit owned target, which arms the PID target-exec consumer
     // for the child even under the run-tree cgroup scope; it never
     // arms the gap consumer.
-    engine.arm_extensive(
-        extensive_effective(args.track_short_lived, policy),
-        policy,
-        Some(pid),
-    );
+    let (extensive, owned) = owned_extensive_arm(args.track_short_lived, policy, pid);
+    engine.arm_extensive(extensive, policy, owned);
     // `start_owned_session` arms the pre-exec loader context before the
     // barrier when exact PT_INTERP binding is safe, and otherwise leaves
     // `initial_set_capture = none` with sticky `PARTIAL`.
@@ -17565,6 +17576,45 @@ mod tests {
             1,
             "one arm site feeds the owned run"
         );
+    }
+
+    /// The owned-`run` arm decision carries the effective flag plus the
+    /// direct child as the explicit owned target: a `false`/`None`
+    /// regression here disarms the PID target-exec consumer the owned
+    /// run must arm.
+    #[test]
+    fn owned_run_arm_decision_passes_effective_flag_and_direct_child() {
+        // Every Detailed policy arms with the flag set, and carries the
+        // child either way.
+        for policy in [
+            CapturePolicy::Allowlisted,
+            CapturePolicy::UnsafeUnvalidatedMetadata,
+            CapturePolicy::AggregateOnly,
+        ] {
+            assert_eq!(
+                owned_extensive_arm(true, policy, 4242),
+                (true, Some(4242)),
+                "{policy:?}"
+            );
+            assert_eq!(
+                owned_extensive_arm(false, policy, 4242),
+                (false, Some(4242)),
+                "{policy:?}"
+            );
+        }
+        // A counter policy never arms, whatever the flag; the child is
+        // still carried (the CLI combination already refused above).
+        for mode in [
+            p11scope_ebpf_common::CounterMode::Counts,
+            p11scope_ebpf_common::CounterMode::Timestamps,
+            p11scope_ebpf_common::CounterMode::Latency,
+        ] {
+            assert_eq!(
+                owned_extensive_arm(true, CapturePolicy::Counter(mode), 4242),
+                (false, Some(4242)),
+                "{mode:?}"
+            );
+        }
     }
 
     #[test]

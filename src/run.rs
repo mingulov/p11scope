@@ -4605,17 +4605,8 @@ fn run_owned_inner_with_host(
         args.track_short_lived,
         args.select_endpoint.as_deref(),
     )?;
-    // 614b P1: programmatic callers bypass the CLI refusal, so
-    // `run_owned` re-checks it here, before anything is forked. Without
-    // this an owned cgroup-scope run would arm exe-identity recording
-    // the grant never authorized (Detailed profile --cgroup/--system
-    // only); the message mirrors the CLI's.
-    if args.track_short_lived {
-        anyhow::bail!(
-            "--track-short-lived records nothing beside run; remove it \
-             (it arms only Detailed profile --cgroup/--system captures)"
-        );
-    }
+    // 7.10b widening: an owned run accepts `--track-short-lived`; the
+    // counter-mode combination already refused above in `capture_policy`.
     // DR-K8S-1: `run` controls its own child by PID, numbered in this
     // observer's namespace (whatever shape the capture scope takes);
     // refuse before anything is forked.
@@ -17483,30 +17474,6 @@ mod tests {
         }
     }
 
-    /// 614b P1 extends to programmatic callers: the CLI refuses
-    /// `--track-short-lived` beside `run`, and `run_owned` refuses it
-    /// the same way before anything is forked — otherwise an owned
-    /// cgroup-scope run would arm exe-identity recording the grant
-    /// never authorized. A nonexistent command proves the refusal
-    /// precedes resolution, and the panicking host proves it precedes
-    /// admission.
-    #[test]
-    fn owned_run_refuses_track_short_lived_before_any_fork() {
-        let mut args = run_args(
-            cli::PausePolicy::Never,
-            &["definitely-not-a-p11scope-program"],
-        );
-        args.track_short_lived = true;
-        let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
-            panic!("host admission must not run for a refused flag combination")
-        })
-        .unwrap_err();
-        assert!(
-            format!("{error:#}").contains("--track-short-lived records nothing beside run"),
-            "{error:#}"
-        );
-    }
-
     /// 7.10b widening wins (controller ruling): an owned `run` accepts
     /// `--track-short-lived` and arms the PID target-exec consumer for its
     /// direct child via `engine.arm_extensive(..., Some(pid))` (pinned by
@@ -17520,8 +17487,7 @@ mod tests {
         let mut args = run_args(cli::PausePolicy::Never, &["/bin/true"]);
         args.track_short_lived = true;
         let probes = std::cell::Cell::new(0);
-        let refusal =
-            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
         let host = || {
             probes.set(probes.get() + 1);
             Err(refusal)
@@ -17552,11 +17518,10 @@ mod tests {
             args.metrics = true;
             args.counter_mode = Some(mode);
             args.track_short_lived = true;
-            let error =
-                run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
-                    panic!("host admission must not run for a refused flag combination")
-                })
-                .unwrap_err();
+            let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
+                panic!("host admission must not run for a refused flag combination")
+            })
+            .unwrap_err();
             assert!(
                 format!("{error:#}").contains(&format!(
                     "--track-short-lived cannot be combined with --counter-mode {}",

@@ -231,11 +231,14 @@ pub(crate) enum PairLinkDirection {
 
 /// One attach-set decision, for the verbose per-pass lines: which
 /// branch decided one plan object (or module) and on which digests.
-/// Fresh admissions always note (they happen once per object);
-/// Known and Blocked note only under pair-relevant keys (a
-/// witness-proven pre-copy-up observation shares the key), so steady
-/// passes stay quiet. Verdict notes carry the module digest as
-/// `incoming` with its endpoint count; resolve notes carry no count.
+/// Fresh admissions always note (they happen once per object, so no
+/// admission is ever missed); the pair-full and no-companion
+/// refusals always note too (a proven pair or side is present by
+/// construction). Known matches note only when pair-relevant (a
+/// pre-copy-up observation shares the key in this pass's aggregate
+/// or among the retained members), so steady passes stay quiet.
+/// Verdict notes carry the module digest as `incoming` with its
+/// endpoint count; resolve notes carry no count.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AttachDecisionNote {
     pub key: ObjectKey,
@@ -827,9 +830,9 @@ impl InventoryAttachSet {
         }
 
         // Keys sharing this pass's aggregate with a witness-proven
-        // pre-copy-up observation: verdicts note under these, so
-        // pair-module decisions read per pass while steady modules
-        // stay quiet.
+        // pre-copy-up observation: verdicts and Known matches note
+        // under these, so pair-module decisions read per pass while
+        // steady modules stay quiet.
         let pair_keys: BTreeSet<ObjectKey> = pins
             .pinned()
             .filter(|summary| summary.pre_copy_up)
@@ -845,6 +848,7 @@ impl InventoryAttachSet {
                     &mut outcome.gaps,
                     prepared.as_deref(),
                     &mut outcome.decisions,
+                    &pair_keys,
                 ));
             }
         }
@@ -958,6 +962,7 @@ impl InventoryAttachSet {
         gaps: &mut Vec<AttachGap>,
         prepared: Option<&PreparedProviderFacts>,
         notes: &mut DecisionLog,
+        pair_keys: &BTreeSet<ObjectKey>,
     ) -> Resolution {
         let Some(summary) = pins.summary(id) else {
             return Resolution::Blocked {
@@ -1012,7 +1017,7 @@ impl InventoryAttachSet {
                 live.push(object);
             }
             if live.is_empty() {
-                return self.resolve_by_content(pins, id, prepared, notes);
+                return self.resolve_by_content(pins, id, prepared, notes, pair_keys);
             }
             for &object in &live {
                 let same = prepared.map_or_else(
@@ -1030,6 +1035,25 @@ impl InventoryAttachSet {
                             recorded: true,
                         };
                     }
+                    if pair_keys.contains(&summary.key)
+                        || self.objects[object.0 as usize].target.pre_copy_up()
+                    {
+                        let matched = self.objects[object.0 as usize]
+                            .target
+                            .borrowed_file_and_digest()
+                            .1
+                            .to_string();
+                        notes.push(AttachDecisionNote {
+                            key: summary.key,
+                            path: summary.path.to_string(),
+                            branch: "known-by-identity",
+                            retained: Some(matched),
+                            incoming: summary.sha256.to_string(),
+                            incoming_pre: summary.pre_copy_up,
+                            direction: None,
+                            endpoints: None,
+                        });
+                    }
                     return Resolution::Known(object);
                 }
             }
@@ -1044,7 +1068,7 @@ impl InventoryAttachSet {
                 // nothing.
                 let mut probe = DecisionLog::default();
                 if let Resolution::Known(object) =
-                    self.resolve_by_content(pins, id, prepared, &mut probe)
+                    self.resolve_by_content(pins, id, prepared, &mut probe, pair_keys)
                 {
                     notes.append(probe);
                     return Resolution::Known(object);
@@ -1114,6 +1138,21 @@ impl InventoryAttachSet {
                 // A proven side is never poisoned by an unproven
                 // conflict: block the newcomer, keep the retained
                 // object extendable for a later proven pass.
+                let member = self.objects[live[0].0 as usize]
+                    .target
+                    .borrowed_file_and_digest()
+                    .1
+                    .to_string();
+                notes.push(AttachDecisionNote {
+                    key: summary.key,
+                    path: summary.path.to_string(),
+                    branch: "blocked-no-companion",
+                    retained: Some(member),
+                    incoming: summary.sha256.to_string(),
+                    incoming_pre: summary.pre_copy_up,
+                    direction: None,
+                    endpoints: None,
+                });
                 return Resolution::Blocked {
                     reason: format!(
                         "{}: the witness-proven pre-copy-up observation has no proven companion \
@@ -1125,6 +1164,16 @@ impl InventoryAttachSet {
             }
             // A key already naming a proven pair refuses further
             // identities without disturbing the pair.
+            notes.push(AttachDecisionNote {
+                key: summary.key,
+                path: summary.path.to_string(),
+                branch: "blocked-pair-full",
+                retained: None,
+                incoming: summary.sha256.to_string(),
+                incoming_pre: summary.pre_copy_up,
+                direction: None,
+                endpoints: None,
+            });
             return Resolution::Blocked {
                 reason: format!(
                     "{}: this key already names a witness-proven copy-up pair; the divergent pin \
@@ -1134,7 +1183,7 @@ impl InventoryAttachSet {
                 recorded: false,
             };
         }
-        self.resolve_by_content(pins, id, prepared, notes)
+        self.resolve_by_content(pins, id, prepared, notes, pair_keys)
     }
 
     /// Drops one member from a raw key's routing list, removing the key
@@ -1200,6 +1249,7 @@ impl InventoryAttachSet {
         id: PinnedObjectId,
         prepared: Option<&PreparedProviderFacts>,
         notes: &mut DecisionLog,
+        pair_keys: &BTreeSet<ObjectKey>,
     ) -> Resolution {
         let Some(summary) = pins.summary(id) else {
             return Resolution::Blocked {
@@ -1237,6 +1287,25 @@ impl InventoryAttachSet {
             if members < 2 && self.aliases < self.limit() {
                 self.by_raw.entry(summary.key).or_default().push(object);
                 self.aliases += 1;
+            }
+            if pair_keys.contains(&summary.key)
+                || self.objects[object.0 as usize].target.pre_copy_up()
+            {
+                let matched = self.objects[object.0 as usize]
+                    .target
+                    .borrowed_file_and_digest()
+                    .1
+                    .to_string();
+                notes.push(AttachDecisionNote {
+                    key: summary.key,
+                    path: summary.path.to_string(),
+                    branch: "known-by-content",
+                    retained: Some(matched),
+                    incoming: summary.sha256.to_string(),
+                    incoming_pre: summary.pre_copy_up,
+                    direction: None,
+                    endpoints: None,
+                });
             }
             return Resolution::Known(object);
         }
@@ -2972,6 +3041,187 @@ pub(crate) mod tests {
             assert_eq!(verdict.retained, None);
             assert_eq!(verdict.endpoints, Some(3));
         }
+    }
+
+    #[test]
+    fn lone_lower_refusal_notes_no_companion_branch() {
+        // Pass 1 retains the plain upper; pass 2 brings only the
+        // proven lower, which refuses for want of a companion. The
+        // note names the refused pairing with both digests.
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        let pass1 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pair_pins,
+                    &upper_path,
+                    "sha-u",
+                    &offsets(3),
+                    None,
+                )],
+                &pair_pins,
+                policy,
+            ),
+            &pair_pins,
+        );
+        assert!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .all(|note| note.branch != "blocked-no-companion"),
+            "no refusal before the lone lower arrives: {:?}",
+            pass1.decisions.notes
+        );
+        let mut pins2 = PinnedObjects::empty();
+        let mut lone = real_scan_pin(&lower_path, Some(key), 1, "sha-l");
+        mark_pre_copy_up(&mut lone);
+        repath_single_pin(&mut lone, upper_path.to_str().unwrap());
+        assert!(pins2.absorb(lone).is_empty());
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-l",
+                    &offsets(3),
+                    Some(0),
+                )],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        let note = pass2
+            .decisions
+            .notes
+            .iter()
+            .find(|note| note.branch == "blocked-no-companion")
+            .expect("a no-companion note");
+        assert_eq!(note.key, key);
+        assert_eq!(note.retained.as_deref(), Some("sha-u"));
+        assert_eq!(note.incoming, "sha-l");
+        assert!(note.incoming_pre);
+        assert_eq!(note.direction, None);
+        assert_eq!(note.endpoints, None);
+    }
+
+    #[test]
+    fn pair_known_resolutions_note_identity_branch() {
+        // A retained pair re-resolving Known still notes under its
+        // pair-relevant key: the note shows the identity match with
+        // the agreed digest.
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        let plan = lower(
+            &[
+                copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None),
+                copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0)),
+            ],
+            &pair_pins,
+            policy,
+        );
+        let pass1 = set.absorb(&plan, &pair_pins);
+        assert!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .all(|note| note.branch != "known-by-identity"),
+            "fresh admissions note no identity match: {:?}",
+            pass1.decisions.notes
+        );
+        let pass2 = set.absorb(&plan, &pair_pins);
+        for sha in ["sha-u", "sha-l"] {
+            let note = pass2
+                .decisions
+                .notes
+                .iter()
+                .find(|note| note.branch == "known-by-identity" && note.incoming == sha)
+                .unwrap_or_else(|| panic!("a known note for {sha}: {:?}", pass2.decisions.notes));
+            assert_eq!(note.key, key);
+            assert_eq!(note.retained.as_deref(), Some(sha));
+        }
+    }
+
+    #[test]
+    fn third_identity_refusal_notes_pair_full_branch() {
+        // A third identity under a proven pair key refuses without
+        // disturbing the pair, and notes the pair-full branch with
+        // the refused digest.
+        use crate::discovery::identity::test_fixture::real_scan_pin;
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let third_path = provider(&dir, "third.so", "provider-third");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, key) = copyup_pair_pins(&upper_path, &lower_path);
+        let pass1 = set.absorb(
+            &lower(
+                &[
+                    copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None),
+                    copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0)),
+                ],
+                &pair_pins,
+                policy,
+            ),
+            &pair_pins,
+        );
+        assert!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .all(|note| note.branch != "blocked-pair-full"),
+            "no pair-full refusal while the pair admits: {:?}",
+            pass1.decisions.notes
+        );
+        let mut pins2 = PinnedObjects::empty();
+        assert!(
+            pins2
+                .absorb(real_scan_pin(&third_path, Some(key), 1, "sha-t"))
+                .is_empty()
+        );
+        crate::discovery::identity::test_fixture::repath_single_pin(
+            &mut pins2,
+            upper_path.to_str().unwrap(),
+        );
+        let pass2 = set.absorb(
+            &lower(
+                &[copyup_module(
+                    &pins2,
+                    &upper_path,
+                    "sha-t",
+                    &offsets(3),
+                    None,
+                )],
+                &pins2,
+                policy,
+            ),
+            &pins2,
+        );
+        let note = pass2
+            .decisions
+            .notes
+            .iter()
+            .find(|note| note.branch == "blocked-pair-full")
+            .expect("a pair-full note");
+        assert_eq!(note.key, key);
+        assert_eq!(note.retained, None);
+        assert_eq!(note.incoming, "sha-t");
+        assert!(!note.incoming_pre);
     }
 
     #[test]

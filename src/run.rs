@@ -17532,6 +17532,41 @@ mod tests {
         }
     }
 
+    /// The owned-run arm site passes the `owned_extensive_arm` decision
+    /// through to `engine.arm_extensive` unchanged: the effective flag
+    /// for `args.track_short_lived` under this policy, plus the direct
+    /// child as the explicit owned target. A `false`/`None` regression
+    /// at the call site disarms the PID target-exec consumer. The
+    /// startup needs a live child, so the wiring is pinned statically
+    /// (same `split_once` precedent as
+    /// `witness_preload_sits_before_owned_spawn`); the decision itself
+    /// is pinned behaviorally by
+    /// `owned_run_arm_decision_passes_effective_flag_and_direct_child`.
+    #[test]
+    fn owned_run_arm_site_uses_owned_decision() {
+        let source = include_str!("run.rs");
+        let body = source
+            .split_once("fn run_owned_inner_with_host(")
+            .unwrap()
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .unwrap()
+            .0;
+        assert!(
+            body.contains("owned_extensive_arm(args.track_short_lived, policy, pid)"),
+            "owned startup arms through the owned decision helper"
+        );
+        assert!(
+            body.contains("engine.arm_extensive(extensive, policy, owned)"),
+            "owned startup passes the decision through unchanged"
+        );
+        assert_eq!(
+            body.matches("engine.arm_extensive(").count(),
+            1,
+            "one arm site feeds the owned run"
+        );
+    }
+
     #[test]
     fn counter_capture_and_run_require_host_after_build_policy_validation() {
         use crate::attach::{MultiHostRefusal, MultiHostStage};

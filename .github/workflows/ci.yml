@@ -863,6 +863,7 @@ jobs:
           UNRUN: scripts/kind-attach-pod-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/cold-pod-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/knative-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/docker-copyup-changed-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/docker-shared-layer-e2e.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/late-provider-negative.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-live-discovery-preflight.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -999,6 +1000,7 @@ jobs:
       - run: scripts/kind-attach-pod-e2e.sh --self-test
       - run: scripts/cold-pod-e2e.sh --self-test
       - run: scripts/knative-e2e.sh --self-test
+      - run: scripts/docker-copyup-changed-e2e.sh --self-test
       - run: scripts/docker-shared-layer-e2e.sh --self-test
       - run: scripts/late-provider-negative.sh --self-test
       - run: scripts/tsprobe.sh --self-test

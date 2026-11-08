@@ -1811,7 +1811,7 @@ mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts" \
     "$HCTX/tests/fixtures/public-cli"
 cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
 cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
-cp LICENSE "$OCTX/"
+cp LICENSE COPYRIGHT "$OCTX/"
 cp -r LICENSES "$OCTX/"
 cp tests/fixtures/public-cli/gated.c "$HCTX/tests/fixtures/public-cli/"
 sha256sum "$OBSERVER_BIN" | tee "$WORK/observer.sha256"

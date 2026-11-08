@@ -11546,26 +11546,25 @@ fn observer_image_runs_p11scope_by_default() {
     );
     // A comment mentioning COPYRIGHT must not satisfy this: the release
     // file needs a real `test -f` for the installed file and the dev file
-    // a real COPY instruction.
-    if std::path::Path::new("COPYRIGHT").exists() {
-        assert!(
-            release.lines().any(|line| {
-                let trimmed = line.trim_start();
-                !trimmed.starts_with('#')
-                    && trimmed.contains("test -f")
-                    && trimmed.contains("COPYRIGHT")
-            }),
-            "observer release image must install COPYRIGHT once the root file exists"
-        );
-        assert!(
-            dockerfile.lines().any(|line| {
-                let trimmed = line.trim_start();
-                (trimmed.starts_with("COPY ") || trimmed.starts_with("COPY\t"))
-                    && trimmed.contains("COPYRIGHT")
-            }),
-            "observer image must install COPYRIGHT once the root file exists"
-        );
-    }
+    // a real COPY instruction. The path is the final-image path, not the
+    // build stage: a stage-only check would pass without installing.
+    assert!(
+        release.lines().any(|line| {
+            let trimmed = line.trim_start();
+            !trimmed.starts_with('#')
+                && trimmed.contains("test -f")
+                && trimmed.contains("/usr/share/licenses/p11scope/COPYRIGHT")
+        }),
+        "observer release image must prove COPYRIGHT at the installed path"
+    );
+    assert!(
+        dockerfile.lines().any(|line| {
+            let trimmed = line.trim_start();
+            (trimmed.starts_with("COPY ") || trimmed.starts_with("COPY\t"))
+                && trimmed.contains("/usr/share/licenses/p11scope/COPYRIGHT")
+        }),
+        "observer image must COPY COPYRIGHT to the installed path"
+    );
 }
 
 /// A step cannot read its own job's log, and a `tee` wrapper would break every

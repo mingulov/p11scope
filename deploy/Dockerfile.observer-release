@@ -28,7 +28,8 @@
 # The tarball must hold exactly one `*/p11scope` regular file (the release
 # layout); anything else is refused. LICENSE, LICENSES/, notices/ and
 # RELEASE.json ride along from the same verified bytes for provenance
-# (COPYRIGHT too, once the root file exists).
+# (COPYRIGHT too: 0.7.0 tarballs carry it, and the final stage refuses an
+# image without it).
 # The base tag+digest stay matched with Dockerfile.observer.
 # Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
 # Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
@@ -70,7 +71,8 @@ RUN chmod 0755 /usr/local/bin/p11scope /usr/local/bin/k8s-profile-entry \
     && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt \
     && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt \
     && test -f /usr/share/licenses/p11scope/notices/NOTICES.md \
-    && test -f /usr/share/licenses/p11scope/RELEASE.json
+    && test -f /usr/share/licenses/p11scope/RELEASE.json \
+    && test -f /usr/share/licenses/p11scope/COPYRIGHT
 # The image runs as root: Docker's --cap-add is only effective for uid 0
 # without ambient capabilities.
 ENTRYPOINT ["/usr/local/bin/p11scope"]

@@ -6939,6 +6939,9 @@ pub(crate) mod tests {
         /// to `exe`; `diverge_maps_exe` splits them for a btrfs-style
         /// host where stat and mapped devices differ.
         exe_maps: Option<ExeIdentity>,
+        /// The scripted `/proc/<pid>/stat` ppid (field 4). Readability
+        /// follows `readable`: one stat line carries both, as in production.
+        ppid: u32,
         /// False simulates an unreadable `/proc` (a race or a permission
         /// wall): liveness answers but identity reads fail.
         readable: bool,
@@ -6985,6 +6988,7 @@ pub(crate) mod tests {
                     start_time,
                     exe: exe.clone(),
                     exe_maps: exe,
+                    ppid: 0,
                     readable: true,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
@@ -7000,10 +7004,17 @@ pub(crate) mod tests {
                     start_time: process_start_time(pid).unwrap(),
                     exe: exe.clone(),
                     exe_maps: exe,
+                    ppid: 0,
                     readable: true,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
+        }
+
+        pub(crate) fn set_ppid(&self, pid: u32, ppid: u32) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.ppid = ppid;
+            }
         }
 
         pub(crate) fn blind(&self, pid: u32) {
@@ -7310,6 +7321,122 @@ pub(crate) mod tests {
             CallerRegistry::new(RegistryLimits::default_limits()).semantic_storage_reserver(),
         );
         (source, adapter)
+    }
+
+    #[test]
+    fn launcher_chain_records_parent_start_time_against_pid_reuse() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1, 1);
+        source.exec(1, 1, "/sbin/init");
+        source.spawn(50, 5);
+        source.exec(50, 50, "/bin/grand");
+        source.set_ppid(50, 1);
+        source.spawn(100, 11);
+        source.exec(100, 101, "/bin/parent-a");
+        source.set_ppid(100, 50);
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let chain = &adapter.record(id).unwrap().launched_by;
+        assert_eq!(chain.len(), 3, "caller -> parent -> grand -> init");
+        assert_eq!((chain[0].pid, chain[0].start_time), (100, Some(11)));
+        assert_eq!(chain[0].exe.as_deref(), Some("parent-a"));
+        assert_eq!((chain[1].pid, chain[1].start_time), (50, Some(5)));
+        assert_eq!((chain[2].pid, chain[2].start_time), (1, Some(1)));
+        assert!(adapter.record(id).unwrap().launcher_gap.is_none());
+        // The parent pid is reused by a new generation: a later admission
+        // must record the live generation, never the stale one, while the
+        // first caller's chain stays frozen evidence.
+        source.kill(100);
+        source.spawn(100, 77);
+        source.exec(100, 102, "/bin/parent-b");
+        source.set_ppid(100, 50);
+        source.spawn(201, 23);
+        source.set_ppid(201, 100);
+        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
+        let chain2 = &adapter.record(id2).unwrap().launched_by;
+        assert_eq!((chain2[0].pid, chain2[0].start_time), (100, Some(77)));
+        assert_eq!(chain2[0].exe.as_deref(), Some("parent-b"));
+        let frozen = &adapter.record(id).unwrap().launched_by;
+        assert_eq!((frozen[0].pid, frozen[0].start_time), (100, Some(11)));
+        assert_eq!(frozen[0].exe.as_deref(), Some("parent-a"));
+    }
+
+    #[test]
+    fn launcher_chain_reports_an_exited_parent_as_a_named_gap() {
+        let (source, mut adapter) = adapter();
+        source.spawn(100, 11);
+        source.kill(100);
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(record.launched_by.is_empty());
+        assert_eq!(
+            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("parent unknown: exited before read")
+        );
+        // A live parent with an exited grandparent keeps the partial chain.
+        source.spawn(101, 12);
+        source.exec(101, 103, "/bin/parent");
+        source.set_ppid(101, 102);
+        source.spawn(102, 13);
+        source.kill(102);
+        source.spawn(201, 23);
+        source.set_ppid(201, 101);
+        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
+        let record2 = adapter.record(id2).unwrap();
+        assert_eq!(record2.launched_by.len(), 1);
+        assert_eq!(
+            (
+                record2.launched_by[0].pid,
+                record2.launched_by[0].start_time
+            ),
+            (101, Some(12))
+        );
+        assert_eq!(
+            record2.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("parent unknown: exited before read")
+        );
+    }
+
+    #[test]
+    fn launcher_chain_stops_at_init_and_truncates_after_four() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1, 1);
+        source.exec(1, 1, "/sbin/init");
+        source.spawn(311, 31);
+        source.exec(311, 311, "/bin/mid");
+        source.set_ppid(311, 1);
+        source.spawn(310, 30);
+        source.set_ppid(310, 311);
+        let id = adapter.admit(310, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(record.launched_by.len(), 2);
+        assert_eq!(record.launched_by[1].pid, 1);
+        assert!(record.launcher_gap.is_none());
+        // Six ancestors: four are kept, the fifth is a named truncation.
+        for pid in 301..=305 {
+            source.spawn(pid, pid as u64);
+            source.set_ppid(pid, pid - 1);
+        }
+        source.set_ppid(301, 1);
+        source.spawn(300, 29);
+        source.set_ppid(300, 305);
+        let deep = adapter.admit(300, AUTHORITY, 11).unwrap();
+        let record = adapter.record(deep).unwrap();
+        assert_eq!(
+            record
+                .launched_by
+                .iter()
+                .map(|ancestor| ancestor.pid)
+                .collect::<Vec<_>>(),
+            vec![305, 304, 303, 302]
+        );
+        assert_eq!(
+            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("parent chain truncated after 4 ancestors")
+        );
     }
 
     fn module_info(path: &str, ino: u64, admission: AdmissionState) -> ModuleInfo {

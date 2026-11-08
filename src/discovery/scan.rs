@@ -4357,9 +4357,12 @@ fn overlay_row_for(mountinfo: &str, merged: &std::path::Path) -> Option<(String,
         }
         let super_opts = post_fields.get(2).unwrap_or(&"");
         let len = mountpoint.len();
+        // An over-mount at the same mountpoint appears later in
+        // mountinfo and is the visible one, so equal lengths resolve to
+        // the later row.
         if best
             .as_ref()
-            .is_some_and(|(best_len, _, _)| *best_len >= len)
+            .is_some_and(|(best_len, _, _)| *best_len > len)
         {
             continue;
         }

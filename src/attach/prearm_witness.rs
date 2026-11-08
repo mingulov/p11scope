@@ -2488,6 +2488,81 @@ mod tests {
     }
 
     #[test]
+    fn backing_refuses_non_regular_upper_over_lower_file() {
+        // The topmost existing entry selects the backing file: an upper
+        // symlink (whiteouts and directories read the same way) over a
+        // lower file refuses instead of falling through to the lower.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xACu8; 64]).expect("write");
+        let upper_link = upper.join("lib.so");
+        std::os::unix::fs::symlink(&lower_file, &upper_link).expect("symlink");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        let merged = merged_root.join("lib.so");
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged,
+                backing_ino_of(&lower_file),
+                Some(&table),
+            ),
+            "a symlinked upper over a lower file must refuse"
+        );
+        // A directory upper refuses the same way.
+        std::fs::remove_file(&upper_link).expect("remove");
+        std::fs::create_dir(&upper_link).expect("dir");
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged,
+                backing_ino_of(&lower_file),
+                Some(&table),
+            ),
+            "a directory upper over a lower file must refuse"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_non_regular_higher_lower_over_deeper_file() {
+        // A non-regular entry in a higher lower layer refuses instead of
+        // being skipped for a deeper lower file.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower1, lower2, upper, merged_root) = (
+            root.path().join("lower1"),
+            root.path().join("lower2"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower1, &lower2, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let deep_file = lower2.join("lib.so");
+        std::fs::write(&deep_file, [0xADu8; 64]).expect("write");
+        std::os::unix::fs::symlink(&deep_file, &lower1.join("lib.so")).expect("symlink");
+        let table = format!(
+            "31 23 0:27 / {} rw,relatime - overlay overlay rw,lowerdir={}:{},upperdir={}\n",
+            merged_root.display(),
+            lower1.display(),
+            lower2.display(),
+            upper.display(),
+        );
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&deep_file),
+                Some(&table),
+            ),
+            "a symlinked higher lower over a deeper file must refuse"
+        );
+    }
+
+    #[test]
     fn upper_is_metacopy_false_for_ordinary_files() {
         // The live probe reads `trusted.overlay.metacopy`: ordinary
         // files (and missing paths) report false, fail closed.

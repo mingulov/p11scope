@@ -100,7 +100,9 @@ probe_spy() {
     done
     return 1
 }
-SPY_SO=${SPY_SO:-$(probe_spy)}
+# A missing tool must not abort the parse: --self-test needs neither probe,
+# and the lane validates both paths explicitly before use.
+SPY_SO=${SPY_SO:-$(probe_spy || true)}
 THREADS=${THREADS:-"1 2 4 8"}
 RAMP_SECS=${RAMP_SECS:-10}
 TRACE_SECS=${TRACE_SECS:-5}
@@ -123,7 +125,7 @@ probe_module() {
     done
     return 1
 }
-MODULE=${MODULE:-$(probe_module)}
+MODULE=${MODULE:-$(probe_module || true)}
 
 # Spy coverage helpers: coverage-only, not count-exact. Count agreement
 # vs the spy ground-truth total uses an explicit ±8 pre-STOP sneak budget

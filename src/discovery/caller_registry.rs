@@ -286,6 +286,18 @@ pub(crate) fn read_exe_identity(pid: u32) -> Option<ExeIdentity> {
     let link = std::fs::read_link(&path)
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
+    exe_identity_from_followed_metadata(&metadata, link)
+}
+
+/// Build the exe identity from already-followed `/proc/<pid>/exe`
+/// metadata: `None` unless the metadata is a regular file. A magic
+/// link that refused the follow must never become an exe identity —
+/// its link inode is stable per pid, so it would compare equal
+/// across execs and falsely claim an observed image.
+fn exe_identity_from_followed_metadata(
+    metadata: &std::fs::Metadata,
+    link: Option<String>,
+) -> Option<ExeIdentity> {
     Some(ExeIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -6698,6 +6710,103 @@ pub(crate) mod tests {
         let probed = crate::discovery::unbound_exe::real_maps_identity(&link_text)
             .expect("our own exe maps");
         assert_eq!((exe.dev, exe.ino), probed);
+    }
+
+    /// A symlink's own metadata is never an exe identity: the
+    /// constructor refuses it, so a magic link that refused the
+    /// follow can never claim an observed image. A regular file
+    /// still builds.
+    #[test]
+    fn exe_identity_refuses_symlink_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("tool");
+        std::fs::write(&target, b"tool").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        let link_meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(link_meta.file_type().is_symlink());
+        assert_eq!(
+            exe_identity_from_followed_metadata(&link_meta, None),
+            None,
+            "link metadata is never an identity"
+        );
+        let file_meta = std::fs::metadata(&target).unwrap();
+        assert!(file_meta.is_file());
+        let exe =
+            exe_identity_from_followed_metadata(&file_meta, Some("/bin/tool".to_string()))
+                .expect("a regular file builds an identity");
+        assert_eq!(exe.path.as_deref(), Some("/bin/tool"));
+    }
+
+    /// Live contract: an unprivileged observer reads no exe identity
+    /// for pid 1 (its exe readlink is denied) but reads its own with
+    /// a path. The probe always runs as a non-root user — when the
+    /// suite runs as root the child drops to `nobody` first — so
+    /// this is never a self-skip.
+    #[test]
+    fn exe_identity_denied_for_pid_1_as_a_nonroot_observer() {
+        const MARKER: &str = "P11SCOPE_B1_NONROOT_PROBE_DONE";
+        const CHILD_ENV: &str = "P11SCOPE_B1_NONROOT_PROBE";
+        const CHILD_TEST: &str = "exe_identity_denied_for_pid_1_as_a_nonroot_observer";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            // SAFETY: reading the effective uid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                let name = std::ffi::CString::new("nobody").unwrap();
+                // SAFETY: a valid NUL-terminated name; the return is checked.
+                let entry = unsafe { libc::getpwnam(name.as_ptr()) };
+                assert!(!entry.is_null(), "the nobody user must exist");
+                // SAFETY: the entry is valid; only its id fields are read.
+                let (uid, gid) = unsafe { ((*entry).pw_uid, (*entry).pw_gid) };
+                assert_ne!(uid, 0, "nobody is unprivileged");
+                // SAFETY: dropping to an unprivileged user in a probe
+                // child that exits immediately afterwards.
+                assert_eq!(unsafe { libc::setgid(gid) }, 0, "setgid(nobody)");
+                assert_eq!(unsafe { libc::setuid(uid) }, 0, "setuid(nobody)");
+            }
+            // SAFETY: reading the effective uid has no preconditions.
+            assert_ne!(
+                unsafe { libc::geteuid() },
+                0,
+                "the probe runs as a non-root user"
+            );
+            assert!(
+                std::fs::read_link("/proc/1/exe").is_err(),
+                "pid 1 exe readlink is denied for the probe user"
+            );
+            assert_eq!(
+                read_exe_identity(1),
+                None,
+                "a denied exe link reads no identity"
+            );
+            let own = std::process::id();
+            let exe = read_exe_identity(own).expect("our own exe reads");
+            assert!(
+                exe.path.is_some(),
+                "our own exe carries its path: {exe:?}"
+            );
+            println!("{MARKER}");
+            std::process::exit(0);
+        }
+        let exe = std::env::current_exe().expect("test binary path");
+        // libtest names omit the crate prefix that `module_path!` carries.
+        let module = module_path!().split_once("::").map(|(_, rest)| rest).unwrap_or(module_path!());
+        let test = format!("{module}::{CHILD_TEST}");
+        let out = std::process::Command::new(&exe)
+            .env(CHILD_ENV, "1")
+            .args(["--exact", &test, "--nocapture"])
+            .output()
+            .expect("spawn the non-root probe");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            out.status.success(),
+            "the non-root probe passes: status={} stdout={stdout} stderr={stderr}",
+            out.status
+        );
+        assert!(
+            stdout.contains(MARKER),
+            "the probe ran to completion (no vacuous filter miss): stdout={stdout} stderr={stderr}"
+        );
     }
 
     /// Deliver only decisions produced by the real registry, in an adversarial

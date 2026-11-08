@@ -2427,18 +2427,22 @@ not "nothing lost". `scripts/verify-induced-gaps.sh` demonstrates loss
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 
 To re-measure on current builds, run `scripts/bench-v070-overhead.sh`
-(defaults: `RUNS=5`, 1,000,000 calls per percall condition; parts `percall`,
-`ramp`, `ceiling`, `spy`). The v0.1.0 table above was produced by
+(defaults: `RUNS=5`, 1M `C_GenerateRandom` calls / 200k sign-ops per
+percall condition; parts `percall`, `ramp`, `ceiling`, with `spy`
+opt-in via `PARTS`). The v0.1.0 table above was produced by
 `scripts/bench-overhead.sh` (defaults: `RUNS=5`, 1,000,000 calls per
-condition). Either script needs:
+condition). The new script needs:
 
 - a non-root user with passwordless `sudo`;
 - `gcc`, `softhsm2-util` and `python3` on `PATH`;
-- SoftHSM2 at `/usr/lib/softhsm/libsofthsm2.so`;
-- the pinned toolchains.
+- SoftHSM2 probed at `/usr/lib/softhsm/libsofthsm2.so`,
+  `/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so`, or
+  `/usr/lib64/pkcs11/libsofthsm2.so` (override with `MODULE`);
+- the pinned toolchains;
+- the caller builds the release observer first (`P11SCOPE` and
+  `DISCOVER` paths are required; the script builds nothing).
 
-It builds the release workspace first and works in a private directory
-under `$TMPDIR`.
+It works in a private directory under `$TMPDIR`.
 
 ## The evidence/completeness model
 

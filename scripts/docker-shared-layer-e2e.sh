@@ -197,6 +197,16 @@ self_test() {
         || { echo "facts lost the lower-stack-b depth" >&2; exit 1; }
     grep -q 'round2-passes-at-ma[p]=' "$0" \
         || { echo "the copy-up no longer waits for the spans to scan the round-2 twin" >&2; exit 1; }
+    # The B2/twin ledger monotonic stamps the oracle's calls-before-watch
+    # honesty proof reads from facts.log.
+    grep -q 'b2-ledger-start-mono-n[s]=' "$0" \
+        || { echo "facts lost the B2 ledger start stamp" >&2; exit 1; }
+    grep -q 'b2-ledger-end-mono-n[s]=' "$0" \
+        || { echo "facts lost the B2 ledger end stamp" >&2; exit 1; }
+    grep -q 'twin-ledger-start-mono-n[s]=' "$0" \
+        || { echo "facts lost the twin ledger start stamp" >&2; exit 1; }
+    grep -q 'twin-ledger-end-mono-n[s]=' "$0" \
+        || { echo "facts lost the twin ledger end stamp" >&2; exit 1; }
     d1_help_self_test
     d1_stub_self_test
     python3 -I "$ORACLE" --self-test
@@ -565,6 +575,13 @@ say() {
 
 fact() {
     printf '%s\n' "$1" >>"$FACTS"
+}
+
+# CLOCK_MONOTONIC nanoseconds (the observer's clock basis for
+# `since_ns`): the B2/twin ledger start/end stamps let the oracle prove
+# the ledgered calls completed before the span edge's watch began.
+mono_ns() {
+    python3 -I -c 'import time; print(time.clock_gettime_ns(time.CLOCK_MONOTONIC))'
 }
 
 summarize() {
@@ -1139,6 +1156,7 @@ fact "upper-stat-b=$UPPER_STAT_B upper-sha-b=$UPPER_SHA_B"
 
 say "=== release the round-2 twin's gate (it ledgers while B2 is set up) ==="
 release_gate "$PID_B3" "$B3_GATE" || fail_cell "gate release failed for the round-2 twin"
+fact "twin-ledger-start-mono-ns=$(mono_ns) span-passes-at-twin-start=$(pass_count span-kernel),$(pass_count span-userspace)"
 
 say "=== second mapper in B maps the upper copy ==="
 start_second_mapper
@@ -1156,13 +1174,16 @@ wait_passes span-userspace "$PID_SPAN_U" "$((SPAN_U0 + 2))" \
     || fail_cell "spanning userspace capture ran fewer than two passes after the second mapper"
 say "=== release the second mapper's gate (one fresh round on the upper edge) ==="
 release_gate "$PID_B2" "$B2_GATE" || fail_cell "gate release failed for the second mapper"
+fact "b2-ledger-start-mono-ns=$(mono_ns) span-passes-at-b2-start=$(pass_count span-kernel),$(pass_count span-userspace)"
 wait_file_line "$WORK/b2.log" '^LEDGER ' 60 || fail_cell "second mapper ledger never completed"
 ledger_is "$WORK/b2.log" "$B2_ITERS" || fail_cell "second mapper ledger is not 6x$B2_ITERS"
+fact "b2-ledger-end-mono-ns=$(mono_ns) span-passes-at-b2-end=$(pass_count span-kernel),$(pass_count span-userspace)"
 grep -h '^LEDGER ' "$WORK/b2.log" >>"$FACTS"
 kill -0 "$PID_SPAN_P" 2>/dev/null || fail_cell "span profile of B ended before the second mapper ledgered"
 say "=== round-2 twin ledger completes inside the span ==="
 wait_file_line "$WORK/b3.log" '^LEDGER ' 60 || fail_cell "round-2 twin ledger never completed"
 ledger_is "$WORK/b3.log" "$ITERS_B" || fail_cell "round-2 twin ledger is not 6x$ITERS_B"
+fact "twin-ledger-end-mono-ns=$(mono_ns) span-passes-at-twin-end=$(pass_count span-kernel),$(pass_count span-userspace)"
 grep -h '^LEDGER ' "$WORK/b3.log" >>"$FACTS"
 kill -0 "$PID_SPAN_P" 2>/dev/null || fail_cell "span profile of B ended before the round-2 twin ledgered"
 R2_K0=$(pass_count span-kernel)

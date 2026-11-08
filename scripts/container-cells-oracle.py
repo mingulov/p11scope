@@ -239,6 +239,45 @@ def parse_facts(text):
     return facts
 
 
+def ledger_window(facts, prefix):
+    """A mapper's ledgered window from facts.log, or None.
+
+    The harness stamps the gate release (ledger start) and the LEDGER
+    line (ledger end) in CLOCK_MONOTONIC nanoseconds, the observer's
+    own clock basis for `since_ns`. A missing or unparsable stamp is
+    None: old runs without stamps still judge, only without the
+    calls-before-watch proof.
+    """
+    try:
+        start = int(facts[f"{prefix}-ledger-start-mono-ns"])
+        end = int(facts[f"{prefix}-ledger-end-mono-ns"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    return (start, end)
+
+
+def calls_before_watch(window, record):
+    """Honesty of a tripped span edge: did the mapper's ledgered calls
+    complete before the edge's watch began (`since_ns`)?
+
+    The LEDGER line only prints after the round's last call, and the
+    harness stamps the release before the first call, so `end < since`
+    proves the 0 count is honest output, not a missed observation. The
+    gate still refuses the trip; this only names the evidence.
+    """
+    if window is None:
+        return "calls-before-watch UNPROVEN (no ledger stamps in facts.log)"
+    since_ns = record["entries"]["coverage"].get("since_ns")
+    if not isinstance(since_ns, int):
+        return "calls-before-watch UNPROVEN (the edge states no since_ns)"
+    start, end = window
+    if end < since_ns:
+        return (f"calls-before-watch PROVEN (ledger [{start},{end}] "
+                f"ended {since_ns - end}ns before since_ns={since_ns})")
+    return (f"calls-before-watch NOT proven (ledger end {end} is not "
+            f"before since_ns={since_ns})")
+
+
 def stat_key(dev_ino):
     """'138:29662859' (stat %d:%i) -> (major, minor, inode), glibc decoding."""
     dev_text, ino_text = dev_ino.split(":")
@@ -561,6 +600,8 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
     assert b_pre_round2_pid is not None, "round-2 twin pid is required"
     round2_pid = b_pre_round2_pid
     twin_shapes = {}
+    ledger_windows = {"B2": ledger_window(facts, "b2"),
+                      "twin": ledger_window(facts, "twin")}
     for pid, tag in ((pid_b_span, "B2"), (round2_pid, "twin")):
         assert pid in span_k_pid.values(), (label, tag, "unscanned", pid)
         record = span_k_records.get((pid, new_id))
@@ -582,8 +623,9 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             assert record["mapping"]["evidence"] == "deep_scan", \
                 (label, tag, record)
             assert record["entries"]["count"] == 0, (label, tag, record)
+            honesty = calls_before_watch(ledger_windows[tag], record)
             assert record["entries"]["coverage"].get("reason") == "not_attached", \
-                (label, tag, record)
+                (label, tag, record, honesty)
             assert not unproven_gaps_for(span_kernel, span_k_pid, pid,
                                          module_suffix), \
                 (label, tag, "admitted yet still carries the gap", pid)
@@ -653,6 +695,7 @@ def copy_up(pre_kernel, pre_userspace, span_kernel, span_userspace,
             "lower_stack_b": lower_stack,
             "kernel_proof": kernel_proof,
             "b_pre_round2": b_pre_round2,
+            "ledger_windows": ledger_windows,
             "stale_caller": stale_caller_line(pid_b_pre)}
 
 
@@ -1459,6 +1502,41 @@ def self_test():
                     st_span_edges() + [st_edge(104, "m7")],
                     st_span_gaps(), backend="kernel",
                     modules=ST_MODULES_SPAN))
+    # The calls-before-watch honesty proof: a watched trip still refuses,
+    # but the refusal names whether the ledgered calls provably completed
+    # before the watch began. Stamps are optional: old runs judge without.
+    stamped_facts = ST_FACTS + ("b2-ledger-start-mono-ns=1000 "
+                                "b2-ledger-end-mono-ns=1500\n"
+                                "twin-ledger-start-mono-ns=1100 "
+                                "twin-ledger-end-mono-ns=1600\n")
+    stamped = good_copy_up("B")
+    stamped["facts_text"] = stamped_facts
+    assert copy_up(**stamped)["ledger_windows"] == \
+        {"B2": (1000, 1500), "twin": (1100, 1600)}
+    assert copy_up(**good_copy_up("B"))["ledger_windows"] == \
+        {"B2": None, "twin": None}
+
+    def tripped_b2(since, facts_text):
+        inputs = good_copy_up("B")
+        inputs["facts_text"] = facts_text
+        inputs["span_kernel"] = good_inventory(
+            [item if item["pid"] != 104
+             else st_edge(104, "m8", state="mapped", cov="watched_no_use",
+                          since=since)
+             for item in st_span_edges()],
+            st_span_gaps(), backend="kernel", fallback="anchor_not_installed",
+            modules=ST_MODULES_SPAN)
+        return inputs
+
+    refuses_with("span B2 trip with the calls before the watch",
+                 "calls-before-watch PROVEN",
+                 lambda: copy_up(**tripped_b2(2000, stamped_facts)))
+    refuses_with("span B2 trip with the ledger inside the watch",
+                 "calls-before-watch NOT proven",
+                 lambda: copy_up(**tripped_b2(1400, stamped_facts)))
+    refuses_with("span B2 trip without ledger stamps",
+                 "calls-before-watch UNPROVEN (no ledger stamps",
+                 lambda: copy_up(**tripped_b2(2000, ST_FACTS)))
     mutate_copy("span B-pre collapsed edge missing",
                 span_kernel=good_inventory(
                     [item for item in st_span_edges()

@@ -31,7 +31,6 @@ apply unless a subsection here says otherwise.
 
 ### Copy-up in-place truncation
 
-<!-- lane: copyup — if the lane misses the drop, delete this subsection; the v0.6.0 copy-up entry below stands. -->
 A spanning capture now attributes both sides of a container copy-up,
 but one shape stays a counted gap: a provider file rewritten in place
 (truncate plus rewrite) while mapped reads `unresolved`, with the
@@ -42,7 +41,6 @@ record is 0.7.x work.
 
 ### Same-namespace subreapers shown as launcher
 
-<!-- lane: parent-chain — if the lane misses the drop, delete this subsection (no launcher chain ships). -->
 Init, the systemd user manager, container inits, pid-namespace
 boundaries and kernel threads are never shown as the launcher. But a
 subreaper in the same pid namespace (`tini -s`, s6/runit,
@@ -54,7 +52,6 @@ an init-only parent shows the systemd unit beside it.
 
 ### Per-key rows partial under heavy threading
 
-<!-- lane: mt-provider — if the lane misses the drop, delete this subsection (no MT qualification ships). -->
 Totals stay exact when many threads share one provider, but per-key
 rows may stay partial: in the 8-thread sign cell, rows plus the named
 race buckets (`unbound`, `key_join_lost`) equal the ledger exactly in
@@ -64,7 +61,6 @@ rows with the race buckets.
 
 ### System-wide captures stay PARTIAL under process churn
 
-<!-- lane: mt-provider — if the lane misses the drop, delete this subsection. -->
 A `--system` capture on a machine with process churn reports PARTIAL
 with `pid_descendant_gaps` and `{discovery subject, discovery
 unavailable}` skips: that verdict is true (newcomers the observer
@@ -93,7 +89,6 @@ no new pre-6.12 product edge case.
 
 ### Key-tracking rate ceiling
 
-<!-- lane: rate — if the lane lands, replace this subsection with its measured ceiling; if it misses, keep as is. -->
 Key-operation rows keep the v0.6.0 ceiling: exact rows at 6,250
 calls/s for 60 s, plain counts exact at 10,000 calls/s.
 

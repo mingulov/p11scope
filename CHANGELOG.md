@@ -15,25 +15,27 @@ versioned separately and are opaque, exact dispatch keys.
   snapshots to file and stdout streams alike.
 - The observer image is published as `ghcr.io/mingulov/p11scope:<version>`
   on releases (see `RELEASING.md` step 7.4), built from the verified
-  release tarball with licenses, notices and `RELEASE.json` inside. Its
+  release tarball with licenses, notices and `RELEASE.json` inside, for
+  one-host Docker use and the Kubernetes DaemonSet. Its
   entrypoint is now `p11scope`, so plain `docker run IMAGE <p11scope args>`
   reaches the observer; this changes behaviour for `docker run IMAGE`
   with in-cluster entry-script arguments (address the entry script by
-  explicit name instead).
+  explicit name instead). <!-- lane: container-image -->
 - Callers running under an interpreter carry an app label beside it:
   `python3 [backup.py]`, `java [app.jar]`. <!-- lane: app-identity -->
 - Callers show their launcher chain: one hop (`from backup.sh`) by
   default, up to four in `-v` and JSON (`launched_by`).
   <!-- lane: parent-chain -->
-- Container image `ghcr.io/mingulov/p11scope:0.7.0` for one-host
-  Docker use and the Kubernetes DaemonSet. <!-- lane: container-image -->
 - Linux 7.4-rc1 joins the tested kernel matrix. <!-- lane: k74 -->
 - A forwarding layer's whole table set is watched when the probe
   budget allows, so calls through pre-attach tables count and the
   layer's own calls separate from application calls.
   <!-- lane: p11kit-cov -->
-- Per-key tracking sustains 10,000 calls/s with exact rows (was
-  6,250). <!-- lane: rate -->
+- A container copy-up attributes both sides of the file: the witness-proven
+  pre-copy-up lower file gets its own module row carrying
+  `"layer": "pre_copy_up"` in JSON (`(file before copy-up)` in verbose
+  text), so stale-mapping calls count on the lower edge.
+  <!-- lane: copyup -->
 
 ### Changed
 

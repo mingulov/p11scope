@@ -697,6 +697,20 @@ class RunnerNoiseTests(unittest.TestCase):
         self.assertTrue(relaxed["pass"])
         self.assertIn("disclosed runner noise", relaxed["detail"])
 
+    def test_skip_family_fails_on_system_when_allowed(self):
+        # Ruling U1 is mt-system-only: the `system` cell keeps the
+        # CI-GAP-1 cause set (pid_descendant_gaps alone).
+        def mutate(d, l, r):
+            d["evidence"]["pid_descendant_gaps"] = 41
+            d["evidence"]["skipped"] = [{"name": "discovery subject",
+                                         "reason": "discovery unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap")
+        result = self.run_case(mutate, cell="system", allow_pid_descendant_gaps=True,
+                               want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
 
 # Test-only independent mapping code runs in both separate lifecycle children.
 FAKE_MAPPING = '''

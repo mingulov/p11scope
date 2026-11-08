@@ -1234,5 +1234,116 @@ class MtOracleTests(unittest.TestCase):
         self.assertIn("SCAFFOLD", result["detail"])
 
 
+class MtSystemSkipFamilyTests(unittest.TestCase):
+    """Ruling U1 (controller): mt-system discloses the named discovery-skip
+    pair plus pid_descendant_gaps the same way CI-GAP-1 discloses runner
+    noise. Each named cause may be present or absent with its count
+    printed; every owned count stays exact and any other cause fails."""
+    run_case_mt = MtOracleTests.run_case_mt
+
+    NAMED_SKIP = {"name": "discovery subject", "reason": "discovery unavailable"}
+
+    def disclose(self, report, *, gaps, skips):
+        report["evidence"].update(
+            completeness="PARTIAL", verdict_detail="concrete_gap",
+            pid_descendant_gaps=gaps,
+            skipped=[dict(self.NAMED_SKIP) for _ in range(skips)])
+        causes = []
+        if skips:
+            causes.append("skipped")
+        if gaps:
+            causes.append("pid_descendant_gaps")
+        report["evidence"]["gap_classes"]["observation"] = {
+            "status": "lossy", "causes": causes}
+
+    def test_named_skip_family_with_gaps_passes_when_allowed(self):
+        # The ruled shape: descendant generations plus one named
+        # discovery skip, owned counts exact.
+        def mutate(d, l, r):
+            self.disclose(d, gaps=41, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40,
+                                  allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=41", result["detail"])
+        self.assertIn("discovery_skips=1", result["detail"])
+
+    def test_named_skip_only_passes_when_allowed(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=0, skips=2)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40,
+                                  allow_pid_descendant_gaps=True)
+        self.assertEqual(result["qualification"], "owned-provider-counts-with-runner-noise")
+        self.assertIn("pid_descendant_gaps=0", result["detail"])
+        self.assertIn("discovery_skips=2", result["detail"])
+
+    def test_skip_family_count_drift_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["functions"][5].update(calls=41)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("owned target count differs from independent ledger",
+                      result["detail"])
+
+    def test_skip_family_unknown_cause_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["multi_rebuild_gaps"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"].append(
+                "multi_rebuild_gaps")
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_skip_family_wrong_reason_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=0)
+            d["evidence"]["skipped"] = [{
+                "name": "discovery subject",
+                "reason": "function table unavailable in file-backed data"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_skip_family_entry_loss_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=0)
+            d["evidence"]["skipped"] = [{
+                "name": "C_Digest", "reason": "function entry unavailable"}]
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["skipped", "pid_descendant_gaps"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+    def test_skip_family_event_loss_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["event_loss"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"] = [
+                "skipped", "event_loss", "pid_descendant_gaps"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("loss or unknown event_loss", result["detail"])
+
+    def test_skip_family_task_uprobe_link_loss_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+            d["evidence"]["task_uprobe_link_losses"] = 1
+            d["evidence"]["gap_classes"]["observation"]["causes"] = [
+                "skipped", "task_uprobe_link_losses", "pid_descendant_gaps"]
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("loss or unknown task_uprobe_link_losses", result["detail"])
+
+    def test_skip_family_strict_fails(self):
+        def mutate(d, l, r):
+            self.disclose(d, gaps=2, skips=1)
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
+        self.assertIn("lossy or unknown observation gap class", result["detail"])
+
+
 if __name__ == "__main__":
     unittest.main()

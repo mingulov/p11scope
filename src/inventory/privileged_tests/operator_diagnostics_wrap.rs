@@ -13,14 +13,15 @@ const RUN_SECONDS: u64 = 900;
 const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Parameterized wrap schedule: `counted` A rounds, `shared` shared rounds,
-/// then the fence/proof pair. The G21 gate always runs `FULL_SCHEDULE`
-/// (400/258/900s); the short full-transition pilot runs `PILOT_SCHEDULE`
-/// (32/4/540s) at default cadence and default diagnostic capacities. The
-/// pilot makes no wrap claim: it measures settling, gap shapes and footer
-/// production. Every validator that depends on the schedule takes these
-/// values as arguments; the `COUNTED`/`SHARED` consts below only anchor the
-/// full-gate wrappers, which keep reading the bare consts so a schedule
-/// slip cannot silently reshape the gate.
+/// then the fence/proof pair. The G21 wrap gate runs `WRAP_SCHEDULE` at the
+/// declared accelerated cadence (`WRAP_POLL_INTERVAL_MS`, R-17); the short
+/// full-transition pilot runs `PILOT_SCHEDULE` (32/4/540s) at default cadence
+/// and default diagnostic capacities. The pilot makes no wrap claim: it
+/// measures settling, gap shapes and footer production. Every validator that
+/// depends on the schedule takes these values as arguments; the
+/// `COUNTED`/`SHARED` consts only anchor the fixture maxima and legacy
+/// full-schedule unit fixtures, while the live gate reads `WRAP_SCHEDULE`
+/// so a schedule slip cannot silently reshape it.
 struct WrapSchedule {
     counted: u64,
     shared: u64,
@@ -33,6 +34,28 @@ const PILOT_SCHEDULE: WrapSchedule = WrapSchedule {
     run_seconds: 540,
     deadline_ms: 590_000,
 };
+
+/// Live wrap-gate schedule (R-17): counted/shared rounds derived from pilot
+/// record rates with margin, at the declared accelerated cadence below.
+/// Both default rings must still actually wrap (per-kind evicted counters),
+/// and paired parity stays exact. Pilot footer (C=32/S=4, k=32): ordinary
+/// 3232 (96/A-round, 32/S-round), exceptional 3897 (101/A-round,
+/// 69/S-round); C=260/S=4 yields ordinary ~25.2k and exceptional ~26.9k,
+/// both over the 24576/8192 capacities with margin. The 900 s per-leg
+/// bound is unchanged.
+const WRAP_COUNTED: u64 = 260;
+const WRAP_SHARED: u64 = 4;
+const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
+    counted: WRAP_COUNTED,
+    shared: WRAP_SHARED,
+    run_seconds: RUN_SECONDS,
+    deadline_ms: 900_000,
+};
+
+/// Declared accelerated inter-pass cadence for the live wrap legs (R-17),
+/// applied through the existing test-only scoped override. Production builds
+/// and all unselected tests retain the 1 s cadence.
+const WRAP_POLL_INTERVAL_MS: u64 = 250;
 
 /// Workload trailing CLI arguments `[NONCE, DEADLINE_MS, COUNTED, SHARED]`
 /// for a schedule, with the fixture binary's own bounds enforced first
@@ -76,11 +99,9 @@ struct WrapWorkload {
     dir: tempfile::TempDir,
 }
 impl WrapWorkload {
-    fn spawn() -> Result<Self> {
-        Self::spawn_profile(false)
-    }
     fn spawn_profile(probe: bool) -> Result<Self> {
         use std::os::unix::fs::OpenOptionsExt;
+        assert!(probe, "only the 3-round probe uses the profile seam");
         let source = std::env::var_os("P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR")
             .context("supply the controller-verified prebuilt32-object fixture directory")?;
         let dir = tempfile::tempdir()?;
@@ -100,17 +121,13 @@ impl WrapWorkload {
                 fifo.clone(),
                 dir.path().join("calls.jsonl"),
             ])
-            .args(if probe {
-                vec![
-                    "0123456789abcdef0123456789abcdef",
-                    "90000",
-                    "3",
-                    "1",
-                    "probe",
-                ]
-            } else {
-                vec!["0123456789abcdef0123456789abcdef", "900000", "400", "258"]
-            })
+            .args(vec![
+                "0123456789abcdef0123456789abcdef",
+                "90000",
+                "3",
+                "1",
+                "probe",
+            ])
             .stdin(Stdio::null())
             .stdout(std::fs::File::create(&out)?)
             .stderr(std::fs::File::create(dir.path().join("workload.err"))?)
@@ -1488,10 +1505,6 @@ fn check_native_ledger_schedule(workload: &WrapWorkload, counted: u64, shared: u
     )
 }
 
-fn check_native_ledger(workload: &WrapWorkload) -> Result<()> {
-    check_native_ledger_schedule(workload, COUNTED, SHARED)
-}
-
 fn check_native_target_mapping(
     targets: &[&serde_json::Value],
     expected: p11scope_manifest::maps::ObjectKey,
@@ -1646,7 +1659,37 @@ fn check_wrap_records(
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
     ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
-    check_wrap_records_core(records, bytes, b_modules, Some(owned_caller))
+    check_wrap_records_core(
+        records,
+        bytes,
+        b_modules,
+        Some(owned_caller),
+        COUNTED,
+        SHARED,
+    )
+}
+
+/// Wrap-export contract under an explicit schedule: the PID-cell scope
+/// header plus the scope-free core.
+fn check_wrap_records_schedule(
+    records: &[serde_json::Value],
+    bytes: u64,
+    b_modules: &BTreeSet<String>,
+    pid: u32,
+    owned_caller: &str,
+    counted: u64,
+    shared: u64,
+) -> Result<()> {
+    let header = records.first().context("diagnostic header missing")?;
+    ensure!(header["scope"] == "pid" && header["mode"] == "native" && header["pid_filter"] == pid);
+    check_wrap_records_core(
+        records,
+        bytes,
+        b_modules,
+        Some(owned_caller),
+        counted,
+        shared,
+    )
 }
 
 /// Scope-free wrap-export contract: envelope, limits, both-ring wrap,
@@ -1659,6 +1702,8 @@ fn check_wrap_records_core(
     bytes: u64,
     b_modules: &BTreeSet<String>,
     expected_caller: Option<&str>,
+    counted: u64,
+    shared: u64,
 ) -> Result<()> {
     let header = records.first().context("diagnostic header missing")?;
     let footer = records.last().context("diagnostic footer missing")?;
@@ -1816,9 +1861,9 @@ fn check_wrap_records_core(
         }
     }
     let (fence_sum, proof_sum, staged_sum) =
-        check_terminal_pairs_as(records, b_modules, expected_caller)?;
+        check_terminal_pairs_schedule(records, b_modules, expected_caller, counted, shared)?;
     let (shared_from, shared_through) =
-        check_retained_shared_suffix(records, b_modules, expected_caller, COUNTED, SHARED)?;
+        check_retained_shared_suffix(records, b_modules, expected_caller, counted, shared)?;
     ensure!(
         missing_context,
         "wrapped export needs truthful lost-history context"
@@ -2070,7 +2115,55 @@ fn check_wrap_records_system(
             );
         }
     }
-    check_wrap_records_core(records, bytes, b_modules, Some(owned_caller))
+    check_wrap_records_core(
+        records,
+        bytes,
+        b_modules,
+        Some(owned_caller),
+        COUNTED,
+        SHARED,
+    )
+}
+
+/// Bounded-system wrap export under an explicit schedule.
+fn check_wrap_records_system_schedule(
+    records: &[serde_json::Value],
+    bytes: u64,
+    b_modules: &BTreeSet<String>,
+    owned_pid: u32,
+    owned_caller: &str,
+    counted: u64,
+    shared: u64,
+) -> Result<()> {
+    let header = records.first().context("diagnostic header missing")?;
+    ensure!(
+        header["kind"] == "header"
+            && header["scope"] == "system"
+            && header["mode"] == "native"
+            && header.get("pid_filter") == Some(&serde_json::Value::Null),
+        "system wrap needs an unfiltered native system header: {header}"
+    );
+    for row in &records[1..records.len() - 1] {
+        if row["kind"] == "capture_health" {
+            ensure!(
+                row["pid"].is_null(),
+                "global health row carries a pid: {row}"
+            );
+        } else {
+            ensure!(
+                row["pid"] == owned_pid,
+                "system export carries a non-owned row: {row}"
+            );
+        }
+    }
+    check_wrap_records_core(
+        records,
+        bytes,
+        b_modules,
+        Some(owned_caller),
+        counted,
+        shared,
+    )
 }
 
 fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
@@ -2085,8 +2178,18 @@ fn time_shape(value: &serde_json::Value, field: &str) -> Result<bool> {
 }
 
 fn primary_facts(document: &serde_json::Value, pid: u32, k: u64) -> Result<serde_json::Value> {
+    primary_facts_schedule(document, pid, k, COUNTED)
+}
+
+/// Owned primary facts under an explicit counted-round schedule.
+fn primary_facts_schedule(
+    document: &serde_json::Value,
+    pid: u32,
+    k: u64,
+    counted: u64,
+) -> Result<serde_json::Value> {
     let caller = primary_pid_caller(document, pid)?;
-    Ok(primary_facts_core(document, pid, k, caller)?.0)
+    Ok(primary_facts_core_schedule(document, pid, k, caller, counted)?.0)
 }
 
 /// PID capture admits exactly the owned workload: one caller entry, the
@@ -2181,15 +2284,6 @@ fn provider_label(module: &serde_json::Value) -> Result<(String, bool)> {
 /// Shared owned-population core: loss-free native observation plus the
 /// pinned indexed A/B edges for the validated caller. Returns the primary
 /// facts with the owned module ids for exclusivity checks.
-fn primary_facts_core(
-    document: &serde_json::Value,
-    pid: u32,
-    k: u64,
-    caller: &serde_json::Value,
-) -> Result<(serde_json::Value, BTreeSet<String>)> {
-    primary_facts_core_schedule(document, pid, k, caller, COUNTED)
-}
-
 fn primary_facts_core_schedule(
     document: &serde_json::Value,
     pid: u32,
@@ -2355,8 +2449,19 @@ fn primary_facts_system(
     owned_pid: u32,
     k: u64,
 ) -> Result<serde_json::Value> {
+    primary_facts_system_schedule(document, owned_pid, k, COUNTED)
+}
+
+/// Owned primary facts from a bounded-system capture under an explicit
+/// counted-round schedule.
+fn primary_facts_system_schedule(
+    document: &serde_json::Value,
+    owned_pid: u32,
+    k: u64,
+    counted: u64,
+) -> Result<serde_json::Value> {
     let caller = primary_system_caller(document, owned_pid)?;
-    let (facts, modules) = primary_facts_core(document, owned_pid, k, caller)?;
+    let (facts, modules) = primary_facts_core_schedule(document, owned_pid, k, caller, counted)?;
     check_owned_module_exclusivity(document, owned_pid, &modules)?;
     Ok(facts)
 }
@@ -2544,18 +2649,24 @@ impl WrapCell {
 }
 
 fn run_wrap(enabled: bool) -> Result<(serde_json::Value, u64)> {
-    run_wrap_cell(enabled, WrapCell::Pid)
+    run_wrap_cell(enabled, WrapCell::Pid, &WRAP_SCHEDULE)
 }
 
 fn run_wrap_system(enabled: bool) -> Result<(serde_json::Value, u64)> {
-    run_wrap_cell(enabled, WrapCell::System)
+    run_wrap_cell(enabled, WrapCell::System, &WRAP_SCHEDULE)
 }
 
-/// One wrap leg under the given cell: the identical issued schedule,
-/// milestone driver and owned-population checks; only the capture scope
-/// (PID-filtered vs unfiltered system) and its validators differ.
-fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u64)> {
-    let mut workload = WrapWorkload::spawn()?;
+/// One wrap leg under the given cell and schedule: the identical issued
+/// schedule, milestone driver and owned-population checks; only the capture
+/// scope (PID-filtered vs unfiltered system) and its validators differ.
+fn run_wrap_cell(
+    enabled: bool,
+    cell: WrapCell,
+    schedule: &WrapSchedule,
+) -> Result<(serde_json::Value, u64)> {
+    let counted = schedule.counted;
+    let shared = schedule.shared;
+    let mut workload = WrapWorkload::spawn_schedule(schedule)?;
     workload.check_providers('A')?;
     workload.check_commons()?;
     let events = workload.dir.path().join("events.jsonl");
@@ -2573,10 +2684,11 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
             if failure.borrow().is_some() {
                 return Ok(true);
             }
-            if start.elapsed() >= Duration::from_secs(RUN_SECONDS) {
+            if start.elapsed() >= Duration::from_secs(schedule.run_seconds) {
                 let view = view.borrow();
                 bail!(
-                    "G21 wrap exceeded900s, phase={:?} k={} A={:?} B={:?} gate_traj={:?} evidence={:?}",
+                    "G21 wrap exceeded{}s, phase={:?} k={} A={:?} B={:?} gate_traj={:?} evidence={:?}",
+                    schedule.run_seconds,
                     state.get(),
                     fence_k.get(),
                     PassView::side_summary(&view.a),
@@ -2632,12 +2744,13 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                         {
                             return Ok(false);
                         }
-                        let k = check_startup_round(
+                        let k = check_startup_round_as(
                             round,
                             &counts,
                             &view.evidence,
                             &caller,
                             Some(fence_k.get()),
+                            counted,
                         )?;
                         fence_k.set(k);
                         eprintln!(
@@ -2671,15 +2784,21 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                         } else {
                             Some(fence_k.get())
                         };
-                        let k =
-                            check_startup_round(round, &counts, &view.evidence, &caller, prior)?;
+                        let k = check_startup_round_as(
+                            round,
+                            &counts,
+                            &view.evidence,
+                            &caller,
+                            prior,
+                            counted,
+                        )?;
                         fence_k.set(k);
-                        if round <= 3 || round % 50 == 0 || round == COUNTED {
+                        if round <= 3 || round % 50 == 0 || round == counted {
                             eprintln!(
                                 "G21_WRAP_ROUND enabled={enabled} phase=a round={round} A={target} k={k}"
                             );
                         }
-                        if round < COUNTED {
+                        if round < counted {
                             workload.command("count", "a-done", round + 1)?;
                             state.set((1, round + 1));
                         } else {
@@ -2710,20 +2829,20 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     ensure!(
                         a_counts
                             .iter()
-                            .all(|count| *count == expected_a(COUNTED, k))
+                            .all(|count| *count == expected_a(counted, k))
                             && b_counts.iter().all(|count| *count == 0),
                         "shared calls escaped withholding: A={a_counts:?} B={b_counts:?} k={k}"
                     );
-                    if !shared_round_floor(round, &view.evidence, &caller, COUNTED) {
+                    if !shared_round_floor(round, &view.evidence, &caller, counted) {
                         return Ok(false);
                     }
-                    if round < SHARED {
+                    if round < shared {
                         workload.command("shared", "shared-done", round + 1)?;
                         state.set((3, round + 1));
                     } else {
                         workload.command("unload-a", "a-unmapped", 0)?;
                         eprintln!(
-                            "G21_WRAP_ROUND enabled={enabled} phase=shared done rounds={SHARED} k={k}"
+                            "G21_WRAP_ROUND enabled={enabled} phase=shared done rounds={shared} k={k}"
                         );
                         state.set((4, 0));
                     }
@@ -2742,7 +2861,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                         b_counts.iter().all(|count| *count == 0),
                         "the fence was attributed: B={b_counts:?}"
                     );
-                    if fence_gap_repeats(&view.evidence, &caller) == TARGETS {
+                    if fence_gap_repeats_as(&view.evidence, &caller, counted, shared) == TARGETS {
                         workload.command("proof", "final-calls", 1)?;
                         eprintln!("G21_WRAP_ROUND enabled={enabled} phase=proof issued");
                         state.set((6, 0));
@@ -2755,7 +2874,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
                     ensure!(
                         a_counts
                             .iter()
-                            .all(|count| *count == expected_a(COUNTED, k)),
+                            .all(|count| *count == expected_a(counted, k)),
                         "A history changed during proof: A={a_counts:?} k={k}"
                     );
                     // Each B edge reaches exactly 1 on its own pair's proof,
@@ -2794,7 +2913,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         true,
         None,
         None,
-        Some(Duration::from_secs(RUN_SECONDS)),
+        Some(Duration::from_secs(schedule.run_seconds)),
         None,
         false,
         Some(&events),
@@ -2825,7 +2944,7 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     );
     workload.command("stop", "done", 0)?;
     ensure!(workload.process.child.wait()?.success());
-    check_native_ledger(&workload)?;
+    check_native_ledger_schedule(&workload, counted, shared)?;
     // The `ended` row is the run's last write, so it always sits in the
     // live file (rotations only move earlier rows aside).
     let mut from_start = 0;
@@ -2837,11 +2956,13 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
         "public event stream lacks terminal end"
     );
     let k = fence_k.get();
-    verify_final_view_gaps(&mut view.borrow_mut(), &events, pid, k, COUNTED, SHARED)?;
+    verify_final_view_gaps(&mut view.borrow_mut(), &events, pid, k, counted, shared)?;
     let document: serde_json::Value = serde_json::from_slice(&stdout)?;
     let facts = match scope {
-        WrapScope::Pid { pid } => primary_facts(&document, pid, k)?,
-        WrapScope::System { owned_pid } => primary_facts_system(&document, owned_pid, k)?,
+        WrapScope::Pid { pid } => primary_facts_schedule(&document, pid, k, counted)?,
+        WrapScope::System { owned_pid } => {
+            primary_facts_system_schedule(&document, owned_pid, k, counted)?
+        }
     };
     if enabled {
         let b_modules = wrap_b_modules(&document, pid)?;
@@ -2862,12 +2983,24 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
             .clone()
             .context("owned caller id never observed")?;
         match scope {
-            WrapScope::Pid { pid } => {
-                check_wrap_records(&records, length, &b_modules, pid, &owned_caller)?
-            }
-            WrapScope::System { owned_pid } => {
-                check_wrap_records_system(&records, length, &b_modules, owned_pid, &owned_caller)?;
-            }
+            WrapScope::Pid { pid } => check_wrap_records_schedule(
+                &records,
+                length,
+                &b_modules,
+                pid,
+                &owned_caller,
+                counted,
+                shared,
+            )?,
+            WrapScope::System { owned_pid } => check_wrap_records_system_schedule(
+                &records,
+                length,
+                &b_modules,
+                owned_pid,
+                &owned_caller,
+                counted,
+                shared,
+            )?,
         }
     } else {
         ensure!(!diagnostics.exists());
@@ -2875,11 +3008,11 @@ fn run_wrap_cell(enabled: bool, cell: WrapCell) -> Result<(serde_json::Value, u6
     eprintln!(
         "G21_PAIRED enabled={enabled} elapsed_ms={} calls={} A_total={} B_total={} k={k} eligible_a={} withheld={} stdout_bytes={}",
         start.elapsed().as_millis(),
-        (COUNTED + SHARED + 2) * TARGETS,
-        TARGETS * expected_a(COUNTED, k),
+        (counted + shared + 2) * TARGETS,
+        TARGETS * expected_a(counted, k),
         TARGETS,
-        COUNTED * TARGETS - k,
-        (SHARED + 1) * TARGETS + k,
+        counted * TARGETS - k,
+        (shared + 1) * TARGETS + k,
         stdout.len()
     );
     Ok((facts, k))
@@ -4130,6 +4263,17 @@ fn fixture_edge_json_k(
     is_a: bool,
     k: u64,
 ) -> serde_json::Value {
+    fixture_edge_json_schedule(caller, module, shift, is_a, k, COUNTED)
+}
+
+fn fixture_edge_json_schedule(
+    caller: crate::discovery::caller_registry::CallerId,
+    module: crate::discovery::caller_registry::ModuleId,
+    shift: u64,
+    is_a: bool,
+    k: u64,
+    counted: u64,
+) -> serde_json::Value {
     use crate::discovery::caller_registry::{
         MappingEvidence, MappingState, SEMANTIC_UNKNOWN, UnknownReason, UseCoverage,
     };
@@ -4147,7 +4291,7 @@ fn fixture_edge_json_k(
         mapping_first_seen_ns: 100 + shift,
         mapping_last_seen_ns: 200 + shift,
         mapping_interruptions: 0,
-        entry_count: if is_a { expected_a(COUNTED, k) } else { 1 },
+        entry_count: if is_a { expected_a(counted, k) } else { 1 },
         entry_saturated: false,
         entry_first_seen_ns: Some(120 + shift),
         entry_last_seen_ns: Some(180 + shift),
@@ -4191,6 +4335,15 @@ fn primary_validator_fixture(pid: u32, shift: u64) -> serde_json::Value {
 }
 
 fn primary_validator_fixture_k(pid: u32, shift: u64, k: u64) -> serde_json::Value {
+    primary_validator_fixture_schedule(pid, shift, k, COUNTED)
+}
+
+fn primary_validator_fixture_schedule(
+    pid: u32,
+    shift: u64,
+    k: u64,
+    counted: u64,
+) -> serde_json::Value {
     use crate::discovery::caller_registry::{CallerId, ModuleId};
     let caller = CallerId(shift as u32);
     let mut modules = Vec::new();
@@ -4200,12 +4353,13 @@ fn primary_validator_fixture_k(pid: u32, shift: u64, k: u64) -> serde_json::Valu
         modules.push(serde_json::json!({"id":module.label(),
             "paths":[format!("/owned/provider-A-{index:02}.so")],
             "lifecycle":"unloaded","unloaded_observed":true}));
-        edges.push(fixture_edge_json_k(
+        edges.push(fixture_edge_json_schedule(
             caller,
             module,
             shift + u64::from(index),
             true,
             k,
+            counted,
         ));
     }
     for index in 0..TARGETS as u32 {
@@ -4429,6 +4583,16 @@ fn seal_validator_fixture(records: &mut [serde_json::Value]) -> u64 {
 }
 
 fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
+    diagnostic_validator_fixture_schedule(COUNTED, SHARED)
+}
+
+/// Synthetic wrapped export under an explicit schedule: full default-ring
+/// occupancy with both-ring eviction, terminal fence/proof pairs and a
+/// retained shared suffix through the last issued shared unit.
+fn diagnostic_validator_fixture_schedule(
+    counted: u64,
+    shared: u64,
+) -> (Vec<serde_json::Value>, u64) {
     let mut records = vec![
         serde_json::json!({"kind":"header","scope":"pid","mode":"native","pid_filter":123,
         "limits":{"ordinary_records":24576,"exceptional_records":8192,"heap_bytes":8*1024*1024}}),
@@ -4447,11 +4611,12 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
         push(serde_json::json!({"kind":"count_decision","decision":"withheld"}));
     }
     // The oldest retained exceptional unit straddles the ordinary boundary:
-    // p0's original657 read(seq1) is genuinely absent; all658 reads remain.
-    for absolute in [COUNTED + SHARED - 1, COUNTED + SHARED] {
+    // p0's original second-to-last read(seq1) is genuinely absent; all last
+    // reads remain.
+    for absolute in [counted + shared - 1, counted + shared] {
         for index in 0..32 {
-            let pre = 6000 + 10 * (absolute - (COUNTED + SHARED - 1));
-            let lost = absolute == COUNTED + SHARED - 1 && index == 0;
+            let pre = 6000 + 10 * (absolute - (counted + shared - 1));
+            let lost = absolute == counted + shared - 1 && index == 0;
             let observation = if lost {
                 1
             } else {
@@ -4471,12 +4636,12 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
     for index in 0..32 {
         let observation = push(
             serde_json::json!({"kind":"count_observation","caller":"c0","pair":format!("p{index}"),
-            "absolute":COUNTED+SHARED+1,"pre":7000,"post":7010}),
+            "absolute":counted+shared+1,"pre":7000,"post":7010}),
         );
         push(
             serde_json::json!({"kind":"count_decision","decision":"withheld","reason":"awaiting_fence",
-            "caller":"c0","pair":format!("p{index}"),"after":COUNTED+SHARED,"through":COUNTED+SHARED+1,
-            "absolute":COUNTED+SHARED+1,"pre":7000,"post":7010,"observation_ref":{"seq":observation,"status":"retained"}}),
+            "caller":"c0","pair":format!("p{index}"),"after":counted+shared,"through":counted+shared+1,
+            "absolute":counted+shared+1,"pre":7000,"post":7010,"observation_ref":{"seq":observation,"status":"retained"}}),
         );
     }
     for _ in 0..24416 {
@@ -4486,11 +4651,11 @@ fn diagnostic_validator_fixture() -> (Vec<serde_json::Value>, u64) {
     for index in 0..32 {
         let observation = push(
             serde_json::json!({"kind":"count_observation","caller":"c0","pair":format!("p{index}"),
-            "absolute":COUNTED+SHARED+2,"pre":7020,"post":7030}),
+            "absolute":counted+shared+2,"pre":7020,"post":7030}),
         );
         push(
             serde_json::json!({"kind":"publication","decision":"placed","module_id":format!("mB-{index:02}"),
-            "pair":format!("p{index}"),"base":COUNTED+SHARED+1,"absolute":COUNTED+SHARED+2,"staged":1,
+            "pair":format!("p{index}"),"base":counted+shared+1,"absolute":counted+shared+2,"staged":1,
             "edge_total":1,"caller":"c0","pre":7020,"post":7030,"baseline_pre":7000,"baseline_post":7010,
             "observation_ref":{"seq":observation,"status":"retained"},
             "transition_ref":{"seq":2,"status":"not_retained"},"history_complete":false}),
@@ -4728,12 +4893,23 @@ fn check_paired_parity(
     enabled: &serde_json::Value,
     ek: u64,
 ) -> Result<()> {
+    check_paired_parity_schedule(disabled, dk, enabled, ek, COUNTED)
+}
+
+/// Strict paired off/on comparison under an explicit counted-round schedule.
+fn check_paired_parity_schedule(
+    disabled: &serde_json::Value,
+    dk: u64,
+    enabled: &serde_json::Value,
+    ek: u64,
+    counted: u64,
+) -> Result<()> {
     for index in 0..TARGETS {
         let a_label = format!("provider-A-{index:02}.so");
         let b_label = format!("provider-B-{index:02}.so");
         ensure!(
-            disabled["edges"][a_label.as_str()]["count"] == expected_a(COUNTED, dk)
-                && enabled["edges"][a_label.as_str()]["count"] == expected_a(COUNTED, ek),
+            disabled["edges"][a_label.as_str()]["count"] == expected_a(counted, dk)
+                && enabled["edges"][a_label.as_str()]["count"] == expected_a(counted, ek),
             "leg A-{index:02} contradicts its validated disposition: dk={dk} ek={ek}"
         );
         ensure!(
@@ -4743,11 +4919,12 @@ fn check_paired_parity(
         );
     }
     ensure!(
-        facts_side_total(disabled, 'A')? == TARGETS * expected_a(COUNTED, dk)
-            && facts_side_total(enabled, 'A')? == TARGETS * expected_a(COUNTED, ek)
+        facts_side_total(disabled, 'A')? == TARGETS * expected_a(counted, dk)
+            && facts_side_total(enabled, 'A')? == TARGETS * expected_a(counted, ek)
             && facts_side_total(disabled, 'B')? == TARGETS
             && facts_side_total(enabled, 'B')? == TARGETS,
-        "paired legs disagree with the fixed 12,800-k/32 totals: dk={dk} ek={ek}"
+        "paired legs disagree with the fixed {}-k/32 totals: dk={dk} ek={ek}",
+        TARGETS * counted,
     );
     ensure!(
         dk == ek,
@@ -4761,23 +4938,41 @@ fn check_paired_parity(
     Ok(())
 }
 
+/// Run one wrap-parity cell at the declared accelerated cadence (R-17),
+/// through the existing test-only scoped override. Production cadence is
+/// untouched; the run declares its cadence up front.
+fn with_wrap_cadence<T>(action: impl FnOnce() -> T) -> T {
+    eprintln!(
+        "{}",
+        declare_gate_poll_interval(
+            "wrap-leg fixed",
+            Duration::from_millis(WRAP_POLL_INTERVAL_MS),
+        )
+    );
+    with_inventory_test_poll_interval(Duration::from_millis(WRAP_POLL_INTERVAL_MS), action)
+}
+
 #[test]
-#[ignore = "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap (~22min)"]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap at declared 250ms cadence"]
 fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
-    let (disabled, dk) = run_wrap(false)?;
-    let (enabled, ek) = run_wrap(true)?;
-    check_paired_parity(&disabled, dk, &enabled, ek)
+    with_wrap_cadence(|| {
+        let (disabled, dk) = run_wrap(false)?;
+        let (enabled, ek) = run_wrap(true)?;
+        check_paired_parity_schedule(&disabled, dk, &enabled, ek, WRAP_COUNTED)
+    })
 }
 
 /// Bounded system wrap pair (cell 3): the identical 32-object schedule
 /// under unfiltered system capture, with owned-caller validators and
-/// the same strict paired off/on parity.
+/// the same strict paired off/on parity, at the declared accelerated cadence.
 #[test]
-#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair (~22min+)"]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 250ms cadence"]
 fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
-    let (disabled, dk) = run_wrap_system(false)?;
-    let (enabled, ek) = run_wrap_system(true)?;
-    check_paired_parity(&disabled, dk, &enabled, ek)
+    with_wrap_cadence(|| {
+        let (disabled, dk) = run_wrap_system(false)?;
+        let (enabled, ek) = run_wrap_system(true)?;
+        check_paired_parity_schedule(&disabled, dk, &enabled, ek, WRAP_COUNTED)
+    })
 }
 
 /// Validate the small probe's actual dispositions independently of its progress
@@ -6037,6 +6232,186 @@ fn operator_diagnostics_wrap_twin_one_ring_wrap_fails() -> Result<()> {
     healthy[last]["kinds"][1]["produced"] = serde_json::json!(1);
     let bytes = seal_validator_fixture(&mut healthy);
     ensure!(check_wrap_records(&healthy, bytes, &twin_b_modules(), 123, "c0").is_err());
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_schedule_args() -> Result<()> {
+    // The live wrap schedule fits the fixture bounds and its workload
+    // deadline covers the run budget.
+    let args = schedule_args(&WRAP_SCHEDULE)?;
+    ensure!(
+        args.len() == 4
+            && args[1] == WRAP_SCHEDULE.deadline_ms.to_string()
+            && args[2] == WRAP_COUNTED.to_string()
+            && args[3] == WRAP_SHARED.to_string(),
+        "wrap schedule args lost their values: {args:?}"
+    );
+    ensure!(
+        WRAP_COUNTED != COUNTED || WRAP_SHARED != SHARED,
+        "the shortened gate must differ from the legacy 400/258 schedule"
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_schedule_export_pass() -> Result<()> {
+    // A healthy wrapped export at the live schedule passes the schedule
+    // validators, with the terminal fence/proof and retained shared suffix
+    // at the shortened absolutes. The legacy full-schedule validators must
+    // reject it (schedule distinction is load-bearing, not vacuous).
+    let (records, bytes) = diagnostic_validator_fixture_schedule(WRAP_COUNTED, WRAP_SHARED);
+    check_wrap_records_schedule(
+        &records,
+        bytes,
+        &twin_b_modules(),
+        123,
+        "c0",
+        WRAP_COUNTED,
+        WRAP_SHARED,
+    )?;
+    ensure!(
+        check_wrap_records(&records, bytes, &twin_b_modules(), 123, "c0").is_err(),
+        "legacy 400/258 validators accepted a shortened-schedule export"
+    );
+    let (fence, proof, staged) = check_terminal_pairs_schedule(
+        &records,
+        &twin_b_modules(),
+        Some("c0"),
+        WRAP_COUNTED,
+        WRAP_SHARED,
+    )?;
+    ensure!(
+        fence == 32 * (WRAP_COUNTED + WRAP_SHARED + 1)
+            && proof == 32 * (WRAP_COUNTED + WRAP_SHARED + 2)
+            && staged == 32,
+        "shortened terminal sums drifted: fence={fence} proof={proof} staged={staged}"
+    );
+    ensure!(
+        check_retained_shared_suffix(
+            &records,
+            &twin_b_modules(),
+            Some("c0"),
+            WRAP_COUNTED,
+            WRAP_SHARED,
+        )? == (WRAP_COUNTED + WRAP_SHARED - 1, WRAP_COUNTED + WRAP_SHARED),
+        "shortened shared suffix misplaced"
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_schedule_wrap_mutations_fail() -> Result<()> {
+    // Mutation proof for the shortened gate: every wrap break that the
+    // full-schedule oracle catches must also fail at the live schedule.
+    let (healthy, _) = diagnostic_validator_fixture_schedule(WRAP_COUNTED, WRAP_SHARED);
+    for mutation in [
+        "exceptional_no_eviction",
+        "ordinary_no_eviction",
+        "missing_proof",
+        "missing_shared_tail",
+    ] {
+        let mut changed = healthy.clone();
+        let last = changed.len() - 1;
+        match mutation {
+            "exceptional_no_eviction" => {
+                changed[last]["kinds"][1]["evicted"] = serde_json::json!(0);
+                changed[last]["kinds"][1]["produced"] = serde_json::json!(1);
+            }
+            "ordinary_no_eviction" => {
+                changed[last]["kinds"][0]["evicted"] = serde_json::json!(0);
+                changed[last]["kinds"][0]["produced"] =
+                    changed[last]["kinds"][0]["retained"].clone();
+            }
+            "missing_proof" => {
+                let at = changed
+                    .iter()
+                    .position(|row| {
+                        row["kind"] == "publication"
+                            && row["decision"] == "placed"
+                            && row["pair"] == "p0"
+                    })
+                    .context("p0 proof row")?;
+                changed[at]["decision"] = serde_json::Value::Null;
+            }
+            _ => {
+                let at = changed
+                    .iter()
+                    .position(|row| {
+                        row["decision"] == "withheld"
+                            && row["reason"] == "shared_owner"
+                            && row["absolute"] == WRAP_COUNTED + WRAP_SHARED
+                            && row["pair"] == "p0"
+                    })
+                    .context("p0 shared tail row")?;
+                changed[at]["reason"] = serde_json::Value::Null;
+            }
+        }
+        let bytes = seal_validator_fixture(&mut changed);
+        ensure!(
+            check_wrap_records_schedule(
+                &changed,
+                bytes,
+                &twin_b_modules(),
+                123,
+                "c0",
+                WRAP_COUNTED,
+                WRAP_SHARED,
+            )
+            .is_err(),
+            "shortened wrap accepted a broken export: {mutation}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_schedule_parity_mutations() -> Result<()> {
+    // Parity at the live counted schedule: matched legs pass exactly, and
+    // every parity break (disposition mismatch, altered counts) fails.
+    for k in [0, 32] {
+        let leg = primary_facts_schedule(
+            &primary_validator_fixture_schedule(123, 0, k, WRAP_COUNTED),
+            123,
+            k,
+            WRAP_COUNTED,
+        )?;
+        check_paired_parity_schedule(&leg, k, &leg.clone(), k, WRAP_COUNTED)?;
+    }
+    let off = primary_facts_schedule(
+        &primary_validator_fixture_schedule(123, 0, 0, WRAP_COUNTED),
+        123,
+        0,
+        WRAP_COUNTED,
+    )?;
+    let on = primary_facts_schedule(
+        &primary_validator_fixture_schedule(456, 500, 0, WRAP_COUNTED),
+        456,
+        0,
+        WRAP_COUNTED,
+    )?;
+    check_paired_parity_schedule(&off, 0, &on, 0, WRAP_COUNTED)?;
+    let fenced = primary_facts_schedule(
+        &primary_validator_fixture_schedule(123, 0, 32, WRAP_COUNTED),
+        123,
+        32,
+        WRAP_COUNTED,
+    )?;
+    ensure!(check_paired_parity_schedule(&off, 0, &fenced, 32, WRAP_COUNTED).is_err());
+    ensure!(check_paired_parity_schedule(&fenced, 32, &off, 0, WRAP_COUNTED).is_err());
+    for (edge, count) in [
+        ("provider-A-00.so", WRAP_COUNTED - 1),
+        ("provider-A-31.so", WRAP_COUNTED + 1),
+        ("provider-B-00.so", 0),
+        ("provider-B-31.so", 2),
+    ] {
+        let mut altered = off.clone();
+        altered["edges"][edge]["count"] = serde_json::json!(count);
+        ensure!(
+            check_paired_parity_schedule(&off, 0, &altered, 0, WRAP_COUNTED).is_err(),
+            "shortened parity accepted {edge}={count}"
+        );
+    }
     Ok(())
 }
 

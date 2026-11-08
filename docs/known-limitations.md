@@ -691,7 +691,10 @@ Inventory accepts and retains pre-arm inputs, attaches proved offsets
 through the inventory lane, and reports one interval row per input in
 `prearm[]`. An in-place rewrite that preserves `(ino, size, ctime)`
 at the filesystem's granularity is undetectable by the retained-fd checks;
-heavier proof is later work.
+heavier proof is later work. The witness copy-up proofs (the open-time
+pin, condition 4, and the finalize re-check) share that premise: a
+copy-up landing in the same timestamp tick as the lower file's ctime
+leaves an equal pin.
 
 Extensive mode (`--track-short-lived`) publishes a `gap_exe_hints`
 split beside `pid_descendant_gaps`, labelled `STATIC HINT`. A hint

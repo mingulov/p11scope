@@ -770,9 +770,11 @@ pub(crate) fn start_with<B: WitnessBackend>(
         // The pre-open pin: a copy-up landing between open() and the
         // open-time pin below would leave the calibration mmap on the
         // lower file while the recorded pin reads post-copy-up state.
-        // Copy-up is one-way and always rewrites ctime, so equal pins
-        // across the stat→fstat span mean the held fd has the recorded
-        // state.
+        // Copy-up is one-way and sets ctime to the copy-up time, so
+        // equal pins across the stat→fstat span mean the held fd has
+        // the recorded state — unless the lower's ctime falls in the
+        // same timestamp tick (the granularity limit the known
+        // limitations name).
         let pre = crate::discovery::identity::pin_from_metadata(&std::fs::metadata(path).map_err(
             |_| Unavailable::Calibration(format!("witness cannot stat {}", path.display())),
         )?);

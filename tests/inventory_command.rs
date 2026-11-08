@@ -2129,3 +2129,405 @@ fn event_log_dash_stderr_move_failure_fails_the_command() {
         serde_json::from_str(&std::fs::read_to_string(&document_path).unwrap()).unwrap();
     assert_eq!(doc["schema"], "p11scope/inventory/v1");
 }
+
+/// A later SIGINT cancels the stderr summary move exactly like the stdout
+/// rule. Stderr is a pipe pre-filled to capacity and never read, so the
+/// move stalls with zero bytes accepted; one SIGINT after the duration
+/// stop exits 1 promptly (well under the 5 s no-progress window). The
+/// failure notice itself sheds on the full pipe (the product's documented
+/// best-effort diagnostic rule): the drained pipe holds only the filler,
+/// which proves the total stall. The same run with healthy stderr exits
+/// 0 (twin phase). The cancelled message text is pinned by the slow-reader
+/// twin below, where a draining reader lets the notice land.
+#[test]
+fn event_log_dash_stderr_move_cancelled_by_later_signal() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-stderr-cancel");
+    let driver = gcc(
+        &dir,
+        "cancel-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let template = gcc(
+        &dir,
+        "cancel-template.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let many = dir.join("many");
+    std::fs::create_dir_all(&many).unwrap();
+    let mut providers = Vec::new();
+    for index in 0..24 {
+        let dest = many.join(format!("prov-{index:03}.so"));
+        std::fs::copy(&template, &dest).unwrap();
+        providers.push(dest);
+    }
+    let ready = dir.join("cancel.ready");
+    let _ = std::fs::remove_file(&ready);
+    let child = Command::new(&driver)
+        .arg("--ready")
+        .arg(&ready)
+        .arg("--call")
+        .arg("--sleep")
+        .arg("120")
+        .args(&providers)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let live = LiveDriver::adopt(child, &ready, "cancel", Duration::from_secs(30));
+    let pid_text = live.pid.to_string();
+
+    // Twin: healthy stderr exits 0; the summary size pins the stall window.
+    let twin_out = dir.join("twin.out");
+    let twin_err = dir.join("twin.err");
+    let twin = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory",
+            "--pid",
+            &pid_text,
+            "--capture",
+            "scan",
+            "--duration",
+            "2s",
+            "--event-log",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&twin_out).unwrap())
+        .stderr(std::fs::File::create(&twin_err).unwrap())
+        .status()
+        .unwrap();
+    assert!(twin.success(), "healthy stderr exits 0");
+    let twin_stderr = std::fs::read(&twin_err).unwrap();
+    let marker = format!("inventory pid:{} (", live.pid);
+    assert!(
+        std::str::from_utf8(&twin_stderr)
+            .unwrap()
+            .contains(&marker),
+        "the text summary moved to stderr"
+    );
+
+    // Stall: stderr is a pipe pre-filled to capacity.
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: `pipe` returned two fresh owned descriptors.
+    let mut stderr_read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let stderr_write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                stderr_write.as_raw_fd(),
+                libc::F_SETPIPE_SZ,
+                65536 as libc::c_int,
+            )
+        },
+        65536
+    );
+    // SAFETY: the fd is an open pipe end owned by the test.
+    let flags = unsafe { libc::fcntl(stderr_write.as_raw_fd(), libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                stderr_write.as_raw_fd(),
+                libc::F_SETFL,
+                flags | libc::O_NONBLOCK,
+            )
+        },
+        0
+    );
+    let chunk = [0x58u8; 4096];
+    let mut filled = 0usize;
+    let mut prefill = &stderr_write;
+    while prefill.write_all(&chunk).is_ok() {
+        filled += chunk.len();
+    }
+    assert_eq!(filled, 65536, "stderr starts pre-filled to capacity");
+    // Restore blocking mode: the child inherits this description, and only
+    // the test's prefill needed nonblocking I/O.
+    assert_eq!(
+        unsafe { libc::fcntl(stderr_write.as_raw_fd(), libc::F_SETFL, flags) },
+        0
+    );
+    let stream_path = dir.join("cancel.jsonl");
+    let mut stalled = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory",
+            "--pid",
+            &pid_text,
+            "--capture",
+            "scan",
+            "--duration",
+            "2s",
+            "--event-log",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stream_path).unwrap())
+        .stderr(Stdio::from(stderr_write))
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    // The `ended` record proves the duration stop settled; the stderr move
+    // stalls from here (the pipe is full).
+    let mut ended_at = None;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let stream = std::fs::read_to_string(&stream_path).unwrap_or_default();
+        if stream.contains("\"kind\":\"ended\"") {
+            ended_at = Some(Instant::now());
+            break;
+        }
+        assert!(
+            stalled.try_wait().unwrap().is_none(),
+            "the stalled run must still be in its no-progress window"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    let ended_at = ended_at.expect("ended reached the healthy event file");
+    // The pipe stays unread: the move stalls with zero bytes accepted.
+    // SAFETY: the child was alive above; a signal to a live observer only
+    // stops output, it never kills the process (the second-signal exit arms
+    // after output attempts finish).
+    assert_eq!(
+        unsafe { libc::kill(stalled.id() as libc::pid_t, libc::SIGINT) },
+        0,
+        "the signal reached the live stalled child"
+    );
+    let signalled_at = Instant::now();
+    assert!(
+        signalled_at - ended_at < Duration::from_secs(1),
+        "the signal lands inside the 5 s stall window"
+    );
+    let status = stalled.wait().unwrap();
+    let exit_after_signal = signalled_at.elapsed();
+    assert_eq!(status.code(), Some(1), "a cancelled move exits 1");
+    assert!(
+        exit_after_signal < Duration::from_secs(3),
+        "a later signal cancels the move promptly ({exit_after_signal:?}, well under 5 s)"
+    );
+    let mut drained = Vec::new();
+    stderr_read.read_to_end(&mut drained).unwrap();
+    assert_eq!(
+        drained.len(),
+        65536,
+        "the stalled move accepted zero bytes and every diagnostic shed"
+    );
+    assert!(
+        !drained
+            .windows(b"inventory stderr failed".len())
+            .any(|window| window == b"inventory stderr failed"),
+        "a stopped stderr sheds the failure notice"
+    );
+}
+
+/// A later SIGINT cancels the stderr summary move even while a slow reader
+/// keeps accepting a few bytes (there is no total deadline, so without the
+/// cancel check the move would ride out the trickle). Stderr is a 4 KiB
+/// pipe drained at ~20 KiB/s; the ~70 KiB verbose summary moves for several
+/// seconds, one SIGINT lands mid-move, and the run exits 1 with
+/// `inventory stderr failed: cancelled by a later signal` reporting a
+/// partial accepted count. Without the signal check the same run exits 0
+/// with the whole summary delivered.
+#[test]
+fn event_log_dash_stderr_move_cancelled_under_slow_reader() {
+    use std::io::Read as _;
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-stderr-trickle");
+    let driver = gcc(
+        &dir,
+        "trickle-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let template = gcc(
+        &dir,
+        "trickle-template.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let many = dir.join("many");
+    std::fs::create_dir_all(&many).unwrap();
+    let mut providers = Vec::new();
+    for index in 0..150 {
+        let dest = many.join(format!("prov-{index:03}.so"));
+        std::fs::copy(&template, &dest).unwrap();
+        providers.push(dest);
+    }
+    let ready = dir.join("trickle.ready");
+    let _ = std::fs::remove_file(&ready);
+    let child = Command::new(&driver)
+        .arg("--ready")
+        .arg(&ready)
+        .arg("--call")
+        .arg("--sleep")
+        .arg("180")
+        .args(&providers)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let live = LiveDriver::adopt(child, &ready, "trickle", Duration::from_secs(30));
+    let pid_text = live.pid.to_string();
+
+    // Twin: healthy stderr exits 0; the summary must exceed one sink
+    // buffer so the paced move runs for seconds.
+    let twin_out = dir.join("twin.out");
+    let twin_err = dir.join("twin.err");
+    let twin = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory",
+            "--pid",
+            &pid_text,
+            "--capture",
+            "scan",
+            "-v",
+            "--duration",
+            "2s",
+            "--event-log",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&twin_out).unwrap())
+        .stderr(std::fs::File::create(&twin_err).unwrap())
+        .status()
+        .unwrap();
+    assert!(twin.success(), "healthy stderr exits 0");
+    let twin_stderr = std::fs::read(&twin_err).unwrap();
+    let marker = format!("inventory pid:{} (", live.pid);
+    let start = std::str::from_utf8(&twin_stderr)
+        .unwrap()
+        .find(&marker)
+        .expect("the text summary moved to stderr");
+    let summary_len = twin_stderr.len() - start;
+    assert!(
+        summary_len > 65536,
+        "the fixture must exceed one sink buffer: {} bytes",
+        summary_len
+    );
+
+    // Stall: stderr is a 4 KiB pipe drained at ~20 KiB/s, so the move
+    // takes seconds while every write makes progress (the 5 s
+    // no-progress window never expires).
+    let mut fds = [0 as libc::c_int; 2];
+    assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+    // SAFETY: `pipe` returned two fresh owned descriptors.
+    let stderr_read = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+    let stderr_write = unsafe { std::fs::File::from_raw_fd(fds[1]) };
+    assert_eq!(
+        unsafe {
+            libc::fcntl(
+                stderr_write.as_raw_fd(),
+                libc::F_SETPIPE_SZ,
+                4096 as libc::c_int,
+            )
+        },
+        4096
+    );
+    let drainer = std::thread::spawn(move || {
+        let mut read = stderr_read;
+        let mut collected = Vec::new();
+        let mut chunk = [0u8; 2048];
+        loop {
+            match read.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(n) => {
+                    collected.extend_from_slice(&chunk[..n]);
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => break,
+            }
+        }
+        collected
+    });
+    let stream_path = dir.join("trickle.jsonl");
+    let mut stalled = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory",
+            "--pid",
+            &pid_text,
+            "--capture",
+            "scan",
+            "-v",
+            "--duration",
+            "2s",
+            "--event-log",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&stream_path).unwrap())
+        .stderr(Stdio::from(stderr_write))
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    // The `ended` record proves the duration stop settled; the paced move
+    // starts here and runs for seconds.
+    let mut ended = false;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let stream = std::fs::read_to_string(&stream_path).unwrap_or_default();
+        if stream.contains("\"kind\":\"ended\"") {
+            ended = true;
+            break;
+        }
+        assert!(
+            stalled.try_wait().unwrap().is_none(),
+            "the paced run must still be moving its summary"
+        );
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    assert!(ended, "ended reached the healthy event file");
+    // Mid-move: the paced move runs ~3 s, so a signal 0.5 s after `ended`
+    // always lands inside it (a slow harness only delays the signal
+    // further into the move, never past it, since the drainer paces the
+    // move too).
+    std::thread::sleep(Duration::from_millis(500));
+    // SAFETY: the child was alive above; a signal to a live observer only
+    // stops output, it never kills the process (the second-signal exit arms
+    // after output attempts finish).
+    assert_eq!(
+        unsafe { libc::kill(stalled.id() as libc::pid_t, libc::SIGINT) },
+        0,
+        "the signal reached the live moving child"
+    );
+    let status = stalled.wait().unwrap();
+    assert_eq!(status.code(), Some(1), "a cancelled move exits 1");
+    let drained = drainer.join().unwrap();
+    let drained = String::from_utf8_lossy(&drained);
+    let failure = drained
+        .find("inventory stderr failed: cancelled by a later signal")
+        .expect("the later signal cancels the move");
+    // The cancel landed mid-move: some bytes were accepted, not all.
+    let tail = &drained[failure..];
+    let accepted: usize = tail
+        .split("accepted ")
+        .nth(1)
+        .and_then(|rest| rest.split(" of ").next()?.parse().ok())
+        .expect("the notice reports the accepted count");
+    let total: usize = tail
+        .split(" of ")
+        .nth(1)
+        .and_then(|rest| rest.split(' ').next()?.parse().ok())
+        .expect("the notice reports the total count");
+    assert!(
+        total > 65536,
+        "the paced move covers a multi-buffer summary ({total} bytes)"
+    );
+    assert!(
+        accepted > 0 && accepted < total,
+        "the cancel landed mid-move ({accepted} of {total})"
+    );
+}

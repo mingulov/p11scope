@@ -100,12 +100,13 @@ fn complete_tokens(cmdline: &[u8]) -> Vec<&[u8]> {
     pieces
 }
 
-/// Basename of a path token: lossy, last component, 1..=255 bytes, never
-/// starting with `-` (a value in disguise).
+/// Basename of a path token: lossy, last component, 1..=255 bytes,
+/// never all whitespace (title padding), never starting with `-` (a
+/// value in disguise).
 fn capture_basename(token: &[u8]) -> Option<String> {
     let text = String::from_utf8_lossy(token);
     let base = basename_of(&text)?;
-    if base.is_empty() || base.len() > HINT_VALUE_MAX_BYTES || base.starts_with('-') {
+    if base.trim().is_empty() || base.len() > HINT_VALUE_MAX_BYTES || base.starts_with('-') {
         return None;
     }
     Some(base.to_string())
@@ -533,6 +534,15 @@ fn bounded_hint(value: String, source: AppHintSource) -> Option<AppHint> {
     Some(AppHint { value, source })
 }
 
+/// Whether a `0::` path component is the user-manager service,
+/// exactly `user@<digits>.service`.
+fn is_user_manager_service(component: &str) -> bool {
+    component
+        .strip_prefix("user@")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 /// Leaf-of-`0::` cgroup hint: `snap <snap>` for snap scopes, the unit
 /// name for services, the opaque leaf for `app-*.scope`. Generic
 /// sessions, slices, and container shapes yield nothing.
@@ -544,7 +554,25 @@ fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
     {
         return None;
     }
-    let leaf = line.rsplit('/').find(|part| !part.is_empty())?;
+    let mut parts = line.rsplit('/').filter(|part| !part.is_empty());
+    let leaf = parts.next()?;
+    // Structural rule: the leaf is accepted only when every ancestor
+    // is a plain host nesting level — ending in `.slice`, except at
+    // most one `user@<digits>.service`. Container scopes, container
+    // services and cgroupfs directories refuse the leaf no matter
+    // what the name list above knows.
+    let mut user_managers = 0;
+    for ancestor in parts {
+        let ancestor = ancestor.trim_end();
+        if is_user_manager_service(ancestor) {
+            user_managers += 1;
+        } else if !ancestor.ends_with(".slice") {
+            return None;
+        }
+    }
+    if user_managers > 1 {
+        return None;
+    }
     let leaf = leaf.trim_end();
     if leaf.is_empty() || leaf.len() > HINT_VALUE_MAX_BYTES {
         return None;

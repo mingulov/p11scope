@@ -6,6 +6,8 @@ Run an explicit --repeat-baseline diagnostic first, then compare distinct
 baseline/candidate commits. Neither mode installs tools or uses target caches.
 The baseline decision is reviewed separately. Both sides build with the
 reviewed release host compiler and the shared BPF tool environment.
+A reviewed --allowed-change-record admits exactly the recorded content
+transition; the repeat diagnostic stays strict.
 """
 
 from __future__ import annotations
@@ -34,6 +36,8 @@ sys.path.insert(0, str(COORDINATOR_DIRECTORY))
 from _loader import load_path
 
 OBJECT_NAMES = ("p11scope-ebpf", "p11scope-ebpf-inventory", "p11scope-ebpf-inventory-callers")
+ALLOWED_CHANGE_RECORD_VERSION = 1
+ALLOWED_CHANGE_TEXT_LIMIT = 2000
 RELEASE_RUST = "1.99.1"
 RELEASE_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
 BPF_RUST = "nightly-2026-05-20"
@@ -474,6 +478,21 @@ def _objects_identical(left: Path, right: Path) -> bool:
                 return True
 
 
+def _strict_verdict(name: str, baseline: Path, candidate: Path, dump_c) -> str:
+    """The strict per-object verdict, raising CheckError on any difference."""
+    # Fast path: whole bytes, including all debug/BTF/relocation sections.
+    if _objects_identical(baseline, candidate):
+        return "exact"
+    try:
+        left = _canonical_projection(baseline, name, dump_c)
+        right = _canonical_projection(candidate, name, dump_c)
+    except CheckError as error:
+        raise CheckError(f"default object differs: {name} ({error})") from error
+    if left != right:
+        raise CheckError(f"default object differs: {name}")
+    return "btf-order-only"
+
+
 def compare_objects(baseline: dict[str, Path], candidate: dict[str, Path],
                     dump_c=_btf_c_dump_sorted) -> dict[str, str]:
     """Compare whole bytes, accepting a proven BTF type-order permutation.
@@ -496,19 +515,128 @@ def compare_objects(baseline: dict[str, Path], candidate: dict[str, Path],
             identities.add(identity)
     verdicts = {}
     for name in OBJECT_NAMES:
-        # Fast path: whole bytes, including all debug/BTF/relocation sections.
-        if _objects_identical(baseline[name], candidate[name]):
-            verdicts[name] = "exact"
-            continue
-        try:
-            left = _canonical_projection(baseline[name], name, dump_c)
-            right = _canonical_projection(candidate[name], name, dump_c)
-        except CheckError as error:
-            raise CheckError(f"default object differs: {name} ({error})") from error
-        if left != right:
-            raise CheckError(f"default object differs: {name}")
-        verdicts[name] = "btf-order-only"
+        verdicts[name] = _strict_verdict(name, baseline[name], candidate[name], dump_c)
     return verdicts
+
+
+def _allowed_text(value, field: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise CheckError(f"allowed-change record has an empty {field}")
+    if len(value) > ALLOWED_CHANGE_TEXT_LIMIT:
+        raise CheckError(f"allowed-change record {field} exceeds {ALLOWED_CHANGE_TEXT_LIMIT} characters")
+    if any(not character.isprintable() for character in value):
+        raise CheckError(f"allowed-change record {field} must be printable single-line text")
+    return value
+
+
+def _allowed_triple(value, side: str) -> dict[str, dict[str, object]]:
+    if not isinstance(value, dict) or set(value) != set(OBJECT_NAMES):
+        raise CheckError(f"allowed-change record {side} must name exactly the three default objects")
+    triple = {}
+    for name in OBJECT_NAMES:
+        entry = value[name]
+        if not isinstance(entry, dict) or set(entry) != {"sha256", "size"}:
+            raise CheckError(f"allowed-change record {side} {name} must carry exactly sha256 and size")
+        digest, size = entry["sha256"], entry["size"]
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise CheckError(f"allowed-change record {side} {name} needs a 64-character lowercase hex sha256")
+        if type(size) is not int or size <= 0:
+            raise CheckError(f"allowed-change record {side} {name} needs a positive size")
+        triple[name] = {"sha256": digest, "size": size}
+    return triple
+
+
+def load_allowed_changes(path: Path, repo: Path) -> list[dict]:
+    """Load and strictly validate the reviewed allowed-change record.
+
+    The record lives in the reviewed candidate tree. Matching is purely
+    content-addressed (per-object sha256 and size); the revision fields
+    only document which revisions produced the recorded bytes.
+    """
+    if not path.is_absolute():
+        raise CheckError("allowed-change record must be an absolute path")
+    try:
+        real = path.resolve(strict=True)
+    except OSError as error:
+        raise CheckError(f"allowed-change record is unavailable: {error}") from error
+    if real != path or not stat.S_ISREG(path.lstat().st_mode):
+        raise CheckError("allowed-change record must be a regular non-symlink file")
+    if not path.is_relative_to(repo):
+        raise CheckError("allowed-change record must live in the reviewed repository tree")
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as error:
+        raise CheckError(f"allowed-change record is not valid JSON: {error}") from error
+    if not isinstance(document, dict) or set(document) != {"version", "transitions"}:
+        raise CheckError("allowed-change record must carry exactly version and transitions")
+    if type(document["version"]) is not int or document["version"] != ALLOWED_CHANGE_RECORD_VERSION:
+        raise CheckError(f"allowed-change record version must be {ALLOWED_CHANGE_RECORD_VERSION}")
+    transitions = document["transitions"]
+    if not isinstance(transitions, list) or not transitions:
+        raise CheckError("allowed-change record must list at least one transition")
+    seen = []
+    for transition in transitions:
+        if not isinstance(transition, dict) or set(transition) != {
+                "baseline", "candidate", "lane", "rationale",
+                "baseline_revision", "candidate_revision"}:
+            raise CheckError("allowed-change transitions must carry exactly baseline, candidate, "
+                             "lane, rationale and revisions")
+        checked = {"baseline": _allowed_triple(transition["baseline"], "baseline"),
+                   "candidate": _allowed_triple(transition["candidate"], "candidate")}
+        for field in ("lane", "rationale", "baseline_revision", "candidate_revision"):
+            checked[field] = _allowed_text(transition[field], field)
+        if checked["baseline"] == checked["candidate"]:
+            raise CheckError("an allowed-change transition must change at least one object")
+        if checked in seen:
+            raise CheckError("allowed-change record must not repeat a transition")
+        seen.append(checked)
+    return seen
+
+
+def _built_identities(objects: dict[str, Path]) -> dict[str, dict[str, object]]:
+    return {name: {"sha256": sha256(objects[name]), "size": objects[name].stat().st_size}
+            for name in OBJECT_NAMES}
+
+
+def match_allowed_change(transitions: list[dict], baseline: dict[str, Path],
+                         candidate: dict[str, Path]) -> dict | None:
+    """The recorded transition both built sides match, if any.
+
+    Content-addressed only: the baseline side must equal the recorded
+    baseline bytes and the candidate side the recorded candidate bytes.
+    """
+    built_baseline = _built_identities(baseline)
+    built_candidate = _built_identities(candidate)
+    for transition in transitions:
+        if (transition["baseline"] == built_baseline
+                and transition["candidate"] == built_candidate):
+            return transition
+    return None
+
+
+def compare_with_allowed_changes(baseline: dict[str, Path], candidate: dict[str, Path],
+                                 transitions: list[dict],
+                                 dump_c=_btf_c_dump_sorted) -> tuple[dict[str, str], dict | None]:
+    """Compare strictly, admitting exactly a recorded content transition.
+
+    Returns the per-object verdicts and the matched transition (None when
+    the strict comparison already passes: the record is never consulted
+    for identical sides). Anything unrecorded raises the strict failure.
+    """
+    try:
+        return compare_objects(baseline, candidate, dump_c), None
+    except CheckError:
+        matched = match_allowed_change(transitions, baseline, candidate)
+        if matched is None:
+            raise
+        verdicts = {}
+        for name in OBJECT_NAMES:
+            try:
+                verdicts[name] = _strict_verdict(name, baseline[name], candidate[name], dump_c)
+            except CheckError:
+                verdicts[name] = "allowed-change"
+        return verdicts, matched
 
 
 def select_out_dir(messages: str, package_id: str, scratch: Path) -> Path:
@@ -783,6 +911,7 @@ def main() -> int:
     parser.add_argument("--candidate", required=True)
     parser.add_argument("--work", type=Path, required=True)
     parser.add_argument("--repeat-baseline", action="store_true")
+    parser.add_argument("--allowed-change-record", type=Path)
     parser.add_argument("--baseline-offline-payload", type=Path)
     parser.add_argument("--candidate-offline-payload", type=Path)
     options = parser.parse_args()
@@ -803,6 +932,10 @@ def main() -> int:
             if payload is not None and (not payload.is_absolute() or payload.resolve(strict=True) != payload
                     or not payload.is_dir() or payload.is_relative_to(work) or work.is_relative_to(payload)):
                 raise CheckError("offline payload must be an absolute real directory disjoint from owned work")
+        if options.repeat_baseline and options.allowed_change_record is not None:
+            raise CheckError("repeat-baseline is a strict self-check; it takes no allowed-change record")
+        transitions = (load_allowed_changes(options.allowed_change_record, repo)
+                       if options.allowed_change_record is not None else None)
         work.mkdir(mode=0o700)
         write_json(work / "ownership.json", {"pid": os.getpid(), "repo": str(repo)})
         (work / "logical").mkdir(mode=0o700)
@@ -847,15 +980,28 @@ def main() -> int:
         if (json.loads((work / "baseline/snapshot.json").read_text())["nightly_source"]
                 != json.loads((work / "candidate/snapshot.json").read_text())["nightly_source"]):
             raise CheckError("selected nightly source changed between snapshot builds")
-        verdicts = compare_objects(left, right)
+        if transitions is None:
+            verdicts = compare_objects(left, right)
+            allowed = None
+        else:
+            verdicts, allowed = compare_with_allowed_changes(left, right, transitions)
         mode = "repeat-baseline" if options.repeat_baseline else "integration"
-        write_json(work / "comparison.json", {"mode": mode,
-                                              "baseline": baseline, "candidate": candidate,
-                                              "host_compilers": {"baseline": baseline_receipt["host_compiler"],
-                                                                 "candidate": candidate_receipt["host_compiler"]},
-                                              "acquisition_mode": "verified-payload" if options.baseline_offline_payload else "online",
-                                              "matched_objects": list(OBJECT_NAMES),
-                                              "verdicts": verdicts})
+        comparison = {"mode": mode,
+                      "baseline": baseline, "candidate": candidate,
+                      "host_compilers": {"baseline": baseline_receipt["host_compiler"],
+                                         "candidate": candidate_receipt["host_compiler"]},
+                      "acquisition_mode": "verified-payload" if options.baseline_offline_payload else "online",
+                      "matched_objects": list(OBJECT_NAMES),
+                      "verdicts": verdicts}
+        if allowed is not None:
+            comparison["allowed_change"] = {
+                key: allowed[key] for key in ("lane", "rationale", "baseline_revision", "candidate_revision")}
+        write_json(work / "comparison.json", comparison)
+        if allowed is not None:
+            changed = sorted(name for name, verdict in verdicts.items() if verdict == "allowed-change")
+            print(f"bpf-noninterference: ALLOWED CHANGE ({allowed['lane']}): {baseline} vs {candidate}: "
+                  f"{', '.join(changed)} differ as recorded")
+            return 0
         relaxed = sorted(name for name, verdict in verdicts.items() if verdict != "exact")
         if relaxed:
             print(f"bpf-noninterference: {baseline} vs {candidate}: all three objects match "

@@ -475,6 +475,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+          fetch-tags: true
       - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal
       - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
       - run: sudo apt-get update && sudo apt-get install -y clang-18 gcc libseccomp-dev llvm python3
@@ -504,7 +505,26 @@ jobs:
           sudo install -m 0755 "$bpftool_source" /usr/local/bin/bpftool
           bpftool version
           sudo bpftool version
-      # Pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
+      # Baseline v0.6.0 tag (release commit 105497f4): the v0.6.0
+      # release objects. Since the 3681a1ab7 pin the BPF inputs gained the
+      # pre-arm witness native unit (19953ee1f plus the witness verdict
+      # series), the Stage3 vma_identity groundwork and the build.rs object
+      # wiring; the Cargo version lines moved 0.5.0 to 0.6.0 with no code
+      # effect. Allowed transition to the v0.7.0 rc line, recorded in
+      # scripts/bpf-noninterference-allowed.json: the PQC parameter-set
+      # lane (405739005) adds CKA_PARAMETER_SET as shared classifier kind
+      # 7. The default Detailed object gains .text (+416 B) and uprobe
+      # (+40 B) from the new classifier arms; both Inventory objects are
+      # byte-identical, and maps, license and .BTF are unchanged. No other
+      # BPF input changed since v0.6.0.
+      # Allowed-change process: when kernel code changes on purpose, run
+      # scripts/check-bpf-noninterference.py locally for the baseline tag
+      # versus the candidate, take the per-object sha256 and size pairs
+      # from the two snapshot.json receipts, and append exactly that
+      # transition (with the lane and rationale) to the record above; the
+      # repeat-baseline control stays strict and any unrecorded byte still
+      # fails loudly.
+      # Earlier pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
       # b27149d51; the pin commit itself only guards the canary strip),
       # on top of 873adf5c4:
       # the round-10 inventory lifecycle ring raise (805a596ae, 2 MiB to
@@ -655,14 +675,26 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81
+          BASELINE_TAG=v0.6.0
+          BASELINE=$(git rev-parse --verify "refs/tags/${BASELINE_TAG}^{commit}")
+          echo "bpf-noninterference baseline: ${BASELINE_TAG} -> ${BASELINE}"
           comparison_root="$RUNNER_TEMP/bpf-noninterference"
           mkdir -m 700 "$comparison_root"
           python3 -I scripts/check-bpf-noninterference.py \
             --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$BASELINE" \
             --work "$comparison_root/repeat-baseline" --repeat-baseline
+          if [ "$BASELINE" = "$GITHUB_SHA" ]; then
+            echo "bpf-noninterference: candidate $GITHUB_SHA equals baseline ${BASELINE_TAG} (${BASELINE})"
+            if [ "${GITHUB_REF_TYPE:-}" = tag ] && [ "${GITHUB_REF_NAME:-}" = "$BASELINE_TAG" ]; then
+              echo "on the baseline tag itself: the repeat-baseline control above is the evidence"
+              exit 0
+            fi
+            echo "refusing a vacuous self-comparison off the baseline tag" >&2
+            exit 1
+          fi
           python3 -I scripts/check-bpf-noninterference.py \
             --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --allowed-change-record "$GITHUB_WORKSPACE/scripts/bpf-noninterference-allowed.json" \
             --work "$comparison_root/integration"
           test -s "$comparison_root/repeat-baseline/comparison.json"
           test -s "$comparison_root/integration/comparison.json"

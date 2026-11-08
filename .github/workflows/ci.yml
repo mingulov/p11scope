@@ -876,6 +876,7 @@ jobs:
           UNRUN: scripts/ci/key-operations-shortlived.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/verify-receipt-lane16.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/verify-spy-forwarding.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/verify-unidentified-exe-name.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/ci/fedora-softhsm-cell.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-abi-routing.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/matrix/verify-fork-scope.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -985,6 +986,7 @@ jobs:
       - run: scripts/verify-receipt-lane02.sh --self-test
       - run: scripts/verify-receipt-lane16.sh --self-test
       - run: scripts/verify-spy-forwarding.sh --self-test
+      - run: scripts/verify-unidentified-exe-name.sh --self-test
       - run: scripts/attach-pod.sh --self-test
       - run: scripts/build-release.sh --self-test
       - run: scripts/bench-overhead.sh --self-test
@@ -1012,6 +1014,7 @@ jobs:
       - run: scripts/matrix/verify-shared-layer.sh --self-test
       - run: scripts/matrix/verify-uretprobe-seccomp.sh --self-test
       - run: scripts/ci/build-counter-fixtures.sh --self-test
+      - run: scripts/ci/build-wrap-fixtures.sh --self-test
       - run: scripts/ci/joint-stall-live.sh --self-test
       - run: scripts/ci/run-root-integration.sh --self-test
       - run: scripts/ci/run-witness-cli.sh --self-test

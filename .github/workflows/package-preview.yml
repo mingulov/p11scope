@@ -255,7 +255,9 @@ jobs:
   # FULL binary, so this job waits for the whole package matrix: like the
   # release, a P0 failure withholds the image. A p0-only dispatch has no
   # FULL bytes and skips the job instead of building from anything else.
-  # Nothing here pushes: container-push owns the registry write, tag-gated.
+  # Nothing here pushes: registry publishing lives in the tag-triggered
+  # container-publish workflow, so this reusable workflow (called by
+  # ordinary push CI) never needs packages:write.
   container-image:
     needs: package
     if: ${{ inputs.capture_mode != 'p0' }}
@@ -347,7 +349,7 @@ jobs:
           assert scanned and max(scanned) > 0, "the smoke must scan host processes"
           print(f"smoke ok: schema p11scope/inventory/v1, scanned {max(scanned)}")
           PY
-      - name: Save the image for the push job
+      - name: Save the smoke-tested image
         shell: bash
         run: |
           set -euo pipefail
@@ -361,65 +363,5 @@ jobs:
         with:
           name: container-image-tarball
           path: ${{ runner.temp }}/container-image-out/
-          if-no-files-found: error
-          retention-days: 30
-  # The only registry write: the exact tarball bytes container-image saved,
-  # re-identified by image ID after loading, published to
-  # ghcr.io/mingulov/p11scope only when this run was dispatched on a final
-  # release tag (vX.Y.Z, this repository). Any other ref skips the job;
-  # release candidates never publish. packages: write is scoped to this
-  # job; the top level stays read-only.
-  container-push:
-    needs: container-image
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'mingulov/p11scope' }}
-    runs-on: ubuntu-26.04
-    timeout-minutes: 15
-    permissions:
-      contents: read
-      actions: read
-      packages: write
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
-        with:
-          name: container-image-tarball
-          path: ./container-image-in
-      - name: Push the exact built image on the release tag
-        shell: bash
-        run: |
-          set -euo pipefail
-          umask 022
-          cd container-image-in
-          test -f observer.tar && test -f image-id.txt
-          grep -Eq '^sha256:[0-9a-f]{64}$' image-id.txt
-          [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
-          docker load -i observer.tar
-          loaded=$(docker inspect --format '{{.Id}}' p11scope-observer:preview)
-          test "$loaded" = "$(cat image-id.txt)"
-          tag="${GITHUB_REF_NAME#v}"
-          dest="ghcr.io/mingulov/p11scope:$tag"
-          docker tag p11scope-observer:preview "$dest"
-          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$dest" | tee push.log
-          digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' push.log | tail -1)
-          test -n "$digest"
-          {
-            echo "image: $dest"
-            echo "digest: $digest"
-            echo "source: $GITHUB_SHA"
-          } | tee receipt.txt
-          {
-            echo "## container-push"
-            echo ""
-            echo "published \`$dest\` \`$digest\` from \`$GITHUB_SHA\`."
-          } >>"$GITHUB_STEP_SUMMARY"
-      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: container-push-receipt
-          path: ./container-image-in/receipt.txt
           if-no-files-found: error
           retention-days: 30

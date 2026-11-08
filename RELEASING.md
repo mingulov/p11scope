@@ -534,17 +534,17 @@ On the commit that steps 3–6 ran on:
    once known, like the CHANGELOG qualification row; the body links to
    it), not into the body. Keep candidate-only results explicitly
    historical. Check the uploaded assets and notes after publication.
-4. Publish the container image: dispatch `package-preview` on the tag
-   (Actions → package-preview → Run workflow, "Use workflow from" the new
-   tag, `accepted_ci_run_id` the green `ci` run on that SHA,
-   `capture_mode` `full`). The `container-image` job rebuilds the FULL
-   package from the tag bytes, builds `p11scope-observer:preview` with
-   `--network=none` and smokes it; `container-push` (which runs only on a
-   final `vX.Y.Z` tag of this repository) publishes
-   `ghcr.io/mingulov/p11scope:<X.Y.Z>`. No other ref publishes: branch
-   dispatches build and smoke the image but skip the push. Record the run
-   URL and the image digest from the push receipt, then verify with
-   `docker pull` and the `docker run` recipe in
+4. Publish the container image: pushing the tag triggers
+   `container-publish` (tags `v*`, this repository only), which rebuilds
+   the FULL observer image from the tag bytes, builds
+   `p11scope-observer:preview` with `--network=none` and smokes it, then —
+   on a final `vX.Y.Z` tag only — publishes
+   `ghcr.io/mingulov/p11scope:<X.Y.Z>` and `:latest`. Prerelease tags
+   build and smoke without publishing; any other ref builds nothing. If
+   the tag-push run fails transiently, re-dispatch `container-publish` on
+   the tag (Actions → container-publish → Run workflow, "Use workflow
+   from" the tag). Record the run URL and the image digest from the push
+   receipt, then verify with `docker pull` and the `docker run` recipe in
    [deploy/README.md](deploy/README.md). That push makes live the DaemonSet
    default retargeted to this tag in step 1.
 

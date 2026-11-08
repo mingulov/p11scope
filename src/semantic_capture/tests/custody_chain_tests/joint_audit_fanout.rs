@@ -1244,11 +1244,12 @@ fn joint_gated_lane_service_stages_nothing() {
     assert_eq!(io.drain.source_mut().inner_mut().remaining(), 5000);
 }
 
-/// A finish service restages through the stop: bytes below Q's producer
-/// bound stage, bytes at or past it stay on the ring, and every staging
-/// call carries the same stop.
+/// A finish service never stages: the finish gates the lane through
+/// the real stop path before Q, producers are already gated, and there
+/// is no ring pressure during finish. The probe stays empty and the
+/// ring keeps every record for the bounded finish drain.
 #[test]
-fn joint_finish_service_stages_pre_q_only() {
+fn joint_finish_service_stages_nothing() {
     let mut fixture = MachineScene::with_initial_files(1, &[0], true);
     let probe_pushed = stage_probe_push(&mut fixture.scene, 256);
     let pid = std::process::id();
@@ -1257,22 +1258,7 @@ fn joint_finish_service_stages_pre_q_only() {
     }
     fixture.enable_finish_fixture(Vec::new());
     fixture.begin_finish().unwrap();
-    // Q observed the scene drain: its stop is the producer bound now.
-    let stop = fixture
-        .scene
-        .drain
-        .consumption_cut()
-        .expect("scene drain takes a cut")
-        .producer_bound();
-    // The scripted wire counts 8 bytes per record, so the stop cuts the
-    // probe after stop/8 records; the probe spans well past the stop.
     let count = probe_pushed.len();
-    assert!(count * 8 > stop, "count={count} stop={stop}");
-    let expected = stop.div_ceil(8);
-    assert!(
-        expected > 0 && expected < count,
-        "expected={expected} count={count} stop={stop}"
-    );
     let mut probe = StageFinishProbe {
         drain: crate::events::EventDrain::over(crate::events::StagedEvents::with_caps(
             crate::events::ScriptedRecords::records(probe_pushed, count),
@@ -1317,18 +1303,15 @@ fn joint_finish_service_stages_pre_q_only() {
         }
     }
     assert!(
-        !probe.stops.is_empty(),
-        "the finish service staged at least once"
-    );
-    assert!(
-        probe.stops.iter().all(|seen| *seen == Some(stop)),
-        "every staging call carries the stop {stop}: {:?}",
+        probe.stops.is_empty(),
+        "the finish service never stages: {:?}",
         probe.stops
     );
-    assert_eq!(probe.drain.source_mut().staged_len(), expected);
-    assert_eq!(
-        probe.drain.source_mut().inner_mut().remaining(),
-        count - expected
+    assert_eq!(probe.drain.source_mut().staged_len(), 0);
+    assert_eq!(probe.drain.source_mut().inner_mut().remaining(), count);
+    assert!(
+        finish.as_ref().expect("finish fixture ran").stop_requests > 0,
+        "the finish ran through the real stop path"
     );
 }
 

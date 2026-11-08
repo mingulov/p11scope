@@ -1591,6 +1591,53 @@ pub(crate) fn admitted_mints_line(
     )
 }
 
+/// One stderr line for the diagnostic ingest-taint summary:
+/// contradiction counts by kind, other taint causes, total
+/// events, and the first taint's cause. Counts and one frozen
+/// label only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only while stage
+/// timings are requested, never a contract.
+#[allow(clippy::too_many_arguments)] // One line, one call site, like semantic_stop_line.
+pub(crate) fn joint_taints_line(
+    duplicate_begin: u64,
+    terminal_before_begin: u64,
+    duplicate_terminal: u64,
+    sequence_regression: u64,
+    no_end_completed: u64,
+    end_begin_mismatch: u64,
+    call_and_end: u64,
+    ambiguous_return: u64,
+    floor_exhausted: u64,
+    refused_overflow: u64,
+    unclosed_endpoint: u64,
+    negative_only_invalidated: u64,
+    sighting_failure: u64,
+    other_caller_refused: u64,
+    claim_ambiguity: u64,
+    claim_unmatched: u64,
+    unclaimed_invalidation: u64,
+    events: u64,
+    first_cause: &str,
+) -> String {
+    format!(
+        "p11scope: joint taints: duplicate_begin={duplicate_begin} \
+         terminal_before_begin={terminal_before_begin} \
+         duplicate_terminal={duplicate_terminal} \
+         sequence_regression={sequence_regression} \
+         no_end_completed={no_end_completed} \
+         end_begin_mismatch={end_begin_mismatch} \
+         call_and_end={call_and_end} ambiguous_return={ambiguous_return} \
+         floor_exhausted={floor_exhausted} refused_overflow={refused_overflow} \
+         unclosed_endpoint={unclosed_endpoint} \
+         negative_only_invalidated={negative_only_invalidated} \
+         sighting_failure={sighting_failure} \
+         other_caller_refused={other_caller_refused} \
+         claim_ambiguity={claim_ambiguity} claim_unmatched={claim_unmatched} \
+         unclaimed_invalidation={unclaimed_invalidation} events={events} \
+         first_cause={first_cause}"
+    )
+}
+
 /// One stderr line for the diagnostic joint-seal summary: seal
 /// attempts by progress kind plus refusal count and the latest
 /// refusal label, with the deliver-side record (active-seal

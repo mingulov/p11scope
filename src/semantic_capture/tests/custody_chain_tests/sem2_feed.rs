@@ -14,7 +14,8 @@ use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
-    image_query_refusal_label, joint_seals_line, scan_refusals_gap_reason, semantic_stop_line,
+    image_query_refusal_label, joint_seals_line, joint_taints_line, scan_refusals_gap_reason,
+    semantic_stop_line,
 };
 
 #[test]
@@ -294,5 +295,49 @@ fn joint_seals_line_format_is_exact() {
          d_entry_zero=9 d_entry_exhausted=10 \
          f_visits=11 f_cleared=12 f_progress=13 f_retried=14 f_stuck=15 \
          f_last_gap=h3_pending d_other=16"
+    );
+}
+
+#[test]
+fn joint_taints_line_format_is_exact() {
+    assert_eq!(
+        joint_taints_line(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "none"),
+        "p11scope: joint taints: duplicate_begin=0 terminal_before_begin=0 \
+         duplicate_terminal=0 sequence_regression=0 no_end_completed=0 \
+         end_begin_mismatch=0 call_and_end=0 ambiguous_return=0 \
+         floor_exhausted=0 refused_overflow=0 unclosed_endpoint=0 \
+         negative_only_invalidated=0 sighting_failure=0 \
+         other_caller_refused=0 claim_ambiguity=0 claim_unmatched=0 \
+         unclaimed_invalidation=0 events=0 first_cause=none"
+    );
+    assert_eq!(
+        joint_taints_line(
+            1,
+            2,
+            3,
+            4,
+            5,
+            6,
+            7,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            16,
+            17,
+            104,
+            "duplicate_begin"
+        ),
+        "p11scope: joint taints: duplicate_begin=1 terminal_before_begin=2 \
+         duplicate_terminal=3 sequence_regression=4 no_end_completed=5 \
+         end_begin_mismatch=6 call_and_end=7 ambiguous_return=8 \
+         floor_exhausted=9 refused_overflow=10 unclosed_endpoint=11 \
+         negative_only_invalidated=12 sighting_failure=13 \
+         other_caller_refused=14 claim_ambiguity=15 claim_unmatched=16 \
+         unclaimed_invalidation=17 events=104 first_cause=duplicate_begin"
     );
 }

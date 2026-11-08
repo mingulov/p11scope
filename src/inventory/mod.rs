@@ -3200,6 +3200,28 @@ fn disclose_semantic_stop(
             counts.marks_refused_cap,
             counts.admission_binding_miss,
         ));
+        let taints = coordinator.contradiction_diagnosis();
+        warn.emit(&crate::inventory_semantics::joint_taints_line(
+            taints.duplicate_begin,
+            taints.terminal_before_begin,
+            taints.duplicate_terminal,
+            taints.sequence_regression,
+            taints.no_end_completed,
+            taints.end_begin_mismatch,
+            taints.call_and_end,
+            taints.ambiguous_return,
+            taints.floor_exhausted,
+            taints.refused_overflow,
+            taints.unclosed_endpoint,
+            taints.negative_only_invalidated,
+            taints.sighting_failure,
+            taints.other_caller_refused,
+            taints.claim_ambiguity,
+            taints.claim_unmatched,
+            taints.unclaimed_invalidation,
+            taints.events,
+            taints.first_cause,
+        ));
         let seals = coordinator.seal_diagnosis();
         warn.emit(&crate::inventory_semantics::joint_seals_line(
             seals.attempts,

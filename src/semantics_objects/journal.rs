@@ -778,6 +778,171 @@ pub(crate) enum JournalContradiction {
     UnclosedEndpoint,
 }
 
+impl JournalContradiction {
+    /// Frozen snake_case name for diagnostics. Never the `Debug`
+    /// spelling: renaming a variant must not change output.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::DuplicateBegin => "duplicate_begin",
+            Self::TerminalBeforeBegin => "terminal_before_begin",
+            Self::DuplicateTerminal => "duplicate_terminal",
+            Self::SequenceRegression => "sequence_regression",
+            Self::NoEndCompleted => "no_end_completed",
+            Self::EndBeginMismatch => "end_begin_mismatch",
+            Self::CallAndEnd => "call_and_end",
+            Self::AmbiguousReturn => "ambiguous_return",
+            Self::FloorExhausted => "floor_exhausted",
+            Self::RefusedOverflow => "refused_overflow",
+            Self::UnclosedEndpoint => "unclosed_endpoint",
+        }
+    }
+}
+
+/// Why one image was tainted: an ingest contradiction, a
+/// negative-only invalidation, a sighting failure, an
+/// other-caller refusal, or a seal-time claim gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TaintCause {
+    Contradiction(JournalContradiction),
+    NegativeOnlyInvalidated,
+    SightingFailure,
+    OtherCallerRefused,
+    ClaimAmbiguity,
+    ClaimUnmatched,
+    UnclaimedInvalidation,
+}
+
+impl TaintCause {
+    /// Frozen snake_case name for diagnostics.
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Contradiction(kind) => kind.label(),
+            Self::NegativeOnlyInvalidated => "negative_only_invalidated",
+            Self::SightingFailure => "sighting_failure",
+            Self::OtherCallerRefused => "other_caller_refused",
+            Self::ClaimAmbiguity => "claim_ambiguity",
+            Self::ClaimUnmatched => "claim_unmatched",
+            Self::UnclaimedInvalidation => "unclaimed_invalidation",
+        }
+    }
+}
+
+/// Diagnostic-only ingest-taint telemetry: contradiction counts by
+/// kind plus the first taint's cause. Global counts and one frozen
+/// label only — no image identities; disclosed beside the stop
+/// line while stage timings are requested, never a contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JournalContradictionDiagnosis {
+    pub(crate) duplicate_begin: u64,
+    pub(crate) terminal_before_begin: u64,
+    pub(crate) duplicate_terminal: u64,
+    pub(crate) sequence_regression: u64,
+    pub(crate) no_end_completed: u64,
+    pub(crate) end_begin_mismatch: u64,
+    pub(crate) call_and_end: u64,
+    pub(crate) ambiguous_return: u64,
+    pub(crate) floor_exhausted: u64,
+    pub(crate) refused_overflow: u64,
+    pub(crate) unclosed_endpoint: u64,
+    pub(crate) negative_only_invalidated: u64,
+    pub(crate) sighting_failure: u64,
+    pub(crate) other_caller_refused: u64,
+    pub(crate) claim_ambiguity: u64,
+    pub(crate) claim_unmatched: u64,
+    pub(crate) unclaimed_invalidation: u64,
+    /// Total contradiction events, including re-taints of one image.
+    pub(crate) events: u64,
+    pub(crate) first_cause: &'static str,
+}
+
+impl Default for JournalContradictionDiagnosis {
+    fn default() -> Self {
+        Self {
+            duplicate_begin: 0,
+            terminal_before_begin: 0,
+            duplicate_terminal: 0,
+            sequence_regression: 0,
+            no_end_completed: 0,
+            end_begin_mismatch: 0,
+            call_and_end: 0,
+            ambiguous_return: 0,
+            floor_exhausted: 0,
+            refused_overflow: 0,
+            unclosed_endpoint: 0,
+            negative_only_invalidated: 0,
+            sighting_failure: 0,
+            other_caller_refused: 0,
+            claim_ambiguity: 0,
+            claim_unmatched: 0,
+            unclaimed_invalidation: 0,
+            events: 0,
+            first_cause: "none",
+        }
+    }
+}
+
+impl JournalContradictionDiagnosis {
+    pub(crate) fn note(&mut self, cause: TaintCause) {
+        self.events = self.events.saturating_add(1);
+        if self.first_cause == "none" {
+            self.first_cause = cause.label();
+        }
+        match cause {
+            TaintCause::Contradiction(JournalContradiction::DuplicateBegin) => {
+                self.duplicate_begin = self.duplicate_begin.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin) => {
+                self.terminal_before_begin = self.terminal_before_begin.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::DuplicateTerminal) => {
+                self.duplicate_terminal = self.duplicate_terminal.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::SequenceRegression) => {
+                self.sequence_regression = self.sequence_regression.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::NoEndCompleted) => {
+                self.no_end_completed = self.no_end_completed.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::EndBeginMismatch) => {
+                self.end_begin_mismatch = self.end_begin_mismatch.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::CallAndEnd) => {
+                self.call_and_end = self.call_and_end.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::AmbiguousReturn) => {
+                self.ambiguous_return = self.ambiguous_return.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::FloorExhausted) => {
+                self.floor_exhausted = self.floor_exhausted.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::RefusedOverflow) => {
+                self.refused_overflow = self.refused_overflow.saturating_add(1);
+            }
+            TaintCause::Contradiction(JournalContradiction::UnclosedEndpoint) => {
+                self.unclosed_endpoint = self.unclosed_endpoint.saturating_add(1);
+            }
+            TaintCause::NegativeOnlyInvalidated => {
+                self.negative_only_invalidated = self.negative_only_invalidated.saturating_add(1);
+            }
+            TaintCause::SightingFailure => {
+                self.sighting_failure = self.sighting_failure.saturating_add(1);
+            }
+            TaintCause::OtherCallerRefused => {
+                self.other_caller_refused = self.other_caller_refused.saturating_add(1);
+            }
+            TaintCause::ClaimAmbiguity => {
+                self.claim_ambiguity = self.claim_ambiguity.saturating_add(1);
+            }
+            TaintCause::ClaimUnmatched => {
+                self.claim_unmatched = self.claim_unmatched.saturating_add(1);
+            }
+            TaintCause::UnclaimedInvalidation => {
+                self.unclaimed_invalidation = self.unclaimed_invalidation.saturating_add(1);
+            }
+        }
+    }
+}
+
 /// Why a seal attempt answered `BoundNotReady` (internal diagnostics
 /// and the frame's future-input decision; never authority).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1092,6 +1257,7 @@ pub(crate) struct JournalAdapter {
     /// bounded fallback: no per-image retention, no silent admission.
     tainted_images: BTreeSet<(u64, u64)>,
     taint_overflow: bool,
+    contradictions: JournalContradictionDiagnosis,
     sightings: BTreeMap<(u64, u64), ImageSighting>,
     /// Exact physical invocation claims, qualified by native domain,
     /// image, caller/router and era authority. A deque represents
@@ -1198,6 +1364,7 @@ impl JournalAdapter {
             image_keys: BTreeMap::new(),
             tainted_images: BTreeSet::new(),
             taint_overflow: false,
+            contradictions: JournalContradictionDiagnosis::default(),
             sightings: BTreeMap::new(),
             claims: BTreeMap::new(),
             claim_counts: 0,
@@ -1555,7 +1722,7 @@ impl JournalAdapter {
                 }
             };
             if !self.note_sighting(*image, affecting, next) {
-                self.taint_image(*image);
+                self.taint_image(*image, TaintCause::SightingFailure);
                 return None;
             }
         }
@@ -1658,23 +1825,32 @@ impl JournalAdapter {
         match endpoint_class(function) {
             Some(EndpointClass::ModeledAffecting) => {}
             Some(EndpointClass::NegativeOnlyAffecting) if begin.no_end() => {
-                self.taint_image(image);
+                self.taint_image(image, TaintCause::NegativeOnlyInvalidated);
                 return JournalDisposition::NegativeOnlyInvalidated;
             }
             _ => {
-                self.taint_image(image);
+                self.taint_image(
+                    image,
+                    TaintCause::Contradiction(JournalContradiction::UnclosedEndpoint),
+                );
                 return JournalDisposition::Contradiction(JournalContradiction::UnclosedEndpoint);
             }
         }
         if self.open.contains_key(&key) {
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::DuplicateBegin),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateBegin);
         }
         // Floors track observed sequences even for refused begins: a later
         // begin below an observed sequence is genuinely regressive.
         match self.floors.get(&begin.thread()) {
             Some(floor) if *floor >= begin.sequence() => {
-                self.taint_image(image);
+                self.taint_image(
+                    image,
+                    TaintCause::Contradiction(JournalContradiction::SequenceRegression),
+                );
                 return JournalDisposition::Contradiction(JournalContradiction::SequenceRegression);
             }
             _ => {}
@@ -1682,13 +1858,19 @@ impl JournalAdapter {
         if !self.floors.contains_key(&begin.thread())
             && self.floors.len() >= self.limits.thread_floors
         {
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::FloorExhausted),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
         }
         if !self.physical_return_floors.contains_key(&begin.pid_tgid())
             && self.physical_return_floors.len() >= self.limits.thread_floors
         {
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::FloorExhausted),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::FloorExhausted);
         }
         let floor = self
@@ -1697,7 +1879,10 @@ impl JournalAdapter {
             .or_default();
         if begin.pid_tgid() as u32 == 0 || begin.pid_tgid() >> 32 == 0 || begin.entry_ns() < *floor
         {
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::SequenceRegression),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::SequenceRegression);
         }
         self.floors.insert(begin.thread(), begin.sequence());
@@ -1754,7 +1939,10 @@ impl JournalAdapter {
         image: (u64, u64),
     ) -> JournalDisposition {
         if self.refused.len() >= self.limits.refused_begins {
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::RefusedOverflow),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::RefusedOverflow);
         }
         let refused = RefusedBegin::of_begin(ordinal, begin, image);
@@ -1766,7 +1954,10 @@ impl JournalAdapter {
     fn ingest_end(&mut self, ordinal: u64, end: ValidatedJournalEnd) -> JournalDisposition {
         let key = (end.thread(), end.sequence());
         let Some(entry) = self.open.get(&key) else {
-            self.taint_image(end_image(&end));
+            self.taint_image(
+                end_image(&end),
+                TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
         if self.is_tainted(entry.image) {
@@ -1774,22 +1965,34 @@ impl JournalAdapter {
         }
         if entry.end.is_some() || entry.abandon.is_some() {
             let image = entry.image;
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::DuplicateTerminal),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateTerminal);
         }
         if entry.begin.no_end() {
             let image = entry.image;
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::NoEndCompleted),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::NoEndCompleted);
         }
         if entry.corroborated_return.is_some() {
             let image = entry.image;
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::CallAndEnd),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::CallAndEnd);
         }
         if !end_agrees_with_begin(&entry.begin, &end) {
             let image = entry.image;
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::EndBeginMismatch),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::EndBeginMismatch);
         }
         self.open.get_mut(&key).expect("open entry").end = Some(StagedEnd { ordinal, end });
@@ -1806,7 +2009,10 @@ impl JournalAdapter {
             // Pre-BEGIN removals carry no staged custody to dispose; the
             // accompanying fault independently invalidates. Without a BEGIN
             // the key is unrepresentable, never silently absorbed.
-            self.taint_image((abandon.image_cookie(), abandon.image_exec()));
+            self.taint_image(
+                (abandon.image_cookie(), abandon.image_exec()),
+                TaintCause::Contradiction(JournalContradiction::TerminalBeforeBegin),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::TerminalBeforeBegin);
         };
         if self.is_tainted(entry.image) {
@@ -1814,7 +2020,10 @@ impl JournalAdapter {
         }
         if entry.end.is_some() || entry.abandon.is_some() {
             let image = entry.image;
-            self.taint_image(image);
+            self.taint_image(
+                image,
+                TaintCause::Contradiction(JournalContradiction::DuplicateTerminal),
+            );
             return JournalDisposition::Contradiction(JournalContradiction::DuplicateTerminal);
         }
         self.open.get_mut(&key).expect("open entry").abandon =
@@ -1867,7 +2076,10 @@ impl JournalAdapter {
                 )
                 .collect();
             for image in images {
-                self.taint_image(image);
+                self.taint_image(
+                    image,
+                    TaintCause::Contradiction(JournalContradiction::CallAndEnd),
+                );
             }
             return JournalDisposition::Contradiction(JournalContradiction::CallAndEnd);
         }
@@ -1882,7 +2094,10 @@ impl JournalAdapter {
                 )
                 .collect();
             for image in images {
-                self.taint_image(image);
+                self.taint_image(
+                    image,
+                    TaintCause::Contradiction(JournalContradiction::AmbiguousReturn),
+                );
             }
             return JournalDisposition::Contradiction(JournalContradiction::AmbiguousReturn);
         }
@@ -1916,7 +2131,15 @@ impl JournalAdapter {
     /// overflow latches, the image's sighting is dropped (future
     /// attestation refuses it as unknown), and its existing keys are
     /// tainted directly so their seals still refuse.
-    fn taint_image(&mut self, image: (u64, u64)) {
+    /// Ingest contradiction telemetry for the stop disclosure (counts
+    /// only): contradiction counts by kind plus the first taint's
+    /// cause. No image identities.
+    pub(crate) fn contradiction_diagnosis(&self) -> JournalContradictionDiagnosis {
+        self.contradictions
+    }
+
+    fn taint_image(&mut self, image: (u64, u64), cause: TaintCause) {
+        self.contradictions.note(cause);
         if self.is_tainted(image) {
             return;
         }
@@ -1945,7 +2168,7 @@ impl JournalAdapter {
         if self.image_keys.contains_key(&image) {
             return false;
         }
-        self.taint_image(image);
+        self.taint_image(image, TaintCause::OtherCallerRefused);
         true
     }
 
@@ -4884,7 +5107,7 @@ impl JournalAdapter {
             // No ordering can select between identical physical inputs.
             // Preserve claims unconsumed and make the ambiguity sticky,
             // including across later pruning and staging voids.
-            self.taint_image(fingerprint.image);
+            self.taint_image(fingerprint.image, TaintCause::ClaimAmbiguity);
         }
         #[cfg(test)]
         self.record_claim_trace_for_test(claim_trace_start);
@@ -5614,7 +5837,7 @@ impl JournalAdapter {
                 // No claim can ever name this staged call: the image's
                 // history cannot be accounted for under any key. End the
                 // attempt named (like duplicate claims) instead of holding.
-                self.taint_image(image);
+                self.taint_image(image, TaintCause::ClaimUnmatched);
                 return Err(self.failure(JournalGap::ClaimUnmatched));
             }
         }
@@ -5814,7 +6037,7 @@ impl JournalAdapter {
             }
         }
         for image in taint {
-            self.taint_image(image);
+            self.taint_image(image, TaintCause::UnclaimedInvalidation);
         }
         for key in doomed {
             if self.is_tainted((key.cookie, key.exec)) {
@@ -6345,7 +6568,7 @@ impl JournalAdapter {
             if count != 1 || claims.len() != 1 {
                 // Do not let pruning/void turn this ambiguity into a later
                 // singleton winner. Taint preserves every claim unconsumed.
-                self.taint_image(identity.image);
+                self.taint_image(identity.image, TaintCause::ClaimAmbiguity);
                 return Err(self.failure(JournalGap::ImageTainted));
             }
             let claim = claims.front().expect("one exact claim");
@@ -14643,7 +14866,12 @@ pub(crate) mod tests {
                                 } else {
                                     (900_000 + rng.next(), rng.next())
                                 };
-                                scene.adapter.taint_image(image);
+                                // Cause incidental: this fuzz taints to stress
+                                // census/prune paths, not a contradiction.
+                                scene.adapter.taint_image(
+                                    image,
+                                    TaintCause::Contradiction(JournalContradiction::DuplicateBegin),
+                                );
                             }
                             1 => {
                                 scene.adapter.void_staged();
@@ -14919,8 +15147,11 @@ pub(crate) mod tests {
         assert!(!scene.adapter.claims_prune_dirty);
         let key_a = scene.attest().key;
         // Killing B's image (a real setter) dirties the prune without
-        // touching A's live claims.
-        scene.adapter.taint_image((COOKIE + 1, EXEC));
+        // touching A's live claims. Cause incidental to the control.
+        scene.adapter.taint_image(
+            (COOKIE + 1, EXEC),
+            TaintCause::Contradiction(JournalContradiction::DuplicateBegin),
+        );
         assert!(scene.adapter.claims_prune_dirty);
         assert_eq!(scene.adapter.claim_counts, 8);
         assert_eq!(

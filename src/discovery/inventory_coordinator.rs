@@ -3008,6 +3008,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.seal_diagnosis
     }
 
+    /// Ingest contradiction counts by kind plus the first taint's
+    /// cause (diagnostics).
+    pub(crate) fn contradiction_diagnosis(
+        &self,
+    ) -> crate::semantics_objects::journal::JournalContradictionDiagnosis {
+        self.joint_capture.adapter().contradiction_diagnosis()
+    }
+
     /// Applied Joint-mode feeds (diagnostics).
     pub(crate) fn joint_feeds(&self) -> usize {
         self.registry.joint_feeds()

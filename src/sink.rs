@@ -8,7 +8,7 @@ use std::io::{self, Write};
 use std::os::fd::{AsRawFd, FromRawFd as _, IntoRawFd as _, OwnedFd, RawFd};
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicBool, Ordering},
 };
 use std::time::{Duration, Instant};
@@ -185,6 +185,69 @@ fn stdout_sink_from(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
     Ok(SinkWriter::without_flag_change(stdout_transport_on_fd(fd)?))
 }
 
+/// Private stdout/stderr descriptions preserved before the startup
+/// capability shed: under `sudo … | cat` (or a user-owned terminal with
+/// old sudo) fds 1 and 2 are pipes the invoking user owns, while the
+/// observer shed `CAP_DAC_OVERRIDE` at startup — so a later
+/// `/proc/self/fd/N` reopen fails EACCES. Opening the private
+/// descriptions once, while the full grant still holds, needs no extra
+/// capability for the run. The files stay open for the process's life;
+/// every transport clones them instead of reopening.
+struct PreservedStdio {
+    stdout: Option<std::fs::File>,
+    stderr: Option<std::fs::File>,
+}
+
+static PRESERVED_STDIO: OnceLock<PreservedStdio> = OnceLock::new();
+
+/// Opens a private description of `fd` when it is a FIFO or terminal,
+/// the same open the transports use (`O_NONBLOCK`, so a readerless
+/// FIFO fails instead of blocking the observer here; `O_CLOEXEC`, so
+/// the preserved files never reach an owned child across exec).
+/// Anything else — not a FIFO/terminal, or an open that fails — is
+/// `None`, and the transports keep their reopen fallback.
+fn private_description(fd: RawFd) -> Option<std::fs::File> {
+    // SAFETY: `fstat` only reads the fd's metadata.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstat(fd, &raw mut stat) } != 0 {
+        return None;
+    }
+    match stat.st_mode & libc::S_IFMT {
+        libc::S_IFIFO | libc::S_IFCHR => std::fs::OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
+            .open(format!("/proc/self/fd/{fd}"))
+            .ok(),
+        _ => None,
+    }
+}
+
+/// Preserves the private stdout/stderr descriptions for the shed run.
+/// Call once, before the startup capability drop: afterwards a reopen
+/// of an invoker-owned pipe or terminal fails EACCES. Best-effort: a
+/// fd that is not a FIFO/terminal, or whose open fails (a readerless
+/// FIFO fails ENXIO here as it would at first write), simply has no
+/// preserved file, and the transports fall back to their reopen.
+pub(crate) fn preserve_stdio_private_descriptions() {
+    PRESERVED_STDIO.get_or_init(|| PreservedStdio {
+        stdout: private_description(1),
+        stderr: private_description(2),
+    });
+}
+
+/// A preserved private description for `fd` (1 or 2) when one exists:
+/// a `try_clone` of the startup file, so no reopen — and no extra
+/// capability — is needed to write the observer's own stdio.
+pub(crate) fn preserved_stdio_file(fd: RawFd) -> Option<std::fs::File> {
+    let preserved = PRESERVED_STDIO.get()?;
+    let file = match fd {
+        1 => preserved.stdout.as_ref()?,
+        2 => preserved.stderr.as_ref()?,
+        _ => return None,
+    };
+    file.try_clone().ok()
+}
+
 /// Acquires the unbuffered transport without mutating inherited status flags.
 /// A failed private reopen is an error; there is no blocking fallback.
 pub(crate) fn stdout_transport_on_fd(fd: RawFd) -> io::Result<StdoutInner> {
@@ -211,7 +274,13 @@ fn stdout_transport_with_reopen(
             // `/proc/self/fd/N` re-opens the pipe or device instead of
             // aliasing the description the way `dup` does.
             // `O_NONBLOCK` at open so a readerless FIFO fails instead of
-            // blocking the observer here.
+            // blocking the observer here. After the startup shed a
+            // reopen of an invoker-owned pipe or terminal fails
+            // EACCES, so prefer the description preserved before the
+            // shed (a clone of our own file needs no capability).
+            if let Some(file) = preserved_stdio_file(fd) {
+                return Ok(StdoutInner::File(file));
+            }
             Ok(StdoutInner::File(reopen(fd)?))
         }
         libc::S_IFSOCK => {
@@ -1171,5 +1240,87 @@ mod tests {
         assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
         assert_eq!(sink.take_drops(), SinkDrops::default());
         assert!(sink.buf.len() <= SINK_BUFFER_BYTES);
+    }
+
+    /// The startup stdio preserve: after
+    /// [`preserve_stdio_private_descriptions`], a transport for fd 1
+    /// must come from the preserved clone, never from a reopen — a
+    /// shed reopen of an invoker-owned pipe fails EACCES. The preserve
+    /// runs in a child (a fresh `OnceLock`, piped stdout), with a
+    /// reopen that always fails the way the shed one does.
+    const PRESERVE_CHILD: &str = "P11SCOPE_SINK_PRESERVE_CHILD";
+    const PRESERVED_LINE: &[u8] = b"PRESERVED STDOUT\n";
+
+    fn preserve_child() {
+        let mode = std::env::var(PRESERVE_CHILD).unwrap_or_default();
+        if mode.is_empty() {
+            return;
+        }
+        // The parent pipes our stdout: fd 1 must be the FIFO case.
+        let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(1, &raw mut stat) }, 0);
+        assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFIFO);
+        let eacces = || io::Error::from_raw_os_error(libc::EACCES);
+        match mode.as_str() {
+            "preserve" => {
+                preserve_stdio_private_descriptions();
+                let mut transport = test_transport_with_reopen(1, |_| Err(eacces()))
+                    .expect("preserved stdout must bypass the reopen");
+                transport.write_all(PRESERVED_LINE).unwrap();
+                transport.flush().unwrap();
+            }
+            "no-preserve" => {
+                match test_transport_with_reopen(1, |_| Err(eacces())) {
+                    Ok(_) => panic!("unpreserved stdout must use the reopen"),
+                    Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EACCES)),
+                }
+            }
+            other => panic!("unknown preserve child mode {other:?}"),
+        }
+        std::process::exit(0);
+    }
+
+    fn preserve_command(test: &str, mode: &str) -> std::process::Command {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        let module = module_path!().split_once("::").unwrap().1;
+        command
+            .args(["--exact", &format!("{module}::{test}"), "--nocapture"])
+            .env(PRESERVE_CHILD, mode)
+            .stdout(std::process::Stdio::piped());
+        command
+    }
+
+    #[test]
+    fn preserved_stdout_bypasses_a_failing_reopen() {
+        preserve_child();
+        let output = preserve_command("preserved_stdout_bypasses_a_failing_reopen", "preserve")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            output
+                .stdout
+                .windows(PRESERVED_LINE.len())
+                .any(|bytes| bytes == PRESERVED_LINE),
+            "preserved stdout never delivered the line: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    #[test]
+    fn unpreserved_stdout_still_uses_the_reopen() {
+        preserve_child();
+        let output = preserve_command("unpreserved_stdout_still_uses_the_reopen", "no-preserve")
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert!(
+            !output
+                .stdout
+                .windows(PRESERVED_LINE.len())
+                .any(|bytes| bytes == PRESERVED_LINE),
+            "unpreserved stdout must not deliver without the reopen: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
     }
 }

@@ -272,9 +272,10 @@ pub struct DoctorArgs {
 
 /// What `p11scope inventory` observes: one process, a retained cgroup and
 /// its descendants, or every process, for one snapshot or across `--duration`.
-/// The scan lane reads `/proc` only; the native usage lane (`--capture`)
-/// adds the Inventory BPF object's witnesses. Usage columns read unknown
-/// unless a feed observed them.
+/// The scan lane loads a short-lived kernel identity check for overlay/9p
+/// original-file proofs; the native usage lane (`--capture`) adds the
+/// Inventory BPF object's witnesses. Usage columns read unknown unless
+/// a feed observed them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InventoryArgs {
     pub scope: ScopeArg,

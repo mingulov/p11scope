@@ -86,6 +86,11 @@ fn run() -> Result<i32> {
         {
             p11scope::caps::set_invoking_effective(effective);
         }
+        // Before the shed: preserve private stdout/stderr descriptions
+        // while the full grant still holds, so later writes to an
+        // invoker-owned pipe or terminal need no reopen (EACCES after
+        // the shed) and no extra capability for the run.
+        p11scope::preserve_stdio_private_descriptions();
         p11scope::caps::drop_unneeded_for_command(command)
             .context("cannot drop unneeded capabilities")?;
     }

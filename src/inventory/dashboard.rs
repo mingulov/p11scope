@@ -1926,13 +1926,18 @@ impl TerminalWriter {
     /// Opens the terminal on `fd` as a private description (through
     /// `/proc/self/fd`, `O_NONBLOCK | O_NOCTTY`): `dup` would alias the
     /// shell's description, and nonblocking writes there would leak to
-    /// it.
+    /// it. After the startup shed a reopen of a user-owned terminal
+    /// fails EACCES, so fds 1 and 2 reuse the description preserved
+    /// before the shed.
     pub(crate) fn open(fd: std::os::fd::RawFd) -> std::io::Result<Self> {
         use std::os::unix::fs::OpenOptionsExt as _;
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
-            .open(format!("/proc/self/fd/{fd}"))?;
+        let file = match crate::sink::preserved_stdio_file(fd) {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY)
+                .open(format!("/proc/self/fd/{fd}"))?,
+        };
         let own_fd = std::os::fd::AsRawFd::as_raw_fd(&file);
         Ok(Self {
             sink: crate::sink::SinkWriter::new(file)?,

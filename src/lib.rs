@@ -113,6 +113,15 @@ pub fn try_stderr_line(line: &str) -> std::io::Result<()> {
     sink::try_stderr_line(line).map(|_| ())
 }
 
+/// Preserves private stdout/stderr descriptions for the shed run, before
+/// the CLI drops unneeded capabilities: after the shed a reopen of an
+/// invoker-owned pipe or terminal fails EACCES, so the transports clone
+/// these instead of reopening. Best-effort: a fd that is not a pipe or
+/// terminal, or whose open fails, keeps the reopen fallback.
+pub fn preserve_stdio_private_descriptions() {
+    sink::preserve_stdio_private_descriptions();
+}
+
 /// The whole public production surface of the capture loops. `run` stays a
 /// crate-private module: the owned child, the pause coordinator, its clocks,
 /// maps, drains, guards and injected actions are unreachable from outside.

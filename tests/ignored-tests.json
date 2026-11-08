@@ -816,6 +816,12 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_witness_calibration_accepts_metacopy_upper",
+      "reason": "root: loop overlay mount (xino=on, metacopy=on) plus a live witness start; calibration accepts the lower backing inode under a metadata-only upper (BTF, ftrace_enabled=1, initial pidns), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_population_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",

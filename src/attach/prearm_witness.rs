@@ -569,6 +569,33 @@ fn map_file_identity(start: u64, end: u64) -> std::result::Result<(u64, u64), St
     Ok((metadata.dev(), metadata.ino()))
 }
 
+/// Whether the upper layer file is a metadata-only copy-up: the kernel
+/// marks those with the `trusted.overlay.metacopy` xattr. Presence is
+/// the marker — the value is empty on current kernels (measured
+/// 7.0.0-38: the xattr lists, reads 0 bytes, and the file serves the
+/// lower data). Any read failure (unprivileged `trusted.*` reads, no
+/// xattr) reports false — the fallback then refuses a lower match,
+/// fail closed.
+pub(crate) fn upper_is_metacopy(upper: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let path = match std::ffi::CString::new(upper.as_os_str().as_bytes()) {
+        Ok(path) => path,
+        Err(_) => return false,
+    };
+    let name = c"trusted.overlay.metacopy";
+    let mut value = [0u8; 16];
+    // SAFETY: path and name are NUL-terminated; value is a valid 16-byte buffer.
+    let read = unsafe {
+        libc::getxattr(
+            path.as_ptr(),
+            name.as_ptr(),
+            value.as_mut_ptr().cast(),
+            value.len(),
+        )
+    };
+    read >= 0
+}
+
 /// Backing-vs-backing acceptance for an overlay split: the BPF slot
 /// carries the backing inode while the mapped-range identity carries
 /// the overlay (xino) inode, so direct equality can never hold there.
@@ -582,6 +609,18 @@ fn calibration_backing_accepted(
     merged: &std::path::Path,
     slot_ino: u64,
     mountinfo: Option<&str>,
+) -> bool {
+    calibration_backing_accepted_with(merged, slot_ino, mountinfo, upper_is_metacopy)
+}
+
+/// [`calibration_backing_accepted`] with an injectable metacopy probe
+/// (the live `trusted.overlay.metacopy` read needs a real metacopy
+/// upper, which unprivileged unit tests cannot fabricate).
+fn calibration_backing_accepted_with(
+    merged: &std::path::Path,
+    slot_ino: u64,
+    mountinfo: Option<&str>,
+    _is_metacopy: impl Fn(&std::path::Path) -> bool,
 ) -> bool {
     use std::os::unix::fs::MetadataExt as _;
     let owned;
@@ -2263,6 +2302,83 @@ mod tests {
             ),
             "a symlinked merged path must resolve to its layers"
         );
+    }
+
+    #[test]
+    fn backing_refuses_lower_slot_when_upper_copy_exists() {
+        // The merged path now backs onto the upper copy: a slot carrying
+        // the lower (pre-copy-up) inode is a different backing file under
+        // the same overlay ino and must refuse, even though the lower
+        // candidate still exists on its layer.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xA8u8; 64]).expect("write");
+        let upper_file = upper.join("lib.so");
+        std::fs::write(&upper_file, [0xA9u8; 64]).expect("write");
+        assert_ne!(
+            backing_ino_of(&lower_file),
+            backing_ino_of(&upper_file),
+            "the twin needs distinct layer inodes"
+        );
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&lower_file),
+                Some(&table),
+            ),
+            "a lower slot under an existing upper copy must refuse"
+        );
+    }
+
+    #[test]
+    fn backing_lower_match_under_existing_upper_needs_metacopy() {
+        // Only a metadata-only upper still backs reads from the lower
+        // file: the lower slot is accepted with a metacopy upper and
+        // refused without one.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xAAu8; 64]).expect("write");
+        let upper_file = upper.join("lib.so");
+        std::fs::write(&upper_file, [0xABu8; 64]).expect("write");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        let merged = merged_root.join("lib.so");
+        let slot = backing_ino_of(&lower_file);
+        assert!(
+            super::calibration_backing_accepted_with(&merged, slot, Some(&table), |_| true),
+            "a lower slot under a metacopy upper must accept"
+        );
+        assert!(
+            !super::calibration_backing_accepted_with(&merged, slot, Some(&table), |_| false),
+            "a lower slot under a full upper copy must refuse"
+        );
+    }
+
+    #[test]
+    fn upper_is_metacopy_false_for_ordinary_files() {
+        // The live probe reads `trusted.overlay.metacopy`: ordinary
+        // files (and missing paths) report false, fail closed.
+        let root = tempfile::tempdir().expect("tempdir");
+        let plain = root.path().join("plain.so");
+        std::fs::write(&plain, [0xACu8; 64]).expect("write");
+        assert!(!super::upper_is_metacopy(&plain));
+        assert!(!super::upper_is_metacopy(&root.path().join("absent.so")));
     }
 
     #[test]

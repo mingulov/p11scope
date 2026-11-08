@@ -6007,3 +6007,81 @@ fn privileged_witness_pin_without_copyup_keeps_proof() {
     );
     eprintln!("WITNESS_STEADY modes=on,same-fs verdict=joined");
 }
+
+/// Witness calibration over a metadata-only copy-up: with
+/// `metacopy=on` a chmod through the merge copies only metadata up,
+/// so the merged file still backs onto the lower file while an upper
+/// copy exists. Calibration must accept the lower backing inode
+/// through the metacopy rule. Fails loud without
+/// root/loop/overlay/BTF/metacopy — never a skip.
+#[test]
+#[ignore = "root: loop overlay mount (xino=on, metacopy=on) plus a live witness start (BTF, ftrace_enabled=1)"]
+fn privileged_witness_calibration_accepts_metacopy_upper() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")
+        .expect("witness needs readable ftrace_enabled");
+    assert_eq!(
+        ftrace.trim(),
+        "1",
+        "witness needs /proc/sys/kernel/ftrace_enabled = 1"
+    );
+    assert!(
+        matches!(
+            crate::pidns::observer(),
+            crate::pidns::ObserverPidNs::Initial
+        ),
+        "witness needs the initial PID namespace"
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let work = tempfile::tempdir().unwrap();
+    let fixture = OverlayFixture::mount_with_extra(work.path(), XinoMode::On, ",metacopy=on")
+        .expect("overlay mount xino=on,metacopy=on");
+    let content = vec![0xC3u8; 8192];
+    std::fs::write(fixture.lower_path("meta.so"), &content).unwrap();
+    let merged = fixture.merged_path("meta.so");
+    // A metadata-only change through the merge: the upper copy must be
+    // a metacopy (the xattr marker, data still from the lower file).
+    let before = std::fs::metadata(&merged)
+        .expect("merged stat")
+        .permissions();
+    use std::os::unix::fs::PermissionsExt as _;
+    let flipped = if before.mode() & 0o111 == 0 {
+        0o755
+    } else {
+        0o644
+    };
+    std::fs::set_permissions(&merged, std::fs::Permissions::from_mode(flipped))
+        .expect("chmod through the merge");
+    let upper = fixture.upper_path("meta.so");
+    assert!(upper.exists(), "the chmod must copy the file up");
+    let upper_meta = std::fs::metadata(&upper).expect("upper stat");
+    assert_eq!(
+        std::fs::read(&merged).expect("merged read"),
+        content,
+        "merged data still comes from the lower file"
+    );
+    assert!(
+        crate::attach::prearm_witness::upper_is_metacopy(&upper),
+        "the upper copy must carry trusted.overlay.metacopy"
+    );
+    let scope = crate::attach::Scope::System;
+    let witness = crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
+        .expect("the witness calibrates the metacopy-backed file");
+    assert_eq!(witness.files.len(), 1, "one calibrated file");
+    let lower_meta = std::fs::metadata(fixture.lower_path("meta.so")).expect("lower stat");
+    eprintln!(
+        "WITNESS_METACOPY key=({},{}) lower=({},{}) upper=({},{})",
+        witness.files[0].key.s_dev,
+        witness.files[0].key.i_ino,
+        lower_meta.dev(),
+        lower_meta.ino(),
+        upper_meta.dev(),
+        upper_meta.ino(),
+    );
+    assert_eq!(
+        witness.files[0].key.i_ino,
+        lower_meta.ino(),
+        "the calibration key must be the lower backing inode"
+    );
+    eprintln!("WITNESS_METACOPY modes=on verdict=calibrated");
+}

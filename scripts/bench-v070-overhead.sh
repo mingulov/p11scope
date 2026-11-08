@@ -1492,12 +1492,40 @@ sample_ceil() {
             inv-system|inv-system-keys)
                 if [ "$3" = "inv-system-keys" ]; then key_args="--key-operations"; else key_args=""; fi
                 wait_for_no_foreign_observer "$2" "$FOREIGN_WAIT_S" || return 1
-                # shellcheck disable=SC2086
-                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
-                    $man_args $key_args --duration "$dur" -o "$WORK/$2.json" \
-                    > "$WORK/$2.obs.log" 2>&1 &
-                SPID=$!
-                wait_for_inv_ready "$WORK/$2.obs.log" "$CEIL_ATTACH_TIMEOUT_S" || return 1
+                attempt=1
+                while :; do
+                    if [ "$attempt" = 1 ]; then
+                        # shellcheck disable=SC2086
+                        sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
+                            $man_args $key_args --duration "$dur" -o "$WORK/$2.json" \
+                            > "$WORK/$2.obs.log" 2>&1 &
+                    else
+                        echo "$2: inv lane never went active, respawning observer once" >&2
+                        echo "--- observer respawn (attempt 2) ---" >> "$WORK/$2.obs.log"
+                        # shellcheck disable=SC2086
+                        sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
+                            $man_args $key_args --duration "$dur" -o "$WORK/$2.json" \
+                            >> "$WORK/$2.obs.log" 2>&1 &
+                    fi
+                    SPID=$!
+                    if wait_for_inv_ready "$WORK/$2.obs.log" "$CEIL_ATTACH_TIMEOUT_S"; then
+                        break
+                    fi
+                    kill "$SPID" 2>/dev/null || true
+                    wt_end=$(( $(date +%s) + 15 ))
+                    while kill -0 "$SPID" 2>/dev/null && [ "$(date +%s)" -lt "$wt_end" ]; do sleep 0.2; done
+                    if kill -0 "$SPID" 2>/dev/null; then
+                        echo "$2: stuck observer would not die; refusing double-spawn" >&2
+                        return 1
+                    fi
+                    SPID=
+                    if [ "$attempt" = 1 ]; then
+                        attempt=2
+                        wait_for_no_foreign_observer "$2" "$FOREIGN_WAIT_S" || return 1
+                        continue
+                    fi
+                    return 1
+                done
                 if grep -q "attach failed" "$WORK/$2.obs.log"; then
                     echo "ATTACH FAILURE in $2:" >&2; cat "$WORK/$2.obs.log" >&2; return 1
                 fi

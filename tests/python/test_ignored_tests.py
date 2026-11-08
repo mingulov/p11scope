@@ -186,6 +186,20 @@ COUNTER_READER_NOFIXTURE_EXPECTED = [
     "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64",
 ]
 
+# The LONG_TESTS diagnostics-wrap members that need the runner-built
+# prebuilt32-object fixture (P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR).
+# Every long wrap cell spawns through WrapWorkload, so any other long
+# wrap member must join WRAP_FIXTURE_TESTS.
+WRAP_FIXTURE_EXPECTED = [
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64",
+    "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64",
+]
+
 INTEGRATION_SOURCES = {
     "tests/foo.rs": (
         '#[test]\n'
@@ -290,6 +304,7 @@ def write_fixture(root, sources, entries, registered, wide_registered=(),
             ("EXPECTED_FAILURE_TESTS", []),
             ("SKIP_TESTS", skip_registered),
             ("COUNTER_FIXTURE_TESTS", []),
+            ("WRAP_FIXTURE_TESTS", []),
             ("BTRFS_TMPDIR_XFAIL_TESTS", []),
             ("WIDE_DETAILED_2112_TESTS", wide_registered),
             ("INTEGRATION_TESTS", integration_registered),
@@ -1511,6 +1526,8 @@ class IgnoredTestsTests(unittest.TestCase):
                          set(XFAIL_EXPECTED))
         self.assertEqual(set(lists["COUNTER_FIXTURE_TESTS"]),
                          set(COUNTER_FIXTURE_EXPECTED))
+        self.assertEqual(set(lists["WRAP_FIXTURE_TESTS"]),
+                         set(WRAP_FIXTURE_EXPECTED))
         self.assertEqual(set(lists["BTRFS_TMPDIR_XFAIL_TESTS"]),
                          set(BTRFS_TMPDIR_XFAIL_EXPECTED))
         self.assertTrue(set(BTRFS_TMPDIR_XFAIL_EXPECTED)
@@ -1522,6 +1539,8 @@ class IgnoredTestsTests(unittest.TestCase):
                 self.assertFalse(set(lists[group]) & lists["DEFAULT_TESTS"])
         self.assertTrue(set(COUNTER_FIXTURE_EXPECTED)
                         <= lists["DEFAULT_TESTS"])
+        self.assertTrue(set(WRAP_FIXTURE_EXPECTED)
+                        <= lists["LONG_TESTS"])
 
     def test_counter_fixture_classification_is_complete(self):
         # Every DEFAULT_TESTS counter-reader member is classified: it
@@ -1536,6 +1555,18 @@ class IgnoredTestsTests(unittest.TestCase):
                          | set(COUNTER_READER_NOFIXTURE_EXPECTED))
         self.assertFalse(set(COUNTER_FIXTURE_EXPECTED)
                          & set(COUNTER_READER_NOFIXTURE_EXPECTED))
+
+    def test_wrap_fixture_classification_is_complete(self):
+        # Every LONG_TESTS diagnostics-wrap member needs the fixture:
+        # all of them spawn through WrapWorkload. A new long wrap cell
+        # fails here until its author classifies it.
+        lists = CHECKER_MOD["runner_lists"](str(RUNNER))
+        long_wrap = {name for name in lists["LONG_TESTS"]
+                     if name.startswith(
+                         "inventory::privileged_tests::"
+                         "operator_diagnostics_wrap::")}
+        self.assertEqual(long_wrap, set(WRAP_FIXTURE_EXPECTED))
+        self.assertEqual(long_wrap, lists["WRAP_FIXTURE_TESTS"])
 
     def test_branch_prints_exist_in_dual_outcome_cells(self):
         inspect = (ROOT / "src/inspect_system.rs").read_text()
@@ -1766,7 +1797,8 @@ class IgnoredTestsTests(unittest.TestCase):
             "ignored-tests counts: DEFAULT_TESTS=2 ALTERNATIVE_TESTS=0 "
             "LONG_TESTS=0 BTRFS_TESTS=0 OVERLAY_TESTS=0 "
             "EXPECTED_FAILURE_TESTS=0 SKIP_TESTS=0 "
-            "COUNTER_FIXTURE_TESTS=0 BTRFS_TMPDIR_XFAIL_TESTS=0 "
+            "COUNTER_FIXTURE_TESTS=0 WRAP_FIXTURE_TESTS=0 "
+            "BTRFS_TMPDIR_XFAIL_TESTS=0 "
             "WIDE_DETAILED_2112_TESTS=1 "
             "COUNTER_BANK_PROOF_TESTS=0 COUNTER_ARTIFACTS_TESTS=0 "
             "DISCOVER_BTRFS_SUBVOL_TESTS=0 "
@@ -1786,6 +1818,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",
             "COUNTER_FIXTURE_TESTS=27",
+            "WRAP_FIXTURE_TESTS=7",
             "BTRFS_TMPDIR_XFAIL_TESTS=2",
             "WIDE_DETAILED_2112_TESTS=9",
             "COUNTER_BANK_PROOF_TESTS=0",

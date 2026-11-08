@@ -14,18 +14,20 @@ numbers below are placeholders for the v0.4 values T11 sets live.
   `p11scope-discover-glibc`, `p11scope-discover-musl`,
   `p11scope-discover`.
 - [ ] Public assets: three versioned `.tar.gz` (observer musl, discover
-  gnu, discover musl), source tarball, top-level `RELEASE.json`,
-  `SHA256SUMS`. glibc and musl helpers remain separately labeled.
+  gnu, discover musl), source tarball, `.deb`, `.rpm`, top-level
+  `RELEASE.json`, `SHA256SUMS`. glibc and musl helpers remain separately
+  labeled.
 
 ## 1. Ledger and provenance
 
 ```sh
 (cd <public-assets> && sha256sum --check SHA256SUMS)
-python3 -c "import json;print(json.load(open('<public-assets>/RELEASE.json'))['schema'])"
+python3 -c "import json;print(json.load(open('<public-assets>/RELEASE.json'))['schema_version'])"
 sha256sum <receipt>/work/dist/p11scope*   # bind bytes to every later lane
 ```
 
-- [ ] `SHA256SUMS` verifies all four archives + `RELEASE.json`.
+- [ ] `SHA256SUMS` verifies all six archives (three `.tar.gz`, source,
+  `.deb`, `.rpm`) + `RELEASE.json`.
 - [ ] `RELEASE.json` provenance matches the receipt (builder, toolchains,
   source SHA); no private receipt paths leak into public metadata.
 

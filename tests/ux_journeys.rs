@@ -564,16 +564,16 @@ fn j4_run_without_separator_names_the_separator() {
 
 #[test]
 fn j5_offline_build_doc_path_pins() {
-    let readme = repo_file("README.md");
+    let install = repo_file("docs/install.md");
     assert!(
-        readme.contains("third-party/archives/"),
+        install.contains("third-party/archives/"),
         "offline archive path"
     );
-    assert!(readme.contains("--offline"), "offline build flag");
-    // F8 fixed (Task 4): the README names the exact archives the trial
+    assert!(install.contains("--offline"), "offline build flag");
+    // F8 fixed (Task 4): the install doc names the exact archives the trial
     // previously had to derive from third-party/sources.json.
-    assert!(readme.contains("aya-0.14.0.crate"), "archive names");
-    assert!(readme.contains("aya-obj-0.3.0.crate"), "archive names");
+    assert!(install.contains("aya-0.14.0.crate"), "archive names");
+    assert!(install.contains("aya-obj-0.3.0.crate"), "archive names");
     let guide = repo_file("docs/build-offline.md");
     assert!(
         guide.contains("scripts/build-offline.sh"),

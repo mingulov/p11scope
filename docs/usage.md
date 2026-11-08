@@ -14,7 +14,7 @@ implementation limits are code contracts, not measurements.
 > per-edge entry counts, FULL object-attribute capture in release builds
 > (P0 stays an explicit option), repeatable `--exclude-module`, and schema v3; its
 > [known limitations](../CHANGELOG.md#known-limitations) apply throughout,
-> [Install](../README.md#install) distinguishes the source build from the
+> [Install](install.md#install) distinguishes the source build from the
 > older v0.3.0 binary downloads, and
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) records what
 > this release was qualified on. The [privacy boundary](#what-it-does-not-intentionally-decode)
@@ -153,7 +153,7 @@ and carries no file capabilities, set-id bits, services or maintainer
 scripts. Installs are tested on Ubuntu 26.04 (DEB) and Fedora 44 (RPM).
 The bundled helper needs glibc 2.34 or newer, so it does not run on older
 distributions. Every release file carries a GitHub build-provenance attestation;
-[Install](../README.md#install) has the full bundle table. Download the
+[Install](install.md#install) has the full bundle table. Download the
 package and `SHA256SUMS`, verify both, then install the file:
 
 ```sh
@@ -498,7 +498,7 @@ offsets. Use a helper that can load the exact provider: a 32-bit provider
 requires a 32-bit helper, and its loader/libc must be compatible. The observer
 remains x86-64. The release builds the helper for glibc and for musl; use the
 build that matches the provider's C library
-([Install](../README.md#install)).
+([Install](install.md#install)).
 
 ```bash
 # Run as an ordinary user. This helper loads and executes provider code.

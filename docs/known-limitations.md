@@ -2295,7 +2295,7 @@ Release binaries are x86-64 only; AArch64 and cgroup v1 remain outside scope.
   `rust:1.99.1`. `crates/ebpf-common` stays at rust-version 1.97 because
   the pinned BPF nightly-2026-05-20 (rustc 1.97) also compiles it.
 - Kernels/conditions: all builds.
-- Disclosure: `README.md` build section, `docs/development.md`, contract
+- Disclosure: `docs/install.md` build section, `docs/development.md`, contract
   test `ebpf_common_rust_version_matches_the_bpf_nightly`.
 - Workaround: install 1.99.1 (`mise install`).
 - Planned: v0.3.0 (C7 BPF campaign: bump the nightly in one verifier/vng

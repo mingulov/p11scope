@@ -315,7 +315,7 @@ fn release_docs_name_the_version_file() {
         "docs/development.md",
         "docs/build-offline.md",
         "RELEASING.md",
-        "README.md",
+        "docs/install.md",
     ] {
         let text = fs::read_to_string(doc).expect("read a release doc");
         assert!(

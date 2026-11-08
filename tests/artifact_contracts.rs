@@ -9724,7 +9724,7 @@ fn usage_documents_every_subcommand_and_capture_needs_no_manifest() {
 fn operator_docs_preserve_semantic_authority_limits() {
     for (path, statement) in [
         (
-            "README.md",
+            "docs/overview.md",
             "Live and terminal evidence are PARTIAL while scan-only semantic claims remain",
         ),
         (
@@ -9969,7 +9969,7 @@ fn documented_scan_operation_cap_matches_the_code() {
         .product();
     assert_eq!(bytes % (1024 * 1024), 0, "{expression}");
     let quoted = format!("{} MiB per scan/hash operation", bytes / (1024 * 1024));
-    for path in ["README.md", "docs/usage.md", "CHANGELOG.md"] {
+    for path in ["docs/overview.md", "docs/usage.md", "CHANGELOG.md"] {
         let flat = read(path).split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(flat.contains(&quoted), "{path} must state {quoted:?}");
         let stated = flat.matches("MiB per scan/hash operation").count();

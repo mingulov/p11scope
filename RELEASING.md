@@ -77,7 +77,8 @@ describing an old CI run as an exact-new-commit result.
 
   Keep earlier candidate measurements revision-specific in `CHANGELOG.md`.
   Final CI URLs, artifact hashes, release-receipt identity and live lane results
-  belong in the GitHub release notes, outside the commit they qualify.
+  belong in `docs/releases/<version>.md`, linked from the short GitHub release
+  notes, outside the commit they qualify.
 - `crates/ebpf-common` is compiled into both the GPL-2.0-only BPF object and
   the GPL-3.0-or-later observer, so it is GPL-2.0-or-later. Confirm no
   GPL-3.0-only or Apache-2.0-only code has entered the BPF build
@@ -510,14 +511,20 @@ On the commit that steps 3–6 ran on:
    ```
 
 3. Create the GitHub release with the four versioned `.tar.gz` assets,
-   `RELEASE.json` and `SHA256SUMS`. Lead the notes with the commands delivered and their known
-   limitations, including the `--system` preview. Link the changelog for
-   detailed history. Identify the exact tag commit, hosted CI run URLs and job
-   results, toolchain versions, local receipt digest and checker summary,
-   artifact hashes,
-   and the exact kernels, lanes, and binaries used for final qualification.
-   Keep candidate-only results explicitly historical. Check the uploaded
-   assets and notes after publication.
+   `RELEASE.json` and `SHA256SUMS`. Keep the release body short — a human
+   front page, not the qualification record. Shape (the
+   [v0.7.0 draft](docs/releases/v0.7.0.md) is the current example): version +
+   publication date; up to 8 highlight bullets in plain words; known issues
+   as one link to the changelog entry (at most 3 bullets for
+   release-blocking surprises); install lines (assets, checksum verify,
+   container note); then links to the full changelog entry, the docs, and
+   the verification record. Long qualification facts — exact tag commit,
+   hosted CI run URLs and job results, toolchain versions, local receipt
+   digest and checker summary, artifact hashes, exact kernels, lanes and
+   binaries — go into `docs/releases/<version>.md` (committed on `main`
+   once known, like the CHANGELOG qualification row; the body links to
+   it), not into the body. Keep candidate-only results explicitly
+   historical. Check the uploaded assets and notes after publication.
 
 ## After the tag
 

@@ -326,7 +326,7 @@ print(f"RESULT label={label} browser={browser} mode={mode} "
       f"pre_presented={pre_presented} "
       f"post_presented={post_presented} "
       f"callers={len(doc.get('callers') or [])} gaps={','.join(gap_names)} "
-      f"knobs=head_start:{os.environ.get('DEMO4_HEAD_START', '20')},"
+      f"knobs=head_start:retired,"
       f"observer_delay:{os.environ.get('DEMO4_OBSERVER_DELAY', '-')},"
       f"lane_held:{os.environ.get('DEMO4_LANE_HELD', '0')}")
 ok = post_presented >= 1

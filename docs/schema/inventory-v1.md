@@ -169,13 +169,18 @@ runtime (python, java, node, perl, ruby) may carry an optional
 `app_hint: {"value", "source"}` (`source` one of `argv`, `comm`,
 `unit`, `snap`), sampled once at admission beside the exe read — one
 grammar-proven argv token (script, `-m` module, `-jar` jar, main
-class), comm for python/perl/ruby direct-shebang launches, or the
-cgroup leaf (snap name, service unit, app scope). Shells and native
+class), comm only when it matches the script-position token of the
+same cmdline sample (python/perl/ruby; a rewritten process title
+never matches), or the cgroup leaf (snap name, service unit with
+template instances truncated to `name@`, app scope). Shells and native
 executables get no hint and no read; the key is absent when unknown,
 never null. No environment, `-c`/`-e` text, or flag value is read or
-published; container/pod shapes stay under the `--caller-metadata`
-opt-in. The hint is a display label only: it never keys, merges, or
-splits callers, edges, or admissions. See the app identity rows of
+published; any container/pod-shaped cgroup component suppresses the
+hint, and container display stays under the `--caller-metadata`
+opt-in. The exe identity and process start time are re-read after
+sampling and must match. The hint is a point-sample display label
+only: it never keys, merges, or splits callers, edges, or admissions,
+and never proves an app identity. See the app identity rows of
 [privacy allowlist v3](../privacy/allowlist-v3.md).
 
 ## Clock and units

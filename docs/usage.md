@@ -1237,7 +1237,7 @@ Limits that matter in pods:
   `entries.coverage` below). Text snapshots begin with an application/module
   overview, followed by detailed retained paths, identities, states and
   coverage. The application label is the observed executable's basename,
-  not a desktop or package identity. When the observer can prove an app
+  not a desktop or package identity. When the observer can suggest an app
   identity for an interpreter — a script, module, service unit, or snap
   name — the label appends it in brackets (`python3 [pkcs11-check]`,
   `java [app.jar]`), with the source named in `-v` and JSON

@@ -1,11 +1,10 @@
 <!-- SPDX-License-Identifier: GPL-3.0-or-later -->
-# Known limitations (v0.6.0)
+# Known limitations (v0.7.0)
 
-v0.6.0 answers "which application used which key, and how": inventory
-captures gain opt-in live key operations with per-category counts, and
-a counter capture can promote one endpoint to full detail while the
-rest stays aggregate. The list below is current for this release; the
-entries under Prior releases retain their historical context.
+v0.7.0 answers "which application called the token": callers carry app
+labels and a launcher chain, `inventory --system` binds usage on large
+hosts, and a container image ships. The list below is current for this
+release; the entries under Prior releases retain their historical context.
 
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
@@ -23,6 +22,91 @@ Strict scale and speed limits apply to captures actually using Multi. Eligible
 scoped Singles stays correct, finite and disclosed in `observation.attach` and
 `evidence.attach_backend`; it does not establish Multi performance coverage.
 Readiness bounds are disclosed harness parameters, never a cold-start SLA.
+
+## Known limitations in 0.7.0
+
+The following limits are new or changed in v0.7.0. Limits from
+[Known limitations in 0.6.0](#known-limitations-in-060) below still
+apply unless a subsection here says otherwise.
+
+### Copy-up in-place truncation
+
+<!-- lane: copyup — if the lane misses the drop, delete this subsection; the v0.6.0 copy-up entry below stands. -->
+A spanning capture now attributes both sides of a container copy-up,
+but one shape stays a counted gap: a provider file rewritten in place
+(truncate plus rewrite) while mapped reads `unresolved`, with the
+disclosed gaps `Could not read file magic` and `no comparable pinned
+identity`, single-instant edges, and nothing attached. That output is
+honest; folding the undigested record into the same-key digested
+record is 0.7.x work.
+
+### Same-namespace subreapers shown as launcher
+
+<!-- lane: parent-chain — if the lane misses the drop, delete this subsection (no launcher chain ships). -->
+Init, the systemd user manager, container inits, pid-namespace
+boundaries and kernel threads are never shown as the launcher. But a
+subreaper in the same pid namespace (`tini -s`, s6/runit,
+`--pid=host` runtimes) exposes no `/proc` flag, so the walk cannot
+tell it from the process that launched the caller and shows its real
+name honestly instead of guessing. Reparented callers report the
+first-call parent or the counted `launcher exited before read` gap;
+an init-only parent shows the systemd unit beside it.
+
+### Per-key rows partial under heavy threading
+
+<!-- lane: mt-provider — if the lane misses the drop, delete this subsection (no MT qualification ships). -->
+Totals stay exact when many threads share one provider, but per-key
+rows may stay partial: in the 8-thread sign cell, rows plus the named
+race buckets (`unbound`, `key_join_lost`) equal the ledger exactly in
+every run, while the single-thread control lands every call in one
+row. Fixing the per-session key-join race is future work; read the
+rows with the race buckets.
+
+### System-wide captures stay PARTIAL under process churn
+
+<!-- lane: mt-provider — if the lane misses the drop, delete this subsection. -->
+A `--system` capture on a machine with process churn reports PARTIAL
+with `pid_descendant_gaps` and `{discovery subject, discovery
+unavailable}` skips: that verdict is true (newcomers the observer
+never admitted, or discovery deferred by racing exits), not noise.
+Owned-provider counts stay exact with zero loss counters; exact
+observation needs a quiescent scope.
+
+### Short-lived processes never scanned
+
+Processes that exit before any scan examines them still count only in
+the aggregate `short-lived processes never scanned` gap. Exit-time
+verdicts (`mapped`/`unknown`, plus `STATIC HINT` identity hints under
+`--track-short-lived`) classify them, but full per-caller call
+attribution below the discovery floor is still planned.
+
+### Kernels before 6.12
+
+Per the owner's 2026-11-08 ruling, specific pre-6.12 edge cases are
+documented, not fixed: the pre-6.8 overlay maps-key split (a
+provider's maps rendering unproven; callers mapping it may stay
+unbound), the pre-6.8 pre-arm join shapes, the 5.15 birth race, and
+speed claims only on `uprobe_multi` hosts (older kernels stay correct
+and finite, never fast) all still apply — see
+[Known limitations in 0.6.0](#known-limitations-in-060). v0.7.0 adds
+no new pre-6.12 product edge case.
+
+### Key-tracking rate ceiling
+
+<!-- lane: rate — if the lane lands, replace this subsection with its measured ceiling; if it misses, keep as is. -->
+Key-operation rows keep the v0.6.0 ceiling: exact rows at 6,250
+calls/s for 60 s, plain counts exact at 10,000 calls/s.
+
+### Test-only: overlay-witness flake
+
+`witness_every_keep_reason_keeps_todays_window_when_mapped` fails
+under full-suite load only (panic `prearm_witness_tests.rs:194`:
+`ftrace keeps today's window`, `None` versus `Some([50..900
+PreAttach])`): the fixture's post-load refresh missed the mapping.
+The same binary passes in isolation and on rerun, so this is a test
+fixture race, not a product regression. The fix (make the fixture
+wait for the mapping observation) is 0.7.x work; a gate failure still
+counts.
 
 ## Known limitations in 0.6.0
 

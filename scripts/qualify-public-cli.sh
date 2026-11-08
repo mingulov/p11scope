@@ -431,6 +431,75 @@ fifo_refused() {
   terminate "$wl"
   result fifo-refused "$([ "$rc" != 0 ] && [ "$rc" != 125 ] && [ "$rc" != 124 ] && [ -p fifo ] && grep -qF 'exists and is a FIFO; refusing to replace it' fifo.stderr && echo 1 || echo 0)" "rc=$rc"
 }
+# Event stdout: `--event-log -` streams pure JSONL to stdout (Docker/
+# Fluent Bit/Loki with no file mount) while the -o report agrees on
+# the counts; a reader that closes early (`head -c`) sheds with
+# counters, still commits its report, and exits 1.
+inventory_event_stdout() {
+  local wl rc1=125 rc2=125 full_out epipe_out judge_rc=1
+  full_out=$(product_output event-stdout.json)
+  epipe_out=$(product_output event-epipe.json)
+  rm -f event-stdout.jsonl event-stdout.stderr event-epipe.stderr event-epipe.head event-stdout.wl
+  asuser "$GATED" "$MODULE" 100000000 1000 - > event-stdout.wl 2>&1 & wl=$!; register "$wl" || true
+  if waitfor event-stdout.wl '^READY pid=' "$wl" "$READY_TICKS"; then
+    timeout 120 "$P" inventory --pid "$wl" --duration 6 -o "$full_out" --event-log - --event-interval 2s > event-stdout.jsonl 2> event-stdout.stderr; rc1=$?
+    timeout 120 "$P" inventory --pid "$wl" --duration 4 -o "$epipe_out" --event-log - 2> event-epipe.stderr | head -c 200 > event-epipe.head; rc2=${PIPESTATUS[0]}
+  fi
+  terminate "$wl"
+  publish_output event-stdout.json || true
+  publish_output event-epipe.json || true
+  full_out=$full_out epipe_out=$epipe_out rc1=$rc1 rc2=$rc2 python3 - <<'PY' > event-stdout.judge 2>&1 && judge_rc=0
+import json
+import os
+
+
+def load_jsonl(path):
+    rows = []
+    with open(path) as handle:
+        for number, line in enumerate(handle):
+            line = line.rstrip("\n")
+            assert line, f"{path}:{number}: blank line breaks the JSONL framing"
+            rows.append(json.loads(line))
+    return rows
+
+
+# Full run: stdout is pure JSONL, sequenced, started to ended.
+assert os.environ["rc1"] == "0", "full run rc=%s" % os.environ["rc1"]
+stream = load_jsonl("event-stdout.jsonl")
+assert len(stream) >= 3, "started, a pass marker and ended"
+for index, row in enumerate(stream):
+    assert row["schema"] == "p11scope/inventory-events/v1", row
+    assert row["seq"] == index, "seq %s != %s" % (row["seq"], index)
+assert stream[0]["kind"] == "started", stream[0]
+assert stream[-1]["kind"] == "ended", stream[-1]
+# The stream and the -o report agree on the counts.
+report = json.load(open(os.environ["full_out"]))
+assert report["schema"] == "p11scope/inventory/v1", report.get("schema")
+assert report["observation"]["passes"] == stream[-1]["event"]["passes"], "passes agree"
+final = [row for row in stream if row["kind"] == "pass_committed"][-1]["event"]
+for key in ["callers", "modules", "edges"]:
+    assert len(report[key]) == final["totals"][key], (key, len(report[key]), final["totals"])
+# Totals kept their cadence: a couple of snapshots, never none.
+totals = [row for row in stream if row["kind"] == "totals"]
+assert 1 <= len(totals) <= 4, "totals count %d" % len(totals)
+last_at = 0
+for row in totals:
+    assert row["event"]["pass"] >= 1, row
+    if last_at:
+        assert row["at_ns"] - last_at >= 2_000_000_000, row
+    last_at = row["at_ns"]
+# Early close: the observer sheds, reports, keeps its report, exits 1.
+assert os.environ["rc2"] == "1", "early-close rc=%s" % os.environ["rc2"]
+with open("event-epipe.head", "rb") as handle:
+    assert handle.read(1) == b"{", "the head holds event bytes"
+epipe = json.load(open(os.environ["epipe_out"]))
+assert epipe["schema"] == "p11scope/inventory/v1", epipe.get("schema")
+with open("event-epipe.stderr") as handle:
+    assert "shed" in handle.read(), "the loss is reported on stderr"
+print("ok lines=%d totals=%d" % (len(stream), len(totals)))
+PY
+  result inventory-event-stdout "$([ "$judge_rc" = 0 ] && echo 1 || echo 0)" "rc1=$rc1 rc2=$rc2 $(tail -n 1 event-stdout.judge 2>/dev/null | head -c 300)"
+}
 # Cgroup capture: inside (cgroup-fork, parent+child) and outside (gated) use the
 # same owned provider copy; a leak breaks equality. The fork child inherits the
 # cgroup after attach and must be counted. The owned cgroup is removed afterwards.
@@ -872,6 +941,7 @@ sigint_exact() {
 sigint_exact
 second_sigint
 fifo_refused
+inventory_event_stdout
 # WP-4 breadth: cgroup scopes (S5).
 cgroup_capture profile-cgroup profile
 cgroup_capture metrics-cgroup metrics
@@ -946,5 +1016,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

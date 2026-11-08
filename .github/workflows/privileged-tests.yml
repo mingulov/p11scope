@@ -1011,7 +1011,7 @@ jobs:
               --require doctor --require profile-pid --require names-pid --require verdict-pid \
               --require metrics-pid --require trace-pid --require run-short --require run-cover \
               --require mt-exact --require system --require sigint --require second-sigint \
-              --require fifo-refused \
+              --require fifo-refused --require inventory-event-stdout \
               >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
             tail -40 "$RUNNER_TEMP/qual.log"
@@ -1058,7 +1058,8 @@ jobs:
           cells = {row["cell"]: row for row in rows}
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
                   "run-short", "run-cover", "run-prearm", "mt-exact", "system", "sigint", "second-sigint",
-                  "fifo-refused", "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
+                  "fifo-refused", "inventory-event-stdout",
+                  "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
                   "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
                   "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
                   "select-endpoint-pid", "select-endpoint-system",

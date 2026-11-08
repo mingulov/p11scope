@@ -158,7 +158,7 @@ pub fn classify_proc_view(
         Ok(status) => status,
         Err(error) => return ProcView::Foreign(format!("/proc/{own}/status: {error}")),
     };
-    let Some(nspid) = status.lines().find_map(|line| line.strip_prefix("NSpid:")) else {
+    let Some(nspid) = nspid_field(&status) else {
         return ProcView::Foreign(format!("/proc/{own}/status has no NSpid line"));
     };
     let fields: Vec<&str> = nspid.split_whitespace().collect();
@@ -171,19 +171,32 @@ pub fn classify_proc_view(
     ProcView::Own
 }
 
+/// The raw `NSpid:` field of a `/proc/<pid>/status` text, or `None`
+/// when the line is missing. The single `NSpid` line finder: the
+/// proc-view check and the pid parser share it.
+fn nspid_field(status: &str) -> Option<&str> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("NSpid:"))
+}
+
 /// Parsed `NSpid` values (outermost first) of a
 /// `/proc/<pid>/status` text, or `None` when the line is missing, empty
-/// or unparsable (kernels before 4.1 have no `NSpid`). The single
-/// `NSpid` parser: the proc-view check and the launcher walk share it.
-pub(crate) fn parse_nspid(_status: &str) -> Option<Vec<u32>> {
-    None
+/// or unparsable (kernels before 4.1 have no `NSpid`).
+pub(crate) fn parse_nspid(status: &str) -> Option<Vec<u32>> {
+    let values: Vec<u32> = nspid_field(status)?
+        .split_whitespace()
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    (!values.is_empty()).then_some(values)
 }
 
 /// True when parsed `NSpid` values name a container init: more than one
 /// level with an innermost 1, while the outermost is not 1 (the
 /// observer's own pid 1 is caught by number, never here).
-pub(crate) fn nspid_is_container_init(_nspid: &[u32]) -> bool {
-    false
+pub(crate) fn nspid_is_container_init(nspid: &[u32]) -> bool {
+    nspid.len() > 1 && nspid.last() == Some(&1) && nspid.first() != Some(&1)
 }
 
 /// The view of the procfs mounted at `proc_root` (normally `/proc`).

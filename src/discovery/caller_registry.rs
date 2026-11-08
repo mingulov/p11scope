@@ -32,7 +32,8 @@ use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
 use crate::process::{
-    PidPin, generation_gone, process_is_zombie, process_start_time, process_stat_pair,
+    PidPin, generation_gone, process_is_kthread, process_is_zombie, process_start_time,
+    process_stat_pair,
 };
 pub(crate) mod metadata;
 
@@ -324,11 +325,6 @@ pub(crate) trait ProcessSource {
     fn cgroup_text(&self, _pid: u32) -> Option<String> {
         None
     }
-    /// True when `pid` is a container init (innermost NSpid 1, not the
-    /// observer's pid 1). The default never claims it.
-    fn is_container_init(&self, _pid: u32) -> bool {
-        false
-    }
     /// Parsed `NSpid` values (outermost first) of `pid`'s
     /// `/proc/<pid>/status`, or `None` when unreadable or unparsable.
     /// The walk derives container-init and pid-namespace-boundary
@@ -465,10 +461,13 @@ pub(crate) fn exe_basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// The gap for an ancestor whose stat line would not parse: exited when
-/// the generation is provably gone, otherwise hidden. Never a guess.
+/// The gap for an ancestor whose stat line would not parse. Under a
+/// `hidepid` `/proc` an unreadable entry is hidden-alive until proven
+/// otherwise (its `ENOENT` is indistinguishable from an exit), so the
+/// mount evidence overrides the gone proof; otherwise exited when the
+/// generation is provably gone, hidden when it looks alive. Never a guess.
 fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> LauncherGap {
-    let reason = if source.gone(pid) {
+    let reason = if !source.proc_hidepid() && source.gone(pid) {
         LAUNCHER_GAP_EXITED
     } else {
         LAUNCHER_GAP_HIDEPID
@@ -479,22 +478,6 @@ fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> Launch
     }
 }
 
-/// True when a `/proc/<pid>/status` text shows the pid as a container
-/// init: an `NSpid:` line whose innermost (last) value is 1 while the
-/// outermost is not (the observer's own pid 1 is caught by number).
-/// Absent or unparsable `NSpid` (kernels before 4.1) answers false.
-/// Child subreapers other than these boundaries expose no `/proc` flag,
-/// so they are caught only by the start-time reparent check below.
-pub(crate) fn status_nspid_is_container_init(status: &str) -> bool {
-    status.lines().any(|line| {
-        let Some(values) = line.strip_prefix("NSpid:") else {
-            return false;
-        };
-        let pids: Vec<&str> = values.split_whitespace().collect();
-        pids.len() > 1 && pids.last() == Some(&"1") && pids.first() != Some(&"1")
-    })
-}
-
 /// Raw `/proc/<pid>/cgroup` text, or `None` when unreadable.
 pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
@@ -503,15 +486,29 @@ pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
 /// True when a `/proc/self/mountinfo` text mounts a procfs at `/proc`
 /// with `hidepid` hiding processes: any `hidepid=` value but `0`/`off`.
 /// Anything else (no procfs at `/proc`, malformed rows) answers false:
-/// hidepid is claimed only on positive mount evidence.
-pub(crate) fn proc_mount_hidepid_on(_mountinfo: &str) -> bool {
-    false
-}
-
-/// True when `pid` is a container init per its status `NSpid`.
-pub(crate) fn read_is_container_init(pid: u32) -> bool {
-    std::fs::read_to_string(format!("/proc/{pid}/status"))
-        .is_ok_and(|status| status_nspid_is_container_init(&status))
+/// hidepid is claimed only on positive mount evidence. The last
+/// matching row wins (a later mount shadows an earlier one).
+pub(crate) fn proc_mount_hidepid_on(mountinfo: &str) -> bool {
+    let mut hidden = false;
+    for line in mountinfo.lines() {
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        if fields.get(4) != Some(&"/proc") {
+            continue;
+        }
+        let Some(separator) = fields.iter().position(|field| *field == "-") else {
+            continue;
+        };
+        let after = &fields[separator + 1..];
+        if after.len() != 3 || after[0] != "proc" {
+            continue;
+        }
+        hidden = after[2].split(',').any(|option| {
+            option
+                .strip_prefix("hidepid=")
+                .is_some_and(|value| !value.is_empty() && value != "0" && value != "off")
+        });
+    }
+    hidden
 }
 
 /// Collapse runs of adjacent identical launcher wrappers (same exe and
@@ -539,15 +536,18 @@ pub(crate) fn collapse_launcher_chain(chain: &[LauncherAncestor]) -> Vec<(Launch
 /// Capture one caller incarnation's launcher chain: up to
 /// [`LAUNCHER_CHAIN_DEPTH`] raw ancestors, nearest first, each as a
 /// (pid, start-time) generation with its exe basename. Init (pid 1 of
-/// the scope's pid namespace), the systemd user manager and container
-/// inits are never recorded: an init-type immediate parent yields
-/// `InitParent` with the caller's systemd unit (or nothing), while an
-/// init-type ancestor above real links just ends the walk. A parent
-/// younger than its child cannot be the original parent (pid reuse), so
-/// the walk stops there with the exited gap. Stops cleanly (no gap) at
-/// ppid 0 (no parent in this pid namespace); any other stop keeps the
-/// ancestors read so far plus a named gap. Never fails, never guesses,
-/// and never touches argv, environ or comm.
+/// the scope's pid namespace), the systemd user manager, container
+/// inits, pid-namespace boundaries and kernel threads are never
+/// recorded: an init-type immediate parent yields `InitParent` with the
+/// caller's systemd unit (or nothing), while an init-type ancestor
+/// above real links just ends the walk. A caller that is itself a
+/// container init is an `InitParent` too: its observer-visible parent
+/// did not launch it. A parent younger than its child cannot be the
+/// original parent (pid reuse), so the walk stops there with the exited
+/// gap. Stops cleanly (no gap) at ppid 0 (no parent in this pid
+/// namespace); any other stop keeps the ancestors read so far plus a
+/// named gap. Never fails, never guesses, and never touches argv,
+/// environ or comm.
 pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
     source: &Source,
     caller_pid: u32,
@@ -577,6 +577,14 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
             LauncherOrigin::Chain
         }
     };
+    // A boundary above real ancestors ends the walk; the chain stands
+    // on its own with no gap and no unit.
+    let plain_stop = |ancestors| CapturedLauncherChain {
+        ancestors,
+        gap: None,
+        origin: LauncherOrigin::Chain,
+        unit: None,
+    };
     let Some(mut ppid) = caller_ppid else {
         return CapturedLauncherChain {
             ancestors: Vec::new(),
@@ -593,26 +601,25 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
     if ppid == 1 {
         return init_parent();
     }
+    // A caller that is itself a container init sits behind a
+    // pid-namespace boundary by definition: its observer-visible
+    // parent (a shim or host process) did not launch it.
+    let caller_nspid = source.status_nspid(caller_pid);
+    if caller_nspid
+        .as_deref()
+        .is_some_and(crate::pidns::nspid_is_container_init)
+    {
+        return init_parent();
+    }
     let mut ancestors = Vec::new();
     let mut child_start_time = caller_start_time;
+    let mut child_nspid_len = caller_nspid.map(|nspid| nspid.len());
     loop {
         if ppid == 0 {
-            return CapturedLauncherChain {
-                ancestors,
-                gap: None,
-                origin: LauncherOrigin::Chain,
-                unit: None,
-            };
+            return plain_stop(ancestors);
         }
         if ppid == 1 {
-            // An init above real ancestors ends the walk; the chain
-            // stands on its own with no gap and no unit.
-            return CapturedLauncherChain {
-                ancestors,
-                gap: None,
-                origin: LauncherOrigin::Chain,
-                unit: None,
-            };
+            return plain_stop(ancestors);
         }
         let (start_time, grand) = source.stat_pair(ppid);
         let (Some(start_time), Some(grand)) = (start_time, grand) else {
@@ -634,25 +641,36 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
                 unit: None,
             };
         }
-        // User-manager and container-init links are never shown; an
-        // immediate one reports init_parent with the caller's unit,
-        // while one above real links just ends the walk. An unreadable
-        // cgroup fails open to an ordinary ancestor: stat already
-        // proved the generation, and the boundary processes are
-        // long-lived, so a classification race is negligible.
+        // User-manager, container-init and pid-namespace-boundary links
+        // are never shown; an immediate one reports init_parent with
+        // the caller's unit, while one above real links just ends the
+        // walk. A parent with fewer NSpid levels than its child lives
+        // outside the child's pid namespace (a shim or host parent
+        // above a container process). One status read classifies both
+        // NSpid shapes. An unreadable cgroup or status fails open to
+        // an ordinary ancestor: stat already proved the generation,
+        // and the boundary processes are long-lived, so a
+        // classification race is negligible. Same-namespace child
+        // subreapers expose no `/proc` flag and stay visible links: a
+        // documented known limit, never a silent rename.
+        let parent_nspid = source.status_nspid(ppid);
         let is_user_manager = source
             .cgroup_text(ppid)
             .is_some_and(|cgroup| crate::caller_metadata::is_user_manager_cgroup_text(&cgroup));
-        if is_user_manager || source.is_container_init(ppid) {
+        let crosses_namespace = match (child_nspid_len, parent_nspid.as_ref().map(Vec::len)) {
+            (Some(child), Some(parent)) => parent < child,
+            _ => false,
+        };
+        if is_user_manager
+            || parent_nspid
+                .as_deref()
+                .is_some_and(crate::pidns::nspid_is_container_init)
+            || crosses_namespace
+        {
             if ancestors.is_empty() {
                 return init_parent();
             }
-            return CapturedLauncherChain {
-                ancestors,
-                gap: None,
-                origin: LauncherOrigin::Chain,
-                unit: None,
-            };
+            return plain_stop(ancestors);
         }
         // The fifth link was statted, start-time checked and classified
         // as a real ancestor above: more above is read evidence, not a
@@ -668,12 +686,23 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
         }
         // Pin the exe to the statted generation: a recycle between the
         // stat and the readlink must not attach the new image's name.
-        // Any mismatch or re-read failure drops the exe with the named
-        // gap; the walk continues from the statted parent.
+        // A proved recycle names the exit; so does a dead generation.
+        // A live generation with no exe link at all is a kernel thread
+        // (no user address space, hence no link): a boundary, never a
+        // recorded link. Anything else is unreadable (no ptrace read
+        // access). The walk continues from the statted parent.
         let exe = source.ancestor_exe(ppid);
         let (recheck, _) = source.stat_pair(ppid);
         let (exe, exe_gap) = match (exe, recheck) {
             (Some(name), Some(again)) if again == start_time => (Some(name), None),
+            (_, Some(again)) if again != start_time => (None, Some(LAUNCHER_GAP_EXITED)),
+            _ if source.gone(ppid) => (None, Some(LAUNCHER_GAP_EXITED)),
+            (None, _) if source.is_kthread(ppid) => {
+                if ancestors.is_empty() {
+                    return init_parent();
+                }
+                return plain_stop(ancestors);
+            }
             _ => (None, Some(LAUNCHER_GAP_EXE_UNREADABLE)),
         };
         ancestors.push(LauncherAncestor {
@@ -684,14 +713,10 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
             exe_gap,
         });
         if grand == 0 {
-            return CapturedLauncherChain {
-                ancestors,
-                gap: None,
-                origin: LauncherOrigin::Chain,
-                unit: None,
-            };
+            return plain_stop(ancestors);
         }
         child_start_time = Some(start_time);
+        child_nspid_len = parent_nspid.map(|nspid| nspid.len());
         ppid = grand;
     }
 }
@@ -735,8 +760,19 @@ impl ProcessSource for OsProcessSource {
         read_cgroup_text(pid)
     }
 
-    fn is_container_init(&self, pid: u32) -> bool {
-        read_is_container_init(pid)
+    fn status_nspid(&self, pid: u32) -> Option<Vec<u32>> {
+        std::fs::read_to_string(format!("/proc/{pid}/status"))
+            .ok()
+            .and_then(|status| crate::pidns::parse_nspid(&status))
+    }
+
+    fn is_kthread(&self, pid: u32) -> bool {
+        process_is_kthread(pid)
+    }
+
+    fn proc_hidepid(&self) -> bool {
+        std::fs::read_to_string("/proc/self/mountinfo")
+            .is_ok_and(|mountinfo| proc_mount_hidepid_on(&mountinfo))
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -7616,14 +7652,6 @@ pub(crate) mod tests {
                 .and_then(|process| process.cgroup.clone())
         }
 
-        fn is_container_init(&self, pid: u32) -> bool {
-            self.status_nspid(pid)
-                .as_deref()
-                .is_some_and(|nspid| {
-                    nspid.len() > 1 && nspid.last() == Some(&1) && nspid.first() != Some(&1)
-                })
-        }
-
         fn status_nspid(&self, pid: u32) -> Option<Vec<u32>> {
             self.state
                 .borrow()
@@ -8478,7 +8506,8 @@ pub(crate) mod tests {
         );
         assert_eq!(
             captured.ancestors[0].exe_gap,
-            Some(LAUNCHER_GAP_EXE_UNREADABLE)
+            Some(LAUNCHER_GAP_EXITED),
+            "a recycle between the stat and the readlink names the exit"
         );
         assert!(captured.gap.is_none());
     }
@@ -8561,19 +8590,6 @@ pub(crate) mod tests {
         let collapsed = collapse_launcher_chain(&chain);
         assert_eq!(collapsed.len(), 2);
         assert_eq!((collapsed[0].1, collapsed[1].1), (0, 0));
-    }
-
-    #[test]
-    fn launcher_container_init_reads_the_innermost_nspid() {
-        assert!(
-            status_nspid_is_container_init("Name:\ttini\nNSpid:\t5000\t1\n"),
-            "innermost NSpid 1 is a container init"
-        );
-        assert!(!status_nspid_is_container_init("Name:\tsh\nNSpid:\t900\n"));
-        assert!(!status_nspid_is_container_init(
-            "Name:\tsh\nNSpid:\t900\t42\n"
-        ));
-        assert!(!status_nspid_is_container_init("Name:\tsh\n"));
     }
 
     fn module_info(path: &str, ino: u64, admission: AdmissionState) -> ModuleInfo {

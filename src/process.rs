@@ -1661,6 +1661,16 @@ pub(crate) fn process_is_zombie(pid: u32) -> bool {
         .is_some_and(|state| state == "Z")
 }
 
+/// True when `pid` is a kernel thread (`PF_KTHREAD` in its stat
+/// flags): no user address space, hence no exe link. Any read or parse
+/// failure answers false — an unreadable pid is merely unknown here.
+pub(crate) fn process_is_kthread(pid: u32) -> bool {
+    read_proc_stat(pid)
+        .ok()
+        .and_then(|stat| stat_flags_from_stat_text(&stat))
+        .is_some_and(|flags| flags & PF_KTHREAD != 0)
+}
+
 /// True when `pid` is provably dead: reaped (`/proc/<pid>/stat` is gone)
 /// or zombie (state `Z`). A single stat read classifies both, so a reap
 /// or exit between two reads cannot strand a dead generation as unknown;

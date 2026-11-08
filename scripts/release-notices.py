@@ -221,6 +221,7 @@ def make_config(metadata, root, recipe):
     text = 'accepted = ["MIT", "ISC", "Zlib", "Unicode-3.0", "Apache-2.0", "GPL-2.0-or-later", "GPL-3.0-or-later", "GPL-2.0-only"]\n'
     text += 'ignore-build-dependencies = false\nignore-dev-dependencies = false\nignore-transitive-dependencies = false\nmax-depth = 10\n'
     project = {"p11scope", "p11scope-discover", "p11scope-bpf-multi", "p11scope-manifest", "p11scope-ebpf", "p11scope-ebpf-common"}
+    clarified = set()
     for package in metadata["packages"]:
         name, expression = package["name"], package["license"]
         files = []
@@ -229,13 +230,32 @@ def make_config(metadata, root, recipe):
             files = [(license_path, expression, digest(checked_bytes(license_path)))]
         elif name in recipe["clarifications"]:
             item = recipe["clarifications"][name]
-            if package["version"] != item["version"] or expression != item["license"] or package["source"] != item["source"]:
+            if expression != item["license"] or package["source"] != item["source"]:
                 raise NoticeError(f"clarification package identity changed: {name}")
-            for entry in item["files"]:
-                path = inputs / entry["path"]
-                expected = recipe["files"][entry["path"]]["sha256"]
-                checked_bytes(path, expected)
-                files.append((path, entry["license"], expected))
+            versions = item.get("versions")
+            if not isinstance(versions, list) or not versions:
+                raise NoticeError(f"clarification versions are invalid: {name}")
+            for pinned in versions:
+                if (not isinstance(pinned, dict) or set(pinned) != {"version", "files"}
+                        or not isinstance(pinned["files"], list)):
+                    raise NoticeError(f"clarification versions are invalid: {name}")
+            if len({pinned["version"] for pinned in versions}) != len(versions):
+                raise NoticeError(f"clarification versions are duplicated: {name}")
+            if sum(pinned["version"] == package["version"] for pinned in versions) != 1:
+                raise NoticeError(f"clarification package identity changed: {name}")
+            if name in clarified:
+                continue
+            clarified.add(name)
+            seen = set()
+            for pinned in versions:
+                for entry in pinned["files"]:
+                    if entry["path"] in seen:
+                        raise NoticeError(f"clarification file pinned twice: {name}")
+                    seen.add(entry["path"])
+                    path = inputs / entry["path"]
+                    expected = recipe["files"][entry["path"]]["sha256"]
+                    checked_bytes(path, expected)
+                    files.append((path, entry["license"], expected))
         if files:
             text += f'\n[{name}.clarify]\nlicense = {json.dumps(expression)}\n'
             for path, license_id, sha in files:
@@ -289,7 +309,7 @@ def generate(root, cargo_about, musl_archives, output):
     recipe_path = root / "third-party/licenses/sources.json"
     recipe_bytes = checked_bytes(recipe_path)
     recipe = json.loads(recipe_bytes)
-    if recipe.get("schema_version") != 1:
+    if recipe.get("schema_version") != 2:
         raise NoticeError("unsupported notice recipe schema")
     verified = load_inputs(root, recipe)
     payload, toolchains = toolchain_payload(root, recipe)

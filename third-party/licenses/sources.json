@@ -1,150 +1,199 @@
 {
   "clarifications": {
     "aya-build": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "aya-302985c-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "aya-302985c-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.0"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "aya-302985c-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "aya-302985c-apache.txt"
+            }
+          ],
+          "version": "0.2.0"
+        }
+      ]
     },
     "aya-ebpf": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "aya-773ca71-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "aya-773ca71-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.1"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "aya-773ca71-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "aya-773ca71-apache.txt"
+            }
+          ],
+          "version": "0.2.1"
+        }
+      ]
     },
     "aya-ebpf-bindings": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "aya-302985c-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "aya-302985c-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.0"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "aya-302985c-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "aya-302985c-apache.txt"
+            }
+          ],
+          "version": "0.2.0"
+        }
+      ]
     },
     "aya-ebpf-macros": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "aya-302985c-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "aya-302985c-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.0"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "aya-302985c-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "aya-302985c-apache.txt"
+            }
+          ],
+          "version": "0.2.0"
+        }
+      ]
     },
     "pkcs11-abi": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "pkcs11-0.2.3-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "pkcs11-0.2.3-apache.txt"
-        }
-      ],
       "license": "Apache-2.0 OR MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.3"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "pkcs11-0.2.3-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "pkcs11-0.2.3-apache.txt"
+            }
+          ],
+          "version": "0.2.3"
+        }
+      ]
     },
     "pkcs11-module": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "pkcs11-0.2.3-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "pkcs11-0.2.3-apache.txt"
-        }
-      ],
       "license": "Apache-2.0 OR MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.3"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "pkcs11-0.2.3-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "pkcs11-0.2.3-apache.txt"
+            }
+          ],
+          "version": "0.2.3"
+        }
+      ]
     },
     "pkcs11-types": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "pkcs11-0.2.3-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "pkcs11-0.2.3-apache.txt"
-        }
-      ],
       "license": "Apache-2.0 OR MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.3"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "pkcs11-0.2.3-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "pkcs11-0.2.3-apache.txt"
+            }
+          ],
+          "version": "0.2.3"
+        }
+      ]
     },
     "r-efi": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "r-efi-6.0.0-AUTHORS.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0 OR LGPL-2.1-or-later",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "6.0.0"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "r-efi-5.3.0-AUTHORS.txt"
+            }
+          ],
+          "version": "5.3.0"
+        },
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "r-efi-6.0.0-AUTHORS.txt"
+            }
+          ],
+          "version": "6.0.0"
+        }
+      ]
     },
     "windows-link": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "windows-link-0.2.1-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "windows-link-0.2.1-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.2.1"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "windows-link-0.2.1-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "windows-link-0.2.1-apache.txt"
+            }
+          ],
+          "version": "0.2.1"
+        }
+      ]
     },
     "windows-sys": {
-      "files": [
-        {
-          "license": "MIT",
-          "path": "windows-sys-0.61.2-mit.txt"
-        },
-        {
-          "license": "Apache-2.0",
-          "path": "windows-sys-0.61.2-apache.txt"
-        }
-      ],
       "license": "MIT OR Apache-2.0",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
-      "version": "0.61.2"
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "windows-sys-0.61.2-mit.txt"
+            },
+            {
+              "license": "Apache-2.0",
+              "path": "windows-sys-0.61.2-apache.txt"
+            }
+          ],
+          "version": "0.61.2"
+        }
+      ]
     }
   },
   "files": {
@@ -460,6 +509,14 @@
       "package_id": "registry+https://github.com/rust-lang/crates.io-index#pkcs11-abi@0.2.3",
       "sha256": "3aa121fcdb31dbf67f6db829710bfd37daed8ed0de3b32913673dec378377402"
     },
+    "r-efi-5.3.0-AUTHORS.txt": {
+      "bytes": 3693,
+      "crate_archive_sha256": "69cdb34c158ceb288df11e18b4bd39de994f6657d83847bdffdbd7f346754b0f",
+      "crate_archive_url": "https://static.crates.io/crates/r-efi/r-efi-5.3.0.crate",
+      "original_filename": "AUTHORS",
+      "package_id": "registry+https://github.com/rust-lang/crates.io-index#r-efi@5.3.0",
+      "sha256": "ff92bed461f50338dd703a9ba9aee496a425957873df1d91192776e4bdf5dda7"
+    },
     "r-efi-6.0.0-AUTHORS.txt": {
       "bytes": 3733,
       "crate_archive_sha256": "f8dcc9c7d52a811697d2151c701e0d08956f92b0e24136cf4cf27b57a6a0d9bf",
@@ -609,7 +666,7 @@
     "rust_gitlink": "https://github.com/rust-lang/rust/tree/1.99.1/src/llvm-project",
     "scope": "Notices for the native libraries and startup objects supplied by the pinned Rust target; actual linked members depend on the final artifact."
   },
-  "schema_version": 1,
+  "schema_version": 2,
   "toolchains": [
     {
       "files": [

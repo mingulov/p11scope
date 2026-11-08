@@ -2219,9 +2219,10 @@ they are held, and a container that drops them fails the child with an
 `CAP_SYS_ADMIN` when its narrow grants cover the rest of the run (multi
 backend with linked dynamics plus `CAP_BPF`, `CAP_PERFMON` and
 `CAP_CHECKPOINT_RESTORE` held); owned `run` sessions never shed it, and
-a `run` child never inherits any capability. `inspect` keeps the full
-live set including `CAP_BPF`/`CAP_PERFMON`: it loads the short-lived
-kernel identity witness for overlay/9p original-file proofs. Dynamic
+a `run` child never inherits any capability. `inspect` and
+`inventory --capture scan` keep the full live set including
+`CAP_BPF`/`CAP_PERFMON`: both load the short-lived kernel identity
+witness for overlay/9p original-file proofs. Dynamic
 loader/export probes link only where the
 kernel's uprobe-multi pid filter is proven (a functional probe at startup;
 6.10+, or 6.9.12+/6.6.y with the backport) — where it is not, they stay on

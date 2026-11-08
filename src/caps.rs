@@ -426,10 +426,9 @@ pub(crate) fn drop_to_keep(keep: u64) -> io::Result<()> {
 /// of the full set. Live capture keeps the minimal set whole (dynamic
 /// attach and rescans run until the end); `doctor` needs the live set
 /// whole (it reports the invoking snapshot `main` records before the
-/// drop, so the drop itself still applies); `inspect` keeps the live
-/// set whole (it loads the kernel identity witness for overlay/9p
-/// proofs); scan-only `inventory` keeps only its
-/// target-read/map-files bits; `diff` keeps file IO only.
+/// drop, so the drop itself still applies); `inspect` and scan-only
+/// `inventory` keep the live set whole (both load the kernel identity
+/// witness for overlay/9p proofs); `diff` keeps file IO only.
 pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let live = minimal_live_mask();
@@ -443,10 +442,11 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
     };
     match command {
         Command::Profile(a) | Command::Trace(a) => live | sys_admin | out(&a.out),
-        Command::Inventory(a) if a.capture == crate::cli::CaptureMode::Scan => {
-            // Scan reads `/proc` only: no BPF load, no links, no perf.
-            (live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT))) | out(&a.out)
-        }
+        // Scan keeps the full live set including the BPF pair exactly
+        // like inspect: the shared scan loads the kernel identity
+        // witness (BPF) for overlay/9p original-file proofs
+        // (controller ruling 2026-11-08, r2 F1).
+        Command::Inventory(a) if a.capture == crate::cli::CaptureMode::Scan => live | out(&a.out),
         Command::Inventory(a) => live | sys_admin | out(&a.out),
         Command::Run(a) => {
             // Always: the sudo drop re-owns the child without `--user`
@@ -494,14 +494,13 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
 /// is the only grant the kernel accepts instead (the DaemonSet holds
 /// SYS_ADMIN, not the narrow caps), so the keep must retain it. Live
 /// capture keeps SYS_ADMIN already for the singles fallback; doctor needs
-/// the BPF pair for its self-probe link plus map_files; inspect needs
-/// all three (the witness BPF load plus map_files); scan needs
-/// map_files only; diff, cbom and version need none of the three.
+/// the BPF pair for its self-probe link plus map_files; inspect and
+/// scan need all three (the witness BPF load plus map_files); diff,
+/// cbom and version need none of the three.
 fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let bpf =
         (1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
-    let map_files = 1u64 << CAP_CHECKPOINT_RESTORE_BIT;
     match command {
         Command::Profile(_)
         | Command::Trace(_)
@@ -509,14 +508,9 @@ fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
         | Command::Doctor(_)
         | Command::Inspect(_)
         | Command::Inventory(_) => {
-            // Inventory scan drops the BPF pair it never loads, so it
-            // needs map_files only; every other live lane (including
-            // inspect's witness load) needs all three.
-            if let Command::Inventory(a) = command
-                && a.capture == crate::cli::CaptureMode::Scan
-            {
-                return map_files;
-            }
+            // Every live lane needs all three, including scan: the
+            // shared scan loads the kernel identity witness exactly
+            // like inspect (controller ruling 2026-11-08, r2 F1).
             bpf
         }
         Command::InventoryDiff(_) | Command::InventoryCbom(_) | Command::Version => 0,

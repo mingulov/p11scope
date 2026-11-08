@@ -30652,8 +30652,9 @@ impl Engine {
     /// keys would refuse every proof there. The pin half closes the
     /// copy-up race: a copy-up between the witness start and the
     /// pre-arm pin keeps the overlay `(dev, ino)` stable while
-    /// rewriting size/ctime, so the fd identity alone would join the
-    /// lower watch to the copied-up pin.
+    /// rewriting ctime (size is preserved), so the proof relies on
+    /// ctime — the fd identity alone would join the lower watch to
+    /// the copied-up pin.
     pub(crate) fn witness_pin_matches(
         fd_dev: u64,
         fd_ino: u64,

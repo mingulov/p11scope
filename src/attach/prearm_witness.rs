@@ -507,8 +507,9 @@ pub(crate) struct WitnessFile {
     pub ino: u64,
     /// The witness fd's open-time `(ino, size, ctime)`: condition 4
     /// requires it to equal the pre-arm pin's held baseline (a copy-up
-    /// between the witness start and the pin rewrites size/ctime while
-    /// the overlay `(dev, ino)` stays stable), and finalize re-checks it.
+    /// between the witness start and the pin rewrites ctime — size is
+    /// preserved — while the overlay `(dev, ino)` stays stable, so the
+    /// proof relies on ctime), and finalize re-checks it.
     pub pin: crate::discovery::identity::Pin,
     pub key: PwWatchedKey,
 }
@@ -540,9 +541,9 @@ impl<B: FinalizeBackend> StartupWitness<B> {
             .zip(self.files.iter())
             .map(|(verdict, file)| {
                 // The witness fd's own pin re-check: a change between
-                // startup and finalize (a copy-up rewrites size/ctime)
-                // voids the calibration-time key, so the slot keeps its
-                // window even when the walk was clean.
+                // startup and finalize (a copy-up rewrites ctime; size is
+                // preserved) voids the calibration-time key, so the slot
+                // keeps its window even when the walk was clean.
                 use std::os::unix::io::AsFd as _;
                 let unchanged = crate::discovery::identity::pin_of_fd(file.fd.as_fd())
                     .is_ok_and(|current| current == file.pin);
@@ -1243,10 +1244,11 @@ pub(crate) enum KeepReason {
     Walk,
     /// The close never quiesced (§8 group 4).
     Quiesce,
-    /// §6.1-listed only: calibration failures abort `start_with` with
-    /// `Unavailable` before any verdict exists, so `finalize_with` never
-    /// emits this; it stays nameable for planted verdicts.
-    #[allow(dead_code)]
+    /// The witness fd's own pin changed between startup and finalize
+    /// (a copy-up rewrites ctime): the slot keeps its window even when
+    /// the walk was clean. `start_with` calibration failures abort with
+    /// `Unavailable` before any verdict exists; only `finalize` emits
+    /// this reason.
     Calibration,
 }
 
@@ -3357,10 +3359,11 @@ mod tests {
 
     #[test]
     fn driver_finalize_changed_witness_fd_keeps_calibration() {
-        // The witness fd's file changed between startup and finalize (a
-        // copy-up rewrites size/ctime the same way): the calibration-time
-        // key watches the old file, so the slot must keep its window
-        // with the calibration reason even though the walk was clean.
+        // The witness fd's file changed between startup and finalize
+        // (a copy-up rewrites ctime the same way; size is preserved):
+        // the calibration-time key watches the old file, so the slot
+        // must keep its window with the calibration reason even though
+        // the walk was clean.
         let (_dir, path, witnessed) = scripted_started_witness_live();
         std::fs::write(&path, [0x7fu8, b'E', b'L', b'F', 1, 2, 3, 4]).expect("rewrite");
         let verdict = witnessed.finalize(false).expect("finalize verdict");

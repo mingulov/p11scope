@@ -108,15 +108,16 @@ before calling a rerun green.
   judged against this systematic difference, not averaged with tip.
 - Disposition: documents the pre-lane base behavior; no gate change.
 
-### `D1-span-b2-entries-race` (R3 A/B, lineage-neutral)
+### `D1-span-b2-entries-race` (R3 A/B, tip-only; lane contribution not ruled out)
 
 - Signature: B2's span-kernel edge shows `watched_no_use` with 0
   entries (observed across the whole span) while the span profile
   counts the full 6x250 fresh ledger on the same module; the span
   gate wants `not_attached` and refuses.
 - Mechanism: unknown; the entries-observation path attaches to B2's
-  edge mid-span on some runs and then counts nothing. Lineage-neutral
-  (R3 A/B: tip 3/10, base edges affected too). Pass timing identical
+  edge mid-span on some runs and then counts nothing. (R3 A/B: tip
+  3/10; base B2 edges read the same state 10/10 but structurally —
+  no pair — not the race.) Pass timing identical
   to passing runs (B2 ready at passes 6,7; ledger at 8,9). R5
   analysis of the R3 `ab-spans` narrows it: on the tripped tips
   (3,4,6) all three edges on B2's module (B-pre, twin, B2) are

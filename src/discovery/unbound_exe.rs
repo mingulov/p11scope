@@ -72,8 +72,8 @@ fn canonical_spelling(path: &str) -> String {
         .unwrap_or_else(|_| path.to_string())
 }
 
-/// Distinct verified spellings by canonical path (first spelling
-/// kept per file), sorted for a stable order.
+/// Distinct verified spellings by canonical path (the sorted-first
+/// spelling kept per file), sorted for a stable order.
 fn dedupe_canonical(paths: Vec<String>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut distinct: Vec<String> = paths
@@ -408,6 +408,10 @@ impl ExeResolver {
         {
             spellings.extend(paths.iter().cloned());
         }
+        // The primary usually lists among the known spellings too:
+        // each distinct spelling verifies once.
+        spellings.sort();
+        spellings.dedup();
         let verified: Vec<String> = spellings
             .into_iter()
             .filter(|path| (scan.verify)(path).is_some_and(|pair| pair == (dev, ino)))
@@ -1028,7 +1032,8 @@ mod tests {
 
     /// Two spellings of one file (a symlinked parent dir, like a
     /// merged-`/usr` `/bin/x` vs `/usr/bin/x` pair) name one
-    /// candidate: no false ambiguity.
+    /// candidate — the sorted-first spelling — with no false
+    /// ambiguity.
     #[test]
     fn canonical_aliases_of_one_file_read_unambiguous() {
         let dir = tempfile::tempdir().unwrap();
@@ -1052,9 +1057,31 @@ mod tests {
             &scan.scan(),
         );
         assert_eq!(exe.resolution, ExeResolution::ScanLearned);
-        assert_eq!(exe.path.as_deref(), Some(direct.as_str()));
+        // Sorted-first spelling wins deterministically.
+        assert_eq!(exe.path.as_deref(), Some(aliased.as_str()));
         assert!(!exe.identity_ambiguous(), "{exe:?}");
-        assert_eq!(exe.identity_candidates, vec![direct], "{exe:?}");
+        assert_eq!(exe.identity_candidates, vec![aliased], "{exe:?}");
+    }
+
+    /// The primary spelling verifies once even when it also
+    /// lists among the known teacher spellings.
+    #[test]
+    fn learned_primary_verifies_once() {
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        scan.learned_multi(8, 99, &["/usr/bin/x", "/alt/bin/x"]);
+        let exe = resolver.resolve(
+            7,
+            8,
+            99,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert_eq!(scan.verify_calls.get(), 2);
     }
 
     /// (b): a learned path whose current maps-domain identity

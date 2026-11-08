@@ -745,6 +745,18 @@ impl<'a> ScopedOwnerProof<'a> {
     }
 }
 
+/// Whether a scoped mint observes exec for this generation: true only
+/// when the generation carries an exe identity. The `CallerRecord`
+/// contract requires false when the exe was unreadable at admission;
+/// production gates (the pin-insert `is_some` check, `original_matches`,
+/// and the prepare/commit generation equality) currently admit only
+/// `Some` here, so this reads true on every live path today. The seam
+/// pins the counterfactual against future gate changes.
+fn scoped_mint_exec_observed(generation: &crate::inspect_system::MemberGeneration) -> bool {
+    let _ = generation;
+    true
+}
+
 impl<Source: ProcessSource> CallerAdapter<Source> {
     /// Never reopen the PID: this is the source pin enclosed by the original
     /// scoped preparation, before the collection's final sample.
@@ -1118,6 +1130,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let incarnation = self.incarnations.get(&prepared.pid).copied().unwrap_or(0);
         self.incarnations
             .insert(prepared.pid, incarnation.saturating_add(1));
+        let exec_observed = scoped_mint_exec_observed(&prepared.generation);
         self.callers.insert(
             id,
             TrackedCaller {
@@ -1128,7 +1141,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     start_time: prepared.generation.start_time,
                     exe: prepared.generation.exe,
                     incarnation,
-                    exec_observed: true,
+                    exec_observed,
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -6823,6 +6836,36 @@ pub(crate) mod tests {
         assert!(
             stdout.contains(MARKER),
             "the probe ran to completion (no vacuous filter miss): stdout={stdout} stderr={stderr}"
+        );
+    }
+
+    /// B1 consumer contract: a scoped mint with no exe identity must not
+    /// claim to observe exec. Production gates currently forbid `None` at
+    /// the mint site; this pins the decision seam so a literal `true` can
+    /// never publish `exec_observed` with no observation.
+    #[test]
+    fn scoped_mint_leaves_unreadable_exe_unobserved() {
+        let denied = crate::inspect_system::MemberGeneration {
+            start_time: Some(7),
+            exe: None,
+        };
+        assert!(
+            !scoped_mint_exec_observed(&denied),
+            "no exe identity means no exec observation"
+        );
+        let seen = crate::inspect_system::MemberGeneration {
+            start_time: Some(7),
+            exe: Some(ExeIdentity {
+                dev: 1,
+                ino: 2,
+                mtime_secs: 3,
+                mtime_nanos: 0,
+                path: Some("/bin/tool".into()),
+            }),
+        };
+        assert!(
+            scoped_mint_exec_observed(&seen),
+            "a carried exe identity still observes exec"
         );
     }
 

@@ -125,7 +125,7 @@ pub(crate) mod provider_metadata_read_test {
     }
 }
 
-fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
+pub(crate) fn pin_from_metadata(md: &std::fs::Metadata) -> Pin {
     Pin {
         ino: md.ino(),
         size: md.len(),

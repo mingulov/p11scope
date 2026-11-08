@@ -11455,6 +11455,74 @@ mod tests {
     }
 
     #[test]
+    fn event_stdout_ended_gets_a_fresh_batch() {
+        use std::io::{Read as _, Write as _};
+        use std::os::fd::AsRawFd as _;
+        let (mut read, write) = event_stdout_test_pipe();
+        let mut writer = super::EventWriter::create_stdout_on_fd(
+            write.as_raw_fd(),
+            std::time::Duration::from_millis(200),
+        )
+        .unwrap();
+        writer.begin_batch();
+        writer
+            .append("pass_committed", serde_json::json!({"pass": 0}), 100)
+            .unwrap();
+        // Fill the pipe with no reader draining, then expire the batch:
+        // a further append sheds immediately (pipe full, no budget left).
+        // Filler lines are valid JSONL the reader filters out.
+        let mut filler = write.try_clone().unwrap();
+        {
+            use std::os::fd::AsRawFd as _;
+            // SAFETY: the fd is an open pipe end owned by the test.
+            let flags = unsafe { libc::fcntl(filler.as_raw_fd(), libc::F_GETFL) };
+            assert!(flags >= 0);
+            assert_eq!(
+                unsafe { libc::fcntl(filler.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) },
+                0
+            );
+        }
+        let chunk = b"{\"filler\":true}\n";
+        while filler.write_all(chunk).is_ok() {}
+        std::thread::sleep(std::time::Duration::from_millis(250));
+        writer
+            .append("pass_committed", serde_json::json!({"pass": 1}), 200)
+            .unwrap();
+        let (shed_lines, _) = writer.stdout_lost();
+        assert_eq!(shed_lines, 1, "the expired batch sheds");
+        // A draining reader frees room: `ended` gets its own fresh
+        // batch, so it waits for room instead of shedding on the
+        // expired deadline.
+        let reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            read.read_to_end(&mut bytes).unwrap();
+            bytes
+        });
+        drop(filler);
+        writer
+            .finish(serde_json::json!({"ended_ns": 300}), 300)
+            .unwrap();
+        let (shed_after, _) = writer.stdout_lost();
+        assert_eq!(
+            shed_after, 1,
+            "ended rides a fresh batch, not the expired one"
+        );
+        drop(writer);
+        drop(write);
+        let bytes = reader.join().unwrap();
+        let lines: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .filter(|line| !line.starts_with(b"{\"filler\""))
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        assert!(
+            lines.iter().any(|line| line["kind"] == "ended"),
+            "ended reached the draining reader"
+        );
+    }
+
+    #[test]
     fn event_stdout_moves_the_text_summary_to_stderr() {
         use std::io::Read as _;
         use std::os::fd::AsRawFd as _;

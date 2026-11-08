@@ -588,7 +588,9 @@ impl EventWriter {
     /// shed-with-counters path instead (itself possibly shed) and
     /// never syncs; its `ended` carries the `stdout_lost` totals for
     /// lines shed before it (its own delivery is covered by the
-    /// stderr notices and the exit status instead).
+    /// stderr notices and the exit status instead). `ended` gets its
+    /// own fresh batch, so a sweep that consumed the completion
+    /// budget cannot shed it without waiting (a no-op for files).
     pub(crate) fn finish(&mut self, payload: serde_json::Value, at_ns: u64) -> Result<(), String> {
         let mut payload = self.project_ended_payload(payload, at_ns);
         if let EventSink::Stdout(stdout) = &self.sink {
@@ -597,6 +599,7 @@ impl EventWriter {
                 "bytes": stdout.lost_bytes,
             });
         }
+        self.begin_batch();
         self.append("ended", payload, at_ns)?;
         #[cfg(test)]
         if let Some(fault) = &self.fault

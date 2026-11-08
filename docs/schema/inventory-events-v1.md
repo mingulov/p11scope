@@ -428,7 +428,9 @@ accepted bytes), so a large summary arrives whole or fails
 explicitly. A stdout that stops reading or is closed (EPIPE, slow
 reader) never stalls capture: each commit batch shares one bounded
 wait, past which lines shed with counters — never retried, never
-silent. Shed lines keep their consumed sequence
+silent. `ended` gets its own fresh batch, so a sweep that consumed
+the completion budget cannot shed it without waiting. Shed lines
+keep their consumed sequence
 numbers, so a slow or closed reader shows as seq gaps accounted by
 `stdout_lost` (in `totals` and the terminal `ended`, plus the stderr
 notices and the nonzero exit), and a shed that leaves a partial line

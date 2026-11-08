@@ -10,8 +10,8 @@ mechanisms, how fast, what errors": eBPF uprobes observe the providers already
 mapped by running processes, so there is no shim to install and no restart.
 
 > **Status: v0.7.0** answers "which application used which key, and how", with opt-in
-> live key operations (`inventory --key-operations`), inventory event-log streaming
-> to stdout (`--event-log -`), and a published observer image
+> live key operations (`inventory --key-operations`), streaming inventory events
+> (`--event-log -` with `--event-interval`), and a published observer image
 > (`ghcr.io/mingulov/p11scope:0.7.0`). Read the [known
 > limitations](CHANGELOG.md#known-limitations) before relying on a capture;
 > [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what this release was qualified on.
@@ -20,22 +20,27 @@ mapped by running processes, so there is no shim to install and no restart.
 
 Get the bundles from the [Releases page](https://github.com/mingulov/p11scope/releases)
 (observer tarball, optional discovery helpers, DEB/RPM packages, source export).
-For example, install **v0.6.0** after verifying its checksum:
+The 0.7.0 files appear there when the release is published.
+For example, install **v0.7.0** after verifying its checksum:
 
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope-0.6.0-x86_64-linux-musl.tar.gz
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/p11scope-0.7.0-x86_64-linux-musl.tar.gz
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/SHA256SUMS
 sha256sum --check --ignore-missing SHA256SUMS
-tar -xzf p11scope-0.6.0-x86_64-linux-musl.tar.gz
-sudo install -m 0755 p11scope-0.6.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
+tar -xzf p11scope-0.7.0-x86_64-linux-musl.tar.gz
+sudo install -m 0755 p11scope-0.7.0-x86_64-linux-musl/p11scope /usr/local/bin/p11scope
 p11scope --version
 sudo p11scope doctor
 ```
 
+(`doctor` loads its BPF preflight, so the first run takes about 10 s
+with no interim output; that is normal.)
+
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
-Container: the 0.7.0 release publishes `ghcr.io/mingulov/p11scope:0.7.0`; run `doctor` through it ([privileges](deploy/k8s/README.md)):
+Container: the 0.7.0 release publishes `ghcr.io/mingulov/p11scope:0.7.0`;
+the tag appears when the release is published. Run `doctor` through it ([privileges](deploy/k8s/README.md)):
 
 ```sh
 docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:0.7.0 doctor
@@ -49,7 +54,10 @@ sudo p11scope inventory --system --duration 15s
 sudo p11scope profile --pid 12345 --duration 30s -o diagnostic-profile.json
 ```
 
-`doctor` reports host readiness (real output, v0.6.0 on Ubuntu 26.04):
+New here? Work through the [Quickstart](docs/usage.md#quickstart): it sets up a
+throwaway SoftHSM token and runs your first observed workload in about two minutes.
+
+`doctor` reports host readiness (real output, v0.7.0 on Ubuntu 26.04):
 
 ```
 Doctor: requested-lane checks passed.
@@ -57,9 +65,11 @@ verdict: capture available; run startup capture not in this build (run reports s
 target loader build ............... warn  unbound
 debug-state hook .................. warn  unavailable
 loader-state live read ............ warn  unavailable
-Next: sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target).
+Next: p11scope profile --pid <PID> (or doctor --pid <PID> to check a target).
 run with -v for details
 ```
+
+Rows vary by host; `run with -v for details` lists every check.
 
 `12345` is a placeholder PID. If a command refuses instead of capturing, see [troubleshooting](docs/troubleshooting.md).
 Text is concise by default; `-v` shows full detail and `--json` is always complete.

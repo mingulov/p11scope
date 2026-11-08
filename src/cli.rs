@@ -580,7 +580,7 @@ Default text output is concise: the main results, one coverage line, and a hint.
 Environment (advanced; normally unset): P11SCOPE_BROAD_ADMIT, P11SCOPE_LOADER_ENV_SANITIZED; docs/usage.md documents every P11SCOPE_* input.
 
 examples:
-  sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
+  sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
   sudo p11scope profile --pid 4242 --duration 30s -o profile.json
   sudo p11scope inventory --system --duration 30s
 
@@ -689,7 +689,8 @@ const RUN_HELP: &str = "usage:
                    [--ring-bytes <n[K|M]>] [--drain-interval-ms <n>] [-v] [--quiet] -- CMD [ARGS...]
 
 example:
-  sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L
+  sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L  # Debian/Ubuntu
+  sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib64/pkcs11/libsofthsm2.so -L  # Fedora/RHEL
   sudo p11scope run --user alice -- pkcs11-tool --module ... -L
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.

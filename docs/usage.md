@@ -6,11 +6,17 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
+New to p11scope? Start here:
+
+- [Quickstart](#quickstart) — a throwaway SoftHSM token and your first observed workload, in about two minutes.
+- [Install](install.md#install) — release bundles, system packages, and building from source.
+- [Troubleshooting](troubleshooting.md) — what a refusal or an empty capture means, and the fix.
+- [Known limitations](known-limitations.md) — what this release does not do, before relying on a capture.
+
 > **Status: v0.7.0.** This source provides `doctor`,
 > `inspect`, `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
-> comparison and diagnostics, opt-in live key operations, and event-log streaming
-> to stdout with `--event-log -`), with memory-scan discovery,
+> comparison and diagnostics, streaming `--event-log -` output, and opt-in live key operations), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
 > per-edge entry counts, FULL object-attribute capture in release builds
 > (P0 stays an explicit option), repeatable `--exclude-module`, and schema v3; its
@@ -146,8 +152,9 @@ window. It is never proof of what the application *cannot* do — see
 
 ## Installing system packages
 
-The v0.6.0 release provides `p11scope_0.6.0_amd64.deb` (Debian/Ubuntu) and
-`p11scope-0.6.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. Each
+The v0.7.0 release provides `p11scope_0.7.0_amd64.deb` (Debian/Ubuntu) and
+`p11scope-0.7.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. The 0.7.0
+packages appear under the release tag when the release is published. Each
 installs the same static observer plus the glibc discovery helper to
 `/usr/bin`, with licenses and provenance under `/usr/share/doc/p11scope`,
 and carries no file capabilities, set-id bits, services or maintainer
@@ -160,18 +167,18 @@ package and `SHA256SUMS`, verify both, then install the file:
 ```sh
 download_dir=$(mktemp -d /var/tmp/p11scope-install.XXXXXX)
 cd "$download_dir"
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/p11scope_0.6.0_amd64.deb
-curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.6.0/SHA256SUMS
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/p11scope_0.7.0_amd64.deb
+curl -fLO https://github.com/mingulov/p11scope/releases/download/v0.7.0/SHA256SUMS
 sha256sum -c --ignore-missing SHA256SUMS
-gh attestation verify p11scope_0.6.0_amd64.deb --repo mingulov/p11scope
-sudo apt install ./p11scope_0.6.0_amd64.deb
+gh attestation verify p11scope_0.7.0_amd64.deb --repo mingulov/p11scope
+sudo apt install ./p11scope_0.7.0_amd64.deb
 p11scope --version
 sudo p11scope doctor
 ```
 
-On Fedora/RHEL, download `p11scope-0.6.0-1.x86_64.rpm` instead, verify it
-with `gh attestation verify p11scope-0.6.0-1.x86_64.rpm --repo mingulov/p11scope`,
-and install with `sudo dnf install ./p11scope-0.6.0-1.x86_64.rpm`.
+On Fedora/RHEL, download `p11scope-0.7.0-1.x86_64.rpm` instead, verify it
+with `gh attestation verify p11scope-0.7.0-1.x86_64.rpm --repo mingulov/p11scope`,
+and install with `sudo dnf install ./p11scope-0.7.0-1.x86_64.rpm`.
 
 ## PKCS #11 versions and interface names
 
@@ -209,6 +216,50 @@ VMA containing the pointer. A name without an in-VMA NUL is unreadable. Text
 classification consequences, never the name bytes.
 
 ## Quickstart
+
+Start here (about 2 minutes). First give yourself a token to observe.
+Install SoftHSM and `pkcs11-tool` if they are missing (`sudo apt install
+softhsm2 opensc` on Debian/Ubuntu, `sudo dnf install softhsm opensc` on
+Fedora/RHEL), then create a throwaway token and pick the module path for
+this host:
+
+```bash
+export SOFTHSM2_CONF=$HOME/softhsm2.conf
+mkdir -p $HOME/softhsm-tokens
+printf 'directories.tokendir = %s/softhsm-tokens\nobjectstore.backend = file\n' "$HOME" > "$SOFTHSM2_CONF"
+softhsm2-util --init-token --slot 0 --label demo --so-pin <so-pin> --pin <pin>
+MODULE=/usr/lib64/pkcs11/libsofthsm2.so
+[ -f "$MODULE" ] || MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
+pkcs11-tool --module "$MODULE" -L
+sudo --preserve-env=SOFTHSM2_CONF p11scope run --pause auto -- \
+  pkcs11-tool --module "$MODULE" -L
+```
+
+(`<so-pin>` and `<pin>` are placeholders: use any values of at least 4
+characters for this throwaway token. `sudo` resets the environment first,
+hence `--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
+
+The 4-step command reference follows; read the concepts after it as needed:
+
+```bash
+# 1. What can this host do, and what does the target map? (sudo: reading
+#    another user's process, and the BPF preflight, need the capture's privileges)
+sudo p11scope doctor --pid 12345
+sudo p11scope inspect --pid 12345
+
+# 2. Count-only diagnostics — no helper or observer-initiated provider calls.
+sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
+
+# 3. Or stream one line per call.
+sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
+
+# 3b. Or capture the whole machine with no PID or cgroup path.
+sudo p11scope profile --system --duration 60 -o system-profile.json
+
+# 4. Or start capture before releasing a command that loads the provider.
+sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
+  -o observed-profile.json --pause auto -- /opt/application/bin/workload
+```
 
 Start with `inspect`: it shows every provider-shaped module the target maps.
 An optional `--module` only narrows that set. On the measured p11-kit stack,
@@ -296,7 +347,7 @@ inode number, can still match. Prefer bare names for container targets.
 `--forwarding-module` is refused beside a matching `--exclude-module`,
 and is not accepted by scan-only `inspect`.
 
-The commands below begin with **passive diagnostics**. Without an accepted
+The commands above begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
 return values and latency. Standard names require a typed legacy return, an
 exact `"PKCS 11"` interface, an accepted manifest, or exact agreement between
@@ -312,26 +363,6 @@ name. Missing mechanism or
 session evidence does not mean the application used none. For those
 semantics, use the separate
 [attested capture workflow](#attested-semantic-capture).
-
-```bash
-# 1. What can this host do, and what does the target map? (sudo: reading
-#    another user's process, and the BPF preflight, need the capture's privileges)
-sudo p11scope doctor --pid 12345
-sudo p11scope inspect --pid 12345
-
-# 2. Count-only diagnostics — no helper or observer-initiated provider calls.
-sudo p11scope profile --pid 12345 --duration 60 -o observed-profile.json
-
-# 3. Or stream one line per call.
-sudo p11scope trace --cgroup /sys/fs/cgroup/... --duration 15
-
-# 3b. Or capture the whole machine with no PID or cgroup path.
-sudo p11scope profile --system --duration 60 -o system-profile.json
-
-# 4. Or start capture before releasing a command that loads the provider.
-sudo p11scope run --module /opt/vendor/lib/pkcs11.so \
-  -o observed-profile.json --pause auto -- /opt/application/bin/workload
-```
 
 ### Text output: concise by default, `-v` for detail
 
@@ -787,7 +818,7 @@ stderr only under `-v`, in the retention notice. A workload sub-cgroup
 below the run publishes from the `p11scope-run-*` component on (never the
 UID/session slices above it).
 
-sudo p11scope run --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
+sudo p11scope run --pause auto --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so \
   --prearm-module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -o tree.json -- \
   sh -c 'pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L'
 

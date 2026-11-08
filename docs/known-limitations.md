@@ -6,6 +6,12 @@ labels and a launcher chain, `inventory --system` binds usage on large
 hosts, and a container image ships. The list below is current for this
 release; the entries under Prior releases retain their historical context.
 
+New to p11scope? Start here:
+
+- [Quickstart](usage.md#quickstart) — a throwaway SoftHSM token and your first observed workload, in about two minutes.
+- [Current release limits](#known-limitations-in-060) — the limits in force for this release.
+- [Troubleshooting](troubleshooting.md) — what a refusal or an empty capture means, and the fix.
+
 Live capture requires a Linux x86-64 host with usable `uprobe_multi` load and
 self-link capability under the current credentials, normally Linux 6.6+ or a
 working backport. Capability is tested, never admitted by version. Missing

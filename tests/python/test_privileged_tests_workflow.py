@@ -570,6 +570,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
                      "run-sudo", "run-user-nobody",
                      "run-kill-on-timeout", "trace-sudo-out",
                      "inventory-sudo-event-log",
+                     "inventory-sudo-fifo-out",
+                     "profile-sudo-fifo-out",
+                     "inventory-diff-sudo-fifo-out",
+                     "inventory-sudo-stderr-fifo",
                      "daemonset-doctor", "daemonset-profile",
                      "daemonset-inventory"):
             with self.subTest(cell=cell):

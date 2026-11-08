@@ -1064,6 +1064,10 @@ jobs:
             --require run-sudo --require run-user-nobody \
             --require run-kill-on-timeout --require trace-sudo-out \
             --require inventory-sudo-event-log \
+            --require inventory-sudo-fifo-out \
+            --require profile-sudo-fifo-out \
+            --require inventory-diff-sudo-fifo-out \
+            --require inventory-sudo-stderr-fifo \
             --require daemonset-doctor --require daemonset-profile \
             --require daemonset-inventory
           # The wrapper translates the documented nonqualifying-smoke exit 2

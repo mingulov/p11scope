@@ -792,6 +792,108 @@ pass=1
 [ "$(stat -c %a "$SUDODIR/events.jsonl")" = "600" ] || pass=0
 row inventory-sudo-event-log "$pass" qualified "exit=$rc owner=$(stat -c %U:%a "$SUDODIR/events.jsonl" 2>/dev/null)"
 rm -rf "$SUDODIR"
+# Sudo stdio to an invoker-owned FIFO: under `sudo ... | cat` (and on
+# user-owned terminals with old sudo) stdout/stderr are a pipe the
+# invoking user owns, while the observer shed DAC_OVERRIDE at startup
+# (no -o here). The observer must write through the inherited
+# descriptors anyway: a /proc/self/fd/N reopen fails EACCES on the
+# invoker-owned pipe, so the startup preserves private descriptions
+# first. Each row drains a nobody-owned 0600 FIFO with cat and
+# requires rc=0 plus the expected stdout and stderr text in the
+# stream. The stderr twin (stdout to a file, stderr to a FIFO)
+# requires the scan progress line, which a shed reopen loses
+# silently while still exiting 0.
+SUDODIR=$(mktemp -d /tmp/inventory-sudo-fifo.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+mkfifo "$SUDODIR/out.fifo"
+chown nobody:nogroup "$SUDODIR/out.fifo" 2>/dev/null || chown nobody:nobody "$SUDODIR/out.fifo"
+chmod 600 "$SUDODIR/out.fifo"
+wlog=$CELLTMP/out/workload-invsudofifo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+timeout 150 cat "$SUDODIR/out.fifo" >"$CELLTMP/out/inventory-sudo-fifo-out.fifo" 2>/dev/null &
+catpid=$!
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory --pid "$wpid" --capture scan \
+  >"$SUDODIR/out.fifo" 2>&1
+rc=$?
+stop_workload "$wpid"
+wait "$catpid" || true
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -q "^inventory pid:" "$CELLTMP/out/inventory-sudo-fifo-out.fifo" || pass=0
+grep -q "pass 0:" "$CELLTMP/out/inventory-sudo-fifo-out.fifo" || pass=0
+row inventory-sudo-fifo-out "$pass" qualified "exit=$rc $(head -1 "$CELLTMP/out/inventory-sudo-fifo-out.fifo" 2>/dev/null | head -c 200)"
+rm -rf "$SUDODIR"
+wlog=$CELLTMP/out/workload-profilesudofifo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+SUDODIR=$(mktemp -d /tmp/profile-sudo-fifo.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+mkfifo "$SUDODIR/out.fifo"
+chown nobody:nogroup "$SUDODIR/out.fifo" 2>/dev/null || chown nobody:nobody "$SUDODIR/out.fifo"
+chmod 600 "$SUDODIR/out.fifo"
+timeout 150 cat "$SUDODIR/out.fifo" >"$CELLTMP/out/profile-sudo-fifo-out.fifo" 2>/dev/null &
+catpid=$!
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" profile --pid "$wpid" --duration 8s \
+  >"$SUDODIR/out.fifo" 2>&1
+rc=$?
+stop_workload "$wpid"
+wait "$catpid" || true
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -qE "[1-9][0-9]* completed calls" "$CELLTMP/out/profile-sudo-fifo-out.fifo" || pass=0
+grep -q "capturing:" "$CELLTMP/out/profile-sudo-fifo-out.fifo" || pass=0
+row profile-sudo-fifo-out "$pass" qualified "exit=$rc $(grep -E 'completed calls' "$CELLTMP/out/profile-sudo-fifo-out.fifo" | head -c 160)"
+rm -rf "$SUDODIR"
+wlog=$CELLTMP/out/workload-diffsudofifo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory --pid "$wpid" --capture scan -o "$CELLTMP/out/diff-sudo-fifo-a.json" \
+  >"$CELLTMP/out/diff-sudo-fifo-gen-a.out" 2>"$CELLTMP/out/diff-sudo-fifo-gen-a.err"
+gena=$?
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory --pid "$wpid" --capture scan -o "$CELLTMP/out/diff-sudo-fifo-b.json" \
+  >"$CELLTMP/out/diff-sudo-fifo-gen-b.out" 2>"$CELLTMP/out/diff-sudo-fifo-gen-b.err"
+genb=$?
+stop_workload "$wpid"
+SUDODIR=$(mktemp -d /tmp/inventory-diff-sudo-fifo.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+mkfifo "$SUDODIR/out.fifo"
+chown nobody:nogroup "$SUDODIR/out.fifo" 2>/dev/null || chown nobody:nobody "$SUDODIR/out.fifo"
+chmod 600 "$SUDODIR/out.fifo"
+timeout 150 cat "$SUDODIR/out.fifo" >"$CELLTMP/out/inventory-diff-sudo-fifo-out.fifo" 2>/dev/null &
+catpid=$!
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory diff "$CELLTMP/out/diff-sudo-fifo-a.json" "$CELLTMP/out/diff-sudo-fifo-b.json" \
+  >"$SUDODIR/out.fifo" 2>&1
+rc=$?
+wait "$catpid" || true
+pass=1
+[ "$gena" -eq 0 ] || pass=0
+[ "$genb" -eq 0 ] || pass=0
+[ "$rc" -eq 0 ] || pass=0
+grep -q "^Inventory comparison:" "$CELLTMP/out/inventory-diff-sudo-fifo-out.fifo" || pass=0
+row inventory-diff-sudo-fifo-out "$pass" qualified "exit=$rc gen=$gena/$genb $(head -1 "$CELLTMP/out/inventory-diff-sudo-fifo-out.fifo" 2>/dev/null | head -c 160)"
+rm -rf "$SUDODIR"
+SUDODIR=$(mktemp -d /tmp/inventory-sudo-stderr-fifo.XXXXXX)
+chmod 700 "$SUDODIR"
+chown nobody:nogroup "$SUDODIR" 2>/dev/null || chown nobody:nobody "$SUDODIR"
+mkfifo "$SUDODIR/err.fifo"
+chown nobody:nogroup "$SUDODIR/err.fifo" 2>/dev/null || chown nobody:nobody "$SUDODIR/err.fifo"
+chmod 600 "$SUDODIR/err.fifo"
+wlog=$CELLTMP/out/workload-invsudostderrfifo.log
+wpid=$(start_workload 120 "$wlog") || exit 2
+timeout 150 cat "$SUDODIR/err.fifo" >"$CELLTMP/out/inventory-sudo-stderr-fifo.fifo" 2>/dev/null &
+catpid=$!
+env $SUDO_IDS timeout 120 "$CELLTMP/bin/full" inventory --pid "$wpid" --capture scan \
+  >"$CELLTMP/out/inventory-sudo-stderr-fifo.out" 2>"$SUDODIR/err.fifo"
+rc=$?
+stop_workload "$wpid"
+wait "$catpid" || true
+pass=1
+[ "$rc" -eq 0 ] || pass=0
+grep -q "^inventory pid:" "$CELLTMP/out/inventory-sudo-stderr-fifo.out" || pass=0
+grep -q "pass 0:" "$CELLTMP/out/inventory-sudo-stderr-fifo.fifo" || pass=0
+row inventory-sudo-stderr-fifo "$pass" qualified "exit=$rc $(head -1 "$CELLTMP/out/inventory-sudo-stderr-fifo.fifo" 2>/dev/null | head -c 200)"
+rm -rf "$SUDODIR"
 # DaemonSet rows: root with exactly the shipped grant (SYS_ADMIN,
 # SYS_PTRACE, DAC_READ_SEARCH). The observer must retain SYS_ADMIN as
 # the only BPF/map_files grant instead of dropping to an unusable set.

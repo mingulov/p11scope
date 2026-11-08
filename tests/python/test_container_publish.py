@@ -99,6 +99,8 @@ class ContainerPublishTests(unittest.TestCase):
         for marker in ("^{tree}", "merge-base --is-ancestor", "GITHUB_REF_NAME#v"):
             self.assertIn(marker, bodies,
                           f"build must check {marker} (tree, ancestry, version)")
+        self.assertIn("tag_version%%-*}", bodies,
+                      "build must strip the RC suffix for the version check")
         self.assertIn("--pattern", bodies, "build must download only the needed assets")
         self.assertIn('$2 == "RELEASE.json"', bodies,
                       "build must verify the RELEASE.json line explicitly")

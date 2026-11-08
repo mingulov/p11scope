@@ -2535,14 +2535,26 @@ impl ExeResolution {
 
 /// One unidentified caller image's executable: the EXEC-joined
 /// `(dev, ino)` pair with its userspace resolution. Invariants: a
-/// resolved image carries `Some` path and a nonzero pair; an
-/// unknown image carries no path.
+/// resolved image carries `Some` path, a nonzero pair, and every
+/// distinct canonical spelling that verified to the pair (sorted,
+/// primary included, so exactly one entry when unambiguous); an
+/// unknown image carries no path and no candidates.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub(crate) struct UnboundExe {
     pub dev: u64,
     pub ino: u64,
     pub path: Option<String>,
     pub resolution: ExeResolution,
+    pub identity_candidates: Vec<String>,
+}
+
+impl UnboundExe {
+    /// True when two or more distinct canonical paths verified to
+    /// the same pair: the shown path is kept (never dropped to
+    /// unknown) and the ambiguity is disclosed beside it.
+    pub(crate) fn identity_ambiguous(&self) -> bool {
+        self.identity_candidates.len() > 1
+    }
 }
 
 /// The unidentified caller image one unbound row names (slice 1):
@@ -6018,6 +6030,7 @@ impl CallerRegistry {
             ino: 0,
             path: None,
             resolution: ExeResolution::ExecRecordLost,
+            identity_candidates: Vec::new(),
         };
         for (cookie, known) in self.unidentified_images.iter_mut() {
             if cookie.domain() == domain && known.exe.resolution == ExeResolution::NoExecRecord {
@@ -9262,6 +9275,7 @@ pub(crate) mod tests {
             ino,
             path: path.map(str::to_string),
             resolution,
+            identity_candidates: path.map(|path| vec![path.to_string()]).unwrap_or_default(),
         }
     }
 

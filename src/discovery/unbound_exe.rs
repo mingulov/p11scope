@@ -204,9 +204,13 @@ fn maps_identity_at(maps: &str, addr: u64) -> Option<(u64, u64)> {
 
 /// Scan-learned identities for source (b): maps-domain
 /// `(dev, ino)` to path, re-verified by the mapping probe at use.
+/// `all_by_identity` carries every learned spelling per pair when
+/// the teacher set is known (production); `None` means exactly
+/// `by_identity` (scripted single-path tests).
 pub(crate) struct ScanLearned<'a> {
     pub by_identity: &'a HashMap<(u64, u64), String>,
     pub verify: VerifyProbe<'a>,
+    pub all_by_identity: Option<&'a HashMap<(u64, u64), Vec<String>>>,
 }
 
 /// Lazy system-binary index plus resolution.
@@ -273,12 +277,14 @@ impl ExeResolver {
                 ino,
                 path: None,
                 resolution: ExeResolution::ExeUnavailable,
+                identity_candidates: Vec::new(),
             };
         }
         if let Some(path) = Self::via_live_process(pid, dev, ino, hook_ts_ns, proc) {
             return UnboundExe {
                 dev,
                 ino,
+                identity_candidates: vec![path.clone()],
                 path: Some(path),
                 resolution: ExeResolution::ProcAlive,
             };
@@ -287,6 +293,7 @@ impl ExeResolver {
             return UnboundExe {
                 dev,
                 ino,
+                identity_candidates: vec![path.clone()],
                 path: Some(path),
                 resolution: ExeResolution::ScanLearned,
             };
@@ -295,6 +302,7 @@ impl ExeResolver {
             return UnboundExe {
                 dev,
                 ino,
+                identity_candidates: vec![path.clone()],
                 path: Some(path),
                 resolution: ExeResolution::SystemIndex,
             };
@@ -304,6 +312,7 @@ impl ExeResolver {
             ino,
             path: None,
             resolution: ExeResolution::PathUnknown,
+            identity_candidates: Vec::new(),
         }
     }
 
@@ -613,6 +622,7 @@ mod tests {
 
     struct ScriptedScan {
         map: HashMap<(u64, u64), String>,
+        multi: HashMap<(u64, u64), Vec<String>>,
         verify_answers: HashMap<String, (u64, u64)>,
         verify_calls: Cell<usize>,
     }
@@ -621,6 +631,7 @@ mod tests {
         fn empty() -> Self {
             Self {
                 map: HashMap::new(),
+                multi: HashMap::new(),
                 verify_answers: HashMap::new(),
                 verify_calls: Cell::new(0),
             }
@@ -633,6 +644,21 @@ mod tests {
             }
         }
 
+        /// Teach several spellings for one pair (a snapshot-clone
+        /// collision): the first is also the primary map entry.
+        fn learned_multi(&mut self, dev: u64, ino: u64, paths: &[&str]) {
+            self.multi.insert(
+                (dev, ino),
+                paths.iter().map(|path| path.to_string()).collect(),
+            );
+            if let Some(first) = paths.first() {
+                self.map.insert((dev, ino), first.to_string());
+            }
+            for path in paths {
+                self.verify_answers.insert(path.to_string(), (dev, ino));
+            }
+        }
+
         fn scan(&self) -> ScanLearned<'_> {
             ScanLearned {
                 by_identity: &self.map,
@@ -640,6 +666,11 @@ mod tests {
                     self.verify_calls.set(self.verify_calls.get() + 1);
                     self.verify_answers.get(path).copied()
                 }),
+                all_by_identity: if self.multi.is_empty() {
+                    None
+                } else {
+                    Some(&self.multi)
+                },
             }
         }
     }
@@ -668,6 +699,7 @@ mod tests {
                 ino: 99,
                 path: Some("/bin/x".to_string()),
                 resolution: ExeResolution::ProcAlive,
+                identity_candidates: vec!["/bin/x".to_string()],
             }
         );
     }
@@ -695,6 +727,7 @@ mod tests {
                 ino: 99,
                 path: None,
                 resolution: ExeResolution::PathUnknown,
+                identity_candidates: Vec::new(),
             }
         );
     }
@@ -743,6 +776,7 @@ mod tests {
                 ino: 99,
                 path: Some("/usr/bin/x".to_string()),
                 resolution: ExeResolution::ScanLearned,
+                identity_candidates: vec!["/usr/bin/x".to_string()],
             }
         );
         assert_eq!(
@@ -801,7 +835,113 @@ mod tests {
                 ino: 99,
                 path: Some("/usr/bin/x".to_string()),
                 resolution: ExeResolution::ScanLearned,
+                identity_candidates: vec!["/usr/bin/x".to_string()],
             }
+        );
+    }
+
+    /// One learned spelling resolves unambiguously: the single
+    /// candidate is the path, and the image is not ambiguous.
+    #[test]
+    fn single_learned_path_resolves_unambiguous() {
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        scan.learned(8, 99, "/usr/bin/x", Some((8, 99)));
+        let exe = resolver.resolve(
+            7,
+            8,
+            99,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert_eq!(exe.path.as_deref(), Some("/usr/bin/x"));
+        assert!(!exe.identity_ambiguous());
+        assert_eq!(exe.identity_candidates, vec!["/usr/bin/x".to_string()]);
+    }
+
+    /// Two learned spellings for one pair (snapshot-clone
+    /// collision): the caller keeps a shown path and the image
+    /// reads ambiguous with both candidates.
+    #[test]
+    fn two_learned_paths_for_one_pair_resolve_ambiguous() {
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        scan.learned_multi(82, 257, &["/snap/a/tool", "/snap/b/tool"]);
+        let exe = resolver.resolve(
+            7,
+            82,
+            257,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert!(
+            exe.path.as_deref() == Some("/snap/a/tool")
+                || exe.path.as_deref() == Some("/snap/b/tool"),
+            "a colliding pair keeps a shown path: {exe:?}"
+        );
+        assert!(
+            exe.identity_ambiguous(),
+            "a colliding pair reads ambiguous: {exe:?}"
+        );
+        assert_eq!(
+            exe.identity_candidates,
+            vec!["/snap/a/tool".to_string(), "/snap/b/tool".to_string()],
+            "both candidates list in a stable order: {exe:?}"
+        );
+    }
+
+    /// Two system-index spellings for one pair: same rule — a shown
+    /// path plus the ambiguity, never first-wins silence. The
+    /// hardlinked pair shares its index bucket like snapshot clones
+    /// share their inode.
+    #[test]
+    fn two_system_index_paths_for_one_pair_resolve_ambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("a-tool");
+        std::fs::write(&first, b"tool").unwrap();
+        let second = dir.path().join("b-tool");
+        std::fs::hard_link(&first, &second).unwrap();
+        let first_text = first.to_string_lossy().into_owned();
+        let second_text = second.to_string_lossy().into_owned();
+        let ino = std::fs::metadata(&first).unwrap().ino();
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        resolver.set_scripted_maps_identities(HashMap::from([
+            (first_text.clone(), (82, ino)),
+            (second_text.clone(), (82, ino)),
+        ]));
+        let proc = ScriptedProc::dead();
+        let scan = ScriptedScan::empty();
+        let exe = resolver.resolve(
+            7,
+            82,
+            ino,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::SystemIndex);
+        assert!(
+            exe.path.as_deref() == Some(first_text.as_str())
+                || exe.path.as_deref() == Some(second_text.as_str()),
+            "a colliding pair keeps a shown path: {exe:?}"
+        );
+        assert!(
+            exe.identity_ambiguous(),
+            "a colliding pair reads ambiguous: {exe:?}"
+        );
+        assert_eq!(
+            exe.identity_candidates,
+            vec![first_text, second_text],
+            "both candidates list in a stable order: {exe:?}"
         );
     }
 
@@ -854,6 +994,7 @@ mod tests {
                 ino,
                 path: Some(path.to_string_lossy().into_owned()),
                 resolution: ExeResolution::SystemIndex,
+                identity_candidates: vec![path.to_string_lossy().into_owned()],
             }
         );
         assert_eq!(
@@ -909,6 +1050,7 @@ mod tests {
                 ino: 99,
                 path: None,
                 resolution: ExeResolution::PathUnknown,
+                identity_candidates: Vec::new(),
             }
         );
     }
@@ -972,6 +1114,7 @@ mod tests {
                 ino: 0,
                 path: None,
                 resolution: ExeResolution::ExeUnavailable,
+                identity_candidates: Vec::new(),
             }
         );
         assert_eq!(proc.start_calls.get() + proc.exe_calls.get(), 0);
@@ -1127,8 +1270,9 @@ mod tests {
             UnboundExe {
                 dev: mapped_dev,
                 ino: meta.ino(),
-                path: Some(path_text),
+                path: Some(path_text.clone()),
                 resolution: ExeResolution::SystemIndex,
+                identity_candidates: vec![path_text],
             }
         );
     }
@@ -1322,6 +1466,118 @@ malformed line without fields
         assert_eq!(real_maps_identity_proc_exe_link(&path_text), None);
         assert_eq!(real_maps_identity_proc_exe_link("/proc/self/exe"), None);
         assert_eq!(real_maps_identity_proc_exe_link("/proc//exe"), None);
+    }
+
+    /// Create one btrfs subvolume under `parent` through the raw
+    /// ioctl (no `btrfs` CLI at runtime), like the D4 cells.
+    fn create_btrfs_subvolume(parent: &Path, name: &str) {
+        use std::os::fd::AsRawFd as _;
+        #[repr(C)]
+        struct VolArgs {
+            fd: i64,
+            name: [u8; 4088],
+        }
+        // musl `ioctl` takes a c_int request, glibc a c_ulong one; the
+        // number fits both.
+        #[cfg(target_env = "musl")]
+        const BTRFS_IOC_SUBVOL_CREATE: libc::c_int = 0x5000_940e;
+        #[cfg(not(target_env = "musl"))]
+        const BTRFS_IOC_SUBVOL_CREATE: libc::c_ulong = 0x5000_940e;
+        let dir = std::fs::File::open(parent).unwrap();
+        let mut args = VolArgs {
+            fd: 0,
+            name: [0; 4088],
+        };
+        args.name[..name.len()].copy_from_slice(name.as_bytes());
+        // SAFETY: a valid directory fd and a NUL-terminated name in a
+        // correctly sized btrfs_ioctl_vol_args.
+        let rc = unsafe { libc::ioctl(dir.as_raw_fd(), BTRFS_IOC_SUBVOL_CREATE, &args) };
+        assert_eq!(rc, 0, "{}", std::io::Error::last_os_error());
+    }
+
+    /// Live subvolume twins on btrfs: the same payload written to two
+    /// fresh subvolumes shares the kernel `(s_dev, ino)` pair while
+    /// stat reports two subvolume devices (the file-identity audit
+    /// shape). Two teacher spellings for that pair resolve to a
+    /// shown path that stays marked ambiguous with both candidates.
+    /// Root lane with TMPDIR on btrfs (the runner provisions a loop
+    /// mount for the group); the fixture subvolumes live and die on
+    /// that disposable mount.
+    #[test]
+    #[ignore = "privileged: btrfs subvolume twins resolve ambiguous (root, btrfs TMPDIR)"]
+    fn privileged_btrfs_subvolume_collision_resolves_ambiguous() {
+        // SAFETY: reading the effective uid has no preconditions.
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root in the btrfs campaign lane"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path();
+        let mut stat = std::mem::MaybeUninit::<libc::statfs>::uninit();
+        let c_parent = std::ffi::CString::new(parent.as_os_str().as_encoded_bytes()).unwrap();
+        // SAFETY: a valid path and writable statfs buffer, read only on success.
+        assert_eq!(
+            unsafe { libc::statfs(c_parent.as_ptr(), stat.as_mut_ptr()) },
+            0
+        );
+        // SAFETY: initialized by the successful statfs above.
+        // `f_type` is signed on glibc and unsigned on musl; the magic fits both.
+        #[allow(clippy::unnecessary_cast)]
+        let magic = unsafe { stat.assume_init().f_type } as u64 & 0xffff_ffff;
+        assert_eq!(magic, 0x9123_683e, "actual fixture TMPDIR must be Btrfs");
+        create_btrfs_subvolume(parent, "a");
+        create_btrfs_subvolume(parent, "b");
+        let a_path = parent.join("a/tool");
+        let b_path = parent.join("b/tool");
+        std::fs::write(&a_path, vec![0x7fu8; 4096]).unwrap();
+        std::fs::write(&b_path, vec![0x7fu8; 4096]).unwrap();
+        let a_text = a_path.to_string_lossy().into_owned();
+        let b_text = b_path.to_string_lossy().into_owned();
+        let pair_a = real_maps_identity(&a_text).expect("twin A maps");
+        let pair_b = real_maps_identity(&b_text).expect("twin B maps");
+        assert_eq!(pair_a, pair_b, "subvolume twins share the kernel pair");
+        let meta_a = std::fs::metadata(&a_path).unwrap();
+        let meta_b = std::fs::metadata(&b_path).unwrap();
+        assert_eq!(meta_a.ino(), meta_b.ino(), "twins share the inode number");
+        assert_ne!(
+            meta_a.dev(),
+            meta_b.dev(),
+            "twins live on two subvolume devices"
+        );
+        let mut by_identity = HashMap::new();
+        by_identity.insert(pair_a, a_text.clone());
+        let mut all = HashMap::new();
+        all.insert(pair_a, vec![a_text.clone(), b_text.clone()]);
+        let scan = ScanLearned {
+            by_identity: &by_identity,
+            verify: Box::new(real_maps_identity),
+            all_by_identity: Some(&all),
+        };
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let exe = resolver.resolve(
+            7,
+            pair_a.0,
+            pair_a.1,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan,
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert!(
+            exe.path.as_deref() == Some(a_text.as_str())
+                || exe.path.as_deref() == Some(b_text.as_str()),
+            "the collision keeps a shown path: {exe:?}"
+        );
+        assert!(
+            exe.identity_ambiguous(),
+            "the collision reads ambiguous: {exe:?}"
+        );
+        let mut candidates = exe.identity_candidates.clone();
+        candidates.sort();
+        assert_eq!(candidates, vec![a_text, b_text], "both twins list: {exe:?}");
     }
 
     /// The user question "which program called?" over one short-lived

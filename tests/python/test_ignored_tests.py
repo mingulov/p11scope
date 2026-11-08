@@ -1607,14 +1607,14 @@ class IgnoredTestsTests(unittest.TestCase):
         # The fake lists both load-gate alternatives (a real binary has
         # exactly one), so the default section shows 223 + 2.
         self.assertIn("default (225)", result.stdout)
-        self.assertIn("btrfs (16, --include-btrfs only)", result.stdout)
+        self.assertIn("btrfs (17, --include-btrfs only)", result.stdout)
         self.assertIn("overlay (3, --include-overlay only)", result.stdout)
         self.assertIn("expected-failures (3, --include-expected-failures "
                       "only)", result.stdout)
         self.assertIn(BTRFS_EXPECTED[0], result.stdout)
         self.assertIn(OVERLAY_EXPECTED[0], result.stdout)
         self.assertIn(XFAIL_EXPECTED[0] + " :: ", result.stdout)
-        self.assertIn("verify: curation matches the binary (287 tests)",
+        self.assertIn("verify: curation matches the binary (288 tests)",
                       result.stdout)
 
     def test_real_tree_skip_entries_carry_until(self):

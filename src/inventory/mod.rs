@@ -8517,6 +8517,8 @@ fn module_json(module: &crate::inventory_present::ModuleView) -> serde_json::Val
                         "dev": {"major": device.major, "minor": device.minor},
                         "ino": pid.exe.ino,
                         "resolution": pid.exe.resolution.json_label(),
+                        "identity_ambiguous": pid.exe.identity_ambiguous(),
+                        "identity_candidates": pid.exe.identity_candidates,
                         "pid_host": pid.pid_host,
                         "first_call_ns": pid.first_call_ns,
                         "calls_at_least": pid.calls_at_least,

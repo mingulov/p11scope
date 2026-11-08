@@ -386,6 +386,38 @@ fn unbound_use_executables_are_carried_when_present() {
 }
 
 #[test]
+fn unbound_use_executables_ignore_additive_ambiguity_keys() {
+    let mut v = fixture();
+    v["modules"][0]["unbound_use"] = json!({
+        "first_ns": 123, "rows": 1,
+        "reasons": {"no_live_caller": 1}, "entries": 1,
+        "images": 1, "images_saturated": false,
+        "pids": [{"pid_host": 9, "first_call_ns": 210}],
+        "pids_dropped": 0,
+        "executables": [
+            {"exe": "/snap/a/tool", "dev": {"major": 0, "minor": 82}, "ino": 257, "resolution": "scan_learned",
+             "identity_ambiguous": true, "identity_candidates": ["/snap/a/tool", "/snap/b/tool"],
+             "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
+        ]
+    });
+    let snapshot = parse_snapshot(&bytes(&v)).unwrap();
+    let unbound = snapshot.modules[0].unbound_use.as_ref().unwrap();
+    assert_eq!(unbound.executables.len(), 1);
+    assert_eq!(
+        unbound.executables[0],
+        UnboundExe {
+            exe: Some("/snap/a/tool".to_string()),
+            dev: 82,
+            ino: 257,
+            resolution: "scan_learned".to_string(),
+            pid_host: 9,
+            first_call_ns: 210,
+            calls_at_least: 1,
+        }
+    );
+}
+
+#[test]
 fn unbound_use_executables_default_for_old_captures() {
     let mut v = fixture();
     v["modules"][0]["unbound_use"] = json!({

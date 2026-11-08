@@ -2616,6 +2616,20 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
             }
             GroupKey::Unknown(..) => unknown_exe_label(&group.members[0].exe),
         };
+        // An ambiguous image keeps its shown path; the marker names
+        // the collision beside it (the most candidates in the group
+        // when members disagree). Counts never change.
+        let candidates = group
+            .members
+            .iter()
+            .map(|pid| pid.exe.identity_candidates.len())
+            .max()
+            .unwrap_or(0);
+        let name = if candidates > 1 {
+            format!("{name} (ambiguous, {candidates} candidates)")
+        } else {
+            name
+        };
         let mut members = group.members.clone();
         members.sort_by(|a, b| {
             a.first_call_ns
@@ -3390,8 +3404,29 @@ fn render_snapshot_inner(
                                 None => unknown_exe_label(&pid.exe),
                             };
                             let device = p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
+                            // Verbose lists every candidate: the shown
+                            // path plus each other spelling that
+                            // verified to the same pair.
+                            let ambiguity = if pid.exe.identity_ambiguous() {
+                                let shown = pid.exe.path.as_deref().unwrap_or_default();
+                                let others: Vec<String> = pid
+                                    .exe
+                                    .identity_candidates
+                                    .iter()
+                                    .filter(|candidate| candidate.as_str() != shown)
+                                    .map(|candidate| escape_controls(candidate).into_owned())
+                                    .collect();
+                                format!(
+                                    "; ambiguous: same identity as {} other file{}: {}",
+                                    others.len(),
+                                    if others.len() == 1 { "" } else { "s" },
+                                    others.join(", "),
+                                )
+                            } else {
+                                String::new()
+                            };
                             format!(
-                                "{} host pid {} (first call {} ago; dev {}:{} ino {}; {})",
+                                "{} host pid {} (first call {} ago; dev {}:{} ino {}; {}{})",
                                 name,
                                 pid.pid_host,
                                 crate::render::fmt_ns(Some(
@@ -3401,6 +3436,7 @@ fn render_snapshot_inner(
                                 device.minor,
                                 pid.exe.ino,
                                 exe_source_label(pid.exe.resolution),
+                                ambiguity,
                             )
                         })
                         .collect::<Vec<_>>()

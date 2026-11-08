@@ -1433,6 +1433,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let scan = ScanLearned {
             by_identity: learned,
             verify: Box::new(crate::discovery::unbound_exe::real_maps_identity),
+            all_by_identity: None,
         };
         self.exe_resolver.resolve(
             exec.pid_host,
@@ -8509,12 +8510,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                         ino: 0,
                         path: None,
                         resolution: ExeResolution::ExecRecordLost,
+                        identity_candidates: Vec::new(),
                     },
                     None => UnboundExe {
                         dev: 0,
                         ino: 0,
                         path: None,
                         resolution: ExeResolution::NoExecRecord,
+                        identity_candidates: Vec::new(),
                     },
                 };
                 let image = UnboundImage {
@@ -29414,6 +29417,7 @@ int main(void) {
                 ino: 0,
                 path: None,
                 resolution: ExeResolution::ExecRecordLost,
+                identity_candidates: Vec::new(),
             }
         );
     }
@@ -29672,6 +29676,109 @@ int main(void) {
         );
     }
 
+    /// Concise ambiguity: two teacher spellings for one pair keep
+    /// a shown path with an `(ambiguous, 2 candidates)` marker; the
+    /// count headline still counts one caller, and JSON keeps the
+    /// path with the additive ambiguity keys. The hardlinked pair
+    /// shares its mapped identity like snapshot clones share
+    /// theirs.
+    #[test]
+    fn concise_marks_an_ambiguous_executable_without_changing_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("tool-a");
+        std::fs::write(&first, b"tool").unwrap();
+        let second = dir.path().join("tool-b");
+        std::fs::hard_link(&first, &second).unwrap();
+        let (dev, ino) = crate::discovery::unbound_exe::real_maps_identity(first.to_str().unwrap())
+            .expect("the staged tool maps");
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        for (pid, path) in [(20u32, &first), (21, &second)] {
+            native.scene.source.spawn(pid, 100);
+            native.scene.source.exec(pid, 101, path.to_str().unwrap());
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, 100)
+                .unwrap();
+        }
+        native.execs(vec![exec_record(41, 9, 100, dev, ino)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let (text, document) = slice_one_views(&native);
+        let line =
+            "unidentified executables: tool-a (ambiguous, 2 candidates) (1 call, host pid 9)";
+        assert!(
+            text.lines().any(|candidate| candidate == line),
+            "concise marks the collision beside its shown path:\n{text}"
+        );
+        let headline = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
+        assert!(
+            text.lines().any(|candidate| candidate == headline),
+            "the caller stays one caller:\n{text}"
+        );
+        assert_eq!(document["modules"][0]["unbound_use"]["images"], 1);
+        let exe = &document["modules"][0]["unbound_use"]["executables"][0];
+        assert_eq!(exe["resolution"], "scan_learned");
+        assert_eq!(exe["exe"], serde_json::json!(first.to_string_lossy()));
+        assert_eq!(exe["identity_ambiguous"], true);
+        assert_eq!(
+            exe["identity_candidates"],
+            serde_json::json!([first.to_string_lossy(), second.to_string_lossy()]),
+            "JSON lists both candidates: {exe}"
+        );
+    }
+
+    /// Verbose ambiguity: the per-executable detail lists every
+    /// other spelling that verified to the same pair.
+    #[test]
+    fn verbose_ambiguous_executable_lists_every_candidate() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("tool-a");
+        std::fs::write(&first, b"tool").unwrap();
+        let second = dir.path().join("tool-b");
+        std::fs::hard_link(&first, &second).unwrap();
+        let (dev, ino) = crate::discovery::unbound_exe::real_maps_identity(first.to_str().unwrap())
+            .expect("the staged tool maps");
+        let (mut native, _) = NativeScene::new();
+        native.scene.coordinator.set_exe_index_dirs(Vec::new());
+        for (pid, path) in [(20u32, &first), (21, &second)] {
+            native.scene.source.spawn(pid, 100);
+            native.scene.source.exec(pid, 101, path.to_str().unwrap());
+            native
+                .scene
+                .coordinator
+                .adapter
+                .admit(pid, ImageAuthority::ScanPinned, 100)
+                .unwrap();
+        }
+        native.execs(vec![exec_record(41, 9, 100, dev, ino)]);
+        native.witness(vec![native.row(41, 1, 9, 210, 0)]);
+        let presentation = crate::inventory_present::Presentation::capture(
+            &native.scene.coordinator,
+            "native",
+            0,
+            2_000,
+            1,
+        );
+        let text = crate::inventory_present::render_snapshot_with_verbosity(
+            &presentation,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        let device = p11scope_manifest::maps::Device::from_kdev(dev);
+        let detail = format!(
+            "{} host pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via scan record; ambiguous: same identity as 1 other file: {})",
+            first.display(),
+            device.major,
+            device.minor,
+            second.display(),
+        );
+        assert!(
+            text.contains(&detail),
+            "verbose lists every candidate:\n{text}"
+        );
+    }
+
     /// Concise unknown groups: lost EXEC records read
     /// `executable unknown (exec record lost)` with their count;
     /// unjoined images without loss read `no exec record`.
@@ -29891,6 +29998,7 @@ int main(void) {
                 ino: 100,
                 path: Some("/bin/driver".to_string()),
                 resolution: ExeResolution::ProcAlive,
+                identity_candidates: vec!["/bin/driver".to_string()],
             }
         );
     }
@@ -29920,6 +30028,7 @@ int main(void) {
                 ino: 700,
                 path: Some("/bin/maps-driver".to_string()),
                 resolution: ExeResolution::ProcAlive,
+                identity_candidates: vec!["/bin/maps-driver".to_string()],
             }
         );
     }
@@ -29945,8 +30054,8 @@ int main(void) {
         assert_eq!(
             document["modules"][0]["unbound_use"]["executables"],
             serde_json::json!([
-                {"exe": path.to_string_lossy(), "dev": {"major": device.major, "minor": device.minor}, "ino": ino, "resolution": "system_index", "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
-                {"exe": null, "dev": {"major": 0, "minor": 0}, "ino": 0, "resolution": "no_exec_record", "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
+                {"exe": path.to_string_lossy(), "dev": {"major": device.major, "minor": device.minor}, "ino": ino, "resolution": "system_index", "identity_ambiguous": false, "identity_candidates": [path.to_string_lossy()], "pid_host": 9, "first_call_ns": 210, "calls_at_least": 1},
+                {"exe": null, "dev": {"major": 0, "minor": 0}, "ino": 0, "resolution": "no_exec_record", "identity_ambiguous": false, "identity_candidates": [], "pid_host": 11, "first_call_ns": 220, "calls_at_least": 1},
             ])
         );
         assert_eq!(

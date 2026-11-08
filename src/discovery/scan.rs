@@ -4391,15 +4391,65 @@ pub(crate) fn lower_candidates_from_mountinfo(
     mountinfo: &str,
     merged: &std::path::Path,
 ) -> Vec<std::path::PathBuf> {
+    lower_rooted_candidates_from_mountinfo(mountinfo, merged)
+        .into_iter()
+        .map(|(_, candidate)| candidate)
+        .collect()
+}
+
+/// Each lower-layer candidate paired with its layer directory: the
+/// same list [`lower_candidates_from_mountinfo`] returns, with the
+/// root each entry was joined under. Callers that treat an entry's
+/// absence as "no entry" must first require the root to stat as a
+/// directory — an unstatable layer proves no absence.
+pub(crate) fn lower_rooted_candidates_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Vec<(std::path::PathBuf, std::path::PathBuf)> {
     let Some((super_opts, rel)) = overlay_row_for(mountinfo, merged) else {
         return Vec::new();
     };
+    let Some(lowers) = overlay_lowerdirs(&super_opts) else {
+        return Vec::new();
+    };
+    if lowers.is_empty() {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for lower in lowers {
+        let root = std::path::PathBuf::from(&lower);
+        let candidate = root.join(&rel);
+        if !out
+            .iter()
+            .any(|(_, known): &(std::path::PathBuf, std::path::PathBuf)| *known == candidate)
+        {
+            out.push((root, candidate));
+        }
+    }
+    out
+}
+
+/// The `upperdir` of an overlay row's super options, unescaped. `None`
+/// when the row names none.
+fn overlay_upperdir(super_opts: &str) -> Option<String> {
+    super_opts
+        .split(',')
+        .find_map(|opt| opt.strip_prefix("upperdir="))
+        .filter(|dir| !dir.is_empty())
+        .map(unescape_mountinfo_field)
+}
+
+/// The ordered `lowerdir` stack of an overlay row's super options,
+/// unescaped. `None` refuses the row outright: a `datadir` layer or
+/// the legacy data-only `::` separator names a layer this reader
+/// cannot resolve, so the stack would be incomplete.
+fn overlay_lowerdirs(super_opts: &str) -> Option<Vec<String>> {
     let mut lowers = Vec::new();
     for opt in super_opts.split(',') {
         // A data-only lower layer this reader cannot resolve: the stack
         // would be incomplete, so the row refuses outright.
         if opt.starts_with("datadir") {
-            return Vec::new();
+            return None;
         }
         if let Some(stack) = opt.strip_prefix("lowerdir=") {
             let layers: Vec<&str> = stack.split(':').collect();
@@ -4413,7 +4463,7 @@ pub(crate) fn lower_candidates_from_mountinfo(
                     && layers[at + 1..].iter().any(|peer| !peer.is_empty())
             });
             if data_only_gap {
-                return Vec::new();
+                return None;
             }
             lowers.extend(
                 layers
@@ -4429,17 +4479,7 @@ pub(crate) fn lower_candidates_from_mountinfo(
             }
         }
     }
-    if lowers.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for lower in lowers {
-        let candidate = std::path::Path::new(&lower).join(&rel);
-        if !out.contains(&candidate) {
-            out.push(candidate);
-        }
-    }
-    out
+    Some(lowers)
 }
 
 /// Upper-layer candidate for a merged path, read back from a mount
@@ -4449,17 +4489,31 @@ pub(crate) fn lower_candidates_from_mountinfo(
 /// upperdir, or the remainder escapes (fail closed). Shares the row
 /// scan with [`lower_candidates_from_mountinfo`], so the same caller
 /// rules apply: the same normalized merged path and mount table on
-/// both sides of a comparison.
+/// both sides of a comparison. Test-only: production reads through
+/// [`upper_rooted_candidate_from_mountinfo`], and this wrapper's
+/// suite pins the shared parse.
+#[cfg(test)]
 pub(crate) fn upper_candidate_from_mountinfo(
     mountinfo: &str,
     merged: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
+    upper_rooted_candidate_from_mountinfo(mountinfo, merged).map(|(_, candidate)| candidate)
+}
+
+/// The upper-layer candidate paired with its layer directory: the
+/// same path [`upper_candidate_from_mountinfo`] returns, with the
+/// root it was joined under (see
+/// [`lower_rooted_candidates_from_mountinfo`] for why the root
+/// matters).
+pub(crate) fn upper_rooted_candidate_from_mountinfo(
+    mountinfo: &str,
+    merged: &std::path::Path,
+) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
     let (super_opts, rel) = overlay_row_for(mountinfo, merged)?;
-    let upper = super_opts
-        .split(',')
-        .find_map(|opt| opt.strip_prefix("upperdir="))
-        .filter(|dir| !dir.is_empty())?;
-    Some(std::path::Path::new(&unescape_mountinfo_field(upper)).join(&rel))
+    let upper = overlay_upperdir(&super_opts)?;
+    let root = std::path::PathBuf::from(&upper);
+    let candidate = root.join(&rel);
+    Some((root, candidate))
 }
 
 /// Prove one witness-requiring provider file with the original-file

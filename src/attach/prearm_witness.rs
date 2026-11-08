@@ -639,14 +639,22 @@ fn calibration_backing_accepted_with(
     // no entry at all, `Ok(Some)` for a regular file, `Err` for a
     // non-regular entry (whiteout, symlink, directory) — the topmost
     // existing entry selects the backing file, so a non-regular topmost
-    // entry refuses instead of falling through. Read with
+    // entry refuses instead of falling through. Only `NotFound` reads
+    // as "no entry", and only after the layer root stats as a
+    // directory: any other stat failure (an unreadable or missing
+    // layer, a looping or blocked entry path) refuses instead of
+    // falling through to a lower layer. Read with
     // `symlink_metadata`, which only skips the last path component;
     // intermediate symlinks are still followed.
-    fn layer_entry(path: &std::path::Path) -> Result<Option<u64>, ()> {
+    fn layer_entry(root: &std::path::Path, path: &std::path::Path) -> Result<Option<u64>, ()> {
         use std::os::unix::fs::MetadataExt as _;
+        if !std::fs::metadata(root).is_ok_and(|meta| meta.is_dir()) {
+            return Err(());
+        }
         let meta = match std::fs::symlink_metadata(path) {
             Ok(meta) => meta,
-            Err(_) => return Ok(None),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(_) => return Err(()),
         };
         if meta.file_type().is_file() {
             Ok(Some(meta.ino()))
@@ -654,15 +662,20 @@ fn calibration_backing_accepted_with(
             Err(())
         }
     }
-    let upper = crate::discovery::scan::upper_candidate_from_mountinfo(table, &merged);
-    let upper_ino = match upper.as_deref().map(layer_entry) {
+    let upper = crate::discovery::scan::upper_rooted_candidate_from_mountinfo(table, &merged);
+    let upper_ino = match upper
+        .as_ref()
+        .map(|(root, candidate)| layer_entry(root, candidate))
+    {
         None | Some(Ok(None)) => None,
         Some(Ok(Some(ino))) => Some(ino),
         Some(Err(())) => return false,
     };
     let mut lower_ino = None;
-    for candidate in crate::discovery::scan::lower_candidates_from_mountinfo(table, &merged) {
-        match layer_entry(&candidate) {
+    for (root, candidate) in
+        crate::discovery::scan::lower_rooted_candidates_from_mountinfo(table, &merged)
+    {
+        match layer_entry(&root, &candidate) {
             Ok(None) => continue,
             Ok(Some(ino)) => {
                 lower_ino = Some(ino);
@@ -677,7 +690,10 @@ fn calibration_backing_accepted_with(
         (None, Some(lower)) if slot_ino == lower => true,
         // A metadata-only upper still backs reads from the lower file.
         (Some(_), Some(lower))
-            if upper.as_deref().is_some_and(&is_metacopy) && slot_ino == lower =>
+            if upper
+                .as_ref()
+                .is_some_and(|(_, candidate)| is_metacopy(candidate))
+                && slot_ino == lower =>
         {
             true
         }

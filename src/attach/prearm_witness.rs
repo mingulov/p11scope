@@ -749,12 +749,14 @@ pub(crate) fn start_with<B: WitnessBackend>(
             .read(true)
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(path)
-            .map_err(|_| Unavailable::Btf(format!("witness cannot open {}", path.display())))?;
+            .map_err(|_| {
+                Unavailable::Calibration(format!("witness cannot open {}", path.display()))
+            })?;
         #[cfg(test)]
         open_race_test::fired(path);
         let meta = file
             .metadata()
-            .map_err(|_| Unavailable::Btf("witness fstat failed".into()))?;
+            .map_err(|_| Unavailable::Calibration("witness fstat failed".into()))?;
         if !meta.file_type().is_file() {
             return Err(Unavailable::Btf(format!(
                 "witness needs regular files: {}",
@@ -765,7 +767,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
         // held baseline: recorded here, and required to equal the
         // pre-open pin, so a copy-up inside the open window refuses.
         let open_pin = crate::discovery::identity::pin_of(&file)
-            .map_err(|_| Unavailable::Btf("witness fstat failed".into()))?;
+            .map_err(|_| Unavailable::Calibration("witness fstat failed".into()))?;
         if open_pin != pre {
             return Err(Unavailable::Calibration(
                 "witness file changed while opening".into(),

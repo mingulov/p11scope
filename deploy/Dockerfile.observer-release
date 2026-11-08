@@ -17,8 +17,11 @@
 #     -t <tag> "$CTX"
 # (CTX/<tarball>, CTX/scripts/k8s-profile-entry.sh).
 # container-publish downloads the release tarball, SHA256SUMS and RELEASE.json,
-# verifies the checksums and the RELEASE tree, head ancestry and version, and
-# passes the checked hash as TARBALL_SHA256. The first stage re-verifies the
+# verifies the checksums and the RELEASE tree, head ancestry and version,
+# refuses absolute or parent-climbing tarball members with the runner's
+# GNU tar (busybox tar here strips those in its listing, so the check cannot
+# live in this build), and passes the checked hash as TARBALL_SHA256. The
+# first stage re-verifies the
 # copied bytes against that hash before unpacking, so a tarball swapped after
 # staging is refused; only the staged binary and license texts are copied into
 # the final stage, so the tarball itself never lands in a published layer.
@@ -44,7 +47,6 @@ RUN set -eu; \
     [ -n "${TARBALL_SHA256:-}" ] || { echo "TARBALL_SHA256 build arg is required" >&2; exit 1; }; \
     echo "${TARBALL_SHA256}  /tmp/release.tar.gz" | sha256sum -c -; \
     mkdir -p /tmp/rel /tmp/stage/bin /tmp/stage/licenses/LICENSES /tmp/stage/licenses/notices; \
-    if tar -tzf /tmp/release.tar.gz | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "tarball has unsafe members" >&2; exit 1; fi; \
     tar -xzf /tmp/release.tar.gz -C /tmp/rel; \
     if [ "$(find /tmp/rel -type f -path '*/p11scope' | head -n 2 | grep -c .)" -ne 1 ]; then echo "tarball must hold exactly one p11scope binary" >&2; exit 1; fi; \
     cp "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)" /tmp/stage/bin/p11scope; \

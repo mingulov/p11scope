@@ -11,8 +11,10 @@ concurrency:
 jobs:
   # Publish the observer image from the release assets: the musl tarball,
   # SHA256SUMS and RELEASE.json for the tag are downloaded, the checksums
-  # are verified and the RELEASE tree, head ancestry and version are
-  # asserted against the tag commit, then
+  # are verified (RELEASE.json before it is parsed) and the RELEASE tree,
+  # head ancestry and version are asserted against the tag commit, with
+  # the packaged head bound to the RELEASE tree and unsafe tarball
+  # members refused, then
   # the reconciled release Dockerfile builds with --network=none after
   # pulling its pinned base by digest. The smoke runs the image with the
   # documented measured flags (--version with a tag match, doctor, a short
@@ -52,15 +54,20 @@ jobs:
             --pattern 'p11scope-[0-9]*-x86_64-linux-musl.tar.gz' \
             --pattern 'RELEASE.json' --pattern 'SHA256SUMS'
           cd "$assets"
-          eval "$(python3 -I - RELEASE.json <<'PY'
+          release_sha256=$(awk '$2 == "RELEASE.json" {print $1}' SHA256SUMS)
+          test -n "$release_sha256"
+          printf '%s  %s\n' "$release_sha256" RELEASE.json | sha256sum --check
+          release_vars=$(python3 -I - RELEASE.json <<'PY'
           import json
           import shlex
           release = json.load(open("RELEASE.json", encoding="utf-8"))
           for key in ("head", "tree", "version"):
               print(f"release_{key}={shlex.quote(str(release[key]))}")
           PY
-          )"
+          )
+          eval "$release_vars"
           test "$(git -C "$GITHUB_WORKSPACE" rev-parse "$GITHUB_SHA^{tree}")" = "$release_tree"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse "$release_head^{tree}")" = "$release_tree"
           git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$release_head" "$GITHUB_SHA"
           tag_version="${GITHUB_REF_NAME#v}"
           test "$release_version" = "${tag_version%%-*}"
@@ -72,9 +79,14 @@ jobs:
           tarball_sha256=$(awk -v want="$tarball" '$2 == want {print $1}' SHA256SUMS)
           test -n "$tarball_sha256"
           printf '%s  %s\n' "$tarball_sha256" "$tarball" | sha256sum --check
-          release_sha256=$(awk '$2 == "RELEASE.json" {print $1}' SHA256SUMS)
-          test -n "$release_sha256"
-          printf '%s  %s\n' "$release_sha256" RELEASE.json | sha256sum --check
+          # The runner tar is GNU tar: it lists raw member names, unlike the
+          # busybox tar in the image build. List to files (a pipefail grep -q
+          # would skew on SIGPIPE) and refuse absolute or parent-climbing
+          # members.
+          tar --version >"$RUNNER_TEMP/tar-version.txt"
+          grep -q 'GNU tar' "$RUNNER_TEMP/tar-version.txt"
+          tar -tzf "$tarball" >"$RUNNER_TEMP/tarball-members.txt"
+          if grep -qE '(^/|(^|/)\.\.(/|$))' "$RUNNER_TEMP/tarball-members.txt"; then echo "tarball has unsafe members" >&2; exit 1; fi
           echo "$tarball" >"$RUNNER_TEMP/observer-tarball-name.txt"
           echo "$tarball_sha256" >"$RUNNER_TEMP/observer-tarball-sha256.txt"
           ctx="$RUNNER_TEMP/container-publish-ctx"

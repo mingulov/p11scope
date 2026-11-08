@@ -2331,7 +2331,9 @@ Safe scoped Singles remains available on eligible hosts; PID Multi additionally
 requires a proven kernel PID filter. Help, version, inspect, discovery, saved
 report read/diff and genuine `inventory --capture scan` remain usable without
 the live gate. Non-Multi live support may be reconsidered around 0.9.x; no
-release commitment is made.
+release commitment is made. Pre-6.12 kernel behavior — what refuses, what
+still works, and the exact messages — is collected in
+[Kernels before 6.12](known-limitations.md#kernels-before-612).
 
 The following permission measurements are historical diagnostics. Their old
 5.15 floor hints and exit-0 partial-capture behavior predate current host

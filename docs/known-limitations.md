@@ -84,8 +84,86 @@ provider's maps rendering unproven; callers mapping it may stay
 unbound), the pre-6.8 pre-arm join shapes, the 5.15 birth race, and
 speed claims only on `uprobe_multi` hosts (older kernels stay correct
 and finite, never fast) all still apply — see
-[Known limitations in 0.6.0](#known-limitations-in-060). v0.7.0 adds
-no new pre-6.12 product edge case.
+[Known limitations in 0.6.0](#known-limitations-in-060). The v0.7.0
+measurements on those kernels follow.
+
+Public CLI vng cells at rc `79108a1c7` (stripped release observer and
+helper) on 5.15.221, 6.1.188 and 6.6.157, with a 7.3.1 control run. No
+6.9 kernel was cached, so 6.9.12 was not run and the fixed-filter
+boundary there stays unverified; 6.7, 6.8, 6.10 and 6.11 were not run
+either. Each edge below names its measured kernel range.
+
+#### 5.15 and 6.1 refuse live capture
+
+- What the user sees: every live capture — `profile`, `metrics`,
+  `trace`, `run`, `--system`/`--cgroup` scopes, counter modes and
+  `--select-endpoint` — exits 1 with one line and writes no report:
+
+  ```
+  p11scope: live capture did not start: attaching p11scope's probes failed (Invalid argument); run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.
+  ```
+
+  Inventory scopes prefix the command (`p11scope: inventory --system:
+  live capture did not start: ...`, same for `--cgroup`). A `run`
+  workload never starts: a guarded `touch` file was never created on
+  the 5.15 probe, and 6.1 exits the same refusal with no report.
+- Kernels/conditions: 5.15.221 and 6.1.188 measured, identically: all
+  27 live cells of the public CLI campaign refuse this way on both.
+- Why: the functional host probe cannot link uprobe-multi (`Invalid
+  argument`), so admission refuses before capture, output changes or
+  workload start.
+- Workaround: capture on a 6.6+ host with usable uprobe-multi, or stay
+  with the scan-only paths below. The historical 5.15/6.1 startup
+  figures in [Quickstart](usage.md#quickstart) predate host admission;
+  current builds refuse before any `capturing:` line.
+
+#### 5.15 and 6.1 keep scan-only paths
+
+- What the user sees: `inspect --pid N` exits 0; `inventory --pid N`
+  exits 0 with a PARTIAL scan report carrying the gap `native usage
+  feed unavailable` (`p11scope: native usage feed unavailable,
+  continuing with the scan lane: live capture refused (...)`);
+  `inventory --capture scan`, help, version, discovery and saved-report
+  read/diff work; `doctor` exits 1 with the honest unready diagnosis
+  (`Doctor: requested lane unavailable.` and `Next: use a host with
+  uprobe-multi (normally Linux 6.6+) for live capture; ...`).
+- Kernels/conditions: 5.15.221 and 6.1.188 measured.
+- Why: these paths need no live probes; `doctor` capability-tests the
+  host instead of admitting by version.
+- Workaround: none needed. Gate order to be aware of: refusal shapes
+  that need a running capture (FIFO `-o`, second-signal cleanup) and
+  the startup-to-`capturing:` timing cannot be distinguished here —
+  the live refusal fires first.
+
+#### 6.6 runs live; one transient honest gap observed
+
+- What the user sees: the 30-cell public CLI campaign passes (23–24
+  pass, `trace-pid` smoke, the 5 declared expected-failures, and a
+  passing minimal-setcap leg). `--pid` captures used uprobe-multi with
+  the kernel pid filter (`scope_filter: "kernel-pid+bpf"`); the
+  per-offset fallback was not needed on 6.6.157. In one of two runs a
+  25 s `--system` capture reported PARTIAL with exact counts and `1
+  discovery step unavailable` (observation `lossy`/`skipped`); the
+  rerun was exact.
+- Kernels/conditions: 6.6.157 measured twice; 7.3.1 control clean.
+  Kernel-specificity of the single transient is not established.
+- Why: live capture is supported where uprobe-multi links. The
+  transient left no trace beyond its own disclosed gap (the internal
+  step is redacted from capture output by design), so no kernel cause
+  is claimed.
+- Workaround: rerun the capture if a `--system` window reports the
+  `discovery step unavailable` gap with otherwise exact counts.
+
+#### Already documented kernel-ranged items
+
+These pre-existing entries also speak for kernels before 6.12 and are
+not re-measured here: the pre-6.8 overlayfs maps-key split
+(`provider's maps rendering unproven`) and the pre-6.8 pre-arm join
+disclosures, the 5.15 key-operation coverage note, the 6.6 to 6.9.11
+thread-exact pid filter with its automatic per-offset fallback (probe
+outcome on 6.6.157 above: filter proven), and the historical 5.15
+physical-identity and non-leader-exec qualifications under
+[Kernels and backends](#kernels-and-backends).
 
 ### Key-tracking rate ceiling
 

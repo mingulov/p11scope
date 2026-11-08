@@ -762,14 +762,14 @@ pub(crate) fn aggregate_excluded(
 /// assembly. Each module is `(id, path, dev, ino)` with `dev` as
 /// `(major, minor)`; `dev` is carried for shape stability and never
 /// compared. A full path (contains `/`) matches the discovered
-/// target-view path, corroborated by inode while the input still
-/// resolves; a bare name matches every file with that basename. Returns
-/// matched module ids (deduped, in module order) plus the inputs that
-/// matched nothing. Bare names never match by ELF soname here — the
-/// scan-time exclusion matcher owns that; an unmatched soname is
-/// reported, not guessed. Generic over the module-id type: the render
-/// lane keys by [`ModuleId`](crate::plan::ModuleId), inventory by the
-/// caller registry's own id.
+/// target-view path, corroborated by inode — fail closed, so an input
+/// that no longer resolves matches nothing; a bare name matches every
+/// file with that basename. Returns matched module ids (deduped, in
+/// module order) plus the inputs that matched nothing. Bare names never
+/// match by ELF soname here — the scan-time exclusion matcher owns
+/// that; an unmatched soname is reported, not guessed. Generic over the
+/// module-id type: the render lane keys by [`ModuleId`](crate::plan::ModuleId),
+/// inventory by the caller registry's own id.
 pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
     declared: &[std::path::PathBuf],
     modules: &[(Id, String, (u64, u64), u64)],
@@ -784,8 +784,8 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
         let mut hit = false;
         // A full path matches the discovered target-view path (mirroring
         // the scan-time --module hint gate, whose verbatim path match is
-        // sufficient even for an unopenable hint), corroborated by inode
-        // while the input still resolves: a rotation between startup
+        // sufficient even for an unopenable hint), corroborated by inode,
+        // and fails closed: a deletion or rotation between startup
         // validation and report time breaks the inode link and leaves the
         // declaration unmatched (named, never applied to the new file).
         // Device numbers are never compared: the module side renders a
@@ -804,7 +804,7 @@ pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
         for (id, path, _dev, ino) in modules {
             let same = if is_path {
                 crate::discovery::identity::target_paths_equal(&input_string, path)
-                    && inode.is_none_or(|file_ino| *ino == file_ino)
+                    && inode.is_some_and(|file_ino| *ino == file_ino)
             } else {
                 std::path::Path::new(path)
                     .file_name()

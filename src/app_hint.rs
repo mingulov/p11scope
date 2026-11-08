@@ -1639,7 +1639,7 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
         let exe = read_exe_identity(pid).expect("child exe identity");
-        let admitted = process_start_time(pid).ok().expect("child start time");
+        let admitted = process_start_time(pid).expect("child start time");
         let hint = sample_for_pid(pid, Some(&exe), Some(admitted))
             .expect("the admitted generation keeps its argv hint");
         assert_eq!(hint.value, script_name);

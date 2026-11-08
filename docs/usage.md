@@ -278,15 +278,20 @@ calls then appear only at the backend below (totals stay correct; the
 shim is named with its zero rows). With `--manifest <shim.json>` or
 `--prearm-module <shim.so>` both layers attach fully and every
 forwarded call would count twice — declare the shim with repeatable
-`--forwarding-module <path-or-name>` (a full path matches by path and
-inode, a bare name by basename) to split its calls out of the headline totals
-exactly like a closure layer under the same gates. No declaration, no
-split: the observer never guesses a forwarding role from coincident
-counts. When two attached non-layer modules show exactly coincident
-vectors, the report instead prints a `Possible forwarding` hint naming
-both modules and the flag; like the `--manifest` hints it is advisory
-text only and changes no count. A `--forwarding-module` input that
-matched no mapped file is named as an unmatched declaration.
+`--forwarding-module <path-or-name>` (a full path matches by host-view
+path and inode, a bare name by basename) to split its calls out of the
+headline totals exactly like a closure layer under the same gates. No
+declaration, no split: the observer never guesses a forwarding role
+from coincident counts. When two attached non-layer modules show
+exactly coincident vectors, the report instead prints a
+`Possible forwarding` hint naming both modules and the flag; like the
+`--manifest` hints it is advisory text only and changes no count. A
+`--forwarding-module` input that matched no mapped file is named as an
+unmatched declaration. A full-path match is inode-corroborated, not a
+held-FD proof, and devices are never compared: an inode recycled for
+different bytes at the same path, or the same spelling naming a
+different file in another mount namespace with a coincidentally equal
+inode number, can still match. Prefer bare names for container targets.
 `--forwarding-module` is refused beside a matching `--exclude-module`,
 and is not accepted by scan-only `inspect`.
 

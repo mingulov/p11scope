@@ -3,7 +3,8 @@
 """Release-asset container publish at the extracted workflow seams.
 
 container-publish.yml downloads the published release tarball, SHA256SUMS
-and RELEASE.json for the tag, verifies the checksum and the RELEASE head,
+and RELEASE.json for the tag, verifies the checksums and the RELEASE tree,
+head ancestry and version,
 builds the reconciled observer-release Dockerfile with --network=none,
 smokes it (including the permanent cell on the built bytes), and publishes
 :<version> (and :latest only when the tag is the newest stable) on final
@@ -94,7 +95,15 @@ class ContainerPublishTests(unittest.TestCase):
                        "TARBALL_SHA256", "docker pull",
                        "docker build --network=none"):
             self.assertIn(marker, bodies, f"build must {marker}")
-        self.assertIn("GITHUB_SHA", bodies, "build must assert RELEASE head == GITHUB_SHA")
+        self.assertIn("GITHUB_SHA", bodies, "build must bind the RELEASE check to the tag commit")
+        for marker in ("^{tree}", "merge-base --is-ancestor", "GITHUB_REF_NAME#v"):
+            self.assertIn(marker, bodies,
+                          f"build must check {marker} (tree, ancestry, version)")
+        self.assertIn("--pattern", bodies, "build must download only the needed assets")
+        self.assertIn('$2 == "RELEASE.json"', bodies,
+                      "build must verify the RELEASE.json line explicitly")
+        self.assertNotIn("sha256sum --check SHA256SUMS", bodies,
+                         "SHA256SUMS covers files not downloaded; verify the needed lines only")
         self.assertNotIn("cargo build", bodies,
                          "the published image holds release bytes, never a rebuild")
         self.assertNotIn("--target x86_64-unknown-linux-musl --bin p11scope", bodies,
@@ -135,6 +144,12 @@ class ContainerPublishTests(unittest.TestCase):
                        "ghcr.io/mingulov/p11scope:latest",
                        "buildx imagetools inspect", "is-latest"):
             self.assertIn(marker, bodies, f"push must {marker}")
+        self.assertIn("{{.Manifest.Digest}}", bodies,
+                      "digest queries must use the Go field name")
+        self.assertNotIn("{{.Manifest.digest}}", bodies,
+                         "JSON tags do not apply to Go templates")
+        self.assertIn(": not found", bodies,
+                      "only a not-found probe may be treated as absent")
         self.assertIn("REGISTRY_TOKEN", bodies, "login must use the step env token")
         self.assertIn("REGISTRY_USER", bodies, "login must use the step env user")
         self.assertNotIn("GITHUB_TOKEN", bodies, "login must not use the unset default variable")
@@ -160,7 +175,7 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertEqual(uploads[0]["with"].get("if-no-files-found"), "error")
 
     def run_push(self, ref, *, version_digest=VERSION_DIGEST, latest_digest=None,
-                 is_latest="true", existing_digest=""):
+                 is_latest="true", existing_digest="", probe_error=""):
         if latest_digest is None:
             latest_digest = version_digest
         self.assertTrue(WORKFLOW.is_file(), "the release publish workflow is missing")
@@ -203,6 +218,15 @@ class ContainerPublishTests(unittest.TestCase):
             '    echo "$1: digest: $digest size: 1234"\n'
             "    ;;\n"
             "  buildx)\n"
+            "    format=\"\"; prev=\"\"\n"
+            '    for arg in \"$@\"; do\n'
+            '      case \"$prev\" in --format) format=\"$arg\" ;; esac\n'
+            '      case \"$arg\" in --format=*) format=\"${arg#--format=}\" ;; esac\n'
+            '      prev=\"$arg\"\n'
+            "    done\n"
+            "    if [ -n \"$format\" ] && [ \"$format\" != '{{.Manifest.Digest}}' ]; then\n"
+            '      echo \"unexpected --format: $format\" >&2; exit 1\n'
+            "    fi\n"
             '    image="${@: -1}"\n'
             '    if grep -q "^docker push " "$FAKE_CALLS" 2>/dev/null; then\n'
             '      case "$image" in\n'
@@ -211,11 +235,15 @@ class ContainerPublishTests(unittest.TestCase):
             "      esac\n"
             "      exit 0\n"
             "    fi\n"
+            '    if [ -n \"${FAKE_PROBE_ERROR:-}\" ]; then\n'
+            '      printf \'%s\\n\' \"$FAKE_PROBE_ERROR\" >&2\n'
+            "      exit 1\n"
+            "    fi\n"
             '    if [ -n "${FAKE_EXISTING_DIGEST:-}" ]; then\n'
             '      printf \'%s\\n\' "$FAKE_EXISTING_DIGEST"\n'
             "      exit 0\n"
             "    fi\n"
-            '    echo "not found" >&2; exit 1\n'
+            '    printf \'ERROR: %s: not found\\n\' \"$image\" >&2; exit 1\n'
             "    ;;\n"
             '  *) echo "unexpected docker $cmd" >&2; exit 99 ;;\n'
             "esac\n"
@@ -230,7 +258,8 @@ class ContainerPublishTests(unittest.TestCase):
                "FAKE_CALLS": str(calls), "FAKE_IMAGE_ID": IMAGE_ID,
                "FAKE_DIGEST_VERSION": version_digest,
                "FAKE_DIGEST_LATEST": latest_digest,
-               "FAKE_EXISTING_DIGEST": existing_digest}
+               "FAKE_EXISTING_DIGEST": existing_digest,
+               "FAKE_PROBE_ERROR": probe_error}
         env.pop("GITHUB_TOKEN", None)
         result = subprocess.run(["bash", "--noprofile", "--norc", "-c", body],
                                 cwd=fixture, env=env, text=True,
@@ -293,6 +322,14 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertEqual([line for line in logged if "docker push " in line], [],
                          "an existing tag must be refused before any push")
         self.assertFalse(receipt.exists(), "a refused overwrite must leave no receipt")
+
+    def test_probe_error_fails_closed_without_pushing(self):
+        result, logged, receipt, _ = self.run_push(
+            "v0.7.0", probe_error="ERROR: denied: permission_denied: access forbidden")
+        self.assertNotEqual(result.returncode, 0, result.stdout + result.stderr)
+        self.assertEqual([line for line in logged if "docker push " in line], [],
+                         "a failed probe must not be treated as absent")
+        self.assertFalse(receipt.exists(), "a failed probe must leave no receipt")
 
     def test_missing_registry_env_fails_the_login(self):
         # Deleting the step env key must fail the test: with no token the

@@ -11544,16 +11544,27 @@ fn observer_image_runs_p11scope_by_default() {
         !release.contains("ENTRYPOINT [\"/usr/local/bin/k8s-profile-entry\"]"),
         "the cluster entry script must not swallow docker run arguments"
     );
+    // A comment mentioning COPYRIGHT must not satisfy this: the release
+    // file needs a real `test -f` for the installed file and the dev file
+    // a real COPY instruction.
     if std::path::Path::new("COPYRIGHT").exists() {
-        for (name, body) in [
-            ("observer image", dockerfile.as_str()),
-            ("observer release image", release.as_str()),
-        ] {
-            assert!(
-                body.contains("COPYRIGHT"),
-                "{name} must install COPYRIGHT once the root file exists"
-            );
-        }
+        assert!(
+            release.lines().any(|line| {
+                let trimmed = line.trim_start();
+                !trimmed.starts_with('#')
+                    && trimmed.contains("test -f")
+                    && trimmed.contains("COPYRIGHT")
+            }),
+            "observer release image must install COPYRIGHT once the root file exists"
+        );
+        assert!(
+            dockerfile.lines().any(|line| {
+                let trimmed = line.trim_start();
+                (trimmed.starts_with("COPY ") || trimmed.starts_with("COPY\t"))
+                    && trimmed.contains("COPYRIGHT")
+            }),
+            "observer image must install COPYRIGHT once the root file exists"
+        );
     }
 }
 

@@ -804,6 +804,7 @@ discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_metacop
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_second_lower_candidate_wins
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_upper_rewrite_keeps_stale_on_lower
 discovery::sweep_attribution::tests::d4_overlay_cells::privileged_copyup_candidate_opens_in_observer_namespace
+discovery::sweep_attribution::tests::d4_overlay_cells::privileged_witness_calibration_accepts_xino_overlay_files
 )
 
 # Expected-failure campaign cells: run only with

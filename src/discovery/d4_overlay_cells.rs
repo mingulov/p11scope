@@ -5677,3 +5677,96 @@ fn privileged_copyup_upper_rewrite_keeps_stale_on_lower() {
         "COPYUP_JOIN direction=upper-rewrite lane={lane:?} modes=on,off,same-fs verdict=join-lower"
     );
 }
+
+/// Pre-arm witness calibration over xino overlay files: the BPF slot
+/// carries the backing inode while the mapped-range identity carries
+/// the overlay (xino) inode. Calibration must accept the lower-layer
+/// file (backing vs backing through the lower candidates) as well as
+/// the upper and copied-up files (direct equality). Each row starts
+/// its own witness so one refusal cannot mask the other rows; all
+/// three verdicts print before the assertion. Fails loud without
+/// root/loop/overlay/BTF/ftrace — never a skip.
+#[test]
+#[ignore = "root: loop overlay mounts (xino=on) plus a live witness start (BTF, ftrace_enabled=1)"]
+fn privileged_witness_calibration_accepts_xino_overlay_files() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")
+        .expect("witness needs readable ftrace_enabled");
+    assert_eq!(
+        ftrace.trim(),
+        "1",
+        "witness needs /proc/sys/kernel/ftrace_enabled = 1"
+    );
+    assert!(
+        matches!(
+            crate::pidns::observer(),
+            crate::pidns::ObserverPidNs::Initial
+        ),
+        "witness needs the initial PID namespace"
+    );
+    let work = tempfile::tempdir().unwrap();
+    let fixture = OverlayFixture::mount(work.path(), XinoMode::On).expect("overlay mount xino=on");
+    // Lower-only file: the xino split (small backing ino, huge overlay ino).
+    std::fs::write(fixture.lower_path("lower.so"), vec![0xB3u8; 8192]).unwrap();
+    let (effective, auto) = fixture.xino_verdict("lower.so").expect("xino on effective");
+    assert!(
+        effective,
+        "xino=on must render the merge device (xino_auto={auto})"
+    );
+    // Upper file: written through the merge, lives in upperdir.
+    std::fs::write(fixture.merged_path("upper.so"), vec![0xB4u8; 8192]).unwrap();
+    assert!(
+        fixture.upper_path("upper.so").exists(),
+        "the upper file must materialize in upperdir"
+    );
+    // Copied-up file: lower content, then a merged write copies it up.
+    std::fs::write(fixture.lower_path("cup.so"), vec![0xB5u8; 8192]).unwrap();
+    trigger_copy_up(
+        &fixture.merged_path("cup.so"),
+        &fixture.upper_path("cup.so"),
+        &fixture.lower_path("cup.so"),
+    )
+    .expect("copy-up");
+    use std::os::unix::fs::MetadataExt as _;
+    let rows = [
+        ("lower", fixture.merged_path("lower.so")),
+        ("upper", fixture.merged_path("upper.so")),
+        ("cup", fixture.merged_path("cup.so")),
+    ];
+    for (tag, path) in &rows {
+        let meta = std::fs::metadata(path).expect("merged stat");
+        eprintln!(
+            "WITNESS_XINO {tag} merged dev={} ino={}",
+            meta.dev(),
+            meta.ino()
+        );
+    }
+    let backing = std::fs::metadata(fixture.lower_path("lower.so")).expect("lower direct stat");
+    eprintln!(
+        "WITNESS_XINO lower backing dev={} ino={}",
+        backing.dev(),
+        backing.ino()
+    );
+    let scope = crate::attach::Scope::System;
+    let mut refused = Vec::new();
+    for (tag, path) in &rows {
+        match crate::attach::prearm_witness::start(std::slice::from_ref(path), &scope, true) {
+            Ok(witness) => {
+                assert_eq!(witness.files.len(), 1, "{tag}: one calibrated file");
+                eprintln!(
+                    "WITNESS_XINO {tag} calibrated key=({},{})",
+                    witness.files[0].key.s_dev, witness.files[0].key.i_ino
+                );
+            }
+            Err(reason) => {
+                eprintln!("WITNESS_XINO {tag} REFUSED: {reason:?}");
+                refused.push(*tag);
+            }
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "the witness refused overlay rows: {refused:?}"
+    );
+    eprintln!("WITNESS_XINO modes=on rows=lower,upper,cup verdict=calibrated");
+}

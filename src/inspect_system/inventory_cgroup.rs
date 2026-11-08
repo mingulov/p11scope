@@ -670,9 +670,17 @@ fn scope_gap(reason: &str) -> PidGap {
 }
 
 /// Whether one member gap marks its whole cgroup transaction incomplete.
-/// Transaction-level truncation boundary for one member gap; see tests.
+/// A scan that ran to completion but refused a file join with a disclosed,
+/// finite-vocabulary `original_file_unproven` proof outcome degrades per
+/// caller (the gap stays on the member), never per transaction: nothing
+/// was cut short, and poisoning the shared transaction would block every
+/// other member's native activation behind one member's proof refusal
+/// (JK-22). Every other truncation signal keeps the
+/// scan-to-live-candidate boundary, and retirement still withholds
+/// absence authority for these members through `CompleteMemberScan`.
 fn member_gap_truncates_transaction(reason: &str) -> bool {
     scan_skip_truncates(reason)
+        && !reason.starts_with(crate::discovery::overlay_witness::ORIGINAL_FILE_UNPROVEN)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

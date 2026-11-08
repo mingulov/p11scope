@@ -1434,7 +1434,9 @@ Limits that matter in pods:
   the text summary moves to stderr. A stdout that stops reading or is
   closed never stalls capture: each commit batch waits bounded, then sheds lines
   with counters reported on stderr, in `totals`/`ended`, and the exit
-  status, while capture continues to its normal stop. Only an stdout
+  status, while capture continues to its normal stop. A line that
+  does not parse as JSON is a shed fragment: skip it; its `seq` gap
+  and `stdout_lost` account for it. Only an stdout
   that cannot be acquired at all fails fast before scanning.
   `--event-interval <dur>` (off by default; e.g. `10s`) adds a periodic
   `totals` snapshot of the current report counts to either sink, at most

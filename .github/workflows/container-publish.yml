@@ -10,8 +10,9 @@ concurrency:
   cancel-in-progress: false
 jobs:
   # Publish the observer image from the release assets: the musl tarball,
-  # SHA256SUMS and RELEASE.json for the tag are downloaded, the checksum
-  # is verified and the RELEASE head is asserted against GITHUB_SHA, then
+  # SHA256SUMS and RELEASE.json for the tag are downloaded, the checksums
+  # are verified and the RELEASE tree, head ancestry and version are
+  # asserted against the tag commit, then
   # the reconciled release Dockerfile builds with --network=none after
   # pulling its pinned base by digest. The smoke runs the image with the
   # documented measured flags (--version with a tag match, doctor, a short
@@ -47,16 +48,22 @@ jobs:
           tag="$GITHUB_REF_NAME"
           assets="$RUNNER_TEMP/release-assets"
           mkdir -p "$assets"
-          gh release download "$tag" --repo "mingulov/p11scope" --dir "$assets" --clobber
+          gh release download "$tag" --repo "mingulov/p11scope" --dir "$assets" --clobber \
+            --pattern 'p11scope-[0-9]*-x86_64-linux-musl.tar.gz' \
+            --pattern 'RELEASE.json' --pattern 'SHA256SUMS'
           cd "$assets"
-          sha256sum --check SHA256SUMS
-          python3 -I - RELEASE.json "$GITHUB_SHA" <<'PY'
+          eval "$(python3 -I - RELEASE.json <<'PY'
           import json
-          import sys
-          release = json.loads(open(sys.argv[1], encoding="utf-8").read())
-          assert release.get("head") == sys.argv[2], "RELEASE head must equal GITHUB_SHA"
-          print(f"RELEASE head ok: {sys.argv[2][:12]}")
+          import shlex
+          release = json.load(open("RELEASE.json", encoding="utf-8"))
+          for key in ("head", "tree", "version"):
+              print(f"release_{key}={shlex.quote(str(release[key]))}")
           PY
+          )"
+          test "$(git -C "$GITHUB_WORKSPACE" rev-parse "$GITHUB_SHA^{tree}")" = "$release_tree"
+          git -C "$GITHUB_WORKSPACE" merge-base --is-ancestor "$release_head" "$GITHUB_SHA"
+          test "$release_version" = "${GITHUB_REF_NAME#v}"
+          echo "RELEASE ok: version $release_version, tree ${release_tree:0:12}, head ${release_head:0:12}"
           set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
           test "$#" -eq 1
           test -f "$1"
@@ -64,6 +71,9 @@ jobs:
           tarball_sha256=$(awk -v want="$tarball" '$2 == want {print $1}' SHA256SUMS)
           test -n "$tarball_sha256"
           printf '%s  %s\n' "$tarball_sha256" "$tarball" | sha256sum --check
+          release_sha256=$(awk '$2 == "RELEASE.json" {print $1}' SHA256SUMS)
+          test -n "$release_sha256"
+          printf '%s  %s\n' "$release_sha256" RELEASE.json | sha256sum --check
           echo "$tarball" >"$RUNNER_TEMP/observer-tarball-name.txt"
           echo "$tarball_sha256" >"$RUNNER_TEMP/observer-tarball-sha256.txt"
           ctx="$RUNNER_TEMP/container-publish-ctx"
@@ -82,11 +92,14 @@ jobs:
         run: |
           set -euo pipefail
           umask 022
-          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
-          test -n "$base"
-          test "$(printf '%s\n' "$base" | wc -l)" -eq 1
-          case "$base" in *@sha256:*) ;; *) echo "base is not digest-pinned: $base" >&2; exit 1 ;; esac
-          docker pull "$base"
+          bases=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
+          test -n "$bases"
+          if printf '%s\n' "$bases" | grep -vq '@sha256:'; then
+            echo "a base is not digest-pinned:" >&2
+            printf '%s\n' "$bases" >&2
+            exit 1
+          fi
+          printf '%s\n' "$bases" | sort -u | xargs -r -I{} docker pull {}
           tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
           tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
           docker build --network=none -f deploy/Dockerfile.observer-release \
@@ -227,15 +240,19 @@ jobs:
             existing=$(grep -o 'sha256:[0-9a-f]\{64\}' existing-inspect.txt | head -1)
             echo "refusing: $version_dest already exists (${existing:-unknown digest})" >&2
             exit 1
+          elif ! grep -q ': not found' existing-inspect.txt; then
+            echo "refusing: probe of $version_dest failed unexpectedly" >&2
+            cat existing-inspect.txt >&2
+            exit 1
           fi
           docker tag p11scope-observer:preview "$version_dest"
           docker push "$version_dest"
-          version_digest=$(docker buildx imagetools inspect --format '{{.Manifest.digest}}' "$version_dest")
+          version_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$version_dest")
           test -n "$version_digest"
           if [ "$(cat is-latest.txt)" = "true" ]; then
             docker tag p11scope-observer:preview "$latest_dest"
             docker push "$latest_dest"
-            latest_digest=$(docker buildx imagetools inspect --format '{{.Manifest.digest}}' "$latest_dest")
+            latest_digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$latest_dest")
             test -n "$latest_digest"
             test "$version_digest" = "$latest_digest"
             {

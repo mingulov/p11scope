@@ -7003,7 +7003,9 @@ fn discover_plan(
                 // Never-stop: a named pid that exits between scope
                 // resolution and discovery gaps like a cgroup member and
                 // reports an empty PARTIAL plan. A missing view for a live
-                // pid stays a programmer error (fatal).
+                // pid stays a programmer error (fatal). A zombie named pid
+                // stays fatal too (deferred): generation_gone is false for
+                // zombies, only reaped exits take the gap path above.
                 if process::generation_gone(*pid) {
                     if let Some(skipped) = unreadable_member_skip(
                         *pid,

@@ -235,11 +235,15 @@ if [ -n "$OBSERVER_BIN" ]; then
     mkdir -p "$OCTX/scripts"
     cp "$CELL_TARBALL" "$OCTX/cell-observer.tar.gz"
     cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
-    BASE=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
-    test -n "$BASE" || { echo "Dockerfile has no FROM line" >&2; exit 2; }
-    test "$(printf '%s\n' "$BASE" | wc -l)" -eq 1 || { echo "Dockerfile has no single base" >&2; exit 2; }
-    case $BASE in *@sha256:*) ;; *) echo "base is not digest-pinned: $BASE" >&2; exit 2 ;; esac
-    timeout --signal=TERM --kill-after=10s 600s docker pull "$BASE" || exit 2
+    BASES=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
+    test -n "$BASES" || { echo "Dockerfile has no FROM line" >&2; exit 2; }
+    if printf '%s\n' "$BASES" | grep -vq '@sha256:'; then
+        echo "a base is not digest-pinned:" >&2
+        printf '%s\n' "$BASES" >&2
+        exit 2
+    fi
+    printf '%s\n' "$BASES" | sort -u | xargs -r -I{} \
+        timeout --signal=TERM --kill-after=10s 600s docker pull {} || exit 2
     OBS_IMAGE="p11scope-container-observer:$RUN_ID"
     TARBALL_SHA256="$CELL_TARBALL_SHA256"
     timeout --signal=TERM --kill-after=10s 600s docker build --network=none -q \

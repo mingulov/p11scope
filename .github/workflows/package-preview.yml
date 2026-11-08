@@ -308,11 +308,14 @@ jobs:
         run: |
           set -euo pipefail
           umask 022
-          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
-          test -n "$base"
-          test "$(printf '%s\n' "$base" | wc -l)" -eq 1
-          case "$base" in *@sha256:*) ;; *) echo "base is not digest-pinned: $base" >&2; exit 1 ;; esac
-          docker pull "$base"
+          bases=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
+          test -n "$bases"
+          if printf '%s\n' "$bases" | grep -vq '@sha256:'; then
+            echo "a base is not digest-pinned:" >&2
+            printf '%s\n' "$bases" >&2
+            exit 1
+          fi
+          printf '%s\n' "$bases" | sort -u | xargs -r -I{} docker pull {}
           tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
           tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
           docker build --network=none -f deploy/Dockerfile.observer-release \

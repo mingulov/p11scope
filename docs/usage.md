@@ -2371,6 +2371,13 @@ silent zero-count capture that reads as healthy.
 
 ## Overhead (measured)
 
+Current numbers (v0.7.0, measured 2026-11-08 on quiet Fedora and busy dev
+VMs): `docs/notes/2026-11-08-overhead-v070.md` — per-call cost per mode,
+maximum exact rates, p11perftest and `pkcs11-spy` cross-checks. The table
+below is the original v0.1.0 measurement, kept for history.
+
+### v0.1.0 history (2026-09-28)
+
 Measured by `scripts/bench-overhead.sh` against **unobserved SoftHSM2 —
 deliberately the worst case** for this measurement: SoftHSM2's
 `C_GenerateRandom` is microsecond-scale software crypto, so uprobe/
@@ -2419,8 +2426,11 @@ and `event_loss` is 0 by construction: a zero there means "not measured",
 not "nothing lost". `scripts/verify-induced-gaps.sh` demonstrates loss
 deliberately on a lighter workload (`docs/notes/phase2-induced-gaps.md`).
 
-To re-measure, run `scripts/bench-overhead.sh` (defaults: `RUNS=5`,
-1,000,000 calls per condition). It needs:
+To re-measure on current builds, run `scripts/bench-v070-overhead.sh`
+(defaults: `RUNS=5`, 1,000,000 calls per percall condition; parts `percall`,
+`ramp`, `ceiling`, `spy`). The v0.1.0 table above was produced by
+`scripts/bench-overhead.sh` (defaults: `RUNS=5`, 1,000,000 calls per
+condition). Either script needs:
 
 - a non-root user with passwordless `sudo`;
 - `gcc`, `softhsm2-util` and `python3` on `PATH`;

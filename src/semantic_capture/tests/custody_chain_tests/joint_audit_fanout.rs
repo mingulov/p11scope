@@ -948,6 +948,236 @@ impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     }
 }
 
+/// Staging probe driver: real collection over a composite scripted
+/// drain, failing H0 tick. The machine collects its quantum, then
+/// strands at AwaitH0 exactly like a seal awaiting future input strands
+/// at Audited: the ring must drain regardless.
+struct StageProbeIo {
+    drain: crate::events::EventDrain<crate::events::StagedEvents<crate::events::ScriptedRecords>>,
+    producers: SessionDrainProducers,
+}
+
+impl crate::inventory_semantics::JointMachineIo for StageProbeIo {
+    fn producers(&self) -> &SessionDrainProducers {
+        &self.producers
+    }
+
+    fn stage_events(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        quantum: usize,
+        stop: Option<usize>,
+    ) -> crate::events::EventsStageOutcome {
+        self.drain.source_mut().stage(quantum, stop)
+    }
+
+    fn collect_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        adapter: &mut JournalAdapter,
+        reserve: &crate::semantics_edge::resources::SemanticResourceReserver,
+        capacity: usize,
+        work: usize,
+    ) -> Result<(RawJointQuantum, Option<crate::events::DispatchPoll>), RawQuantumRefusal> {
+        RawJointQuantum::begin_bounded_with_adapter(
+            &mut self.drain,
+            &publish_object_descriptors(),
+            capacity,
+            work,
+            None,
+            &BirthFault,
+            &self.producers,
+            |bytes| reserve.reserve(bytes),
+            adapter,
+        )
+    }
+
+    fn continue_raw(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        raw: &mut RawJointQuantum,
+        adapter: &mut JournalAdapter,
+        work: usize,
+    ) -> Result<crate::events::DispatchPoll, RawQuantumRefusal> {
+        raw.continue_bounded_with_adapter(
+            &mut self.drain,
+            &publish_object_descriptors(),
+            work,
+            None,
+            &BirthFault,
+            &self.producers,
+            adapter,
+        )
+    }
+
+    fn tick_collected(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _bindings: &[SemanticCallerBinding],
+        _raw: &mut RawJointQuantum,
+    ) -> Result<SemanticBatch, SemanticRefusal> {
+        Err(SemanticRefusal::Unavailable)
+    }
+
+    fn prepare_publication(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _coordinator: &mut InventoryCoordinator<OsProcessSource>,
+        _raw: &mut RawJointQuantum,
+        _engine_changed: bool,
+    ) -> anyhow::Result<()> {
+        unreachable!("StageProbeIo strands at AwaitH0, before preparation")
+    }
+
+    fn consume_birth(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _candidate: crate::semantic_capture::H0BirthCandidate,
+        _absence: Option<crate::semantic_capture::CommittedAbsenceBirth>,
+        _input: &crate::discovery::caller_registry::instance_input::AdmittedInstanceCall,
+        _binding: &SemanticCallerBinding,
+        _proof: &crate::semantics_objects::journal::JournalDomainProof,
+        _adapter: &JournalAdapter,
+    ) -> Result<crate::semantic_capture::RetainedBirthWitness, crate::attach::BirthObservationRefusal>
+    {
+        unreachable!("StageProbeIo strands at AwaitH0, before births")
+    }
+
+    fn acquire_absence(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _binding: &SemanticCallerBinding,
+        _slot: u32,
+        _adapter: &mut JournalAdapter,
+    ) -> Result<
+        crate::semantic_capture::CommittedAbsenceBirth,
+        crate::attach::BirthObservationRefusal,
+    > {
+        unreachable!("StageProbeIo strands at AwaitH0, before births")
+    }
+
+    fn absence_query_storage_bytes(
+        &self,
+        _lane: &AttestedSemanticLane,
+        _object: crate::discovery::identity::PinnedObjectId,
+        _target_copy: usize,
+    ) -> Option<usize> {
+        unreachable!("StageProbeIo strands at AwaitH0, before births")
+    }
+
+    fn with_native<R>(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _witnesses: &crate::inventory_semantics::RetainedJointBirths,
+        _inspect: impl for<'io> FnOnce(crate::inventory_semantics::JointCommitIo<'io>) -> R,
+    ) -> Result<R, SemanticRefusal> {
+        unreachable!("StageProbeIo strands at AwaitH0, before native reads")
+    }
+}
+
+/// Known-good ordinary CALL bytes in the MachineScene push_quiet shape.
+fn stage_probe_push(scene: &mut JointScene, count: usize) -> Vec<Vec<u8>> {
+    let mut out = Vec::with_capacity(count);
+    for _ in 0..count {
+        let mut held = scene.real.h0.0.borrow_mut();
+        held.io
+            .enqueue(std::process::id(), 0, "C_GetSessionInfo", 0, 0);
+        let mut record = held.io.script.records.pop_back().unwrap();
+        record.base.event.pid_tgid |= record.base.event.pid_tgid >> 32;
+        record.base.event.duration_ns = 1;
+        record.base.event.target_function = p11scope_ebpf_common::FUNCTION_NONE;
+        out.push(crate::events::record_bytes(&record.base));
+    }
+    out
+}
+
+fn stage_probe_service(
+    fixture: &mut MachineScene,
+    io: &mut StageProbeIo,
+) -> Result<crate::inventory_semantics::JointServiceProgress, SemanticRefusal> {
+    let mut budget = crate::inventory_semantics::JointWorkBudget {
+        remaining_actions: 1024,
+        deadline: Instant::now() + Duration::from_secs(60),
+    };
+    fixture.machine.service_with_io(
+        &mut fixture.scene.real.lane,
+        &mut fixture.scene.real.scene.coordinator,
+        io,
+        crate::inventory_semantics::JointServiceMode::Running,
+        &mut budget,
+    )
+}
+
+#[test]
+fn joint_service_stages_ring_while_h0_awaits() {
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    let pushed = stage_probe_push(&mut fixture.scene, 5000);
+    let mut io = StageProbeIo {
+        drain: crate::events::EventDrain::over_domain(
+            crate::events::StagedEvents::with_caps(
+                crate::events::ScriptedRecords::records(pushed, 5000),
+                8192,
+                8 * 1024 * 1024,
+            ),
+            fixture.scene.producers.events_domain_for_test(),
+        ),
+        producers: fixture.scene.producers.clone(),
+    };
+    let mut outcome = Ok(crate::inventory_semantics::JointServiceProgress::Pending);
+    for _ in 0..100 {
+        outcome = stage_probe_service(&mut fixture, &mut io);
+        if outcome.is_err() {
+            break;
+        }
+    }
+    assert_eq!(outcome, Err(SemanticRefusal::Unavailable));
+    let (phase, _, counts, _) = fixture.machine.diagnostic_snapshot_for_test();
+    assert_eq!(phase, "AwaitH0");
+    let Some((attempted, _)) = counts else {
+        panic!("the stranded quantum retains its collection counts");
+    };
+    assert!(attempted > 0, "attempted={attempted}");
+    // Every ring byte left the script: collected ones in the quantum,
+    // the rest queued — nothing stranded on the ring while the
+    // machine awaits downstream.
+    assert_eq!(io.drain.source_mut().inner_mut().remaining(), 0);
+    assert_eq!(io.drain.source_mut().staged_len(), 5000 - attempted);
+}
+
+#[test]
+fn joint_service_names_staging_saturation() {
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    let pushed = stage_probe_push(&mut fixture.scene, 5000);
+    let mut io = StageProbeIo {
+        drain: crate::events::EventDrain::over_domain(
+            crate::events::StagedEvents::with_caps(
+                crate::events::ScriptedRecords::records(pushed, 5000),
+                64,
+                1024 * 1024,
+            ),
+            fixture.scene.producers.events_domain_for_test(),
+        ),
+        producers: fixture.scene.producers.clone(),
+    };
+    // One service: the 64-entry queue fills from the 5,000-record
+    // backlog and the service names the saturation.
+    let _ = stage_probe_service(&mut fixture, &mut io);
+    let gaps = fixture
+        .scene
+        .real
+        .scene
+        .coordinator
+        .registry()
+        .staged_scope_gaps_for_test();
+    assert!(
+        gaps.contains(&(
+            crate::inventory_semantics::EVENTS_STAGE_SATURATED_SUBJECT.to_string(),
+            crate::inventory_semantics::EVENTS_STAGE_SATURATED_REASON.to_string()
+        )),
+        "saturation gap staged: {gaps:?}"
+    );
+}
+
 struct MachineScene {
     scene: JointScene,
     machine: crate::inventory_semantics::LiveJointMachine,

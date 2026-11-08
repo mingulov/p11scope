@@ -454,6 +454,123 @@ impl BoundedRecordSource for aya::maps::RingBuf<MapData> {
     }
 }
 
+/// Userspace staging bounds for the kernel EVENTS ring, sized from the
+/// existing pools: 131,072 records (32 live quanta) and 48 MiB of staged
+/// ring spans (3 joint rings). The byte bound dominates worst-case memory
+/// (48 MiB plus per-entry overhead); the entry bound caps the queue
+/// structure itself. Staging stops at either bound with the ring keeping
+/// the rest, exactly like the discovery staging FIFO.
+pub(crate) const EVENTS_STAGE_ENTRIES: usize = 32 * LIVE_POLL_QUANTUM;
+pub(crate) const EVENTS_STAGE_BYTES: usize = 3 * (p11scope_ebpf_common::JOINT_RING_BYTES as usize);
+
+/// What one staging call moved: how many entries entered the queue
+/// (records plus kernel-discard markers), and whether staging stopped
+/// at the queue bounds with the ring still holding records below the
+/// stop. A stopped-at-bounds move is a counted, named saturation gap
+/// at the service site, never silent loss.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) struct EventsStageOutcome {
+    pub(crate) staged: usize,
+    pub(crate) saturated: bool,
+}
+
+/// One staged queue entry: a verbatim ring-record copy with its exact
+/// ring span, or a kernel-discard count observed while pulling.
+#[derive(Debug)]
+#[allow(dead_code)]
+enum StagedItem {
+    Bytes { span: usize, bytes: Vec<u8> },
+    Discarded { count: u64 },
+}
+
+/// A userspace staging queue in front of the kernel EVENTS ring. The
+/// Joint service stages records here on every service call, whatever
+/// the seal state, and collection consumes staged records first, then
+/// the ring directly once the queue runs dry. Positions and cuts stay
+/// in ring coordinates, so bounds, lineage and post-Q checks behave
+/// exactly as on the bare ring; an unstaged queue is transparent.
+///
+/// C1 scaffold: shells and direct passthrough; the staging move lands
+/// with the queue implementation.
+#[allow(dead_code)]
+pub(crate) struct StagedEvents<S> {
+    inner: S,
+    fifo: std::collections::VecDeque<StagedItem>,
+    consumed_to: usize,
+    discarded_consumed: u64,
+    discarded_baseline: u64,
+    entry_cap: usize,
+    byte_cap: usize,
+    fifo_spans: usize,
+}
+
+#[allow(dead_code)]
+impl<S: BoundedRecordSource> StagedEvents<S> {
+    pub(crate) fn with_caps(inner: S, entry_cap: usize, byte_cap: usize) -> Self {
+        let consumed_to = inner.consumer();
+        Self {
+            inner,
+            fifo: std::collections::VecDeque::new(),
+            consumed_to,
+            discarded_consumed: 0,
+            discarded_baseline: 0,
+            entry_cap,
+            byte_cap,
+            fifo_spans: 0,
+        }
+    }
+
+    /// Moves up to `quantum` records off the ring into the queue without
+    /// letting it exceed its caps, and never past `stop` when bounded.
+    pub(crate) fn stage(&mut self, quantum: usize, stop: Option<usize>) -> EventsStageOutcome {
+        let _ = (quantum, stop);
+        EventsStageOutcome::default()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn staged_len(&self) -> usize {
+        self.fifo.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inner_mut(&mut self) -> &mut S {
+        &mut self.inner
+    }
+}
+
+#[allow(dead_code)]
+impl<S: RecordSource> RecordSource for StagedEvents<S> {
+    fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
+        self.inner.next_record().map(|item| item.to_vec())
+    }
+
+    fn discarded(&self) -> u64 {
+        self.inner.discarded()
+    }
+}
+
+#[allow(dead_code)]
+impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
+    fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
+        self.inner.positions()
+    }
+
+    fn consumer(&self) -> usize {
+        self.inner.consumer()
+    }
+
+    fn bounded_record(
+        &mut self,
+        stop: usize,
+    ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        Ok(match self.inner.bounded_record(stop)? {
+            BoundedRecord::Item(item) => BoundedRecord::Item(item.to_vec()),
+            BoundedRecord::Pending => BoundedRecord::Pending,
+            BoundedRecord::Reached => BoundedRecord::Reached,
+        })
+    }
+}
+
 pub(crate) const ROOT_TAIL_FENCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RootTailProgress {
@@ -2063,6 +2180,272 @@ mod tests {
             drain.consumption_cut(),
             Err(EventsCutRefusal::Exhausted)
         ));
+    }
+
+    fn numbered_call(seq: u64) -> Vec<u8> {
+        record_bytes(&EventRecord {
+            event: Event {
+                event_type: event_type::CALL,
+                root_affiliation: 0,
+                ts_ns: seq,
+                ..Default::default()
+            },
+            continuity: Default::default(),
+        })
+    }
+
+    fn staged_script(
+        records: Vec<Vec<u8>>,
+        bound: usize,
+        entry_cap: usize,
+        byte_cap: usize,
+    ) -> EventDrain<StagedEvents<ScriptedRecords>> {
+        EventDrain::over(StagedEvents::with_caps(
+            ScriptedRecords::records(records, bound),
+            entry_cap,
+            byte_cap,
+        ))
+    }
+
+    fn polled_ts_ns(drain: &mut EventDrain<StagedEvents<ScriptedRecords>>) -> (Vec<u64>, bool) {
+        let mut seen = Vec::new();
+        let backlog = drain.poll(None, |event| {
+            seen.push(event.ts_ns);
+            ControlFlow::Continue(())
+        });
+        (seen, backlog)
+    }
+
+    #[test]
+    fn staged_events_preserve_ring_order_exactly_once() {
+        let pushed: Vec<Vec<u8>> = (0..64).map(numbered_call).collect();
+        let mut drain = staged_script(pushed, 64, 1024, 1024 * 1024);
+        let outcome = drain.source_mut().stage(64, None);
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 64,
+                saturated: false
+            }
+        );
+        assert_eq!(drain.source_mut().staged_len(), 64);
+        assert_eq!(drain.source_mut().inner_mut().remaining(), 0);
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert!(!backlog);
+        assert_eq!(seen, (0..64).collect::<Vec<_>>());
+        assert_eq!(drain.source_mut().staged_len(), 0);
+        // Nothing is re-readable: a second drain sees nothing new.
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert!(seen.is_empty());
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn staged_events_entry_cap_stops_with_ring_remainder() {
+        let pushed: Vec<Vec<u8>> = (0..10).map(numbered_call).collect();
+        let mut drain = staged_script(pushed, 10, 4, 1024 * 1024);
+        let outcome = drain.source_mut().stage(100, None);
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 4,
+                saturated: true
+            }
+        );
+        assert_eq!(drain.source_mut().staged_len(), 4);
+        assert_eq!(drain.source_mut().inner_mut().remaining(), 6);
+        let (seen, _) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![0, 1, 2, 3]);
+        let outcome = drain.source_mut().stage(100, None);
+        assert_eq!(outcome.staged, 4);
+        assert!(outcome.saturated);
+        let (seen, _) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![4, 5, 6, 7]);
+        let outcome = drain.source_mut().stage(100, None);
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 2,
+                saturated: false
+            }
+        );
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![8, 9]);
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn staged_events_byte_cap_bounds_staged_spans() {
+        // Scripted ring spans are 8 bytes per record; two records fit in
+        // 16 span bytes and the third stops the move.
+        let pushed: Vec<Vec<u8>> = (0..10).map(numbered_call).collect();
+        let mut drain = staged_script(pushed, 10, 1024, 16);
+        let outcome = drain.source_mut().stage(100, None);
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 2,
+                saturated: true
+            }
+        );
+        assert_eq!(drain.source_mut().inner_mut().remaining(), 8);
+        let (seen, _) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![0, 1]);
+    }
+
+    #[test]
+    fn staged_events_cuts_chain_across_staging() {
+        let pushed: Vec<Vec<u8>> = (0..6).map(numbered_call).collect();
+        let mut drain = EventDrain::over_test_domain(
+            StagedEvents::with_caps(ScriptedRecords::records(pushed, 6), 1024, 1024 * 1024),
+            0xe5a6,
+        );
+        let cut0 = drain.consumption_cut().unwrap();
+        assert!(cut0.is_initial());
+        drain.source_mut().stage(3, None);
+        assert_eq!(drain.source_mut().staged_len(), 3);
+        // Staging moves bytes, not the logical consumer: the cut is
+        // unchanged while nothing was consumed.
+        let positions = drain.source.positions();
+        assert_eq!(positions.consumer, 0);
+        let cut1 = drain.consumption_cut().unwrap();
+        assert!(cut1.same_boundary(&cut0));
+        let (seen, _) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![0]);
+        let cut2 = drain.consumption_cut().unwrap();
+        assert!(!cut2.same_boundary(&cut1));
+        assert!(cut2.clean_successor_of(&cut1));
+        drain.source_mut().stage(3, None);
+        let cut3 = drain.consumption_cut().unwrap();
+        assert!(cut3.same_boundary(&cut2));
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![1, 2, 3, 4, 5]);
+        assert!(!backlog);
+        let cut4 = drain.consumption_cut().unwrap();
+        assert!(cut4.clean_successor_of(&cut3));
+        assert!(cut4.is_drained());
+    }
+
+    #[test]
+    fn staged_events_stop_bounds_finish_restage() {
+        // Six scripted records end at byte offset 48; the stop bounds
+        // the move there without tripping saturation.
+        let pushed: Vec<Vec<u8>> = (0..6).map(numbered_call).collect();
+        let mut drain = staged_script(pushed, 6, 1024, 1024 * 1024);
+        let outcome = drain.source_mut().stage(100, Some(48));
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 6,
+                saturated: false
+            }
+        );
+        assert_eq!(drain.source_mut().inner_mut().remaining(), 0);
+        let (post_q, backlog) =
+            poll_events_to_position(&mut drain, 48, None, |_| ControlFlow::Continue(())).unwrap();
+        assert!(!post_q);
+        assert!(!backlog);
+        // Two records committed after the stop read as post-Q, exactly
+        // as on the bare ring.
+        drain
+            .source_mut()
+            .inner_mut()
+            .push_record(numbered_call(10));
+        drain
+            .source_mut()
+            .inner_mut()
+            .push_record(numbered_call(11));
+        let (post_q, backlog) =
+            poll_events_to_position(&mut drain, 48, None, |_| ControlFlow::Continue(())).unwrap();
+        assert!(post_q);
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn staged_events_stop_leaves_beyond_stop_bytes_unstaged() {
+        // Ten records with a stop after the sixth: six stage, four stay
+        // on the ring, and the bounded read reports them post-Q.
+        let pushed: Vec<Vec<u8>> = (0..10).map(numbered_call).collect();
+        let mut drain = staged_script(pushed, 10, 1024, 1024 * 1024);
+        let outcome = drain.source_mut().stage(100, Some(48));
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 6,
+                saturated: false
+            }
+        );
+        assert_eq!(drain.source_mut().inner_mut().remaining(), 4);
+        let mut seen = Vec::new();
+        let (post_q, backlog) = poll_events_to_position(&mut drain, 48, None, |event| {
+            seen.push(event.ts_ns);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        assert_eq!(seen, vec![0, 1, 2, 3, 4, 5]);
+        assert!(post_q);
+        assert!(!backlog);
+    }
+
+    #[test]
+    fn staged_events_surface_kernel_discards_at_consume_time() {
+        let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+        script.push_discard();
+        script.push_record(numbered_call(1));
+        let mut drain = EventDrain::over(StagedEvents::with_caps(script, 1024, 1024 * 1024));
+        assert_eq!(drain.discarded(), 0);
+        let outcome = drain.source_mut().stage(10, None);
+        assert_eq!(outcome.staged, 3);
+        assert!(!outcome.saturated);
+        // The discard crossed into the queue but surfaces only when its
+        // position is consumed, preserving poll-time loss accounting.
+        assert_eq!(drain.discarded(), 0);
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![0, 1]);
+        assert!(!backlog);
+        assert_eq!(drain.discarded(), 1);
+    }
+
+    #[test]
+    fn staged_events_count_malformed_at_decode() {
+        let pushed = vec![vec![0u8; 10], numbered_call(7)];
+        let mut drain = staged_script(pushed, 2, 1024, 1024 * 1024);
+        // Raw bytes stage without decoding; the short record counts
+        // malformed only when a consumer decodes it.
+        let outcome = drain.source_mut().stage(10, None);
+        assert_eq!(outcome.staged, 2);
+        assert_eq!(drain.malformed(), 0);
+        let (seen, backlog) = polled_ts_ns(&mut drain);
+        assert_eq!(seen, vec![7]);
+        assert!(!backlog);
+        assert_eq!(drain.malformed(), 1);
+    }
+
+    #[test]
+    fn unstaged_composite_matches_bare_ring() {
+        let pushed: Vec<Vec<u8>> = (0..16).map(numbered_call).collect();
+        let mut bare = EventDrain::over(ScriptedRecords::records(pushed.clone(), 16));
+        let mut staged = staged_script(pushed, 16, 1024, 1024 * 1024);
+        let mut bare_seen = Vec::new();
+        let bare_backlog = bare.poll(None, |event| {
+            bare_seen.push(event.ts_ns);
+            ControlFlow::Continue(())
+        });
+        let (staged_seen, staged_backlog) = polled_ts_ns(&mut staged);
+        assert_eq!((staged_seen, staged_backlog), (bare_seen, bare_backlog));
+        assert_eq!(staged.malformed(), bare.malformed());
+        assert_eq!(staged.discarded(), bare.discarded());
+    }
+
+    #[test]
+    fn events_stage_bounds_derive_from_existing_pools() {
+        assert_eq!(EVENTS_STAGE_ENTRIES, 131_072);
+        assert_eq!(EVENTS_STAGE_ENTRIES, 32 * LIVE_POLL_QUANTUM);
+        assert_eq!(
+            EVENTS_STAGE_BYTES,
+            3 * (p11scope_ebpf_common::JOINT_RING_BYTES as usize)
+        );
+        assert_eq!(EVENTS_STAGE_BYTES, 48 * 1024 * 1024);
     }
 
     #[test]

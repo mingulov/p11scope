@@ -3266,6 +3266,13 @@ impl SessionDrainProducers {
         self.events.id()
     }
 
+    /// The retained EVENTS domain itself, so a scripted driver can wire
+    /// its composite drain to the scene's exact allocation.
+    #[cfg(test)]
+    pub(crate) fn events_domain_for_test(&self) -> events::EventsDomain {
+        self.events.clone()
+    }
+
     /// Whether a journal producer is linked for this lane, as derived by
     /// the producers drain from the Session's retained sealed fact.
     pub(crate) fn journal_linked(&self) -> bool {

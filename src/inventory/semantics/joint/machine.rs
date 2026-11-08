@@ -216,6 +216,16 @@ pub(crate) const JOINT_FINISH_NO_PROGRESS_TIMEOUT: Duration =
 pub(crate) const JOINT_FINISH_SETTLE_TIMEOUT: Duration =
     Duration::from_millis(10 * (JOINT_FINISH_NO_PROGRESS_LIMIT as u64) * 2 + 1000);
 
+/// Named saturation gap: staging stopped at the queue bounds with the
+/// ring still holding records. The ring keeps the rest and kernel ring
+/// loss counts any overflow; the repeats count how many services
+/// observed saturation. Recorded by the service step.
+#[allow(dead_code)]
+pub(crate) const EVENTS_STAGE_SATURATED_SUBJECT: &str = "joint events staging saturated";
+/// Named saturation gap, reason half of [`EVENTS_STAGE_SATURATED_SUBJECT`].
+#[allow(dead_code)]
+pub(crate) const EVENTS_STAGE_SATURATED_REASON: &str = "the staged events queue is full while the kernel ring still holds records; the ring keeps the rest and kernel ring loss counts any overflow";
+
 pub(crate) struct JointWorkBudget {
     pub(crate) remaining_actions: usize,
     pub(crate) deadline: Instant,
@@ -441,6 +451,22 @@ pub(crate) trait JointMachineIo {
         adapter: &mut JournalAdapter,
         work: usize,
     ) -> Result<DispatchPoll, RawQuantumRefusal>;
+    /// Drain up to `quantum` EVENTS records off the kernel ring into the
+    /// lane's bounded userspace staging queue, never past `stop` when the
+    /// finish bounds the move. The machine service calls this on every
+    /// service, whatever the seal state, so a seal awaiting future input
+    /// or a binding never wedges the ring behind it; collection consumes
+    /// the queue first. The default stages nothing (existing scripted
+    /// drivers keep their direct reads); the Session driver overrides it.
+    #[allow(dead_code)]
+    fn stage_events(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        _quantum: usize,
+        _stop: Option<usize>,
+    ) -> crate::events::EventsStageOutcome {
+        crate::events::EventsStageOutcome::default()
+    }
     fn tick_collected(
         &mut self,
         lane: &mut AttestedSemanticLane,

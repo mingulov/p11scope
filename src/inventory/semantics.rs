@@ -12,6 +12,7 @@ pub(crate) mod selected;
 #[allow(unused_imports)]
 // Private Session service types; the ordinary driver remains inactive.
 pub(crate) use joint::{
+    EVENTS_STAGE_SATURATED_REASON, EVENTS_STAGE_SATURATED_SUBJECT,
     JOINT_FINISH_NO_PROGRESS_TIMEOUT, JOINT_FINISH_SETTLE_TIMEOUT, JointCommitRefusal,
     JointServiceMode, JointServiceProgress, JointWorkBudget,
 };

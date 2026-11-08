@@ -7759,8 +7759,8 @@ fn emit_commit(
         payload["final"] = serde_json::Value::Bool(true);
     }
     writer.append("pass_committed", payload, now_ns)?;
-    // The queues still waiting after this commit: the next totals
-    // snapshot reports them as `deferred`.
+    // The queues still waiting after this commit: the totals
+    // snapshot of this commit reports them as `deferred`.
     state.last_deferred = DeferredCounts {
         edge_events: edges.deferred as u64,
         instance_events: instances.instance_deferred as u64,

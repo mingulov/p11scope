@@ -3,7 +3,7 @@
 
 Appendable JSONL companions to the [`p11scope/inventory/v1` snapshot](inventory-v1.md):
 one JSON object per line, for external observability/monitoring to consume
-and forward. Emitted by `p11scope inventory --event-log <f.jsonl>`
+and forward. Emitted by `p11scope inventory --event-log <f.jsonl|->`
 (classic and `--dashboard` paths alike).
 
 Consumers dispatch on the exact per-line `schema` string

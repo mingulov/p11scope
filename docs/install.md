@@ -104,7 +104,7 @@ The P0 configuration needs `--features stub-object-attributes` as well as
 The official builder defaults to FULL; the observer example below selects P0.
 
 **Build prerequisites** (x86-64 Linux; Ubuntu package names): the pinned
-toolchains from [docs/development.md](development.md). The scripts select
+toolchains from [development setup](development.md). The scripts select
 the stable toolchain as `+1.99.1`, and the static observer needs its musl
 target:
 
@@ -177,6 +177,7 @@ sudo p11scope doctor
 
 If you installed the optional helper, also run
 `p11scope-discover --version` as your normal user.
+
 ## Building from source
 
 The root manifest selects two patched crates reconstructed from

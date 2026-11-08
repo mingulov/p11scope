@@ -9,11 +9,10 @@ provider or changing each application's configuration**.
 mechanisms, how fast, what errors": eBPF uprobes observe the providers already
 mapped by running processes, so there is no shim to install and no restart.
 
-> **Status: v0.6.0** answers "which application used which key, and how", with
-> opt-in live key operations (`inventory --key-operations`). Read the
-> [known limitations](CHANGELOG.md#known-limitations) before relying on a capture;
-> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what this
-> release was qualified on.
+> **Status: v0.6.0** answers "which application used which key, and how", with opt-in
+> live key operations (`inventory --key-operations`). Read the [known
+> limitations](CHANGELOG.md#known-limitations) before relying on a capture;
+> [CHANGELOG.md](CHANGELOG.md#qualification-of-this-release) records what this release was qualified on.
 
 ## Install
 
@@ -33,9 +32,12 @@ p11scope --version
 sudo p11scope doctor
 ```
 
-System packages, the discovery helper and local builds are in
-[Install](docs/install.md#install). There is no published container image:
-build it from this tree ([Kubernetes notes](deploy/k8s/README.md)).
+System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
+Container: the 0.7.0 release publishes `ghcr.io/mingulov/p11scope:0.7.0`; run `doctor` through it ([privileges](deploy/k8s/README.md)):
+
+```sh
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:0.7.0 doctor
+```
 
 ## First commands
 
@@ -57,16 +59,14 @@ Next: sudo p11scope profile --pid <PID> (or doctor --pid <PID> to check a target
 run with -v for details
 ```
 
-`12345` is a placeholder PID. If a command refuses instead of capturing, see
-[troubleshooting](docs/troubleshooting.md). Text is concise by default;
-`-v` shows full detail and `--json` is always complete.
+`12345` is a placeholder PID. If a command refuses instead of capturing, see [troubleshooting](docs/troubleshooting.md).
+Text is concise by default; `-v` shows full detail and `--json` is always complete.
 
 ## Requirements
 
 - Linux x86-64 with BTF (`/sys/kernel/btf/vmlinux`).
 - Kernel 6.6+ (or a working backport) for full live-capture support.
-- Root, or the [documented capabilities](docs/usage.md#privileges-per-environment)
-  (`CAP_BPF`+`CAP_PERFMON` at `perf_event_paranoid` below 3, else `CAP_SYS_ADMIN`).
+- Root, or the [documented capabilities](docs/usage.md#privileges-per-environment) (`CAP_BPF`+`CAP_PERFMON` at `perf_event_paranoid` below 3, else `CAP_SYS_ADMIN`).
 
 ## Documentation
 

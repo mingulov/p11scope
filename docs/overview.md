@@ -22,7 +22,7 @@ snapshots support offline comparison; detailed profiles support investigation.
 > with `-v` for details, and live capture resolves 7.3 while the
 > Detailed object loads on 7.4-rc1. Read the
 > [known limitations](../CHANGELOG.md#known-limitations) and
-> [docs/known-limitations.md](known-limitations.md) before relying on a
+> [known-limitations.md](known-limitations.md) before relying on a
 > capture. `--system` selects whole-machine scope;
 > [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release) records what
 > this release was qualified on.
@@ -150,11 +150,11 @@ cryptographic operations.
 
 See [CHANGELOG.md](../CHANGELOG.md) for what each release contains and its
 known limitations, [Install](install.md#install) to build and install it, and
-[docs/usage.md](usage.md) for the full operator's guide (privileges,
+[usage.md](usage.md) for the full operator's guide (privileges,
 kernel floor, overhead, and the evidence/completeness model — every
 quantitative claim there cites the script that measured it).
 The v0.6.0 user-facing limits live in
-[docs/known-limitations.md](known-limitations.md).
+[known-limitations.md](known-limitations.md).
 
 Saved inventories can be compared offline with
 `p11scope inventory diff before.json after.json`. The readable report groups
@@ -249,7 +249,7 @@ Public live cgroup qualification remains a development gate.
   An unobserved call or missing metadata remains unknown.
 
   Full quickstart, real command output, and `trace` mode:
-  [docs/usage.md](usage.md#quickstart).
+  [usage.md](usage.md#quickstart).
 
 ## Why not just pkcs11-spy?
 
@@ -351,8 +351,8 @@ The official builder selects `--no-default-features --features
 stub-object-attributes` for P0; packaging fails if the unsafe path is reachable.
 
 The field-by-field inventory is
-[docs/privacy/allowlist-v1.md](privacy/allowlist-v1.md), extended by
-[docs/privacy/allowlist-v2.md](privacy/allowlist-v2.md) (interface
+[privacy/allowlist-v1.md](privacy/allowlist-v1.md), extended by
+[privacy/allowlist-v2.md](privacy/allowlist-v2.md) (interface
 selection, attach mechanism, descendant rebuild, task-uprobe loss and ABI
 refusal evidence). The explicitly approved sections of
 [allowlist v3](privacy/allowlist-v3.md#h7-e4-attribute-capture-2026-10-20)
@@ -390,7 +390,7 @@ report format.
   proportionally largest; the same ~3.3µs absolute overhead is negligible
   against a millisecond-scale network HSM
   (`scripts/bench-overhead.sh`, `docs/notes/phase5-overhead.md`; full numbers
-  and the event-loss finding at high call rates: [docs/usage.md](usage.md#overhead-measured)).
+  and the event-loss finding at high call rates: [usage.md](usage.md#overhead-measured)).
 - Requires elevated privileges, kernel-version-dependent, x86-64 first. Live
   capture requires general Multi host capability; a safe scoped per-probe
   backend can still be selected on an eligible host. With multi active,
@@ -509,11 +509,11 @@ report format.
   this window," never "the application cannot do it"; aliased table entries are
   ambiguous by construction; requested attributes are what the app asked for,
   not the key's effective policy. Full honest-claims section:
-  [docs/usage.md](usage.md#honest-claims).
+  [usage.md](usage.md#honest-claims).
 - The schema is `p11scope/observed-profile/v3` for `profile` and
   `p11scope/observed-profile/v3-metrics` for `metrics`, with optional
   discovery input at `p11scope-manifest/5`, documented at
-  [docs/schema/observed-profile-v3.md](schema/observed-profile-v3.md).
+  [schema/observed-profile-v3.md](schema/observed-profile-v3.md).
   Schema ids are opaque exact dispatch keys; the major/minor spelling grants
   no compatibility.
 
@@ -538,8 +538,9 @@ counts (host kernel 7.0; see the
 [v0.1.0 notes](https://github.com/mingulov/p11scope/releases/tag/v0.1.0)).
 This release's qualification is
 [CHANGELOG.md](../CHANGELOG.md#qualification-of-this-release).
-`deploy/k8s` is a least-privilege node DaemonSet built from this tree (not a
-published image or an operator), with a committed kind end-to-end test
+`deploy/k8s` is a least-privilege node DaemonSet example built from this tree
+(not the published release image, nor an operator), with a committed kind
+end-to-end test
 (`scripts/kind-e2e.sh`); see [deploy/k8s/README.md](../deploy/k8s/README.md) for
 the privileges it needs and why.
 

@@ -51,7 +51,7 @@ command -v python3 >/dev/null 2>&1 \
 command -v openssl >/dev/null 2>&1 \
     || { echo "demo: openssl not found; install OpenSSL, then rerun this script" >&2; exit 2; }
 probe() { for p in "$@"; do [ -e "$p" ] && { echo "$p"; return 0; }; done; return 1; }
-SOFTHSM=$(probe /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so) \
+SOFTHSM=$(probe /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so /usr/lib64/pkcs11/libsofthsm2.so /usr/lib/softhsm/libsofthsm2.so /usr/lib64/softhsm/libsofthsm2.so) \
     || { echo "demo: no SoftHSM library found; install SoftHSM (softhsm2 / softhsm), then rerun this script" >&2; exit 2; }
 PKCS11SO=$(probe /usr/lib/x86_64-linux-gnu/ossl-modules/pkcs11.so /usr/lib64/ossl-modules/pkcs11.so) \
     || { echo "demo: no pkcs11-provider module found; install it (pkcs11-provider), then rerun this script" >&2; exit 2; }

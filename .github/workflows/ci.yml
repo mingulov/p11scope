@@ -826,6 +826,7 @@ jobs:
           UNRUN: scripts/bench-count-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-stagea-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/bench-marker-cost.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/bench-v070-overhead.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/build-release.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/capture-stopped-canary.py (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/check-canary-evidence.py (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
@@ -993,6 +994,7 @@ jobs:
       - run: scripts/bench-overhead.sh --self-test
       - run: scripts/bench-stagea-overhead.sh --self-test
       - run: scripts/bench-marker-cost.sh --self-test
+      - run: scripts/bench-v070-overhead.sh --self-test
       - run: scripts/bench-count-overhead.sh --self-test
       - run: scripts/bench-discovery.sh --self-test
       - run: scripts/k8s-profile-entry.sh --self-test

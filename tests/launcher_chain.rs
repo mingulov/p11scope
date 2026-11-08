@@ -91,10 +91,14 @@ struct Chain {
 
 impl Chain {
     fn spawn(dir: &Path, name: &str) -> Self {
+        Self::spawn_with_parent(dir, name, "chain-parent", "public-cli/chain-parent.c")
+    }
+
+    fn spawn_with_parent(dir: &Path, name: &str, parent_exe: &str, parent_src: &str) -> Self {
         let parent_bin = gcc(
             dir,
-            "chain-parent",
-            &fixture_source("public-cli/chain-parent.c"),
+            parent_exe,
+            &fixture_source(parent_src),
             &["-O2", "-Wall", "-Wextra", "-Werror"],
             &[],
         );
@@ -180,6 +184,187 @@ impl Drop for Chain {
             let _ = parent.wait();
         }
     }
+}
+
+/// A double-forked client reparented to init: no waitable parent, only
+/// the gate and the init adoption. Killed on drop like a chain client.
+struct Orphan {
+    client_pid: u32,
+    gate: PathBuf,
+}
+
+impl Orphan {
+    fn spawn(dir: &Path, name: &str) -> Self {
+        let parent_bin = gcc(
+            dir,
+            "orphan-parent",
+            &fixture_source("parent-chain/orphan-parent.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &[],
+        );
+        let client_bin = gcc(
+            dir,
+            "chain-client",
+            &fixture_source("parent-chain/chain-client.c"),
+            &["-O2", "-Wall", "-Wextra", "-Werror"],
+            &["-ldl"],
+        );
+        let ready = dir.join(format!("{name}.ready"));
+        let _ = std::fs::remove_file(&ready);
+        let gate = dir.join(format!("{name}.gate"));
+        let _ = std::fs::remove_file(&gate);
+        let mut spawner = Command::new(&parent_bin)
+            .arg(&client_bin)
+            .arg(softhsm_path())
+            .arg(&ready)
+            .arg(&gate)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        // The spawner reaps the intermediate child and exits at once;
+        // the client outlives it under init.
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let status = loop {
+            if let Some(status) = spawner.try_wait().unwrap() {
+                break status;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the orphan spawner never exited"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        };
+        assert!(
+            status.success(),
+            "the orphan spawner must exit cleanly: {status}"
+        );
+        let client_pid = {
+            let deadline = Instant::now() + Duration::from_secs(30);
+            loop {
+                if let Ok(text) = std::fs::read_to_string(&ready)
+                    && let Some(pid) = text.split_whitespace().nth(1)
+                {
+                    break pid.parse::<u32>().unwrap();
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture {name} never became ready"
+                );
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        };
+        // The independent oracle: the client really is orphaned to init.
+        // Anything else (a subreaper between here and pid 1) fails
+        // loudly: this cell needs the init adoption, never a skip.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (ppid, _) = stat_pair(client_pid);
+            if ppid == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the orphaned client never reached init (ppid {ppid}): \
+                 a subreaper adopted it or the double fork failed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Self { client_pid, gate }
+    }
+
+    /// Release the client and require its exit. Not our child, so poll
+    /// `/proc` for the exit (reaped, or zombie awaiting init's wait).
+    fn release(self) {
+        std::fs::write(&self.gate, b"go\n").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            match std::fs::read_to_string(format!("/proc/{}/stat", self.client_pid)) {
+                Err(_) => break,
+                Ok(text) => {
+                    let end = text.rfind(')').expect("stat comm");
+                    let state = text[end + 1..].split_whitespace().next();
+                    if state == Some("Z") {
+                        break;
+                    }
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the orphaned client never exited"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+}
+
+impl Drop for Orphan {
+    fn drop(&mut self) {
+        unsafe {
+            libc::kill(self.client_pid as libc::pid_t, libc::SIGKILL);
+        }
+    }
+}
+
+/// Independent `/proc` oracle for the systemd unit: the first unit of
+/// the `0:` cgroup path (leading slices skipped), or the first unit
+/// after `user@<uid>.service` inside a user subtree. Derived in the
+/// test from the raw file, so production must agree byte for byte.
+fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
+    const SUFFIXES: &[&str] = &[
+        ".service",
+        ".scope",
+        ".socket",
+        ".timer",
+        ".target",
+        ".path",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".device",
+    ];
+    let mut path = None;
+    for line in cgroup.lines() {
+        let Some(rest) = line.strip_prefix("0:") else {
+            continue;
+        };
+        let Some((_, candidate)) = rest.split_once(':') else {
+            continue;
+        };
+        path = Some(candidate.strip_suffix(" (deleted)").unwrap_or(candidate));
+        break;
+    }
+    let path = path?;
+    if path.starts_with("/../") {
+        return None;
+    }
+    let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
+    let start = parts
+        .iter()
+        .position(|component| {
+            component
+                .strip_prefix("user@")
+                .and_then(|rest| rest.strip_suffix(".service"))
+                .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+        })
+        .map(|at| at + 1)
+        .unwrap_or(0);
+    for component in &parts[start..] {
+        let name = component.strip_prefix('_').unwrap_or(component);
+        if name.len() > ".slice".len() && name.ends_with(".slice") {
+            continue;
+        }
+        if SUFFIXES
+            .iter()
+            .any(|suffix| name.len() > suffix.len() && name.ends_with(suffix))
+        {
+            return Some(name.to_string());
+        }
+        return None;
+    }
+    None
 }
 
 fn observe(pid: u32, args: &[&str]) -> std::process::Output {
@@ -298,5 +483,84 @@ fn launcher_chain_concise_text_shows_one_hop() {
         text.contains("chain-client (from chain-parent)"),
         "the concise one-hop suffix, got:\n{text}"
     );
+    chain.release();
+}
+
+/// An orphaned client (double fork, adopted by init) reports
+/// `init_parent` with an empty chain, a null gap and the systemd unit
+/// the independent `/proc` oracle derives for the live client.
+#[test]
+fn launcher_chain_orphan_reports_init_parent_with_oracle_unit() {
+    let _guard = serial_guard();
+    let dir = tmp("launcher-chain-orphan");
+    let orphan = Orphan::spawn(&dir, "orphan");
+    let raw = std::fs::read_to_string(format!("/proc/{}/cgroup", orphan.client_pid)).unwrap();
+    let expected_unit = systemd_unit_oracle(&raw);
+    let output = observe(orphan.client_pid, &["--capture", "scan", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "orphan observe failed: {stderr}");
+    assert!(
+        !stderr.contains("panicked"),
+        "stderr stays panic-free: {stderr}"
+    );
+    let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let callers = caller_for(&doc, u64::from(orphan.client_pid));
+    assert_eq!(callers.len(), 1, "one incarnation for the orphan");
+    let caller = callers[0];
+    assert!(
+        caller["launched_by"].as_array().is_some_and(Vec::is_empty),
+        "init is never shown as the launcher: {}",
+        caller["launched_by"]
+    );
+    assert_eq!(caller["launched_by_origin"], "init_parent");
+    assert!(
+        caller["launched_by_gap"].is_null(),
+        "init_parent is not a read failure: {}",
+        caller["launched_by_gap"]
+    );
+    assert_eq!(
+        caller["launched_by_unit"].as_str(),
+        expected_unit.as_deref(),
+        "the unit matches the independent /proc oracle (raw {raw:?})"
+    );
+    orphan.release();
+}
+
+/// A client adopted by a same-namespace child subreaper keeps the
+/// adopter as a visible link: subreapers expose no `/proc` flag, so
+/// this is the documented known limit, pinned against silent renames.
+#[test]
+fn launcher_chain_subreaper_adoption_shows_the_adopter() {
+    let _guard = serial_guard();
+    let dir = tmp("launcher-chain-subreaper");
+    let chain = Chain::spawn_with_parent(
+        &dir,
+        "subreaper",
+        "subreaper-parent",
+        "parent-chain/subreaper-parent.c",
+    );
+    let output = observe(chain.client_pid, &["--capture", "scan", "--json"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        output.status.success(),
+        "subreaper observe failed: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "stderr stays panic-free: {stderr}"
+    );
+    let doc: Value = serde_json::from_str(&String::from_utf8_lossy(&output.stdout)).unwrap();
+    let callers = caller_for(&doc, u64::from(chain.client_pid));
+    assert_eq!(callers.len(), 1, "one incarnation for the client");
+    let caller = callers[0];
+    let launched = caller["launched_by"].as_array().unwrap();
+    assert!(
+        !launched.is_empty(),
+        "the adopting subreaper stays a visible link: {caller}"
+    );
+    assert_eq!(launched[0]["pid"], chain.parent_pid);
+    assert_eq!(launched[0]["exe"], "subreaper-parent");
+    assert_eq!(caller["launched_by_origin"], "chain");
+    assert!(caller["launched_by_unit"].is_null());
     chain.release();
 }

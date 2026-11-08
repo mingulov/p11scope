@@ -60,6 +60,24 @@ const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
 const WRAP_PID_POLL_INTERVAL_MS: u64 = 250;
 const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 50;
 
+/// Ordinary-ring capacity and required 10% wrap margin for the live gate.
+/// The C=260 schedule leaves 224 records (<1%); any product change reducing
+/// per-round production by >0.9% would break the wrap proof loudly but
+/// without warning. Pilot-anchored rates (C=32/S=4/k=32 ordinary 3232,
+/// C=260/S=4/k=32 ordinary 24800) give ~94.6 ordinary records per counted
+/// round; the floor below (94) keeps the pin conservative so a passing pin
+/// implies live margin with ~220 records to spare.
+const ORDINARY_CAPACITY: u64 = 24576;
+const ORDINARY_MARGIN_REQUIRED: u64 = 2458;
+const ORDINARY_PER_COUNTED_ROUND_FLOOR: u64 = 94;
+
+/// Conservative ordinary-produced floor for a wrap schedule: 94 per counted
+/// round, 32 per shared round, 32 for the fence/proof pair. Pure so unit
+/// tests pin the 10% margin without a live run.
+fn expected_ordinary_produced_floor(counted: u64, shared: u64) -> u64 {
+    counted * ORDINARY_PER_COUNTED_ROUND_FLOOR + shared * 32 + 32
+}
+
 /// Workload trailing CLI arguments `[NONCE, DEADLINE_MS, COUNTED, SHARED]`
 /// for a schedule, with the fixture binary's own bounds enforced first
 /// (deadline 1..=900_000, counted 1..=400, shared 1..=258) plus the
@@ -6255,6 +6273,22 @@ fn operator_diagnostics_wrap_twin_wrap_schedule_args() -> Result<()> {
     ensure!(
         WRAP_COUNTED != COUNTED || WRAP_SHARED != SHARED,
         "the shortened gate must differ from the legacy 400/258 schedule"
+    );
+    Ok(())
+}
+
+#[test]
+fn operator_diagnostics_wrap_twin_wrap_margin_ten_percent() -> Result<()> {
+    // The live schedule must carry >=10% ordinary-ring margin over the
+    // 24576 capacity, pinned by the conservative pilot-anchored floor.
+    // C=260 (floor 24560) fails; the live gate needs a longer counted run.
+    let produced = expected_ordinary_produced_floor(WRAP_COUNTED, WRAP_SHARED);
+    let required = ORDINARY_CAPACITY + ORDINARY_MARGIN_REQUIRED;
+    ensure!(
+        produced >= required,
+        "wrap ordinary margin eroded: produced={produced} required={required} (C={} S={})",
+        WRAP_COUNTED,
+        WRAP_SHARED
     );
     Ok(())
 }

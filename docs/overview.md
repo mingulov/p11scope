@@ -71,7 +71,7 @@ sudo p11scope doctor
 
 ```
 Doctor: requested-lane checks passed.
-verdict: capture available; run initial-set capture not in this build (run reports stay PARTIAL; run itself works)
+verdict: capture available; run startup capture not in this build (run reports stay partial; run itself works)
 target loader build ............... warn  unbound
 debug-state hook .................. warn  unavailable
 loader-state live read ............ warn  unavailable

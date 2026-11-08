@@ -1669,16 +1669,18 @@ fn verdict_line(checks: &[Check]) -> String {
             // ("never eligible"): that is not availability — but `run`
             // itself still works. What the limit removes is the proof that
             // the child's initial provider set was captured from its first
-            // constructor, which keeps every `run` report PARTIAL (HIGH-5).
+            // constructor, which keeps every `run` report partial (HIGH-5).
+            // Plain words, lowercase partial like the coverage lines; the
+            // -v row keeps the technical check name.
             Status::NotApplicable(detail) if detail == BUILD_LIMIT_NOT_IN_BUILD => {
                 parts.push(format!(
-                    "run initial-set capture {detail} (run reports stay PARTIAL; run itself works)"
+                    "run startup capture {detail} (run reports stay partial; run itself works)"
                 ));
             }
             Status::NotApplicable(_) => {}
             Status::Fail(detail) => parts.push(format!("run capture unavailable ({detail})")),
             Status::Warn(detail) => parts.push(format!(
-                "run initial-set capture {detail} (run reports stay PARTIAL; run itself works)"
+                "run startup capture {detail} (run reports stay partial; run itself works)"
             )),
             Status::Ok(_) => parts.push("run capture available".to_string()),
         }
@@ -3934,8 +3936,8 @@ mod tests {
         // Fable: the legacy Warn("none") shape ("never eligible while
         // the catalog is empty") must not render as "available".
         // HIGH-5: nor as "run capture not eligible" — `run` itself works on
-        // a capable host; what `none` limits is its initial-set proof, which
-        // keeps its reports PARTIAL.
+        // a capable host; what `none` limits is its startup proof, which
+        // keeps its reports partial.
         let ineligible = vec![Check {
             name: "run initial-set capture".into(),
             status: Status::Warn("none".into()),
@@ -3943,16 +3945,14 @@ mod tests {
         assert_eq!(verdict(&ineligible), 0);
         let line = verdict_line(&ineligible);
         assert!(
-            line.contains(
-                "run initial-set capture none (run reports stay PARTIAL; run itself works)"
-            ),
+            line.contains("run startup capture none (run reports stay partial; run itself works)"),
             "verdict text misstates an ineligible lane: {line}"
         );
         assert!(!line.contains("not eligible"), "{line}");
         assert!(!line.contains("run capture available"), "{line}");
 
-        // The same lane as a build-limit n/a keeps the PARTIAL note:
-        // `run` itself works, only its initial-set proof is missing.
+        // The same lane as a build-limit n/a keeps the partial note:
+        // `run` itself works, only its startup proof is missing.
         let limited = vec![Check {
             name: "run initial-set capture".into(),
             status: Status::NotApplicable("not in this build".into()),
@@ -3961,7 +3961,7 @@ mod tests {
         let line = verdict_line(&limited);
         assert!(
             line.contains(
-                "run initial-set capture not in this build (run reports stay PARTIAL; run itself works)"
+                "run startup capture not in this build (run reports stay partial; run itself works)"
             ),
             "{line}"
         );

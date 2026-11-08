@@ -477,11 +477,15 @@ pub(crate) struct EventsStageOutcome {
 }
 
 /// One staged queue entry: a verbatim ring-record copy with its exact
-/// ring span, or a kernel-discard count observed while pulling.
+/// ring span, or kernel discards observed while pulling. A marker
+/// staged beside its record carries no span (the record's span covers
+/// the whole pull); a marker staged for discards with no record after
+/// them carries their span, so consuming it advances the logical
+/// consumer exactly to the inner cursor.
 #[derive(Debug)]
 enum StagedItem {
     Bytes { span: usize, bytes: Vec<u8> },
-    Discarded { count: u64 },
+    Discarded { count: u64, span: usize },
 }
 
 /// A userspace staging queue in front of the kernel EVENTS ring. The
@@ -498,7 +502,9 @@ enum StagedItem {
 ///   so cuts chain across interleaved staging and collection;
 /// - kernel discards observed while pulling surface as markers that
 ///   count only when their position is consumed, preserving poll-time
-///   loss accounting; malformed counts at decode, never at staging;
+///   loss accounting; a marker for discards with no record after them
+///   also carries their ring span, so the logical consumer advances
+///   exactly; malformed counts at decode, never at staging;
 /// - the move stops at the entry/byte caps (the ring keeps the rest,
 ///   reported as saturation) and never past `stop` when bounded, so a
 ///   finish restages only pre-Q bytes and post-Q commits still flag.
@@ -540,38 +546,71 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
     /// which carries no bytes); the positions capacity below carries a
     /// full byte-cap margin for that overrun.
     pub(crate) fn stage(&mut self, quantum: usize, stop: Option<usize>) -> EventsStageOutcome {
-        let stop = stop.unwrap_or(usize::MAX);
+        let stop_pos = stop.unwrap_or(usize::MAX);
         let mut staged = 0;
         while staged < quantum
             && self.fifo.len() < self.entry_cap
             && self.fifo_spans < self.byte_cap
         {
-            if self.inner.consumer() >= stop {
+            if self.inner.consumer() >= stop_pos {
                 break;
             }
+            // The inner cursor moves under every outcome: Aya's reader
+            // skips kernel-discarded reservations inside the call and
+            // may then return no record. Resync from these snapshots
+            // after every pull, whatever it returns, or the skipped
+            // bytes never join any staged span.
             let before = self.inner.consumer();
-            let bytes = {
-                let Some(item) = self.inner.next_record() else {
-                    break;
-                };
-                item.to_vec()
+            // A bounded move pulls through the bounded reader so Aya
+            // enforces the stop. Each copy ends the inner borrow
+            // before the resync below reborrows the source. A boundary
+            // refusal stops the move after accounting: the record
+            // still stands at the inner head, so the next direct
+            // bounded read reports the same refusal.
+            let mut halt = false;
+            let pulled: Option<Vec<u8>> = match stop {
+                Some(bound) => match self.inner.bounded_record(bound) {
+                    Ok(BoundedRecord::Item(item)) => Some(item.to_vec()),
+                    Ok(BoundedRecord::Pending | BoundedRecord::Reached) => None,
+                    Err(_) => {
+                        halt = true;
+                        None
+                    }
+                },
+                None => self.inner.next_record().map(|item| item.to_vec()),
             };
             let after = self.inner.consumer();
             let discarded = self.inner.discarded();
             let delta = discarded.saturating_sub(self.discarded_baseline);
             self.discarded_baseline = discarded;
-            if delta > 0 {
-                self.fifo.push_back(StagedItem::Discarded { count: delta });
-                staged += 1;
-            }
             let span = after.saturating_sub(before);
             debug_assert!(span.is_multiple_of(8), "ring spans stay 8-aligned");
-            self.fifo_spans = self.fifo_spans.saturating_add(span);
-            self.fifo.push_back(StagedItem::Bytes { span, bytes });
-            staged += 1;
+            match pulled {
+                Some(bytes) => {
+                    if delta > 0 {
+                        self.fifo.push_back(StagedItem::Discarded {
+                            count: delta,
+                            span: 0,
+                        });
+                        staged += 1;
+                    }
+                    self.fifo_spans = self.fifo_spans.saturating_add(span);
+                    self.fifo.push_back(StagedItem::Bytes { span, bytes });
+                    staged += 1;
+                }
+                None if span == 0 && delta == 0 => break,
+                None => {
+                    self.fifo
+                        .push_back(StagedItem::Discarded { count: delta, span });
+                    staged += 1;
+                }
+            }
+            if halt {
+                break;
+            }
         }
         let capped = self.fifo.len() >= self.entry_cap || self.fifo_spans >= self.byte_cap;
-        let inner_more = self.inner.consumer() < stop
+        let inner_more = self.inner.consumer() < stop_pos
             && self.inner.positions().producer != self.inner.consumer();
         EventsStageOutcome {
             staged,
@@ -580,7 +619,9 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
     }
 
     /// Folds ring-side discards observed by a direct (queue-dry) pull
-    /// into the consumed count, exactly as the bare ring would.
+    /// into the consumed count, exactly as the bare ring would. Runs
+    /// after every direct pull, whatever it returns: a no-record
+    /// outcome may still have skipped discards.
     fn sync_direct_discards(&mut self) {
         let discarded = self.inner.discarded();
         let delta = discarded.saturating_sub(self.discarded_baseline);
@@ -609,23 +650,22 @@ impl<S: BoundedRecordSource> RecordSource for StagedEvents<S> {
                     self.fifo_spans = self.fifo_spans.saturating_sub(span);
                     return Some(bytes);
                 }
-                Some(StagedItem::Discarded { count }) => {
+                Some(StagedItem::Discarded { count, span }) => {
+                    self.consumed_to = self.consumed_to.saturating_add(span);
                     self.discarded_consumed = self.discarded_consumed.saturating_add(count);
                 }
                 None => break,
             }
         }
         // Queue dry: serve the ring directly, keeping the logical
-        // cursor synced so an unstaged queue reads exactly as the
-        // bare ring. The scoped copy ends the ring borrow before the
-        // cursor sync reborrows the source.
-        let bytes = {
-            let item = self.inner.next_record()?;
-            item.to_vec()
-        };
+        // cursor synced on every outcome — even a no-record return
+        // may have skipped kernel discards — so an unstaged queue
+        // reads exactly as the bare ring. The mapped copy ends the
+        // ring borrow before the cursor sync reborrows the source.
+        let bytes = self.inner.next_record().map(|item| item.to_vec());
         self.consumed_to = self.inner.consumer();
         self.sync_direct_discards();
-        Some(bytes)
+        bytes
     }
 
     fn discarded(&self) -> u64 {
@@ -680,9 +720,10 @@ impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
                     return Ok(BoundedRecord::Item(bytes));
                 }
                 Some(StagedItem::Discarded { .. }) => {
-                    let Some(StagedItem::Discarded { count }) = self.fifo.pop_front() else {
+                    let Some(StagedItem::Discarded { count, span }) = self.fifo.pop_front() else {
                         unreachable!("the peeked staged marker pops");
                     };
+                    self.consumed_to = self.consumed_to.saturating_add(span);
                     self.discarded_consumed = self.discarded_consumed.saturating_add(count);
                 }
                 None => break,
@@ -704,8 +745,19 @@ impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
                 self.sync_direct_discards();
                 Ok(BoundedRecord::Item(bytes))
             }
-            OwnedRead::Pending => Ok(BoundedRecord::Pending),
-            OwnedRead::Reached => Ok(BoundedRecord::Reached),
+            // A no-record outcome may still have skipped discards:
+            // resync the cursor and the loss count exactly as a
+            // direct record read does.
+            OwnedRead::Pending => {
+                self.consumed_to = self.inner.consumer();
+                self.sync_direct_discards();
+                Ok(BoundedRecord::Pending)
+            }
+            OwnedRead::Reached => {
+                self.consumed_to = self.inner.consumer();
+                self.sync_direct_discards();
+                Ok(BoundedRecord::Reached)
+            }
         }
     }
 }

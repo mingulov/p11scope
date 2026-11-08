@@ -2559,6 +2559,181 @@ mod tests {
     }
 
     #[test]
+    fn backing_refuses_upper_under_mode_000_parent() {
+        // An upper entry hidden behind an unreadable parent directory
+        // refuses instead of falling through to the lower file: a
+        // stat failure is not proof of absence. Which claim applies
+        // is decided by what this process can actually do (root stats
+        // through mode-000 parents): both configurations assert.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, gated, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("gated"),
+            root.path().join("gated").join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &gated, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xB0u8; 64]).expect("write");
+        let upper_file = upper.join("lib.so");
+        std::fs::write(&upper_file, [0xB1u8; 64]).expect("write");
+        let (lower_ino, upper_ino) = (backing_ino_of(&lower_file), backing_ino_of(&upper_file));
+        assert_ne!(lower_ino, upper_ino, "the twin needs distinct layer inodes");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        let merged = merged_root.join("lib.so");
+        // Visible control: the upper file is real and wired.
+        assert!(
+            super::calibration_backing_accepted(&merged, upper_ino, &table),
+            "a visible upper copy must match the slot"
+        );
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&gated, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let denied = std::fs::symlink_metadata(&upper_file).is_err();
+        let lower_hidden = super::calibration_backing_accepted(&merged, lower_ino, &table);
+        let upper_hidden = super::calibration_backing_accepted(&merged, upper_ino, &table);
+        std::fs::set_permissions(&gated, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        if !denied {
+            assert!(
+                upper_hidden,
+                "a process that stats through still matches the upper copy"
+            );
+            assert!(
+                !lower_hidden,
+                "a lower slot under a visible upper copy must refuse"
+            );
+            return;
+        }
+        assert!(
+            !lower_hidden,
+            "an unreadable upper must not fall through to the lower file"
+        );
+        assert!(
+            !upper_hidden,
+            "an unreadable upper must not match its own slot either"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_when_layer_root_is_missing() {
+        // The table names an upperdir that stats nothing (a layer the
+        // observer cannot see): the entry's NotFound proves no absence,
+        // so the lower slot refuses instead of being accepted through
+        // the invisible upper.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("missing-upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xB2u8; 64]).expect("write");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&lower_file),
+                &table,
+            ),
+            "a missing upper layer root must refuse the lower slot"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_when_layer_root_is_not_a_directory() {
+        // The table names an upperdir that is a regular file: no layer
+        // directory stands behind the entry path, so the lower slot
+        // refuses instead of falling through.
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper-file"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        std::fs::write(&upper, [0xB3u8; 64]).expect("write");
+        let lower_file = lower.join("lib.so");
+        std::fs::write(&lower_file, [0xB4u8; 64]).expect("write");
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("lib.so"),
+                backing_ino_of(&lower_file),
+                &table,
+            ),
+            "a non-directory upper layer root must refuse the lower slot"
+        );
+    }
+
+    #[test]
+    fn backing_refuses_unstatable_entry_under_healthy_layer_root() {
+        // The layer root stats as a directory but the entry itself
+        // fails with a non-NotFound error (a symlink loop and an
+        // unreadable intermediate directory): both refuse instead of
+        // reading as "no entry".
+        let root = tempfile::tempdir().expect("tempdir");
+        let (lower, upper, merged_root) = (
+            root.path().join("lower"),
+            root.path().join("upper"),
+            root.path().join("merged"),
+        );
+        for dir in [&lower, &upper, &merged_root] {
+            std::fs::create_dir(dir).expect("layer dir");
+        }
+        // Each unstatable upper entry sits over a lower file, so the
+        // old fall-through would accept the lower slot (RED) while the
+        // fix refuses (GREEN).
+        for sub in ["loopy", "gated"] {
+            let dir = lower.join(sub);
+            std::fs::create_dir(&dir).expect("layer dir");
+            std::fs::write(dir.join("lib.so"), [0xB5u8; 64]).expect("write");
+        }
+        let table = overlay_table_for(&merged_root, &upper, &lower);
+        // A symlink loop as the intermediate component: ELOOP.
+        let loopy = upper.join("loopy");
+        std::os::unix::fs::symlink(&loopy, &loopy).expect("symlink");
+        assert!(
+            !super::calibration_backing_accepted(
+                &merged_root.join("loopy/lib.so"),
+                backing_ino_of(&lower.join("loopy/lib.so")),
+                &table,
+            ),
+            "a looping upper entry must refuse"
+        );
+        // An unreadable intermediate directory: EACCES for a process
+        // that cannot stat through (root sees the absent entry and
+        // falls through to the lower file — both configurations assert).
+        let gated = upper.join("gated");
+        std::fs::create_dir(&gated).expect("layer dir");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&gated, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let denied = std::fs::symlink_metadata(gated.join("lib.so")).is_err();
+        let outcome = super::calibration_backing_accepted(
+            &merged_root.join("gated/lib.so"),
+            backing_ino_of(&lower.join("gated/lib.so")),
+            &table,
+        );
+        std::fs::set_permissions(&gated, std::fs::Permissions::from_mode(0o755)).expect("restore");
+        if !denied {
+            assert!(
+                outcome,
+                "a process that stats through still falls through to the lower file"
+            );
+            return;
+        }
+        assert!(
+            !outcome,
+            "an unreadable upper entry must not fall through to the lower file"
+        );
+    }
+
+    #[test]
     fn upper_is_metacopy_false_for_ordinary_files() {
         // The live probe reads `trusted.overlay.metacopy`: ordinary
         // files (and missing paths) report false, fail closed.

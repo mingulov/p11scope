@@ -51,6 +51,17 @@ enum Interpreter {
     Ruby,
 }
 
+/// Whether `comm` may source a hint for `interpreter` at all. One
+/// predicate gates both the `/proc/<pid>/comm` read and the comm hint
+/// below: java and node get no comm read, since their task names are
+/// not script names (node's main task is `MainThread`, measured).
+fn comm_eligible(interpreter: Interpreter) -> bool {
+    matches!(
+        interpreter,
+        Interpreter::Python | Interpreter::Perl | Interpreter::Ruby
+    )
+}
+
 /// Last nonempty `/`-separated component, if any.
 fn basename_of(path: &str) -> Option<&str> {
     path.rsplit('/').find(|part| !part.is_empty())
@@ -228,6 +239,31 @@ fn java_attached(token: &[u8]) -> bool {
     PREFIXES.iter().any(|prefix| token.starts_with(prefix))
 }
 
+/// Self-contained `--name=value` java launcher forms (the JDK
+/// whitespace-option lists): the value rides the token, so the whole
+/// token skips. Every other `--*=*` bails — notably
+/// `--module=<m>/<class>`, after which the launcher hands every later
+/// token to the application: skipping it would capture the first
+/// application argument as the "main class".
+const JAVA_EQ_FLAGS: &[&[u8]] = &[
+    b"--class-path",
+    b"--module-path",
+    b"--upgrade-module-path",
+    b"--add-modules",
+    b"--enable-native-access",
+    b"--limit-modules",
+    b"--add-exports",
+    b"--add-opens",
+    b"--add-reads",
+    b"--patch-module",
+    b"--enable-final-field-mutation",
+    b"--illegal-native-access",
+    b"--illegal-final-field-mutation",
+    b"--sun-misc-unsafe-memory-access",
+    b"--finalization",
+    b"--source",
+];
+
 /// `java` walker: `-jar` captures the jar basename; otherwise the first
 /// non-flag token must be a dotted main class. Unknown flags bail.
 fn java_token(tokens: &[&[u8]]) -> Option<String> {
@@ -247,9 +283,12 @@ fn java_token(tokens: &[&[u8]]) -> Option<String> {
             continue;
         }
         if token.starts_with(b"--") {
-            if token.contains(&b'=') {
-                index = index.checked_add(1)?;
-                continue;
+            if let Some(eq) = token.iter().position(|byte| *byte == b'=') {
+                let name = &token[..eq];
+                if JAVA_EQ_FLAGS.contains(&name) {
+                    index = index.checked_add(1)?;
+                    continue;
+                }
             }
             return None;
         }
@@ -306,6 +345,79 @@ const NODE_BOOL_FLAGS: &[&[u8]] = &[
     b"--heap-prof",
 ];
 
+/// Self-contained `--name=value` node forms: every `--name=...`
+/// spelling `node --help` documents (v24; the `--inspect*` family takes
+/// `[=...]`), except `--eval` (evaluated text, bails above) and `--run`
+/// (package-script entry: later tokens are that script's arguments, not
+/// node scripts), plus `--loader` (`=` acceptance probe-verified,
+/// probe-r3). Each carries an attached value and leaves positional
+/// parsing unchanged, so the whole token skips. Anything unlisted — V8
+/// tuning flags, future options — bails to a safe miss.
+const NODE_EQ_FLAGS: &[&[u8]] = &[
+    b"--allow-fs-read",
+    b"--allow-fs-write",
+    b"--build-snapshot-config",
+    b"--conditions",
+    b"--cpu-prof-dir",
+    b"--cpu-prof-interval",
+    b"--cpu-prof-name",
+    b"--diagnostic-dir",
+    b"--disable-proto",
+    b"--disable-warning",
+    b"--dns-result-order",
+    b"--env-file",
+    b"--env-file-if-exists",
+    b"--experimental-config-file",
+    b"--experimental-loader",
+    b"--experimental-package-map",
+    b"--experimental-sea-config",
+    b"--experimental-test-tag-filter",
+    b"--heap-prof-dir",
+    b"--heap-prof-interval",
+    b"--heap-prof-name",
+    b"--heapsnapshot-near-heap-limit",
+    b"--heapsnapshot-signal",
+    b"--icu-data-dir",
+    b"--import",
+    b"--input-type",
+    b"--inspect",
+    b"--inspect-brk",
+    b"--inspect-port",
+    b"--inspect-publish-uid",
+    b"--inspect-wait",
+    b"--loader",
+    b"--localstorage-file",
+    b"--max-http-header-size",
+    b"--max-old-space-size-percentage",
+    b"--network-family-autoselection-attempt-timeout",
+    b"--openssl-config",
+    b"--redirect-warnings",
+    b"--report-dir",
+    b"--report-filename",
+    b"--report-signal",
+    b"--require",
+    b"--secure-heap",
+    b"--secure-heap-min",
+    b"--snapshot-blob",
+    b"--test-concurrency",
+    b"--test-coverage-branches",
+    b"--test-coverage-exclude",
+    b"--test-coverage-functions",
+    b"--test-coverage-include",
+    b"--test-coverage-lines",
+    b"--test-global-setup",
+    b"--test-isolation",
+    b"--test-name-pattern",
+    b"--test-random-seed",
+    b"--test-reporter",
+    b"--test-reporter-destination",
+    b"--test-rerun-failures",
+    b"--test-shard",
+    b"--test-skip-pattern",
+    b"--test-timeout",
+    b"--title",
+];
+
 /// A node script token must look like a path: a script suffix or a `/`.
 /// Bare extensionless names are indistinguishable from an unknown
 /// value-taking flag's value, so they yield no hint.
@@ -339,17 +451,20 @@ fn node_token(tokens: &[&[u8]]) -> Option<String> {
             continue;
         }
         if token.starts_with(b"--") {
-            if token.contains(&b'=') {
+            if let Some(eq) = token.iter().position(|byte| *byte == b'=') {
                 // `--eval=<code>` / `--print=<expr>` evaluate inline
                 // text: no script runs (after `--print=` the next token
                 // is itself evaluated as code), so bail before the
-                // generic self-contained skip.
-                let name = token.split(|byte| *byte == b'=').next()?;
+                // tabled self-contained skip.
+                let name = &token[..eq];
                 if name == b"--eval" || name == b"--print" {
                     return None;
                 }
-                index = index.checked_add(1)?;
-                continue;
+                if NODE_EQ_FLAGS.contains(&name) {
+                    index = index.checked_add(1)?;
+                    continue;
+                }
+                return None;
             }
             if NODE_BOOL_FLAGS.contains(&token) {
                 index = index.checked_add(1)?;
@@ -383,16 +498,21 @@ fn argv_token(interpreter: Interpreter, cmdline: &[u8]) -> Option<String> {
     }
 }
 
-/// Whether a cgroup leaf is container/pod-shaped (DR04 owns that display
-/// under its opt-in): never a default-on hint source.
-fn cgroup_container_shaped(leaf: &str) -> bool {
-    leaf.contains("kubepods")
-        || leaf.contains("libpod")
-        || leaf.contains("podman")
-        || leaf.starts_with("docker-")
-        || leaf.starts_with("crio-")
-        || leaf.starts_with("cri-")
-        || leaf.starts_with("containerd-")
+/// Whether a cgroup path component is container/pod-shaped (DR04 owns
+/// that display under its opt-in): never a default-on hint source.
+/// Every component of the `0::` path is screened, not just the leaf: a
+/// container running its own systemd nests services under container
+/// scopes, and those service names stay behind the opt-in too.
+fn cgroup_container_shaped(component: &str) -> bool {
+    component.contains("kubepods")
+        || component.contains("libpod")
+        || component.contains("podman")
+        || component.contains("lxc.payload.")
+        || component.contains("systemd-nspawn@")
+        || component.starts_with("docker-")
+        || component.starts_with("crio-")
+        || component.starts_with("cri-")
+        || component.starts_with("containerd-")
 }
 
 /// Whether `text` is a snap/scope name word (`[a-z0-9-]+`, nonempty).
@@ -418,9 +538,15 @@ fn bounded_hint(value: String, source: AppHintSource) -> Option<AppHint> {
 /// sessions, slices, and container shapes yield nothing.
 fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
     let line = cgroup.lines().find_map(|line| line.strip_prefix("0::"))?;
+    if line
+        .split('/')
+        .any(|component| cgroup_container_shaped(component.trim_end()))
+    {
+        return None;
+    }
     let leaf = line.rsplit('/').find(|part| !part.is_empty())?;
     let leaf = leaf.trim_end();
-    if leaf.is_empty() || leaf.len() > HINT_VALUE_MAX_BYTES || cgroup_container_shaped(leaf) {
+    if leaf.is_empty() || leaf.len() > HINT_VALUE_MAX_BYTES {
         return None;
     }
     if let Some(scope) = leaf.strip_suffix(".scope") {
@@ -443,19 +569,65 @@ fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
         if unit.is_empty() || unit.starts_with("user@") {
             return None;
         }
-        return bounded_hint(unit.to_string(), AppHintSource::Unit);
+        // Template instances take the instance id as an argument
+        // (`job@tenant.service`): publish the template name only.
+        let unit = match unit.split_once('@') {
+            Some((prefix, _)) if !prefix.is_empty() => format!("{prefix}@"),
+            Some(_) => return None,
+            None => unit.to_string(),
+        };
+        return bounded_hint(unit, AppHintSource::Unit);
     }
     None
+}
+
+/// Script-position token for the comm cross-check: `argv[1]`, or
+/// `argv[2]` when `argv[1]` is a single dash-led shebang argument (the
+/// kernel passes at most one: `perl -w` / `ruby -w` shebangs put the
+/// script at `argv[2]`).
+fn comm_script_token(args: &[&[u8]]) -> Option<&[u8]> {
+    let first = *args.first()?;
+    if first.len() > 1 && first.starts_with(b"-") {
+        args.get(1).copied()
+    } else {
+        Some(first)
+    }
+}
+
+/// Whether `comm` is the name the kernel set at exec: it must equal the
+/// first 15 bytes (`TASK_COMM_LEN`) of the basename of the
+/// script-position token from the same cmdline sample. comm is writable
+/// by the process (`$0`, prctl), and a rewritten title arrives as a
+/// single cmdline token with no script position — so an unmatched comm
+/// is never published.
+fn comm_matches_script(comm: &str, cmdline: &[u8]) -> bool {
+    let tokens = complete_tokens(cmdline);
+    let args = match tokens.get(1..) {
+        Some(args) => args,
+        None => return false,
+    };
+    let script = match comm_script_token(args) {
+        Some(script) => script,
+        None => return false,
+    };
+    let text = String::from_utf8_lossy(script);
+    let base = match basename_of(&text) {
+        Some(base) => base,
+        None => return false,
+    };
+    let bytes = base.as_bytes();
+    comm.as_bytes() == &bytes[..bytes.len().min(15)]
 }
 
 /// Pure selection over already-read facts.
 ///
 /// Only a tabled runtime gets any hint: shells and native exes keep
 /// the plain name (owner ruling 2026-11-08). Precedence: grammar-proven
-/// argv token, then comm (python/perl/ruby direct-shebang launches),
-/// then the cgroup leaf of an admitted runtime. A hint equal to the
-/// exe basename carries no information and is dropped. `None`
-/// (missing/unreadable) inputs yield `None`: the bare label as today.
+/// argv token, then comm (python/perl/ruby, only when it matches the
+/// script-position token of the same cmdline sample), then the cgroup
+/// leaf of an admitted runtime. A hint equal to the exe basename
+/// carries no information and is dropped. `None` (missing/unreadable)
+/// inputs yield `None`: the bare label as today.
 pub(crate) fn app_hint_for(
     exe_path: Option<&str>,
     comm: Option<&str>,
@@ -473,13 +645,16 @@ pub(crate) fn app_hint_for(
             source: AppHintSource::Argv,
         });
     }
-    if matches!(
-        interpreter,
-        Interpreter::Python | Interpreter::Perl | Interpreter::Ruby
-    ) && let Some(comm) = comm
+    if comm_eligible(interpreter)
+        && let Some(comm) = comm
+        && let Some(cmdline) = cmdline
     {
         let comm = comm.trim_end_matches(['\n', '\0']);
-        if !comm.is_empty() && comm != basename && comm.len() <= HINT_VALUE_MAX_BYTES {
+        if !comm.is_empty()
+            && comm != basename
+            && comm.len() <= HINT_VALUE_MAX_BYTES
+            && comm_matches_script(comm, cmdline)
+        {
             return Some(AppHint {
                 value: comm.to_string(),
                 source: AppHintSource::Comm,
@@ -523,14 +698,25 @@ pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
     Some(text)
 }
 
+/// Whether the sampled process generation is intact: the start time
+/// read before the comm/cmdline/cgroup reads must equal the one read
+/// after. Both must be present — an unreadable generation is dropped,
+/// like an unreadable exe. (A same-binary re-exec inside the window
+/// keeps both, so the label stays a point sample; see below.)
+fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
+    matches!((before, after), (Some(t0), Some(t1)) if t0 == t1)
+}
+
 /// Sample one admission hint for `pid` beside its already-read `exe`.
 ///
-/// Without a readable exe there is no hint and no read. comm, argv and
-/// the cgroup leaf are read only for a tabled runtime; shells and
-/// native exes get no read at all. The exe identity is re-read after
-/// sampling and must match, so an exec between the admission read and
-/// these reads drops the hint instead of attributing one image's facts
-/// to another.
+/// Without a readable exe there is no hint and no read. cmdline and the
+/// cgroup text are read only for a tabled runtime, comm only for
+/// python/perl/ruby; shells and native exes get no read at all. The exe
+/// identity and the process start time are re-read after sampling and
+/// must match, so an exec or pid reuse under the reads drops the hint
+/// instead of attributing one image's or generation's facts to another.
+/// The label is sampled once: a same-binary re-exec inside the sample
+/// window keeps a stale label.
 pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
@@ -538,13 +724,14 @@ pub(crate) fn sample_for_pid(
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
-    let (comm, cmdline, cgroup) = match interpreter {
-        Some(_) => (
-            read_comm(pid),
-            read_cmdline_prefix(pid),
-            read_cgroup_text(pid),
-        ),
-        None => (None, None, None),
+    let start_before = crate::process::process_start_time(pid).ok();
+    let comm = match interpreter {
+        Some(interpreter) if comm_eligible(interpreter) => read_comm(pid),
+        _ => None,
+    };
+    let (cmdline, cgroup) = match interpreter {
+        Some(_) => (read_cmdline_prefix(pid), read_cgroup_text(pid)),
+        None => (None, None),
     };
     let hint = app_hint_for(
         exe.path.as_deref(),
@@ -552,10 +739,13 @@ pub(crate) fn sample_for_pid(
         cmdline.as_deref(),
         cgroup.as_deref(),
     )?;
-    // TOCTOU close: the sampled facts belong to the admitted image only
-    // if the exe identity did not change under the reads.
+    // TOCTOU close: the sampled facts belong to the admitted image and
+    // generation only if neither changed under the reads.
     let current = crate::discovery::caller_registry::read_exe_identity(pid)?;
     if current != *exe {
+        return None;
+    }
+    if !sampled_generation_intact(start_before, crate::process::process_start_time(pid).ok()) {
         return None;
     }
     Some(hint)

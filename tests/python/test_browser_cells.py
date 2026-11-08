@@ -485,6 +485,13 @@ class BrowserCells(unittest.TestCase):
                 cc.client_certs_presented, 1, "client cert never presented")
         self.assertEqual(result.flow.get("observer_exit"), 0,
                          f"observer failed: {result.observer_stderr_tail}")
+        bg.stop()
+        bg_calls = cells.soft_call_completed(bg.log.read_text())
+        self.assertIsNotNone(
+            bg_calls, "background caller left no STOP line (died mid-cell?)")
+        self.assertGreaterEqual(
+            bg_calls, 30,
+            "background caller made too few calls to pin its precondition")
         with open(result.report_path, encoding="utf-8") as handle:
             report = json.load(handle)
         observations = report.get("object_observations") or {}
@@ -518,11 +525,17 @@ class BrowserCells(unittest.TestCase):
             "no key-operation rows on the browser instance")
         capture = (report.get("observation") or {}).get("semantic_capture") or {}
         self.assertEqual(capture.get("events_lost"), 0, "semantic events lost")
-        subjects = {gap.get("subject") for gap in report.get("gaps") or []
-                    if isinstance(gap, dict)}
-        self.assertIn(
-            "scan seal settled", subjects,
-            "the seal seated without settling over the newcomer")
+        # The settle gap is diagnostic, not a failure leg: seating over an
+        # unchanged set is deliberately silent, so requiring the gap would
+        # couple this cell to timing instead of the fix's guarantee (the
+        # browser covered). When present, it must name its wait.
+        settled = [gap for gap in report.get("gaps") or []
+                   if isinstance(gap, dict)
+                   and gap.get("subject") == "scan seal settled"]
+        for gap in settled:
+            self.assertIn(
+                "waited", gap.get("reason") or "",
+                "the settle gap does not name its wait")
 
     # -- Unprivileged counterexample twins (P2-2/P2-3; run everywhere) --
     #

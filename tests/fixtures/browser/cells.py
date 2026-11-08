@@ -18,6 +18,7 @@ privilege comes from ``sudo -n`` and fails fast when unavailable.
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -296,6 +297,37 @@ def start_soft_call(module: Path, workdir: Path, *,
     raise CellError(f"soft-call never became ready: {log.read_text()[-500:]}")
 
 
+def soft_call_completed(log_text: str) -> int | None:
+    """Calls completed per a soft-call log's STOP line; None when absent.
+
+    The STOP line only exists after a clean shutdown, so a missing
+    line (crash, SIGKILL, never stopped) reads as unknown, never zero.
+    """
+    match = re.search(r"^STOP n=(\d+)\s*$", log_text, re.M)
+    return int(match.group(1)) if match else None
+
+
+def wait_for_observer_line(observer_err: Path, observer: subprocess.Popen,
+                           needle: str, timeout_seconds: float,
+                           what: str) -> None:
+    """Block until the observer's stderr carries ``needle``.
+
+    ``what`` names the awaited milestone for the failure message. An
+    observer that exits first, or a wait that outlasts its timeout,
+    raises CellError: the cell never proceeds on a dead observer.
+    """
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        if observer.poll() is not None:
+            raise CellError(
+                f"observer exited {observer.returncode} before {what}: "
+                f"{observer_err.read_text()[-1000:]}")
+        if needle in observer_err.read_text():
+            return
+        time.sleep(1.0)
+    raise CellError(f"observer never {what} before the timeout")
+
+
 def observe_first_system(name: str, browser: str, workdir: Path, *,
                          plain_url: str, cc_url: str, nss_credential,
                          duration_seconds: int = 90,
@@ -325,6 +357,13 @@ def observe_first_system(name: str, browser: str, workdir: Path, *,
             start_new_session=True)
     facts: dict = {}
     try:
+        # Observer-first ordering: the browser launches only after the
+        # observer completes pass 0 (its capture-readiness line), so a
+        # fast browser can never arrive before the background provider
+        # is walked and turn this cell into an unlabelled late attach.
+        wait_for_observer_line(
+            observer_err, observer, "p11scope: pass 0:", 300.0,
+            "completing pass 0")
         # Import here so collection never requires playwright before preflight.
         from playwright.sync_api import sync_playwright  # noqa: PLC0415
         from flows import make_client_cert_visit, make_visit  # noqa: PLC0415

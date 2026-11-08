@@ -6626,7 +6626,7 @@ mod tests {
         }
         assert!(USAGE.contains("p11scope help [command]"), "{USAGE}");
         for example in [
-            "sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
             "sudo p11scope profile --pid 4242 --duration 30s -o profile.json",
             "sudo p11scope inventory --system --duration 30s",
         ] {
@@ -6660,12 +6660,12 @@ mod tests {
     #[test]
     fn capture_examples_show_sudo_and_parse() {
         let run = HelpTopic::Run.text();
-        assert!(
-            run.contains(
-                "sudo p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L"
-            ),
-            "{run}"
-        );
+        for example in [
+            "sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib64/pkcs11/libsofthsm2.so -L",
+        ] {
+            assert!(run.contains(example), "{run}");
+        }
         assert!(!run.contains("/absolute/path/to/program"), "{run}");
         // 7.10b: run help documents the flag now (pinned by
         // run_help_documents_track_short_lived).
@@ -6676,7 +6676,8 @@ mod tests {
         );
         // The sudo examples parse once the privilege prefix is stripped.
         for words in [
-            "p11scope run -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
+            "p11scope run --pause auto -- pkcs11-tool --module /usr/lib64/pkcs11/libsofthsm2.so -L",
             "p11scope inventory --system --duration 30s",
         ] {
             parse(args(&words.split_whitespace().skip(1).collect::<Vec<_>>()))

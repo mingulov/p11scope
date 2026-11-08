@@ -224,7 +224,7 @@ fn advertised_examples_parse_and_run_command_boundary_is_verbatim() {
         ),
         (
             "run",
-            "sudo p11scope run -- pkcs11-tool --module \
+            "sudo p11scope run --pause auto -- pkcs11-tool --module \
              /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L",
         ),
     ] {

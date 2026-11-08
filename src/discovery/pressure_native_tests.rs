@@ -2374,6 +2374,64 @@ fn ambient_exec_pids(records: &[DiscoveryRecord], owned: &BTreeSet<u32>) -> Vec<
         .collect()
 }
 
+/// The ambient gate flags any non-owned EXEC, however the capture is
+/// scoped: cgroup scoping keeps unrelated host EXECs out of the batch
+/// at event time, but an EXEC from inside the workload that no owned
+/// child produced — an in-scope ambient — must still refuse the cell.
+/// This pins that the gate classifies by owned membership alone: owned
+/// EXECs pass, a non-owned EXEC is flagged, and non-EXEC records never
+/// trip the EXEC gate.
+#[test]
+fn ambient_exec_gate_flags_any_non_owned_exec() {
+    const WHAT: &str = "ambient-gate-pin";
+    let owned: BTreeSet<u32> = [1001, 1002].into_iter().collect();
+    let record = |pid: u32, kind: u8| DiscoveryRecord {
+        hook_ts_ns: 1,
+        pid_tgid: (u64::from(pid) << 32) | u64::from(pid),
+        table_ptr: 0,
+        interface_flags: 0,
+        pointers: [0; DISCOVERY_POINTERS],
+        kind,
+        case_id: 0,
+        interface_index: 0,
+        name_class: 0,
+        status_flags: 0,
+        usable_n: 0,
+        pointers_attempted: 0,
+        completed_prefix: 0,
+        version_major: 0,
+        version_minor: 0,
+        selection_version_class: 0,
+        reserved_zero: [0; 1],
+        symbol_id: 0,
+        announced_count: 0,
+        reserved_tail_zero: [0; 4],
+        send_signal_rc: 0,
+        return_rv: 0,
+        request_flags: 0,
+        binding_id: 0,
+    };
+    let records = vec![
+        record(1001, DISCOVERY_KIND_EXEC),
+        record(1002, DISCOVERY_KIND_EXEC),
+        record(2001, DISCOVERY_KIND_EXEC),
+        record(2002, DISCOVERY_KIND_LOADER),
+    ];
+    assert_eq!(
+        ambient_exec_pids(&records, &owned),
+        vec![2001],
+        "{WHAT}: exactly the non-owned EXEC is flagged"
+    );
+    let clean = vec![
+        record(1001, DISCOVERY_KIND_EXEC),
+        record(1002, DISCOVERY_KIND_EXEC),
+    ];
+    assert!(
+        ambient_exec_pids(&clean, &owned).is_empty(),
+        "{WHAT}: an owned-only batch passes"
+    );
+}
+
 fn cgroup_args(hints: Vec<PathBuf>, path: PathBuf) -> CaptureArgs {
     CaptureArgs {
         track_short_lived: false,
@@ -3288,6 +3346,13 @@ fn image_quota_16385_births_are_counted_identity_refusals() {
 /// than pressure admitted them; the viewless requests stranded and the
 /// rotation stalled. The cell now converges (14-tick settle) and runs in
 /// the privileged campaign; see the T8 report.
+///
+/// Cgroup-scoped by determinism, not by product need (the 257 cell's
+/// pattern): under System scope ambient EXECs share the burst batch,
+/// so batch purity is host-churn luck and any unrelated host exec
+/// refuses the cell. The engine paths are scope-independent, so the
+/// episode pins the identical admission with the ambient lottery
+/// removed; the REFUSED gate below stays as a scope-leak detector.
 #[test]
 #[ignore = "privileged: live BPF 256-request pressure episode; run as root with --ignored --test-threads=1 under the privileged lane"]
 fn pressure_live256_genuine_episode_admits_late_then_head() {
@@ -3304,10 +3369,40 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     let fixtures = FixtureBuild::compile_all("live256");
     let late_path = fixtures.late.clone();
     let hints = vec![fixtures.early.clone(), fixtures.late.clone()];
-    let (mut engine, mut session) = start_live_system_capture(hints, WHAT);
+    let cgroup = OwnedCgroup::create("live256", WHAT);
+    let started = Instant::now();
+    let scope = crate::scope::capture_cgroup(&cgroup.path)
+        .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
+    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
+        .expect("live cgroup discovery");
+    let mut session = engine
+        .start_session(
+            CapturePolicy::Allowlisted,
+            None,
+            BackendSelection::default(),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: start_session failed: {error:#}"));
+    println!("t8: {WHAT}: capture live after {:?}", started.elapsed());
+    assert_eq!(
+        engine.loader_arms, 0,
+        "{WHAT}: capture startup arms nothing"
+    );
 
     // Capture first, then the population: 255 retained plus the late
     // owner, READY, then the head after a hook-clock separation.
+    //
+    // Born inside the scope: the test moves itself in, spawns the wave
+    // there (every EXEC in scope), then moves itself back out. No tick
+    // runs on this path, so enumeration only ever sees the wave.
+    let this = std::process::id();
+    cgroup.move_in(this, WHAT);
+    // Armed before any fallible step: a panic below still vacates the
+    // cgroup, so the directory removes instead of littering root-owned.
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
+    assert!(
+        cgroup.members(WHAT).contains(&this),
+        "{WHAT}: the test must spawn from inside the cgroup"
+    );
     let wave_start = Instant::now();
     let mut population = Population::spawn_on(
         fixtures,
@@ -3322,6 +3417,14 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     let head_pid = population.spawn_head(WHAT);
     let owned = population.pids();
     assert_eq!(owned.len(), RETAINED_CHILDREN + 2);
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
+    assert_eq!(
+        cgroup.members(WHAT),
+        owned,
+        "{WHAT}: the cgroup holds exactly the 257 owned pids"
+    );
     let wave_elapsed = wave_start.elapsed();
     // Nothing drained yet: the whole burst is genuinely pending.
     assert_eq!(
@@ -3366,7 +3469,7 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     let ambient_execs = ambient_exec_pids(&records, &owned);
     assert!(
         ambient_execs.is_empty(),
-        "{WHAT}: REFUSED: ambient EXECs in the burst batch ({ambient_execs:?}); rerun in a quiet window"
+        "{WHAT}: REFUSED: ambient EXECs in the burst batch ({ambient_execs:?}); refuses the cell as a scope leak"
     );
     let head_ts = owned_execs[&head_pid];
     let max_ts = *owned_execs.values().max().unwrap();
@@ -3533,6 +3636,7 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     population.terminate_all(WHAT, &|_| 0);
     drop(session);
     drop(engine);
+    cgroup.remove(WHAT);
     let fds_end = fd_count();
     println!(
         "t8: live256: PASS: 256 keys + head admitted, tickets 256 owned-only, zero loss; wave={wave_elapsed:?} release1={release1_elapsed:?} apply+settle={apply_elapsed:?} post={post_elapsed:?} ticks={} inter_drain_max={:?} pending_hw={} requested_hw={} wall={:?} VmHWM={}KiB fds {fds_start}->{fds_end} cpu={} jiffies",

@@ -314,8 +314,9 @@ discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control
 # T8 live256 episodes, re-run green by hand at the fixed tip (waiter-
 # driven eviction converges the settle): the genuine 257-EXEC episode
 # admits its late head, and the all-blocked twin refuses exactly once.
-# Both refuse the cell on any ambient EXEC in the burst batch, so they
-# need a quiet window like the other live cells above.
+# Both are cgroup-scoped (the 257 cell's pattern), so unrelated host
+# EXECs never enter the burst batch; the ambient gates stay as
+# scope-leak detectors, not quiet-window lotteries.
 discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
 # T8 FIRST live control: quiet window arms nothing, then a 3-child owned

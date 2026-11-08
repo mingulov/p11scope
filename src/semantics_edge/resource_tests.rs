@@ -223,9 +223,10 @@ impl Drop for OwnedProbeChild {
     }
 }
 
-/// Each profile runs in a fresh copy of the test binary with a 40-second
-/// deadline. File-backed output avoids a full-pipe wait; the owned child is
-/// killed and reaped on every unsuccessful return/unwind.
+/// Each profile runs in a fresh copy of the test binary with a
+/// 120-second deadline. File-backed output avoids a full-pipe wait;
+/// the owned child is killed and reaped on every unsuccessful
+/// return/unwind.
 pub(crate) fn run_child(test: &str, profile: &str) -> serde_json::Value {
     use std::io::{Read, Seek};
     let mut output = tempfile::tempfile().unwrap();
@@ -238,7 +239,12 @@ pub(crate) fn run_child(test: &str, profile: &str) -> serde_json::Value {
         .spawn()
         .unwrap();
     let mut child = OwnedProbeChild(child);
-    let deadline = Instant::now() + Duration::from_secs(40);
+    // The largest profile (mixed:32) needs 47 s of CPU alone in a
+    // debug build under the counting allocator, 49-74 s of wall
+    // time on a loaded lane; 40 s tripped on healthy runs. 120 s
+    // still kills a hung child quickly while covering the measured
+    // work with margin for lane load.
+    let deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
         if let Some(status) = child.0.try_wait().unwrap() {
             break status;

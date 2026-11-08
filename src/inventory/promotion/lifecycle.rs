@@ -1385,6 +1385,7 @@ pub(crate) fn scripted_promotion_view_with_baseline_for_test(
             start_time,
             incarnation,
             exe: None,
+            app_hint: None,
             exec_observed: true,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

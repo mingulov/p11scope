@@ -170,6 +170,9 @@ pub(crate) struct CallerRecord {
     /// Zero-based incarnation index for this pid (admission order).
     pub incarnation: u32,
     pub exe: Option<ExeIdentity>,
+    /// Display-only app hint (interpreter script/unit/snap label), sampled
+    /// at admission. Never identity, admission, or join input.
+    pub app_hint: Option<crate::app_hint::AppHint>,
     /// False when the exe identity was unreadable at admission: exec
     /// changes are then undetectable and the record says so.
     pub exec_observed: bool,
@@ -986,6 +989,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: exe.is_some(),
                     exe,
+                    app_hint: None,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1148,6 +1152,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     pid: prepared.pid,
                     start_time: prepared.generation.start_time,
                     exe: prepared.generation.exe,
+                    app_hint: None,
                     incarnation,
                     exec_observed,
                     authority: ImageAuthority::ScanPinned,
@@ -1256,6 +1261,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: generation.exe.is_some(),
                     exe: generation.exe,
+                    app_hint: None,
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1665,6 +1671,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     incarnation,
                     exec_observed: exe.is_some(),
                     exe,
+                    app_hint: None,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,

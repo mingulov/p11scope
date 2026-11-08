@@ -9781,6 +9781,39 @@ fn allowlist_v3_names_the_reload_disclosure_linkage_row() {
     }
 }
 
+/// App identity (owner ruling 2026-11-08): allowlist-v3 carries the
+/// implemented hint section — comm, narrow argv token, and cgroup leaf —
+/// with its heading, status-paragraph link, and the fixed publication
+/// shape. The argv grammar pins (`-c`/`-e` refusal, no flag value) must
+/// not silently leave the contract.
+#[test]
+fn allowlist_v3_names_the_app_identity_hint_rows() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## App identity hints (owner ruling 2026-11-08)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the app identity hints section"
+    );
+    assert!(
+        text.contains(
+            "[app identity hints](#app-identity-hints-owner-ruling-2026-11-08)"
+        ),
+        "the status paragraph must list the app identity hints section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "Caller app hint from comm",
+        "Caller app hint from argv",
+        "Caller app hint from cgroup leaf",
+        "app_hint",
+        "no `-c`/`-e` text",
+        "no flag value",
+        "non-interpreter exes get no read",
+    ] {
+        assert!(flat.contains(marker), "the hint rows must name {marker:?}");
+    }
+}
+
 /// F16 residual (review item 1): the allowlist-v3 PQC section states the
 /// implemented publication rule — the field publishes the classified code
 /// `1..=12` whenever the word is in range, whatever the key type, and only

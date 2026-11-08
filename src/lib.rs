@@ -28,6 +28,7 @@ macro_rules! eprint {
     }};
 }
 
+pub(crate) mod app_hint;
 pub mod attach;
 // DR04's private parser/acquisition packet is staged; the opt-in coordinator
 // must validate image/sample authority before these values can be published.

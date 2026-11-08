@@ -2522,3 +2522,122 @@ fn event_log_dash_stderr_move_cancelled_under_slow_reader() {
         "the move started delivering before the cancel"
     );
 }
+
+#[test]
+fn inventory_snapshot_labels_a_console_script_and_never_its_pin_value() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-app-hint");
+    let private = private_dir();
+    let file = private.path().join("snapshot.json");
+    let ready = dir.join("app-hint.ready");
+    let text_file = dir.join("snapshot.txt");
+    // Real interpreter, console-script shape: a generated script with a
+    // direct absolute shebang, like pip writes into a venv. python3 is a
+    // documented test prerequisite (docs/development.md), like gcc.
+    let python = {
+        let out = Command::new("sh")
+            .args(["-c", "command -v python3"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "python3 is required for this cell");
+        let path = String::from_utf8(out.stdout).unwrap();
+        path.trim().to_string()
+    };
+    assert!(python.starts_with('/'), "python3 path: {python}");
+    let script_name = "app-hint-tool";
+    let script = dir.join(script_name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!{python}\n\
+             import ctypes, os, sys, time\n\
+             ready = None\n\
+             sleep_s = 30\n\
+             provider = None\n\
+             args = sys.argv[1:]\n\
+             i = 0\n\
+             while i < len(args):\n\
+             \x20   arg = args[i]\n\
+             \x20   if arg == \"--ready\":\n\
+             \x20       ready = args[i + 1]\n\
+             \x20       i += 2\n\
+             \x20   elif arg == \"--sleep\":\n\
+             \x20       sleep_s = int(args[i + 1])\n\
+             \x20       i += 2\n\
+             \x20   elif arg == \"--pin\":\n\
+             \x20       i += 2\n\
+             \x20   elif arg.startswith(\"-\"):\n\
+             \x20       i += 1\n\
+             \x20   else:\n\
+             \x20       provider = arg\n\
+             \x20       i += 1\n\
+             ctypes.CDLL(provider, mode=ctypes.RTLD_GLOBAL)\n\
+             open(ready, \"w\").write(f\"READY {{os.getpid()}}\\n\")\n\
+             time.sleep(sleep_s)\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = gcc(
+        &dir,
+        "app-hint-provider.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let pin = "app-hint-pin-7319";
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-app-hint.sh"))
+        .args(["--capture", "scan", "-o"])
+        .arg(&file)
+        .env("INV_DRIVER", &script)
+        .env("INV_PROV", &provider)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &text_file)
+        .env("INV_PIN", pin)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let ready_text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = ready_text
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _driver_guard = FixtureGuard { pids: vec![pid] };
+    assert!(output.status.success(), "{output:?}");
+    let text = std::fs::read_to_string(&text_file).unwrap();
+    let raw = std::fs::read(&file).unwrap();
+    let doc: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    let callers = doc["callers"].as_array().unwrap();
+    assert_eq!(callers.len(), 1, "single-PID scope keeps one caller");
+    let caller = &callers[0];
+    assert_eq!(caller["pid"], pid);
+    assert_eq!(caller["app_hint"]["value"], script_name);
+    assert_eq!(caller["app_hint"]["source"], "argv");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (name, surface) in [
+        ("json", String::from_utf8_lossy(&raw).into_owned()),
+        ("text", text.clone()),
+        ("stderr", stderr.into_owned()),
+    ] {
+        assert!(
+            !surface.contains(pin),
+            "pin value leaked into {name}: {}",
+            surface.lines().find(|line| line.contains(pin)).unwrap_or("")
+        );
+    }
+    let exe = caller["image"]["exe"]["path"].as_str().unwrap();
+    assert_eq!(
+        exe,
+        std::fs::canonicalize(&python).unwrap().to_str().unwrap()
+    );
+    let interpreter = Path::new(exe).file_name().unwrap().to_str().unwrap();
+    assert!(
+        text.contains(&format!("{interpreter} [{script_name}]")),
+        "concise label carries the hint: {text}"
+    );
+}

@@ -2733,6 +2733,7 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
                 mtime_nanos: 22,
                 path: Some("/usr/bin/canary-app".into()),
             }),
+            app_hint: None,
             exec_observed: false,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

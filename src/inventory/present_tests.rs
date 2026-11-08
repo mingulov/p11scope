@@ -4256,3 +4256,48 @@ fn concise_ambiguous_marker_uses_richest_member_when_members_disagree() {
         "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool (+1 more)) (3 calls, host pids 9, 10)"
     );
 }
+
+#[test]
+fn app_hint_appends_a_bracketed_label_and_json_value() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let caller = presentation.callers[0].id;
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/python3".into());
+    presentation.callers[0].app_hint = Some(crate::app_hint::AppHint {
+        value: "pkcs11-check".into(),
+        source: crate::app_hint::AppHintSource::Argv,
+    });
+    assert_eq!(
+        application_label(&presentation, caller),
+        "python3 [pkcs11-check]"
+    );
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let rendered = document["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == caller.label())
+        .unwrap();
+    assert_eq!(rendered["app_hint"]["value"], "pkcs11-check");
+    assert_eq!(rendered["app_hint"]["source"], "argv");
+}
+
+#[test]
+fn missing_app_hint_renders_no_brackets_and_no_key() {
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    let caller = presentation.callers[0].id;
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/python3".into());
+    assert_eq!(application_label(&presentation, caller), "python3");
+    let document = crate::inventory::render_json_from_presentation(&presentation);
+    let rendered = document["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == caller.label())
+        .unwrap();
+    assert!(
+        rendered.get("app_hint").is_none(),
+        "absent hint stays absent: {rendered}"
+    );
+}

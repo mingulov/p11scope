@@ -317,6 +317,7 @@ fn metadata_record(
         start_time: Some(1),
         incarnation: 0,
         exe: None,
+        app_hint: None,
         exec_observed: false,
         authority: ImageAuthority::ScanPinned,
         lifecycle: CallerLifecycle::Mapped,

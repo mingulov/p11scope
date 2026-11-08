@@ -298,6 +298,11 @@ fn exe_identity_from_followed_metadata(
     metadata: &std::fs::Metadata,
     link: Option<String>,
 ) -> Option<ExeIdentity> {
+    // A magic link that refused the follow returns the link itself
+    // (a symlink on the procfs device): never an exe identity.
+    if !metadata.is_file() {
+        return None;
+    }
     Some(ExeIdentity {
         dev: metadata.dev(),
         ino: metadata.ino(),
@@ -6732,9 +6737,8 @@ pub(crate) mod tests {
         );
         let file_meta = std::fs::metadata(&target).unwrap();
         assert!(file_meta.is_file());
-        let exe =
-            exe_identity_from_followed_metadata(&file_meta, Some("/bin/tool".to_string()))
-                .expect("a regular file builds an identity");
+        let exe = exe_identity_from_followed_metadata(&file_meta, Some("/bin/tool".to_string()))
+            .expect("a regular file builds an identity");
         assert_eq!(exe.path.as_deref(), Some("/bin/tool"));
     }
 
@@ -6780,16 +6784,16 @@ pub(crate) mod tests {
             );
             let own = std::process::id();
             let exe = read_exe_identity(own).expect("our own exe reads");
-            assert!(
-                exe.path.is_some(),
-                "our own exe carries its path: {exe:?}"
-            );
+            assert!(exe.path.is_some(), "our own exe carries its path: {exe:?}");
             println!("{MARKER}");
             std::process::exit(0);
         }
         let exe = std::env::current_exe().expect("test binary path");
         // libtest names omit the crate prefix that `module_path!` carries.
-        let module = module_path!().split_once("::").map(|(_, rest)| rest).unwrap_or(module_path!());
+        let module = module_path!()
+            .split_once("::")
+            .map(|(_, rest)| rest)
+            .unwrap_or(module_path!());
         let test = format!("{module}::{CHILD_TEST}");
         let out = std::process::Command::new(&exe)
             .env(CHILD_ENV, "1")

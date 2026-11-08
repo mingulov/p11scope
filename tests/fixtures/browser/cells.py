@@ -318,8 +318,9 @@ def observe_first_system(name: str, browser: str, workdir: Path, *,
     with open(observer_out, "w", encoding="utf-8") as out, \
             open(observer_err, "w", encoding="utf-8") as err:
         observer = subprocess.Popen(
-            [str(binary), "inventory", "--system", "--key-operations",
-             "--duration", str(duration_seconds), "-o", str(report)],
+            ["sudo", "-n", str(binary), "inventory", "--system",
+             "--key-operations", "--duration", str(duration_seconds),
+             "-o", str(report)],
             stdin=subprocess.DEVNULL, stdout=out, stderr=err,
             start_new_session=True)
     facts: dict = {}

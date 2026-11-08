@@ -15619,6 +15619,32 @@ mod tests {
         assert!(rendered.contains(UNSUPPORTED_ENV_HINT));
     }
 
+    #[test]
+    fn unsupported_environment_hint_names_the_minimal_live_set() {
+        for cap in [
+            "CAP_BPF",
+            "CAP_CHECKPOINT_RESTORE",
+            "CAP_DAC_READ_SEARCH",
+            "CAP_PERFMON",
+            "CAP_SYS_PTRACE",
+        ] {
+            assert!(
+                UNSUPPORTED_ENV_HINT.contains(cap),
+                "the hint must name {cap}: {UNSUPPORTED_ENV_HINT}"
+            );
+        }
+        assert!(
+            !UNSUPPORTED_ENV_HINT.contains("CAP_SYS_ADMIN"),
+            "the default lane never needs CAP_SYS_ADMIN: {UNSUPPORTED_ENV_HINT}"
+        );
+        for cause in ["LSM", "seccomp"] {
+            assert!(
+                UNSUPPORTED_ENV_HINT.contains(cause),
+                "the hint must name {cause} enforcement: {UNSUPPORTED_ENV_HINT}"
+            );
+        }
+    }
+
     use super::*;
 
     #[test]

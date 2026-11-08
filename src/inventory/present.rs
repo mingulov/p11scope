@@ -24,9 +24,9 @@
 use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, RegistryInstanceId};
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
-    CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending, MappingState,
-    ModuleId, ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN,
-    UnboundPid, UnknownReason, UseCoverage, module_init,
+    CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending,
+    MappingState, ModuleId, ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource,
+    SEMANTIC_UNKNOWN, UnboundPid, UnknownReason, UseCoverage, module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};

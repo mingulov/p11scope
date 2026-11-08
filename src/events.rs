@@ -2567,6 +2567,205 @@ mod tests {
         assert_eq!(drain.discarded(), 1);
     }
 
+    /// Runs one root-tail reduction to its end on any drain, returning
+    /// the outcome and the reduced timestamps. Shared by the bare-ring
+    /// oracle and its staging-queue twin.
+    fn root_tail_to_end<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+        domain: EventsDomain,
+    ) -> (Result<RootTailProgress, String>, Vec<u64>) {
+        let mut tail = OwnedRootTail::new(
+            crate::run::OriginalRootExit::test_reaped(domain),
+            std::time::Instant::now() + std::time::Duration::from_secs(1),
+        );
+        drain.begin_root_tail(&mut tail).unwrap();
+        let mut seen = Vec::new();
+        let progress = drain
+            .poll_root_tail(&mut tail, LIVE_POLL_QUANTUM, |event| {
+                seen.push(event.ts_ns);
+                Ok(())
+            })
+            .map_err(|error| format!("{error:#}"));
+        (progress, seen)
+    }
+
+    /// One unbounded terminal poll plus its completion verdict: the seen
+    /// timestamps, backlog flag, head-pending flag, discarded total, and
+    /// whether the consumer reached the producer.
+    fn terminal_tuple<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+    ) -> (Vec<u64>, bool, bool, u64, bool) {
+        let mut seen = Vec::new();
+        let backlog = drain.poll(None, |event| {
+            seen.push(event.ts_ns);
+            ControlFlow::Continue(())
+        });
+        let positions = drain.source.positions();
+        let drained = positions.consumer == positions.producer;
+        (
+            seen,
+            backlog,
+            events_head_pending(drain),
+            drain.discarded(),
+            drained,
+        )
+    }
+
+    /// One bounded drain to `stop`: the seen timestamps, post-Q and
+    /// backlog flags, the resulting consumer, and the discarded total.
+    fn bounded_to_stop<S: BoundedRecordSource>(
+        drain: &mut EventDrain<S>,
+        stop: usize,
+    ) -> (Vec<u64>, bool, bool, usize, u64) {
+        let mut seen = Vec::new();
+        let (post_q, backlog) = poll_events_to_position(drain, stop, None, |event| {
+            seen.push(event.ts_ns);
+            ControlFlow::Continue(())
+        })
+        .unwrap();
+        (
+            seen,
+            post_q,
+            backlog,
+            drain.source.consumer(),
+            drain.discarded(),
+        )
+    }
+
+    /// One scripted call followed by a trailing kernel discard: Aya's
+    /// reader skips the discard and returns no record, after moving its
+    /// cursor past it. Every twin below drives this shape.
+    fn trailing_discard_script(extra_bound: usize) -> ScriptedRecords {
+        let mut script = ScriptedRecords::records([numbered_call(0)], 2 + extra_bound);
+        script.push_discard();
+        script
+    }
+
+    #[test]
+    fn staged_trailing_discard_root_tail_reaches_like_bare() {
+        let mut bare = EventDrain::over_domain(
+            trailing_discard_script(0),
+            EventsDomain::test_standin(0xd1ca),
+        );
+        let (bare_progress, bare_seen) =
+            root_tail_to_end(&mut bare, EventsDomain::test_standin(0xd1ca));
+        assert_eq!(bare_progress, Ok(RootTailProgress::Reached));
+        assert_eq!(bare_seen, vec![0]);
+        assert_eq!(bare.discarded(), 1);
+
+        let mut queued = EventDrain::over_domain(
+            StagedEvents::with_caps(trailing_discard_script(0), 1024, 1024 * 1024),
+            EventsDomain::test_standin(0xd1ca),
+        );
+        let (queued_progress, queued_seen) =
+            root_tail_to_end(&mut queued, EventsDomain::test_standin(0xd1ca));
+        assert_eq!(queued_progress, bare_progress);
+        assert_eq!(queued_seen, bare_seen);
+        assert_eq!(queued.discarded(), bare.discarded());
+    }
+
+    #[test]
+    fn staged_trailing_discard_terminal_poll_matches_bare() {
+        let mut bare = EventDrain::over(trailing_discard_script(0));
+        let bare_tuple = terminal_tuple(&mut bare);
+        assert_eq!(bare_tuple, (vec![0], false, false, 1, true));
+        let mut queued = EventDrain::over(StagedEvents::with_caps(
+            trailing_discard_script(0),
+            1024,
+            1024 * 1024,
+        ));
+        assert_eq!(terminal_tuple(&mut queued), bare_tuple);
+    }
+
+    #[test]
+    fn staged_trailing_discard_bounded_drain_direct_matches_bare() {
+        let mut bare = EventDrain::over(trailing_discard_script(0));
+        let bare_outcome = bounded_to_stop(&mut bare, 16);
+        assert_eq!(bare_outcome, (vec![0], false, false, 16, 1));
+        let mut queued = EventDrain::over(StagedEvents::with_caps(
+            trailing_discard_script(0),
+            1024,
+            1024 * 1024,
+        ));
+        assert_eq!(bounded_to_stop(&mut queued, 16), bare_outcome);
+    }
+
+    #[test]
+    fn staged_trailing_discard_bounded_drain_after_staging_matches_bare() {
+        let mut bare = EventDrain::over(trailing_discard_script(0));
+        let bare_outcome = bounded_to_stop(&mut bare, 16);
+        assert_eq!(bare_outcome, (vec![0], false, false, 16, 1));
+        let mut queued = EventDrain::over(StagedEvents::with_caps(
+            trailing_discard_script(0),
+            1024,
+            1024 * 1024,
+        ));
+        let outcome = queued.source_mut().stage(100, Some(16));
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 2,
+                saturated: false
+            }
+        );
+        assert_eq!(queued.source_mut().inner_mut().remaining(), 0);
+        assert_eq!(bounded_to_stop(&mut queued, 16), bare_outcome);
+    }
+
+    #[test]
+    fn staged_trailing_discard_live_then_more_records_matches_bare() {
+        let mut bare = EventDrain::over(trailing_discard_script(1));
+        let bare_first = terminal_tuple(&mut bare);
+        assert_eq!(bare_first, (vec![0], false, false, 1, true));
+        bare.source_mut().push_record(numbered_call(1));
+        let bare_second = terminal_tuple(&mut bare);
+        assert_eq!(bare_second, (vec![1], false, false, 1, true));
+
+        let mut queued = EventDrain::over(StagedEvents::with_caps(
+            trailing_discard_script(1),
+            1024,
+            1024 * 1024,
+        ));
+        queued.source_mut().stage(10, None);
+        assert_eq!(terminal_tuple(&mut queued), bare_first);
+        queued
+            .source_mut()
+            .inner_mut()
+            .push_record(numbered_call(1));
+        queued.source_mut().stage(10, None);
+        assert_eq!(terminal_tuple(&mut queued), bare_second);
+    }
+
+    #[test]
+    fn staged_stop_never_pulls_past_q_with_trailing_discard() {
+        // A post-Q record already sits on the ring past the discard that
+        // ends at the stop: staging must leave it there, and the bounded
+        // read must still flag it post-Q.
+        fn script() -> ScriptedRecords {
+            let mut script = ScriptedRecords::records([numbered_call(0)], 3);
+            script.push_discard();
+            script.push_record(numbered_call(1));
+            script
+        }
+        let mut bare = EventDrain::over(script());
+        let bare_outcome = bounded_to_stop(&mut bare, 16);
+        assert_eq!(bare_outcome, (vec![0], true, false, 16, 1));
+        assert_eq!(bare.source_mut().remaining(), 1);
+
+        let mut queued = EventDrain::over(StagedEvents::with_caps(script(), 1024, 1024 * 1024));
+        let outcome = queued.source_mut().stage(100, Some(16));
+        assert_eq!(
+            outcome,
+            EventsStageOutcome {
+                staged: 2,
+                saturated: false
+            }
+        );
+        assert_eq!(queued.source_mut().inner_mut().remaining(), 1);
+        assert_eq!(bounded_to_stop(&mut queued, 16), bare_outcome);
+        assert_eq!(queued.source_mut().inner_mut().remaining(), 1);
+    }
+
     #[test]
     fn staged_events_count_malformed_at_decode() {
         let pushed = vec![vec![0u8; 10], numbered_call(7)];

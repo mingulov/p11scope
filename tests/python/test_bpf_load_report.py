@@ -22,6 +22,7 @@ ROOT = Path(__file__).resolve().parents[2]
 SCRIPT = ROOT / "scripts/bpf-load-report.py"
 DRIVER = ROOT / "scripts/check-bpf-load-kernels.sh"
 RELEASE_MATCH = ROOT / "scripts/bpf-guest-release.sh"
+RC_VECTORS = ROOT / "tests/fixtures/rc-match-vectors.json"
 BUDGETS_FILE = ROOT / "tests/bpf-verifier-budgets.json"
 COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
@@ -553,7 +554,11 @@ class ReportTests(unittest.TestCase):
         # release only; a bare prefix also matches a different kernel
         # (6.1.1880 for 6.1.188). A release-candidate tag (v7.4-rc1) boots
         # the dotted triplet (7.4.0-070400rc1-generic) and must match only
-        # its own rc number. Run the shared release_ok function.
+        # its own rc number. The rc vectors live in the shared fixture
+        # tests/fixtures/rc-match-vectors.json (the sums contract runs the
+        # same vectors through deb_matches_kernel); the shell-only
+        # version-boundary cases stay here, since substring matching in a
+        # deb name cannot anchor them. Run the shared release_ok function.
         self.assertTrue(RELEASE_MATCH.is_file(),
                         "scripts/bpf-guest-release.sh is missing")
         match_text = RELEASE_MATCH.read_text(encoding="ascii")
@@ -569,18 +574,16 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("release_ok() {", text)
         # The doctor, inventory, counter and witness guests all use it.
         self.assertEqual(text.count('if release_ok "$KERNEL" '), 4)
-        cases = [
+        vectors = json.loads(RC_VECTORS.read_text(encoding="ascii"))
+        self.assertTrue(vectors, "rc-match-vectors.json names no vectors")
+        cases = [(vector["tag"], vector["release"], vector["expected"])
+                 for vector in vectors]
+        cases += [
             ("v6.1.188", "6.1.188", True),
             ("v6.1.188", "6.1.188-0601188-generic", True),
             ("v6.1.188", "6.1.1880", False),
             ("v6.1.188", "6.1.1880-generic", False),
             ("v6.1.188", "6.1.18", False),
-            ("v7.4-rc1", "7.4.0-070400rc1-generic", True),
-            ("v7.4-rc1", "7.4.0-070400rc1", True),
-            ("v7.4-rc1", "7.4.0-070400rc10-generic", False),
-            ("v7.4-rc1", "7.4.0-070400rc2-generic", False),
-            ("v7.4-rc1", "7.4.1-070401-generic", False),
-            ("v7.4-rc1", "7.40.0-070400rc1-generic", False),
         ]
         for tag, release, expected in cases:
             result = subprocess.run(

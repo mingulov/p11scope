@@ -1,0 +1,15 @@
+[
+  {"tag": "v7.3.1", "release": "7.3.1-070301-generic", "expected": true},
+  {"tag": "v6.6.157", "release": "7.3.1-070301-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc1-generic", "expected": true},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc1", "expected": true},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc10-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc2-generic", "expected": false},
+  {"tag": "v7.4-rc2", "release": "7.4.0-070400rc1-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.3.1-070301-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.4.1-070401-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.40.0-070400rc1-generic", "expected": false},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc10-foo-rc1", "expected": true},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc10-foo-rc1-generic", "expected": true},
+  {"tag": "v7.4-rc1", "release": "7.4.0-070400rc10-foo-rc2", "expected": false}
+]

@@ -26,6 +26,7 @@ CI_YML = ROOT / ".github" / "workflows" / "ci.yml"
 BPF_YML = ROOT / ".github" / "workflows" / "bpf-kernels.yml"
 RELEASE_RUST_VERSION = ROOT / ".release-rust-version"
 SUMS_DIR = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
+RC_VECTORS = ROOT / "tests" / "fixtures" / "rc-match-vectors.json"
 
 SUMS_LINE = re.compile(r"^[0-9a-f]{64}  (\S+)$")
 DEB_NAME = re.compile(r"^linux-(image-unsigned|modules)-[^-]+-.*_amd64\.deb$")
@@ -268,19 +269,22 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR, others))
 
     def test_deb_names_match_stable_and_rc_tags(self):
-        stable = ("linux-image-unsigned-7.3.1-070301-generic_"
-                  "7.3.1-070301.202610301300_amd64.deb")
-        rc1 = ("linux-image-unsigned-7.4.0-070400rc1-generic_"
-               "7.4.0-070400rc1.202611012313_amd64.deb")
-        rc2 = rc1.replace("rc1", "rc2")
-        rc10 = rc1.replace("rc1", "rc10")
-        self.assertTrue(deb_matches_kernel(stable, "v7.3.1"))
-        self.assertFalse(deb_matches_kernel(stable, "v6.6.157"))
-        self.assertTrue(deb_matches_kernel(rc1, "v7.4-rc1"))
-        self.assertFalse(deb_matches_kernel(rc2, "v7.4-rc1"))
-        self.assertFalse(deb_matches_kernel(rc1, "v7.4-rc2"))
-        self.assertFalse(deb_matches_kernel(rc10, "v7.4-rc1"))
-        self.assertFalse(deb_matches_kernel(stable, "v7.4-rc1"))
+        # The same shared vectors the shell release_ok runs (multi-marker
+        # inputs included): both matchers must agree on every one. Each
+        # release is wrapped in a realistic vng deb filename; the version
+        # half keeps the same markers, so a multi-marker release stays
+        # multi-marker in the deb.
+        vectors = json.loads(RC_VECTORS.read_text(encoding="ascii"))
+        self.assertTrue(vectors, "rc-match-vectors.json names no vectors")
+        for vector in vectors:
+            with self.subTest(vector=vector):
+                release = vector["release"]
+                version = (release[:-len("-generic")]
+                           if release.endswith("-generic") else release)
+                deb = (f"linux-image-unsigned-{release}_{version}."
+                       "202611012313_amd64.deb")
+                self.assertEqual(deb_matches_kernel(deb, vector["tag"]),
+                                 vector["expected"])
 
     def test_active_positives_and_combined_stock_refusals_are_separate(self):
         self.assertEqual(matrix_kernels(self.bpf),

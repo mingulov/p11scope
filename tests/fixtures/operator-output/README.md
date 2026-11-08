@@ -367,9 +367,11 @@ runtime/output bytes. Controlled RSS/CPU/performance cost is a separate T10 gate
 
 The 400/258 default-cadence schedule (KI-1/KI-2: ~1326 passes/leg exceeding
 900s at1s cadence on any host) is retired; the shortened264-round schedule
-above replaces it with identical wrap and parity assertions, parameterized to
-the live schedule. Both default-ring capacities stay24576/8192. Ordinary margin is 224 records
-(<1%); longer counted runs exceed the 900 s system bound live.
+(264 = 260 counted + 4 shared without fence/proof; 266 with fence/proof per
+leg, 532 per two-leg cell) above replaces it with identical wrap and parity
+assertions, parameterized to the live schedule. Both default-ring capacities
+stay24576/8192. Ordinary margin is 224 records (<1%); longer counted runs
+exceed the 900 s system bound live.
 
 Readable stderr accepts either complete once-only main-control-thread marker:
 `p11scope: cancel: loop exited on signal N after T ticks` or the truthful late

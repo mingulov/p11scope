@@ -531,21 +531,33 @@ fn dashboard_keeps_its_stderr_lines_in_a_file_and_on_the_terminal() {
 /// normal host or CI runner), so the note fires at all.
 #[test]
 fn dashboard_capture_holds_diagnostics_written_while_it_runs() {
+    // The capability note only fires for a caller that cannot read every
+    // process: root would see no note at all, so the cell needs non-root.
+    let euid = unsafe { libc::geteuid() };
+    assert!(
+        euid != 0,
+        "this cell needs a non-root caller with at least one unreadable process (euid={euid})"
+    );
     let dir = private_dir();
     let typescript = dir.path().join("typescript");
     let binary = env!("CARGO_BIN_EXE_p11scope");
     // `script` owns the terminal: the observer's stdout and stderr both
     // land on the pty slave, and the typescript records the session.
+    // `timeout` bounds the session: a hung observer must fail this cell,
+    // not the whole CI job.
     let command = format!("{binary} inventory --system --capture scan --dashboard --duration 4s");
-    let status = Command::new("script")
-        .args(["-qec", &command])
+    let status = Command::new("timeout")
+        .args(["60", "script", "-qec", &command])
         .arg(&typescript)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status()
-        .expect("script runs the dashboard session");
-    let _ = status;
+        .expect("timeout runs the script dashboard session");
+    assert!(
+        status.success(),
+        "the script dashboard session exits 0 (timeout kills it at 60 s): {status}"
+    );
     let output = std::fs::read(&typescript).expect("script wrote the typescript");
     let text = String::from_utf8_lossy(&output);
     let enter = b"\x1b[?1049h";
@@ -562,7 +574,7 @@ fn dashboard_capture_holds_diagnostics_written_while_it_runs() {
     // The trigger fired at all: without it the screen check is vacuous.
     assert!(
         text.contains("p11scope: needs"),
-        "a capability note fired during the run: {}",
+        "no capability note fired: this cell needs a non-root caller with at least one unreadable process (euid={euid}): {}",
         text.chars().take(3000).collect::<String>()
     );
     // Nothing bypassed the capture onto the screen: every on-screen

@@ -753,8 +753,7 @@ impl<'a> ScopedOwnerProof<'a> {
 /// `Some` here, so this reads true on every live path today. The seam
 /// pins the counterfactual against future gate changes.
 fn scoped_mint_exec_observed(generation: &crate::inspect_system::MemberGeneration) -> bool {
-    let _ = generation;
-    true
+    generation.exe.is_some()
 }
 
 impl<Source: ProcessSource> CallerAdapter<Source> {

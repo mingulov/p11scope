@@ -11533,6 +11533,51 @@ pub(crate) mod tests {
         );
     }
 
+    /// Concise keeps one manifest remedy (coverage); verbose keeps every
+    /// hint. Three identical nags in one concise report bury the result.
+    #[test]
+    fn concise_frame_mentions_manifest_once() {
+        let mut unattested = discovered_fixture();
+        unattested.sources = vec!["scan"];
+        let mut ev = evidence();
+        ev.discovery.modules = vec![unattested];
+        ev.semantic_unverified_slots = 68;
+        ev.verdict();
+        let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
+        let row = report("C_Sign", 2, 0, false);
+        let concise = live_scoped_with_verbosity(
+            &[row.clone()],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Concise,
+        );
+        assert_eq!(
+            concise.matches("--manifest").count(),
+            1,
+            "concise keeps one manifest hint: {concise}"
+        );
+        let verbose = live_scoped_with_verbosity(
+            &[row],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &mechanisms,
+            crate::cli::TextVerbosity::Verbose,
+        );
+        assert!(
+            verbose.matches("--manifest").count() >= 3,
+            "verbose keeps every hint: {verbose}"
+        );
+    }
+
     /// Unverified slots with every mapped provider attested (partial
     /// manifest coverage, e.g. a manifest/scan conflict): the manifest
     /// remedy would mislead, so the note records the bare fact.

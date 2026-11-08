@@ -122,13 +122,15 @@ pub(crate) struct ExeIdentity {
 /// One launcher-chain ancestor: one (pid, start-time) generation and its
 /// executable basename. Chains run nearest first. The `label` hook stays
 /// `None` in this lane; the app-identity lane fills interpreter labels
-/// without touching capture.
+/// without touching capture. `exe_unreadable` marks a stat-readable
+/// ancestor whose exe link could not be read (the named exe gap in JSON).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LauncherAncestor {
     pub pid: u32,
     pub start_time: Option<u64>,
     pub exe: Option<String>,
     pub label: Option<String>,
+    pub exe_unreadable: bool,
 }
 
 /// Why a launcher chain stops before a root: a named gap, never a guess.
@@ -138,14 +140,50 @@ pub(crate) struct LauncherGap {
     pub reason: String,
 }
 
+/// Where a launcher chain came from: a real ancestor chain, an
+/// init-type immediate parent (init, user manager, container init —
+/// neither "launched by a service manager" nor "reparented" is claimed),
+/// or a read gap.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LauncherOrigin {
+    Chain,
+    InitParent,
+    Gap,
+}
+
+impl LauncherOrigin {
+    pub(crate) const fn label(self) -> &'static str {
+        match self {
+            Self::Chain => "chain",
+            Self::InitParent => "init_parent",
+            Self::Gap => "gap",
+        }
+    }
+}
+
+/// One captured launcher chain: the raw ancestors (never init, the user
+/// manager, a container init or a proven-reused generation), the stop
+/// gap, and the origin/unit pair.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CapturedLauncherChain {
+    pub ancestors: Vec<LauncherAncestor>,
+    pub gap: Option<LauncherGap>,
+    pub origin: LauncherOrigin,
+    pub unit: Option<String>,
+}
+
 /// How many ancestors the walk keeps (nearest first).
 pub(crate) const LAUNCHER_CHAIN_DEPTH: usize = 4;
 /// Gap subject for every launcher-chain stop.
 pub(crate) const LAUNCHER_GAP_SUBJECT: &str = "caller parent chain";
-/// The parent exited between admission and the ancestor read.
-pub(crate) const LAUNCHER_GAP_EXITED: &str = "parent unknown: exited before read";
+/// The parent exited before the ancestor read, or the live generation is
+/// provably not the original parent (it started after its child).
+pub(crate) const LAUNCHER_GAP_EXITED: &str = "launcher exited before read";
+/// A stat-readable ancestor's exe link could not be read (no ptrace read
+/// access, or the generation turned over under the read).
+pub(crate) const LAUNCHER_GAP_EXE_UNREADABLE: &str = "launcher exe unreadable";
 /// The parent's `/proc` entry was unreadable though it looks alive.
-pub(crate) const LAUNCHER_GAP_UNREADABLE: &str = "parent unknown: unreadable /proc entry";
+pub(crate) const LAUNCHER_GAP_HIDEPID: &str = "launcher hidden by /proc hidepid";
 /// The walk kept [`LAUNCHER_CHAIN_DEPTH`] ancestors with more above.
 pub(crate) const LAUNCHER_GAP_TRUNCATED: &str = "parent chain truncated after 4 ancestors";
 /// Cgroup-transaction commits sample no parentage (zero post-sample reads).
@@ -213,6 +251,11 @@ pub(crate) struct CallerRecord {
     pub launched_by: Vec<LauncherAncestor>,
     /// Why the chain stops before a root, if it does.
     pub launcher_gap: Option<LauncherGap>,
+    /// Where the chain came from (real ancestors, an init-type parent,
+    /// or a read gap).
+    pub launched_by_origin: LauncherOrigin,
+    /// The caller's systemd unit/scope, set only for `InitParent`.
+    pub launched_by_unit: Option<String>,
     /// False when the exe identity was unreadable at admission: exec
     /// changes are then undetectable and the record says so.
     pub exec_observed: bool,
@@ -273,6 +316,17 @@ pub(crate) trait ProcessSource {
         self.exe_identity(pid)
             .and_then(|exe| exe.path)
             .map(|path| exe_basename(&path))
+    }
+    /// Raw `/proc/<pid>/cgroup` text, or `None` when unreadable. The
+    /// default knows no cgroup; production reads the file and scripted
+    /// sources replay fixture contents.
+    fn cgroup_text(&self, _pid: u32) -> Option<String> {
+        None
+    }
+    /// True when `pid` is a container init (innermost NSpid 1, not the
+    /// observer's pid 1). The default never claims it.
+    fn is_container_init(&self, _pid: u32) -> bool {
+        false
     }
     /// True when `pid` names no live process: reaped, never existed, or
     /// a zombie awaiting its parent's `wait`. Zombies count as gone —
@@ -392,12 +446,12 @@ pub(crate) fn exe_basename(path: &str) -> String {
 }
 
 /// The gap for an ancestor whose stat line would not parse: exited when
-/// the generation is provably gone, otherwise unreadable. Never a guess.
+/// the generation is provably gone, otherwise hidden. Never a guess.
 fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> LauncherGap {
     let reason = if source.gone(pid) {
         LAUNCHER_GAP_EXITED
     } else {
-        LAUNCHER_GAP_UNREADABLE
+        LAUNCHER_GAP_HIDEPID
     };
     LauncherGap {
         subject: LAUNCHER_GAP_SUBJECT,
@@ -405,50 +459,279 @@ fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> Launch
     }
 }
 
+/// The systemd cgroup path in a `/proc/<pid>/cgroup` text: the cgroup-v2
+/// `0::` line, else the v1 `name=systemd` line.
+fn systemd_cgroup_path(cgroup: &str) -> Option<&str> {
+    let mut v1 = None;
+    for line in cgroup.lines() {
+        let mut parts = line.splitn(3, ':');
+        let (id, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
+        if controllers.is_empty() {
+            if id == "0" {
+                return Some(path);
+            }
+        } else if controllers.split(',').any(|c| c == "name=systemd") {
+            v1 = Some(path);
+        }
+    }
+    v1
+}
+
+/// The leafmost unit name in a systemd cgroup path, or `None` when the
+/// path carries none.
+fn unit_from_systemd_path(path: &str) -> Option<String> {
+    const UNIT_SUFFIXES: &[&str] = &[
+        ".service",
+        ".scope",
+        ".slice",
+        ".socket",
+        ".timer",
+        ".target",
+        ".path",
+        ".mount",
+        ".automount",
+        ".swap",
+        ".device",
+    ];
+    path.rsplit('/')
+        .filter(|segment| !segment.is_empty())
+        .find(|segment| {
+            UNIT_SUFFIXES
+                .iter()
+                .any(|suffix| segment.ends_with(suffix) && segment.len() > suffix.len())
+        })
+        .map(str::to_string)
+}
+
+/// The systemd unit or scope for a `/proc/<pid>/cgroup` text, following
+/// `sd_pid_get_unit` without a libsystemd link: the systemd cgroup path
+/// above, then its leafmost unit name. Components are returned verbatim
+/// (no cgroup unescaping); escaped names show escaped. Only the unit
+/// name is kept — full cgroup paths are never retained or published.
+pub(crate) fn parse_systemd_unit(cgroup: &str) -> Option<String> {
+    systemd_cgroup_path(cgroup).and_then(unit_from_systemd_path)
+}
+
+/// True when a `/proc/<pid>/cgroup` text places the pid in the systemd
+/// user manager itself: `user@<uid>.service/init.scope`.
+pub(crate) fn is_user_manager_cgroup(cgroup: &str) -> bool {
+    systemd_cgroup_path(cgroup).is_some_and(|path| {
+        let mut segments = path.rsplit('/').filter(|segment| !segment.is_empty());
+        matches!(
+            (segments.next(), segments.next()),
+            (Some("init.scope"), Some(manager))
+                if manager.starts_with("user@") && manager.ends_with(".service")
+        )
+    })
+}
+
+/// True when a `/proc/<pid>/status` text shows the pid as a container
+/// init: an `NSpid:` line whose innermost (last) value is 1 while the
+/// outermost is not (the observer's own pid 1 is caught by number).
+/// Absent or unparsable `NSpid` (kernels before 4.1) answers false.
+/// Child subreapers other than these boundaries expose no `/proc` flag,
+/// so they are caught only by the start-time reparent check below.
+pub(crate) fn status_nspid_is_container_init(status: &str) -> bool {
+    status.lines().any(|line| {
+        let Some(values) = line.strip_prefix("NSpid:") else {
+            return false;
+        };
+        let pids: Vec<&str> = values.split_whitespace().collect();
+        pids.len() > 1 && pids.last() == Some(&"1") && pids.first() != Some(&"1")
+    })
+}
+
+/// Raw `/proc/<pid>/cgroup` text, or `None` when unreadable.
+pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
+}
+
+/// True when `pid` is a container init per its status `NSpid`.
+pub(crate) fn read_is_container_init(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .is_ok_and(|status| status_nspid_is_container_init(&status))
+}
+
+/// Collapse runs of adjacent identical launcher wrappers (same exe and
+/// label, with at least one name present) for `-v`/JSON: each run keeps
+/// its nearest link with the count of additional folded ancestors (`0`
+/// when nothing folded). Records keep the raw chain; both emitters share
+/// this helper so they cannot drift.
+pub(crate) fn collapse_launcher_chain(chain: &[LauncherAncestor]) -> Vec<(LauncherAncestor, u32)> {
+    let mut collapsed: Vec<(LauncherAncestor, u32)> = Vec::with_capacity(chain.len());
+    for ancestor in chain {
+        let named = ancestor.exe.is_some() || ancestor.label.is_some();
+        if named
+            && let Some((last, folded)) = collapsed.last_mut()
+            && last.exe == ancestor.exe
+            && last.label == ancestor.label
+        {
+            *folded += 1;
+            continue;
+        }
+        collapsed.push((ancestor.clone(), 0));
+    }
+    collapsed
+}
+
 /// Capture one caller incarnation's launcher chain: up to
-/// [`LAUNCHER_CHAIN_DEPTH`] ancestors, nearest first, each as a
-/// (pid, start-time) generation with its exe basename. Stops cleanly (no
-/// gap) at pid 1 and at ppid 0 (no parent in this pid namespace); any
-/// other stop keeps the ancestors read so far plus a named gap. Never
-/// fails, never guesses, and never touches argv, environ or comm.
+/// [`LAUNCHER_CHAIN_DEPTH`] raw ancestors, nearest first, each as a
+/// (pid, start-time) generation with its exe basename. Init (pid 1 of
+/// the scope's pid namespace), the systemd user manager and container
+/// inits are never recorded: an init-type immediate parent yields
+/// `InitParent` with the caller's systemd unit (or nothing), while an
+/// init-type ancestor above real links just ends the walk. A parent
+/// younger than its child cannot be the original parent (pid reuse), so
+/// the walk stops there with the exited gap. Stops cleanly (no gap) at
+/// ppid 0 (no parent in this pid namespace); any other stop keeps the
+/// ancestors read so far plus a named gap. Never fails, never guesses,
+/// and never touches argv, environ or comm.
 pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
     source: &Source,
     caller_pid: u32,
+    caller_start_time: Option<u64>,
     caller_ppid: Option<u32>,
-) -> (Vec<LauncherAncestor>, Option<LauncherGap>) {
-    let mut chain = Vec::new();
+) -> CapturedLauncherChain {
+    let gap = |reason: &str| LauncherGap {
+        subject: LAUNCHER_GAP_SUBJECT,
+        reason: reason.into(),
+    };
+    // The caller's unit, read only when an init-type parent needs it.
+    let caller_unit = || {
+        source
+            .cgroup_text(caller_pid)
+            .and_then(|cgroup| parse_systemd_unit(&cgroup))
+    };
+    let init_parent = || CapturedLauncherChain {
+        ancestors: Vec::new(),
+        gap: None,
+        origin: LauncherOrigin::InitParent,
+        unit: caller_unit(),
+    };
+    let partial_origin = |ancestors: &[LauncherAncestor]| {
+        if ancestors.is_empty() {
+            LauncherOrigin::Gap
+        } else {
+            LauncherOrigin::Chain
+        }
+    };
     let Some(mut ppid) = caller_ppid else {
-        return (chain, Some(launcher_read_gap(source, caller_pid)));
+        return CapturedLauncherChain {
+            ancestors: Vec::new(),
+            gap: Some(launcher_read_gap(source, caller_pid)),
+            origin: LauncherOrigin::Gap,
+            unit: None,
+        };
     };
     if ppid == 0 {
-        return (chain, None);
+        return CapturedLauncherChain {
+            ancestors: Vec::new(),
+            gap: None,
+            origin: LauncherOrigin::Chain,
+            unit: None,
+        };
     }
+    if ppid == 1 {
+        return init_parent();
+    }
+    let mut ancestors = Vec::new();
+    let mut child_start_time = caller_start_time;
     loop {
-        if chain.len() >= LAUNCHER_CHAIN_DEPTH {
+        if ancestors.len() >= LAUNCHER_CHAIN_DEPTH {
             // The fourth ancestor's own stat line (already read) names a
             // parent above it — otherwise the loop would have stopped
             // cleanly — so the truncation is read evidence, not a guess.
-            return (
-                chain,
-                Some(LauncherGap {
-                    subject: LAUNCHER_GAP_SUBJECT,
-                    reason: LAUNCHER_GAP_TRUNCATED.into(),
-                }),
-            );
+            return CapturedLauncherChain {
+                ancestors,
+                gap: Some(gap(LAUNCHER_GAP_TRUNCATED)),
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
+        }
+        if ppid == 0 {
+            return CapturedLauncherChain {
+                ancestors,
+                gap: None,
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
+        }
+        if ppid == 1 {
+            // An init above real ancestors ends the walk; the chain
+            // stands on its own with no gap and no unit.
+            return CapturedLauncherChain {
+                ancestors,
+                gap: None,
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
         }
         let (start_time, grand) = source.stat_pair(ppid);
         let (Some(start_time), Some(grand)) = (start_time, grand) else {
-            return (chain, Some(launcher_read_gap(source, ppid)));
+            return CapturedLauncherChain {
+                gap: Some(launcher_read_gap(source, ppid)),
+                origin: partial_origin(&ancestors),
+                unit: None,
+                ancestors,
+            };
         };
-        chain.push(LauncherAncestor {
+        // A parent younger than its child cannot be the original parent:
+        // the pid was recycled after the child started.
+        if child_start_time.is_some_and(|child| start_time > child) {
+            let origin = partial_origin(&ancestors);
+            return CapturedLauncherChain {
+                ancestors,
+                gap: Some(gap(LAUNCHER_GAP_EXITED)),
+                origin,
+                unit: None,
+            };
+        }
+        // User-manager and container-init links are never shown; an
+        // immediate one reports init_parent with the caller's unit,
+        // while one above real links just ends the walk. An unreadable
+        // cgroup fails open to an ordinary ancestor: stat already
+        // proved the generation, and the boundary processes are
+        // long-lived, so a classification race is negligible.
+        let is_user_manager = source
+            .cgroup_text(ppid)
+            .is_some_and(|cgroup| is_user_manager_cgroup(&cgroup));
+        if is_user_manager || source.is_container_init(ppid) {
+            if ancestors.is_empty() {
+                return init_parent();
+            }
+            return CapturedLauncherChain {
+                ancestors,
+                gap: None,
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
+        }
+        // Pin the exe to the statted generation: a recycle between the
+        // stat and the readlink must not attach the new image's name.
+        // Any mismatch or re-read failure drops the exe with the named
+        // gap; the walk continues from the statted parent.
+        let exe = source.ancestor_exe(ppid);
+        let (recheck, _) = source.stat_pair(ppid);
+        let (exe, exe_unreadable) = match (exe, recheck) {
+            (Some(name), Some(again)) if again == start_time => (Some(name), false),
+            _ => (None, true),
+        };
+        ancestors.push(LauncherAncestor {
             pid: ppid,
             start_time: Some(start_time),
-            exe: source.ancestor_exe(ppid),
+            exe,
             label: None,
+            exe_unreadable,
         });
-        if ppid == 1 || grand == 0 {
-            return (chain, None);
+        if grand == 0 {
+            return CapturedLauncherChain {
+                ancestors,
+                gap: None,
+                origin: LauncherOrigin::Chain,
+                unit: None,
+            };
         }
+        child_start_time = Some(start_time);
         ppid = grand;
     }
 }
@@ -472,10 +755,7 @@ impl ProcessSource for OsProcessSource {
     }
 
     fn stat_pair(&self, pid: u32) -> (Option<u64>, Option<u32>) {
-        match process_stat_pair(pid) {
-            Ok((start_time, ppid)) => (Some(start_time), Some(ppid)),
-            Err(_) => (None, None),
-        }
+        process_stat_pair(pid)
     }
 
     fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
@@ -489,6 +769,14 @@ impl ProcessSource for OsProcessSource {
         admitted_start_time: Option<u64>,
     ) -> Option<crate::app_hint::AppHint> {
         crate::app_hint::sample_for_pid(pid, exe, admitted_start_time)
+    }
+
+    fn cgroup_text(&self, pid: u32) -> Option<String> {
+        read_cgroup_text(pid)
+    }
+
+    fn is_container_init(&self, pid: u32) -> bool {
+        read_is_container_init(pid)
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -1128,7 +1416,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
         let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
-        let (launched_by, launcher_gap) = capture_launcher_chain(&self.source, pid, caller_ppid);
+        let captured = capture_launcher_chain(&self.source, pid, start_time, caller_ppid);
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
@@ -1146,8 +1434,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     exec_observed: exe.is_some(),
                     exe,
                     app_hint,
-                    launched_by,
-                    launcher_gap,
+                    launched_by: captured.ancestors,
+                    launcher_gap: captured.gap,
+                    launched_by_origin: captured.origin,
+                    launched_by_unit: captured.unit,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1323,6 +1613,8 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         subject: LAUNCHER_GAP_SUBJECT,
                         reason: LAUNCHER_GAP_CGROUP_DEFERRED.into(),
                     }),
+                    launched_by_origin: LauncherOrigin::Gap,
+                    launched_by_unit: None,
                     incarnation,
                     exec_observed,
                     authority: ImageAuthority::ScanPinned,
@@ -1442,6 +1734,8 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                         subject: LAUNCHER_GAP_SUBJECT,
                         reason: LAUNCHER_GAP_CGROUP_DEFERRED.into(),
                     }),
+                    launched_by_origin: LauncherOrigin::Gap,
+                    launched_by_unit: None,
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1827,7 +2121,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = self.source.exe_identity(pid);
         let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
-        let (launched_by, launcher_gap) = capture_launcher_chain(&self.source, pid, caller_ppid);
+        let captured = capture_launcher_chain(&self.source, pid, start_time, caller_ppid);
         // Per-incarnation detection (F7a): after the validation above.
         let admitted_ns = match detected() {
             Some(stamp) => stamp.max(now_ns),
@@ -1854,8 +2148,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     exec_observed: exe.is_some(),
                     exe,
                     app_hint,
-                    launched_by,
-                    launcher_gap,
+                    launched_by: captured.ancestors,
+                    launcher_gap: captured.gap,
+                    launched_by_origin: captured.origin,
+                    launched_by_unit: captured.unit,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -7098,6 +7394,11 @@ pub(crate) mod tests {
         /// False simulates an unreadable `/proc` (a race or a permission
         /// wall): liveness answers but identity reads fail.
         readable: bool,
+        /// Scripted `/proc/<pid>/cgroup` text for user-manager and unit
+        /// classification.
+        cgroup: Option<String>,
+        /// Scripted container-init flag (innermost NSpid 1).
+        container_init: bool,
         leader_exit: crate::process::leader_exit::LeaderExitObservation,
     }
 
@@ -7143,6 +7444,8 @@ pub(crate) mod tests {
                     exe_maps: exe,
                     ppid: 0,
                     readable: true,
+                    cgroup: None,
+                    container_init: false,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
@@ -7159,6 +7462,8 @@ pub(crate) mod tests {
                     exe_maps: exe,
                     ppid: 0,
                     readable: true,
+                    cgroup: None,
+                    container_init: false,
                     leader_exit: crate::process::leader_exit::LeaderExitObservation::Unresolved,
                 },
             );
@@ -7193,9 +7498,25 @@ pub(crate) mod tests {
         }
 
         fn hide_exe(&self, pid: u32) {
+            self.hide_ancestor_exe(pid);
+        }
+
+        pub(crate) fn hide_ancestor_exe(&self, pid: u32) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.exe = None;
                 process.exe_maps = None;
+            }
+        }
+
+        pub(crate) fn set_cgroup(&self, pid: u32, cgroup: &str) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.cgroup = Some(cgroup.to_string());
+            }
+        }
+
+        pub(crate) fn set_container_init(&self, pid: u32, container_init: bool) {
+            if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
+                process.container_init = container_init;
             }
         }
 
@@ -7301,6 +7622,23 @@ pub(crate) mod tests {
                 .get(&pid)
                 .filter(|process| process.alive && process.readable)
                 .and_then(|process| process.exe_maps.clone())
+        }
+
+        fn cgroup_text(&self, pid: u32) -> Option<String> {
+            self.state
+                .borrow()
+                .processes
+                .get(&pid)
+                .filter(|process| process.alive && process.readable)
+                .and_then(|process| process.cgroup.clone())
+        }
+
+        fn is_container_init(&self, pid: u32) -> bool {
+            self.state
+                .borrow()
+                .processes
+                .get(&pid)
+                .is_some_and(|process| process.alive && process.readable && process.container_init)
         }
 
         fn gone(&self, pid: u32) -> bool {
@@ -7501,7 +7839,11 @@ pub(crate) mod tests {
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
         let record = adapter.record(id).unwrap();
         let chain = &record.launched_by;
-        assert_eq!(chain.len(), 2, "caller -> parent -> grand; init is never shown");
+        assert_eq!(
+            chain.len(),
+            2,
+            "caller -> parent -> grand; init is never shown"
+        );
         assert_eq!((chain[0].pid, chain[0].start_time), (100, Some(11)));
         assert_eq!(chain[0].exe.as_deref(), Some("parent-a"));
         assert_eq!((chain[1].pid, chain[1].start_time), (50, Some(5)));
@@ -7515,7 +7857,9 @@ pub(crate) mod tests {
         source.spawn(100, 77);
         source.exec(100, 102, "/bin/parent-b");
         source.set_ppid(100, 50);
-        source.spawn(201, 23);
+        // The new caller starts after the live parent generation: a
+        // parent younger than its child would prove pid reuse.
+        source.spawn(201, 99);
         source.set_ppid(201, 100);
         let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
         let chain2 = &adapter.record(id2).unwrap().launched_by;
@@ -7574,7 +7918,9 @@ pub(crate) mod tests {
         source.spawn(311, 31);
         source.exec(311, 311, "/bin/mid");
         source.set_ppid(311, 1);
-        source.spawn(310, 30);
+        // The caller starts after its parent: a younger parent would
+        // prove pid reuse instead of an init stop.
+        source.spawn(310, 32);
         source.set_ppid(310, 311);
         let id = adapter.admit(310, AUTHORITY, 10).unwrap();
         let record = adapter.record(id).unwrap();
@@ -7588,7 +7934,8 @@ pub(crate) mod tests {
             source.set_ppid(pid, pid - 1);
         }
         source.set_ppid(301, 1);
-        source.spawn(300, 29);
+        // The deep caller starts after every ancestor generation.
+        source.spawn(300, 390);
         source.set_ppid(300, 305);
         let deep = adapter.admit(300, AUTHORITY, 11).unwrap();
         let record = adapter.record(deep).unwrap();
@@ -7614,14 +7961,17 @@ pub(crate) mod tests {
         source.exec(1, 1, "/sbin/init");
         source.spawn(200, 22);
         source.set_ppid(200, 1);
-        source.set_cgroup(
-            200,
-            "0::/system.slice/backup.service\n",
-        );
+        source.set_cgroup(200, "0::/system.slice/backup.service\n");
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
         let record = adapter.record(id).unwrap();
-        assert!(record.launched_by.is_empty(), "init is never shown as the launcher");
-        assert!(record.launcher_gap.is_none(), "init_parent is not a read failure");
+        assert!(
+            record.launched_by.is_empty(),
+            "init is never shown as the launcher"
+        );
+        assert!(
+            record.launcher_gap.is_none(),
+            "init_parent is not a read failure"
+        );
         assert_eq!(record.launched_by_origin.label(), "init_parent");
         assert_eq!(record.launched_by_unit.as_deref(), Some("backup.service"));
         // Without a unit, init_parent shows nothing but still claims neither
@@ -7647,7 +7997,10 @@ pub(crate) mod tests {
         );
         source.spawn(200, 22);
         source.set_ppid(200, 1500);
-        source.set_cgroup(200, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n");
+        source.set_cgroup(
+            200,
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n",
+        );
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
         let record = adapter.record(id).unwrap();
         assert!(
@@ -7730,7 +8083,10 @@ pub(crate) mod tests {
             record.launched_by[0].exe_unreadable,
             "a stat-readable ancestor with no exe read carries the exe gap"
         );
-        assert!(record.launcher_gap.is_none(), "the chain itself stopped cleanly");
+        assert!(
+            record.launcher_gap.is_none(),
+            "the chain itself stopped cleanly"
+        );
         assert_eq!(record.launched_by_origin.label(), "chain");
     }
 
@@ -7739,9 +8095,10 @@ pub(crate) mod tests {
         use std::cell::RefCell;
         use std::collections::HashMap;
         use std::rc::Rc;
+        type StatQueues = Rc<RefCell<HashMap<u32, Vec<(Option<u64>, Option<u32>)>>>>;
         #[derive(Clone)]
         struct FlappingSource {
-            stats: Rc<RefCell<HashMap<u32, Vec<(Option<u64>, Option<u32>)>>>>,
+            stats: StatQueues,
         }
         impl ProcessSource for FlappingSource {
             type Pin = (u32, u64);
@@ -7788,7 +8145,10 @@ pub(crate) mod tests {
         assert_eq!(captured.ancestors.len(), 1);
         assert_eq!(captured.ancestors[0].pid, 100);
         assert_eq!(captured.ancestors[0].start_time, Some(11));
-        assert!(captured.ancestors[0].exe.is_none(), "the recycled exe is dropped");
+        assert!(
+            captured.ancestors[0].exe.is_none(),
+            "the recycled exe is dropped"
+        );
         assert!(captured.ancestors[0].exe_unreadable);
         assert!(captured.gap.is_none());
     }
@@ -7796,9 +8156,27 @@ pub(crate) mod tests {
     #[test]
     fn launcher_collapse_folds_adjacent_identical_wrappers() {
         let chain = vec![
-            LauncherAncestor { pid: 100, start_time: Some(11), exe: Some("sh".into()), label: None, exe_unreadable: false },
-            LauncherAncestor { pid: 90, start_time: Some(9), exe: Some("sh".into()), label: None, exe_unreadable: false },
-            LauncherAncestor { pid: 80, start_time: Some(8), exe: Some("cron".into()), label: None, exe_unreadable: false },
+            LauncherAncestor {
+                pid: 100,
+                start_time: Some(11),
+                exe: Some("sh".into()),
+                label: None,
+                exe_unreadable: false,
+            },
+            LauncherAncestor {
+                pid: 90,
+                start_time: Some(9),
+                exe: Some("sh".into()),
+                label: None,
+                exe_unreadable: false,
+            },
+            LauncherAncestor {
+                pid: 80,
+                start_time: Some(8),
+                exe: Some("cron".into()),
+                label: None,
+                exe_unreadable: false,
+            },
         ];
         let collapsed = collapse_launcher_chain(&chain);
         assert_eq!(collapsed.len(), 2);
@@ -7808,12 +8186,51 @@ pub(crate) mod tests {
         assert_eq!(collapsed[1].1, 0);
         // Non-adjacent repeats do not fold; labels distinguish wrappers.
         let chain = vec![
-            LauncherAncestor { pid: 100, start_time: Some(11), exe: Some("sh".into()), label: Some("a".into()), exe_unreadable: false },
-            LauncherAncestor { pid: 90, start_time: Some(9), exe: Some("cron".into()), label: None, exe_unreadable: false },
-            LauncherAncestor { pid: 80, start_time: Some(8), exe: Some("sh".into()), label: Some("a".into()), exe_unreadable: false },
+            LauncherAncestor {
+                pid: 100,
+                start_time: Some(11),
+                exe: Some("sh".into()),
+                label: Some("a".into()),
+                exe_unreadable: false,
+            },
+            LauncherAncestor {
+                pid: 90,
+                start_time: Some(9),
+                exe: Some("cron".into()),
+                label: None,
+                exe_unreadable: false,
+            },
+            LauncherAncestor {
+                pid: 80,
+                start_time: Some(8),
+                exe: Some("sh".into()),
+                label: Some("a".into()),
+                exe_unreadable: false,
+            },
         ];
         let collapsed = collapse_launcher_chain(&chain);
         assert_eq!(collapsed.len(), 3);
+        // Nameless links never fold: without ptrace read access every
+        // ancestor is `pid N`, and folding them would hide generations.
+        let chain = vec![
+            LauncherAncestor {
+                pid: 100,
+                start_time: Some(11),
+                exe: None,
+                label: None,
+                exe_unreadable: true,
+            },
+            LauncherAncestor {
+                pid: 90,
+                start_time: Some(9),
+                exe: None,
+                label: None,
+                exe_unreadable: true,
+            },
+        ];
+        let collapsed = collapse_launcher_chain(&chain);
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!((collapsed[0].1, collapsed[1].1), (0, 0));
     }
 
     #[test]
@@ -7823,7 +8240,10 @@ pub(crate) mod tests {
             Some("backup.service")
         );
         assert_eq!(
-            parse_systemd_unit("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n").as_deref(),
+            parse_systemd_unit(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
+            )
+            .as_deref(),
             Some("app-gated.scope")
         );
         // cgroup v1: the systemd controller line carries the path.
@@ -7837,7 +8257,9 @@ pub(crate) mod tests {
             "user@<uid>.service/init.scope is the user manager"
         );
         assert!(!is_user_manager_cgroup("0::/system.slice/backup.service\n"));
-        assert!(!is_user_manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"));
+        assert!(!is_user_manager_cgroup(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
+        ));
         // No unit when the path carries none.
         assert_eq!(parse_systemd_unit("0::/\n").as_deref(), None);
         assert_eq!(parse_systemd_unit("").as_deref(), None);
@@ -7850,7 +8272,9 @@ pub(crate) mod tests {
             "innermost NSpid 1 is a container init"
         );
         assert!(!status_nspid_is_container_init("Name:\tsh\nNSpid:\t900\n"));
-        assert!(!status_nspid_is_container_init("Name:\tsh\nNSpid:\t900\t42\n"));
+        assert!(!status_nspid_is_container_init(
+            "Name:\tsh\nNSpid:\t900\t42\n"
+        ));
         assert!(!status_nspid_is_container_init("Name:\tsh\n"));
     }
 

@@ -1700,39 +1700,45 @@ pub(crate) fn process_start_time(pid: u32) -> io::Result<u64> {
     start_time_from_stat(&stat)
 }
 
-pub(crate) fn start_time_from_stat(stat: &str) -> io::Result<u64> {
-    let end = stat
-        .rfind(')')
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat comm"))?;
-    stat[end + 1..]
-        .split_whitespace()
-        .nth(19)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))?
-        .parse()
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))
+/// `(start_time, ppid)` from one `/proc/<pid>/stat` line in a single
+/// pass: one `rfind(')')` past comm, one field walk keeping ppid (field
+/// 4) on the way to starttime (field 22). Each field parses
+/// independently — a malformed ppid keeps the good start_time (and vice
+/// versa) instead of collapsing the pair. The comm field is skipped,
+/// never retained.
+pub(crate) fn stat_pair_from_stat(stat: &str) -> (Option<u64>, Option<u32>) {
+    let Some(end) = stat.rfind(')') else {
+        return (None, None);
+    };
+    let mut ppid = None;
+    let mut start_time = None;
+    for (index, field) in stat[end + 1..].split_whitespace().enumerate() {
+        if index == 1 {
+            ppid = field.parse::<u32>().ok();
+        } else if index == 19 {
+            start_time = field.parse::<u64>().ok();
+            break;
+        }
+    }
+    (start_time, ppid)
 }
 
-/// ppid (field 4) of a `/proc/<pid>/stat` line, parsed after the LAST `)`
-/// like [`start_time_from_stat`]. `None` on any malformed input — callers
-/// fail closed. The comm field is skipped, never retained.
-pub(crate) fn ppid_from_stat(stat: &str) -> Option<u32> {
-    let end = stat.rfind(')')?;
-    stat[end + 1..]
-        .split_whitespace()
-        .nth(1)?
-        .parse::<u32>()
-        .ok()
+pub(crate) fn start_time_from_stat(stat: &str) -> io::Result<u64> {
+    stat_pair_from_stat(stat)
+        .0
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))
 }
 
 /// `(start_time, ppid)` from ONE `/proc/<pid>/stat` read: the generation
 /// and its parent share the line, so pid reuse between two reads cannot
-/// mix them. Fails when the line is unreadable or either field is malformed.
-pub(crate) fn process_stat_pair(pid: u32) -> io::Result<(u64, u32)> {
-    let stat = read_proc_stat(pid)?;
-    let start_time = start_time_from_stat(&stat)?;
-    let ppid = ppid_from_stat(&stat)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat ppid"))?;
-    Ok((start_time, ppid))
+/// mix them. Each field is `None` independently when the line is
+/// unreadable or that field is malformed, so a good start_time survives
+/// a malformed ppid.
+pub(crate) fn process_stat_pair(pid: u32) -> (Option<u64>, Option<u32>) {
+    let Ok(stat) = read_proc_stat(pid) else {
+        return (None, None);
+    };
+    stat_pair_from_stat(&stat)
 }
 
 /// `PF_KTHREAD` (`include/linux/sched.h`): set in `/proc/<pid>/stat` field 9
@@ -2459,7 +2465,6 @@ int main(int argc, char **argv) {
         let stat = "123 (a) b (c) S 1 2 3 4 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 300 0";
         assert_eq!(stat_pair_from_stat(stat), (Some(300), Some(1)));
         assert_eq!(start_time_from_stat(stat).unwrap(), 300);
-        assert_eq!(ppid_from_stat(stat), Some(1));
         let bad_ppid = "123 (a) b (c) S xx 2 3 4 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 300 0";
         assert_eq!(
             stat_pair_from_stat(bad_ppid),
@@ -2470,7 +2475,11 @@ int main(int argc, char **argv) {
         assert_eq!(stat_pair_from_stat(bad_start), (None, Some(1)));
         assert_eq!(stat_pair_from_stat(""), (None, None));
         assert_eq!(stat_pair_from_stat("123 no-paren-here"), (None, None));
-        assert_eq!(stat_pair_from_stat("123 (x) S 1"), (None, None));
+        assert_eq!(
+            stat_pair_from_stat("123 (x) S 1"),
+            (None, Some(1)),
+            "a present ppid parses even when starttime is missing"
+        );
     }
 
     /// The single-read stat helper returns the same content

@@ -261,9 +261,11 @@ def calls_before_watch(window, record):
     complete before the edge's watch began (`since_ns`)?
 
     The LEDGER line only prints after the round's last call, and the
-    harness stamps the release before the first call, so `end < since`
-    proves the 0 count is honest output, not a missed observation. The
-    gate still refuses the trip; this only names the evidence.
+    end stamp is taken after it, so `end < since` proves the 0 count
+    is honest output, not a missed observation. (The start stamp is
+    taken after the gate release returns, so it bounds nothing; only
+    `end` decides PROVEN.) The gate still refuses the trip; this only
+    names the evidence.
     """
     if window is None:
         return "calls-before-watch UNPROVEN (no ledger stamps in facts.log)"

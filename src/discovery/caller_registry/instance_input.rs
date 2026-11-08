@@ -1707,10 +1707,14 @@ impl CallerRegistry {
     }
 
     /// Whether a staged registration row could mint at the drain:
-    /// identified module, proven image, in-domain boundary, live
-    /// caller with an edge. Mirrors the drain's refusal checks in
-    /// [`Self::apply_instance`]; ordering-only, never authority
-    /// (the drain re-checks everything at apply time).
+    /// identified module, proven image, live caller with an edge,
+    /// in-domain boundary, and no blocking negative. Mirrors the
+    /// drain's refusal checks in [`Self::apply_instance`];
+    /// ordering-only, never authority (the drain re-checks
+    /// everything at apply time, and the fits count is unchanged
+    /// — misclassification only costs a row its priority, never
+    /// correctness). Keys already held need no mirror: the fits
+    /// loop skips by_key hits itself.
     fn staged_row_could_mint(&self, at: usize) -> bool {
         let Mutation::NoteInstance(input) = &self.staged[at] else {
             return false;
@@ -1731,6 +1735,13 @@ impl CallerRegistry {
         }
         if input.boundary.is_some_and(|p| p.domain != input.key.domain) {
             return false;
+        }
+        for negative in &self.instance_state.negatives {
+            if negative.matches(&input.key, module)
+                && (negative.authority_exhausted || negative.retirement.is_some())
+            {
+                return false;
+            }
         }
         true
     }
@@ -4898,9 +4909,10 @@ mod journal_unavailable_tests {
     /// Scaled-down wall (limit 8, genuine ninth): same code path
     /// as the live 4095-row wall. The drain fate per flavor is
     /// pinned to document the accounting: bound churn mints
-    /// (real cap), drain-refused flavors (unbound caller,
-    /// unidentified module, zero cookie) must neither mint nor
-    /// consume a genuine row's slot.
+    /// (real cap); drain-refused flavors (unbound caller,
+    /// unidentified module, zero cookie, caller-mismatched
+    /// re-registration, negative-blocked scope) must neither
+    /// mint nor consume a genuine row's slot.
     #[test]
     fn p6_genuine_birth_behind_churn_still_registers() {
         #[derive(Clone, Copy)]
@@ -4909,6 +4921,8 @@ mod journal_unavailable_tests {
             UnboundCaller,
             UnidentifiedModule,
             CookieZero,
+            CallerMismatch,
+            NegativeBlocked,
         }
         impl Flavor {
             fn name(self) -> &'static str {
@@ -4917,6 +4931,8 @@ mod journal_unavailable_tests {
                     Self::UnboundCaller => "unbound_caller",
                     Self::UnidentifiedModule => "unidentified_module",
                     Self::CookieZero => "cookie_zero",
+                    Self::CallerMismatch => "caller_mismatch",
+                    Self::NegativeBlocked => "negative_blocked",
                 }
             }
             fn junk(self, scene: &UnlinkedScene, i: u64) -> (InstanceKey, CallerId) {
@@ -4963,6 +4979,84 @@ mod journal_unavailable_tests {
                         ),
                         scene.caller,
                     ),
+                    // Same keys the setup pre-minted, re-staged
+                    // under a stranger: bound and edged, but the
+                    // drain refuses the caller mismatch.
+                    Self::CallerMismatch => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(777),
+                            InstanceId::from_raw(4000 + i),
+                            scene.module.clone(),
+                        ),
+                        CallerId(99),
+                    ),
+                    // Bound and edged like churn, but the setup's
+                    // negative blocks the whole cookie scope.
+                    Self::NegativeBlocked => (
+                        InstanceKey::scripted(
+                            scene.domain,
+                            image(777),
+                            InstanceId::from_raw(5000 + i),
+                            scene.module.clone(),
+                        ),
+                        scene.caller,
+                    ),
+                }
+            }
+            /// Flavor setup before staging: limit, edges, records,
+            /// negatives. Returns the expected record count after
+            /// the final drain.
+            fn setup(self, scene: &mut UnlinkedScene) -> usize {
+                match self {
+                    Self::CallerMismatch => {
+                        scene.registry.reference_instance_limit(16);
+                        scene
+                            .registry
+                            .scripted_module_edge(scene.module.clone(), CallerId(99));
+                        // Pre-mint the junk keys under the genuine
+                        // caller, so the staged rows hit by_key
+                        // with a mismatched caller.
+                        for i in 0..8u64 {
+                            let (key, _) = self.junk(scene, i);
+                            scene
+                                .registry
+                                .note_instance(AdmittedInstance::scripted(key, scene.caller));
+                        }
+                        scene.registry.publish();
+                        9
+                    }
+                    Self::NegativeBlocked => {
+                        scene.registry.reference_instance_limit(8);
+                        let module = scene
+                            .registry
+                            .scripted_module_edge(scene.module.clone(), scene.caller);
+                        scene
+                            .registry
+                            .instance_state
+                            .negatives
+                            .push(NegativeRecord {
+                                domain: scene.domain,
+                                cookie: 777,
+                                exec: 0,
+                                router: 0,
+                                module,
+                                barrier: 0,
+                                reasons: 0,
+                                kind: NegativeKind::Task,
+                                retirement: Some(InstanceReason::InstanceRetired),
+                                authority_exhausted: false,
+                            });
+                        1
+                    }
+                    Self::BoundChurn => {
+                        scene.registry.reference_instance_limit(8);
+                        8
+                    }
+                    _ => {
+                        scene.registry.reference_instance_limit(8);
+                        1
+                    }
                 }
             }
         }
@@ -4971,10 +5065,12 @@ mod journal_unavailable_tests {
             Flavor::UnboundCaller,
             Flavor::UnidentifiedModule,
             Flavor::CookieZero,
+            Flavor::CallerMismatch,
+            Flavor::NegativeBlocked,
         ] {
             let name = flavor.name();
             let mut scene = UnlinkedScene::new();
-            scene.registry.reference_instance_limit(8);
+            let expected_records = flavor.setup(&mut scene);
             for i in 0..8u64 {
                 let (key, caller) = flavor.junk(&scene, i);
                 scene
@@ -5030,15 +5126,9 @@ mod journal_unavailable_tests {
             drop(plan);
             scene.registry.publish();
             let records = scene.registry.instance_state.records.len();
-            if name == "bound_churn" {
-                // Real cap: eight bound rows mint, the genuine ninth
-                // is refused at the drain by the same limit.
-                assert_eq!(records, 8, "{name}: bound rows mint");
-            } else {
-                // Drain-refused junk never mints; only the genuine
-                // row becomes a record.
-                assert_eq!(records, 1, "{name}: junk never mints");
-            }
+            // Bound churn mints (real cap); every drain-refused
+            // flavor leaves only mintable rows as records.
+            assert_eq!(records, expected_records, "{name}: drain fate");
         }
     }
 }

@@ -898,12 +898,19 @@ impl InventoryAttachSet {
                 if matches!(resolved.get(&slot.object), Some(Resolution::Fresh))
                     && let Some(summary) = pins.summary(slot.object)
                 {
-                    fresh_by_key.entry(summary.key).or_default().push((
-                        slot.object,
-                        summary.path.to_string(),
-                        summary.sha256.to_string(),
-                        summary.pre_copy_up,
-                    ));
+                    // Slots are per endpoint; the arbitration below is
+                    // per object, so each object joins its key once —
+                    // otherwise one plain object earns a refusal note
+                    // per endpoint and can fill the note cap alone.
+                    let fresh = fresh_by_key.entry(summary.key).or_default();
+                    if !fresh.iter().any(|(id, _, _, _)| *id == slot.object) {
+                        fresh.push((
+                            slot.object,
+                            summary.path.to_string(),
+                            summary.sha256.to_string(),
+                            summary.pre_copy_up,
+                        ));
+                    }
                 }
             }
             for (key, fresh) in &fresh_by_key {

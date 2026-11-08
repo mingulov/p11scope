@@ -3391,7 +3391,7 @@ fn render_snapshot_inner(
                             };
                             let device = p11scope_manifest::maps::Device::from_kdev(pid.exe.dev);
                             format!(
-                                "{} pid {} (first call {} ago; dev {}:{} ino {}; {})",
+                                "{} host pid {} (first call {} ago; dev {}:{} ino {}; {})",
                                 name,
                                 pid.pid_host,
                                 crate::render::fmt_ns(Some(

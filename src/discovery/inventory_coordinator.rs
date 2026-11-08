@@ -29852,7 +29852,7 @@ int main(void) {
         );
         let device = p11scope_manifest::maps::Device::from_kdev(dev);
         let resolved = format!(
-            "{} pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via system index)",
+            "{} host pid 9 (first call 1.8µs ago; dev {}:{} ino {ino}; via system index)",
             path.display(),
             device.major,
             device.minor,
@@ -29862,7 +29862,7 @@ int main(void) {
             "verbose names the resolved executable:\n{text}"
         );
         assert!(
-            text.contains("executable unknown (exec record lost) pid 10 (first call 1.8µs ago; dev 0:0 ino 0; lifecycle evidence lost)"),
+            text.contains("executable unknown (exec record lost) host pid 10 (first call 1.8µs ago; dev 0:0 ino 0; lifecycle evidence lost)"),
             "verbose names the lost executable with its reason:\n{text}"
         );
     }

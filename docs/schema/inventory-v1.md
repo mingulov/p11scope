@@ -306,7 +306,7 @@ non-null values needs a new allowlist row.
   `unidentified executables` line groups the run-wide images by
   executable with call counts (five groups, five host pids each, the rest
   counted); the verbose per-module line names every collected
-  executable with its pid, `dev major:minor`/`ino`, resolution source, and
+  executable with its host pid, `dev major:minor`/`ino`, resolution source, and
   first-call time. Absent in captures that predate exe naming.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records

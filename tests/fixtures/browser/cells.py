@@ -631,7 +631,19 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
     browser's own empty-password NSS database with a usable client
     key before launch (DEMO-4), so the browser signs with its own
     softokn token and no PIN prompt can stall the handshake.
+    With ``register_module=None`` the browser inherits no
+    ``SOFTHSM2_CONF``: it registered no store, so a caller-staged
+    store pointer must not leak in (Chromium maps the
+    system-registered SoftHSM module regardless, and a foreign token
+    holding a client certificate poisons client-cert selection).
     """
+    # No registered module means no store to point at: drop a leaked
+    # SOFTHSM2_CONF (e.g. a background workload's staging export)
+    # before either browser inherits it. Registered launches keep the
+    # pointer — the browser needs it to find the registered token.
+    browser_env = dict(os.environ)
+    if register_module is None:
+        browser_env.pop("SOFTHSM2_CONF", None)
     if browser == "firefox":
         ff_prefs = {"security.default_personal_cert": "Select Automatically"}
         ff_prefs.update(extra_prefs or {})
@@ -647,7 +659,7 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
         # fresh Chromium HOME below) must ride `env=` to reach the browser.
         context = pw.firefox.launch_persistent_context(
             str(profile.path), headless=True, ignore_https_errors=True,
-            args=list(extra_browser_args), env=dict(os.environ))
+            args=list(extra_browser_args), env=browser_env)
         return context, str(profile.path), profile.path
     elif browser == "chromium":
         home = ChromiumHome.create(workdir / "home", module_lib=register_module).path
@@ -655,7 +667,6 @@ def launch_browser_context(pw, browser: str, workdir: Path, *,
             from profiles import seed_nss_client_credential
             seed_nss_client_credential(
                 home / ".pki" / "nssdb", nss_credential, nss_nickname)
-        browser_env = dict(os.environ)
         browser_env["HOME"] = str(home)
         cr_args = list(extra_browser_args)
         if auto_select_cert:

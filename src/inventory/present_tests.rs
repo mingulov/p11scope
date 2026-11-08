@@ -3388,6 +3388,37 @@ fn concise_snapshot_groups_gap_reasons_with_counts() {
     assert!(verbose.contains("gap ["), "{verbose}");
 }
 
+/// Concise inventory names missed short-lived processes with a pointer
+/// to the right mode, not just "activity unknown" on the edges.
+#[test]
+fn concise_inventory_points_short_lived_misses_to_run() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: crate::discovery::engine::inventory_coordinator::SHORT_LIVED_NEVER_SCANNED_SUBJECT
+            .into(),
+        reason: crate::discovery::engine::inventory_coordinator::short_lived_never_scanned_reason(
+            54, 0,
+        ),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        out.contains("54 short-lived process(es)"),
+        "concise names the missed count: {out}"
+    );
+    assert!(
+        out.contains("p11scope run"),
+        "concise points to the one-shot mode: {out}"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

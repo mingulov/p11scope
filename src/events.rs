@@ -389,11 +389,13 @@ impl RecordSource for aya::maps::RingBuf<MapData> {
 }
 
 /// The session's single retained `EVENTS` consumer: an owned map-backed
-/// ring reader over a duplicate of the retained domain descriptor. It
-/// owns its mappings and descriptor for the whole capture, so one cursor
-/// and one malformed total survive every live, root-tail and terminal
-/// poll without per-poll mmap/munmap and identity-query work.
-pub type OwnedDrain = EventDrain<aya::maps::RingBuf<MapData>>;
+/// ring reader over a duplicate of the retained domain descriptor, fronted
+/// by the bounded userspace staging queue. It owns its mappings and
+/// descriptor for the whole capture, so one cursor and one malformed total
+/// survive every live, root-tail and terminal poll without per-poll
+/// mmap/munmap and identity-query work. Sessions that never stage read
+/// through the empty queue exactly as the bare ring.
+pub type OwnedDrain = EventDrain<StagedEvents<aya::maps::RingBuf<MapData>>>;
 
 pub(crate) enum BoundedRecord<T> {
     Item(T),
@@ -490,10 +492,21 @@ enum StagedItem {
 /// in ring coordinates, so bounds, lineage and post-Q checks behave
 /// exactly as on the bare ring; an unstaged queue is transparent.
 ///
-/// C1 scaffold: shells and direct passthrough; the staging move lands
-/// with the queue implementation.
-#[allow(dead_code)]
-pub(crate) struct StagedEvents<S> {
+/// Invariants (each pinned by a unit test below):
+/// - order and exactly-once: staging appends in pull order and every
+///   pulled byte is consumed exactly once, staged or direct;
+/// - the logical consumer moves only on consumption, never on staging,
+///   so cuts chain across interleaved staging and collection;
+/// - kernel discards observed while pulling surface as markers that
+///   count only when their position is consumed, preserving poll-time
+///   loss accounting; malformed counts at decode, never at staging;
+/// - the move stops at the entry/byte caps (the ring keeps the rest,
+///   reported as saturation) and never past `stop` when bounded, so a
+///   finish restages only pre-Q bytes and post-Q commits still flag.
+///
+/// Public because the public [`OwnedDrain`] names it; construction and
+/// staging stay crate-private.
+pub struct StagedEvents<S> {
     inner: S,
     fifo: std::collections::VecDeque<StagedItem>,
     consumed_to: usize,
@@ -504,16 +517,17 @@ pub(crate) struct StagedEvents<S> {
     fifo_spans: usize,
 }
 
-#[allow(dead_code)]
+#[allow(private_bounds)] // Staging stays crate-private; only the public drain names this queue.
 impl<S: BoundedRecordSource> StagedEvents<S> {
     pub(crate) fn with_caps(inner: S, entry_cap: usize, byte_cap: usize) -> Self {
         let consumed_to = inner.consumer();
+        let discarded_baseline = inner.discarded();
         Self {
             inner,
             fifo: std::collections::VecDeque::new(),
             consumed_to,
             discarded_consumed: 0,
-            discarded_baseline: 0,
+            discarded_baseline,
             entry_cap,
             byte_cap,
             fifo_spans: 0,
@@ -522,9 +536,58 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
 
     /// Moves up to `quantum` records off the ring into the queue without
     /// letting it exceed its caps, and never past `stop` when bounded.
+    /// The caps are checked before each pull, so a single pull can
+    /// overrun them by at most one record (plus its discard marker,
+    /// which carries no bytes); the positions capacity below carries a
+    /// full byte-cap margin for that overrun.
+    #[allow(dead_code)]
     pub(crate) fn stage(&mut self, quantum: usize, stop: Option<usize>) -> EventsStageOutcome {
-        let _ = (quantum, stop);
-        EventsStageOutcome::default()
+        let stop = stop.unwrap_or(usize::MAX);
+        let mut staged = 0;
+        while staged < quantum
+            && self.fifo.len() < self.entry_cap
+            && self.fifo_spans < self.byte_cap
+        {
+            if self.inner.consumer() >= stop {
+                break;
+            }
+            let before = self.inner.consumer();
+            let bytes = {
+                let Some(item) = self.inner.next_record() else {
+                    break;
+                };
+                item.to_vec()
+            };
+            let after = self.inner.consumer();
+            let discarded = self.inner.discarded();
+            let delta = discarded.saturating_sub(self.discarded_baseline);
+            self.discarded_baseline = discarded;
+            if delta > 0 {
+                self.fifo.push_back(StagedItem::Discarded { count: delta });
+                staged += 1;
+            }
+            let span = after.saturating_sub(before);
+            debug_assert!(span.is_multiple_of(8), "ring spans stay 8-aligned");
+            self.fifo_spans = self.fifo_spans.saturating_add(span);
+            self.fifo.push_back(StagedItem::Bytes { span, bytes });
+            staged += 1;
+        }
+        let capped = self.fifo.len() >= self.entry_cap || self.fifo_spans >= self.byte_cap;
+        let inner_more = self.inner.consumer() < stop
+            && self.inner.positions().producer != self.inner.consumer();
+        EventsStageOutcome {
+            staged,
+            saturated: staged < quantum && capped && inner_more,
+        }
+    }
+
+    /// Folds ring-side discards observed by a direct (queue-dry) pull
+    /// into the consumed count, exactly as the bare ring would.
+    fn sync_direct_discards(&mut self) {
+        let discarded = self.inner.discarded();
+        let delta = discarded.saturating_sub(self.discarded_baseline);
+        self.discarded_baseline = discarded;
+        self.discarded_consumed = self.discarded_consumed.saturating_add(delta);
     }
 
     #[cfg(test)]
@@ -538,36 +601,114 @@ impl<S: BoundedRecordSource> StagedEvents<S> {
     }
 }
 
-#[allow(dead_code)]
-impl<S: RecordSource> RecordSource for StagedEvents<S> {
+#[allow(private_bounds)] // Staging stays crate-private; only the public drain names this queue.
+impl<S: BoundedRecordSource> RecordSource for StagedEvents<S> {
     fn next_record(&mut self) -> Option<impl Deref<Target = [u8]> + '_> {
-        self.inner.next_record().map(|item| item.to_vec())
+        loop {
+            match self.fifo.pop_front() {
+                Some(StagedItem::Bytes { span, bytes }) => {
+                    self.consumed_to = self.consumed_to.saturating_add(span);
+                    self.fifo_spans = self.fifo_spans.saturating_sub(span);
+                    return Some(bytes);
+                }
+                Some(StagedItem::Discarded { count }) => {
+                    self.discarded_consumed = self.discarded_consumed.saturating_add(count);
+                }
+                None => break,
+            }
+        }
+        // Queue dry: serve the ring directly, keeping the logical
+        // cursor synced so an unstaged queue reads exactly as the
+        // bare ring. The scoped copy ends the ring borrow before the
+        // cursor sync reborrows the source.
+        let bytes = {
+            let item = self.inner.next_record()?;
+            item.to_vec()
+        };
+        self.consumed_to = self.inner.consumer();
+        self.sync_direct_discards();
+        Some(bytes)
     }
 
     fn discarded(&self) -> u64 {
-        self.inner.discarded()
+        self.discarded_consumed
     }
 }
 
-#[allow(dead_code)]
+#[allow(private_bounds)] // Staging stays crate-private; only the public drain names this queue.
 impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
     fn positions(&self) -> aya::maps::ring_buf::RingBufPositions {
-        self.inner.positions()
+        let inner = self.inner.positions();
+        // Staged spans plus unread ring bytes never exceed the byte cap
+        // (plus its one-record overrun margin) plus the ring itself; a
+        // non-power-of-two fallback fails closed in the cut check.
+        let slack = self
+            .byte_cap
+            .saturating_add(self.byte_cap)
+            .saturating_add(inner.capacity);
+        let capacity = slack.checked_next_power_of_two().unwrap_or(slack);
+        aya::maps::ring_buf::RingBufPositions {
+            consumer: self.consumed_to,
+            producer: inner.producer,
+            capacity,
+        }
     }
 
     fn consumer(&self) -> usize {
-        self.inner.consumer()
+        self.consumed_to
     }
 
     fn bounded_record(
         &mut self,
         stop: usize,
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
-        Ok(match self.inner.bounded_record(stop)? {
-            BoundedRecord::Item(item) => BoundedRecord::Item(item.to_vec()),
-            BoundedRecord::Pending => BoundedRecord::Pending,
-            BoundedRecord::Reached => BoundedRecord::Reached,
-        })
+        loop {
+            match self.fifo.front() {
+                Some(StagedItem::Bytes { span, .. }) => {
+                    let start = self.consumed_to;
+                    // Staged bytes below the stop serve in order; anything
+                    // at or past it ends the read, and a record straddling
+                    // the stop (impossible: staging never pulls past it)
+                    // ends it too, failing closed downstream instead of
+                    // serving past Q.
+                    if start >= stop || start.saturating_add(*span) > stop {
+                        return Ok(BoundedRecord::Reached);
+                    }
+                    let Some(StagedItem::Bytes { span, bytes }) = self.fifo.pop_front() else {
+                        unreachable!("the peeked staged head pops");
+                    };
+                    self.consumed_to = self.consumed_to.saturating_add(span);
+                    self.fifo_spans = self.fifo_spans.saturating_sub(span);
+                    return Ok(BoundedRecord::Item(bytes));
+                }
+                Some(StagedItem::Discarded { .. }) => {
+                    let Some(StagedItem::Discarded { count }) = self.fifo.pop_front() else {
+                        unreachable!("the peeked staged marker pops");
+                    };
+                    self.discarded_consumed = self.discarded_consumed.saturating_add(count);
+                }
+                None => break,
+            }
+        }
+        enum OwnedRead {
+            Item(Vec<u8>),
+            Pending,
+            Reached,
+        }
+        let read = match self.inner.bounded_record(stop)? {
+            BoundedRecord::Item(item) => OwnedRead::Item(item.to_vec()),
+            BoundedRecord::Pending => OwnedRead::Pending,
+            BoundedRecord::Reached => OwnedRead::Reached,
+        };
+        match read {
+            OwnedRead::Item(bytes) => {
+                self.consumed_to = self.inner.consumer();
+                self.sync_direct_discards();
+                Ok(BoundedRecord::Item(bytes))
+            }
+            OwnedRead::Pending => Ok(BoundedRecord::Pending),
+            OwnedRead::Reached => Ok(BoundedRecord::Reached),
+        }
     }
 }
 
@@ -930,7 +1071,7 @@ impl OwnedDrain {
         );
         let ring = aya::maps::RingBuf::try_from(Map::from_map_data(data)?)?;
         Ok(Self {
-            source: ring,
+            source: StagedEvents::with_caps(ring, EVENTS_STAGE_ENTRIES, EVENTS_STAGE_BYTES),
             malformed: 0,
             malformed_reported: 0,
             domain: Some(domain.clone()),
@@ -2208,8 +2349,15 @@ mod tests {
     }
 
     fn polled_ts_ns(drain: &mut EventDrain<StagedEvents<ScriptedRecords>>) -> (Vec<u64>, bool) {
+        polled_ts_ns_bounded(drain, None)
+    }
+
+    fn polled_ts_ns_bounded(
+        drain: &mut EventDrain<StagedEvents<ScriptedRecords>>,
+        quantum: Option<usize>,
+    ) -> (Vec<u64>, bool) {
         let mut seen = Vec::new();
-        let backlog = drain.poll(None, |event| {
+        let backlog = drain.poll(quantum, |event| {
             seen.push(event.ts_ns);
             ControlFlow::Continue(())
         });
@@ -2254,12 +2402,14 @@ mod tests {
         );
         assert_eq!(drain.source_mut().staged_len(), 4);
         assert_eq!(drain.source_mut().inner_mut().remaining(), 6);
-        let (seen, _) = polled_ts_ns(&mut drain);
+        // Bounded polls observe the queue boundary: an unbounded poll
+        // would keep reading through to the ring once the queue runs dry.
+        let (seen, _) = polled_ts_ns_bounded(&mut drain, Some(4));
         assert_eq!(seen, vec![0, 1, 2, 3]);
         let outcome = drain.source_mut().stage(100, None);
         assert_eq!(outcome.staged, 4);
         assert!(outcome.saturated);
-        let (seen, _) = polled_ts_ns(&mut drain);
+        let (seen, _) = polled_ts_ns_bounded(&mut drain, Some(4));
         assert_eq!(seen, vec![4, 5, 6, 7]);
         let outcome = drain.source_mut().stage(100, None);
         assert_eq!(
@@ -2289,7 +2439,7 @@ mod tests {
             }
         );
         assert_eq!(drain.source_mut().inner_mut().remaining(), 8);
-        let (seen, _) = polled_ts_ns(&mut drain);
+        let (seen, _) = polled_ts_ns_bounded(&mut drain, Some(2));
         assert_eq!(seen, vec![0, 1]);
     }
 
@@ -2310,7 +2460,7 @@ mod tests {
         assert_eq!(positions.consumer, 0);
         let cut1 = drain.consumption_cut().unwrap();
         assert!(cut1.same_boundary(&cut0));
-        let (seen, _) = polled_ts_ns(&mut drain);
+        let (seen, _) = polled_ts_ns_bounded(&mut drain, Some(1));
         assert_eq!(seen, vec![0]);
         let cut2 = drain.consumption_cut().unwrap();
         assert!(!cut2.same_boundary(&cut1));

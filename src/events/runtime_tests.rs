@@ -37,12 +37,12 @@ fn real_retained_consumer_keeps_one_cursor_across_all_drains() {
     let second_positions = OwnedDrain::for_session(&second, &second_domain)
         .expect("second retained consumer")
         .source()
-        .snapshot_positions();
-    assert_eq!(second_positions, consumer.source().snapshot_positions());
+        .positions();
+    assert_eq!(second_positions, consumer.source().positions());
     let backlog = consumer.poll(poll_quantum(false), |_| std::ops::ControlFlow::Continue(()));
     assert!(!backlog, "empty ring reads empty on the ordinary poll");
     assert_eq!(consumer.take_malformed_delta(), 0);
-    let ordinary = consumer.source().snapshot_positions();
+    let ordinary = consumer.source().positions();
 
     let mut tail = OwnedRootTail::new(
         crate::run::OriginalRootExit::test_reaped(first_domain.clone()),
@@ -59,7 +59,7 @@ fn real_retained_consumer_keeps_one_cursor_across_all_drains() {
 
     let backlog = consumer.poll(poll_quantum(true), |_| std::ops::ControlFlow::Continue(()));
     assert!(!backlog, "empty ring reads empty on the terminal poll");
-    let terminal = consumer.source().snapshot_positions();
+    let terminal = consumer.source().positions();
     assert_eq!((ordinary.consumer, ordinary.producer), (0, 0));
     assert_eq!(terminal, ordinary);
     assert!(ordinary.capacity > 0);
@@ -111,10 +111,10 @@ fn real_retained_discovery_consumer_owns_one_exact_map() {
         .expect("retained consumer over same DISCOVERY map");
     let first_id = first_domain.id();
     assert_eq!(consumer.domain_id(), first_id);
-    let positions = consumer.source().snapshot_positions();
+    let positions = consumer.source().positions();
     assert_eq!((positions.consumer, positions.producer), (0, 0));
     assert!(consumer.dequeue().is_none());
-    assert_eq!(consumer.source().snapshot_positions(), positions);
+    assert_eq!(consumer.source().positions(), positions);
 
     match OwnedDiscoveryDrain::for_session(&second, &first_domain) {
         Ok(_) => panic!("foreign DISCOVERY map accepted with equal cursors"),

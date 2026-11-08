@@ -1119,7 +1119,13 @@ fn joint_service_stages_ring_while_h0_awaits() {
                 8192,
                 8 * 1024 * 1024,
             ),
-            fixture.scene.producers.events_domain_for_test(),
+            fixture
+                .scene
+                .drain
+                .consumption_cut()
+                .expect("scene drain takes a cut")
+                .events()
+                .clone(),
         ),
         producers: fixture.scene.producers.clone(),
     };
@@ -1155,7 +1161,13 @@ fn joint_service_names_staging_saturation() {
                 64,
                 1024 * 1024,
             ),
-            fixture.scene.producers.events_domain_for_test(),
+            fixture
+                .scene
+                .drain
+                .consumption_cut()
+                .expect("scene drain takes a cut")
+                .events()
+                .clone(),
         ),
         producers: fixture.scene.producers.clone(),
     };

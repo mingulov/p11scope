@@ -652,6 +652,7 @@ pub(crate) struct FinalOutputOutcome {
     event_log_stdout: bool,
     report_committed: Option<bool>,
     stdout_result: Option<StdoutResult>,
+    stderr_result: Option<StdoutResult>,
     failures: Vec<String>,
     diagnostics_failed: bool,
 }
@@ -718,6 +719,13 @@ impl FinalOutputOutcome {
                 "stdout complete"
             } else {
                 "stdout incomplete (may contain a prefix)"
+            });
+        }
+        if let Some(result) = &self.stderr_result {
+            statuses.push(if result.is_ok() {
+                "stderr summary complete"
+            } else {
+                "stderr summary incomplete (may contain a prefix)"
             });
         }
         notice(&format!(
@@ -7341,6 +7349,7 @@ pub(crate) fn finish_output(
         event_log_stdout: stream.stdout_requested(),
         report_committed: None,
         stdout_result: None,
+        stderr_result: None,
         failures: stream
             .first_error()
             .map(str::to_string)
@@ -7380,7 +7389,8 @@ pub(crate) fn finish_output(
             text = render_snapshot(presentation);
             text.as_bytes()
         };
-        if let Err(error) = stdout.write_document_to(2, bytes) {
+        let result = stdout.write_document_to(2, bytes);
+        if let Err(error) = &result {
             let reason = match &error.reason {
                 StdoutFailureReason::NoProgress => "no progress for 5 seconds".to_string(),
                 StdoutFailureReason::Cancelled => "cancelled by a later signal".to_string(),
@@ -7390,6 +7400,7 @@ pub(crate) fn finish_output(
                 "p11scope: inventory stderr failed: {reason}; accepted {} of {} bytes; remaining {} not written",
                 error.accepted, error.total, error.total - error.accepted));
         }
+        outcome.stderr_result = Some(result);
     }
     if (json || !silent_text) && !stdout_requested {
         let text;
@@ -11645,6 +11656,15 @@ mod tests {
                 ))),
             "the cancel counts exact bytes: {:?}",
             outcome.failures()
+        );
+        let mut notices = Vec::new();
+        outcome.notices(None, &mut |line| notices.push(line.to_string()));
+        assert!(
+            notices.iter().any(|line| line.contains(
+                "inventory outputs: event log complete; \
+                 stderr summary incomplete (may contain a prefix)"
+            )),
+            "the status line names the failed move: {notices:?}"
         );
     }
 

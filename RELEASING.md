@@ -519,8 +519,10 @@ On the commit that steps 3–6 ran on:
    git push origin main v0.5.0
    ```
 
-3. Create the GitHub release with the four versioned `.tar.gz` assets,
-   `RELEASE.json` and `SHA256SUMS`. Keep the release body short — a human
+<<<<<<< HEAD
+3. Create the GitHub release with every file named in `SHA256SUMS`
+   (the four versioned `.tar.gz` assets, the `.deb`, the `.rpm` and
+   `RELEASE.json`), plus `SHA256SUMS` itself. Keep the release body short — a human
    front page, not the qualification record. Shape (the
    [v0.7.0 draft](docs/releases/v0.7.0.md) is the current example): version +
    publication date; up to 8 highlight bullets in plain words; known issues
@@ -538,7 +540,9 @@ On the commit that steps 3–6 ran on:
    `container-publish` (release `published`, plus a tag-gated manual
    dispatch for retries; this repository only), which downloads the musl
    tarball, `SHA256SUMS` and `RELEASE.json` for the tag, verifies the
-   checksum and asserts the `RELEASE.json` head against the tag commit,
+   tarball and `RELEASE.json` lines explicitly, and asserts the
+   `RELEASE.json` tree against the tag commit's tree, the head as an
+   ancestor of the tag commit, and the version against the tag,
    then builds `p11scope-observer:preview` from the verified tarball with
    `deploy/Dockerfile.observer-release` (`--network=none`), smokes it
    (`--version` matched to the tag, `doctor`, `inventory --system`) and
@@ -546,16 +550,27 @@ On the commit that steps 3–6 ran on:
    `vX.Y.Z` tag only it publishes `ghcr.io/mingulov/p11scope:<X.Y.Z>`
    (and `:latest` only when the tag is the newest stable); prerelease
    tags build, smoke and prove the registry login without publishing;
-   any other `v*` tag fails closed. If the run fails transiently, use
-   "Re-run failed jobs" on the same run (it reuses the same tarball and
-   image ID); do not re-dispatch, which would rebuild different bytes
+   any other `v*` tag fails closed. A prerelease rehearsal needs a
+   GitHub prerelease carrying the full assets (the job downloads the
+   release); keep the Cargo version at `X.Y.Z` for RCs so the version
+   check passes. If the run fails transiently, use
+   "Re-run failed jobs" on the same run (when the push job is the one
+   that failed it reuses the same tarball and image ID; a failed build
+   rebuilds); do not re-dispatch, which would rebuild different bytes
    and can overwrite the tag with a new digest. A re-push to an existing
-   version tag is refused. Record the run URL and the image digest from
-   the push receipt. On the first publish the owner sets the package to
-   Public and confirms its repository link (owner step: new GHCR
-   packages are private by default). Then verify as an anonymous client
-   with a clean config plus the `docker run` recipe in
-   [deploy/README.md](deploy/README.md):
+   version tag is refused, as is any registry probe that fails for a
+   reason other than "not found". After a partial push (the version tag
+   exists but `:latest` or the receipt is missing), compare the existing
+   tag's digest with the digest the failed attempt logged: if they match,
+   finish `:latest` registry-side with
+   `docker buildx imagetools create -t ghcr.io/mingulov/p11scope:latest
+   ghcr.io/mingulov/p11scope:<X.Y.Z>`; otherwise delete the version tag
+   first, then re-run. Record the run URL and the image digest from
+   the push receipt. The package is public and linked to
+   `mingulov/p11scope` since 2026-11-08; confirm visibility at each
+   release with the anonymous clean-client pull below (the controller
+   deletes the `0.7.0-test.*` versions only after the real 0.7.0 push),
+   plus the `docker run` recipe in [deploy/README.md](deploy/README.md):
    ```sh
    DOCKER_CONFIG=$(mktemp -d) docker pull ghcr.io/mingulov/p11scope:<X.Y.Z>
    ```

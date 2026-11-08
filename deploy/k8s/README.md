@@ -14,9 +14,10 @@ memory through hostPID + `/proc`, opens the provider through
 `/proc/<pid>/root` and attaches eBPF uprobes to it, exactly like
 `scripts/attach-pod.sh` does from a node shell.
 
-It is an example deployment built from this tree, not a published image or
-an operator. Capture is never continuous: every capture has a human trigger,
-a bounded `--duration` and its own output file.
+It is an example deployment built from this tree or from the published
+observer image (see Deploy), not an operator. Capture is never continuous:
+every capture has a human trigger, a bounded `--duration` and its own output
+file.
 
 ## Layout
 
@@ -33,8 +34,9 @@ name order and the namespace must exist first.
 - `e2e/workloads.yaml` — **test-only** ledgered SoftHSM2 pods and an idle
   negative control, used by `scripts/kind-e2e.sh`. `kubectl apply -f
   deploy/k8s/` does not recurse into it.
-- `../Dockerfile.observer`, `../Dockerfile.holder` — image builds (holder is
-  test-only).
+- `../Dockerfile.observer`, `../Dockerfile.observer-release`,
+  `../Dockerfile.holder` — image builds (observer-release builds the
+  published image from the release tarball; holder is test-only).
 - `../../scripts/k8s-profile-entry.sh` — the in-pod entry: resolves a pod UID
   (or container id) to its pod cgroup from the node's cgroup hierarchy and
   execs `p11scope profile|trace|doctor --cgroup <pod cgroup>`.
@@ -412,5 +414,5 @@ other privileged work on the host. Evidence lands in a 0700 directory under
 - **Holder: `ubuntu:26.04` (test-only)**, multi-stage: gcc builds the
   ledgered client, the final stage carries only SoftHSM2 and the client.
 - **Maintenance note**: bump `alpine:3.24` and its pinned digest together in
-  `Dockerfile.observer` when EOL approaches (one line + e2e re-run); the
-  holder pins `ubuntu:26.04` the same way.
+  `Dockerfile.observer` and `Dockerfile.observer-release` when EOL approaches
+  (one line per file + e2e re-run); the holder pins `ubuntu:26.04` the same way.

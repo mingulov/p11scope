@@ -212,6 +212,9 @@ class VngWrapperExitTests(unittest.TestCase):
         body = inner.read_text(encoding="utf-8")
         self.assertIn("SUDO_UID='1001'", body)
         self.assertIn("SUDO_GID='1002'", body)
+        # The dropped child must traverse the guest workdir: the
+        # root-owned mode-700 tmpfs would refuse it with EACCES.
+        self.assertIn('chown "$SUDO_UID:$SUDO_GID" "$T"', body)
 
     def test_runtree_refuses_a_root_invoker_without_a_drop_target(self):
         # A root invoker names no non-root account: fail fast in the

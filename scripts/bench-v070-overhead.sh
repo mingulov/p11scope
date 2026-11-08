@@ -1644,6 +1644,11 @@ sample_spy() {
     wall_ms=$(echo "$tpsinfo" | sed -n 's/.*wall_ms=\([^ ]*\).*/\1/p')
     headline_n=$(awk -v t="$tps" -v w="$wall_ms" 'BEGIN{printf "%d", t*w/1000}')
     headline_wall=$(awk -v w="$wall_ms" 'BEGIN{printf "%d", w*1000000}')
+    case "$tps" in ''|*[!0-9.]*) echo "$1: bad tps '$tps'" >&2; return 1;; esac
+    case "$wall_ms" in ''|*[!0-9.]*) echo "$1: bad wall '$wall_ms'" >&2; return 1;; esac
+    if [ "$headline_n" -le 0 ] || [ "$headline_wall" -le 0 ]; then
+        echo "$1: bad headline n=$headline_n wall=$headline_wall" >&2; return 1
+    fi
     notes="tps=$tps run_wall_ns=$((T1-T0)) $tpsinfo"
     exact=1
     case "$2" in
@@ -1683,27 +1688,31 @@ sample_spy() {
         "$CPU_TICKS" "$CPU_RSS" "$exact" 0 "n/a" "$notes"
 }
 
-# tool_op <tool> <tag>: one CLI-tool signing operation (exit nonzero on failure).
-tool_op() {
+# tool_bg <tool> <tag>: start one CLI-tool signing op in background;
+# sets TOOLOP_PID to the TOOL's pid (the leaf command is backgrounded
+# directly: $! of a backgrounded function would be a subshell).
+tool_bg() {
     case $1 in
         pkcs11-tool)
             pkcs11-tool --module "$MODULE" --login --pin 1234 --sign \
                 --mechanism SHA256-HMAC --label hmackey \
                 --input-file "$WORK/tool-data.bin" --output-file "$WORK/$2.sig" \
-                > "$WORK/$2.op.log" 2>&1
+                > "$WORK/$2.op.log" 2>&1 &
+            TOOLOP_PID=$!
             ;;
         p11tool)
             p11tool --provider "$MODULE" --login --set-pin=1234 --test-sign \
                 --hash=SHA256 --outfile="$WORK/$2.sig" \
                 "pkcs11:token=v070bench;object=rsakey;type=private" < /dev/null \
-                > "$WORK/$2.op.log" 2>&1
+                > "$WORK/$2.op.log" 2>&1 &
+            TOOLOP_PID=$!
             ;;
     esac
 }
 # tool_k <tool>: PKCS#11 calls per tool op, via one STOP-started trace.
 tool_k() {
-    tool_op "$1" "toolk-$1" &
-    TOOLPID=$!
+    tool_bg "$1" "toolk-$1"
+    TOOLPID=$TOOLOP_PID
     kill -STOP "$TOOLPID" 2>/dev/null || { echo "toolk-$1: STOP failed" >&2; return 1; }
     sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace --manifest "$WORK/manifest-soft.json" \
         --pid "$TOOLPID" --duration 120 -o "$WORK/toolk-$1.txt" \
@@ -1739,8 +1748,8 @@ sample_toolloop() {
     TOOLPIDS=""
     i=1
     while [ "$i" -le "$n" ]; do
-        tool_op "$2" "$1" &
-        oppid=$!
+        tool_bg "$2" "$1"
+        oppid=$TOOLOP_PID
         if [ -z "$TOOLPIDS" ]; then TOOLPIDS="$oppid"; else TOOLPIDS="$TOOLPIDS,$oppid"; fi
         if wait "$oppid"; then :; else status=$?; echo "$1: tool op $i failed: $status" >&2; return "$status"; fi
         i=$((i + 1))
@@ -1796,7 +1805,9 @@ pkcs11-tool --module "$MODULE" --login --pin 1234 --keypairgen --key-type rsa:20
     --label rsakey --usage-sign > "$WORK/tool-keypairgen.log" 2>&1 \
     || { echo "tool rsakey keypairgen failed" >&2; tail -3 "$WORK/tool-keypairgen.log" >&2; exit 1; }
 for tool in pkcs11-tool p11tool; do
-    TOOLK=$(tool_k "$tool") || exit 1
+    tool_k "$tool" > "$WORK/toolk-$tool.K" || exit 1
+    TOOLK=$(cat "$WORK/toolk-$tool.K")
+    case "$TOOLK" in ''|*[!0-9]*) echo "tool $tool: bad K '$TOOLK'" >&2; exit 1;; esac
     echo "tool $tool: K=$TOOLK calls/op"
     ROUND="tool-$tool"
     sample_toolloop "spy-tool-$tool-unobs" "$tool" unobserved || exit 1

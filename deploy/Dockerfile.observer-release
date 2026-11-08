@@ -17,46 +17,51 @@
 #     -t <tag> "$CTX"
 # (CTX/<tarball>, CTX/scripts/k8s-profile-entry.sh).
 # container-publish downloads the release tarball, SHA256SUMS and RELEASE.json,
-# verifies the checksum and the RELEASE head, and passes the checked hash as
-# TARBALL_SHA256. The build re-verifies the copied bytes against that hash
-# before unpacking, so a tarball swapped after staging is refused. The tarball
-# must hold exactly one `*/p11scope` regular file (the release layout);
-# anything else is refused. LICENSE, LICENSES/, notices/ and RELEASE.json
-# ride along from the same verified bytes for provenance (COPYRIGHT too, once
-# the root file exists).
+# verifies the checksums and the RELEASE tree, head ancestry and version, and
+# passes the checked hash as TARBALL_SHA256. The first stage re-verifies the
+# copied bytes against that hash before unpacking, so a tarball swapped after
+# staging is refused; only the staged binary and license texts are copied into
+# the final stage, so the tarball itself never lands in a published layer.
+# The tarball must hold exactly one `*/p11scope` regular file (the release
+# layout); anything else is refused. LICENSE, LICENSES/, notices/ and
+# RELEASE.json ride along from the same verified bytes for provenance
+# (COPYRIGHT too, once the root file exists).
 # The base tag+digest stay matched with Dockerfile.observer.
 # Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
 # Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
 # No curl/jq: the observer never talks to the Kubernetes API.
 # The base is pinned by digest (multi-arch index of alpine:3.24 as published
-# 2026-10-03); bump tag and digest together. Layer timestamps float, so the
-# image is repeatable, not bit-reproducible; the container-publish push
-# job re-identifies the exact bytes by image ID instead of trusting the tag.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
-LABEL org.opencontainers.image.source=https://github.com/mingulov/p11scope
+# 2026-10-03); bump tag and digest together in both stages. Layer timestamps
+# float, so the image is repeatable, not bit-reproducible; the
+# container-publish push job re-identifies the exact bytes by image ID instead
+# of trusting the tag.
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS src
 ARG TARBALL
 ARG TARBALL_SHA256
 COPY ${TARBALL} /tmp/release.tar.gz
-COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
 RUN set -eu; \
     [ -n "${TARBALL_SHA256:-}" ] || { echo "TARBALL_SHA256 build arg is required" >&2; exit 1; }; \
     echo "${TARBALL_SHA256}  /tmp/release.tar.gz" | sha256sum -c -; \
-    mkdir -p /tmp/rel /usr/share/licenses/p11scope; \
+    mkdir -p /tmp/rel /tmp/stage/bin /tmp/stage/licenses/LICENSES /tmp/stage/licenses/notices; \
     if tar -tzf /tmp/release.tar.gz | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "tarball has unsafe members" >&2; exit 1; fi; \
     tar -xzf /tmp/release.tar.gz -C /tmp/rel; \
     if [ "$(find /tmp/rel -type f -path '*/p11scope' | head -n 2 | grep -c .)" -ne 1 ]; then echo "tarball must hold exactly one p11scope binary" >&2; exit 1; fi; \
-    cp "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)" /usr/local/bin/p11scope; \
-    chmod 0755 /usr/local/bin/p11scope; \
+    cp "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)" /tmp/stage/bin/p11scope; \
+    chmod 0755 /tmp/stage/bin/p11scope; \
     RELDIR="$(dirname "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)")"; \
-    cp "$RELDIR/LICENSE" /usr/share/licenses/p11scope/LICENSE; \
-    mkdir -p /usr/share/licenses/p11scope/LICENSES /usr/share/licenses/p11scope/notices; \
-    cp "$RELDIR/LICENSES/"*.txt /usr/share/licenses/p11scope/LICENSES/; \
-    cp -r "$RELDIR/notices/." /usr/share/licenses/p11scope/notices/; \
-    cp "$RELDIR/RELEASE.json" /usr/share/licenses/p11scope/RELEASE.json; \
-    if [ -f "$RELDIR/COPYRIGHT" ]; then cp "$RELDIR/COPYRIGHT" /usr/share/licenses/p11scope/COPYRIGHT; chmod 0644 /usr/share/licenses/p11scope/COPYRIGHT; fi; \
-    chmod 0644 /usr/share/licenses/p11scope/LICENSE /usr/share/licenses/p11scope/RELEASE.json; \
-    rm -rf /tmp/rel /tmp/release.tar.gz; \
-    chmod 0755 /usr/local/bin/k8s-profile-entry \
+    cp "$RELDIR/LICENSE" /tmp/stage/licenses/LICENSE; \
+    cp "$RELDIR/LICENSES/"*.txt /tmp/stage/licenses/LICENSES/; \
+    cp -r "$RELDIR/notices/." /tmp/stage/licenses/notices/; \
+    cp "$RELDIR/RELEASE.json" /tmp/stage/licenses/RELEASE.json; \
+    if [ -f "$RELDIR/COPYRIGHT" ]; then cp "$RELDIR/COPYRIGHT" /tmp/stage/licenses/COPYRIGHT; chmod 0644 /tmp/stage/licenses/COPYRIGHT; test -f /tmp/stage/licenses/COPYRIGHT; fi; \
+    chmod 0644 /tmp/stage/licenses/LICENSE /tmp/stage/licenses/RELEASE.json
+FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+LABEL org.opencontainers.image.source=https://github.com/mingulov/p11scope
+COPY --from=src /tmp/stage/bin/p11scope /usr/local/bin/p11scope
+COPY --from=src /tmp/stage/licenses/ /usr/share/licenses/p11scope/
+COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
+RUN chmod 0755 /usr/local/bin/p11scope /usr/local/bin/k8s-profile-entry \
     && /usr/local/bin/p11scope --help >/dev/null \
     && /usr/local/bin/k8s-profile-entry --self-test \
     && test -f /usr/share/licenses/p11scope/LICENSE \

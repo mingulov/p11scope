@@ -695,14 +695,15 @@ if owned is None:
         assert g.get('subject')==modpath, 'overlay unproven subject'
         assert g.get('pid')==pidof[g.get('caller')], 'overlay unproven pid'
     rest=[g for g in report.get('gaps',[]) if not (g.get('reason') or '').startswith('original_file_unproven: kernel witness unavailable')]
-    # Ruling CI-GAP-2 (proposed; owner to confirm): the collection
-    # deadline is the designed bound on cgroup transactions. A pass that
-    # starts just before the run deadline is cancelled mid-flight and
-    # honestly records this reason alongside the sibling transaction
-    # reasons; the overlay signature below still fails the cell, so this
-    # only keeps the failure classified. Full record: the v070 cli-flakes
-    # job report (inventory-cgroup deadline section).
-    known={'cgroup member scan was incomplete','no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
+    # The exact overlay signature: the per-caller activation refusal
+    # plus, when a pass straddles the run deadline, the designed
+    # collection bound (ruling CI-GAP-2, confirmed
+    # docs/superpowers/decisions/2026-11-06-schedule-dl10.md). The
+    # unproven member gaps degrade per caller without incompleting
+    # the shared transaction, so 'cgroup member scan was incomplete'
+    # is deliberately NOT known here: its reappearance fails loudly
+    # below instead of hiding inside expected-failure.
+    known={'no settled expected native image for this caller in the acquisition domain; scan-pinned fallback retained','cgroup collection deadline reached'}
     assert all(g.get('reason') in known for g in rest), 'overlay unproven extra gap: %r' % rest
     assert False, 'inventory overlay unproven signature: 0 modules, %d unproven gaps' % len(unproven)
 assert modules[owned].get('admission',{}).get('state')=='admitted', 'owned provider not admitted'

@@ -1550,6 +1550,24 @@ wait_for_pid_exit() {
     return 0
 }
 
+# maps_gated_stop <pid> <libbase> <timeout_s>: STOP the process once
+# libbase is mapped (for inventory, whose endpoint attach needs the
+# mapping observed in a scan). Callers LD_PRELOAD the provider so the
+# mapping appears during the loader, before any PKCS#11 call is possible.
+maps_gated_stop() {
+    mgse_end=$(( $(date +%s) + $3 ))
+    while ! grep -Fq "$2" /proc/$1/maps 2>/dev/null; do
+        if ! kill -0 "$1" 2>/dev/null; then
+            echo "pid $1 exited before $2 was mapped" >&2; return 1
+        fi
+        [ "$(date +%s)" -lt "$mgse_end" ] || {
+            echo "pid $1 never mapped $2 within $3s" >&2; return 1
+        }
+        sleep 0.005
+    done
+    kill -STOP "$1" 2>/dev/null || { echo "STOP of $1 failed" >&2; return 1; }
+}
+
 # iters_for_cov <cov>: iterations from SPY_ITERS ("rand:30000 ecdsa:3000 ...").
 iters_for_cov() {
     for kv in $SPY_ITERS; do
@@ -1595,11 +1613,16 @@ sample_spy() {
         CPU_TICKS=0; CPU_RSS=0
         ;;
     *)
-        env ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
+        case "$2" in inv-pid) preload=1;; *) preload="";; esac
+        env ${preload:+LD_PRELOAD=$MODULE} ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
             "$P11PERFTEST" -l "$mod" -s 0 -p 1234 -t "$4" -i "$iters" --skip "$skip" \
             -v "$SPY_VEC" -c "$3" -j -o "$WORK/$1.p11t.json" > "$WORK/$1.p11t.log" 2>&1 &
         P11PID=$!
-        kill -STOP "$P11PID" 2>/dev/null || { echo "$1: STOP failed" >&2; return 1; }
+        WPID=$P11PID
+        case "$2" in
+            inv-pid) maps_gated_stop "$P11PID" "$(basename "$MODULE")" 60 || return 1;;
+            *) kill -STOP "$P11PID" 2>/dev/null || { echo "$1: STOP failed" >&2; return 1; };;
+        esac
         case "$2" in
             inv-pid)
                 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
@@ -1631,7 +1654,7 @@ sample_spy() {
         kill -CONT "$P11PID" 2>/dev/null || { echo "$1: CONT failed" >&2; return 1; }
         T0=$(date +%s%N)
         wait_for_pid_exit "$P11PID" 600 || return 1
-        if wait "$P11PID"; then :; else status=$?; echo "$1: p11perftest failed: $status" >&2; return "$status"; fi
+        if wait "$P11PID"; then WPID=; else status=$?; WPID=; echo "$1: p11perftest failed: $status" >&2; return "$status"; fi
         T1=$(date +%s%N)
         cpu_window_end "$1"
         if [ "$is_inv" = 1 ]; then sleep "$POST_PID_S"; fi
@@ -1661,7 +1684,8 @@ sample_spy() {
             reclaim_root_output "$WORK/$1.json"
             info=$(python3 -I "$WORK/validate.py" invcount "$WORK/$1.json" "$P11PID" "$MODULE") \
                 || { echo "$1: invcount failed" >&2; return 1; }
-            notes="$notes :: uprobe=$ukind obs $info"
+            semline=$(grep -m1 "semantic calls:" "$WORK/$1.obs.log" 2>/dev/null || echo "semantic calls: n/a")
+            notes="$notes :: uprobe=$ukind obs $info :: $semline"
             case "$info" in *"state=counted"*) ;; *) exact=0;; esac
             ;;
         metrics)
@@ -1690,18 +1714,20 @@ sample_spy() {
 
 # tool_bg <tool> <tag>: start one CLI-tool signing op in background;
 # sets TOOLOP_PID to the TOOL's pid (the leaf command is backgrounded
-# directly: $! of a backgrounded function would be a subshell).
+# directly: $! of a backgrounded function would be a subshell). The
+# provider is LD_PRELOADed so it is mapped from birth (tool_k needs the
+# mapping present for the attach scan); preloading adds no PKCS#11 calls.
 tool_bg() {
     case $1 in
         pkcs11-tool)
-            pkcs11-tool --module "$MODULE" --login --pin 1234 --sign \
+            LD_PRELOAD="$MODULE" pkcs11-tool --module "$MODULE" --login --pin 1234 --sign \
                 --mechanism SHA256-HMAC --label hmackey \
                 --input-file "$WORK/tool-data.bin" --output-file "$WORK/$2.sig" \
                 > "$WORK/$2.op.log" 2>&1 &
             TOOLOP_PID=$!
             ;;
         p11tool)
-            p11tool --provider "$MODULE" --login --set-pin=1234 --test-sign \
+            LD_PRELOAD="$MODULE" p11tool --provider "$MODULE" --login --set-pin=1234 --test-sign \
                 --hash=SHA256 --outfile="$WORK/$2.sig" \
                 "pkcs11:token=v070bench;object=rsakey;type=private" < /dev/null \
                 > "$WORK/$2.op.log" 2>&1 &
@@ -1713,7 +1739,8 @@ tool_bg() {
 tool_k() {
     tool_bg "$1" "toolk-$1"
     TOOLPID=$TOOLOP_PID
-    kill -STOP "$TOOLPID" 2>/dev/null || { echo "toolk-$1: STOP failed" >&2; return 1; }
+    WPID=$TOOLPID
+    maps_gated_stop "$TOOLPID" "$(basename "$MODULE")" 60 || return 1
     sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace --manifest "$WORK/manifest-soft.json" \
         --pid "$TOOLPID" --duration 120 -o "$WORK/toolk-$1.txt" \
         > "$WORK/toolk-$1.obs.log" 2>&1 &
@@ -1721,7 +1748,7 @@ tool_k() {
     wait_for_observer_attach "$WORK/toolk-$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
     kill -CONT "$TOOLPID" 2>/dev/null || { echo "toolk-$1: CONT failed" >&2; return 1; }
     wait_for_pid_exit "$TOOLPID" 120 || return 1
-    if wait "$TOOLPID"; then :; else status=$?; echo "toolk-$1: tool failed: $status" >&2; return "$status"; fi
+    if wait "$TOOLPID"; then WPID=; else status=$?; WPID=; echo "toolk-$1: tool failed: $status" >&2; return "$status"; fi
     stop_observer "toolk-$1" || return 1
     reclaim_root_output "$WORK/toolk-$1.txt"
     info=$(python3 -I "$WORK/validate.py" tracetotal "$WORK/toolk-$1.txt") \
@@ -1750,10 +1777,12 @@ sample_toolloop() {
     while [ "$i" -le "$n" ]; do
         tool_bg "$2" "$1"
         oppid=$TOOLOP_PID
+        WPID=$oppid
         if [ -z "$TOOLPIDS" ]; then TOOLPIDS="$oppid"; else TOOLPIDS="$TOOLPIDS,$oppid"; fi
-        if wait "$oppid"; then :; else status=$?; echo "$1: tool op $i failed: $status" >&2; return "$status"; fi
+        if wait "$oppid"; then WPID=; else status=$?; WPID=; echo "$1: tool op $i failed: $status" >&2; return "$status"; fi
         i=$((i + 1))
     done
+    WPID=
     T1=$(date +%s%N)
     if [ "$3" = "inv-system" ]; then
         cpu_window_end "$1"
@@ -1767,7 +1796,8 @@ sample_toolloop() {
         vstatus=0
         info=$(python3 -I "$WORK/validate.py" invsumcheck "$WORK/$1.json" "$MODULE" \
             $(( n * TOOLK )) "$TOOLPIDS") 2>"$WORK/$1.verdict" || vstatus=$?
-        notes="uprobe=$ukind $info K=$TOOLK"
+        semline=$(grep -m1 "semantic calls:" "$WORK/$1.obs.log" 2>/dev/null || echo "semantic calls: n/a")
+        notes="uprobe=$ukind $info K=$TOOLK :: $semline"
         if [ "$vstatus" = 10 ]; then exact=0; notes="INVALID: $(cat "$WORK/$1.verdict") :: $notes";
         elif [ "$vstatus" = 0 ]; then exact=1;
         else echo "$1: report validation failed" >&2; cat "$WORK/$1.verdict" >&2; return 1; fi

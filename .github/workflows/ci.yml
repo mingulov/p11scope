@@ -47,8 +47,8 @@ on:
 permissions:
   contents: read
 # Per ref, so a branch that moves sequences its queued runs. Several refs at
-# one commit (a release branch, main and the tag) each start a run; the dedupe
-# job below lets only the first of them run the check matrix.
+# one commit (a release branch and main) each start a run; tag pushes trigger
+# nothing. The dedupe job below lets only the first run the check matrix.
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: false

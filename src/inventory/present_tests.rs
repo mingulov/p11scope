@@ -811,6 +811,59 @@ fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
     assert_eq!(row["launched_by_gap"]["reason"], LAUNCHER_GAP_EXITED);
 }
 
+/// Concise shows named links and `.service` units only: nameless
+/// links (`pid N`) and scopes/transient units stay in `-v`/JSON.
+#[test]
+fn launcher_chain_concise_hides_nameless_links_and_non_service_units() {
+    use crate::discovery::caller_registry::{
+        LAUNCHER_GAP_EXE_UNREADABLE, LauncherAncestor, LauncherOrigin,
+    };
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/pkcs11-tool".into());
+    presentation.callers[0].launched_by = vec![LauncherAncestor {
+        pid: 900,
+        start_time: Some(90),
+        exe: None,
+        label: None,
+        exe_gap: Some(LAUNCHER_GAP_EXE_UNREADABLE),
+    }];
+    presentation.callers[0].launcher_gap = None;
+    presentation.callers[0].launched_by_origin = LauncherOrigin::Chain;
+    presentation.callers[0].launched_by_unit = None;
+    presentation.callers[1].exe.as_mut().unwrap().path = Some("/usr/bin/svc-tool".into());
+    presentation.callers[1].launched_by = vec![];
+    presentation.callers[1].launcher_gap = None;
+    presentation.callers[1].launched_by_origin = LauncherOrigin::InitParent;
+    presentation.callers[1].launched_by_unit = Some("session-c2.scope".into());
+    presentation.callers[2].exe.as_mut().unwrap().path = Some("/usr/bin/other".into());
+    presentation.callers[2].launched_by = vec![];
+    presentation.callers[2].launcher_gap = None;
+    presentation.callers[2].launched_by_origin = LauncherOrigin::InitParent;
+    presentation.callers[2].launched_by_unit = Some("backup.service".into());
+    let nameless = presentation.callers[0].id;
+    let scoped = presentation.callers[1].id;
+    let serviced = presentation.callers[2].id;
+    assert_eq!(caller_origin_suffix(&presentation, nameless), None);
+    assert_eq!(
+        launcher_chain_text(&presentation, nameless).as_deref(),
+        Some("pkcs11-tool <- pid 900")
+    );
+    assert_eq!(caller_origin_suffix(&presentation, scoped), None);
+    assert_eq!(
+        launcher_chain_text(&presentation, scoped).as_deref(),
+        Some("svc-tool (from session-c2.scope)")
+    );
+    assert_eq!(
+        caller_origin_suffix(&presentation, serviced).as_deref(),
+        Some(" (from backup.service)")
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(!concise.contains("(from pid 900)"), "{concise}");
+    assert!(!concise.contains("(from session-c2.scope)"), "{concise}");
+    assert!(concise.contains("other (from backup.service)"), "{concise}");
+}
+
 /// Item 24: the inventory coverage line uses the one lowercase
 /// format and omits zero counts — `coverage: complete`, or
 /// `coverage: partial — 2 gaps, 1 refused, 3 more not shown` with

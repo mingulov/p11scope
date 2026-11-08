@@ -248,6 +248,11 @@ pub(crate) struct CgroupCollectRequest {
     /// finding 3), charged against the shared manifest+pre-arm budget when
     /// count manifests pin.
     pub(crate) prearm_prior: (usize, u64),
+    /// Test seam: one gap per reason, appended to every scanned
+    /// member, so call-site tests can drive the transaction fold
+    /// through the real collect path. Always empty in production.
+    #[cfg(test)]
+    pub(crate) scripted_member_gaps: Vec<String>,
 }
 
 pub(crate) struct CgroupCollection {
@@ -687,6 +692,22 @@ fn member_gap_truncates_transaction(reason: &str) -> bool {
         && !crate::discovery::overlay_witness::witness_unavailable_refusal(reason)
 }
 
+/// Append one scripted gap per reason to a scanned member (test
+/// seam): the gaps join the member before the transaction fold, so
+/// call-site tests observe the real wiring.
+#[cfg(test)]
+fn with_scripted_gaps(mut member: MemberResult, reasons: &[String]) -> MemberResult {
+    for reason in reasons {
+        member.gaps.push(PidGap {
+            pid: None,
+            subject: "scripted member gap".into(),
+            reason: reason.clone(),
+            generic: false,
+        });
+    }
+    member
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectionStage {
     Traversed,
@@ -875,6 +896,8 @@ fn collect_with(
                 before,
             )
         });
+        #[cfg(test)]
+        let member = with_scripted_gaps(member, &request.scripted_member_gaps);
         members.push(member);
     }
     noise.report();
@@ -1396,6 +1419,7 @@ mod tests {
             observer: None,
             count_manifests: Vec::new(),
             prearm_prior: (0, 0),
+            scripted_member_gaps: Vec::new(),
         }
     }
     fn fixture(pid: u32) -> (tempfile::TempDir, Arc<File>) {
@@ -1957,5 +1981,45 @@ mod tests {
                 "benign absence must not truncate its transaction: {reason}"
             );
         }
+    }
+
+    #[test]
+    fn scripted_unproven_member_gap_keeps_transaction_complete() {
+        // Call-site test: the CollectionWork-diagnosed unproven gap
+        // flows through the real collect path without incompleting
+        // the transaction. Reverting the call site to
+        // `scan_skip_truncates` turns this RED.
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let (_fixture, root) = fixture(pid);
+        let mut req = request(root);
+        req.scripted_member_gaps = vec![
+            "original_file_unproven: kernel witness unavailable: scoped collection deactivates the kernel proof"
+                .into(),
+        ];
+        let collection = collect(req, &[], &HookRegistry::default(), policy());
+        assert_eq!(collection.member_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(collection.outcome(), ScopedCollectionOutcome::Complete);
+    }
+
+    #[test]
+    fn scripted_ceiling_member_gap_incompletes_its_transaction() {
+        // Twin: a cut-short gap through the same seam still
+        // incompletes the transaction, proving the seam reaches the
+        // fold (the unproven test above is not vacuous).
+        use crate::discovery::scan::IO_CEILING_REASON;
+        let child =
+            crate::inspect_system::demotion_retirement_producer_tests::OwnedStoppedChild::new();
+        let pid = child.id();
+        let (_fixture, root) = fixture(pid);
+        let mut req = request(root);
+        req.scripted_member_gaps = vec![IO_CEILING_REASON.into()];
+        let collection = collect(req, &[], &HookRegistry::default(), policy());
+        assert_eq!(collection.member_pids().collect::<Vec<_>>(), vec![pid]);
+        assert_eq!(
+            collection.outcome(),
+            ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete)
+        );
     }
 }

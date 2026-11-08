@@ -4319,6 +4319,8 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             observer,
             count_manifests: self.count_manifests.clone(),
             prearm_prior: self.prearm_prior,
+            #[cfg(test)]
+            scripted_member_gaps: Vec::new(),
         };
         let hints = self.engine.module_hints.clone();
         let hooks = self.engine.hooks.clone();

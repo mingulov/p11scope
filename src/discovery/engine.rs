@@ -6948,6 +6948,7 @@ fn discover_plan(
                 crate::pidns::observer(),
                 crate::pidns::ObserverPidNs::Initial
             ),
+            &mut discovered.budget,
         ) {
             Ok(witness) => Some(witness),
             Err(reason) => {

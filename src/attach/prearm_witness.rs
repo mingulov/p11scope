@@ -683,6 +683,7 @@ pub(crate) fn start_with<B: WitnessBackend>(
     family: DepartFamily,
     mut backend: B,
     clock: impl Fn() -> u64,
+    budget: &mut crate::discovery::scan::CaptureWorkBudget,
 ) -> Result<StartupWitness<B>, Unavailable> {
     if paths.is_empty() || paths.len() > 64 {
         return Err(Unavailable::TooManyFiles);
@@ -742,6 +743,11 @@ pub(crate) fn start_with<B: WitnessBackend>(
     // Per-file unmap calibration.
     // SAFETY: gettid has no preconditions.
     let tid = unsafe { libc::syscall(libc::SYS_gettid) } as u32;
+    // The observer mount table, read once and lazily through the bounded
+    // reader: only a direct calibration mismatch needs it, and one read
+    // serves every file of this start. A failed read refuses (fail
+    // closed) without retrying per file.
+    let mut mountinfo_cache: Option<Option<String>> = None;
     let mut files: Vec<WitnessFile> = Vec::new();
     for (index, (path, fd, dev, ino, open_pin)) in opened.into_iter().enumerate() {
         cfg.calib_tid = tid;
@@ -788,10 +794,20 @@ pub(crate) fn start_with<B: WitnessBackend>(
         // while the mapped-range identity carries the overlay inode,
         // so a direct mismatch falls back to backing-vs-backing
         // through the layer candidates — never fstat against maps.
-        if slot.i_ino != identity.1 && !calibration_backing_accepted(&path, slot.i_ino, None) {
-            return Err(Unavailable::Calibration(
-                "witness calibration mismatch".into(),
-            ));
+        if slot.i_ino != identity.1 {
+            let cached = mountinfo_cache.get_or_insert_with(|| {
+                std::fs::File::open("/proc/self/mountinfo")
+                    .ok()
+                    .and_then(|table| crate::discovery::scan::read_mountinfo(table, budget).ok())
+            });
+            let accepted = cached
+                .as_deref()
+                .is_some_and(|table| calibration_backing_accepted(&path, slot.i_ino, Some(table)));
+            if !accepted {
+                return Err(Unavailable::Calibration(
+                    "witness calibration mismatch".into(),
+                ));
+            }
         }
         files.push(WitnessFile {
             fd,
@@ -1350,6 +1366,7 @@ pub(crate) fn start(
     paths: &[std::path::PathBuf],
     scope: &crate::attach::Scope,
     pidns_initial: bool,
+    budget: &mut crate::discovery::scan::CaptureWorkBudget,
 ) -> Result<StartupWitness<LiveBackend>, Unavailable> {
     let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled").ok();
     let lto = super::instance::lto_refusal();
@@ -1392,6 +1409,7 @@ pub(crate) fn start(
         family,
         backend,
         || crate::attach::monotonic_ns().unwrap_or(0),
+        budget,
     )
 }
 
@@ -2085,7 +2103,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2100,7 +2119,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2122,7 +2142,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2144,7 +2165,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2434,7 +2456,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2450,7 +2473,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2470,7 +2494,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2485,7 +2510,8 @@ mod tests {
                 false,
                 super::DepartFamily::Pair,
                 backend,
-                || 100
+                || 100,
+                &mut crate::discovery::scan::CaptureWorkBudget::default(),
             )
             .is_err()
         );
@@ -2505,6 +2531,7 @@ mod tests {
             super::DepartFamily::Pair,
             backend,
             || 12345,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("clean start succeeds");
         assert_eq!(witnessed.active_ns, 12345);
@@ -2525,6 +2552,7 @@ mod tests {
             super::DepartFamily::Pair,
             backend,
             || 7,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("clean start succeeds");
         let ops = &witnessed.backend.ops;
@@ -2556,6 +2584,7 @@ mod tests {
             super::DepartFamily::Pair,
             backend,
             || 7,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         ) {
             Ok(_) => panic!("a calibration mismatch must refuse"),
             Err(err) => err,
@@ -2578,6 +2607,7 @@ mod tests {
             super::DepartFamily::Pair,
             backend,
             || 7,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         ) {
             Ok(_) => panic!("a missed departure calibration must refuse"),
             Err(err) => err,
@@ -2601,6 +2631,7 @@ mod tests {
             super::DepartFamily::Pair,
             backend,
             || 7,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("clean start succeeds");
         assert_eq!(witnessed.files.len(), 1);
@@ -2608,6 +2639,70 @@ mod tests {
             crate::discovery::identity::pin_of(&std::fs::File::open(&path).expect("open"))
                 .expect("pin");
         assert_eq!(witnessed.files[0].pin, expected);
+    }
+
+    #[test]
+    fn start_reads_mountinfo_only_on_calibration_mismatch() {
+        // Laziness: a direct-match calibration never touches the mount
+        // table, so the budget records no table IO.
+        let (_dir, path) = temp_prearm_file("liblazy.so");
+        let backend = ScriptBackend::new(calib_for(&path), 1);
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let witnessed = super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+            &mut budget,
+        )
+        .expect("clean start succeeds");
+        assert_eq!(witnessed.files.len(), 1);
+        assert_eq!(
+            budget.attempted_io_bytes(),
+            0,
+            "no table read without a mismatch"
+        );
+    }
+
+    #[test]
+    fn start_fallback_table_read_goes_through_the_budget() {
+        // A direct mismatch reads the observer table through the bounded
+        // reader: the budget records the table IO (and the non-overlay
+        // temp file still refuses, fail closed).
+        let (_dir, path) = temp_prearm_file("libcharged.so");
+        let good = calib_for(&path);
+        let backend = ScriptBackend::new(
+            super::PwCalibSlot {
+                hits: 1,
+                s_dev: good.s_dev,
+                i_ino: good.i_ino.wrapping_add(1),
+            },
+            1,
+        );
+        let mut budget = crate::discovery::scan::CaptureWorkBudget::default();
+        let err = match super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+            &mut budget,
+        ) {
+            Ok(_) => panic!("an unbacked slot must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.class(), "calibration");
+        assert!(
+            budget.attempted_io_bytes() > 0,
+            "the fallback read charges the budget"
+        );
     }
 
     fn probe_softhsm_path() -> std::path::PathBuf {
@@ -2666,6 +2761,7 @@ mod tests {
             family,
             backend,
             || crate::attach::monotonic_ns().expect("monotonic clock"),
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("live start succeeds");
         assert_eq!(witnessed.backend.read_active().expect("read active"), 1);
@@ -3176,6 +3272,7 @@ mod tests {
             family,
             backend,
             || crate::attach::monotonic_ns().expect("clock"),
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("live start succeeds");
         let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled").ok();
@@ -3228,6 +3325,7 @@ mod tests {
             family,
             backend,
             || crate::attach::monotonic_ns().expect("clock"),
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
         )
         .expect("live start succeeds");
         // Churn an unwatched temp file mapping while finalizing.

@@ -5864,6 +5864,7 @@ fn privileged_witness_calibration_accepts_xino_overlay_files() {
         backing.ino()
     );
     let scope = crate::attach::Scope::System;
+    let mut witness_budget = CaptureWorkBudget::default();
     let mut refused = Vec::new();
     for (tag, path) in &rows {
         // Each row's expected backing identity, read straight from its
@@ -5889,7 +5890,12 @@ fn privileged_witness_calibration_accepts_xino_overlay_files() {
             (merged_meta.dev(), merged_meta.ino()),
             "{tag}: the twin needs split layer/merged identities"
         );
-        match crate::attach::prearm_witness::start(std::slice::from_ref(path), &scope, true) {
+        match crate::attach::prearm_witness::start(
+            std::slice::from_ref(path),
+            &scope,
+            true,
+            &mut witness_budget,
+        ) {
             Ok(witness) => {
                 assert_eq!(witness.files.len(), 1, "{tag}: one calibrated file");
                 let key = &witness.files[0].key;
@@ -5947,6 +5953,7 @@ fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
         "witness needs the initial PID namespace"
     );
     use std::os::unix::fs::MetadataExt as _;
+    let mut witness_budget = CaptureWorkBudget::default();
     let mut joined = Vec::new();
     for mode in [XinoMode::On, XinoMode::SameFs] {
         let work = tempfile::tempdir().unwrap();
@@ -5957,9 +5964,13 @@ fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
         let pre = std::fs::metadata(&merged).expect("merged stat before copy-up");
         // The witness starts first, on the lower-backed merged file.
         let scope = crate::attach::Scope::System;
-        let witness =
-            crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
-                .expect("the witness starts on the lower-backed file");
+        let witness = crate::attach::prearm_witness::start(
+            std::slice::from_ref(&merged),
+            &scope,
+            true,
+            &mut witness_budget,
+        )
+        .expect("the witness starts on the lower-backed file");
         assert_eq!(witness.files.len(), 1, "mode {mode:?}: one calibrated file");
         let (witness_dev, witness_ino) = (witness.files[0].dev, witness.files[0].ino);
         // The copy-up lands between the witness start and the pre-arm pin.
@@ -6036,6 +6047,7 @@ fn privileged_witness_pin_without_copyup_keeps_proof() {
         ),
         "witness needs the initial PID namespace"
     );
+    let mut witness_budget = CaptureWorkBudget::default();
     let mut refused = Vec::new();
     for mode in [XinoMode::On, XinoMode::SameFs] {
         let work = tempfile::tempdir().unwrap();
@@ -6044,9 +6056,13 @@ fn privileged_witness_pin_without_copyup_keeps_proof() {
         std::fs::write(fixture.lower_path("steady.so"), vec![0xC2u8; 8192]).unwrap();
         let merged = fixture.merged_path("steady.so");
         let scope = crate::attach::Scope::System;
-        let witness =
-            crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
-                .expect("the witness starts on the lower-backed file");
+        let witness = crate::attach::prearm_witness::start(
+            std::slice::from_ref(&merged),
+            &scope,
+            true,
+            &mut witness_budget,
+        )
+        .expect("the witness starts on the lower-backed file");
         assert_eq!(witness.files.len(), 1, "mode {mode:?}: one calibrated file");
         let (witness_dev, witness_ino) = (witness.files[0].dev, witness.files[0].ino);
         // No copy-up: the pre-arm pin opens the same file state.
@@ -6138,8 +6154,14 @@ fn privileged_witness_calibration_accepts_metacopy_upper() {
         "the upper copy must carry trusted.overlay.metacopy"
     );
     let scope = crate::attach::Scope::System;
-    let witness = crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
-        .expect("the witness calibrates the metacopy-backed file");
+    let mut witness_budget = CaptureWorkBudget::default();
+    let witness = crate::attach::prearm_witness::start(
+        std::slice::from_ref(&merged),
+        &scope,
+        true,
+        &mut witness_budget,
+    )
+    .expect("the witness calibrates the metacopy-backed file");
     assert_eq!(witness.files.len(), 1, "one calibrated file");
     let lower_meta = std::fs::metadata(fixture.lower_path("meta.so")).expect("lower stat");
     eprintln!(

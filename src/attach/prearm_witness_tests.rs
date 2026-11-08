@@ -417,7 +417,13 @@ fn live_start(
     so: &Path,
     scope: &crate::attach::Scope,
 ) -> super::StartupWitness<super::LiveBackend> {
-    super::start(&[so.to_path_buf()], scope, pidns_initial()).expect("live witness starts")
+    super::start(
+        &[so.to_path_buf()],
+        scope,
+        pidns_initial(),
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    )
+    .expect("live witness starts")
 }
 
 fn scenario_map_and_call_after_finalize() -> WitnessVerdict {
@@ -1095,7 +1101,12 @@ fn fixture_nested_inner() {
         crate::pidns::observer()
     );
     let so = PathBuf::from(std::env::var(ENV_SO).expect("fixture so path"));
-    match super::start(&[so], &crate::attach::Scope::System, pidns_initial()) {
+    match super::start(
+        &[so],
+        &crate::attach::Scope::System,
+        pidns_initial(),
+        &mut crate::discovery::scan::CaptureWorkBudget::default(),
+    ) {
         Err(Unavailable::Pidns(_)) => {
             say("PIDNS-UNAVAILABLE");
         }

@@ -5,9 +5,9 @@ p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11
 with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
 The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
-provides the same bundle set. The v0.7.0 release provides a static x86-64 Linux
-observer bundle, optional glibc and musl discovery helper bundles, DEB and RPM
-system packages, and a source export. The examples below install **v0.7.0**;
+provides the bundle set below, and the v0.7.0 release provides the same set:
+a static x86-64 Linux observer bundle, optional glibc and musl discovery
+helper bundles, DEB and RPM system packages, and a source export. The examples below install **v0.7.0**;
 the 0.7.0 files appear on the
 [Releases page](https://github.com/mingulov/p11scope/releases) when the release
 is published. Download `SHA256SUMS` with the bundle you

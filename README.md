@@ -35,7 +35,7 @@ p11scope --version
 sudo p11scope doctor
 ```
 
-(`doctor` loads its BPF preflight, so the first run takes about 10 s
+(`doctor` loads its BPF preflight on every run, so expect about 10 s
 with no interim output; that is normal.)
 
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).

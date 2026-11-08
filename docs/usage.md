@@ -224,10 +224,11 @@ Fedora/RHEL), then create a throwaway token and pick the module path for
 this host:
 
 ```bash
-export SOFTHSM2_CONF=$HOME/softhsm2.conf
-mkdir -p $HOME/softhsm-tokens
-printf 'directories.tokendir = %s/softhsm-tokens\nobjectstore.backend = file\n' "$HOME" > "$SOFTHSM2_CONF"
-softhsm2-util --init-token --slot 0 --label demo --so-pin <so-pin> --pin <pin>
+demo_dir=$(mktemp -d /var/tmp/softhsm-demo.XXXXXX)
+export SOFTHSM2_CONF="$demo_dir/softhsm2.conf"
+mkdir -p "$demo_dir/tokens"
+printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\n' "$demo_dir" > "$SOFTHSM2_CONF"
+softhsm2-util --init-token --slot 0 --label demo --so-pin 1234 --pin 1234
 MODULE=/usr/lib64/pkcs11/libsofthsm2.so
 [ -f "$MODULE" ] || MODULE=/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so
 pkcs11-tool --module "$MODULE" -L
@@ -235,9 +236,11 @@ sudo --preserve-env=SOFTHSM2_CONF p11scope run --pause auto -- \
   pkcs11-tool --module "$MODULE" -L
 ```
 
-(`<so-pin>` and `<pin>` are placeholders: use any values of at least 4
-characters for this throwaway token. `sudo` resets the environment first,
-hence `--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
+(The `1234` values are throwaway PINs for this demo token; SoftHSM needs
+at least 4 characters. The config and tokens live in a fresh directory
+under `/var/tmp`, so your own SoftHSM setup is untouched; remove that
+directory when you are done. `sudo` resets the environment first, hence
+`--preserve-env=SOFTHSM2_CONF` so the observed command sees the token.)
 
 The 4-step command reference follows; read the concepts after it as needed:
 

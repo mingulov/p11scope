@@ -304,27 +304,51 @@ fn cg_unescape(name: &str) -> &str {
     name.strip_prefix('_').unwrap_or(name)
 }
 
-/// Whether an unescaped component is a slice the unit walk skips: a
-/// non-empty control-free prefix with the `.slice` suffix.
+/// systemd `UNIT_NAME_MAX` (`unit-def.h`): a valid unit name is
+/// shorter than 256 bytes. Path validation already caps components at
+/// 255 bytes; the bound is restated so the walk matches systemd even
+/// if the input bound ever moves.
+const UNIT_NAME_MAX: usize = 256;
+
+/// systemd `unit_name_is_valid` prefix charset (`unit-name.c`):
+/// `VALID_CHARS` for slices (`PLAIN`), plus the `@` for units
+/// (`PLAIN|INSTANCE`). Anything outside it — spaces, controls,
+/// non-ASCII bytes — disqualifies the name.
+fn unit_prefix_chars_valid(prefix: &str, allow_at: bool) -> bool {
+    prefix.bytes().all(|byte| {
+        byte.is_ascii_alphanumeric()
+            || matches!(byte, b':' | b'-' | b'_' | b'.' | b'\\')
+            || (allow_at && byte == b'@')
+    })
+}
+
+/// Whether an unescaped component is a slice the unit walk skips:
+/// systemd's `valid_slice_name` — the `.slice` suffix with a
+/// non-empty `PLAIN` prefix (never an `@`: a `foo@bar.slice` ends
+/// the walk instead of skipping past it).
 fn is_slice_name(name: &str) -> bool {
     const SUFFIX: &str = ".slice";
-    name.len() > SUFFIX.len()
+    name.len() < UNIT_NAME_MAX
+        && name.len() > SUFFIX.len()
         && name.ends_with(SUFFIX)
-        && !name[..name.len() - SUFFIX.len()]
-            .chars()
-            .any(char::is_control)
+        && unit_prefix_chars_valid(&name[..name.len() - SUFFIX.len()], false)
 }
 
 /// Whether an unescaped component is a unit `cg_path_get_unit`
-/// returns: a known non-slice suffix with a non-empty control-free
-/// prefix.
+/// returns: systemd's `skip_unit` — a known non-slice suffix with a
+/// non-empty `PLAIN|INSTANCE` prefix. A leading `@` never qualifies,
+/// and neither does a template (`foo@.service`): past the first `@`
+/// the instance must be non-empty.
 fn is_unit_name(name: &str) -> bool {
+    if name.len() >= UNIT_NAME_MAX || name.starts_with('@') {
+        return false;
+    }
     SYSTEMD_UNIT_SUFFIXES.iter().any(|suffix| {
-        name.len() > suffix.len()
-            && name.ends_with(suffix)
-            && !name[..name.len() - suffix.len()]
-                .chars()
-                .any(char::is_control)
+        name.len() > suffix.len() && name.ends_with(suffix) && {
+            let prefix = &name[..name.len() - suffix.len()];
+            unit_prefix_chars_valid(prefix, true)
+                && prefix.find('@').is_none_or(|at| prefix.len() > at + 1)
+        }
     })
 }
 
@@ -356,15 +380,28 @@ fn is_user_manager_service(component: &[u8]) -> bool {
 /// The systemd unit for a `/proc/<pid>/cgroup` text, the way
 /// `sd_pid_get_unit` derives it without a libsystemd link: the `0:`
 /// line's path over `validate_path` components, leading slices
-/// skipped, first unit taken. Inside a `user@<uid>.service` subtree
-/// the `sd_pid_get_user_unit` rule applies instead: the first unit
-/// after the user manager, or nothing. Only the unit name is kept —
-/// full paths are never retained or published.
+/// skipped, first unit taken. Only when `user@<uid>.service` is the
+/// first non-slice component (systemd's anchored `skip_user_prefix`)
+/// does the `sd_pid_get_user_unit` rule apply instead: the first
+/// unit after the user manager, or nothing. A mid-path occurrence
+/// sits in a delegated subtree its owner chose, so the system
+/// first-unit rule applies there instead. Only the unit name is kept
+/// — full paths are never retained or published.
 pub(crate) fn systemd_unit_from_cgroup_text(cgroup: &str) -> Option<String> {
     let path = unified_cgroup_path(cgroup)?;
     let components = validate_path(path.as_bytes()).ok()?;
-    if let Some(at) = components.iter().position(|c| is_user_manager_service(c)) {
-        return unit_from_components(&components[at + 1..]);
+    let mut rest = components.as_slice();
+    while let [first, tail @ ..] = rest {
+        let name = cg_unescape(std::str::from_utf8(first).ok()?);
+        if !is_slice_name(name) {
+            break;
+        }
+        rest = tail;
+    }
+    if let [manager, tail @ ..] = rest
+        && is_user_manager_service(manager)
+    {
+        return unit_from_components(tail);
     }
     unit_from_components(&components)
 }

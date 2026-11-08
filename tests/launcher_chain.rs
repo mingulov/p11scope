@@ -145,11 +145,25 @@ impl Chain {
             }
         };
         // The independent oracle: the client really is the parent's child.
-        let (ppid, _) = stat_pair(client_pid);
-        assert_eq!(
-            ppid, parent_pid,
-            "the client must be parented by the named launcher"
-        );
+        // Under a subreaper the adoption lands only once the intermediate
+        // has exited, so poll with a deadline like the orphan helper.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let (ppid, _) = stat_pair(client_pid);
+            if ppid == parent_pid {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "the client must be parented by the named launcher \
+                 (ppid {ppid}, parent {parent_pid})"
+            );
+            assert!(
+                parent.try_wait().unwrap().is_none(),
+                "the named parent exited before its client was adopted"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
         Self {
             parent: Some(parent),
             parent_pid,
@@ -253,13 +267,19 @@ impl Orphan {
                 std::thread::sleep(Duration::from_millis(50));
             }
         };
-        // The independent oracle: the client really is orphaned to init.
-        // Anything else (a subreaper between here and pid 1) fails
-        // loudly: this cell needs the init adoption, never a skip.
+        // The orphan owns its client from here: on any failure below
+        // its `Drop` kills the client at once instead of leaving it to
+        // the gate's 30 s ceiling.
+        let orphan = Self { client_pid, gate };
+        // The independent oracle: the client really is orphaned to init
+        // — or, under a desktop shell, to the systemd user manager,
+        // which production reports as `init_parent` too. Anything else
+        // (another subreaper between here and pid 1) fails loudly:
+        // this cell needs the init adoption, never a skip.
         let deadline = Instant::now() + Duration::from_secs(10);
         loop {
-            let (ppid, _) = stat_pair(client_pid);
-            if ppid == 1 {
+            let (ppid, _) = stat_pair(orphan.client_pid);
+            if ppid == 1 || adopted_by_user_manager(ppid) {
                 break;
             }
             assert!(
@@ -269,7 +289,7 @@ impl Orphan {
             );
             std::thread::sleep(Duration::from_millis(50));
         }
-        Self { client_pid, gate }
+        orphan
     }
 
     /// Release the client and require its exit. Not our child, so poll
@@ -305,9 +325,12 @@ impl Drop for Orphan {
     }
 }
 
-/// Independent `/proc` oracle for the systemd unit: the first unit of
-/// the `0:` cgroup path (leading slices skipped), or the first unit
-/// after `user@<uid>.service` inside a user subtree. Derived in the
+/// Independent `/proc` oracle for the systemd unit: the first valid
+/// unit of the `0:` cgroup path (leading slices skipped), or the first
+/// valid unit after `user@<uid>.service` when that service is the first
+/// non-slice component (systemd's anchored `skip_user_prefix`; a
+/// mid-path occurrence is a delegated name). Walked names keep
+/// systemd's unit-name charset, length and `@` rules. Derived in the
 /// test from the raw file, so production must agree byte for byte.
 fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
     const SUFFIXES: &[&str] = &[
@@ -322,6 +345,36 @@ fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
         ".swap",
         ".device",
     ];
+    fn chars_valid(prefix: &str, allow_at: bool) -> bool {
+        prefix.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b':' | b'-' | b'_' | b'.' | b'\\')
+                || (allow_at && byte == b'@')
+        })
+    }
+    fn is_slice(name: &str) -> bool {
+        name.len() < 256
+            && name.len() > ".slice".len()
+            && name.ends_with(".slice")
+            && chars_valid(&name[..name.len() - ".slice".len()], false)
+    }
+    fn is_unit(name: &str) -> bool {
+        if name.len() >= 256 || name.starts_with('@') {
+            return false;
+        }
+        SUFFIXES.iter().any(|suffix| {
+            name.len() > suffix.len() && name.ends_with(suffix) && {
+                let prefix = &name[..name.len() - suffix.len()];
+                chars_valid(prefix, true) && prefix.find('@').is_none_or(|at| prefix.len() > at + 1)
+            }
+        })
+    }
+    fn is_user_manager(component: &str) -> bool {
+        component
+            .strip_prefix("user@")
+            .and_then(|rest| rest.strip_suffix(".service"))
+            .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+    }
     let mut path = None;
     for line in cgroup.lines() {
         let Some(rest) = line.strip_prefix("0:") else {
@@ -338,25 +391,23 @@ fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
         return None;
     }
     let parts: Vec<&str> = path.split('/').filter(|part| !part.is_empty()).collect();
-    let start = parts
-        .iter()
-        .position(|component| {
-            component
-                .strip_prefix("user@")
-                .and_then(|rest| rest.strip_suffix(".service"))
-                .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
-        })
-        .map(|at| at + 1)
-        .unwrap_or(0);
+    let mut rest = parts.as_slice();
+    while let [first, tail @ ..] = rest {
+        if !is_slice(first.strip_prefix('_').unwrap_or(first)) {
+            break;
+        }
+        rest = tail;
+    }
+    let start = match rest {
+        [manager, ..] if is_user_manager(manager) => parts.len() - rest.len() + 1,
+        _ => 0,
+    };
     for component in &parts[start..] {
         let name = component.strip_prefix('_').unwrap_or(component);
-        if name.len() > ".slice".len() && name.ends_with(".slice") {
+        if is_slice(name) {
             continue;
         }
-        if SUFFIXES
-            .iter()
-            .any(|suffix| name.len() > suffix.len() && name.ends_with(suffix))
-        {
+        if is_unit(name) {
             return Some(name.to_string());
         }
         return None;
@@ -368,8 +419,42 @@ fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
 /// manager itself (`user@<uid>.service/init.scope`, numeric uid):
 /// desktop test shells run under `systemd --user`, so an orphaned
 /// fixture lands there instead of pid 1.
-fn cgroup_is_user_manager_init(_cgroup: &str) -> bool {
-    false
+fn cgroup_is_user_manager_init(cgroup: &str) -> bool {
+    let mut path = None;
+    for line in cgroup.lines() {
+        let Some(rest) = line.strip_prefix("0:") else {
+            continue;
+        };
+        let Some((_, candidate)) = rest.split_once(':') else {
+            continue;
+        };
+        path = Some(candidate);
+        break;
+    }
+    let Some(path) = path else {
+        return false;
+    };
+    let mut tail = [None, None];
+    for part in path.split('/').filter(|part| !part.is_empty()) {
+        tail = [tail[1], Some(part)];
+    }
+    let [Some(manager), Some(scope)] = tail else {
+        return false;
+    };
+    if scope != "init.scope" {
+        return false;
+    }
+    manager
+        .strip_prefix("user@")
+        .and_then(|rest| rest.strip_suffix(".service"))
+        .is_some_and(|uid| !uid.is_empty() && uid.bytes().all(|b| b.is_ascii_digit()))
+}
+
+/// Whether `pid` was adopted by the systemd user manager (an
+/// unreadable cgroup answers false: adoption needs positive evidence).
+fn adopted_by_user_manager(pid: u32) -> bool {
+    std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+        .is_ok_and(|cgroup| cgroup_is_user_manager_init(&cgroup))
 }
 
 #[test]

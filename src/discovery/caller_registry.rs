@@ -673,10 +673,16 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
             return plain_stop(ancestors);
         }
         // The fifth link was statted, start-time checked and classified
-        // as a real ancestor above: more above is read evidence, not a
-        // guess, so keeping four truncates with the named gap.
-        // Boundaries stop before this check, so they never truncate.
+        // above, but kernel threads classify only at the exe arm below:
+        // check first, so a kthread above the fourth ancestor ends the
+        // walk instead of truncating it. One stat-flags read, only at
+        // depth four. Ancestors are never empty here. A real fifth link
+        // is read evidence, not a guess, so keeping four truncates with
+        // the named gap.
         if ancestors.len() >= LAUNCHER_CHAIN_DEPTH {
+            if source.is_kthread(ppid) {
+                return plain_stop(ancestors);
+            }
             return CapturedLauncherChain {
                 ancestors,
                 gap: Some(gap(LAUNCHER_GAP_TRUNCATED)),

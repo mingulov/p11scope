@@ -1084,6 +1084,17 @@ mod tests {
     }
 
     #[test]
+    fn comm_is_eligible_only_for_python_perl_and_ruby() {
+        // One predicate gates both the comm read and the comm hint:
+        // java and node get no comm read at all.
+        assert!(comm_eligible(Interpreter::Python));
+        assert!(comm_eligible(Interpreter::Perl));
+        assert!(comm_eligible(Interpreter::Ruby));
+        assert!(!comm_eligible(Interpreter::Java));
+        assert!(!comm_eligible(Interpreter::Node));
+    }
+
+    #[test]
     fn comm_is_refused_for_node_java_and_compiled_apps() {
         no_hint(Some("/usr/bin/node"), Some("MainThread"), None, None);
         no_hint(Some("/usr/bin/java"), Some("java-renamed"), None, None);
@@ -1256,6 +1267,18 @@ mod tests {
         assert!(cmdline.len() <= CMDLINE_PREFIX_BYTES);
         let cgroup = read_cgroup_text(pid).expect("own cgroup is readable");
         assert!(cgroup.contains("0::"));
+    }
+
+    #[test]
+    fn sampled_generation_check_needs_matching_start_times() {
+        // The sampler re-reads the process start time after its reads:
+        // a changed (or unreadable) generation drops the hint instead
+        // of attributing one generation's facts to another.
+        assert!(sampled_generation_intact(Some(100), Some(100)));
+        assert!(!sampled_generation_intact(Some(100), Some(101)));
+        assert!(!sampled_generation_intact(Some(100), None));
+        assert!(!sampled_generation_intact(None, Some(100)));
+        assert!(!sampled_generation_intact(None, None));
     }
 
     #[test]

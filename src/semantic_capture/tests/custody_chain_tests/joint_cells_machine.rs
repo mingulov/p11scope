@@ -3630,10 +3630,9 @@ fn joint_pregrant_pending_capacity_closes_during_extension() {
 /// BEGIN table (4,096) and the setup row consumes the wire budget
 /// first, so the wire closes the quantum with 4,095 invocations while
 /// the table stays one short of full — the close reason and the short
-/// table pin that binding order. (Historical name: at the 1,024 table
-/// the table bound closed first.)
+/// table pin that binding order.
 #[test]
-fn joint_pregrant_begin_table_full_closes_during_extension() {
+fn joint_pregrant_wire_capacity_closes_during_extension() {
     use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);

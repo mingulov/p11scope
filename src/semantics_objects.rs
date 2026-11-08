@@ -1166,6 +1166,14 @@ impl ObjectLimits {
     }
 }
 
+// The model converts what the journal holds at seal, so its pending
+// cap must never drop below the journal's open cap; a lower model
+// cap fails seals and taints keys.
+const _: () = assert!(
+    ObjectLimits::policy().pending_calls >= journal::JournalLimits::policy().open_calls,
+    "ObjectLimits::pending_calls tracks JournalLimits::open_calls"
+);
+
 /// The capture-owned object model.
 #[derive(Debug)]
 pub(crate) struct ObjectSemantics {

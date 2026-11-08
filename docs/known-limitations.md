@@ -2339,14 +2339,16 @@ a silent drop.
 ### `--cgroup` with no visible member reads like "no provider" (DR-K8S-5)
 
 - What the user sees: without hostPID the observer resolves the pod cgroup
-  but sees none of its processes; capture exits 0 with "no PKCS#11 modules
-  discovered" and 0 probes, not naming the PID-visibility cause.
-- Kernels/conditions: cgroup captures without PID visibility.
-- Disclosure: troubleshooting doc covers it; the message does not yet name
-  hostPID/PID visibility.
+  but sees none of its processes; a capture that finds no modules refuses
+  with `pid-namespace-mismatch`, naming the container PID namespace and
+  the hostPID remedy (exit nonzero, no report). Fixed in v0.7.0 (was:
+  exit 0 with "no PKCS#11 modules discovered", not naming the cause).
+- Kernels/conditions: cgroup and system captures without PID visibility
+  that find zero modules; captures that find in-namespace providers
+  proceed with the PID-namespace warning as before.
+- Disclosure: the refusal names hostPID/PID visibility; troubleshooting
+  doc covers it.
 - Workaround: run with hostPID.
-- Planned: v0.3.0 (name the cause when the cgroup resolves but has no
-  visible members).
 
 ### Untested cluster shapes (DR-K8S-6, DR-K8S-7)
 

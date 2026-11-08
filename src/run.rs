@@ -3484,7 +3484,20 @@ fn capture_with_host(
     let named_pid_gone =
         matches!(&a.scope, ScopeArg::Pid(pid) if crate::process::generation_gone(*pid));
     if engine.plan().modules.is_empty() && !named_pid_gone {
-        emit_capture_diagnostic(&no_modules_hint(&a.scope));
+        // DR-K8S-5: a nested observer that found nothing cannot tell "no
+        // providers" from "providers only on the invisible host": refuse
+        // by name (nonzero, no report) instead of an empty view.
+        let what = match &a.scope {
+            ScopeArg::Pid(pid) => format!("--pid {pid}"),
+            ScopeArg::Cgroup(_) => "a --cgroup capture".to_string(),
+            ScopeArg::System => "a --system capture".to_string(),
+        };
+        crate::pidns::refuse_nested_empty_capture(
+            crate::pidns::numbering(),
+            &what,
+            engine.plan().modules.is_empty(),
+        )?;
+        emit_capture_diagnostic(&empty_plan_hint(&a.scope, engine.plan()));
     }
     let mut session = engine
         .start_session(policy, a.ring_bytes, a.attach_backend)
@@ -5066,9 +5079,129 @@ fn pid_namespace_preflight(
 
 /// P1-3: the empty-plan line. A plan with zero modules but provider
 /// skips names what was found and why it cannot be counted, instead
-/// of claiming nothing was found. (RED stub: always the old hint.)
-fn empty_plan_hint(scope: &ScopeArg, _plan: &crate::plan::AttachPlan) -> String {
-    no_modules_hint(scope)
+/// of claiming nothing was found. Refused whole modules are confirmed
+/// providers (admitted, then refused), as is a K1 skip — the witness
+/// runs only after hook exports were found, or the operator named the
+/// file with `--module`. Every other non-benign skip is a mapped file
+/// the scan could not examine, whose provider-ness is exactly what
+/// cannot be determined. Verified absence (an examined file with no
+/// table, a hint verified absent) keeps the nothing-found hint, as
+/// does a proxy closure still awaiting publication (the start gate
+/// reads it like nothing mapped yet). Subjects and reasons are
+/// target-controlled bytes: escaped at this terminal boundary.
+fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
+    use crate::discovery::scan::Skipped;
+    let mut confirmed: Vec<&Skipped> = plan
+        .modules_skipped
+        .iter()
+        .filter(|skip| !crate::plan::is_closure_awaiting_publication(&skip.reason))
+        .collect();
+    let mut unexamined: Vec<&Skipped> = Vec::new();
+    for skip in &plan.skipped {
+        if skip
+            .reason
+            .contains(crate::discovery::overlay_witness::ORIGINAL_FILE_UNPROVEN)
+        {
+            confirmed.push(skip);
+        } else if empty_plan_skip_is_verified_absence(skip)
+            || crate::kinds::function_id(&skip.subject).is_some()
+        {
+            // Verified not-a-provider, or a function entry in a decoded
+            // table (not a file the scan failed to use): no provider
+            // count, no unexamined file.
+        } else {
+            unexamined.push(skip);
+        }
+    }
+    if confirmed.is_empty() && unexamined.is_empty() {
+        return no_modules_hint(scope);
+    }
+    let scope_bit = match scope {
+        ScopeArg::Pid(pid) => format!("in pid {pid}"),
+        ScopeArg::Cgroup(path) => format!("in cgroup {}", path.display()),
+        ScopeArg::System => "system-wide".to_string(),
+    };
+    let pointer = match scope {
+        ScopeArg::Pid(pid) => {
+            format!("`p11scope inspect --pid {pid}` or `p11scope doctor --pid {pid}` to see why")
+        }
+        ScopeArg::Cgroup(path) => format!(
+            "`p11scope inspect --pid <n>` for a process in it or `p11scope doctor --cgroup {}` \
+             to see why",
+            path.display()
+        ),
+        ScopeArg::System => {
+            "`p11scope inspect --system` for the whole-machine catalog, `p11scope inspect --pid \
+             <n>` for one process, or `p11scope doctor` to see why"
+                .to_string()
+        }
+    };
+    let mut segments = Vec::new();
+    if !confirmed.is_empty() {
+        let noun = if confirmed.len() == 1 {
+            "provider"
+        } else {
+            "providers"
+        };
+        segments.push(format!(
+            "found {} PKCS#11 {noun} {scope_bit} but could not count calls: {}",
+            confirmed.len(),
+            empty_plan_pairs(&confirmed),
+        ));
+    }
+    if !unexamined.is_empty() {
+        let noun = if unexamined.len() == 1 {
+            "file"
+        } else {
+            "files"
+        };
+        if confirmed.is_empty() {
+            segments.push(format!(
+                "no PKCS#11 modules discovered {scope_bit}, but {} mapped {noun} could not be \
+                 examined, so providers among them would be missed: {}",
+                unexamined.len(),
+                empty_plan_pairs(&unexamined),
+            ));
+        } else {
+            segments.push(format!(
+                "{} mapped {noun} could not be examined: {}",
+                unexamined.len(),
+                empty_plan_pairs(&unexamined),
+            ));
+        }
+    }
+    format!("p11scope: {}; run {pointer}", segments.join("; "))
+}
+
+/// Verified nothing-found for one scan skip: the file was examined and
+/// holds no table, or the operator's hint was verified absent from the
+/// maps. Unknown future reasons fail closed (counted as unexamined).
+fn empty_plan_skip_is_verified_absence(skip: &crate::discovery::scan::Skipped) -> bool {
+    skip.reason
+        .contains(crate::discovery::scan::NO_TABLE_FOUND_MARKER)
+        || skip.reason == crate::discovery::scan::HINT_NOT_MAPPED_REASON
+}
+
+/// One `subject — reason` pair per skip, control-escaped, at most two
+/// shown plus an "and K more" tail (the concise module-gaps width).
+fn empty_plan_pairs(skips: &[&crate::discovery::scan::Skipped]) -> String {
+    const SHOWN: usize = 2;
+    let shown: Vec<String> = skips
+        .iter()
+        .take(SHOWN)
+        .map(|skip| {
+            format!(
+                "{} — {}",
+                crate::render::escape_controls(&skip.subject),
+                crate::render::escape_controls(&skip.reason),
+            )
+        })
+        .collect();
+    if skips.len() > SHOWN {
+        format!("{}; and {} more", shown.join("; "), skips.len() - SHOWN)
+    } else {
+        shown.join("; ")
+    }
 }
 
 /// Zero modules is not an error; point the operator at the discovery diagnostics.
@@ -23926,10 +24059,7 @@ mod tests {
         assert!(hint.contains("found 1 PKCS#11 provider"), "{hint}");
         assert!(hint.contains("could not count calls"), "{hint}");
         assert!(hint.contains("original_file_unproven"), "{hint}");
-        assert!(
-            !hint.contains("no PKCS#11 modules discovered"),
-            "{hint}"
-        );
+        assert!(!hint.contains("no PKCS#11 modules discovered"), "{hint}");
         assert!(hint.contains("p11scope doctor"), "{hint}");
     }
 
@@ -23964,10 +24094,7 @@ mod tests {
         let hint = empty_plan_hint(&ScopeArg::System, &plan);
         assert!(hint.contains("found 1 PKCS#11 provider"), "{hint}");
         assert!(hint.contains("could not count calls"), "{hint}");
-        assert!(
-            !hint.contains("no PKCS#11 modules discovered"),
-            "{hint}"
-        );
+        assert!(!hint.contains("no PKCS#11 modules discovered"), "{hint}");
     }
 
     /// P1-3 guard: verified absence (an examined file with no table)
@@ -24002,9 +24129,7 @@ mod tests {
                 .into(),
         });
         assert!(
-            crate::plan::is_closure_awaiting_publication(
-                &plan.modules_skipped[0].reason
-            ),
+            crate::plan::is_closure_awaiting_publication(&plan.modules_skipped[0].reason),
             "the fixture must carry the awaiting-publication marker"
         );
         let hint = empty_plan_hint(&ScopeArg::System, &plan);

@@ -154,12 +154,13 @@ boot-policy change or another host, not a p11scope flag.
 What you see (documented as DR-K8S-5 under
 [Scopes (cgroup and pod)](known-limitations.md#scopes-cgroup-and-pod)):
 without `hostPID` the observer resolves the pod cgroup but sees none
-of its processes; capture exits 0 with "no PKCS#11 modules
-discovered" and 0 probes, not naming the PID-visibility cause. Why:
-the observer's `/proc` has no entries for the cgroup members, so
-there is nothing to scan. Fix: run with `hostPID: true` on real
-nodes (see [PID namespaces](usage.md#pid-namespaces)), or capture
-the target's cgroup with the observer in the initial PID namespace.
+of its processes; a capture that finds no modules refuses with
+`pid-namespace-mismatch`, naming the container PID namespace and the
+hostPID remedy (exit nonzero, no report). Why: the observer's
+`/proc` has no entries for the cgroup members, so there is nothing
+to scan. Fix: run with `hostPID: true` on real nodes (see [PID
+namespaces](usage.md#pid-namespaces)), or capture the target's
+cgroup with the observer in the initial PID namespace.
 
 ## Related docs
 

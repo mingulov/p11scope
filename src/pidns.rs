@@ -342,13 +342,29 @@ pub fn require_numbering_agrees(numbering: &PidNumbering, what: &str) -> Result<
 /// processes are not visible there, so an empty result cannot mean
 /// "nothing uses PKCS#11". Call only when the plan is empty; any
 /// modules found are in-namespace data and proceed with the warning
-/// [`nested_warning`] already emitted. (RED stub: always proceeds.)
+/// [`nested_warning`] already emitted. Every other numbering proceeds:
+/// a foreign `/proc` may still show host processes, and an unreadable
+/// namespace cannot prove host invisibility.
 pub fn refuse_nested_empty_capture(
-    _numbering: &PidNumbering,
-    _what: &str,
-    _modules_empty: bool,
+    numbering: &PidNumbering,
+    what: &str,
+    modules_empty: bool,
 ) -> Result<()> {
-    Ok(())
+    if !modules_empty {
+        return Ok(());
+    }
+    if !matches!(numbering.observer, ObserverPidNs::Nested)
+        || !matches!(numbering.proc_view, ProcView::Own)
+    {
+        return Ok(());
+    }
+    Err(anyhow::Error::new(NumberingMismatch(format!(
+        "{MISMATCH_CODE}: refusing {what}: it found no PKCS#11 modules, but this observer runs \
+         in a container PID namespace with its own /proc, so host processes are not visible and \
+         providers only they map are never discovered — an empty result here cannot mean \
+         nothing uses PKCS#11. Run p11scope in the host's initial PID namespace with its own \
+         /proc (Kubernetes: hostPID: true on a real node; docker: --pid host)"
+    ))))
 }
 
 /// Refuses every capture when the mounted `/proc` has no entry for this

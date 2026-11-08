@@ -113,12 +113,30 @@ PROXY_CANDIDATES = (
 
 
 def check_openssl3() -> str:
-    proc = subprocess.run(["openssl", "version"], capture_output=True, text=True, check=False)
+    proc = subprocess.run(["openssl", "version"], capture_output=True, text=True, check=False,
+                          stdin=subprocess.DEVNULL, timeout=30)
     line = (proc.stdout + proc.stderr).strip().splitlines()
     line = line[0] if line else ""
     if proc.returncode != 0 or "OpenSSL 3" not in line:
         raise CellError(f"openssl 3 required, got: {line!r}")
     return line
+
+
+def provider_version(provider_so: Path) -> str:
+    """pkcs11-provider version (e.g. '1.2.0') via openssl list; '' if unknown."""
+    env = dict(os.environ, OPENSSL_MODULES=str(provider_so.parent))
+    try:
+        proc = subprocess.run(
+            ["openssl", "list", "-providers", "-provider", "pkcs11", "-verbose"],
+            capture_output=True, text=True, check=False, env=env,
+            stdin=subprocess.DEVNULL, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return ""
+    for line in (proc.stdout + proc.stderr).splitlines():
+        line = line.strip()
+        if line.lower().startswith("version:"):
+            return line.split(":", 1)[1].strip().split()[0]
+    return ""
 
 
 def gate(*tools, need_provider=False, need_engine=False, need_proxy=False,
@@ -323,9 +341,13 @@ class OpensslPkcs11Cells(unittest.TestCase):
             path.write_bytes(b"openssl-pkcs11 cell test data 0123456789" * 4)
         return path
 
-    def dgst_argv(self, store: SoftHSMStore, key_label: str, sig: Path, extra=()) -> list:
+    def dgst_argv(self, store: SoftHSMStore, key_label: str, sig: Path, extra=(),
+                  uri_pin: bool = True) -> list:
         # PIN in URI as well as config: provider 1.1 (Fedora) prompts without it.
-        return ["openssl", "dgst", "-sha256", "-sign", store.key_uri(key_label, store.pin),
+        # Failure twin sets uri_pin=False so the wrong PIN lives only in config
+        # (provider 1.1 echoes the URI, PIN included, in its error output).
+        pin = store.pin if uri_pin else None
+        return ["openssl", "dgst", "-sha256", "-sign", store.key_uri(key_label, pin),
                 *extra, "-out", str(sig), str(self.data_file())]
 
     def aggregate_runs(self, name: str, binary: Path, module: Path, store: SoftHSMStore,
@@ -391,10 +413,20 @@ class OpensslPkcs11Cells(unittest.TestCase):
 
     @gate(need_provider=True, need_manifest=True)
     def test_provider_ec_sign_loop(self):
-        """Provider EC P-256: N dgst signs (Init exact, ECDSA mechanism)."""
+        """Provider EC P-256: N dgst signs (Init exact, ECDSA mechanism).
+
+        Skipped on pkcs11-provider 1.1 (Fedora): ECDSA multi-part Update fails
+        and one-shot hangs there (measured); 1.2 (Ubuntu/CI) is green.
+        """
         binary = p11scope_bin()
-        store = self.seed("ossl-ec-cell")
         provider_so = probe_module(PROVIDER_CANDIDATES, "P11SCOPE_TEST_PROVIDER_SO")
+        version = provider_version(provider_so)
+        if version.startswith("1.1"):
+            reason = f"pkcs11-provider {version} ECDSA broken (multi-part fails, one-shot hangs)"
+            if STRICT:
+                raise AssertionError(f"strict mode requires working EC: {reason}")
+            self.skipTest(reason)
+        store = self.seed("ossl-ec-cell")
         conf = write_provider_conf(self.work / "openssl.cnf", provider_so, store.lib)
         manifest = make_manifest(store.lib, self.work / "manifest.json")
         child_env = {"SOFTHSM2_CONF": str(store.conf), "OPENSSL_CONF": str(conf)}
@@ -544,7 +576,7 @@ class OpensslPkcs11Cells(unittest.TestCase):
         child_env = {"SOFTHSM2_CONF": str(store.conf), "OPENSSL_CONF": str(conf)}
         report, exit_code, out, err = run_single(
             binary, store.lib, self.work / "obs", child_env,
-            self.dgst_argv(store, "ossl-rsa", self.work / "fail.sig"),
+            self.dgst_argv(store, "ossl-rsa", self.work / "fail.sig", uri_pin=False),
             mode="profile", manifest=None)
         self.assertNotEqual(exit_code, 0, "wrong-PIN workload must fail")
         if report.exists():

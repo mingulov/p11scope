@@ -173,6 +173,8 @@ class SoftHSMStore:
         self._keypairgen("EC:prime256v1", "ossl-ec", "02")
 
     def _run(self, argv, **kw):
+        kw.setdefault("stdin", subprocess.DEVNULL)
+        kw.setdefault("timeout", 60)
         return subprocess.run(argv, capture_output=True, text=True, check=False,
                               env=dict(os.environ, **self.env), **kw)
 
@@ -189,8 +191,11 @@ class SoftHSMStore:
         if proc.returncode != 0:
             raise CellError(f"pkcs11-tool --keypairgen {label} failed: {proc.stderr.strip()}")
 
-    def key_uri(self, label: str) -> str:
-        return f"pkcs11:token={self.label};object={label};type=private"
+    def key_uri(self, label: str, pin: str | None = None) -> str:
+        uri = f"pkcs11:token={self.label};object={label};type=private"
+        if pin is not None:
+            uri += f";pin-value={pin}"
+        return uri
 
 
 def write_provider_conf(path: Path, provider_so: Path, pkcs11_module: Path, pin: str = TEST_PIN) -> Path:
@@ -227,7 +232,8 @@ def reown(path: Path) -> None:
 
 def make_manifest(module: Path, out: Path) -> Path:
     proc = subprocess.run([str(discover_bin()), "--module", str(module), "-o", str(out)],
-                          capture_output=True, text=True, check=False)
+                          capture_output=True, text=True, check=False,
+                          stdin=subprocess.DEVNULL, timeout=120)
     if proc.returncode != 0 or not out.exists():
         raise CellError(f"p11scope-discover failed: {(proc.stderr or '')[-200:]}")
     return out
@@ -245,7 +251,8 @@ def run_single(binary: Path, module: Path, workdir: Path, child_env: dict, child
     argv += ["-o", str(report), "--mode", mode, "--pause", "auto",
             "--duration", str(duration), "--kill-on-timeout",
             "--", "/usr/bin/env", *child_argv]
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=duration + 120)
+    proc = subprocess.run(argv, capture_output=True, text=True, check=False, timeout=duration + 120,
+                            stdin=subprocess.DEVNULL)
     reown(report)
     return report, proc.returncode, proc.stdout or "", proc.stderr or ""
 
@@ -317,7 +324,8 @@ class OpensslPkcs11Cells(unittest.TestCase):
         return path
 
     def dgst_argv(self, store: SoftHSMStore, key_label: str, sig: Path, extra=()) -> list:
-        return ["openssl", "dgst", "-sha256", "-sign", store.key_uri(key_label),
+        # PIN in URI as well as config: provider 1.1 (Fedora) prompts without it.
+        return ["openssl", "dgst", "-sha256", "-sign", store.key_uri(key_label, store.pin),
                 *extra, "-out", str(sig), str(self.data_file())]
 
     def aggregate_runs(self, name: str, binary: Path, module: Path, store: SoftHSMStore,
@@ -476,9 +484,10 @@ class OpensslPkcs11Cells(unittest.TestCase):
         srv_env = dict(os.environ, SOFTHSM2_CONF=str(store.conf), OPENSSL_CONF=str(conf))
         cert = self.work / "srv-cert.pem"
         proc = subprocess.run(
-            ["openssl", "req", "-x509", "-new", "-key", store.key_uri("ossl-rsa"),
+            ["openssl", "req", "-x509", "-new", "-key", store.key_uri("ossl-rsa", store.pin),
              "-out", str(cert), "-days", "2", "-subj", "/CN=ossl-tls"],
-            capture_output=True, text=True, check=False, env=srv_env)
+            capture_output=True, text=True, check=False, env=srv_env,
+            stdin=subprocess.DEVNULL, timeout=60)
         self.assertEqual(proc.returncode, 0, f"req failed: {proc.stderr[-300:]}")
         port = 18531
         trusted_dir(self.work / "obs")
@@ -490,7 +499,7 @@ class OpensslPkcs11Cells(unittest.TestCase):
                 "--mode", "profile", "--pause", "auto", "--duration", "90",
                 "--kill-on-timeout", "--", "/usr/bin/env",
                 "openssl", "s_server", "-accept", f"127.0.0.1:{port}",
-                "-cert", str(cert), "-key", store.key_uri("ossl-rsa"),
+                "-cert", str(cert), "-key", store.key_uri("ossl-rsa", store.pin),
                 "-naccept", str(K_HANDSHAKES)]
         server = subprocess.Popen(argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                   stderr=subprocess.PIPE, text=True, bufsize=1)
@@ -529,6 +538,7 @@ class OpensslPkcs11Cells(unittest.TestCase):
         """Failure twin: wrong PIN fails cleanly; no PIN in any output."""
         binary = p11scope_bin()
         store = self.seed("ossl-fail-cell")
+        store.pin = "wrong0000"
         provider_so = probe_module(PROVIDER_CANDIDATES, "P11SCOPE_TEST_PROVIDER_SO")
         conf = write_provider_conf(self.work / "openssl.cnf", provider_so, store.lib, pin="wrong0000")
         child_env = {"SOFTHSM2_CONF": str(store.conf), "OPENSSL_CONF": str(conf)}
@@ -550,14 +560,15 @@ class OpensslPkcs11Cells(unittest.TestCase):
         cert = self.work / "inv-cert.pem"
         if not cert.exists():
             proc = subprocess.run(
-                ["openssl", "req", "-x509", "-new", "-key", store.key_uri("ossl-rsa"),
+                ["openssl", "req", "-x509", "-new", "-key", store.key_uri("ossl-rsa", store.pin),
                  "-out", str(cert), "-days", "2", "-subj", "/CN=ossl-inv"],
-                capture_output=True, text=True, check=False, env=srv_env)
+                capture_output=True, text=True, check=False, env=srv_env,
+                stdin=subprocess.DEVNULL, timeout=60)
             self.assertEqual(proc.returncode, 0, f"req failed: {proc.stderr[-200:]}")
         port = 18532 if scope_args[0] == "--pid" else 18533
         srv = subprocess.Popen(
             ["openssl", "s_server", "-accept", f"127.0.0.1:{port}", "-cert", str(cert),
-             "-key", store.key_uri("ossl-rsa"), "-naccept", "4"],
+             "-key", store.key_uri("ossl-rsa", store.pin), "-naccept", "4"],
             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
             env=srv_env, text=True, bufsize=1)
         self.addCleanup(lambda: (srv.terminate(), srv.wait()))
@@ -716,7 +727,8 @@ class ToolCapabilities(unittest.TestCase):
         proc = subprocess.run(
             ["openssl", "speed", "-provider", "pkcs11", "-provider", "default",
              "-propquery", "?provider=pkcs11", "-seconds", "2", "rsa2048"],
-            capture_output=True, text=True, check=False, timeout=60, env=env)
+            capture_output=True, text=True, check=False, timeout=60, env=env,
+            stdin=subprocess.DEVNULL)
         log = proc.stderr + proc.stdout
         self.assertTrue("Initializing the module" in log, "speed did not touch token")
         self.assertTrue("C_GenerateKeyPair" in log, "speed did no token keygen")

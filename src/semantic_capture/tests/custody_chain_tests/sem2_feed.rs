@@ -13,8 +13,8 @@ use super::*;
 use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
-    SCAN_REFUSAL_LABELS, count_scan_refusals, image_query_refusal_index, image_query_refusal_label,
-    scan_refusals_gap_reason, semantic_stop_line,
+    SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
+    image_query_refusal_label, scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -233,4 +233,16 @@ fn semantic_stop_line_format_is_exact() {
          hook misses 2318, eras 41, instances 3"
     );
     assert_eq!(scan_refusals_gap_reason(&[0; 12]), None);
+}
+
+#[test]
+fn admitted_mints_line_format_is_exact() {
+    assert_eq!(
+        admitted_mints_line(0, 0),
+        "p11scope: admitted mints: reported=0 attached=0"
+    );
+    assert_eq!(
+        admitted_mints_line(3, 1),
+        "p11scope: admitted mints: reported=3 attached=1"
+    );
 }

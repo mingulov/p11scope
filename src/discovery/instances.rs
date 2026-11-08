@@ -945,6 +945,13 @@ impl InstanceRouter {
         }
     }
 
+    /// Admitted-mint telemetry for the stop disclosure: observations
+    /// that reported `AdmittedFirst`, and keys whose birth attached.
+    /// Counts only.
+    pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
+        (self.counters.admitted_first, self.admitted_minted.len())
+    }
+
     pub(crate) fn ranges_retained(&self) -> usize {
         self.ranges
     }

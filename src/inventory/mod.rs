@@ -3117,6 +3117,8 @@ struct SemanticStopCounts {
     hook_misses: u64,
     eras: u64,
     instances: u64,
+    admitted_reported: u64,
+    admitted_attached: u64,
 }
 
 impl SemanticStopCounts {
@@ -3129,6 +3131,7 @@ impl SemanticStopCounts {
         let lost = lane.events_ring_loss_disclosed();
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
         let (hook_misses, eras, instances) = lane.semantic_era_counts();
+        let (admitted_reported, admitted_attached) = lane.admitted_mint_counts();
         Self {
             refusals,
             collected,
@@ -3140,6 +3143,8 @@ impl SemanticStopCounts {
             hook_misses,
             eras,
             instances,
+            admitted_reported,
+            admitted_attached: admitted_attached as u64,
         }
     }
 }
@@ -3171,6 +3176,14 @@ fn disclose_semantic_stop(
     if let Some(summary) = coordinator.settlement_latency_summary() {
         warn.emit(&crate::inventory_semantics::settlement_latency_line(
             &summary,
+        ));
+    }
+    // Diagnostic-only admitted-mint counts ride it too, behind the
+    // stage-timings telemetry gate.
+    if crate::inspect_system::stage_timings_requested() {
+        warn.emit(&crate::inventory_semantics::admitted_mints_line(
+            counts.admitted_reported,
+            counts.admitted_attached,
         ));
     }
 }
@@ -25218,6 +25231,8 @@ mod promotion_driver_tests {
             hook_misses: 0,
             eras: 0,
             instances: 0,
+            admitted_reported: 0,
+            admitted_attached: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(

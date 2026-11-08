@@ -1567,6 +1567,15 @@ pub(crate) fn settlement_latency_line(
     )
 }
 
+/// One stderr line for the diagnostic admitted-mint summary: continued
+/// observations that reported `AdmittedFirst`, and receipts that
+/// attached the birth. Counts only; no identities, paths or payloads.
+/// Diagnostic-only: printed beside the stop line only while stage
+/// timings are requested, never a contract.
+pub(crate) fn admitted_mints_line(reported: u64, attached: u64) -> String {
+    format!("p11scope: admitted mints: reported={reported} attached={attached}")
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;
@@ -1786,6 +1795,14 @@ impl AttestedSemanticLane {
         if let Some(live) = self.live.as_mut() {
             live.capture.mark_admitted_for(image, file);
         }
+    }
+
+    /// Admitted-mint telemetry for the stop disclosure: (reported,
+    /// attached). Zeros without a live lane. Counts only.
+    pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
+        self.live
+            .as_ref()
+            .map_or((0, 0), |live| live.capture.admitted_mint_counts())
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the

@@ -1770,6 +1770,11 @@ impl SemanticCapture {
     pub(crate) fn mark_admitted_for(&mut self, image: ImageIdentity, file: u32) {
         self.router.mark_admitted(image, file);
     }
+
+    /// Admitted-mint telemetry for the stop disclosure (counts only).
+    pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
+        self.router.admitted_mint_counts()
+    }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins
     /// assert the positive disclosure from the report and use this only to

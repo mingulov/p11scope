@@ -3221,6 +3221,12 @@ fn login_user_type_capture_uses_full_width_finite_policy() {
 /// builds, plus its comment lines): 148920 B, measured with this
 /// same lexer on the integrated source; the previous pin matches its
 /// parent.
+/// Re-baselined for the inventory-callers exe identity (the only
+/// BPF source change: the Callers flavor accepts the exe-identity
+/// bit beside one scope while other inventory builds keep exact
+/// flag compares, plus their comment lines): 149085 B, measured
+/// with this same lexer on the integrated source; the previous pin
+/// matches its parent.
 #[test]
 fn strip_rust_prose_real_bpf_source_dump_stable() {
     use sha2::{Digest as _, Sha256};
@@ -3230,8 +3236,8 @@ fn strip_rust_prose_real_bpf_source_dump_stable() {
     assert_eq!(
         (stripped.len(), hex.as_str()),
         (
-            148920,
-            "c37b4fb50cef10a5d72512ded16d931d7b76468b16fff547424fa87f8a916b98"
+            149085,
+            "f7ac1270807f27d74982ed9ccee864209c951a5b6529047b7aa33d8213e76ff5"
         ),
         "stripped BPF dump must stay byte-identical"
     );

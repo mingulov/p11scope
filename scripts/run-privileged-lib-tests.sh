@@ -345,6 +345,12 @@ discovery::pause::tests::privileged_pause_auto_preloaded_exec_matches_direct_cou
 discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64
 discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64
 discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64
+# Short-lived naming cell: one pkcs11-tool run under inventory --system
+# must NAME the tool (its EXEC-joined pair resolved to the exact path,
+# not just its pid) in modules[].unbound_use.executables and on the
+# concise unidentified line (root, BPF, SoftHSM, pkcs11-tool; a holder
+# keeps the module mapped; about 1-4 min with retries).
+discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executable
 # D4 file-identity qualifying cells: ext4 inode-reuse confirmation
 # parity (own loop ext4 per row) and overlay xino backend parity (own
 # loop layers per mode). The copy-up no-re-edge positive runs in the

@@ -1270,8 +1270,7 @@ malformed line without fields
         let proc_exe = format!("/proc/{pid}/exe");
         let link = std::fs::read_link(&proc_exe).unwrap();
         let link_text = link.to_string_lossy().into_owned();
-        let via_link =
-            real_maps_identity_proc_exe_link(&proc_exe).expect("our own exe opens");
+        let via_link = real_maps_identity_proc_exe_link(&proc_exe).expect("our own exe opens");
         let via_target = real_maps_identity(&link_text).expect("our own exe maps");
         assert_eq!(via_link, via_target);
     }
@@ -1291,5 +1290,325 @@ malformed line without fields
         assert_eq!(real_maps_identity_proc_exe_link(&path_text), None);
         assert_eq!(real_maps_identity_proc_exe_link("/proc/self/exe"), None);
         assert_eq!(real_maps_identity_proc_exe_link("/proc//exe"), None);
+    }
+
+    /// The user question "which program called?" over one short-lived
+    /// run: `inventory --system --capture native` while `pkcs11-tool
+    /// --module <private SoftHSM> -O` runs once must NAME the tool in
+    /// `modules[].unbound_use.executables` (its EXEC-joined pair
+    /// resolved to the exact tool path with a resolved verdict) and on
+    /// the concise `unidentified executables` line — not just its pid.
+    /// The oracle matches the tool's own mapped-domain pair, so a
+    /// pid-only or path-unknown record fails; attempts where the run
+    /// binds to a caller edge (or its calls are missed) retry with a
+    /// fresh capture, since only an unidentified image exercises the
+    /// EXEC join. A holder keeps the SoftHSM module mapped for the
+    /// whole cell: discovery attaches mapped modules, and the
+    /// short-lived tool alone maps it too briefly. Root BPF lane, run
+    /// serially through `scripts/run-privileged-lib-tests.sh`; the
+    /// fixed test PIN travels only in this cell's own argv, which the
+    /// observer never reads.
+    #[test]
+    #[ignore = "privileged: one pkcs11-tool run under inventory --system names its executable (root, BPF, SoftHSM, pkcs11-tool)"]
+    fn privileged_shortlived_tool_run_names_its_executable() {
+        // SAFETY: reading the effective uid has no preconditions.
+        assert_eq!(
+            unsafe { libc::geteuid() },
+            0,
+            "run as root via scripts/run-privileged-lib-tests.sh"
+        );
+        const TOOL_CANDIDATES: &[&str] = &["/usr/bin/pkcs11-tool", "/usr/local/bin/pkcs11-tool"];
+        let tool = TOOL_CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("a pkcs11-tool binary must be installed for the cell");
+        const SOFTHSM_CANDIDATES: &[&str] = &[
+            "/usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so",
+            "/usr/lib/softhsm/libsofthsm2.so",
+            "/usr/lib64/pkcs11/libsofthsm2.so",
+        ];
+        let module = SOFTHSM_CANDIDATES
+            .iter()
+            .copied()
+            .find(|path| std::path::Path::new(path).is_file())
+            .expect("a SoftHSM2 provider must be installed for the cell");
+        let (kdev, ino) = real_maps_identity(tool).expect("the tool maps");
+        let device = Device::from_kdev(kdev);
+        let dir = tempfile::tempdir().expect("cell dir");
+        let tokens = dir.path().join("tokens");
+        std::fs::create_dir_all(&tokens).expect("token dir");
+        let conf = dir.path().join("softhsm2.conf");
+        std::fs::write(
+            &conf,
+            format!(
+                "directories.tokendir = {}\nobjectstore.backend = file\nlog.level = ERROR\n",
+                tokens.display()
+            ),
+        )
+        .expect("token conf");
+        let output = std::process::Command::new("/usr/bin/softhsm2-util")
+            .env("SOFTHSM2_CONF", &conf)
+            .args([
+                "--init-token",
+                "--free",
+                "--label",
+                "exename",
+                "--so-pin",
+                "5678",
+                "--pin",
+                "1234",
+            ])
+            .output()
+            .expect("spawn softhsm2-util");
+        assert!(
+            output.status.success(),
+            "token init: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let _holder = MappedHolder::spawn(module, &conf);
+        let observer = exename_observer_binary();
+        let mut last = String::from("no attempt ran");
+        for attempt in 1..=3 {
+            let out = dir.path().join(format!("attempt{attempt}.json"));
+            let log = dir.path().join(format!("attempt{attempt}.log"));
+            let err = dir.path().join(format!("attempt{attempt}.err"));
+            let log_file = std::fs::File::create(&log).expect("attempt log");
+            let err_file = std::fs::File::create(&err).expect("attempt err");
+            let mut child = std::process::Command::new(&observer)
+                .env("SOFTHSM2_CONF", &conf)
+                .args([
+                    "inventory",
+                    "--system",
+                    "--capture",
+                    "native",
+                    "--module",
+                    module,
+                    "--duration",
+                    "60",
+                    "-o",
+                ])
+                .arg(&out)
+                .stdin(std::process::Stdio::null())
+                .stdout(log_file)
+                .stderr(err_file)
+                .spawn()
+                .expect("spawn the observer");
+            std::thread::sleep(std::time::Duration::from_secs(20));
+            if let Some(status) = child.try_wait().expect("poll the observer") {
+                let stderr = std::fs::read_to_string(&err).unwrap_or_default();
+                panic!("the observer exited {status} before the workload: {stderr}");
+            }
+            let run = std::process::Command::new(tool)
+                .env("SOFTHSM2_CONF", &conf)
+                .args(["--module", module, "-O", "--login", "--pin", "1234"])
+                .output()
+                .expect("spawn pkcs11-tool");
+            assert!(
+                run.status.success(),
+                "pkcs11-tool: {}",
+                String::from_utf8_lossy(&run.stderr)
+            );
+            let status = exename_wait(&mut child, 180).expect("the observer exits");
+            assert_eq!(status.code(), Some(0), "inventory exits 0");
+            let document: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(&out).expect("report exists"))
+                    .expect("the report parses");
+            match exename_oracle(&document, tool, device, ino) {
+                ExenameVerdict::Pass => {
+                    let text = std::fs::read_to_string(&log).expect("attempt log");
+                    let line = text
+                        .split("unidentified executables:")
+                        .nth(1)
+                        .and_then(|tail| tail.lines().next())
+                        .unwrap_or_default();
+                    assert!(
+                        line.contains("pkcs11-tool"),
+                        "the concise line names the tool: {line}"
+                    );
+                    return;
+                }
+                ExenameVerdict::Retry(detail) => last = detail,
+                ExenameVerdict::Fail(detail) => {
+                    panic!("attempt {attempt}: our pair is unnamed: {detail}")
+                }
+            }
+        }
+        panic!("no passing attempt ({last})");
+    }
+
+    /// A child reaped on every exit path: the runner kills the cell on
+    /// timeout, and Drop still reaps a live child on panic paths.
+    struct ExenameChild(std::process::Child);
+
+    impl Drop for ExenameChild {
+        fn drop(&mut self) {
+            if self.0.try_wait().is_ok_and(|waiting| waiting.is_none()) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    /// The SoftHSM holder: a python process with the provider dlopened,
+    /// kept mapped until the cell ends so discovery attaches the module.
+    struct MappedHolder {
+        _child: ExenameChild,
+    }
+
+    impl MappedHolder {
+        fn spawn(module: &str, conf: &std::path::Path) -> Self {
+            let child = std::process::Command::new("/usr/bin/python3")
+                .env("SOFTHSM2_CONF", conf)
+                .args([
+                    "-I",
+                    "-c",
+                    "import ctypes, sys, time; ctypes.CDLL(sys.argv[1]); time.sleep(600)",
+                    module,
+                ])
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .expect("spawn the SoftHSM holder");
+            let pid = child.id();
+            let mut holder = Self {
+                _child: ExenameChild(child),
+            };
+            for _ in 0..100 {
+                if holder
+                    ._child
+                    .0
+                    .try_wait()
+                    .expect("poll the holder")
+                    .is_some()
+                {
+                    panic!("the holder exited before mapping the provider");
+                }
+                let maps = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap_or_default();
+                if maps.contains("libsofthsm2.so") {
+                    return holder;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            panic!("the holder never mapped libsofthsm2.so");
+        }
+    }
+
+    /// The observer under test: an explicit `P11SCOPE_E2E_OBSERVER`
+    /// binary or the `p11scope` sibling of this test binary's directory
+    /// (a local `cargo build` layout).
+    fn exename_observer_binary() -> std::path::PathBuf {
+        if let Ok(path) = std::env::var("P11SCOPE_E2E_OBSERVER") {
+            let path = std::path::PathBuf::from(path);
+            assert!(path.exists(), "P11SCOPE_E2E_OBSERVER is missing");
+            return path;
+        }
+        let sibling = std::env::current_exe()
+            .ok()
+            .and_then(|exe| exe.parent()?.parent().map(|dir| dir.join("p11scope")));
+        if let Some(sibling) = sibling.filter(|path| path.exists()) {
+            return sibling;
+        }
+        panic!(
+            "no observer binary: set P11SCOPE_E2E_OBSERVER or build the p11scope binary beside this test binary"
+        );
+    }
+
+    /// Bounded wait: poll the observer, then kill it instead of hanging
+    /// the campaign lane forever.
+    fn exename_wait(
+        child: &mut std::process::Child,
+        seconds: u64,
+    ) -> Option<std::process::ExitStatus> {
+        for _ in 0..seconds * 10 {
+            if let Some(status) = child.try_wait().expect("poll the observer") {
+                return Some(status);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        let _ = child.kill();
+        let _ = child.wait();
+        None
+    }
+
+    enum ExenameVerdict {
+        Pass,
+        Retry(String),
+        Fail(String),
+    }
+
+    /// The cell oracle: PASS names our pair at the exact tool path with
+    /// a resolved verdict, RETRY missed it (bound to a caller edge or
+    /// its calls were missed), FAIL leaves it unnamed or misnamed.
+    fn exename_oracle(
+        document: &serde_json::Value,
+        tool: &str,
+        device: Device,
+        ino: u64,
+    ) -> ExenameVerdict {
+        let Some(modules) = document.get("modules").and_then(|m| m.as_array()) else {
+            return ExenameVerdict::Fail("document has no modules[]".to_string());
+        };
+        let mut seen = Vec::new();
+        for module in modules {
+            let executables = module
+                .get("unbound_use")
+                .and_then(|use_| use_.get("executables"));
+            let Some(executables) = executables else {
+                continue;
+            };
+            let Some(executables) = executables.as_array() else {
+                return ExenameVerdict::Fail("executables is not a list".to_string());
+            };
+            for record in executables {
+                let pair = record.get("dev").and_then(|dev| {
+                    Some((
+                        dev.get("major")?.as_u64()?,
+                        dev.get("minor")?.as_u64()?,
+                        record.get("ino")?.as_u64()?,
+                    ))
+                });
+                let Some(pair) = pair else {
+                    return ExenameVerdict::Fail(format!(
+                        "executables[] record lacks dev{{ major, minor }}/ino: {record}"
+                    ));
+                };
+                if pair == (device.major, device.minor, ino) {
+                    seen.push(record);
+                }
+            }
+        }
+        if seen.is_empty() {
+            return ExenameVerdict::Retry(
+                "our (dev, ino) left no unidentified image (bound or missed)".to_string(),
+            );
+        }
+        let unnamed: Vec<_> = seen
+            .iter()
+            .filter(|record| {
+                record
+                    .get("exe")
+                    .and_then(|exe| exe.as_str())
+                    .is_none_or(|exe| exe.is_empty())
+                    || !matches!(
+                        record.get("resolution").and_then(|r| r.as_str()),
+                        Some("proc_alive" | "scan_learned" | "system_index")
+                    )
+            })
+            .collect();
+        if !unnamed.is_empty() {
+            return ExenameVerdict::Fail(format!("our pair is unnamed: {unnamed:?}"));
+        }
+        let mut names: Vec<_> = seen
+            .iter()
+            .filter_map(|record| record.get("exe").and_then(|exe| exe.as_str()))
+            .collect();
+        names.sort_unstable();
+        names.dedup();
+        if names != [tool] {
+            return ExenameVerdict::Fail(format!("our pair named the wrong path: {names:?}"));
+        }
+        ExenameVerdict::Pass
     }
 }

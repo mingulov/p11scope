@@ -158,17 +158,72 @@ class CellScriptLibrary(unittest.TestCase):
                          ["P11SCOPE_DIAGNOSTIC_SETTLEMENT_LATENCY=1",
                           "P11SCOPE_STAGE_TIMINGS=1"])
 
-    def test_observer_nice_flags_default_override_and_empty(self):
-        proc = run_sourced('observer_nice_flags', env={})
+    def test_observer_nice_level_default_override_and_empty(self):
+        proc = run_sourced('observer_nice_level', env={})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "-n -5")
-        proc = run_sourced('observer_nice_flags',
+        self.assertEqual(proc.stdout.strip(), "-5")
+        proc = run_sourced('observer_nice_level',
                            env={"JOINT_NICE": "-n 0"})
         self.assertEqual(proc.returncode, 0, proc.stderr)
-        self.assertEqual(proc.stdout.strip(), "-n 0")
-        proc = run_sourced('observer_nice_flags', env={"JOINT_NICE": ""})
+        self.assertEqual(proc.stdout.strip(), "0")
+        proc = run_sourced('observer_nice_level', env={"JOINT_NICE": ""})
         self.assertEqual(proc.returncode, 0, proc.stderr)
         self.assertEqual(proc.stdout.strip(), "")
+
+    def test_observer_nice_level_rejects_anything_but_n_dash_int(self):
+        bad = ("-n x", "-n", "-n ", "0", "5", "-n 5 -n 6",
+               "-n 5 extra", "--foo", "-n --5", "-n 5-",
+               "-n $(reboot)", "-n 5; reboot", "-n -")
+        for value in bad:
+            with self.subTest(value=value):
+                proc = run_sourced('observer_nice_level',
+                                   env={"JOINT_NICE": value})
+                self.assertNotEqual(proc.returncode, 0, value)
+                self.assertEqual(proc.stdout.strip(), "", value)
+
+    def spawned_child_nice(self, env):
+        """Resolve JOINT_NICE through the script and report the child's
+        effective niceness: the child reads /proc/self/stat field 19
+        itself after the exec, so no sampling race remains. The
+        controlled comms (sh, sleep) carry no spaces, making the
+        field split exact."""
+        script = ('level=$(observer_nice_level) || exit 3; '
+                  'if [ -n "$level" ]; then '
+                  'exec nice -n "$level" sh -c '
+                  '\'cut -d" " -f19 /proc/$$/stat\'; '
+                  'else cut -d" " -f19 /proc/$$/stat; fi')
+        proc = run_sourced(script, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        return int(proc.stdout.strip())
+
+    def test_joint_nice_empty_runs_at_parent_priority(self):
+        parent = os.getpriority(os.PRIO_PROCESS, 0)
+        self.assertEqual(self.spawned_child_nice({"JOINT_NICE": ""}),
+                         parent)
+
+    def test_joint_nice_level_shifts_child_priority(self):
+        parent = os.getpriority(os.PRIO_PROCESS, 0)
+        self.assertEqual(self.spawned_child_nice({"JOINT_NICE": "-n 5"}),
+                         min(parent + 5, 19))
+
+    def test_validate_params_rejects_bad_joint_nice(self):
+        for value in ("-n x", "5", "-n 5 -n 6"):
+            with self.subTest(value=value):
+                proc = run_sourced('validate_params',
+                                   env={"JOINT_NICE": value})
+                self.assertNotEqual(proc.returncode, 0, value)
+        for value in (None, "", "-n -5", "-n 0"):
+            with self.subTest(value=value):
+                env = {} if value is None else {"JOINT_NICE": value}
+                proc = run_sourced('validate_params', env=env)
+                self.assertEqual(proc.returncode, 0, proc.stderr)
+
+    def test_bad_joint_nice_is_exit_2(self):
+        with tempfile.TemporaryDirectory(prefix="jtp-cli-") as tmp:
+            proc = run_script(["/bin/true", tmp],
+                              env={"JOINT_NICE": "bogus"})
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("JOINT_NICE", proc.stderr)
 
     def test_start_intruder_is_off_unless_requested(self):
         with tempfile.TemporaryDirectory(prefix="jtp-intr-") as tmp:

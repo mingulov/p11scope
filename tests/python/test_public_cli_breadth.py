@@ -787,6 +787,145 @@ class Gated32FixtureTests(unittest.TestCase):
             self.assertEqual(row["successful"], 3)
 
 
+PROVIDER_MT = r'''
+#include <stdlib.h>
+typedef unsigned long U;
+typedef struct { U slotID; U state; U flags; U ulDeviceError; } INFO;
+U C_Initialize(void *a){(void)a;return 0;}
+U C_Finalize(void *a){(void)a;return 0;}
+U C_GetSlotList(unsigned char t,U *s,U *n){(void)t;s[0]=1;*n=1;return 0;}
+U C_OpenSession(U a,U b,void *c,void*d,U*s){(void)a;(void)b;(void)c;(void)d;*s=7;return 0;}
+U C_CloseSession(U s){(void)s;return 0;}
+U C_GetSessionInfo(U s,INFO*i){i->slotID=1;i->state=0;i->flags=6;i->ulDeviceError=(U)(s!=7);return 0;}
+U C_GenerateRandom(U s,unsigned char*b,U n){(void)b;(void)n;return s==0xDEADBEEFUL?0xB3:0;}
+U C_DigestInit(U s,void*m){(void)s;(void)m;return 0;}
+U C_DigestUpdate(U s,unsigned char*b,U n){(void)s;(void)b;(void)n;return 0;}
+U C_DigestFinal(U s,unsigned char*b,U*l){(void)s;(void)b;*l=32;return 0;}
+U C_FindObjectsInit(U s,void*t,U n){(void)s;(void)t;(void)n;return 0;}
+U C_FindObjects(U s,U*o,U n,U*c){(void)s;(void)o;(void)n;*c=0;return 0;}
+U C_FindObjectsFinal(U s){(void)s;return 0;}
+struct { unsigned char version[8]; void *p[68]; } list={.version={2,40},.p={
+ [0]=C_Initialize,[1]=C_Finalize,[4]=C_GetSlotList,[12]=C_OpenSession,
+ [13]=C_CloseSession,[15]=C_GetSessionInfo,[26]=C_FindObjectsInit,
+ [27]=C_FindObjects,[28]=C_FindObjectsFinal,[37]=C_DigestInit,
+ [39]=C_DigestUpdate,[41]=C_DigestFinal,[64]=C_GenerateRandom}};
+U C_GetFunctionList(void**out){*out=&list;return 0;}
+'''
+
+PROVIDER_MT_ALWAYS_OK = PROVIDER_MT.replace(
+    "return s==0xDEADBEEFUL?0xB3:0;", "return 0;")
+
+
+def parse_mt_output(text):
+    lines = text.splitlines()
+    targets = [json.loads(line[7:]) for line in lines if line.startswith("TARGET ")]
+    ready = [line for line in lines if line.startswith("READY pid=")]
+    ledgers = [json.loads(line[7:]) for line in lines if line.startswith("LEDGER ")]
+    return targets, ready, ledgers
+
+
+def check_mt_ledger(testcase, ledger, pid, calls, errors):
+    testcase.assertEqual(ledger["schema"], "p11scope/public-cli-ledger/v2")
+    testcase.assertEqual(ledger["pid"], pid)
+    testcase.assertTrue(ledger["complete"])
+    testcase.assertEqual([row["name"] for row in ledger["functions"]], list(MT_NAMES))
+    for i, row in enumerate(ledger["functions"]):
+        want_errors = errors if i == 0 else 0
+        testcase.assertEqual(row["attempts"], calls + want_errors, row["name"])
+        testcase.assertEqual(row["successful"], calls, row["name"])
+        testcase.assertEqual(row["rv_counts"].get("0x0000000000000000"), calls, row["name"])
+        if want_errors:
+            testcase.assertEqual(row["rv_counts"].get("0x00000000000000b3"), want_errors,
+                                 row["name"])
+        else:
+            testcase.assertNotIn("0x00000000000000b3", row["rv_counts"], row["name"])
+
+
+class MtFixtureTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.storage = tempfile.TemporaryDirectory()
+        cls.tmp = Path(cls.storage.name)
+        for name, source in (("provider-mt.c", PROVIDER_MT),
+                             ("provider-mt-ok.c", PROVIDER_MT_ALWAYS_OK)):
+            (cls.tmp / name).write_text(source)
+        cls.module = cls.tmp / "provider-mt.so"
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O0", "-o", str(cls.module),
+                        str(cls.tmp / "provider-mt.c")], check=True)
+        cls.ok_module = cls.tmp / "provider-mt-ok.so"
+        subprocess.run(["gcc", "-shared", "-fPIC", "-O0", "-o", str(cls.ok_module),
+                        str(cls.tmp / "provider-mt-ok.c")], check=True)
+        flags = ["-O2", "-Wall", "-Wextra", "-Werror"]
+        subprocess.run(["gcc", *flags, "-o", str(cls.tmp / "mt_mixed"),
+                        str(ROOT / "tests/fixtures/public-cli/mt_mixed.c"),
+                        "-ldl", "-lpthread"], check=True)
+        subprocess.run(["gcc", *flags, "-o", str(cls.tmp / "mt_fork"),
+                        str(ROOT / "tests/fixtures/public-cli/mt_fork.c"),
+                        "-ldl", "-lpthread"], check=True)
+        cls.gate = cls.tmp / "gate"
+        cls.gate.touch()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.storage.cleanup()
+
+    def run_mixed(self, module, *args):
+        return subprocess.run([str(self.tmp / "mt_mixed"), str(module), *args],
+                              capture_output=True, text=True, timeout=60)
+
+    def test_sessions_mode_ledgers_exact_totals(self):
+        proc = self.run_mixed(self.module, "8", "50", str(self.gate), "sessions", "3")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        targets, ready, ledgers = parse_mt_output(proc.stdout)
+        self.assertEqual({row["name"] for row in targets}, set(MT_NAMES))
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(len(ledgers), 1)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 8 * 3)
+
+    def test_shared_mode_ledgers_exact_totals(self):
+        proc = self.run_mixed(self.module, "8", "50", str(self.gate), "shared", "0")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, ready, ledgers = parse_mt_output(proc.stdout)
+        self.assertEqual(len(ledgers), 1)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 0)
+
+    def test_churn_mode_ledgers_exact_totals(self):
+        proc = self.run_mixed(self.module, "8", "50", str(self.gate), "churn", "2")
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        _, ready, ledgers = parse_mt_output(proc.stdout)
+        self.assertEqual(len(ledgers), 1)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 8 * 50, 8 * 2)
+
+    def test_churn_rejects_odd_iterations(self):
+        proc = self.run_mixed(self.module, "8", "51", str(self.gate), "churn", "0")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("LEDGER ", proc.stdout)
+
+    def test_churn_rejects_odd_errors(self):
+        proc = self.run_mixed(self.module, "8", "50", str(self.gate), "churn", "1")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("LEDGER ", proc.stdout)
+
+    def test_error_probe_that_succeeds_fails_loud(self):
+        # The always-OK provider breaks the error script: no LEDGER may print.
+        proc = self.run_mixed(self.ok_module, "4", "10", str(self.gate), "sessions", "2")
+        self.assertNotEqual(proc.returncode, 0)
+        self.assertNotIn("LEDGER ", proc.stdout)
+
+    def test_fork_merges_multiprocess_totals(self):
+        proc = subprocess.run([str(self.tmp / "mt_fork"), str(self.module),
+                               "2", "4", "25", str(self.gate), "2"],
+                              capture_output=True, text=True, timeout=60)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        targets, ready, ledgers = parse_mt_output(proc.stdout)
+        self.assertEqual({row["name"] for row in targets}, set(MT_NAMES))
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(len(ledgers), 1)
+        children = [line for line in proc.stdout.splitlines() if line.startswith("CHILD pid=")]
+        self.assertEqual(len(children), 2)
+        check_mt_ledger(self, ledgers[0], int(ready[0].split("=")[1]), 2 * 4 * 25, 2 * 4 * 2)
+
+
 class MtOracleTests(unittest.TestCase):
     """Multi-threaded same-provider exact cells: every count, error and
     return-value assertion has a healthy twin and a failing twin."""

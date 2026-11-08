@@ -2734,6 +2734,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
                 path: Some("/usr/bin/canary-app".into()),
             }),
             app_hint: None,
+            launched_by: Vec::new(),
+            launcher_gap: None,
             exec_observed: false,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

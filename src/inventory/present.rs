@@ -25,8 +25,9 @@ use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, Regis
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
     CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending,
-    MappingState, ModuleId, ModuleLifecycle, ModuleRecord, NO_MAPPING_EDGE, ProcessSource,
-    SEMANTIC_UNKNOWN, UnboundPid, UnknownReason, UseCoverage, module_init,
+    LauncherAncestor, LauncherGap, MappingState, ModuleId, ModuleLifecycle, ModuleRecord,
+    NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnboundPid, UnknownReason, UseCoverage,
+    module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -250,6 +251,8 @@ pub(crate) struct CallerView {
     pub incarnation: u32,
     pub exe: Option<ExeIdentity>,
     pub app_hint: Option<crate::app_hint::AppHint>,
+    pub launched_by: Vec<LauncherAncestor>,
+    pub launcher_gap: Option<LauncherGap>,
     pub exec_observed: bool,
     pub authority: ImageAuthority,
     pub lifecycle: CallerLifecycle,
@@ -761,6 +764,8 @@ impl Presentation {
                 incarnation: record.incarnation,
                 exe: record.exe.clone(),
                 app_hint: record.app_hint.clone(),
+                launched_by: record.launched_by.clone(),
+                launcher_gap: record.launcher_gap.clone(),
                 exec_observed: record.exec_observed,
                 authority: record.authority,
                 lifecycle: record.lifecycle,

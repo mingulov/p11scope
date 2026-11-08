@@ -124,7 +124,6 @@ pub(crate) struct ExeIdentity {
 /// `None` in this lane; the app-identity lane fills interpreter labels
 /// without touching capture.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // Capture lands before its JSON/text readers; the JSON commit removes this.
 pub(crate) struct LauncherAncestor {
     pub pid: u32,
     pub start_time: Option<u64>,
@@ -134,7 +133,6 @@ pub(crate) struct LauncherAncestor {
 
 /// Why a launcher chain stops before a root: a named gap, never a guess.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // See `LauncherAncestor`.
 pub(crate) struct LauncherGap {
     pub subject: &'static str,
     pub reason: String,
@@ -212,10 +210,8 @@ pub(crate) struct CallerRecord {
     pub app_hint: Option<crate::app_hint::AppHint>,
     /// The launcher chain (nearest first), captured at admission; frozen
     /// evidence like the exe identity above.
-    #[allow(dead_code)] // See `LauncherAncestor`.
     pub launched_by: Vec<LauncherAncestor>,
     /// Why the chain stops before a root, if it does.
-    #[allow(dead_code)] // See `LauncherAncestor`.
     pub launcher_gap: Option<LauncherGap>,
     /// False when the exe identity was unreadable at admission: exec
     /// changes are then undetectable and the record says so.

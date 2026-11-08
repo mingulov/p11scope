@@ -1386,6 +1386,8 @@ pub(crate) fn scripted_promotion_view_with_baseline_for_test(
             incarnation,
             exe: None,
             app_hint: None,
+            launched_by: Vec::new(),
+            launcher_gap: None,
             exec_observed: true,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

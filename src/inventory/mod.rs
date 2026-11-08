@@ -8697,12 +8697,35 @@ fn caller_json(
             "path": exe.path,
         })
     });
+    let launched_by: Vec<serde_json::Value> = record
+        .launched_by
+        .iter()
+        .map(|ancestor| {
+            let mut item = serde_json::json!({
+                "pid": ancestor.pid,
+                "start_time": ancestor.start_time,
+                "exe": ancestor.exe,
+            });
+            if let Some(label) = ancestor.label.as_deref() {
+                item["label"] = serde_json::Value::from(label);
+            }
+            item
+        })
+        .collect();
+    let launched_by_gap = record.launcher_gap.as_ref().map(|gap| {
+        serde_json::json!({
+            "subject": gap.subject,
+            "reason": gap.reason,
+        })
+    });
     let mut value = serde_json::json!({
         "id": record.id.label(),
         "pid": record.pid,
         "start_time": record.start_time,
         "start_time_unit": "clock_ticks_since_boot",
         "incarnation": record.incarnation,
+        "launched_by": launched_by,
+        "launched_by_gap": launched_by_gap,
         "image": {
             "authority": record.authority.label(),
             "task_cookie": task_cookie,

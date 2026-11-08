@@ -281,6 +281,14 @@ judge() {
   if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)
   fi
+  # Flake-66: the 6.6 leg rarely reports PARTIAL with exactly one
+  # redacted discovery skip on select-endpoint-system (short-lived
+  # kernel tasks racing system discovery while every count stays
+  # exact). Disclose exactly that record on 6.6 kernels; every other
+  # cell and kernel stays strict, and any other gap still fails.
+  if [ "${4:-}" = select-endpoint-system ] && [[ $(uname -r) =~ ^6\.6\. ]]; then
+    extra+=(--allow-66-discovery-gap)
+  fi
   local out rc
   case "${4:-}" in
     inventory-mt-*)

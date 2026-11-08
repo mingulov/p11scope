@@ -64,7 +64,9 @@ which describes its development implementation pending privacy review and
 installed qualification,
 and [copy-up layer publication](#copy-up-layer-publication-f11-2026-11-07),
 which attributes a witness-proven pre-copy-up lower file as its own
-module row with the finite `pre_copy_up` marker.**
+module row with the finite `pre_copy_up` marker,
+and [caller launcher chain](#caller-launcher-chain-v070),
+which publishes the implemented per-caller parentage below.**
 Apart from those sections, this document does not enable capture, describe
 implemented fields, or qualify a release. The implemented contracts remain
 [v1](allowlist-v1.md) and [v2](allowlist-v2.md), whose bytes and existing
@@ -2003,3 +2005,23 @@ merge path is published, never lowerdir host paths.
 | --- | --- | --- | --- |
 | Lower module row (merge path plus lower identity) | The lower file the kernel VMA witness proved for the stale range: opened by descriptor, whole-file SHA-256 at pin time, `(ino, size, ctime)` re-checks, and ELF re-inspection from the lower fd — the same custody as any provider file. Upper offsets are never reused for it. The row exists only on a kernel `same_file` proof for a lower candidate; an unproven, unopenable, escaped, or budget-exhausted candidate keeps the named gap, never a join. | A second module row beside the upper file's, in `evidence.discovery[]` (profile/metrics), `inspect --pid` modules, and the `inspect --system` catalog. Both rows publish the merge path and the shared merge-view key `{dev, ino}` under the existing module-identity fields; `sha256` and `build_id` are read from each row's own file, and only the lower row carries `layer` — digest and layer tell the two rows apart whenever the copy-up changed a byte (a byte-identical copy-up still admits the pair, differing only by `layer`). `functions[].module` joins either row by identity, so stale-mapping calls count on the lower edge and fresh calls on the upper edge. `capture.modules[]` stays the identity-only projection. A fallback search that proves no lower file publishes only the refused count and the finite stage words in the gap reason (`; lower candidates refused: N (stage; ...)` — the first eight stages in search order, any rest counted). The words print in the order candidates were tried, so a word's position reflects the search order, and they name the witness's other-file outcome where it occurred; no candidate path or numeric index is published. | No lowerdir host path, candidate list, candidate path, numeric candidate index, range, address, PID, argv, environ, PIN, key or payload value reaches output. A genuine in-place change (no witness proof) still blocks with the existing changed-identity refusal. Required evidence: the stale-mapper acceptance with 2 witness queries, the lower/upper routing twins, the in-place-change refusal twin, the budget-exhaustion gap twin, the unopenable/escaped-candidate refusal twins, and the matching shapes in `docs/schema/observed-profile-v3.md` and `docs/schema/inspect-v1.md`. |
 | Finite layer marker (`layer: "pre_copy_up"`) | A pure projection of the pin's proven side: present exactly on rows whose pinned object is the witness-proven pre-copy-up file. One finite value; no target read happens for this key. | JSON `"layer": "pre_copy_up"` on the lower file's module row only (absent — never null — on every ordinary row); verbose text marks the row `(file before copy-up)`; concise text shows the same counts unmarked. | No second value exists; an unproven side never carries the marker. Required evidence: the marker serialization twins (profile, inspect JSON, catalog), the verbose-marker twins, and the concise-silence twins. |
+
+## Caller launcher chain (v0.7.0)
+
+**Status: IMPLEMENTED on this branch; the v0.7.0 parent-chain lane
+captures the rows below, pending independent review and merge.**
+It adds no target-memory, argument, command-line or environment
+capture: every field comes from `/proc` stat/exe reads of the same
+kind the inventory scan lane already makes for callers, and it changes
+no v1/v2 exclusion (trace, profile, metrics and inspect outputs are
+untouched).
+
+| Field | Source, authority and validation | Retention and public output | Failure and required evidence |
+| --- | --- | --- | --- |
+| Caller launcher chain (`launched_by`, `launched_by_gap`) | The caller's ppid (stat field 4) from the SAME `/proc/<pid>/stat` line already read for its start_time, so pid reuse between two reads cannot mix generations; then up to four ancestors, nearest first, each as a (pid, start_time) generation with its exe basename from `/proc/<ppid>/stat` (starttime plus ppid) and the `/proc/<ppid>/exe` link (readlink, the same read kind as caller exe identity). The walk stops at pid 1 and at ppid 0 (no parent in this pid namespace). No `cmdline`, `environ`, argument or memory read, and no retained or published `comm` (each stat line is parsed around the comm field, discarding it). The native lane adds none: no BPF parent record exists, and short-lived parents that exit before the scan read are reported, not reconstructed. | Public per caller incarnation in `p11scope/inventory/v1` (`callers[].launched_by`: `pid`, `start_time` in `clock_ticks_since_boot`, exe basename `exe`, optional `label` hook unset in v0.7.0; `callers[].launched_by_gap` with `subject` `caller parent chain` and a named `reason`), the inventory event stream's caller records (same producer), the `-v` chain detail line, and the concise one-hop suffix (`app (from parent)`, only when a non-init parent was recorded). PIDs are in the observer's `/proc` numbering (`pid_namespace`). Chains are frozen at admission like exe identity. | An unreadable ancestor is a named gap with the ancestors read so far, never a guess: `parent unknown: exited before read` when the generation is provably gone, else `parent unknown: unreadable /proc entry`; a fifth ancestor above the fourth is `parent chain truncated after 4 ancestors`; cgroup-transaction commits sample no parentage (`parent chain not sampled in cgroup transaction`). An unreadable exe link is a null `exe`, never a guessed name. Documented in [inventory v1](../schema/inventory-v1.md#model). |
+
+Command lines, environments, arguments, `comm` values, session IDs and
+full ancestor paths are never read or published in this lane: the
+basename is the whole exe fact. A recorded parent proves process
+parentage at admission, not operator attestation and not that the
+parent invoked PKCS#11. Counts and caller identity never change.

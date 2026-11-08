@@ -9812,6 +9812,37 @@ fn allowlist_v3_names_the_app_identity_hint_rows() {
     }
 }
 
+/// The caller launcher chain has its own allowlist-v3 row: the status
+/// paragraph lists the section, its anchor matches the heading, and the
+/// row names the exact fields, the same-line stat source, the published
+/// outputs and the never-read subjects.
+#[test]
+fn allowlist_v3_names_the_caller_launcher_chain_row() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## Caller launcher chain (v0.7.0)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the caller launcher chain section"
+    );
+    assert!(
+        text.contains("[caller launcher chain](#caller-launcher-chain-v070)"),
+        "the status paragraph must list the caller launcher chain section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "launched_by",
+        "launched_by_gap",
+        "field 4",
+        "No `cmdline`, `environ`",
+        "parent unknown: exited before read",
+        "parent chain truncated after 4 ancestors",
+        "parent chain not sampled in cgroup transaction",
+        "never read or published",
+    ] {
+        assert!(flat.contains(marker), "the chain row must name {marker:?}");
+    }
+}
+
 /// F16 residual (review item 1): the allowlist-v3 PQC section states the
 /// implemented publication rule — the field publishes the classified code
 /// `1..=12` whenever the word is in range, whatever the key type, and only

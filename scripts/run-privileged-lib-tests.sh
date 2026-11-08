@@ -49,6 +49,12 @@
 #     with cc (scripts/ci/build-counter-fixtures.sh) and points these at
 #     the provider/driver pairs for the counter-bank default cells.
 #     Without cc those cells SKIP with a reason instead of failing.
+#   P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR: the runner builds the 97
+#     prebuilt32-object inputs (scripts/ci/build-wrap-fixtures.sh) and
+#     points this at them for the diagnostics-wrap long cells. An
+#     already-set directory (a controller-delivered verified prebuilt)
+#     is used as is and nothing is rebuilt. Without cc or python3
+#     those cells SKIP with a reason instead of failing.
 #   CARGO_TARGET_TMPDIR: the runner points this at an
 #     owned-child-writable dir under OUTDIR for the owned-child counter
 #     run cell only; every other cell inherits the ambient value.
@@ -585,6 +591,22 @@ metrics::counter_reader::tests::counter_cli_profile_timestamps_matches_workload_
 metrics::counter_reader::tests::counter_cli_profile_latency_matches_workload_ledger_lp64
 metrics::counter_reader::tests::selected_detail_cli_profile_counts_resolves_live_plan_and_conserves_aggregate_lp64
 metrics::counter_reader::tests::selected_detail_system_scope_refuses_live_plan_lp64
+)
+
+# Wrap-fixture membership: the LONG_TESTS members that need the
+# runner-built P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR inputs (not a
+# campaign list: every member also runs as a long cell). The runner
+# builds the fixtures when any member is selected and no directory is
+# already set, points the variable at them for exactly these cells,
+# and SKIPs them (with a reason) when cc or python3 is missing.
+WRAP_FIXTURE_TESTS=(
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_startup_probe_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_transition_pilot_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_accelerated_pilot_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_gate_cadence_probe_lp64
+inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_pid_diagnostics_three_round_default_cadence_control_lp64
 )
 
 # Feature-alternative load gates: exactly one exists per binary. Default
@@ -1278,10 +1300,11 @@ main() {
     local m32_ok=0 p11kit_ok=0 need_m32=0 need_p11kit=0
     local need_ext4loop=0 ext4loop_skip=
     local need_counter=0 counter_skip=
+    local need_wrap=0 wrap_skip=
     local need_btrfs_run=0 btrfs_mnt='' btrfs_skip=''
     local need_target_tmp=0 target_tmpdir=
     local cell_tmpdir
-    local -A counter_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
+    local -A counter_fixture_set=() wrap_fixture_set=() btrfs_set=() xfail_reason=() xfail_sig=()
     local -a cell_env=()
 
     if [ $# -eq 0 ]; then
@@ -1517,6 +1540,7 @@ main() {
     # mkfs.btrfs) SKIPs the affected cells with a reason; a failure with
     # the tools present fails the run loudly.
     for name in "${COUNTER_FIXTURE_TESTS[@]}"; do counter_fixture_set[$name]=1; done
+    for name in "${WRAP_FIXTURE_TESTS[@]}"; do wrap_fixture_set[$name]=1; done
     for name in "${BTRFS_TESTS[@]}" "${BTRFS_TMPDIR_XFAIL_TESTS[@]}"; do btrfs_set[$name]=1; done
     for i in "${!EXPECTED_FAILURE_TESTS[@]}"; do
         xfail_reason[${EXPECTED_FAILURE_TESTS[$i]}]=${XFAIL_REASONS[$i]}
@@ -1524,6 +1548,7 @@ main() {
     done
     for name in ${selected_runnable[@]+"${selected_runnable[@]}"}; do
         if [ -n "${counter_fixture_set[$name]+present}" ]; then need_counter=1; fi
+        if [ -n "${wrap_fixture_set[$name]+present}" ]; then need_wrap=1; fi
         if [ -n "${btrfs_set[$name]+present}" ]; then need_btrfs_run=1; fi
         if [ "$name" = "metrics::counter_reader::tests::counter_cli_run_counts_with_owned_child_lp64" ]; then
             need_target_tmp=1
@@ -1546,6 +1571,20 @@ main() {
                     return 1
                 fi
             done
+        fi
+    fi
+    if [ "$need_wrap" -eq 1 ] && [ -z "${P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR:-}" ]; then
+        "$REPO_ROOT/scripts/ci/build-wrap-fixtures.sh" "$outdir/wrap-fixtures" \
+            >"$tmpdir/wrap-fixtures.log" 2>&1
+        rc=$?
+        if [ "$rc" -eq 77 ]; then
+            wrap_skip="cc or python3 cannot build the wrap fixtures ($(tail -n 1 "$tmpdir/wrap-fixtures.log"))"
+        elif [ "$rc" -ne 0 ]; then
+            echo "$PROG: wrap fixture build failed, see $tmpdir/wrap-fixtures.log" >&2
+            return 1
+        elif [ ! -x "$outdir/wrap-fixtures/workload" ]; then
+            echo "$PROG: fixture build reported success but workload is missing" >&2
+            return 1
         fi
     fi
     if [ "$need_target_tmp" -eq 1 ]; then
@@ -1653,6 +1692,16 @@ main() {
                 P11SCOPE_COUNTER_BANK_FIXTURE_WORKLOAD="$outdir/counter-fixtures/counter-bank-driver"
                 P11SCOPE_COUNTER_GROWTH_FIXTURE_PROVIDER="$outdir/counter-fixtures/counter-bank-growth-provider.so"
                 P11SCOPE_COUNTER_GROWTH_FIXTURE_WORKLOAD="$outdir/counter-fixtures/counter-bank-growth-driver")
+        fi
+        if [ -n "${wrap_fixture_set[$name]+present}" ]; then
+            if [ -n "$wrap_skip" ]; then
+                echo "SKIP $name :: $wrap_skip" | tee -a "$results"
+                skipped=$((skipped + 1))
+                continue
+            fi
+            if [ -z "${P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR:-}" ]; then
+                cell_env+=(P11SCOPE_DIAGNOSTICS_WRAP_PREBUILT_DIR="$outdir/wrap-fixtures")
+            fi
         fi
         if [ -n "${btrfs_set[$name]+present}" ]; then
             if [ -n "$btrfs_skip" ]; then

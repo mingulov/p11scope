@@ -2716,7 +2716,9 @@ fn has_unattested_provider(ev: &Evidence) -> bool {
 /// Prints only when unverified slots remain and at least one mapped
 /// provider lacks any manifest source; partial manifest coverage keeps
 /// the machine fragment alone. Human text only; the JSON is unchanged.
-fn unattributed_provider_line(ev: &Evidence) -> String {
+/// Concise states the fact; the `--manifest` remedy lives once in the
+/// coverage line, with verbose repeating it here.
+fn unattributed_provider_line(ev: &Evidence, verbose: bool) -> String {
     if ev.semantic_unverified_slots == 0 || !has_unattested_provider(ev) {
         return String::new();
     }
@@ -2741,9 +2743,14 @@ fn unattributed_provider_line(ev: &Evidence) -> String {
     } else {
         shown.join(", ")
     };
+    let remedy = if verbose {
+        " — rerun with --manifest for each mapped provider file"
+    } else {
+        ""
+    };
     format!(
         "Attribution: {} of {} mapped provider file{} {} no manifest ({}); counts are exact, \
-         names are unconfirmed — rerun with --manifest for each mapped provider file.\n",
+         names are unconfirmed{remedy}.\n",
         unattested.len(),
         modules.len(),
         if modules.len() == 1 { "" } else { "s" },
@@ -2908,7 +2915,7 @@ pub fn scope_summary_with_verbosity(
     text.push_str(&coverage_line(ev, verbose));
     text.push('\n');
     if verbosity != TextVerbosity::Quiet {
-        text.push_str(&unattributed_provider_line(ev));
+        text.push_str(&unattributed_provider_line(ev, verbose));
         if let Some(hint) = forwarding_suggestion(reports, &ev.discovery.modules, &forwarding) {
             text.push_str(&hint);
             text.push('\n');
@@ -3277,9 +3284,16 @@ pub fn live_scoped_with_verbosity(
         // none for the observed calls. The manifest remedy prints only
         // while a mapped provider actually lacks one.
         if ev.semantic_unverified_slots > 0 && has_unattested_provider(ev) {
+            // Concise points at Coverage for the one remedy; verbose
+            // repeats the remedy here beside the fact.
+            let remedy = if verbosity == crate::cli::TextVerbosity::Verbose {
+                "; add --manifest for each mapped provider file"
+            } else {
+                ""
+            };
             s.push_str(&format!(
                 "Mechanisms: none attributed — {} function{} named from the standard table, \
-                 unconfirmed; add --manifest for each mapped provider file (see Coverage).\n",
+                 unconfirmed{remedy} (see Coverage).\n",
                 ev.semantic_unverified_slots,
                 if ev.semantic_unverified_slots == 1 {
                     ""
@@ -9197,7 +9211,8 @@ pub(crate) mod tests {
 
     /// The terminal summary explains withheld attribution in plain words:
     /// how many mapped providers have no manifest at all, naming them, so
-    /// PARTIAL coverage reads as a cause rather than an alarm.
+    /// PARTIAL coverage reads as a cause rather than an alarm. Verbose
+    /// repeats the remedy; concise keeps it once in Coverage.
     #[test]
     fn scope_summary_names_providers_without_manifests() {
         let mut softhsm = discovered_fixture();
@@ -9212,7 +9227,12 @@ pub(crate) mod tests {
         ev.discovery.modules = vec![softhsm, nss];
         ev.semantic_unverified_slots = 212;
         ev.verdict();
-        let text = scope_summary("pid", &reports_fixture(), &ev);
+        let text = scope_summary_with_verbosity(
+            "pid",
+            &reports_fixture(),
+            &ev,
+            crate::cli::TextVerbosity::Verbose,
+        );
         assert!(
             text.contains(
                 "Attribution: 1 of 2 mapped provider files has no manifest (libsoftokn3.so); \

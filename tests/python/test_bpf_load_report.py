@@ -797,6 +797,18 @@ class ReportTests(unittest.TestCase):
         self.assertNotIn("unwired", text)
         self.assertIn("counter-<mode>-probe-", text)
 
+    def test_driver_comment_records_the_rc_default_decision(self):
+        # v7.4-rc1 stays out of the local-qualification defaults by
+        # decision (an -rc joins only when its final ships), while CI
+        # runs it as an extra matrix cell. The 7.3.1 precedent extended
+        # the defaults, so the deviation must say so next to them.
+        self.assertTrue(DRIVER.is_file(),
+                        "scripts/check-bpf-load-kernels.sh is missing")
+        text = DRIVER.read_text(encoding="ascii")
+        self.assertIn("v7.3.1 stays the default newest-stable", text)
+        self.assertIn("an -rc joins the defaults only when its final ships",
+                      text)
+
     def test_driver_scores_counter_loads_with_budgets(self):
         # Numeric bank budgets close the missing-program and growth gaps:
         # each mode scores against its counter object under the counter

@@ -109,27 +109,36 @@ before calling a rerun green.
   judged against this systematic difference, not averaged with tip.
 - Disposition: documents the pre-lane base behavior; no gate change.
 
-### `D1-span-b2-entries-race` (tip-only; R3 A/B 3/10, R6 1/20; lane contribution not ruled out)
+### `D1-span-b2-entries-race` (tip-only; R3 A/B 3/10, R6 1/20; root-caused and fixed in R7)
 
 - Signature: B2's span-kernel edge shows `watched_no_use` with 0
   entries (observed across the whole span) while the span profile
   counts the full 6x250 fresh ledger on the same module; the span
   gate wants `not_attached` and refuses.
-- Mechanism: unknown; the entries-observation path attaches to B2's
-  edge mid-span on some runs and then counts nothing. (R3 A/B: tip
-  3/10; base B2 edges read the same state 10/10 but structurally —
-  no pair — not the race.) Pass timing identical
-  to passing runs (B2 ready at passes 6,7; ledger at 8,9). R5
-  analysis of the R3 `ab-spans` narrows it: on the tripped tips
+- Mechanism: joint same-pass fresh admission (root-caused R7), not a
+  torn digest. The twin-start scan (pass 6) sometimes observes the
+  pre AND the plain side of the pair in ONE pass under the empty key
+  0:84; each resolves Fresh-by-content (by_raw empty, so the
+  pair-proof gate never runs) and both admit — B2's mapping gets
+  endpoints and the edge attaches mid-span. Passes that land pre in
+  pass 6 refuse the plain side from pass 7 on
+  (blocked-no-companion, same digest). This explains every R6
+  discriminator (shared first_seen, refusal-free 68-endpoint
+  admission, same final sha256, module-wide flip). The torn-digest
+  lead is refuted: production hash sites reject digests whose pin
+  changed mid-hash, T1-tight shows 0/50000 same-tick stable pins on
+  the D1 stack, a product-faithful `cat`-shape race shows zero torn
+  full-size reads, and no digest besides 8453e1 appears in any
+  campaign. (R3 A/B: tip 3/10; base B2 edges read the same state
+  10/10 but structurally — no pair — not the race.) Pass timing
+  identical to passing runs (B2 ready at passes 6,7; ledger at 8,9).
+  R5 analysis of the R3 `ab-spans` narrows it: on the tripped tips
   (3,4,6) all three edges on B2's module (B-pre, twin, B2) are
   `watched_no_use`, while on passing tips all three are
-  `not_attached` — the flip is module-wide, not B2-specific. Lead:
-  the byte-identical collapse usually suppresses probing on the pair
-  module, yet on some tips the endpoints attach mid-span
-  (`since_ns` ≈ first-mapping + 13–20 s, counting nothing either
-  way); the exact attach trigger is still unknown. R6 adds B2/twin
-  ledger start/end monotonic stamps to `facts.log`, and the oracle
-  now proves calls-before-watch on every trip (refusal message).
+  `not_attached` — the flip is module-wide, not B2-specific. R6 adds
+  B2/twin ledger start/end monotonic stamps to `facts.log`, and the
+  oracle now proves calls-before-watch on every trip (refusal
+  message).
 - R6 measurement (quiet fedora, exclusive lane, tip `03f8182c4`,
   R3 A/B flags): 1/20 trips (run-10; combined with R3: 4/30).
   Run-10's oracle message proves calls-before-watch (B2's ledger
@@ -146,5 +155,49 @@ before calling a rerun green.
   equaling the pre-copy-up merged pin) and the link to B2's
   arrival timing are unproven. Next: capture per-pass attach
   verdicts for the pair module on a tripped run.
-- Disposition: named flake; the span gate stays exact. Needs a root
-  cause before the D1 cell can go green reliably.
+- R7 fix and measurement (quiet fedora, exclusive lane, R3 A/B
+  flags): before (diagnostic build `051a165c9`): 5/20 FAIL, all 5
+  with a surviving pass-6 joint fresh on 0:84 (runs 8, 11, 15-17)
+  and none of the 15 PASS runs with one — 5/5 joint trips, 0/15
+  otherwise. Fix: post-resolve joint arbitration refuses the plain
+  side exactly like sequential passes do, whichever plan order it
+  resolved in, recalling its premature fresh note (`c71cc3b98`),
+  with same-key verdict merging so the admission stands beside the
+  disclosed refusal (`4a7cb54b1`; arbitration alone regressed
+  after-1 to module-refused, so the two ship together). After
+  (complete fix `4a7cb54b1`): 10/20 runs drew a joint landing and
+  all 10 arbitrated (pass 6: one fresh pre=y plus
+  blocked-no-companion pre=n, module admitted with 68 endpoints) —
+  0/10 joint trips, 19/20 PASS; the one FAIL is the unrelated
+  in-place-truncation shape below. Joint detection is fresh pre=y
+  plus blocked-no-companion pre=n in one pass: the arbitration
+  recalls the plain fresh note, so a surviving-note detector is
+  blind to handled joints by construction.
+- Disposition: fixed and live-verified; the span gate stays exact.
+  The R6 D1 blocker is closed. Remaining joint corner (pre-existing,
+  out of scope, never observed): divergent digests with no pre/plain
+  split admitted jointly stay both-Fresh and converge next pass via
+  the changed mark.
+
+### `D1-after-5-in-place-truncation` (counted known issue; 1/20 in the R7 after-campaign)
+
+- Signature: the oracle's single-module assert finds TWO records with
+  B's key — m3 admitted 8453e1 plus a stale m2 `unresolved`,
+  identity sha null, `unloaded_observed`. Unique across all R7 D1
+  evidence: gaps `not parseable as an ELF object: Could not read
+  file magic` (c245) and `module has no comparable pinned identity`
+  (c226, c245). m2 (0:84) is seen at a single instant, one pass
+  after m1's last sighting and one pass before m3; its pass-6 joint
+  landing arbitrates normally, so this FAIL is not a joint trip.
+- Mechanism: the pass-5 scan read B's merged path while the harness
+  rewrote the file in place (`cp` then `cat /tmp/p > "$p"`
+  truncates the upper copy and refills it,
+  `scripts/docker-shared-layer-e2e.sh:1142`). That pass's object had
+  no digest, so the attach set never judged it; the fix acts from
+  pass 6, so it can neither cause nor prevent this. Product output
+  is honest: the record stays unresolved, the gaps are disclosed,
+  its edges are single-instant, and nothing attaches.
+- Disposition: counted campaign FAIL, shipped as a known issue. The
+  harness rewrite stays as is (a real in-place rewrite shape); the
+  product follow-up (fold an undigested record into the same-key
+  digested record) is 0.7.x work. Do not loosen the oracle.

@@ -775,7 +775,11 @@ detail during a counter capture (`--select-endpoint`).
   refusal's stage words (first eight, in stack order, rest counted);
   no path or index is published, never silent; in collapse mode
   spanning upper ranges stay unprobed with the miss disclosed, never
-  counted.
+  counted. While both sides of a same-bytes pair stay mapped, the
+  module's edges read unknown module-wide (callers of the attached
+  pre side included), and the joint arbitration is order-independent
+  within one pass only — a plain side admitted in an earlier pass
+  still leaves a later pre side refused.
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

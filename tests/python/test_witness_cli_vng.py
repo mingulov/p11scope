@@ -53,6 +53,8 @@ mode="${FAKE_VNG_MODE:-all-pass}"
 if [ "$mode" = "rc1" ]; then echo "vng: cannot boot"; exit 1; fi
 release="${kernel#v}"
 [ "$mode" = "wrong-kernel" ] && release="9.9.9"
+[ "$mode" = "rc-triplet" ] && release="7.4.0-070400rc1-generic"
+[ "$mode" = "rc-mismatch" ] && release="7.4.0-070400rc2-generic"
 echo "$release" > "$out/uname.txt"
 if [ "$mode" != "no-results" ]; then
     mkdir -p "$out/cells"
@@ -318,6 +320,36 @@ class WitnessCliScriptTests(unittest.TestCase):
         self.assertTrue(staged.is_file(),
                         "the harness must stage the booted kernel config")
         self.assertEqual(staged.read_text(encoding="utf-8"), config)
+
+    def test_rc_tag_accepts_the_dotted_triplet_release(self):
+        config = "CONFIG_LTO_NONE=y\n"
+        result, _ = self.run_script_with_cache(
+            "v7.4-rc1",
+            {"v7.4-rc1/amd64/boot/config-7.4.0-070400rc1-generic": config},
+            mode="rc-triplet",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_rc_tag_rejects_another_rc_release(self):
+        config = "CONFIG_LTO_NONE=y\n"
+        result, _ = self.run_script_with_cache(
+            "v7.4-rc1",
+            {"v7.4-rc1/amd64/boot/config-7.4.0-070400rc1-generic": config},
+            mode="rc-mismatch",
+        )
+        self.assertEqual(result.returncode, 2, result.stderr)
+        self.assertIn("expected v7.4-rc1", result.stderr)
+
+    def test_partial_release_tags_stay_rejected(self):
+        out = self.work / "out"
+        for tag in ("v7.4", "7.4-rc1", "v7.4-rc"):
+            with self.subTest(tag=tag):
+                result = subprocess.run(
+                    [str(SCRIPT), str(self.testbin), str(out), tag],
+                    capture_output=True, text=True, timeout=30)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("use an explicit stock kernel release",
+                              result.stderr)
 
     def test_missing_kernel_config_is_a_harness_error(self):
         result, _ = self.run_script_with_cache("v6.18.58", {})

@@ -749,7 +749,7 @@ fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
 pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
-    _admitted_start_time: Option<u64>,
+    admitted_start_time: Option<u64>,
 ) -> Option<AppHint> {
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
@@ -773,6 +773,12 @@ pub(crate) fn sample_for_pid(
     // generation only if neither changed under the reads.
     let current = crate::discovery::caller_registry::read_exe_identity(pid)?;
     if current != *exe {
+        return None;
+    }
+    // The generation admission pinned must be the generation sampled:
+    // with the intact check below this requires
+    // before == after == admitted.
+    if admitted_start_time != start_before {
         return None;
     }
     if !sampled_generation_intact(start_before, crate::process::process_start_time(pid).ok()) {

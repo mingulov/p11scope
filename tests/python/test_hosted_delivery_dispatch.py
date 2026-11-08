@@ -177,6 +177,13 @@ sys.stdout.write(answer.stdout)
         self.assertEqual(output, {})
         self.assertEqual(calls, [])
 
+    def test_ordinary_ci_never_holds_package_publish_rights(self):
+        text = (ROOT / ".github/workflows/ci.yml").read_text()
+        self.assertNotIn("packages: write", text,
+                         "ordinary push CI must never hold package-publish rights; "
+                         "registry publishing lives in the tag-triggered "
+                         "container-publish workflow only")
+
 
 if __name__ == "__main__":
     unittest.main()

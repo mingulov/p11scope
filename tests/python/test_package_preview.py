@@ -428,7 +428,7 @@ else:
         self.assertEqual(str(inputs["jobs"]["default"]), "2")
         self.assertEqual(document["permissions"], {"contents": "read", "actions": "read"})
         self.assertEqual(set(document["jobs"]), {"validate", "package", "attest", "install-test",
-                                                "container-image", "container-push"})
+                                                "container-image"})
         standard = yaml.safe_load((ROOT / ".github/workflows/ci.yml").read_text())
         ordinary = set(standard["jobs"]) - {"contracts", "coverage", "privileged-e2e", "release-preview", "quarantine",
                                              "package-delivery", "docker-delivery", "kubernetes-delivery"}
@@ -448,15 +448,23 @@ else:
                 if "uses" in item:
                     self.assertIn(item["uses"], pins, f"unreviewed action in {name}")
         # Attestation writes stay on the attest job only; nothing else gains
-        # id-token or attestations. The registry write stays on the
-        # container-push job only; the image build itself inherits the
-        # read-only top level and can never push.
+        # id-token or attestations. The registry write lives in the
+        # tag-triggered container-publish workflow only: this reusable
+        # workflow (called by ordinary push CI) must never hold
+        # packages:write, or the caller grant would hand publish rights to
+        # every push run. The image build itself inherits the read-only top
+        # level and can never push.
         self.assertEqual(document["jobs"]["attest"]["permissions"],
                          {"contents": "read", "actions": "read",
                           "id-token": "write", "attestations": "write"})
-        self.assertEqual(document["jobs"]["container-push"]["permissions"],
-                         {"contents": "read", "actions": "read",
-                          "packages": "write"})
+        for name, job in document["jobs"].items():
+            self.assertNotIn("packages", job.get("permissions", {}),
+                             f"{name} must never hold packages:write")
+        self.assertNotIn("packages", document["permissions"])
+        self.assertNotIn("docker push", WORKFLOW.read_text(),
+                         "only container-publish may push")
+        self.assertNotIn("ghcr.io", WORKFLOW.read_text(),
+                         "only container-publish may name the registry")
         for name in ("validate", "package", "install-test", "container-image"):
             self.assertNotIn("permissions", document["jobs"][name],
                              f"{name} must inherit the read-only top-level permissions")
@@ -511,8 +519,8 @@ else:
         # The base image reference stays single-sourced in the Dockerfile;
         # the job parses it out instead of carrying its own copy.
         self.assertIn("FROM", bodies)
-        self.assertNotIn("docker push", bodies, "only container-push may push")
-        self.assertNotIn("ghcr.io", bodies, "only container-push may name the registry")
+        self.assertNotIn("docker push", bodies, "only container-publish may push")
+        self.assertNotIn("ghcr.io", bodies, "only container-publish may name the registry")
         # Smoke: the image runs the observer entrypoint, reports doctor and
         # completes a short inventory --system with SoftHSM on the runner.
         for marker in ("docker run", "--version", "doctor", "inventory --system",
@@ -522,8 +530,9 @@ else:
         self.assertEqual(len(uploads), 1)
         self.assertEqual(uploads[0]["with"].get("name"), "container-image-tarball")
         self.assertEqual(uploads[0]["with"].get("if-no-files-found"), "error")
-        # The push job must re-identify the exact built bytes after loading
-        # the tarball, never push by tag alone.
+        # The saved tarball carries the image ID beside the bytes so the
+        # smoke-tested bytes stay identifiable; publishing (with its own
+        # re-identification) lives in container-publish.yml.
         self.assertIn("image-id", bodies)
 
     def test_container_image_selects_only_the_observer_tarball(self):
@@ -542,30 +551,6 @@ else:
         # one, or the `test "$#" -eq 1` gate fails the job on every run.
         selected = sorted(path.name for path in fixture.glob(patterns[0]))
         self.assertEqual(selected, [observer])
-
-    def test_container_push_reaches_the_registry_only_on_a_release_tag(self):
-        self.assertTrue(WORKFLOW.is_file(), "the package-only workflow is missing")
-        document = workflow()
-        push = document["jobs"]["container-push"]
-        self.assertEqual(push["needs"], "container-image")
-        gate = push.get("if", "")
-        for marker in ("github.ref_type == 'tag'", "refs/tags/v",
-                       "github.repository == 'mingulov/p11scope'"):
-            self.assertIn(marker, gate, f"container-push must gate on {marker}")
-        downloads = [item for item in push["steps"] if "download-artifact" in item.get("uses", "")]
-        self.assertEqual(len(downloads), 1)
-        self.assertEqual(downloads[0]["with"].get("name"), "container-image-tarball")
-        bodies = "\n".join(item.get("run", "") for item in push["steps"])
-        for marker in ("docker load", "docker tag", "docker login ghcr.io",
-                       "ghcr.io/mingulov/p11scope", "docker push"):
-            self.assertIn(marker, bodies, f"container-push must {marker}")
-        # The published tag is the release tag without its leading v, and
-        # only a final X.Y.Z release tag publishes (no release candidates):
-        # the job gate admits any v* tag, so this in-step regex is the whole
-        # RC guard and is pinned verbatim.
-        self.assertIn('GITHUB_REF_NAME', bodies)
-        self.assertIn(r'[[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]', bodies)
-
 
 if __name__ == "__main__":
     unittest.main()

@@ -5847,3 +5847,158 @@ fn privileged_witness_calibration_accepts_xino_overlay_files() {
     );
     eprintln!("WITNESS_XINO modes=on rows=lower,upper,cup verdict=calibrated");
 }
+
+/// Copy-up between the witness start and the pre-arm pin must refuse the
+/// ordering proof: the witness watches the lower backing inode while the
+/// pin opens the copied-up file, so condition 4 (witness fd identity vs
+/// the pin's held baseline) must not join them. Production order on both
+/// overlay kinds: live witness start, then copy-up through the merge,
+/// then the production pin. Fails loud without root/loop/overlay/BTF —
+/// never a skip.
+#[test]
+#[ignore = "root: loop overlay mounts (xino=on, same-fs) plus a live witness start (BTF, ftrace_enabled=1)"]
+fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")
+        .expect("witness needs readable ftrace_enabled");
+    assert_eq!(
+        ftrace.trim(),
+        "1",
+        "witness needs /proc/sys/kernel/ftrace_enabled = 1"
+    );
+    assert!(
+        matches!(
+            crate::pidns::observer(),
+            crate::pidns::ObserverPidNs::Initial
+        ),
+        "witness needs the initial PID namespace"
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let mut joined = Vec::new();
+    for mode in [XinoMode::On, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        let fixture =
+            OverlayFixture::mount(work.path(), mode).expect("overlay mount for the race twin");
+        std::fs::write(fixture.lower_path("race.so"), vec![0xC1u8; 8192]).unwrap();
+        let merged = fixture.merged_path("race.so");
+        let pre = std::fs::metadata(&merged).expect("merged stat before copy-up");
+        // The witness starts first, on the lower-backed merged file.
+        let scope = crate::attach::Scope::System;
+        let witness =
+            crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
+                .expect("the witness starts on the lower-backed file");
+        assert_eq!(witness.files.len(), 1, "mode {mode:?}: one calibrated file");
+        let (witness_dev, witness_ino) = (witness.files[0].dev, witness.files[0].ino);
+        // The copy-up lands between the witness start and the pre-arm pin.
+        trigger_copy_up(
+            &merged,
+            &fixture.upper_path("race.so"),
+            &fixture.lower_path("race.so"),
+        )
+        .expect("copy-up");
+        let post = std::fs::metadata(&merged).expect("merged stat after copy-up");
+        // The pre-arm pin opens after the copy-up, like production.
+        let bytes = std::fs::read(&merged).expect("merged read for the pin");
+        let digest = {
+            use sha2::{Digest as _, Sha256};
+            p11scope_manifest::identity::hex(&Sha256::digest(&bytes))
+        };
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(&merged, None, 0, &digest);
+        let object = pins.pinned().next().expect("held-file pin").id;
+        let pin_meta = pins
+            .file_for(object)
+            .expect("pin holds an fd")
+            .metadata()
+            .expect("fstat the pin fd");
+        let matched = crate::discovery::engine::Engine::witness_pin_matches(
+            witness_dev,
+            witness_ino,
+            object,
+            &pins,
+        );
+        eprintln!(
+            "WITNESS_RACE mode={mode:?} pre=({},{}) witness=({},{}) post=({},{}) pin=({},{}) matched={matched}",
+            pre.dev(),
+            pre.ino(),
+            witness_dev,
+            witness_ino,
+            post.dev(),
+            post.ino(),
+            pin_meta.dev(),
+            pin_meta.ino(),
+        );
+        if matched {
+            joined.push(mode);
+        }
+    }
+    assert!(
+        joined.is_empty(),
+        "condition 4 must refuse across the copy-up, joined on {joined:?}"
+    );
+    eprintln!("WITNESS_RACE modes=on,same-fs verdict=refused");
+}
+
+/// No copy-up between the witness start and the pre-arm pin: condition 4
+/// still joins them, so the ordering proof stays available. The guard
+/// against over-refusal for the race twin above.
+#[test]
+#[ignore = "root: loop overlay mounts (xino=on, same-fs) plus a live witness start (BTF, ftrace_enabled=1)"]
+fn privileged_witness_pin_without_copyup_keeps_proof() {
+    overlay_preflight().expect("overlay preconditions hold");
+    let ftrace = std::fs::read_to_string("/proc/sys/kernel/ftrace_enabled")
+        .expect("witness needs readable ftrace_enabled");
+    assert_eq!(
+        ftrace.trim(),
+        "1",
+        "witness needs /proc/sys/kernel/ftrace_enabled = 1"
+    );
+    assert!(
+        matches!(
+            crate::pidns::observer(),
+            crate::pidns::ObserverPidNs::Initial
+        ),
+        "witness needs the initial PID namespace"
+    );
+    use std::os::unix::fs::MetadataExt as _;
+    let mut refused = Vec::new();
+    for mode in [XinoMode::On, XinoMode::SameFs] {
+        let work = tempfile::tempdir().unwrap();
+        let fixture =
+            OverlayFixture::mount(work.path(), mode).expect("overlay mount for the steady twin");
+        std::fs::write(fixture.lower_path("steady.so"), vec![0xC2u8; 8192]).unwrap();
+        let merged = fixture.merged_path("steady.so");
+        let scope = crate::attach::Scope::System;
+        let witness =
+            crate::attach::prearm_witness::start(std::slice::from_ref(&merged), &scope, true)
+                .expect("the witness starts on the lower-backed file");
+        assert_eq!(witness.files.len(), 1, "mode {mode:?}: one calibrated file");
+        let (witness_dev, witness_ino) = (witness.files[0].dev, witness.files[0].ino);
+        // No copy-up: the pre-arm pin opens the same file state.
+        let bytes = std::fs::read(&merged).expect("merged read for the pin");
+        let digest = {
+            use sha2::{Digest as _, Sha256};
+            p11scope_manifest::identity::hex(&Sha256::digest(&bytes))
+        };
+        let pins =
+            crate::discovery::identity::test_fixture::real_scan_pin(&merged, None, 0, &digest);
+        let object = pins.pinned().next().expect("held-file pin").id;
+        let matched = crate::discovery::engine::Engine::witness_pin_matches(
+            witness_dev,
+            witness_ino,
+            object,
+            &pins,
+        );
+        eprintln!(
+            "WITNESS_STEADY mode={mode:?} witness=({witness_dev},{witness_ino}) matched={matched}"
+        );
+        if !matched {
+            refused.push(mode);
+        }
+    }
+    assert!(
+        refused.is_empty(),
+        "condition 4 must join without a copy-up, refused on {refused:?}"
+    );
+    eprintln!("WITNESS_STEADY modes=on,same-fs verdict=joined");
+}

@@ -30645,7 +30645,7 @@ impl Engine {
     /// than fd stats on split filesystems (btrfs: fd `0:37` vs maps
     /// `00:23` for the same file), so comparing the witness fd against
     /// raw keys would refuse every proof there.
-    fn witness_pin_matches(
+    pub(crate) fn witness_pin_matches(
         fd_dev: u64,
         fd_ino: u64,
         object: PinnedObjectId,

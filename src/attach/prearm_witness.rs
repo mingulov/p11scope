@@ -2740,6 +2740,56 @@ mod tests {
         assert_eq!(verdict.slots[0].fd_ino, ino);
     }
 
+    /// One-file started witness over a live temp path (the dir outlives
+    /// the witness), for the finalize re-check twin: the file must stay
+    /// rewritable after startup.
+    fn scripted_started_witness_live() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        super::StartupWitness<ScriptFinalize>,
+    ) {
+        use std::os::unix::fs::MetadataExt as _;
+        use std::os::unix::io::{FromRawFd as _, IntoRawFd as _};
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("witness-recheck.so");
+        std::fs::write(&path, [0x7fu8, b'E', b'L', b'F']).expect("write");
+        let meta = std::fs::metadata(&path).expect("fstat");
+        let raw = std::fs::File::open(&path).expect("open").into_raw_fd();
+        // SAFETY: owned fd from an open File.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+        let witnessed = super::StartupWitness {
+            backend: ScriptFinalize::clean(),
+            files: vec![super::WitnessFile {
+                fd,
+                dev: meta.dev(),
+                ino: meta.ino(),
+                key: super::PwWatchedKey {
+                    s_dev: meta.dev(),
+                    i_ino: meta.ino(),
+                },
+            }],
+            active_ns: 40,
+            scope_start_ns: Some(50),
+        };
+        (dir, path, witnessed)
+    }
+
+    #[test]
+    fn driver_finalize_changed_witness_fd_keeps_calibration() {
+        // The witness fd's file changed between startup and finalize (a
+        // copy-up rewrites size/ctime the same way): the calibration-time
+        // key watches the old file, so the slot must keep its window
+        // with the calibration reason even though the walk was clean.
+        let (_dir, path, witnessed) = scripted_started_witness_live();
+        std::fs::write(&path, [0x7fu8, b'E', b'L', b'F', 1, 2, 3, 4]).expect("rewrite");
+        let verdict = witnessed.finalize(false).expect("finalize verdict");
+        assert_eq!(verdict.slots.len(), 1);
+        assert_eq!(
+            verdict.slots[0].verdict,
+            super::FileVerdict::Keep(super::KeepReason::Calibration)
+        );
+    }
+
     #[test]
     fn keep_reasons_carry_exact_section_61_spellings() {
         let spelled: Vec<&str> = super::KeepReason::all()

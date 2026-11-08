@@ -804,6 +804,18 @@
       "cell": "privileged"
     },
     {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_witness_copyup_between_start_and_pin_refuses_proof",
+      "reason": "root: loop overlay mounts (xino=on, same-fs) plus a live witness start; a copy-up between the witness start and the pre-arm pin must refuse condition 4 (BTF, ftrace_enabled=1, initial pidns), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
+      "file": "src/discovery/d4_overlay_cells.rs",
+      "path": "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_witness_pin_without_copyup_keeps_proof",
+      "reason": "root: loop overlay mounts (xino=on, same-fs) plus a live witness start; without a copy-up condition 4 still joins (BTF, ftrace_enabled=1, initial pidns), fail-loud-unprivileged by design, runs in the --include-overlay campaign",
+      "cell": "privileged"
+    },
+    {
       "file": "src/discovery/d4_population_cells.rs",
       "path": "discovery::sweep_attribution::tests::d4_population_cells::privileged_d4_kernel_positive_population_excludes_anchors",
       "reason": "root Btrfs disk TMPDIR plus eligible BTF/task_vma identity; kernel-positive population excludes watched anchors",

@@ -168,10 +168,11 @@ cryptographic bill of materials with
 ([export guide](usage.md#offline-cbom-export)).
 
 Two newer capture flags: `--track-short-lived` (profile,
-default off) is extensive mode: the kernel records exec-time executable identity
-so unmatched exits gain bounded static-linkage hints, arming only on Detailed
-profile `--cgroup`/`--system` captures and refused beside `--counter-mode`
-and beside `run`
+trace, run; default off) is extensive mode: the kernel records exec-time
+executable identity so unmatched exits gain bounded static-linkage hints on
+Detailed `--cgroup`/`--system` captures, while exact `--pid` and owned `run`
+captures group the target's own execs instead; refused beside `--counter-mode`,
+never armed for inventory
 ([options](usage.md#more-capture-options)). `--prearm-module
 <provider.so>` (profile, trace, run, inventory; repeatable) pins a provider file
 before any mapping and pre-arms its proved offsets; under inventory the inputs

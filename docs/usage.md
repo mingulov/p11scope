@@ -772,7 +772,9 @@ for admission whose exit has not drained when the capture ends (each
 pending generation once), so a forking workload with prearmed
 or already-attached providers reports exact counts with `PARTIAL`
 observation; unprearmed cold grandchildren may show missing calls; see
-the [known limitations](known-limitations.md). Without permission to
+the [known limitations](known-limitations.md). With `--track-short-lived`,
+the direct child's own execs group by linkage (`target_exec_hints` beside
+the gap counts) while descendant gaps carry no hints. Without permission to
 create the cgroup, `run` observes only the started command itself and
 names the gap; `capture.scope` reads `cgroup` for the tree scope, `pid`
 when degraded. The run-cgroup leaf name (random `p11scope-run-*`, never
@@ -1202,8 +1204,8 @@ Limits that matter in pods:
   report's additive `selected_detail` evidence object; unrelated
   endpoints stay aggregate-only, and aggregate and detail counts are
   never summed.
-- `--track-short-lived` — profile (default off): extensive
-  mode. The kernel records the exec-time executable identity (device +
+- `--track-short-lived` — profile, trace, run (default off):
+  extensive mode. The kernel records the exec-time executable identity (device +
   inode, no path, argv, or environment) in EXEC records, and each novel
   unmatched exit gains a bounded static-linkage hint (`gap_exe_hints`
   beside `pid_descendant_gaps`): does the dead process's executable

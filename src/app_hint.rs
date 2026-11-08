@@ -720,11 +720,11 @@ fn read_cmdline_once(pid: u32) -> Option<Vec<u8>> {
 /// several `read()` calls, so a title rewrite landing mid-sample can
 /// tear original argv bytes and title bytes into one token. Two
 /// byte-equal samples prove the title was stable across the reads.
-fn stable_cmdline_sample(
-    first: Option<Vec<u8>>,
-    _second: Option<Vec<u8>>,
-) -> Option<Vec<u8>> {
-    first
+fn stable_cmdline_sample(first: Option<Vec<u8>>, second: Option<Vec<u8>>) -> Option<Vec<u8>> {
+    match (first, second) {
+        (Some(first), Some(second)) if first == second => Some(first),
+        _ => None,
+    }
 }
 
 /// Bounded prefix of `/proc/<pid>/cmdline`, sampled twice: the two

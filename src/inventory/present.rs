@@ -2318,6 +2318,32 @@ fn concise_deleted_notes_line(gaps: &[GapView]) -> Option<String> {
     ))
 }
 
+/// Concise pointer for missed short-lived processes: the gap group may
+/// fold beyond [`GAP_GROUPS_SHOWN`], but a one-shot workload's owner
+/// still needs the why and the right mode at first sight. The count
+/// parses from the pinned reason's leading number; an unparsable
+/// reason still names the mode. Verbose and JSON keep the full gap.
+fn concise_short_lived_pointer(gaps: &[GapView]) -> Option<String> {
+    let gap = gaps.iter().find(|gap| {
+        gap.subject
+            == crate::discovery::engine::inventory_coordinator::SHORT_LIVED_NEVER_SCANNED_SUBJECT
+    })?;
+    let tail = "one-shot commands are best observed with `p11scope run`";
+    let count = gap
+        .reason
+        .split_whitespace()
+        .next()
+        .and_then(|head| head.parse::<u64>().ok());
+    match count {
+        Some(n) => Some(format!(
+            "note: {n} short-lived process(es) exited before any scan; {tail}."
+        )),
+        None => Some(format!(
+            "note: short-lived processes exited before any scan; {tail}."
+        )),
+    }
+}
+
 /// The concise limits line (INV-1): the headline budgets in words.
 /// The full budget dump stays verbose-only; `--json` carries `budgets`.
 /// Watched functions count against the real inventory endpoint budget
@@ -3345,6 +3371,9 @@ fn render_snapshot_inner(
             let _ = writeln!(out, "{line}");
         }
         if let Some(line) = concise_deleted_notes_line(&presentation.gaps) {
+            let _ = writeln!(out, "{line}");
+        }
+        if let Some(line) = concise_short_lived_pointer(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }
         let _ = writeln!(out, "{}", crate::cli::VERBOSE_HINT);

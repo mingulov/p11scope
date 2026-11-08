@@ -85,10 +85,11 @@ before calling a rerun green.
   Base totals 0/24 trips (R2 0/14 + R3 A/B 0/10). The batch verdicts
   differ for two separate reasons, neither a loss trip: base drops
   B-pre's new-module span edge 10/10 (`original_file_unproven`: the
-  witness proved another file) while tip keeps it 10/10; a
-  lineage-neutral entries race (`watched_no_use` with 0 entries on
-  B2's edge while the span profile counts 6x250) fails tip 3/10 and
-  also appears on base edges. Both need their own records.
+  witness proved another file) while tip keeps it 10/10; an entries
+  race (`watched_no_use` with 0 entries on B2's edge while the span
+  profile counts 6x250) fails tip 3/10 in R3 A/B (base B2 edges read
+  the same state structurally — no pair — not the race; see
+  `D1-span-b2-entries-race`). Both need their own records.
 - Disposition: named flake; the span gate stays exact. A rerun that
   trips must be preserved and retried serially, never averaged away.
   Future work (out of scope): collapse-order determinism across span
@@ -108,7 +109,7 @@ before calling a rerun green.
   judged against this systematic difference, not averaged with tip.
 - Disposition: documents the pre-lane base behavior; no gate change.
 
-### `D1-span-b2-entries-race` (R3 A/B, tip-only; lane contribution not ruled out)
+### `D1-span-b2-entries-race` (tip-only; R3 A/B 3/10, R6 1/20; lane contribution not ruled out)
 
 - Signature: B2's span-kernel edge shows `watched_no_use` with 0
   entries (observed across the whole span) while the span profile
@@ -122,12 +123,28 @@ before calling a rerun green.
   analysis of the R3 `ab-spans` narrows it: on the tripped tips
   (3,4,6) all three edges on B2's module (B-pre, twin, B2) are
   `watched_no_use`, while on passing tips all three are
-  `not_attached` — the flip is module-wide, not B2-specific. Base
-  B2 edges are `watched_no_use` 10/10, but structurally (no pair:
-  B-pre edges the old module only), not the race. Lead: the
-  byte-identical collapse usually suppresses probing on the pair
-  module, yet on 3/10 tips the endpoints attach mid-span
+  `not_attached` — the flip is module-wide, not B2-specific. Lead:
+  the byte-identical collapse usually suppresses probing on the pair
+  module, yet on some tips the endpoints attach mid-span
   (`since_ns` ≈ first-mapping + 13–20 s, counting nothing either
-  way); the exact attach trigger is still unknown.
+  way); the exact attach trigger is still unknown. R6 adds B2/twin
+  ledger start/end monotonic stamps to `facts.log`, and the oracle
+  now proves calls-before-watch on every trip (refusal message).
+- R6 measurement (quiet fedora, exclusive lane, tip `03f8182c4`,
+  R3 A/B flags): 1/20 trips (run-10; combined with R3: 4/30).
+  Run-10's oracle message proves calls-before-watch (B2's ledger
+  ended 10.4 s before the edge's `since_ns`; the twin's 10.3 s):
+  the refused 0 counts are honest output, not missed observations.
+  Two discriminators hold 30/30 (R3 10 + R6 20): trips have one
+  shared edge `first_seen` (joint split-discovery admission) while
+  passes have two, and trips carry a refusal-free module admission
+  (68 endpoints, no reasons) while passes disclose a later
+  "no proven companion" refusal. A scratch attach-set experiment
+  (not committed) shows a mid-copy divergent digest would admit a
+  companion and that same-digest pairs refuse in both plan orders,
+  but the live premises (a torn mid-copy hash; the lower pin
+  equaling the pre-copy-up merged pin) and the link to B2's
+  arrival timing are unproven. Next: capture per-pass attach
+  verdicts for the pair module on a tripped run.
 - Disposition: named flake; the span gate stays exact. Needs a root
   cause before the D1 cell can go green reliably.

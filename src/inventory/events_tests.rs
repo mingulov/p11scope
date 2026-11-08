@@ -1448,6 +1448,25 @@ fn stdout_sink_never_rotates_and_reports_neutral_retention() {
 }
 
 #[test]
+fn totals_cadence_phases_to_a_fake_clock_without_bursts() {
+    // A 10s cadence from a fake start: due exactly on the marks,
+    // and an emission re-phases the next due date instead of
+    // bursting catch-ups.
+    let mut cadence = TotalsCadence::new(std::time::Duration::from_secs(10), 1_000);
+    assert!(!cadence.due(1_000), "nothing is due at the start");
+    assert!(!cadence.due(1_000 + 9_999_999_999));
+    assert!(cadence.due(1_000 + 10_000_000_000));
+    cadence.mark_emitted(1_000 + 10_000_000_000);
+    assert!(!cadence.due(1_000 + 19_999_999_999));
+    assert!(cadence.due(1_000 + 20_000_000_000));
+    // A late pass (12s after the previous emission) moves the next
+    // due date to emission + interval: one totals per pass at most.
+    cadence.mark_emitted(1_000 + 32_000_000_000);
+    assert!(!cadence.due(1_000 + 40_000_000_000));
+    assert!(cadence.due(1_000 + 42_000_000_000));
+}
+
+#[test]
 fn file_streams_carry_no_stdout_loss_object() {
     // The file stream keeps its exact v1 shape: `stdout_lost` exists
     // only on `--event-log -` lines, never on file lines.

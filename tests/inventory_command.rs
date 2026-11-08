@@ -1763,6 +1763,101 @@ fn event_log_dash_reports_a_closed_stdout_and_keeps_the_report() {
     assert_eq!(doc["scope"], format!("pid:{pid}"));
 }
 
+/// `--event-interval` adds periodic `totals` snapshots to the file
+/// stream: versioned lines, one per due pass, carrying the current
+/// report counts.
+#[test]
+fn event_interval_adds_periodic_totals_to_the_file_stream() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-totals");
+    let ready = dir.join("totals.ready");
+    let driver = gcc(
+        &dir,
+        "totals-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "totals-prov.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let private = private_dir();
+    let stream_path = private.path().join("totals.jsonl");
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-pid.sh"))
+        .args(["--capture", "scan", "--duration", "5s"])
+        .arg("--event-log")
+        .arg(&stream_path)
+        .arg("--event-interval")
+        .arg("2s")
+        .env("INV_DRIVER", &driver)
+        .env("INV_MODE", "plain")
+        .env("INV_PROV", &prov)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", dir.join("totals.out"))
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = text.split_whitespace().nth(1).unwrap().parse().unwrap();
+    let _fixture = FixtureGuard { pids: vec![pid] };
+    assert!(
+        output.status.success(),
+        "observe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let lines: Vec<Value> = std::fs::read_to_string(&stream_path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let totals: Vec<&Value> = lines
+        .iter()
+        .filter(|line| line["kind"] == "totals")
+        .collect();
+    // Passes tick about every second; a 2s cadence over 5s lands a
+    // couple of snapshots, never a burst and never none.
+    assert!(
+        (1..=4).contains(&totals.len()),
+        "expected a couple of totals, got {}",
+        totals.len()
+    );
+    let mut last_pass = 0u64;
+    let mut last_at = 0u64;
+    for line in &totals {
+        assert_eq!(line["schema"], "p11scope/inventory-events/v1");
+        let pass = line["event"]["pass"].as_u64().unwrap();
+        assert!(pass > last_pass, "totals passes increase: {line}");
+        last_pass = pass;
+        let at_ns = line["at_ns"].as_u64().unwrap();
+        if last_at != 0 {
+            assert!(
+                at_ns - last_at >= 2_000_000_000,
+                "totals keep the cadence: {line}"
+            );
+        }
+        last_at = at_ns;
+        for section in [
+            "callers",
+            "modules",
+            "edges",
+            "entries",
+            "key_operations",
+            "deferred",
+            "stream",
+            "stdout_lost",
+        ] {
+            assert!(line["event"].get(section).is_some(), "{line}");
+        }
+    }
+}
+
 /// `--event-log -` beside `--json` or `--dashboard` is refused up
 /// front (exit 2), before anything is observed.
 #[test]

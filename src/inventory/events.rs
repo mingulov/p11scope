@@ -2784,6 +2784,61 @@ pub(crate) fn ended_payload(
     })
 }
 
+/// Periodic `totals` cadence (`--event-interval`): at most one
+/// totals event per pass, phase-locked to actual emissions — a late
+/// pass moves the next due date instead of bursting, and the check
+/// rides the existing pass ticks, so stop never waits for it.
+pub(crate) struct TotalsCadence {
+    interval_ns: u64,
+    next_due_ns: u64,
+}
+
+impl TotalsCadence {
+    pub(crate) fn new(interval: Duration, started_ns: u64) -> Self {
+        let interval_ns = interval.as_nanos().min(u128::from(u64::MAX)) as u64;
+        Self {
+            interval_ns,
+            next_due_ns: started_ns.saturating_add(interval_ns),
+        }
+    }
+
+    /// Whether a totals event is due at this pass.
+    pub(crate) fn due(&self, _now_ns: u64) -> bool {
+        // Scaffold: the comparison lands with the totals commit.
+        let _ = (self.interval_ns, self.next_due_ns);
+        false
+    }
+
+    /// Phase the cadence to an emission: the next totals is due one
+    /// interval after this pass, never sooner (no catch-up bursts).
+    pub(crate) fn mark_emitted(&mut self, now_ns: u64) {
+        self.next_due_ns = now_ns.saturating_add(self.interval_ns);
+    }
+}
+
+/// Emitter queues still waiting after a commit: the totals
+/// `deferred` section.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct DeferredCounts {
+    pub edge_events: u64,
+    pub instance_events: u64,
+    pub semantic_edge_events: u64,
+    pub key_operation_events: u64,
+}
+
+/// The periodic `totals` payload: the current report-summary counts
+/// (callers, modules, edges, entries, key rows, coverage), the
+/// emitter deferred queues, and the writer accounting — all values
+/// the report already carries, as a mid-run snapshot.
+pub(crate) fn totals_payload(
+    _presentation: &Presentation,
+    _deferred: &DeferredCounts,
+    _writer: &EventWriter,
+) -> serde_json::Value {
+    // Scaffold: the payload lands with the totals commit.
+    serde_json::json!({})
+}
+
 #[cfg(test)]
 #[path = "events_tests.rs"]
 mod tests;

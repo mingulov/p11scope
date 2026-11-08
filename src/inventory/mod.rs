@@ -47,9 +47,9 @@ use crate::inventory_diagnostics::{
 use crate::inventory_diagnostics_output::{DiagnosticsDestination, PrepareError};
 use crate::inventory_event_identity::IdentityIndex;
 use crate::inventory_events::{
-    EdgeEmitter, EventWriter, GapEmitter, InstanceEmitter, KeyOperationEmitter,
-    caller_event_payload, combined_dump_fits, ended_payload, pass_payload, settle_ended_combined,
-    started_payload,
+    DeferredCounts, EdgeEmitter, EventWriter, GapEmitter, InstanceEmitter, KeyOperationEmitter,
+    TotalsCadence, caller_event_payload, combined_dump_fits, ended_payload, pass_payload,
+    settle_ended_combined, started_payload,
 };
 #[cfg(test)]
 use crate::inventory_output::WriterStdout;
@@ -7531,6 +7531,11 @@ pub(crate) struct StreamState {
     /// Unbound witness rows per (module, reason) already counted on a
     /// pass marker.
     emitted_unbound: BTreeMap<(ModuleId, &'static str), u64>,
+    /// Periodic `totals` cadence (`--event-interval`); `None` ⇒ off.
+    pub(crate) totals: Option<TotalsCadence>,
+    /// Emitter queues still waiting after the last commit: the totals
+    /// `deferred` section.
+    pub(crate) last_deferred: DeferredCounts,
 }
 
 impl StreamState {
@@ -7545,6 +7550,8 @@ impl StreamState {
             last_stream_view: None,
             emitted_suppressed: 0,
             emitted_unbound: BTreeMap::new(),
+            totals: None,
+            last_deferred: DeferredCounts::default(),
         }
     }
 
@@ -11315,6 +11322,256 @@ mod tests {
         let ended: serde_json::Value = serde_json::from_str(lines[lines.len() - 1]).unwrap();
         assert_eq!(ended["kind"], "ended");
         assert_eq!(ended["event"]["stdout_lost"]["lines"], 0);
+    }
+
+    /// One fake-clock pass through the real commit path, for totals
+    /// cadence tests: no threads, no sleeps, just `now_ns`.
+    fn totals_test_pass(
+        writer: &mut EventWriter,
+        state: &mut StreamState,
+        coordinator: &InventoryCoordinator<OsProcessSource>,
+        pass: u64,
+        now_ns: u64,
+    ) {
+        let presentation = Presentation::capture(coordinator, "system", 1, now_ns, pass);
+        let report = PassReport {
+            pass,
+            scanned: 1,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 1,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        emit_pass_events(writer, state, &report, &presentation, now_ns).unwrap();
+    }
+
+    #[test]
+    fn event_totals_follow_a_fake_clock_cadence() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let mut state = StreamState::new();
+        state.totals = Some(TotalsCadence::new(
+            std::time::Duration::from_secs(10),
+            1_000,
+        ));
+        // Passes every fake second: totals land after the 10s and 20s
+        // passes only, each behind its pass_committed marker.
+        for pass in 1..=21u64 {
+            totals_test_pass(
+                &mut writer,
+                &mut state,
+                &coordinator,
+                pass,
+                1_000 + pass * 1_000_000_000,
+            );
+        }
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let totals: Vec<(usize, &serde_json::Value)> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line["kind"] == "totals")
+            .collect();
+        assert_eq!(totals.len(), 2, "totals at 10s and 20s only");
+        for (index, line) in &totals {
+            assert_eq!(line["schema"], "p11scope/inventory-events/v1");
+        }
+        assert_eq!(totals[0].1["event"]["pass"], 10);
+        assert_eq!(totals[1].1["event"]["pass"], 20);
+        for (index, line) in &totals {
+            let marker = &lines[index - 1];
+            assert_eq!(
+                marker["kind"], "pass_committed",
+                "a totals trails its pass marker"
+            );
+            assert_eq!(marker["event"]["pass"], line["event"]["pass"]);
+        }
+    }
+
+    #[test]
+    fn event_totals_carry_the_current_report_counts() {
+        let mut coordinator = coordinator();
+        coordinator.note_scope_gap("first".into(), "pass gap".into());
+        coordinator.commit_batch(false).unwrap();
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let deferred = DeferredCounts {
+            edge_events: 3,
+            instance_events: 5,
+            semantic_edge_events: 7,
+            key_operation_events: 11,
+        };
+        let totals = crate::inventory_events::totals_payload(&presentation, &deferred, &writer);
+        // Every section mirrors a count the report already carries.
+        assert_eq!(totals["pass"], presentation.passes);
+        assert_eq!(totals["callers"], presentation.callers.len() as u64);
+        assert_eq!(totals["modules"], presentation.modules.len() as u64);
+        assert_eq!(totals["edges"], presentation.edges.len() as u64);
+        assert_eq!(totals["instances"], presentation.instances.len() as u64);
+        assert_eq!(
+            totals["semantic_edges"],
+            presentation.semantic_edges.len() as u64
+        );
+        assert_eq!(totals["gaps"], presentation.gaps.len() as u64);
+        assert_eq!(totals["gaps_suppressed"], presentation.gaps_suppressed);
+        assert_eq!(totals["refusals"], presentation.budgets.refusals());
+        let (logical, forwarding) = crate::inventory_present::layer_entry_totals(&presentation);
+        assert_eq!(totals["entries"]["logical"], logical);
+        assert_eq!(totals["entries"]["forwarding"], forwarding);
+        let observations = &presentation.object_observations;
+        assert_eq!(totals["key_operations"]["revision"], observations.revision);
+        assert_eq!(
+            totals["key_operations"]["status"],
+            observations.status.label()
+        );
+        assert_eq!(
+            totals["key_operations"]["objects"],
+            observations.objects.len() as u64
+        );
+        assert_eq!(
+            totals["key_operations"]["known_rows"],
+            observations.key_operations.len() as u64
+        );
+        assert_eq!(
+            totals["key_operations"]["unknown_rows"],
+            observations.unknown_key_operations.len() as u64
+        );
+        assert_eq!(totals["deferred"]["edge_events"], 3);
+        assert_eq!(totals["deferred"]["instance_events"], 5);
+        assert_eq!(totals["deferred"]["semantic_edge_events"], 7);
+        assert_eq!(totals["deferred"]["key_operation_events"], 11);
+        assert_eq!(totals["stream"]["rotations"], 0);
+        assert_eq!(totals["stream"]["evicted_events"], 0);
+        assert_eq!(totals["stream"]["evicted_bytes"], 0);
+        assert_eq!(totals["stdout_lost"]["lines"], 0);
+        assert_eq!(totals["stdout_lost"]["bytes"], 0);
+    }
+
+    #[test]
+    fn event_totals_emit_on_stdout_sinks_too() {
+        use std::io::Read as _;
+        use std::os::fd::AsRawFd as _;
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let (mut read, write) = event_stdout_test_pipe();
+        let mut writer = EventWriter::create_stdout_on_fd(
+            write.as_raw_fd(),
+            std::time::Duration::from_millis(50),
+        )
+        .unwrap();
+        let mut state = StreamState::new();
+        state.totals = Some(TotalsCadence::new(
+            std::time::Duration::from_secs(10),
+            1_000,
+        ));
+        totals_test_pass(
+            &mut writer,
+            &mut state,
+            &coordinator,
+            10,
+            1_000 + 10_000_000_000,
+        );
+        drop(writer);
+        drop(write);
+        let mut bytes = Vec::new();
+        read.read_to_end(&mut bytes).unwrap();
+        let lines: Vec<serde_json::Value> = bytes
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_slice(line).unwrap())
+            .collect();
+        let totals: Vec<&serde_json::Value> = lines
+            .iter()
+            .filter(|line| line["kind"] == "totals")
+            .collect();
+        assert_eq!(totals.len(), 1);
+        assert_eq!(totals[0]["schema"], "p11scope/inventory-events/v1");
+        assert_eq!(totals[0]["event"]["pass"], 10);
+    }
+
+    #[test]
+    fn event_totals_stay_off_without_an_interval() {
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let mut state = StreamState::new();
+        assert!(state.totals.is_none(), "totals are off by default");
+        for pass in 1..=3u64 {
+            totals_test_pass(
+                &mut writer,
+                &mut state,
+                &coordinator,
+                pass,
+                1_000 + pass * 1_000_000_000,
+            );
+        }
+        let body = std::fs::read_to_string(&path).unwrap();
+        let kinds: Vec<String> = body
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !kinds.iter().any(|kind| kind == "totals"),
+            "no totals without --event-interval: {kinds:?}"
+        );
+    }
+
+    #[test]
+    fn event_totals_never_emit_on_the_stop_commit() {
+        // The stop commit's `ended` and the final report already
+        // carry the final counts; a totals there would be noise.
+        let mut coordinator = coordinator();
+        coordinator.commit_batch(false).unwrap();
+        let dir = private_tempdir();
+        let path = dir.path().join("events.jsonl");
+        let mut writer = EventWriter::create(&path, 1 << 20, 5).unwrap();
+        let mut state = StreamState::new();
+        state.totals = Some(TotalsCadence::new(
+            std::time::Duration::from_secs(10),
+            1_000,
+        ));
+        let presentation = Presentation::capture(&coordinator, "system", 1, 2, 1);
+        emit_stop_events(
+            &mut writer,
+            &mut state,
+            &[],
+            1,
+            &presentation,
+            1_000 + 10_000_000_000,
+        )
+        .unwrap();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let kinds: Vec<String> = body
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).unwrap()["kind"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            })
+            .collect();
+        assert!(
+            !kinds.iter().any(|kind| kind == "totals"),
+            "the due stop commit still emits no totals: {kinds:?}"
+        );
     }
 
     #[test]

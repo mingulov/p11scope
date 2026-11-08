@@ -2836,7 +2836,7 @@ fn s2s3_bounded_state_and_redaction_policy_limits() {
     assert_eq!(l.instances, 4_096);
     assert_eq!(l.session_records, 16_384);
     assert_eq!(l.object_records, 65_536);
-    assert_eq!(l.pending_calls, 1_024);
+    assert_eq!(l.pending_calls, 4_096);
     assert_eq!(MAX_ACCESS_RELATIONS, 32, "v3 relation ceiling preserved");
 }
 
@@ -3075,7 +3075,7 @@ fn count_created(effects: &ObjectEffects) -> usize {
 fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     // Policy-scale bounds: 4,096 views per instance across 16 instances
     // reach the capture-wide 65,536 object records; then N+1 per instance,
-    // capture-wide and for the 1,024-call pending budget.
+    // capture-wide and for the 4,096-call pending budget.
     let mut model = ObjectSemantics::new();
     let mut ledger = StagingLedger::new();
     let rss_before = crate::discovery::inventory_workload::rss_bytes();
@@ -3163,7 +3163,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     // Pending N/N+1 at policy scale.
     let domain = ObjectDomain::reference(1, 1, 1, 998, 1);
     model.register_domain(domain).unwrap();
-    for cut in 1..=1_024u64 {
+    for cut in 1..=4_096u64 {
         model
             .begin(
                 scale_origin(domain, cut, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
@@ -3171,10 +3171,10 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
             )
             .expect("N pending");
     }
-    assert_eq!(model.project().usage.pending_calls, 1_024);
+    assert_eq!(model.project().usage.pending_calls, 4_096);
     assert_eq!(
         model.begin(
-            scale_origin(domain, 1_025, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
+            scale_origin(domain, 4_097, "C_GetObjectSize", 0x6600, Some(0x9000_0001)),
             &mut ledger
         ),
         Err(ObjectGap::PendingCapacity)
@@ -3183,7 +3183,7 @@ fn s2s3_bounded_state_and_redaction_policy_scale_n_and_n_plus_one() {
     let estimate = model.state_estimate();
     eprintln!(
         "s2s3 policy-scale state: measured RSS delta {} bytes after 65,536 records \
-         ({} bytes after +1,024 pending); estimated occupied {} bytes \
+         ({} bytes after +4,096 pending); estimated occupied {} bytes \
          (object records {}, session records {}, bindings {}, pending {}); \
          the estimate is size_of*len, not allocator evidence",
         rss_full.saturating_sub(rss_before),

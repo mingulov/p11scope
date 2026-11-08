@@ -1154,7 +1154,11 @@ impl ObjectLimits {
             instances: 4_096,
             session_records: 16_384,
             object_records: 65_536,
-            pending_calls: 1_024,
+            // One model pending call per open H8 call at seal: the
+            // model converts what the journal holds, so this tracks
+            // JournalLimits::open_calls (raised 1,024 to 4,096 with
+            // it; a lower model cap fails seals and taints keys).
+            pending_calls: 4_096,
             max_object_id: u64::MAX,
             max_session_id: u64::MAX,
             max_call_token: u64::MAX,

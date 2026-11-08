@@ -269,8 +269,8 @@ use crate::discovery::caller_registry::instance_input::AdmittedInstanceCall;
 // ---------------------------------------------------------------------------
 
 /// Injectable journal bounds. [`JournalLimits::policy`] is the H8 proposal:
-/// 1,024 open plus completed-unsettled calls, 16,448 capture-lifetime
-/// thread floors, 1,024 refused begins awaiting a bound, 4,096 domain keys,
+/// 4,096 open plus completed-unsettled calls, 16,448 capture-lifetime
+/// thread floors, 1,024 refused begins awaiting a bound, 8,192 domain keys,
 /// 16,448 image birth sightings. Marker admissions (16,384) arrive with the
 /// native marker experiment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -11154,17 +11154,17 @@ pub(crate) mod tests {
     fn object_journal_pending_and_floor_capacity() {
         use p11scope_ebpf_common::object_wire::OBJECT_ACTION_CREATE;
 
-        // The 1,025th open call at the 1,024 policy bound records its
+        // The 4,097th open call at the 4,096 policy bound records its
         // refusal; a corroborated synchronous return bounds it and the
         // seal clears the refusal without a bootstrap refusal.
         let mut scene = Scene::new(image_default());
-        let proof = scene.attest_calls(1_025);
+        let proof = scene.attest_calls(4_097);
         let create = function_id("C_CreateObject");
-        for sequence in 1..=1_024u64 {
+        for sequence in 1..=4_096u64 {
             let begin = begin_bytes(1, sequence, create, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         }
-        let refused = begin_bytes(1, 1_025, create, 0);
+        let refused = begin_bytes(1, 4_097, create, 0);
         assert_eq!(
             scene.ingest(&refused),
             JournalDisposition::BeginRefusedCapacity
@@ -11182,11 +11182,11 @@ pub(crate) mod tests {
         let bootstrap = scene.bootstrap(proof, 0);
         let success = scene.seal(&bootstrap).expect("bounded refusal seals");
         // The held opens pin below the floors, so the seal continues
-        // without claiming new authority; the 1,026 bound lives in the
+        // without claiming new authority; the 4,098 bound lives in the
         // model's floor, and the staged refusal is disposed.
         assert_eq!(success.prefix.birth_cut(), 0);
         assert_eq!(success.prefix.bootstrap_cut(), None);
-        assert_eq!(success.prefix.open_keys().len(), 1_024);
+        assert_eq!(success.prefix.open_keys().len(), 4_096);
         assert!(scene.adapter.refused.is_empty());
 
         // Small injected bounds refuse overflow exactly: two opens, two
@@ -13402,8 +13402,8 @@ pub(crate) mod tests {
     fn object_journal_policy_capacity_bounds() {
         // At policy scale: 16,448 thread floors fill across sealing
         // batches and the 16,449th taints its image (floors never
-        // recycle); then 1,024 opens fill the table on one live thread
-        // and the 1,025th is refused for capacity, never dropped.
+        // recycle); then 4,096 opens fill the table on one live thread
+        // and the 4,097th is refused for capacity, never dropped.
         let mut scene = Scene::new(image_default());
         // H3 admits each call before its batch seals; conversions
         // consume as they go (one in-flight admission stays ahead).
@@ -13432,13 +13432,13 @@ pub(crate) mod tests {
         // New threads refuse now, but the live thread still admits up to
         // the open bound.
         let create = function_id("C_CreateObject");
-        for sequence in 2..=1_025u64 {
+        for sequence in 2..=4_097u64 {
             let begin = begin_bytes(1, sequence, create, 0);
             assert_eq!(scene.ingest(&begin), JournalDisposition::BeginAdmitted);
         }
-        assert_eq!(scene.adapter.open.len(), 1_024);
+        assert_eq!(scene.adapter.open.len(), 4_096);
         assert_eq!(
-            scene.ingest(&begin_bytes(1, 1_026, create, 0)),
+            scene.ingest(&begin_bytes(1, 4_098, create, 0)),
             JournalDisposition::BeginRefusedCapacity
         );
         assert_eq!(scene.adapter.refused.len(), 1);

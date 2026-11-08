@@ -58,6 +58,14 @@ fn reborrow_acquisition<'a, 'b: 'a>(
 /// before it takes the named disposition path.
 pub(crate) const MAX_UNPAID_VOID_YIELDS: u32 = 64;
 
+/// Total wire rows one pre-grant quantum may attempt. This doubles as
+/// the collection's allocation limit (the quantum reserves exactly
+/// this many row slots and refuses allocator over-reservation), so a
+/// raise must stay allocation-exact for all three row Vecs or every
+/// collection refuses. At 4,096 it coincides with the BEGIN table
+/// (MAX_UNSETTLED_STAGED): a quantum's setup row consumes the wire
+/// budget first, so the wire bound closes a full quantum before the
+/// table fills. An engineering limit: it may be raised, never lowered.
 const RAW_CAPACITY: usize = 4_096;
 // Wall-time bound on a pre-grant linked quantum's extension: at most
 // this long from the quantum's first poll. An engineering limit: it

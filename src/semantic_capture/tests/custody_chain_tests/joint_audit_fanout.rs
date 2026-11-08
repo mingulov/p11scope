@@ -6371,7 +6371,7 @@ fn joint_machine_full_raw_capacity_preserves_n_plus_one() {
     let boundary = fixture.scene.drain.consumption_cut().unwrap();
     let coordinator = &fixture.scene.real.scene.coordinator;
     let roles = coordinator.joint_capture().ledger().roles_for_test();
-    assert_eq!((roles[0], roles[1], roles[2], roles[3]), (1_024, 0, 0, 0));
+    assert_eq!((roles[0], roles[1], roles[2], roles[3]), (4_096, 0, 0, 0));
     let reserve = coordinator.registry().semantic_storage_reserver();
     let snapshot = coordinator.registry().semantic_resource_snapshot();
     let hold = reserve
@@ -24014,7 +24014,7 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     // `changed` packs into the bool tail). +8 (F12 fs-identity): the
     // entry carries the held fd's own `st_dev` (`fd_dev`) so snapshot
     // twins on one mount separate. Re-audited: the worst-case
-    // 1,024-partition transaction below still binds within the 64 MiB
+    // 1,024-partition transaction below still binds within the 160 MiB
     // pool at this size, so the reservation holds.
     assert_eq!(
         size_of::<crate::semantic_capture::CurrentPartitionReceipt>(),
@@ -24041,7 +24041,7 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
     );
     assert_eq!(
         crate::semantics_edge::resources::SEMANTIC_RESOURCE_LIMIT,
-        64 * 1024 * 1024
+        160 * 1024 * 1024
     );
     assert_eq!(crate::discovery::instances::MAX_INSTANCES, 4_096);
     assert_eq!(crate::discovery::instances::MAX_PENDING, 1_024);
@@ -24065,7 +24065,7 @@ fn joint_machine_receipt_model_sizes_and_collect_growth() {
 /// A full H0 transaction at the widest system-scale spread must bind: 1,024
 /// pending call records (the most the collector holds) over 1,024 distinct
 /// caller partitions across five callers publish through the real collected
-/// machine within the shared 64 MiB semantic pool. Receipts are minted per
+/// machine within the shared 160 MiB semantic pool. Receipts are minted per
 /// partition, never per record, so this is the most receipts one Binding
 /// pass can accumulate.
 #[test]

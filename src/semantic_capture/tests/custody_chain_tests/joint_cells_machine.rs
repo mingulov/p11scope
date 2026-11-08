@@ -3610,18 +3610,35 @@ fn joint_pregrant_pending_capacity_closes_during_extension() {
     );
 }
 
-/// A filled BEGIN table closes an extending quantum even with a
-/// thousand open STARTs: the setup record keeps the no-H0 hold out
-/// of the way, so only the table bound can close it.
+/// A 4,096-row quantum closes with four thousand open STARTs: the setup
+/// record keeps the no-H0 hold out of the way, so only a capacity
+/// bound can close it. The wire bound (4,096 rows) coincides with the
+/// BEGIN table (4,096) and the setup row consumes the wire budget
+/// first, so the wire closes the quantum with 4,095 invocations while
+/// the table stays one short of full — the close reason and the short
+/// table pin that binding order. (Historical name: at the 1,024 table
+/// the table bound closed first.)
 #[test]
 fn joint_pregrant_begin_table_full_closes_during_extension() {
     use crate::semantics_objects::journal::tests::{begin_bytes, function_id};
     let mut scene = pregrant_scene();
     publish_empty_first_quantum(&mut scene);
-    scene.scene.drain.source_mut().bound = 4_096;
+    scene.scene.drain.source_mut().bound = 8_192;
     let pid = std::process::id();
     push_ordinary_payload(&mut scene, pid, "C_GetFunctionList", 1);
-    for (chunk, threads) in [1..=400, 401..=800].into_iter().enumerate() {
+    for (chunk, threads) in [
+        1..=400,
+        401..=800,
+        801..=1200,
+        1201..=1600,
+        1601..=2000,
+        2001..=2400,
+        2401..=2800,
+        2801..=3200,
+    ]
+    .into_iter()
+    .enumerate()
+    {
         for thread in threads {
             let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
             scene.scene.drain.source_mut().push_record(begin.to_vec());
@@ -3630,10 +3647,26 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
         assert_eq!(
             phase_of(&scene),
             "Collecting",
-            "chunk {chunk} extends below the table bound"
+            "chunk {chunk} extends below the wire bound"
         );
     }
-    for thread in 801..=1_024 {
+    // The drain pulls incrementally, like production ring polls: two
+    // more 400-wide chunks extend below the bound, then the final 96
+    // push past it — the wire bound closes the quantum.
+    for (chunk, threads) in [3201..=3600, 3601..=4000].into_iter().enumerate() {
+        for thread in threads {
+            let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
+            scene.scene.drain.source_mut().push_record(begin.to_vec());
+        }
+        scene.service(100_000).expect("chunk collects");
+        assert_eq!(
+            phase_of(&scene),
+            "Collecting",
+            "chunk {} extends below the wire bound",
+            chunk + 8
+        );
+    }
+    for thread in 4001..=4_096 {
         let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
         scene.scene.drain.source_mut().push_record(begin.to_vec());
     }
@@ -3646,17 +3679,49 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
     assert_ne!(
         phase_of(&scene),
         "Collecting",
-        "the full BEGIN table closes despite open STARTs"
+        "the full wire budget closes despite open STARTs"
     );
     let raw = scene
         .machine
         .retained_raw_for_test()
         .expect("a retained raw");
-    assert!(raw.begin_table_full_or_refused(), "the table bound engaged");
+    assert!(
+        !raw.resource_refused_for_test(),
+        "no START was refused: the wire stopped the pulls"
+    );
+    assert_eq!(
+        raw.invocations_for_test(),
+        4_095,
+        "the setup row plus 4,095 STARTs fill the 4,096 wire budget"
+    );
+    assert!(
+        !raw.begin_table_full_or_refused(),
+        "the table stays one short: the wire bound first"
+    );
     assert!(
         raw.has_open_affecting_start(),
         "STARTs were open: the bound closed, not idleness"
     );
+    assert_eq!(
+        scene.scene.drain.source_mut().pending_records(),
+        1,
+        "the last START waits on the wire for the next quantum"
+    );
+    let counts = scene.machine.pregrant_close_counts_for_test();
+    assert_eq!(
+        counts.request, 1,
+        "the empty first quantum closes by request"
+    );
+    assert_eq!(
+        counts.raw_capacity, 1,
+        "the full quantum closes on the wire bound"
+    );
+    assert_eq!(counts.timeout, 0, "no timeout close");
+    assert_eq!(counts.max_pending, 0, "no MAX_PENDING close");
+    assert_eq!(counts.q, 0, "no Q close");
+    assert_eq!(counts.custody, 0, "no custody close");
+    assert_eq!(counts.begin_table, 0, "no table close");
+    assert_eq!(counts.no_hold, 0, "no idle close");
 }
 
 /// One reservation the ledger already holds outside the quantum (a

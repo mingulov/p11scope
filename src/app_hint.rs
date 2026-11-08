@@ -585,7 +585,7 @@ fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
 /// `argv[2]` when `argv[1]` is a single dash-led shebang argument (the
 /// kernel passes at most one: `perl -w` / `ruby -w` shebangs put the
 /// script at `argv[2]`).
-fn comm_script_token(args: &[&[u8]]) -> Option<&[u8]> {
+fn comm_script_token<'a>(args: &[&'a [u8]]) -> Option<&'a [u8]> {
     let first = *args.first()?;
     if first.len() > 1 && first.starts_with(b"-") {
         args.get(1).copied()

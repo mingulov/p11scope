@@ -167,6 +167,15 @@ pub(crate) fn try_stderr_line(line: &str) -> io::Result<SinkDrops> {
     try_diagnostic_line_on_fd(std::io::stderr().as_raw_fd(), line)
 }
 
+/// [`try_stderr_line`] for already-terminated multi-line text (the
+/// inventory summary on its stderr move): no extra newline is added.
+pub(crate) fn try_stderr_text(text: &str) -> io::Result<SinkDrops> {
+    let mut sink = stdout_sink_from(std::io::stderr().as_raw_fd())?;
+    sink.write_all(text.as_bytes())?;
+    sink.abort_wait()?;
+    Ok(sink.take_drops())
+}
+
 fn try_diagnostic_line_on_fd(fd: RawFd, line: &str) -> io::Result<SinkDrops> {
     let mut sink = stdout_sink_from(fd)?;
     writeln!(sink, "{line}")?;

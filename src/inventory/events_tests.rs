@@ -1381,10 +1381,11 @@ fn stdout_sink_repairs_a_shed_partial_line() {
     let (mut read, mut write) = stdout_test_pipe();
     let capacity = stdout_pipe_capacity(&write);
     stdout_fill_pipe(&mut write, capacity);
-    // Free exactly one head's worth of room: the big line below
-    // (past PIPE_BUF, so the pipe takes a partial head rather than
-    // refusing whole) lands its head and sheds its tail.
-    const HEAD: usize = 64;
+    // Free exactly one pipe page slot: bytes freed inside the
+    // reader's page buy no writable slot, so a partial head needs a
+    // fully drained page. The big line below (past PIPE_BUF) then
+    // fills that one slot and sheds its tail.
+    const HEAD: usize = 4096;
     stdout_drain_exact(&mut read, HEAD);
     let pad = "x".repeat(8192);
     let mut writer = stdout_test_writer(&write, std::time::Duration::from_millis(20));

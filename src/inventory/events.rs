@@ -138,9 +138,121 @@ impl StdoutEventSink {
 
     /// Deliver one complete line (trailing newline included), or shed
     /// and count it. Never fails: loss is accounting, not an error.
-    fn write_line(&mut self, _line: &[u8]) {
-        // Scaffold: the bounded writer lands with the sink commit.
-        // Every stdout behavioral test fails against this no-op.
+    fn write_line(&mut self, line: &[u8]) {
+        if self.deadline.is_none() {
+            self.begin_batch();
+        }
+        // A previously shed partial line must end before the next
+        // line starts, or the two join into one corrupt line (whose
+        // bytes would then be miscounted as delivered). While the
+        // repair cannot land, this line sheds whole: its bytes never
+        // land, so framing stays repairable on the next line. The
+        // repair byte belongs to the already-counted partial line,
+        // so only the reason is kept, never a second count.
+        if self.mid_line {
+            match self.write_bounded(b"\n") {
+                LineOutcome::Delivered => self.mid_line = false,
+                LineOutcome::Shed { reason, .. } => {
+                    self.shed_whole(line.len(), reason);
+                    return;
+                }
+            }
+        }
+        match self.write_bounded(line) {
+            LineOutcome::Delivered => {}
+            LineOutcome::Shed { delivered, reason } => {
+                self.lost_lines = self.lost_lines.saturating_add(1);
+                self.lost_bytes = self
+                    .lost_bytes
+                    .saturating_add(line.len().saturating_sub(delivered) as u64);
+                self.mid_line = delivered > 0;
+                self.first_reason.get_or_insert(reason);
+            }
+        }
+    }
+
+    /// Count one line shed whole (its repair failed, so none of its
+    /// bytes may land).
+    fn shed_whole(&mut self, len: usize, reason: String) {
+        self.lost_lines = self.lost_lines.saturating_add(1);
+        self.lost_bytes = self.lost_bytes.saturating_add(len as u64);
+        self.first_reason.get_or_insert(reason);
+    }
+
+    /// Write `rest` within the batch budget: nonblocking writes with
+    /// sliced `poll` waits for room. A spent budget sheds the
+    /// remainder (slow reader); a transport error sheds immediately
+    /// without waiting (a closed reader never stalls). Readiness,
+    /// timeouts and hangups never count as progress: only the next
+    /// write reports the truth, so a dead peer still reads as
+    /// broken pipe.
+    fn write_bounded(&mut self, mut rest: &[u8]) -> LineOutcome {
+        let mut delivered = 0usize;
+        loop {
+            if rest.is_empty() {
+                return LineOutcome::Delivered;
+            }
+            match self.inner.write(rest) {
+                Ok(0) => {
+                    return LineOutcome::Shed {
+                        delivered,
+                        reason: "stdout accepted zero bytes from a nonempty line".into(),
+                    };
+                }
+                Ok(wrote) => {
+                    delivered += wrote;
+                    rest = &rest[wrote..];
+                    continue;
+                }
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock
+                    ) => {}
+                Err(error) => {
+                    return LineOutcome::Shed {
+                        delivered,
+                        reason: describe_write_error(&error),
+                    };
+                }
+            }
+            let remaining = self.remaining();
+            if remaining.is_zero() {
+                return LineOutcome::Shed {
+                    delivered,
+                    reason: "slow reader: the batch bounded wait expired".into(),
+                };
+            }
+            let slice = remaining.min(SINK_POLL_SLICE);
+            // Ceiling milliseconds: a sub-millisecond remainder still
+            // waits instead of spinning. The slice cap keeps the
+            // conversion within poll's i32 range.
+            let timeout = slice.as_nanos().div_ceil(1_000_000) as i32;
+            let mut fd = libc::pollfd {
+                fd: self.inner.as_raw_fd(),
+                events: libc::POLLOUT,
+                revents: 0,
+            };
+            // SAFETY: poll only accesses this one initialized pollfd.
+            let ready = unsafe { libc::poll(&raw mut fd, 1, timeout) };
+            if ready < 0 {
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return LineOutcome::Shed {
+                        delivered,
+                        reason: describe_write_error(&error),
+                    };
+                }
+                // A signal cut the slice short: the next write round
+                // re-checks the budget, so an interrupting stall
+                // still sheds on time.
+            } else if fd.revents & libc::POLLNVAL != 0 {
+                return LineOutcome::Shed {
+                    delivered,
+                    reason: "stdout descriptor became invalid".into(),
+                };
+            }
+        }
     }
 
     /// Loss since the last call: the per-batch stderr delta. `None`
@@ -268,6 +380,13 @@ impl EventWriter {
         })
     }
 
+    /// Open the stdout event sink (`--event-log -`) on the inherited
+    /// fd 1 with one [`crate::sink::SINK_TICK_BUDGET`] bounded wait per
+    /// commit batch.
+    pub(crate) fn create_stdout() -> Result<Self, String> {
+        Self::create_stdout_on_fd(1, crate::sink::SINK_TICK_BUDGET)
+    }
+
     /// Open the stdout event sink (`--event-log -`) over any writer
     /// fd with an explicit batch budget: the same
     /// `p11scope/inventory-events/v1` lines, never rotated, with one
@@ -344,6 +463,9 @@ impl EventWriter {
     }
 
     /// Append one event line: `{"schema","seq","at_ns","kind","event"}`.
+    /// Stdout lines join the current commit batch
+    /// ([`EventWriter::begin_batch`]); outside a batch each append
+    /// spends one implicit single-line batch.
     pub(crate) fn append(
         &mut self,
         kind: &str,
@@ -463,9 +585,17 @@ impl EventWriter {
     /// Write the terminal `ended` event, flush, and sync the live
     /// file. The stdout sink writes `ended` through the same
     /// shed-with-counters path instead (itself possibly shed) and
-    /// never syncs.
+    /// never syncs; its `ended` carries the `stdout_lost` totals for
+    /// lines shed before it (its own delivery is covered by the
+    /// stderr notices and the exit status instead).
     pub(crate) fn finish(&mut self, payload: serde_json::Value, at_ns: u64) -> Result<(), String> {
-        let payload = self.project_ended_payload(payload, at_ns);
+        let mut payload = self.project_ended_payload(payload, at_ns);
+        if let EventSink::Stdout(stdout) = &self.sink {
+            payload["stdout_lost"] = serde_json::json!({
+                "lines": stdout.lost_lines,
+                "bytes": stdout.lost_bytes,
+            });
+        }
         self.append("ended", payload, at_ns)?;
         #[cfg(test)]
         if let Some(fault) = &self.fault
@@ -697,6 +827,15 @@ impl EventWriter {
         }
         Ok(())
     }
+}
+
+/// Name a stdout transport failure for the shed accounting: a
+/// closed reader reads as broken pipe, never a bare errno.
+fn describe_write_error(error: &std::io::Error) -> String {
+    if error.kind() == std::io::ErrorKind::BrokenPipe {
+        return "broken pipe: the stdout reader closed".into();
+    }
+    format!("stdout write failed: {error}")
 }
 
 fn rotated_path(live: &Path, seq: u64) -> PathBuf {
@@ -1050,6 +1189,8 @@ pub(crate) fn emit_snapshot_as_events(
     presentation: &Presentation,
     at_ns: u64,
 ) -> Result<(), String> {
+    // One bounded stdout wait for the whole replay (a no-op for files).
+    writer.begin_batch();
     let document = render_json_from_presentation(presentation);
     for caller in document["callers"].as_array().expect("callers array") {
         writer.append("caller_observed", caller.clone(), at_ns)?;

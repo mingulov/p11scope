@@ -1704,7 +1704,7 @@ fn event_log_dash_reports_a_closed_stdout_and_keeps_the_report() {
         .custom_flags(libc::O_NONBLOCK)
         .open(&fifo)
         .unwrap();
-    let mut child = Command::new("sh")
+    let child = Command::new("sh")
         .arg(fixture_source("inventory-observe-pid.sh"))
         .args(["--capture", "scan", "--duration", "4s", "-o"])
         .arg(&document_path)
@@ -1724,7 +1724,7 @@ fn event_log_dash_reports_a_closed_stdout_and_keeps_the_report() {
         .unwrap();
     let mut prefix = Vec::new();
     let deadline = Instant::now() + Duration::from_secs(30);
-    while Instant::now() < deadline && !prefix.starts_with(b"{\"schema\"") {
+    while Instant::now() < deadline && !prefix.contains(&b'\n') {
         let mut chunk = [0u8; 256];
         match read_end.read(&mut chunk) {
             Ok(n) => prefix.extend_from_slice(&chunk[..n]),
@@ -1733,10 +1733,14 @@ fn event_log_dash_reports_a_closed_stdout_and_keeps_the_report() {
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    assert!(
-        prefix.starts_with(b"{\"schema\""),
-        "no event bytes arrived in 30s"
-    );
+    let end = prefix
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .expect("no event line arrived in 30s");
+    let first: Value =
+        serde_json::from_slice(&prefix[..end]).expect("the first stdout line is an event");
+    assert_eq!(first["schema"], "p11scope/inventory-events/v1");
+    assert_eq!(first["kind"], "started");
     drop(read_end);
     let output = child.wait_with_output().unwrap();
     let text = std::fs::read_to_string(&ready).unwrap();

@@ -514,16 +514,25 @@ pub(crate) fn begin_scan_stdout(stdout: &mut dyn FinalStdout, native_stopped: bo
 
 /// An event transport failure does not invalidate captured facts. Retire
 /// the writer once and keep the first error through ordinary finalization.
+/// The stdout sink instead sheds with counters and never retires: each
+/// batch reports its own newly shed lines immediately, while
+/// `stdout_loss` keeps the refreshed running totals for the final
+/// notices and the exit status.
 pub(crate) struct EventLogState {
     writer: Option<EventWriter>,
     first_error: Option<String>,
+    stdout_loss: Option<String>,
+    stdout_requested: bool,
 }
 
 impl EventLogState {
     pub(crate) fn new(writer: Option<EventWriter>) -> Self {
+        let stdout_requested = writer.as_ref().is_some_and(EventWriter::is_stdout);
         Self {
             writer,
             first_error: None,
+            stdout_loss: None,
+            stdout_requested,
         }
     }
 
@@ -535,6 +544,21 @@ impl EventLogState {
         let writer = self.writer.as_mut()?;
         if let Err(error) = action(writer) {
             return Some(self.retire(stage, error));
+        }
+        // A shed stdout batch reports its delta now; the writer stays
+        // live, and the refreshed totals below fail the command at
+        // the end like any other sink error.
+        if let Some((lines, bytes)) = writer.take_stdout_loss_delta() {
+            let (total_lines, total_bytes) = writer.stdout_lost();
+            let reason = writer.stdout_loss_reason().unwrap_or("unknown");
+            self.stdout_loss = Some(format!(
+                "p11scope: inventory event log stdout shed {total_lines} lines \
+                 ({total_bytes} bytes; first: {reason}); capture continues"
+            ));
+            return Some(format!(
+                "p11scope: inventory event log stdout shed {lines} lines ({bytes} bytes) \
+                 during {stage}; capture continues"
+            ));
         }
         None
     }
@@ -548,6 +572,25 @@ impl EventLogState {
 
     pub(crate) fn first_error(&self) -> Option<&str> {
         self.first_error.as_deref()
+    }
+
+    /// The refreshed stdout shed totals, if any lines shed so far.
+    pub(crate) fn stdout_loss(&self) -> Option<&str> {
+        self.stdout_loss.as_deref()
+    }
+
+    /// Whether this run streams events to stdout (`--event-log -`):
+    /// stdout then carries events only, and the human summary moves
+    /// to stderr. Pinned at construction, so a later retirement
+    /// cannot reroute the summary back onto the event stream.
+    pub(crate) fn stdout_requested(&self) -> bool {
+        self.stdout_requested
+    }
+
+    /// Whether the event writer is still live (a shed stdout batch
+    /// never retires it; a file transport error does).
+    pub(crate) fn is_live(&self) -> bool {
+        self.writer.is_some()
     }
 }
 
@@ -582,15 +625,24 @@ pub(crate) fn start_event_log_guarded<Source: ProcessSource>(
     }
     stream.writer.as_ref()?;
     let prologue = Presentation::capture(coordinator, scope_label, started_ns, started_ns, 0);
-    stream
-        .attempt("startup", |writer| {
-            writer.append(
-                "started",
-                started_payload(scope_label, started_ns, &prologue),
-                started_ns,
-            )
-        })
-        .map(anyhow::Error::msg)
+    let note = stream.attempt("startup", |writer| {
+        writer.begin_batch();
+        writer.append(
+            "started",
+            started_payload(scope_label, started_ns, &prologue),
+            started_ns,
+        )
+    });
+    // A retired file writer fails fast, as before. A shed stdout
+    // `started` instead notes its loss and captures on: the stream
+    // stays live for the next batch.
+    if !stream.is_live() {
+        return note.map(anyhow::Error::msg);
+    }
+    if let Some(note) = note {
+        inventory_diagnostic(&note);
+    }
+    None
 }
 
 /// None means not requested; false means failed or not sync-confirmed.
@@ -1326,6 +1378,34 @@ fn run_with_terminal_budget(
     if !prearm_modules.is_empty() && capture == CaptureMode::Scan {
         anyhow::bail!("--prearm-module requires --capture auto or native");
     }
+    // The parser refuses these combinations; the runner repeats the
+    // refusal for programmatic callers, before any pin, sink, probe
+    // or scan. `--event-log -` owns stdout for the event stream, so
+    // the JSON document and the dashboard (which need stdout) and
+    // the file-only rotation options are refused beside it; the
+    // human text summary instead moves to stderr at the end.
+    let event_stdout = event_log == Some(Path::new("-"));
+    if event_stdout && json {
+        anyhow::bail!(
+            "--event-log - owns stdout, so it cannot be combined with --json \
+             (the JSON document goes to stdout)"
+        );
+    }
+    if event_stdout && dashboard {
+        anyhow::bail!(
+            "--event-log - owns stdout, so it cannot be combined with --dashboard \
+             (the dashboard needs the terminal)"
+        );
+    }
+    if event_stdout && (event_rotate_bytes.is_some() || event_max_files.is_some()) {
+        anyhow::bail!(
+            "--event-rotate-bytes/--event-max-files cannot be combined with --event-log - \
+             (stdout is not rotated)"
+        );
+    }
+    // Stdout aliases nothing on disk: the `-` stream skips the
+    // report/rotation alias checks below.
+    let event_log_file = event_log.filter(|_| !event_stdout);
     // F5: pin `--prearm-module` inputs before any sink, probe or scan; one
     // bad path gaps (PARTIAL) while good pins continue (never-stop).
     let prearm_pinning = if prearm_modules.is_empty() {
@@ -1333,7 +1413,7 @@ fn run_with_terminal_budget(
     } else {
         Some(pin_inventory_prearm(prearm_modules, scope)?)
     };
-    validate_primary_destinations(out, event_log)?;
+    validate_primary_destinations(out, event_log_file)?;
     if capture != CaptureMode::Scan
         && let Err(refusal) = host()
     {
@@ -1386,7 +1466,7 @@ fn run_with_terminal_budget(
     // truncates).
     let mut diagnostics = request
         .path
-        .map(|path| DiagnosticsState::prepare(path, out, event_log))
+        .map(|path| DiagnosticsState::prepare(path, out, event_log_file))
         .transpose()?;
     // Fail fast before scanning: an unwritable `-o` or event stream
     // must not cost a pass.
@@ -1399,6 +1479,11 @@ fn run_with_terminal_budget(
         None => None,
     };
     let writer = match event_log {
+        Some(path) if event_stdout => Some(
+            crate::inventory_events::EventWriter::create_stdout()
+                .map_err(|error| anyhow::anyhow!("{error}"))
+                .with_context(|| format!("opening inventory event stream {}", path.display()))?,
+        ),
         Some(path) => Some(
             crate::inventory_events::EventWriter::create(
                 path,
@@ -1410,6 +1495,11 @@ fn run_with_terminal_budget(
         ),
         None => None,
     };
+    if event_stdout {
+        inventory_diagnostic(
+            "p11scope: --event-log - owns stdout; the text summary goes to stderr",
+        );
+    }
     let mut stream = EventLogState::new(writer);
     #[cfg(test)]
     if let Some(writer) = stream.writer.as_mut() {
@@ -7108,6 +7198,9 @@ pub(crate) fn finish_output(
     }
     let event_requested = stream.writer.is_some() || stream.first_error().is_some();
     stream.attempt("completion", |writer| {
+        // One bounded stdout wait for the whole completion tail (a
+        // no-op for files, which flush per line).
+        writer.begin_batch();
         // Exact repeat counts, then the final combined sweep of physical
         // edges plus both instance kinds plus key-operation rows, then
         // ended: preserve healthy ordering and the sweep's retention
@@ -7218,13 +7311,15 @@ pub(crate) fn finish_output(
     });
     let mut outcome = FinalOutputOutcome {
         diagnostics_failed: false,
-        event_log_confirmed: event_requested.then(|| stream.first_error().is_none()),
+        event_log_confirmed: event_requested
+            .then(|| stream.first_error().is_none() && stream.stdout_loss().is_none()),
         report_committed: None,
         stdout_result: None,
         failures: stream
             .first_error()
             .map(str::to_string)
             .into_iter()
+            .chain(stream.stdout_loss().map(str::to_string))
             .collect(),
     };
     if let Some(mut sink) = sink {
@@ -7240,7 +7335,26 @@ pub(crate) fn finish_output(
                 .push(format!("p11scope: inventory -o report failed: {error}"));
         }
     }
-    if json || !silent_text {
+    // `--event-log -` owns stdout for the event stream: the human
+    // document moves to stderr instead, verbatim, so stdout stays
+    // pure JSONL (a stopped stderr may shed it, like any diagnostic).
+    // `--json` beside `-` is refused before the run; a programmatic
+    // caller that still combines them gets the document on stderr
+    // too, never interleaved onto the stream.
+    let stdout_requested = stream.stdout_requested();
+    if (json || !silent_text) && stdout_requested {
+        let text;
+        let bytes = if json {
+            document_bytes.as_slice()
+        } else {
+            text = render_snapshot(presentation);
+            text.as_bytes()
+        };
+        if let Ok(moved) = std::str::from_utf8(bytes) {
+            let _ = crate::sink::try_stderr_text(moved);
+        }
+    }
+    if (json || !silent_text) && !stdout_requested {
         let text;
         let bytes = if json {
             document_bytes.as_slice()
@@ -7532,6 +7646,9 @@ fn emit_commit(
     stop: bool,
     now_ns: u64,
 ) -> Result<(), String> {
+    // One bounded stdout wait for the whole commit (a no-op for
+    // files, which flush per line).
+    writer.begin_batch();
     let identities = IdentityIndex::new(presentation);
     for event in &report.events {
         writer.append(
@@ -11239,6 +11356,8 @@ mod tests {
                     first_error: Some(
                         "p11scope: inventory event log pass publication failed: injected".into(),
                     ),
+                    stdout_loss: None,
+                    stdout_requested: false,
                 };
                 let result = finish_output(
                     None,

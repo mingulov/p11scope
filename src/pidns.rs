@@ -175,9 +175,7 @@ pub fn classify_proc_view(
 /// when the line is missing. The single `NSpid` line finder: the
 /// proc-view check and the pid parser share it.
 fn nspid_field(status: &str) -> Option<&str> {
-    status
-        .lines()
-        .find_map(|line| line.strip_prefix("NSpid:"))
+    status.lines().find_map(|line| line.strip_prefix("NSpid:"))
 }
 
 /// Parsed `NSpid` values (outermost first) of a

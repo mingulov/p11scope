@@ -1203,7 +1203,9 @@ mod tests {
         assert!(!is_user_manager_cgroup_text(
             "0::/user.slice/user-1000.slice/user@notauid.service/init.scope\n"
         ));
-        assert!(!is_user_manager_cgroup_text("0::/system.slice/backup.service\n"));
+        assert!(!is_user_manager_cgroup_text(
+            "0::/system.slice/backup.service\n"
+        ));
         assert!(!is_user_manager_cgroup_text(
             "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
         ));

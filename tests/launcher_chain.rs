@@ -231,10 +231,7 @@ impl Orphan {
             if let Some(status) = spawner.try_wait().unwrap() {
                 break status;
             }
-            assert!(
-                Instant::now() < deadline,
-                "the orphan spawner never exited"
-            );
+            assert!(Instant::now() < deadline, "the orphan spawner never exited");
             std::thread::sleep(Duration::from_millis(50));
         };
         assert!(

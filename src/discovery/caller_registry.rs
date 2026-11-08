@@ -7519,7 +7519,11 @@ pub(crate) mod tests {
 
         pub(crate) fn set_container_init(&self, pid: u32, container_init: bool) {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
-                process.nspid = if container_init { vec![pid, 1] } else { vec![pid] };
+                process.nspid = if container_init {
+                    vec![pid, 1]
+                } else {
+                    vec![pid]
+                };
             }
         }
 
@@ -8205,10 +8209,7 @@ pub(crate) mod tests {
         );
         assert!(record.launcher_gap.is_none());
         assert_eq!(record.launched_by_origin.label(), "init_parent");
-        assert_eq!(
-            record.launched_by_unit.as_deref(),
-            Some("docker-abc.scope")
-        );
+        assert_eq!(record.launched_by_unit.as_deref(), Some("docker-abc.scope"));
     }
 
     #[test]
@@ -8259,10 +8260,7 @@ pub(crate) mod tests {
         );
         assert!(record.launcher_gap.is_none());
         assert_eq!(record.launched_by_origin.label(), "init_parent");
-        assert_eq!(
-            record.launched_by_unit.as_deref(),
-            Some("docker-abc.scope")
-        );
+        assert_eq!(record.launched_by_unit.as_deref(), Some("docker-abc.scope"));
     }
 
     #[test]

@@ -32,6 +32,10 @@ on:
   # pushes main and the tag together): tag pushes trigger nothing, so a
   # release never reruns this matrix on an identical SHA.
   push:
+    # branches: is required: with tags-ignore alone GitHub runs nothing
+    # on branch pushes (an undefined ref type never runs).
+    branches:
+      - '**'
     tags-ignore:
       - '**'
   pull_request:

@@ -5,6 +5,10 @@ on:
   # release never reruns this matrix on an identical SHA. The dedupe job
   # below still covers same-SHA branch re-pushes.
   push:
+    # branches: is required: with tags-ignore alone GitHub runs nothing
+    # on branch pushes (an undefined ref type never runs).
+    branches:
+      - '**'
     tags-ignore:
       - '**'
   pull_request:

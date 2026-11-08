@@ -472,7 +472,8 @@ class BrowserCells(unittest.TestCase):
                 cc.client_certs_presented, 1, "client cert never presented")
         self.assertEqual(result.flow.get("observer_exit"), 0,
                          f"observer failed: {result.observer_stderr_tail}")
-        report = oracle.load_report(result.report_path)
+        with open(result.report_path, encoding="utf-8") as handle:
+            report = json.load(handle)
         observations = report.get("object_observations") or {}
         self.assertEqual(
             observations.get("status"), "populated",

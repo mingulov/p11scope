@@ -2725,13 +2725,18 @@ mod tests {
             "a looping upper entry must refuse"
         );
         // An unreadable intermediate directory: EACCES for a process
-        // that cannot stat through (root sees the absent entry and
-        // falls through to the lower file — both configurations assert).
+        // that cannot stat through (root stats through to the absent
+        // entry and falls through to the lower file — both
+        // configurations assert, so only PermissionDenied counts as
+        // denied).
         let gated = upper.join("gated");
         std::fs::create_dir(&gated).expect("layer dir");
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&gated, std::fs::Permissions::from_mode(0o000)).expect("chmod");
-        let denied = std::fs::symlink_metadata(gated.join("lib.so")).is_err();
+        let denied = matches!(
+            std::fs::symlink_metadata(gated.join("lib.so")),
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        );
         let outcome = super::calibration_backing_accepted(
             &merged_root.join("gated/lib.so"),
             backing_ino_of(&lower.join("gated/lib.so")),

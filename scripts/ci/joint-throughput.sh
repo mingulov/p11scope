@@ -46,9 +46,10 @@
 #             including the lifecycle ring high-water mark on the
 #             stop line (default unset records nothing)
 #   JOINT_NICE
-#             nice flags for the joint observer (default "-n -5";
-#             empty runs at default priority for without-nice
-#             control cells). The S1 twin always runs unniced.
+#             nice level for the joint observer, exactly "-n <int>"
+#             (default "-n -5"); empty skips nice and runs at the
+#             caller's priority for without-nice control cells. The
+#             S1 twin always runs unniced.
 #
 # Cells:
 #   joint-10k-single  --system --key-operations over keyed RATE/DURATION
@@ -139,10 +140,27 @@ observer_env() {
     fi
 }
 
-# Nice flags for the joint observer: JOINT_NICE overrides the level
-# (empty runs at default priority for without-nice control cells).
-observer_nice_flags() {
-    printf '%s\n' "${JOINT_NICE--n -5}"
+# Validated nice level for the joint observer: JOINT_NICE overrides
+# the level (empty skips nice for without-nice control cells).
+# Prints the level (an integer), or nothing when empty. Only
+# "-n <int>" is accepted; anything else fails without printing, so
+# no unvalidated word ever reaches the sudo line below.
+observer_nice_level() {
+    flags=${JOINT_NICE--n -5}
+    [ -z "$flags" ] && return 0
+    level=${flags#-n }
+    rest=${level#-}
+    if [ "$level" = "$flags" ] || [ -z "$rest" ]; then
+        log "JOINT_NICE must be '-n <int>' or empty"
+        return 1
+    fi
+    case "$rest" in
+        *[!0-9]*)
+            log "JOINT_NICE must be '-n <int>' or empty"
+            return 1
+            ;;
+    esac
+    printf '%s\n' "$level"
 }
 
 # Print the provider path, or nothing when no candidate exists.
@@ -217,6 +235,9 @@ validate_params() {
                 ;;
         esac
     done
+    if ! observer_nice_level > /dev/null; then
+        return 1
+    fi
     return 0
 }
 
@@ -655,12 +676,27 @@ run_joint_cell() {
     # The drain keeps up with 10k/s only with steady CPU: run the
     # observer (and the threads it spawns) one step above best-effort
     # so a contended host cannot starve the ring drain. JOINT_NICE
-    # overrides the level (empty runs at default priority); without-nice
-    # control cells compare against this default.
-    # shellcheck disable=SC2046,SC2086 # observer_env is empty or one assignment per line; observer_nice_flags is empty or nice flags.
-    sudo -n env $(observer_env) nice $(observer_nice_flags) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
-        $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
-        --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
+    # overrides the level; empty skips nice and runs at the caller's
+    # priority. Without-nice control cells compare against this
+    # default. The level is one validated word (validate_params
+    # rejected anything else), so no word-splitting reaches sudo.
+    if ! joint_nice_level=$(observer_nice_level); then
+        log "$cell: invalid JOINT_NICE"
+        exec 9>&-
+        fail_flow "$dir" "invalid JOINT_NICE"
+        finish_cell "$cell" "$dir" "flow=bad-nice" || return 1
+        return 0
+    fi
+    # shellcheck disable=SC2086 # observer_env is empty or one assignment per line.
+    if [ -n "$joint_nice_level" ]; then
+        sudo -n env $(observer_env) nice -n "$joint_nice_level" "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
+            $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
+            --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
+    else
+        sudo -n env $(observer_env) "$P11SCOPE" inventory --system --manifest "$MANIFEST" \
+            $keyops_flag --duration "$obs_dur" --json -o "$dir/report.json" \
+            --event-log "$dir/events.jsonl" > "$dir/observer.out" 2>&1 &
+    fi
     echo $! > "$dir/observer.pid"
     if ! wait_for_line "p11scope: pass 0:" "$dir/observer.out" 300; then
         log "$cell: pass 0 never published"

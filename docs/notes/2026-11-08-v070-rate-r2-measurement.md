@@ -17,9 +17,14 @@ Every cell below ran the joint observer one step above best-effort
 (`scripts/ci/joint-throughput.sh`: `nice -n -5`). The keep-up claims
 are conditional on that scheduling; operator runs at default
 priority may differ. The S1 twin cell always runs unniced.
-`JOINT_NICE` overrides the level (empty runs at default priority);
-the round-3 without-nice control re-runs 10k/60s with `JOINT_NICE=`
-(empty) — see the round-3 report.
+`JOINT_NICE` overrides the level; empty now skips nice and runs at
+the caller's priority. Correction: the round-3 control re-ran
+10k/60s with `JOINT_NICE=` (empty), but the round-3 script ran that
+case under a bare `nice`, which adds its default +10 — so the old
+control was really a nice +10 run, not a without-nice one (its
+Gate-2 exactness held even de-prioritised; its latency comparison
+was +10 against −5). Round 4 re-runs the control at true default
+priority.
 
 ## Gate 2 exactness and settlement
 

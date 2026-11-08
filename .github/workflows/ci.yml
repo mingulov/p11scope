@@ -873,6 +873,7 @@ jobs:
           UNRUN: scripts/verify-receipt-lane02.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
           UNRUN: scripts/ci/joint-throughput.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/joint-stall-live.sh (privileged/container lane body UNRUN hosted; only its unprivileged self-test runs in this job; local run needs owner approval)
+          UNRUN: scripts/ci/joint-saturating.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/key-operations-linked-control.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/key-operations-system.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)
           UNRUN: scripts/ci/key-operations-shortlived.sh (privileged/container lane body UNRUN hosted; no self-test; local run needs owner approval)

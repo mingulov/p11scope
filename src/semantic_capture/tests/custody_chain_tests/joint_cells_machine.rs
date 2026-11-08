@@ -45,6 +45,19 @@ fn phase_of(scene: &MachineScene) -> &'static str {
     scene.machine.diagnostic_snapshot_for_test().0
 }
 
+/// Hold the pre-grant wall-time bound fixed while a capacity test
+/// fills its quantum: refresh the first-poll stamp whenever the
+/// machine is still collecting, so suite load cannot time the
+/// quantum out from under the capacity bound under test. The
+/// timeout path itself stays covered by its own twin.
+fn hold_pregrant_wall_time(scene: &mut MachineScene) {
+    if phase_of(scene) == "Collecting" {
+        scene
+            .machine
+            .set_pregrant_first_poll_for_test(Some(std::time::Instant::now()));
+    }
+}
+
 /// Step the running machine until one of the wanted phases holds.
 fn reach_any(scene: &mut MachineScene, wants: &[&str]) -> &'static str {
     for _ in 0..512 {
@@ -3650,6 +3663,7 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
             "Collecting",
             "chunk {chunk} extends below the wire bound"
         );
+        hold_pregrant_wall_time(&mut scene);
     }
     // The drain pulls incrementally, like production ring polls: two
     // more 400-wide chunks extend below the bound, then the final 96
@@ -3666,12 +3680,14 @@ fn joint_pregrant_begin_table_full_closes_during_extension() {
             "chunk {} extends below the wire bound",
             chunk + 8
         );
+        hold_pregrant_wall_time(&mut scene);
     }
     for thread in 4001..=4_096 {
         let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
         scene.scene.drain.source_mut().push_record(begin.to_vec());
     }
     for _ in 0..512 {
+        hold_pregrant_wall_time(&mut scene);
         scene.service(1).expect("close poll succeeds");
         if phase_of(&scene) != "Collecting" {
             break;
@@ -3770,6 +3786,7 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
             "Collecting",
             "chunk {chunk} extends below the ledger's room"
         );
+        hold_pregrant_wall_time(&mut scene);
     }
     // The drain pulls incrementally, like production ring polls: two
     // more 400-wide chunks extend below the room, then the final 96
@@ -3786,13 +3803,22 @@ fn joint_pregrant_ledger_room_closes_before_refusing_a_begin() {
             "chunk {} extends below the ledger's room",
             chunk + 9
         );
+        hold_pregrant_wall_time(&mut scene);
     }
     for thread in 4001..=4_096 {
         let begin = begin_bytes(thread, 1, function_id("C_SignInit"), 0);
         scene.scene.drain.source_mut().push_record(begin.to_vec());
     }
-    assert!(
-        drive_until_closed(&mut scene, 512),
+    for _ in 0..512 {
+        hold_pregrant_wall_time(&mut scene);
+        scene.service(1).expect("close poll succeeds");
+        if phase_of(&scene) != "Collecting" {
+            break;
+        }
+    }
+    assert_ne!(
+        phase_of(&scene),
+        "Collecting",
         "the ledger's room closes the quantum"
     );
     let raw = scene

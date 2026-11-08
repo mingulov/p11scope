@@ -364,6 +364,73 @@ fn systemd_unit_oracle(cgroup: &str) -> Option<String> {
     None
 }
 
+/// Whether a `/proc/<pid>/cgroup` text ends in the systemd user
+/// manager itself (`user@<uid>.service/init.scope`, numeric uid):
+/// desktop test shells run under `systemd --user`, so an orphaned
+/// fixture lands there instead of pid 1.
+fn cgroup_is_user_manager_init(_cgroup: &str) -> bool {
+    false
+}
+
+#[test]
+fn systemd_unit_oracle_matches_systemd_on_anchored_and_invalid_names() {
+    // The oracle pins the same systemd rule production implements: an
+    // anchored `user@N.service` takes the user unit, a mid-path one is
+    // a delegated name, and names systemd rejects yield nothing.
+    assert_eq!(
+        systemd_unit_oracle("0::/system.slice/docker-abc.scope/user@0.service/sshd.service\n")
+            .as_deref(),
+        Some("docker-abc.scope")
+    );
+    assert_eq!(
+        systemd_unit_oracle(
+            "0::/machine.slice/systemd-nspawn@c1.service/payload/user.slice/user-1000.slice/user@1000.service/app.slice/backup.service\n"
+        )
+        .as_deref(),
+        Some("systemd-nspawn@c1.service")
+    );
+    assert_eq!(
+        systemd_unit_oracle(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/backup.service\n"
+        )
+        .as_deref(),
+        Some("backup.service")
+    );
+    assert_eq!(
+        systemd_unit_oracle("0::/system.slice/foo bar.service\n").as_deref(),
+        None
+    );
+    assert_eq!(
+        systemd_unit_oracle("0::/foo@bar.slice/x.service\n").as_deref(),
+        None
+    );
+    assert_eq!(
+        systemd_unit_oracle("0::/system.slice/foo@.service\n").as_deref(),
+        None
+    );
+    assert_eq!(
+        systemd_unit_oracle("0::/system.slice/getty@tty1.service\n").as_deref(),
+        Some("getty@tty1.service")
+    );
+}
+
+#[test]
+fn orphan_user_manager_adoption_tail_matches_init_scope_only() {
+    assert!(cgroup_is_user_manager_init(
+        "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n"
+    ));
+    assert!(!cgroup_is_user_manager_init(
+        "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
+    ));
+    assert!(!cgroup_is_user_manager_init(
+        "0::/user.slice/user-1000.slice/user@notauid.service/init.scope\n"
+    ));
+    assert!(!cgroup_is_user_manager_init(
+        "0::/system.slice/session-c2.scope\n"
+    ));
+    assert!(!cgroup_is_user_manager_init(""));
+}
+
 fn observe(pid: u32, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_p11scope"))
         .arg("inventory")

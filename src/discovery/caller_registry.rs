@@ -8088,6 +8088,40 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn launcher_chain_four_real_plus_kthread_stops_cleanly() {
+        let (source, mut adapter) = adapter();
+        // A kernel thread above four real ancestors (a user-mode helper
+        // chain four shells deep under kthreadd): the fifth link is a
+        // boundary, not a truncated ancestor.
+        source.spawn(2, 2);
+        source.hide_ancestor_exe(2);
+        source.set_kthread(2, true);
+        for pid in 302..=305 {
+            source.spawn(pid, pid as u64);
+            source.set_ppid(pid, pid - 1);
+        }
+        source.set_ppid(302, 2);
+        source.spawn(300, 390);
+        source.set_ppid(300, 305);
+        let id = adapter.admit(300, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(
+            record
+                .launched_by
+                .iter()
+                .map(|ancestor| ancestor.pid)
+                .collect::<Vec<_>>(),
+            vec![305, 304, 303, 302]
+        );
+        assert!(
+            record.launcher_gap.is_none(),
+            "a kernel thread above the fourth ancestor ends the walk: {:?}",
+            record.launcher_gap
+        );
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
     fn launcher_chain_ppid_zero_is_an_init_parent() {
         let (source, mut adapter) = adapter();
         // No parent in this pid namespace: a boundary, never an empty chain.

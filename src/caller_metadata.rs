@@ -1269,4 +1269,75 @@ mod tests {
             Some("app-gated.scope")
         );
     }
+
+    #[test]
+    fn launcher_systemd_unit_anchors_the_user_rule_after_leading_slices() {
+        // systemd `skip_user_prefix`: `user@N.service` anchors the user
+        // rule only as the first non-slice component. A mid-path
+        // occurrence sits in a delegated subtree its owner chose, so the
+        // system first-unit rule applies instead.
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/system.slice/docker-abc.scope/user@0.service/sshd.service\n"
+            )
+            .as_deref(),
+            Some("docker-abc.scope")
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/machine.slice/systemd-nspawn@c1.service/payload/user.slice/user-1000.slice/user@1000.service/app.slice/backup.service\n"
+            )
+            .as_deref(),
+            Some("systemd-nspawn@c1.service")
+        );
+        // A genuinely anchored manager still takes the user rule.
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/backup.service\n"
+            )
+            .as_deref(),
+            Some("backup.service")
+        );
+        // The user-manager *classification* keeps its anywhere tail: it
+        // can only hide a link, never invent one.
+        assert!(is_user_manager_cgroup_text(
+            "0::/machine.slice/systemd-nspawn@c1.service/payload/user.slice/user-1000.slice/user@1000.service/init.scope\n"
+        ));
+    }
+
+    #[test]
+    fn launcher_systemd_unit_rejects_names_systemd_rejects() {
+        // systemd `unit_name_is_valid`: the walked names keep the valid
+        // charset, fewer than 256 bytes, and the `@` rules (slices are
+        // `PLAIN`, units `PLAIN|INSTANCE`, so templates never qualify).
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/foo bar.service\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/foo@bar.slice/x.service\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/foo@.service\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/@x.service\n").as_deref(),
+            None
+        );
+        // Positive controls: instances and `@`-free names still qualify.
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/getty@tty1.service\n").as_deref(),
+            Some("getty@tty1.service")
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/foo-bar_baz.service\n").as_deref(),
+            Some("foo-bar_baz.service")
+        );
+        // The 256-byte bound (`UNIT_NAME_MAX`), pinned directly: path
+        // validation already caps components at 255 bytes.
+        assert!(is_unit_name(&format!("{}.service", "a".repeat(247))));
+        assert!(!is_unit_name(&format!("{}.service", "a".repeat(248))));
+    }
 }

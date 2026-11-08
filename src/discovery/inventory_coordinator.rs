@@ -11872,6 +11872,9 @@ pub(crate) mod tests {
         fn gone(&self, pid: u32) -> bool {
             OsProcessSource.gone(pid)
         }
+        fn proven_exited(&self, pid: u32) -> bool {
+            OsProcessSource.proven_exited(pid)
+        }
         fn shared_semantic_custody(
             &self,
             _pin: &Arc<Self::Pin>,
@@ -16542,6 +16545,9 @@ exit 0
         }
         fn gone(&self, pid: u32) -> bool {
             OsProcessSource.gone(pid)
+        }
+        fn proven_exited(&self, pid: u32) -> bool {
+            OsProcessSource.proven_exited(pid)
         }
     }
 
@@ -26345,6 +26351,9 @@ exit 0
 
         fn gone(&self, pid: u32) -> bool {
             self.inner.gone(pid)
+        }
+        fn proven_exited(&self, pid: u32) -> bool {
+            self.inner.proven_exited(pid)
         }
     }
 

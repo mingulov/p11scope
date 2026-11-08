@@ -860,6 +860,16 @@ impl ProcessSource for ScriptedSource {
             .get(&pid)
             .is_some_and(|process| process.alive)
     }
+
+    fn proven_exited(&self, pid: u32) -> bool {
+        // Liveness alone, never readability: this scripted source has
+        // no zombies and its launcher walk is unexercised.
+        !self
+            .state
+            .borrow()
+            .get(&pid)
+            .is_some_and(|process| process.alive)
+    }
 }
 
 /// One churn workload: `pids` pids turning over `generations` times

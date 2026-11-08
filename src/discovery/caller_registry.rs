@@ -32,8 +32,8 @@ use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
 use crate::process::{
-    PidPin, generation_gone, process_is_kthread, process_is_zombie, process_start_time,
-    process_stat_pair,
+    PidPin, generation_gone, process_is_kthread, process_is_zombie, process_proven_exited,
+    process_start_time, process_stat_pair,
 };
 pub(crate) mod metadata;
 
@@ -349,6 +349,14 @@ pub(crate) trait ProcessSource {
     /// the generation is dead even though `/proc` still parses — so a
     /// dead-but-unreaped target retires instead of re-admitting.
     fn gone(&self, pid: u32) -> bool;
+    /// True when `pid` provably names no process: reaped or never
+    /// lived, shown through a channel `/proc` `hidepid` cannot affect
+    /// (`kill(pid, 0)` answering `ESRCH`). An unreadable-but-live pid
+    /// (hidden, unpermitted, transiently unreadable) answers false:
+    /// only `ESRCH` is proof, never `/proc` `ENOENT`. Zombies answer
+    /// false — they still answer the signal — so this decides only
+    /// stat-failure gaps, where a zombie's parseable stat never lands.
+    fn proven_exited(&self, pid: u32) -> bool;
     /// A leader-exit hook plus a held process pin is not proof of a live
     /// worker. Sources without fresh original-custody task evidence defer.
     fn leader_exit_observation(
@@ -783,6 +791,10 @@ impl ProcessSource for OsProcessSource {
 
     fn gone(&self, pid: u32) -> bool {
         generation_gone(pid) || process_is_zombie(pid)
+    }
+
+    fn proven_exited(&self, pid: u32) -> bool {
+        process_proven_exited(pid)
     }
 
     fn leader_exit_observation(
@@ -7692,6 +7704,18 @@ pub(crate) mod tests {
                 .is_some_and(|process| process.alive)
         }
 
+        fn proven_exited(&self, pid: u32) -> bool {
+            // The scripted `ESRCH` proof: liveness alone, never
+            // readability — a blind-but-alive process is hidden, not
+            // exited.
+            !self
+                .state
+                .borrow()
+                .processes
+                .get(&pid)
+                .is_some_and(|process| process.alive)
+        }
+
         fn leader_exit_observation(
             &self,
             pin: &Self::Pin,
@@ -8399,6 +8423,44 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn launcher_chain_proven_exit_reports_exited_despite_hidepid() {
+        let (source, mut adapter) = adapter();
+        // Pid 100 never lived: the exit proof holds whatever the mount
+        // hides, so no hidepid verdict overrides it.
+        source.set_proc_hidepid(true);
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(record.launched_by.is_empty());
+        assert_eq!(
+            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("launcher exited before read")
+        );
+        assert_eq!(record.launched_by_origin.label(), "gap");
+    }
+
+    #[test]
+    fn launcher_chain_hidden_alive_parent_reports_hidden_not_exited() {
+        let (source, mut adapter) = adapter();
+        // Pid 100 lives but its stat is unreadable (hidden or
+        // unpermitted): without an exit proof the gap names the hiding,
+        // never an exit.
+        source.spawn(100, 11);
+        source.blind(100);
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(record.launched_by.is_empty());
+        assert_eq!(
+            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("launcher hidden by /proc hidepid")
+        );
+        assert_eq!(record.launched_by_origin.label(), "gap");
+    }
+
+    #[test]
     fn launcher_hidepid_mount_option_needs_positive_procfs_evidence() {
         let row = |super_options: &str| {
             format!(
@@ -8520,6 +8582,9 @@ pub(crate) mod tests {
             queue.remove(0)
         }
         fn gone(&self, _: u32) -> bool {
+            self.gone
+        }
+        fn proven_exited(&self, _: u32) -> bool {
             self.gone
         }
     }

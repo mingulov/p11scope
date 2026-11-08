@@ -1600,6 +1600,19 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
     gone_from(process_start_time(pid))
 }
 
+/// True when `pid` provably names no process at all: a `kill(pid, 0)`
+/// that answers `ESRCH`. Unlike `/proc` reads this channel is
+/// unaffected by `hidepid` mounts, so it proves an exit where
+/// `/proc` `ENOENT` is ambiguous. Anything else answers false: a
+/// live pid (signal delivered or `EPERM`), a zombie (still answers),
+/// an unrepresentable pid, or an unexpected error. Only `ESRCH` is
+/// proof, never the absence of a `/proc` entry.
+pub(crate) fn process_proven_exited(_pid: u32) -> bool {
+    // Scaffolding for the launcher exit-proof tests; the `ESRCH`
+    // proof lands with the gap change.
+    false
+}
+
 /// The whole `/proc/<pid>/stat` in (almost always) one `read`:
 /// `read_to_string` grows from 32 bytes, so it issues ~5 tiny reads per
 /// stat (~13 us vs ~10 us measured, exp-pass-profile). Same bytes on
@@ -2687,6 +2700,32 @@ int main(int argc, char **argv) {
         assert!(generation_dead(pid), "a zombie reads live");
         child.wait().unwrap();
         assert!(generation_dead(pid), "a reaped child reads live");
+    }
+
+    #[test]
+    fn proven_exited_proves_reaped_and_never_lived_pids() {
+        // A reaped child and a pid that never lived both answer
+        // `ESRCH` (`i32::MAX` is far above the kernel's pid ceiling).
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .die_with_parent()
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(process_proven_exited(pid), "a reaped child proves live");
+        assert!(
+            process_proven_exited(i32::MAX as u32),
+            "a pid that never lived proves live"
+        );
+    }
+
+    #[test]
+    fn proven_exited_fails_closed_on_live_and_unrepresentable_pids() {
+        assert!(!process_proven_exited(std::process::id()));
+        assert!(!process_proven_exited(0));
+        assert!(!process_proven_exited(u32::MAX));
     }
 
     #[test]

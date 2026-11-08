@@ -1742,7 +1742,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          scripts/ci/check-cell-results.py "$GITHUB_WORKSPACE/container-image-out/results.jsonl" \
+          python3 -I scripts/ci/check-cell-results.py "$GITHUB_WORKSPACE/container-image-out/results.jsonl" \
             --require host-exact --require container-exact \
             --require refusal-pidns --require refusal-cap
       - name: Upload the container-image results

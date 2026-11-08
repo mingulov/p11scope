@@ -2593,6 +2593,20 @@ What this tool proves, and what it deliberately does not claim to:
   cannot.** The corollary of the first point: a clean capture with zero
   errors over an hour is not a correctness guarantee for the next hour,
   or for a code path the workload never took during the window.
+- **A same-namespace child subreaper stays a visible launcher link.**
+  Init, the systemd user manager, container inits, pid-namespace
+  boundaries and kernel threads are never shown as the launcher: the
+  chain stops there, naming the caller's systemd unit beside an
+  init-only parent. But a subreaper in the same pid namespace (`tini
+  -s`, s6/runit, `--pid=host` runtimes) exposes no `/proc` flag, so the
+  walk cannot tell it from the process that launched the caller and
+  shows its real name honestly instead of guessing. A recorded parent
+  proves parentage at admission, not operator attestation.
+- **Concise launcher origins stay short on purpose.** The concise
+  suffix shows a named parent (`app (from cron)`) or a `.service` unit
+  for an init-only parent; scopes, transient units and nameless (`pid
+  N`) links print no suffix there and stay in `-v` and JSON, which are
+  always complete.
 
 ## Related docs
 

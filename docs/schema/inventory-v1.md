@@ -214,19 +214,29 @@ and never proves an app identity. See the app identity rows of
   four raw ancestors, nearest first, each with its `pid`, `start_time`
   (`clock_ticks_since_boot`, for generation comparison like the caller's
   own) and exe basename (`exe`), plus an optional `label` hook (absent
-  in v0.7.0; a future lane fills interpreter labels). Init (pid 1),
-  the systemd user manager and container inits are never recorded; a
-  parent younger than its child proves pid reuse and stops the walk.
-  Runs of adjacent identical wrappers (same exe and label) collapse in
-  output: one link keeps the nearest `pid`/`start_time` with `folded`
-  counting the additional ancestors (absent when zero). An ancestor
-  whose exe link could not be read carries `exe: null` with the named
-  `exe_gap` reason. `launched_by_origin` is `chain` (real ancestors),
-  `init_parent` (the immediate parent is init-type; `launched_by` is
-  empty, no gap is emitted, and `launched_by_unit` carries the caller's
-  systemd unit/scope or null) or `gap` (empty chain with a stop gap).
-  The walk stops cleanly at ppid 0 (no parent in this pid namespace);
-  any earlier stop keeps the ancestors read so far plus
+  in v0.7.0; a future lane fills interpreter labels). Init (pid 1 of
+  the scope's pid namespace), the systemd user manager, container
+  inits, a parent outside the child's pid namespace (fewer `NSpid`
+  levels) and kernel threads are never recorded, and neither is the
+  observer-visible parent of a caller that is itself a container init;
+  a parent younger than its child proves pid reuse and stops the walk.
+  Same-namespace child subreapers stay visible links (no `/proc` flag
+  distinguishes them). Runs of adjacent identical wrappers (same exe
+  and label) collapse in output: one link keeps the nearest
+  `pid`/`start_time` with `folded` counting the additional ancestors
+  (absent when zero). An ancestor whose exe link could not be pinned
+  to the statted generation carries `exe: null` with the named
+  `exe_gap` reason (the exit for a proved recycle or a dead
+  generation, otherwise the unreadable link). `launched_by_origin` is
+  `chain` (real ancestors), `init_parent` (the immediate parent is
+  init-type, or there is no parent in this pid namespace; `launched_by`
+  is empty, no gap is emitted, and `launched_by_unit` carries the
+  caller's systemd unit/scope or null) or `gap` (empty chain with a
+  stop gap). The unit follows `sd_pid_get_unit` (first unit past the
+  leading slices of the `0:` cgroup path), or `sd_pid_get_user_unit`
+  inside a `user@<uid>.service` subtree (the first unit after the user
+  manager, or nothing). A boundary above real ancestors ends the walk
+  with no gap; any earlier stop keeps the ancestors read so far plus
   `launched_by_gap` (`subject` `caller parent chain` with a named
   `reason`: the launcher exited before read, hid behind `/proc`
   hidepid, the chain was truncated after four ancestors, or the cgroup

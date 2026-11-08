@@ -96,7 +96,13 @@ else
     fi
 fi
 
-python3 -I - "$MODE" "$BINARY" "$WORK" "$TOOL" "$RUNS" "$KEEP" "$TEACH" "$LINGER" "$DOCKER" <<'PY'
+# The embedded runner ships in two capped heredocs (scripts tree shape
+# gate caps each heredoc body): their concatenation is the whole program,
+# written once and executed once. The program reads only argv[1..9], never
+# stdin or argv[0], so the temp-file form behaves identically.
+exe_runner=$(mktemp "${TMPDIR:-/tmp}/verify-unidentified-exe-name.XXXXXX.py")
+trap 'rm -f "$exe_runner"' EXIT
+cat > "$exe_runner" <<'PY'
 import json
 import mmap
 import os
@@ -397,6 +403,8 @@ def main(binary, work, keep, tool_arg, runs_arg, teach_arg, linger_arg, docker):
             holder.kill()
             holder.wait()
     require(False, "no passing attempt (%s)" % (last,))
+PY
+cat >> "$exe_runner" <<'PY'
 
 
 def docker_exec_env(container, env, *args, **kwargs):
@@ -684,3 +692,4 @@ if mode == "self":
 else:
     main(binary, workdir, keep, tool_arg, runs_arg, teach, linger, docker)
 PY
+python3 -I "$exe_runner" "$MODE" "$BINARY" "$WORK" "$TOOL" "$RUNS" "$KEEP" "$TEACH" "$LINGER" "$DOCKER"

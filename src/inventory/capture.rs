@@ -718,11 +718,12 @@ impl<L> NativeLane<L> {
         // proved offsets absorbed before passes), so the module is watched
         // before it is mapped instead of after the first full scan pass. An
         // empty host still activates empty, exactly as before.
-        let delta = if host.has_pending_targets() {
+        let mut delta = if host.has_pending_targets() {
             host.take_target_delta()
         } else {
             TargetDelta::default()
         };
+        host.order_drain_targets(&mut delta.endpoints);
         let receipt = capture.extend(delta, host.capture_targets(), windows.extend());
         if let Some(reason) = receipt.refused.clone() {
             host.abandon_capture_coverage();

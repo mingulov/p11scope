@@ -31,7 +31,9 @@ use crate::discovery::retained_member::RetainedGroupMember;
 use crate::discovery::scan::CaptureWorkBudget;
 use crate::discovery::sweep_attribution::{ReservationOwner, SegmentPolicy};
 use crate::process::CustodyCharge;
-use crate::process::{PidPin, generation_gone, process_is_zombie, process_start_time};
+use crate::process::{
+    PidPin, generation_gone, process_is_zombie, process_start_time, process_stat_pair,
+};
 pub(crate) mod metadata;
 
 use crate::semantics_edge::resources::{SemanticResourceRefusal, SemanticResourceReserver};
@@ -117,6 +119,41 @@ pub(crate) struct ExeIdentity {
     pub path: Option<String>,
 }
 
+/// One launcher-chain ancestor: one (pid, start-time) generation and its
+/// executable basename. Chains run nearest first. The `label` hook stays
+/// `None` in this lane; the app-identity lane fills interpreter labels
+/// without touching capture.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // Capture lands before its JSON/text readers; the JSON commit removes this.
+pub(crate) struct LauncherAncestor {
+    pub pid: u32,
+    pub start_time: Option<u64>,
+    pub exe: Option<String>,
+    pub label: Option<String>,
+}
+
+/// Why a launcher chain stops before a root: a named gap, never a guess.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // See `LauncherAncestor`.
+pub(crate) struct LauncherGap {
+    pub subject: &'static str,
+    pub reason: String,
+}
+
+/// How many ancestors the walk keeps (nearest first).
+pub(crate) const LAUNCHER_CHAIN_DEPTH: usize = 4;
+/// Gap subject for every launcher-chain stop.
+pub(crate) const LAUNCHER_GAP_SUBJECT: &str = "caller parent chain";
+/// The parent exited between admission and the ancestor read.
+pub(crate) const LAUNCHER_GAP_EXITED: &str = "parent unknown: exited before read";
+/// The parent's `/proc` entry was unreadable though it looks alive.
+pub(crate) const LAUNCHER_GAP_UNREADABLE: &str = "parent unknown: unreadable /proc entry";
+/// The walk kept [`LAUNCHER_CHAIN_DEPTH`] ancestors with more above.
+pub(crate) const LAUNCHER_GAP_TRUNCATED: &str = "parent chain truncated after 4 ancestors";
+/// Cgroup-transaction commits sample no parentage (zero post-sample reads).
+pub(crate) const LAUNCHER_GAP_CGROUP_DEFERRED: &str =
+    "parent chain not sampled in cgroup transaction";
+
 /// Which authority backs a caller incarnation's image reference.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ImageAuthority {
@@ -173,6 +210,13 @@ pub(crate) struct CallerRecord {
     /// Display-only app hint (interpreter script/unit/snap label), sampled
     /// at admission. Never identity, admission, or join input.
     pub app_hint: Option<crate::app_hint::AppHint>,
+    /// The launcher chain (nearest first), captured at admission; frozen
+    /// evidence like the exe identity above.
+    #[allow(dead_code)] // See `LauncherAncestor`.
+    pub launched_by: Vec<LauncherAncestor>,
+    /// Why the chain stops before a root, if it does.
+    #[allow(dead_code)] // See `LauncherAncestor`.
+    pub launcher_gap: Option<LauncherGap>,
     /// False when the exe identity was unreadable at admission: exec
     /// changes are then undetectable and the record says so.
     pub exec_observed: bool,
@@ -215,6 +259,24 @@ pub(crate) trait ProcessSource {
         _admitted_start_time: Option<u64>,
     ) -> Option<crate::app_hint::AppHint> {
         None
+    }
+    /// ppid (stat field 4) of `pid`, or `None` when unknown. The default
+    /// knows no parentage; production and scripted sources override it.
+    fn parent_pid(&self, _pid: u32) -> Option<u32> {
+        None
+    }
+    /// `(start_time, ppid)` for `pid`. Production reads ONE stat line so
+    /// reuse between two reads cannot mix generations; the default
+    /// composes the two separate reads.
+    fn stat_pair(&self, pid: u32) -> (Option<u64>, Option<u32>) {
+        (self.start_time(pid), self.parent_pid(pid))
+    }
+    /// Basename of `pid`'s `/proc/<pid>/exe` link, or `None` when
+    /// unreadable. The default derives it from [`exe_identity`].
+    fn ancestor_exe(&self, pid: u32) -> Option<String> {
+        self.exe_identity(pid)
+            .and_then(|exe| exe.path)
+            .map(|path| exe_basename(&path))
     }
     /// True when `pid` names no live process: reaped, never existed, or
     /// a zombie awaiting its parent's `wait`. Zombies count as gone —
@@ -327,6 +389,74 @@ fn exe_identity_from_followed_metadata(
     })
 }
 
+/// Last path segment of an exe link, verbatim (a ` (deleted)` marker
+/// survives as part of the name, as in presentation labels).
+pub(crate) fn exe_basename(path: &str) -> String {
+    path.rsplit('/').next().unwrap_or(path).to_string()
+}
+
+/// The gap for an ancestor whose stat line would not parse: exited when
+/// the generation is provably gone, otherwise unreadable. Never a guess.
+fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> LauncherGap {
+    let reason = if source.gone(pid) {
+        LAUNCHER_GAP_EXITED
+    } else {
+        LAUNCHER_GAP_UNREADABLE
+    };
+    LauncherGap {
+        subject: LAUNCHER_GAP_SUBJECT,
+        reason: reason.into(),
+    }
+}
+
+/// Capture one caller incarnation's launcher chain: up to
+/// [`LAUNCHER_CHAIN_DEPTH`] ancestors, nearest first, each as a
+/// (pid, start-time) generation with its exe basename. Stops cleanly (no
+/// gap) at pid 1 and at ppid 0 (no parent in this pid namespace); any
+/// other stop keeps the ancestors read so far plus a named gap. Never
+/// fails, never guesses, and never touches argv, environ or comm.
+pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
+    source: &Source,
+    caller_pid: u32,
+    caller_ppid: Option<u32>,
+) -> (Vec<LauncherAncestor>, Option<LauncherGap>) {
+    let mut chain = Vec::new();
+    let Some(mut ppid) = caller_ppid else {
+        return (chain, Some(launcher_read_gap(source, caller_pid)));
+    };
+    if ppid == 0 {
+        return (chain, None);
+    }
+    loop {
+        if chain.len() >= LAUNCHER_CHAIN_DEPTH {
+            // The fourth ancestor's own stat line (already read) names a
+            // parent above it — otherwise the loop would have stopped
+            // cleanly — so the truncation is read evidence, not a guess.
+            return (
+                chain,
+                Some(LauncherGap {
+                    subject: LAUNCHER_GAP_SUBJECT,
+                    reason: LAUNCHER_GAP_TRUNCATED.into(),
+                }),
+            );
+        }
+        let (start_time, grand) = source.stat_pair(ppid);
+        let (Some(start_time), Some(grand)) = (start_time, grand) else {
+            return (chain, Some(launcher_read_gap(source, ppid)));
+        };
+        chain.push(LauncherAncestor {
+            pid: ppid,
+            start_time: Some(start_time),
+            exe: source.ancestor_exe(ppid),
+            label: None,
+        });
+        if ppid == 1 || grand == 0 {
+            return (chain, None);
+        }
+        ppid = grand;
+    }
+}
+
 /// Production source: `PidPin` identity, `/proc` start-time and exe.
 pub(crate) struct OsProcessSource;
 
@@ -343,6 +473,13 @@ impl ProcessSource for OsProcessSource {
 
     fn start_time(&self, pid: u32) -> Option<u64> {
         process_start_time(pid).ok()
+    }
+
+    fn stat_pair(&self, pid: u32) -> (Option<u64>, Option<u32>) {
+        match process_stat_pair(pid) {
+            Ok((start_time, ppid)) => (Some(start_time), Some(ppid)),
+            Err(_) => (None, None),
+        }
     }
 
     fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
@@ -992,9 +1129,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 Err(named) => bail!("cannot admit caller pid {pid}: {named}"),
             }
         }
-        let start_time = self.source.start_time(pid);
+        let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
         let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
+        let (launched_by, launcher_gap) = capture_launcher_chain(&self.source, pid, caller_ppid);
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
@@ -1012,6 +1150,8 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     exec_observed: exe.is_some(),
                     exe,
                     app_hint,
+                    launched_by,
+                    launcher_gap,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1180,6 +1320,13 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     start_time: prepared.generation.start_time,
                     exe: prepared.generation.exe,
                     app_hint,
+                    // No post-sample parentage read: the commit uses its
+                    // verified generation only, and says so.
+                    launched_by: Vec::new(),
+                    launcher_gap: Some(LauncherGap {
+                        subject: LAUNCHER_GAP_SUBJECT,
+                        reason: LAUNCHER_GAP_CGROUP_DEFERRED.into(),
+                    }),
                     incarnation,
                     exec_observed,
                     authority: ImageAuthority::ScanPinned,
@@ -1292,6 +1439,13 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     exec_observed: generation.exe.is_some(),
                     exe: generation.exe,
                     app_hint,
+                    // No post-sample parentage read: the handoff commits
+                    // its verified generation only, and says so.
+                    launched_by: Vec::new(),
+                    launcher_gap: Some(LauncherGap {
+                        subject: LAUNCHER_GAP_SUBJECT,
+                        reason: LAUNCHER_GAP_CGROUP_DEFERRED.into(),
+                    }),
                     authority: ImageAuthority::ScanPinned,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -1674,9 +1828,10 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                 budget: None,
             });
         }
-        let start_time = self.source.start_time(pid);
+        let (start_time, caller_ppid) = self.source.stat_pair(pid);
         let exe = self.source.exe_identity(pid);
         let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
+        let (launched_by, launcher_gap) = capture_launcher_chain(&self.source, pid, caller_ppid);
         // Per-incarnation detection (F7a): after the validation above.
         let admitted_ns = match detected() {
             Some(stamp) => stamp.max(now_ns),
@@ -1703,6 +1858,8 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
                     exec_observed: exe.is_some(),
                     exe,
                     app_hint,
+                    launched_by,
+                    launcher_gap,
                     authority,
                     lifecycle: CallerLifecycle::Mapped,
                     lifecycle_reason: None,
@@ -7121,6 +7278,15 @@ pub(crate) mod tests {
                 .get(&pid)
                 .filter(|process| process.alive && process.readable)
                 .map(|process| process.start_time)
+        }
+
+        fn parent_pid(&self, pid: u32) -> Option<u32> {
+            self.state
+                .borrow()
+                .processes
+                .get(&pid)
+                .filter(|process| process.alive && process.readable)
+                .map(|process| process.ppid)
         }
 
         fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {

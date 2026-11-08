@@ -1712,6 +1712,29 @@ pub(crate) fn start_time_from_stat(stat: &str) -> io::Result<u64> {
         .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "stat starttime"))
 }
 
+/// ppid (field 4) of a `/proc/<pid>/stat` line, parsed after the LAST `)`
+/// like [`start_time_from_stat`]. `None` on any malformed input — callers
+/// fail closed. The comm field is skipped, never retained.
+pub(crate) fn ppid_from_stat(stat: &str) -> Option<u32> {
+    let end = stat.rfind(')')?;
+    stat[end + 1..]
+        .split_whitespace()
+        .nth(1)?
+        .parse::<u32>()
+        .ok()
+}
+
+/// `(start_time, ppid)` from ONE `/proc/<pid>/stat` read: the generation
+/// and its parent share the line, so pid reuse between two reads cannot
+/// mix them. Fails when the line is unreadable or either field is malformed.
+pub(crate) fn process_stat_pair(pid: u32) -> io::Result<(u64, u32)> {
+    let stat = read_proc_stat(pid)?;
+    let start_time = start_time_from_stat(&stat)?;
+    let ppid = ppid_from_stat(&stat)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "stat ppid"))?;
+    Ok((start_time, ppid))
+}
+
 /// `PF_KTHREAD` (`include/linux/sched.h`): set in `/proc/<pid>/stat` field 9
 /// (flags) only for kernel threads, which have no user address space.
 pub(crate) const PF_KTHREAD: u32 = 0x0020_0000;

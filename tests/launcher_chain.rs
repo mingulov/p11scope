@@ -9,6 +9,7 @@
 //! identity never change. The test reads the expected (ppid, start_time)
 //! pair itself from `/proc`, so a wrong chain fails loudly.
 
+#[allow(dead_code)]
 mod support;
 
 use serde_json::Value;
@@ -72,7 +73,11 @@ fn stat_pair(pid: u32) -> (u32, u64) {
     let mut fields = text[end + 1..].split_whitespace();
     let _state = fields.next().expect("stat state");
     let ppid: u32 = fields.next().expect("stat ppid").parse().expect("ppid");
-    let start: u64 = fields.nth(17).expect("stat starttime").parse().expect("start");
+    let start: u64 = fields
+        .nth(17)
+        .expect("stat starttime")
+        .parse()
+        .expect("start");
     (ppid, start)
 }
 

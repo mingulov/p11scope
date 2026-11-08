@@ -318,6 +318,8 @@ fn metadata_record(
         incarnation: 0,
         exe: None,
         app_hint: None,
+        launched_by: Vec::new(),
+        launcher_gap: None,
         exec_observed: false,
         authority: ImageAuthority::ScanPinned,
         lifecycle: CallerLifecycle::Mapped,

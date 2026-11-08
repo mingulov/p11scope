@@ -338,12 +338,6 @@ pub(crate) trait ProcessSource {
     fn is_kthread(&self, _pid: u32) -> bool {
         false
     }
-    /// True when the mounted `/proc` hides processes (`hidepid` in its
-    /// mount options): an unreadable entry is then hidden-alive until
-    /// proven otherwise, never presumed exited.
-    fn proc_hidepid(&self) -> bool {
-        false
-    }
     /// True when `pid` names no live process: reaped, never existed, or
     /// a zombie awaiting its parent's `wait`. Zombies count as gone —
     /// the generation is dead even though `/proc` still parses — so a
@@ -469,13 +463,13 @@ pub(crate) fn exe_basename(path: &str) -> String {
     path.rsplit('/').next().unwrap_or(path).to_string()
 }
 
-/// The gap for an ancestor whose stat line would not parse. Under a
-/// `hidepid` `/proc` an unreadable entry is hidden-alive until proven
-/// otherwise (its `ENOENT` is indistinguishable from an exit), so the
-/// mount evidence overrides the gone proof; otherwise exited when the
-/// generation is provably gone, hidden when it looks alive. Never a guess.
+/// The gap for an ancestor whose stat line would not parse. Only a
+/// `hidepid`-independent exit proof (`kill(pid, 0)` answering `ESRCH`)
+/// names the exit: `/proc` `ENOENT` is ambiguous under a hiding mount,
+/// so an unreadable-but-answering pid is hidden-alive, never presumed
+/// exited. Never a guess, and no mount table is read.
 fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> LauncherGap {
-    let reason = if !source.proc_hidepid() && source.gone(pid) {
+    let reason = if source.proven_exited(pid) {
         LAUNCHER_GAP_EXITED
     } else {
         LAUNCHER_GAP_HIDEPID
@@ -489,34 +483,6 @@ fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> Launch
 /// Raw `/proc/<pid>/cgroup` text, or `None` when unreadable.
 pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
     std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok()
-}
-
-/// True when a `/proc/self/mountinfo` text mounts a procfs at `/proc`
-/// with `hidepid` hiding processes: any `hidepid=` value but `0`/`off`.
-/// Anything else (no procfs at `/proc`, malformed rows) answers false:
-/// hidepid is claimed only on positive mount evidence. The last
-/// matching row wins (a later mount shadows an earlier one).
-pub(crate) fn proc_mount_hidepid_on(mountinfo: &str) -> bool {
-    let mut hidden = false;
-    for line in mountinfo.lines() {
-        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
-        if fields.get(4) != Some(&"/proc") {
-            continue;
-        }
-        let Some(separator) = fields.iter().position(|field| *field == "-") else {
-            continue;
-        };
-        let after = &fields[separator + 1..];
-        if after.len() != 3 || after[0] != "proc" {
-            continue;
-        }
-        hidden = after[2].split(',').any(|option| {
-            option
-                .strip_prefix("hidepid=")
-                .is_some_and(|value| !value.is_empty() && value != "0" && value != "off")
-        });
-    }
-    hidden
 }
 
 /// Collapse runs of adjacent identical launcher wrappers (same exe and
@@ -782,11 +748,6 @@ impl ProcessSource for OsProcessSource {
 
     fn is_kthread(&self, pid: u32) -> bool {
         process_is_kthread(pid)
-    }
-
-    fn proc_hidepid(&self) -> bool {
-        std::fs::read_to_string("/proc/self/mountinfo")
-            .is_ok_and(|mountinfo| proc_mount_hidepid_on(&mountinfo))
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -7429,8 +7390,6 @@ pub(crate) mod tests {
         reopen_poisoned: bool,
         reopen_attempts: usize,
         leader_exit_queries: usize,
-        /// Scripted `/proc` mount options: a hidden process table.
-        hidepid: bool,
     }
 
     /// Scripted source: the pid/exit/reuse/exec sequence is programmed,
@@ -7555,10 +7514,6 @@ pub(crate) mod tests {
             if let Some(process) = self.state.borrow_mut().processes.get_mut(&pid) {
                 process.kthread = kthread;
             }
-        }
-
-        pub(crate) fn set_proc_hidepid(&self, hidepid: bool) {
-            self.state.borrow_mut().hidepid = hidepid;
         }
 
         pub(crate) fn exec(&self, pid: u32, ino: u64, path: &str) {
@@ -7689,10 +7644,6 @@ pub(crate) mod tests {
                 .processes
                 .get(&pid)
                 .is_some_and(|process| process.alive && process.readable && process.kthread)
-        }
-
-        fn proc_hidepid(&self) -> bool {
-            self.state.borrow().hidepid
         }
 
         fn gone(&self, pid: u32) -> bool {
@@ -8393,41 +8344,10 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn launcher_chain_hidepid_reports_hidden_not_exited() {
-        let (source, mut adapter) = adapter();
-        // Pid 100 never lived here, but the mount table hides
-        // processes: the unreadable parent is hidden-alive until
-        // proven otherwise, never presumed exited.
-        source.set_proc_hidepid(true);
-        source.spawn(200, 22);
-        source.set_ppid(200, 100);
-        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
-        let record = adapter.record(id).unwrap();
-        assert!(record.launched_by.is_empty());
-        assert_eq!(
-            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
-            Some("launcher hidden by /proc hidepid")
-        );
-        assert_eq!(record.launched_by_origin.label(), "gap");
-        // Without hidepid evidence the same absence is an exit.
-        source.set_proc_hidepid(false);
-        source.spawn(201, 23);
-        source.set_ppid(201, 100);
-        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
-        let record2 = adapter.record(id2).unwrap();
-        assert_eq!(
-            record2.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
-            Some("launcher exited before read")
-        );
-        assert_eq!(record2.launched_by_origin.label(), "gap");
-    }
-
-    #[test]
     fn launcher_chain_proven_exit_reports_exited_despite_hidepid() {
         let (source, mut adapter) = adapter();
-        // Pid 100 never lived: the exit proof holds whatever the mount
-        // hides, so no hidepid verdict overrides it.
-        source.set_proc_hidepid(true);
+        // Pid 100 never lived: the exit proof decides alone, so no
+        // mount state is consulted and none can override it.
         source.spawn(200, 22);
         source.set_ppid(200, 100);
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
@@ -8458,27 +8378,6 @@ pub(crate) mod tests {
             Some("launcher hidden by /proc hidepid")
         );
         assert_eq!(record.launched_by_origin.label(), "gap");
-    }
-
-    #[test]
-    fn launcher_hidepid_mount_option_needs_positive_procfs_evidence() {
-        let row = |super_options: &str| {
-            format!(
-                "31 23 0:27 / /proc rw,nosuid,nodev,noexec,relatime - proc proc {super_options}\n"
-            )
-        };
-        assert!(proc_mount_hidepid_on(&row("rw,hidepid=2")));
-        assert!(proc_mount_hidepid_on(&row("rw,hidepid=invisible")));
-        assert!(proc_mount_hidepid_on(&row("rw,hidepid=1")));
-        assert!(!proc_mount_hidepid_on(&row("rw")));
-        assert!(!proc_mount_hidepid_on(&row("rw,hidepid=0")));
-        assert!(!proc_mount_hidepid_on(&row("rw,hidepid=off")));
-        // No procfs at /proc, or a malformed row: no evidence, no claim.
-        assert!(!proc_mount_hidepid_on(""));
-        assert!(!proc_mount_hidepid_on(
-            "31 23 0:27 / /proc rw,nosuid,nodev,noexec,relatime - tmpfs tmpfs rw,hidepid=2\n"
-        ));
-        assert!(!proc_mount_hidepid_on("not a mount table\n"));
     }
 
     #[test]

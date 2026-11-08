@@ -1607,10 +1607,20 @@ pub(crate) fn generation_gone(pid: u32) -> bool {
 /// live pid (signal delivered or `EPERM`), a zombie (still answers),
 /// an unrepresentable pid, or an unexpected error. Only `ESRCH` is
 /// proof, never the absence of a `/proc` entry.
-pub(crate) fn process_proven_exited(_pid: u32) -> bool {
-    // Scaffolding for the launcher exit-proof tests; the `ESRCH`
-    // proof lands with the gap change.
-    false
+pub(crate) fn process_proven_exited(pid: u32) -> bool {
+    // `kill` takes a `pid_t`: convert exactly, never wrapping — a
+    // negative `pid_t` would address a process GROUP. Zero addresses
+    // the caller's own group, so it proves nothing either.
+    let Ok(target) = libc::pid_t::try_from(pid) else {
+        return false;
+    };
+    if target <= 0 {
+        return false;
+    }
+    if unsafe { libc::kill(target, 0) } == 0 {
+        return false;
+    }
+    std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
 }
 
 /// The whole `/proc/<pid>/stat` in (almost always) one `read`:

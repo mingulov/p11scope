@@ -475,11 +475,16 @@ class BrowserCells(unittest.TestCase):
         with open(result.report_path, encoding="utf-8") as handle:
             report = json.load(handle)
         observations = report.get("object_observations") or {}
-        self.assertEqual(
-            observations.get("status"), "populated",
-            f"late browser never covered: {observations.get('reason')}")
+        self.assertNotEqual(
+            observations.get("reason"), "bootstrap_unavailable",
+            "late browser never covered (per-key tracking never started)")
         rows = observations.get("key_operations") or []
         self.assertGreater(len(rows), 0, "no key-operation rows at all")
+        completed_signs = sum(
+            row.get("completed", 0) for row in rows
+            if row.get("category") == "sign")
+        self.assertGreaterEqual(
+            completed_signs, 1, "no completed client-cert signs observed")
         browser_modules = {
             module.get("id")
             for module in report.get("modules") or []

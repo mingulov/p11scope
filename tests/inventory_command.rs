@@ -1890,7 +1890,13 @@ fn event_log_dash_with_closed_stdout_discards_the_stream_and_succeeds() {
         .args(["-c", "exec \"$0\" \"$@\" >&-"])
         .arg(env!("CARGO_BIN_EXE_p11scope"))
         .args([
-            "inventory", "--pid", &pid, "--capture", "scan", "--event-log", "-",
+            "inventory",
+            "--pid",
+            &pid,
+            "--capture",
+            "scan",
+            "--event-log",
+            "-",
         ])
         .stdin(Stdio::null())
         .output()

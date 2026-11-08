@@ -76,10 +76,46 @@ before calling a rerun green.
   spans trip, 3/14 invert (evening base 0/8, stable, exact parity
   with tip-evening). The R2 base spans r2-r14 ran the release
   observer (only r1 ran debug); the trip tally is exact.
-- Base-hit status: A/B RUNNING (interleaved tip/base release runs
-  on the quiet fedora host, same harness fix, ~10 each, stop at
-  first base trip; outcome lands below when the batch completes).
+- Base-hit status: A/B COMPLETE 2026-11-08 (interleaved tip/base
+  release runs on the quiet fedora host, same harness fix, 10 each,
+  no stop: zero trips on both lineages). All 20 spans collapse
+  single-direction `[(B,A)]`; the flip did not reproduce on the quiet
+  host for either lineage, so the inversion stays bound to the
+  dev-morning conditions and is still not shown to predate the lane.
+  Base totals 0/24 trips (R2 0/14 + R3 A/B 0/10). The batch verdicts
+  differ for two separate reasons, neither a loss trip: base drops
+  B-pre's new-module span edge 10/10 (`original_file_unproven`: the
+  witness proved another file) while tip keeps it 10/10; a
+  lineage-neutral entries race (`watched_no_use` with 0 entries on
+  B2's edge while the span profile counts 6x250) fails tip 3/10 and
+  also appears on base edges. Both need their own records.
 - Disposition: named flake; the span gate stays exact. A rerun that
   trips must be preserved and retried serially, never averaged away.
   Future work (out of scope): collapse-order determinism across span
   passes.
+
+### `D1-span-base-drops-stale-edge` (R3 A/B, base pre-fix behavior)
+
+- Signature: base span-kernel edges B-pre to the old module only;
+  the new-module edge is missing and the span gate refuses
+  (`B-pre stale edge`, got None). B-pre carries
+  `original_file_unproven: the kernel witness proved another file`.
+- Mechanism: pre-R3 pair admission drops the proven-pre entry when
+  the witness proves another file. Not a flake: R3 A/B base 0/10
+  keep the edge, tip 10/10 keep it (F5 order-free admission spares
+  proven pres). Recorded so a future base rerun is judged against
+  this systematic difference, not averaged with tip.
+- Disposition: documents the fixed behavior; no gate change.
+
+### `D1-span-b2-entries-race` (R3 A/B, lineage-neutral)
+
+- Signature: B2's span-kernel edge shows `watched_no_use` with 0
+  entries (observed across the whole span) while the span profile
+  counts the full 6x250 fresh ledger on the same module; the span
+  gate wants `not_attached` and refuses.
+- Mechanism: unknown; the entries-observation path attaches to B2's
+  edge mid-span on some runs and then counts nothing. Lineage-neutral
+  (R3 A/B: tip 3/10, base edges affected too). Pass timing identical
+  to passing runs (B2 ready at passes 6,7; ledger at 8,9).
+- Disposition: named flake; the span gate stays exact. Needs a root
+  cause before the D1 cell can go green reliably.

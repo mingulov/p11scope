@@ -51,11 +51,14 @@ ELIGIBLE_MARKER = ("IDENTITY_515_DENIAL outcome=eligible mm_present=true "
 PUBLIC = {
     "profile-pid": "owned-provider-counts", "metrics-pid": "owned-provider-counts",
     "mt-exact": "owned-provider-counts", "system": "owned-provider-counts",
+    "mt-metrics": "owned-provider-counts", "mt-errors": "owned-provider-counts",
+    "mt-shared": "owned-provider-counts", "mt-churn": "owned-provider-counts",
+    "mt-system": "owned-provider-counts", "counter-latency-mt": "owned-provider-counts",
     "names-pid": "semantic-names", "verdict-pid": "verdict-consistency",
     "doctor": "command-contract", "sigint": "command-contract",
     "second-sigint": "command-contract", "fifo-refused": "command-contract",
     "run-short": "nonqualifying", "run-cover": "nonqualifying",
-    "trace-pid": "nonqualifying", "run-prearm": "prearm-exactness",
+    "trace-pid": "nonqualifying", "mt-trace": "nonqualifying", "run-prearm": "prearm-exactness",
 }
 
 

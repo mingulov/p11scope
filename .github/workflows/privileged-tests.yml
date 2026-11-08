@@ -1019,13 +1019,15 @@ jobs:
             # Template proof: the host leg runs through run-cell-script.sh,
             # which validates with check-cell-results.py (smoke allow-listed).
             sudo -n env RUNUID="$(id -u)" RUNGID="$(id -g)" P11SCOPE_ALLOW_PID_DESCENDANT_GAPS=1 scripts/ci/run-cell-script.sh public-cli-host "$in/p11scope" "$out/cells" \
-              --allow-nonqualifying trace-pid \
+              --allow-nonqualifying trace-pid --allow-nonqualifying mt-trace \
               --expected-failure profile-cgroup --expected-failure trace-cgroup \
               --expected-failure inventory-cgroup --expected-failure profile-pid-ia32 \
               --expected-failure run-ia32 \
               --require doctor --require profile-pid --require names-pid --require verdict-pid \
               --require metrics-pid --require trace-pid --require run-short --require run-cover \
               --require mt-exact --require system --require sigint --require second-sigint \
+              --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
+              --require mt-trace --require counter-latency-mt --require mt-system \
               --require fifo-refused --require inventory-event-stdout \
               >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
@@ -1073,6 +1075,8 @@ jobs:
           cells = {row["cell"]: row for row in rows}
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
                   "run-short", "run-cover", "run-prearm", "parent-chain", "mt-exact", "system", "sigint", "second-sigint",
+                  "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace",
+                  "counter-latency-mt", "mt-system",
                   "fifo-refused", "inventory-event-stdout",
                   "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
                   "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
@@ -1080,14 +1084,14 @@ jobs:
                   "select-endpoint-pid", "select-endpoint-system",
                   "profile-pid-ia32", "run-ia32", "startup-to-capturing"}
           problems = sorted("missing cell " + name for name in need - set(cells))
-          # trace-pid stays nonqualifying smoke; the gap cells below are
+          # trace-pid and mt-trace stay nonqualifying smoke; the gap cells below are
           # declared expected-failures with named product reasons.
           # run-short, run-cover and metrics-cgroup are qualified now
           # that their observation gaps closed; inventory-cgroup shows
           # the owned-module gap signature on every kernel, so it is
           # declared everywhere. The harness emits expected only on
           # the known signatures, qualified on pass.
-          smoke_cells = {"trace-pid"}
+          smoke_cells = {"trace-pid", "mt-trace"}
           expected_cells = {"profile-cgroup", "trace-cgroup", "inventory-cgroup",
                             "profile-pid-ia32", "run-ia32"}
           actual_expected = set()

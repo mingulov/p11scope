@@ -38,8 +38,8 @@ fi
 # shellcheck disable=SC2086
 for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
   case $_cell in
-    profile-pid|metrics-pid|trace-pid|mt-exact|system) ;;
-    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system)" >&2; exit 64 ;;
+    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|counter-latency-mt) ;;
+    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system counter-latency-mt)" >&2; exit 64 ;;
   esac
 done
 unset _cell
@@ -271,7 +271,7 @@ judge() {
   # runner noise on the system cell only. Every other cell stays strict,
   # and unset/0 keeps the system cell strict (fedora, sm1, vng guests).
   local -a extra=()
-  if [ "${4:-}" = system ] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
+  if [[ "${4:-}" = system || "${4:-}" = mt-system ]] && [ "${P11SCOPE_ALLOW_PID_DESCENDANT_GAPS:-0}" = 1 ]; then
     extra=(--allow-pid-descendant-gaps)
   fi
   local out rc
@@ -283,7 +283,7 @@ judge() {
 gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   local gate=$OUT/$cell.gate ext=json
-  case "$cell" in trace-*) ext=txt;; esac
+  case "$cell" in trace-*|mt-trace) ext=txt;; esac
   rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
   local output; output=$(product_output "$cell.$ext")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
@@ -291,11 +291,17 @@ gated() {
   local poll=waitfor settle=finish release=touch
   if [ "$scope" = system ]; then poll=waitfor_quiet settle=finish_quiet release=touch_quiet; fi
   before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
-  if [ "$cell" = mt-exact ]; then
-    asuser "$fixture" "$MODULE" "$THREADS" 5 0 "$gate" > "$cell.wl" 2>&1 &
-  else
-    asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 &
-  fi
+  case "$cell" in
+    mt-exact) asuser "$fixture" "$MODULE" "$THREADS" 5 0 "$gate" > "$cell.wl" 2>&1 & ;;
+    mt-metrics) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
+    mt-errors) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 5 > "$cell.wl" 2>&1 & ;;
+    mt-shared) asuser "$fixture" "$MODULE" 32 250 "$gate" shared 0 > "$cell.wl" 2>&1 & ;;
+    mt-churn) asuser "$fixture" "$MODULE" 32 250 "$gate" churn 0 > "$cell.wl" 2>&1 & ;;
+    mt-trace) asuser "$fixture" "$MODULE" 8 100 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
+    counter-latency-mt) asuser "$fixture" "$MODULE" 8 500 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
+    mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
+    *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
+  esac
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
   if waitfor "$cell.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
     ready=1; readygen=$(generation "$wl")
@@ -313,11 +319,19 @@ gated() {
     fi
   fi
   if [ -n "$pp" ] && [ -n "${CHILDREN[$pp]:-}" ]; then terminate "$pp"; observer_rc=$LAST_EXIT; fi
-  if [ "$cell" = mt-exact ] && [ "$released" = 1 ]; then
-    if finish "$wl" "$LEDGER_TICKS"; then workload_rc=$LAST_EXIT; else workload_rc=124; fi
-  else
-    terminate "$wl"; workload_rc=$LAST_EXIT
-  fi
+  case "$cell" in
+    mt-exact|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|counter-latency-mt|mt-system)
+      # The mt workloads self-exit after LEDGER; every other workload holds.
+      if [ "$released" = 1 ] && finish "$wl" "$LEDGER_TICKS"; then
+        workload_rc=$LAST_EXIT
+      elif [ "$released" = 1 ]; then
+        workload_rc=124
+      else
+        terminate "$wl"; workload_rc=$LAST_EXIT
+      fi ;;
+    *)
+      terminate "$wl"; workload_rc=$LAST_EXIT ;;
+  esac
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
@@ -920,9 +934,12 @@ if [ -n "${P11SCOPE_QUALIFY_CHAIN_PARENT_BIN:-}" ]; then
 else
   gcc -O1 -o "$FIX/chain-parent" "$SRC/chain-parent.c" || exit 65
 fi
+gcc -O2 -Wall -Wextra -Werror -o "$FIX/mt_mixed" "$SRC/mt_mixed.c" -ldl -lpthread || exit 65
+gcc -O2 -Wall -Wextra -Werror -o "$FIX/mt_fork" "$SRC/mt_fork.c" -ldl -lpthread || exit 65
 GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use; CFORK=$FIX/cgroup-fork
 CHAIN_PARENT=$FIX/chain-parent
-chmod 755 "$FIX" "$GATED" "$MT" "$CFORK" "$CHAIN_PARENT"
+MTM=$FIX/mt_mixed; MTF=$FIX/mt_fork
+chmod 755 "$FIX" "$GATED" "$MT" "$CFORK" "$CHAIN_PARENT" "$MTM" "$MTF"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
 mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
@@ -945,6 +962,13 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       trace-pid) gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.txt" ;;
       mt-exact) gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json" ;;
       system) system_cell ;;
+      mt-metrics) gated mt-metrics pid "$MTM" profile --mode metrics --pid @PID@ --duration 12 -o "$OUT/mt-metrics.json" ;;
+      mt-errors) gated mt-errors pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-errors.json" ;;
+      mt-shared) gated mt-shared pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-shared.json" ;;
+      mt-churn) gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.json" ;;
+      mt-trace) gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt" ;;
+      counter-latency-mt) gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
+      mt-system) gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json" ;;
     esac
   done
   summary "$@"; exit $?
@@ -991,6 +1015,16 @@ run_prearm
 parent_chain_cell
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
 system_cell
+# Multi-threaded same-provider exact cells: N threads in one process (and, for
+# mt-system, several processes) hammer the same provider concurrently; every
+# count, error and per-CKR total is asserted exactly against the v2 ledger.
+gated mt-metrics pid "$MTM" profile --mode metrics --pid @PID@ --duration 12 -o "$OUT/mt-metrics.json"
+gated mt-errors pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-errors.json"
+gated mt-shared pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-shared.json"
+gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.json"
+gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt"
+gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json"
+gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json"
 # SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
 # SIGINT arrives after the ledger is complete; require exact counts, a proven
 # drain and exact observation via the oracle.
@@ -1101,5 +1135,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

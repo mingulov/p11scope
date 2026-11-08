@@ -1072,7 +1072,7 @@ jobs:
           rows = [json.loads(line) for line in Path(sys.argv[1]).read_text().splitlines() if line.strip()]
           cells = {row["cell"]: row for row in rows}
           need = {"doctor", "profile-pid", "names-pid", "verdict-pid", "metrics-pid", "trace-pid",
-                  "run-short", "run-cover", "run-prearm", "mt-exact", "system", "sigint", "second-sigint",
+                  "run-short", "run-cover", "run-prearm", "parent-chain", "mt-exact", "system", "sigint", "second-sigint",
                   "fifo-refused", "inventory-event-stdout",
                   "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
                   "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",

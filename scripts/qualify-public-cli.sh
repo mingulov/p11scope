@@ -825,6 +825,73 @@ PY
 ) || { result run-prearm 0 "$(printf '%.600s' "$detail")" prearm-exactness; return 1; }
   result run-prearm 1 "$detail" prearm-exactness
 }
+# The launcher-chain cell (v0.7.0 parent-chain lane): a named parent
+# launches the gated SoftHSM workload, and live pid inventory must
+# report the chain in JSON, -v text and the concise default. The
+# workload holds after its LEDGER, so one pair serves both legs.
+parent_chain_cell() {
+  local cell=parent-chain
+  local gate=$OUT/$cell.gate
+  rm -f -- "$gate" "$cell.json" "$cell-v.json" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell-v.stderr" "$cell-v.stdout"
+  local output output_v
+  output=$(product_output "$cell.json"); output_v=$(product_output "$cell-v.json")
+  [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output" "$output_v"
+  local before wl='' pp='' parent='' observer_rc=125
+  before=$(pin) || { result "$cell" 0 'provider pin failed' failed; return 1; }
+  asuser "$CHAIN_PARENT" "$GATED" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & parent=$!; register "$parent" || { result "$cell" 0 'parent registration failed' failed; return 1; }
+  local parent_gen=${CHILDREN[$parent]}
+  if ! waitfor "$cell.wl" '^READY pid=' "$parent" "$READY_TICKS"; then result "$cell" 0 'workload never ready' failed; terminate "$parent" || true; return 1; fi
+  wl=$(grep -m1 '^READY pid=' "$cell.wl" 2>/dev/null | sed 's/^READY pid=//')
+  [[ "$wl" =~ ^[1-9][0-9]*$ ]] || { result "$cell" 0 'unparseable READY pid' failed; terminate "$parent" || true; return 1; }
+  register_owned_child "$wl" "$parent" || { result "$cell" 0 'workload is not the named parent child' failed; terminate "$parent" || true; return 1; }
+  local wl_gen=${CHILDREN[$wl]}
+  "$P" inventory --pid "$wl" --duration 10 -o "$output" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
+  sleep 2
+  if ! alive "$pp"; then result "$cell" 0 'concise observer exited early' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; fi
+  touch "$gate" || { result "$cell" 0 'gate release failed' failed; terminate "$pp" || true; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  if ! waitfor "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then result "$cell" 0 'ledger missing' failed; terminate "$pp" || true; terminate "$parent" || true; terminate "$wl" || true; return 1; fi
+  if [ "$(grep -c '^LEDGER ' "$cell.wl")" != 1 ]; then result "$cell" 0 'ledger not exactly once' failed; terminate "$pp" || true; terminate "$parent" || true; terminate "$wl" || true; return 1; fi
+  if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+  [ "$observer_rc" = 0 ] || { result "$cell" 0 "concise observer rc=$observer_rc" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  publish_output "$cell.json" || { result "$cell" 0 'output copy failed' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  "$P" inventory --pid "$wl" --duration 10 -v -o "$output_v" > "$cell-v.stdout" 2> "$cell-v.stderr" & pp=$!; register "$pp" || true
+  sleep 2
+  if ! alive "$pp"; then result "$cell" 0 'verbose observer exited early' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; fi
+  if finish "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
+  [ "$observer_rc" = 0 ] || { result "$cell" 0 "verbose observer rc=$observer_rc" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  publish_output "$cell-v.json" || { result "$cell" 0 'output copy failed' failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  local detail
+  detail=$(python3 - "$cell.json" "$cell.stdout" "$cell-v.stdout" "$wl" "$wl_gen" "$parent" "$parent_gen" <<'PY' 2>&1
+import json,sys
+doc,concise,verbose,wl,wl_gen,parent,parent_gen=sys.argv[1:8]
+report=json.load(open(doc))
+wl=int(wl); wl_gen=int(wl_gen); parent=int(parent); parent_gen=int(parent_gen)
+callers=[c for c in report.get('callers',[]) if c.get('pid')==wl]
+assert len(callers)==1, 'one incarnation for the workload'
+c=callers[0]
+assert c.get('start_time')==wl_gen, 'caller generation unchanged'
+lb=c.get('launched_by')
+assert isinstance(lb,list) and 1<=len(lb)<=4, 'walk keeps 1..=4 ancestors'
+assert lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_time']==parent_gen, \
+    'named parent first: %r' % (lb[0],)
+for a in lb[1:]:
+    assert a['pid']>0 and isinstance(a['start_time'],int), 'ancestor generation: %r' % (a,)
+gap=c.get('launched_by_gap')
+if gap is not None:
+    assert gap['subject']=='caller parent chain', gap
+    assert gap['reason'] in ('parent unknown: exited before read',
+        'parent unknown: unreadable /proc entry',
+        'parent chain truncated after 4 ancestors',
+        'parent chain not sampled in cgroup transaction'), gap
+concise_text=open(concise).read(); verbose_text=open(verbose).read()
+assert 'gated (from chain-parent)' in concise_text, 'concise one-hop'
+assert 'gated <- chain-parent' in verbose_text, 'verbose chain'
+print('chain to chain-parent with %d ancestors; concise and -v agree' % len(lb))
+PY
+) || { result "$cell" 0 "$(printf '%.600s' "$detail")" failed; terminate "$parent" || true; terminate "$wl" || true; return 1; }
+  terminate "$parent" || true; terminate "$wl" || true
+  result "$cell" 1 "$detail"
+}
 if [ "$CONTROL" = 1 ]; then
   if [ "$CONTROL_KIND" = signal ]; then second_sigint
   elif [ "$CONTROL_KIND" = fifo ]; then fifo_refused
@@ -843,8 +910,15 @@ else
 fi
 gcc -std=c11 -O2 -Wall -Wextra -Werror -o "$FIX/prearm-first-use" "$SRC/prearm-first-use.c" -ldl || exit 65
 gcc -O1 -o "$FIX/cgroup-fork" "$SRC/cgroup-fork.c" -ldl || exit 65
+if [ -n "${P11SCOPE_QUALIFY_CHAIN_PARENT_BIN:-}" ]; then
+  [ -x "$P11SCOPE_QUALIFY_CHAIN_PARENT_BIN" ] || exit 65
+  cp -- "$P11SCOPE_QUALIFY_CHAIN_PARENT_BIN" "$FIX/chain-parent" || exit 65
+else
+  gcc -O1 -o "$FIX/chain-parent" "$SRC/chain-parent.c" || exit 65
+fi
 GATED=$FIX/gated; MT=$FIX/mt; PREARM_LOADER=$FIX/prearm-first-use; CFORK=$FIX/cgroup-fork
-chmod 755 "$FIX" "$GATED" "$MT" "$CFORK"
+CHAIN_PARENT=$FIX/chain-parent
+chmod 755 "$FIX" "$GATED" "$MT" "$CFORK" "$CHAIN_PARENT"
 export SOFTHSM2_CONF=$OUT/softhsm2.conf
 mkdir -p tokens
 printf 'directories.tokendir = %s/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$OUT" > softhsm2.conf
@@ -910,6 +984,7 @@ gated trace-pid pid "$GATED" trace --pid @PID@ --duration 12 -o "$OUT/trace-pid.
 run_exact run-short "$GATED" 3
 run_exact run-cover "$GATED" 2000
 run_prearm
+parent_chain_cell
 gated mt-exact pid "$MT" profile --pid @PID@ --duration 25 -o "$OUT/mt-exact.json"
 system_cell
 # SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
@@ -1022,5 +1097,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm mt-exact system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

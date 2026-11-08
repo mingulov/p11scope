@@ -57,7 +57,7 @@ use crate::discovery::engine::inventory::image_guard::ImageAcquisition;
 use crate::discovery::engine::inventory_coordinator::{
     InventoryCoordinator, NativeBatch, NativeReceipt, PassReport,
 };
-use crate::discovery::inventory_attach_set::TargetDelta;
+use crate::discovery::inventory_attach_set::{AttachEndpoint, TargetDelta};
 use crate::discovery::native_binding::{BoundImage, NativeIdentity, ScanOnlyIdentity};
 use crate::inspect_system::Catalog;
 use crate::inspect_system::inventory_cgroup::CgroupCollection;
@@ -472,6 +472,11 @@ pub(crate) trait LaneHost<Pin> {
     fn has_pending_targets(&self) -> bool {
         false
     }
+    /// Order one extend window's endpoints before the lane sends them:
+    /// the deferred backlog plus the fresh delta, merged. Defaults to
+    /// the merged (ID) order; the coordinator sorts smallest-module-first
+    /// so a late small provider is not stuck behind a huge plan.
+    fn order_drain_targets(&self, _endpoints: &mut Vec<AttachEndpoint>) {}
     fn capture_targets(&self) -> &dyn CaptureTargets;
     fn stage_native(
         &mut self,
@@ -525,6 +530,10 @@ impl<S: ProcessSource> LaneHost<S::Pin> for InventoryCoordinator<S> {
 
     fn take_target_delta(&mut self) -> TargetDelta {
         InventoryCoordinator::take_target_delta(self)
+    }
+
+    fn order_drain_targets(&self, endpoints: &mut Vec<AttachEndpoint>) {
+        self.attach_set().sort_drain_order(endpoints);
     }
 
     fn has_pending_targets(&self) -> bool {

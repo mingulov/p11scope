@@ -589,6 +589,13 @@ impl InventoryAttachSet {
                 None => ModuleMembers::Unrecorded,
             })
     }
+
+    /// Drain order for one extend window: smallest-module-first
+    /// (shortest-job-first), endpoint-ID tiebreak. Endpoints no admitted
+    /// module claims drain last. This decides only the attempt order
+    /// within one window, never what attaches: deferred tails keep their
+    /// relative order and merge ahead of new arrivals upstream.
+    pub(crate) fn sort_drain_order(&self, _endpoints: &mut Vec<AttachEndpoint>) {}
 }
 
 // Private preparation ceilings. Existing state remains bounded by InventoryBudget.
@@ -2268,6 +2275,45 @@ pub(crate) mod tests {
                 endpoints: 2,
                 reasons: vec![]
             })
+        );
+    }
+
+    #[test]
+    fn drain_order_prefers_the_smaller_module_first() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = provider(&dir, "big.so", "provider-big");
+        let small = provider(&dir, "small.so", "provider-small");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        // Discovery order puts the big module first (low endpoint IDs);
+        // the small workload provider arrives late, as on a busy host.
+        let pins = pass_pins(&[(&big, "sha-big"), (&small, "sha-small")]);
+        let modules = [
+            module(&pins, &big, &offsets(40)),
+            module(&pins, &small, &[0x2000, 0x2010]),
+        ];
+        let absorbed = set.absorb(&lower(&modules, &pins, policy), &pins);
+        let mut endpoints = absorbed.delta.endpoints;
+        assert_eq!(endpoints.len(), 42);
+        assert_eq!(
+            endpoints.first().map(|endpoint| endpoint.id.0),
+            Some(0),
+            "discovery order keeps the big module first"
+        );
+        set.sort_drain_order(&mut endpoints);
+        let ids: Vec<u32> = endpoints
+            .iter()
+            .map(|endpoint| endpoint.id.0)
+            .collect();
+        let small_ids: Vec<u32> = (40..42).collect();
+        let big_ids: Vec<u32> = (0..40).collect();
+        assert_eq!(
+            ids,
+            small_ids
+                .into_iter()
+                .chain(big_ids)
+                .collect::<Vec<_>>(),
+            "the small module drains first, ID order holds within each module"
         );
     }
 

@@ -13,8 +13,11 @@ use crate::discovery::caller_registry::{CallerId, ExeIdentity, RegistryLimits, U
 use crate::discovery::engine::inventory::UnavailableImageGuard;
 use crate::discovery::engine::inventory::image_guard::{ImageAcquisition, ScriptedAcquisition};
 use crate::discovery::hooks::HookRegistry;
+use crate::capacity::InventoryBudget;
 use crate::discovery::inventory_attach_set::AttachEndpoint;
+use crate::discovery::inventory_attach_set::InventoryAttachSet;
 use crate::discovery::inventory_attach_set::tests as fx;
+use crate::plan::AdmissionPolicy;
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::discovery::native_binding::UnboundReason;
 use crate::fixture_guard::DieWithParent as _;
@@ -1475,6 +1478,68 @@ fn activation_extend_carries_pending_prearm_delta() {
     assert!(
         log_entries.iter().any(|entry| entry == "extend[0,1]"),
         "the activating extend carries the pending pre-arm endpoints, not empty: {log_entries:?}"
+    );
+}
+
+/// A host that reverses every extend window: the lane must send the
+/// host's drain order, not the merged delta order.
+struct ReverseOrderHost {
+    set: InventoryAttachSet,
+    delta: TargetDelta,
+}
+
+impl LaneHost<Pin> for ReverseOrderHost {
+    fn begin_capture_coverage(&mut self, _scope: CaptureScopeCoverage) {}
+    fn abandon_capture_coverage(&mut self) {}
+    fn note_extend_receipt(&mut self, _receipt: &ExtendReceipt) {}
+    fn note_capture_custody(&mut self, _custody: &ScopeCustody) {}
+    fn take_target_delta(&mut self) -> TargetDelta {
+        std::mem::take(&mut self.delta)
+    }
+    fn capture_targets(&self) -> &dyn CaptureTargets {
+        &self.set
+    }
+    fn stage_native(
+        &mut self,
+        _batch: NativeBatch,
+        _identity: &mut dyn NativeIdentity<Pin>,
+        _now_ns: u64,
+    ) -> NativeReceipt {
+        NativeReceipt::default()
+    }
+    fn end_capture_coverage(&mut self, _at_ns: u64) {}
+    fn note_native_lane(&mut self) {}
+    fn note_scope_gap(&mut self, _subject: String, _reason: String) {}
+    fn note_refresh_loss(&mut self, _reason: String) {}
+    fn order_drain_targets(&self, endpoints: &mut Vec<AttachEndpoint>) {
+        endpoints.reverse();
+    }
+}
+
+#[test]
+fn extend_sends_the_host_drain_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let a = fx::provider(&dir, "a.so", "provider-a");
+    let pins = fx::pass_pins(&[(&a, "sha-a")]);
+    let mut set = InventoryAttachSet::new(InventoryBudget::new(4096, 4096 * 8).unwrap());
+    let policy = AdmissionPolicy::Inventory(set.budget());
+    let modules = [fx::module(&pins, &a, &[0x1000, 0x1010, 0x1020, 0x1030])];
+    let absorbed = set.absorb(&fx::lower_named(&modules, &pins, policy), &pins);
+    assert_eq!(absorbed.delta.endpoints.len(), 4);
+    let log = Log::default();
+    let mut host = ReverseOrderHost {
+        set,
+        delta: absorbed.delta,
+    };
+    let mut lane =
+        NativeLane::start(ScriptedLane::new(&log), &mut host, windows(), None)
+            .map_err(|(_, reason)| reason)
+            .unwrap();
+    lane.after_pass(&mut host);
+    let log_entries = entries(&log);
+    assert!(
+        log_entries.iter().any(|entry| entry == "extend[3,2,1,0]"),
+        "the pass extend carries the host-ordered endpoints: {log_entries:?}"
     );
 }
 

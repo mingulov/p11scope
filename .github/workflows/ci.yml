@@ -519,11 +519,13 @@ jobs:
       # BPF input changed since v0.6.0.
       # Allowed-change process: when kernel code changes on purpose, run
       # scripts/check-bpf-noninterference.py locally for the baseline tag
-      # versus the candidate, take the per-object sha256 and size pairs
-      # from the two snapshot.json receipts, and append exactly that
-      # transition (with the lane and rationale) to the record above; the
-      # repeat-baseline control stays strict and any unrecorded byte still
-      # fails loudly.
+      # versus the candidate, take the per-section size deltas of the two
+      # receipts' objects (llvm-readelf --sections on each side), and
+      # record exactly that transition (with the lane and rationale) in
+      # the record above; object hashes vary across runs (Cargo bakes the
+      # work path into the disambiguator), so the record pins the
+      # run-independent shape. The repeat-baseline control stays strict
+      # and any unrecorded byte still fails loudly.
       # Earlier pin 3681a1ab7, the integrated keygen pick (BPF inputs final since
       # b27149d51; the pin commit itself only guards the canary strip),
       # on top of 873adf5c4:

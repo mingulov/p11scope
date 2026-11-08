@@ -6,8 +6,8 @@ Run an explicit --repeat-baseline diagnostic first, then compare distinct
 baseline/candidate commits. Neither mode installs tools or uses target caches.
 The baseline decision is reviewed separately. Both sides build with the
 reviewed release host compiler and the shared BPF tool environment.
-A reviewed --allowed-change-record admits exactly the recorded content
-transition; the repeat diagnostic stays strict.
+A reviewed --allowed-change-record admits exactly the recorded diff
+shape; the repeat diagnostic stays strict.
 """
 
 from __future__ import annotations
@@ -38,6 +38,9 @@ from _loader import load_path
 OBJECT_NAMES = ("p11scope-ebpf", "p11scope-ebpf-inventory", "p11scope-ebpf-inventory-callers")
 ALLOWED_CHANGE_RECORD_VERSION = 1
 ALLOWED_CHANGE_TEXT_LIMIT = 2000
+ALLOWED_CHANGE_TRANSITIONS_LIMIT = 64
+ALLOWED_CHANGE_SECTIONS_LIMIT = 512
+ALLOWED_CHANGE_SECTION_NAME_LIMIT = 128
 RELEASE_RUST = "1.99.1"
 RELEASE_COMMIT = "58cf8f9c35b355199727627d07ae34a4e2846d67"
 BPF_RUST = "nightly-2026-05-20"
@@ -529,30 +532,68 @@ def _allowed_text(value, field: str) -> str:
     return value
 
 
-def _allowed_triple(value, side: str) -> dict[str, dict[str, object]]:
-    if not isinstance(value, dict) or set(value) != set(OBJECT_NAMES):
-        raise CheckError(f"allowed-change record {side} must name exactly the three default objects")
-    triple = {}
-    for name in OBJECT_NAMES:
-        entry = value[name]
-        if not isinstance(entry, dict) or set(entry) != {"sha256", "size"}:
-            raise CheckError(f"allowed-change record {side} {name} must carry exactly sha256 and size")
-        digest, size = entry["sha256"], entry["size"]
-        if (not isinstance(digest, str) or len(digest) != 64
-                or any(c not in "0123456789abcdef" for c in digest)):
-            raise CheckError(f"allowed-change record {side} {name} needs a 64-character lowercase hex sha256")
+def _allowed_section_name(value) -> str:
+    if (not isinstance(value, str) or not value or len(value) > ALLOWED_CHANGE_SECTION_NAME_LIMIT
+            or any(not character.isascii() or not character.isprintable() for character in value)):
+        raise CheckError("allowed-change record section names must be short printable ASCII")
+    return value
+
+
+def _allowed_deltas(value) -> dict[str, int]:
+    if not isinstance(value, dict) or len(value) > ALLOWED_CHANGE_SECTIONS_LIMIT:
+        raise CheckError("allowed-change record deltas must map at most "
+                         f"{ALLOWED_CHANGE_SECTIONS_LIMIT} sections")
+    deltas = {}
+    for section, delta in value.items():
+        if type(delta) is not int or delta == 0:
+            raise CheckError("allowed-change record deltas must be nonzero integers")
+        deltas[_allowed_section_name(section)] = delta
+    return deltas
+
+
+def _allowed_added(value) -> dict[str, int]:
+    if not isinstance(value, dict) or len(value) > ALLOWED_CHANGE_SECTIONS_LIMIT:
+        raise CheckError("allowed-change record additions must map at most "
+                         f"{ALLOWED_CHANGE_SECTIONS_LIMIT} sections")
+    added = {}
+    for section, size in value.items():
         if type(size) is not int or size <= 0:
-            raise CheckError(f"allowed-change record {side} {name} needs a positive size")
-        triple[name] = {"sha256": digest, "size": size}
-    return triple
+            raise CheckError("allowed-change record additions need a positive size")
+        added[_allowed_section_name(section)] = size
+    return added
+
+
+def _allowed_removed(value) -> list[str]:
+    if not isinstance(value, list) or len(value) > ALLOWED_CHANGE_SECTIONS_LIMIT:
+        raise CheckError("allowed-change record removals must list at most "
+                         f"{ALLOWED_CHANGE_SECTIONS_LIMIT} sections")
+    removed = [_allowed_section_name(section) for section in value]
+    if len(set(removed)) != len(removed):
+        raise CheckError("allowed-change record must not remove a section twice")
+    return removed
+
+
+def _allowed_changed_object(value) -> dict[str, object]:
+    if not isinstance(value, dict) or set(value) != {"deltas", "added", "removed"}:
+        raise CheckError("allowed-change record changed objects must carry exactly "
+                         "deltas, added and removed")
+    checked = {"deltas": _allowed_deltas(value["deltas"]),
+               "added": _allowed_added(value["added"]),
+               "removed": _allowed_removed(value["removed"])}
+    roles = [set(checked["deltas"]), set(checked["added"]), set(checked["removed"])]
+    if sum(len(role) for role in roles) != len(set().union(*roles)):
+        raise CheckError("allowed-change record must give each section exactly one role")
+    return checked
 
 
 def load_allowed_changes(path: Path, repo: Path) -> list[dict]:
     """Load and strictly validate the reviewed allowed-change record.
 
-    The record lives in the reviewed candidate tree. Matching is purely
-    content-addressed (per-object sha256 and size); the revision fields
-    only document which revisions produced the recorded bytes.
+    The record lives in the reviewed candidate tree. Each transition
+    pins the run-independent diff shape (per-section size deltas plus
+    added and removed sections) while every other object must match
+    within the run; the revision fields only document which revisions
+    produced the recorded shape.
     """
     if not path.is_absolute():
         raise CheckError("allowed-change record must be an absolute path")
@@ -575,44 +616,111 @@ def load_allowed_changes(path: Path, repo: Path) -> list[dict]:
     transitions = document["transitions"]
     if not isinstance(transitions, list) or not transitions:
         raise CheckError("allowed-change record must list at least one transition")
+    if len(transitions) > ALLOWED_CHANGE_TRANSITIONS_LIMIT:
+        raise CheckError("allowed-change record must list at most "
+                         f"{ALLOWED_CHANGE_TRANSITIONS_LIMIT} transitions")
     seen = []
     for transition in transitions:
         if not isinstance(transition, dict) or set(transition) != {
-                "baseline", "candidate", "lane", "rationale",
-                "baseline_revision", "candidate_revision"}:
-            raise CheckError("allowed-change transitions must carry exactly baseline, candidate, "
-                             "lane, rationale and revisions")
-        checked = {"baseline": _allowed_triple(transition["baseline"], "baseline"),
-                   "candidate": _allowed_triple(transition["candidate"], "candidate")}
+                "lane", "rationale", "baseline_revision", "candidate_revision",
+                "identical", "changed"}:
+            raise CheckError("allowed-change transitions must carry exactly lane, rationale, "
+                             "revisions, identical and changed")
+        identical, changed = transition["identical"], transition["changed"]
+        if (not isinstance(identical, list) or not isinstance(changed, dict) or not changed
+                or any(name not in OBJECT_NAMES for name in identical)
+                or any(name not in OBJECT_NAMES for name in changed)
+                or len(set(identical)) != len(identical)
+                or set(identical) & set(changed)
+                or set(identical) | set(changed) != set(OBJECT_NAMES)):
+            raise CheckError("allowed-change transitions must partition the three default "
+                             "objects into identical and changed, changing at least one")
+        checked = {"identical": list(identical),
+                   "changed": {name: _allowed_changed_object(spec) for name, spec in changed.items()}}
         for field in ("lane", "rationale", "baseline_revision", "candidate_revision"):
             checked[field] = _allowed_text(transition[field], field)
-        if checked["baseline"] == checked["candidate"]:
-            raise CheckError("an allowed-change transition must change at least one object")
         if checked in seen:
             raise CheckError("allowed-change record must not repeat a transition")
         seen.append(checked)
     return seen
 
 
-def _built_identities(objects: dict[str, Path]) -> dict[str, dict[str, object]]:
-    return {name: {"sha256": sha256(objects[name]), "size": objects[name].stat().st_size}
-            for name in OBJECT_NAMES}
+def section_sizes(path: Path, name: str) -> dict[str, int]:
+    """Per-section content sizes, keyed like the canonical projection."""
+    _, sections = _elf_sections(path, name)
+    return {section: len(content) - 8 for section, content in sections.items()}
+
+
+def _transition_matches(transition: dict, baseline: dict[str, Path],
+                        candidate: dict[str, Path], dump_c) -> bool:
+    """Whether the built sides show exactly the recorded shape."""
+    try:
+        for name in transition["identical"]:
+            _strict_verdict(name, baseline[name], candidate[name], dump_c)
+        for name, spec in transition["changed"].items():
+            try:
+                _strict_verdict(name, baseline[name], candidate[name], dump_c)
+            except CheckError:
+                pass
+            else:
+                return False
+            base_sizes = section_sizes(baseline[name], name)
+            cand_sizes = section_sizes(candidate[name], name)
+            actual_added = {section: cand_sizes[section] for section in cand_sizes
+                            if section not in base_sizes}
+            actual_removed = sorted(section for section in base_sizes if section not in cand_sizes)
+            if actual_added != spec["added"] or actual_removed != sorted(spec["removed"]):
+                return False
+            for section in set(base_sizes) & set(cand_sizes):
+                if cand_sizes[section] - base_sizes[section] != spec["deltas"].get(section, 0):
+                    return False
+            for section in spec["deltas"]:
+                if section not in base_sizes or section not in cand_sizes:
+                    return False
+    except CheckError:
+        return False
+    return True
 
 
 def match_allowed_change(transitions: list[dict], baseline: dict[str, Path],
-                         candidate: dict[str, Path]) -> dict | None:
-    """The recorded transition both built sides match, if any.
+                         candidate: dict[str, Path],
+                         dump_c=_btf_c_dump_sorted) -> dict | None:
+    """The recorded transition whose shape the built sides show, if any.
 
-    Content-addressed only: the baseline side must equal the recorded
-    baseline bytes and the candidate side the recorded candidate bytes.
+    Shape-only: the identical objects must match within the run while
+    each changed object must differ by exactly the recorded per-section
+    size deltas, additions and removals. Anything else returns None.
     """
-    built_baseline = _built_identities(baseline)
-    built_candidate = _built_identities(candidate)
     for transition in transitions:
-        if (transition["baseline"] == built_baseline
-                and transition["candidate"] == built_candidate):
+        if _transition_matches(transition, baseline, candidate, dump_c):
             return transition
     return None
+
+
+def observed_shape_summary(baseline: dict[str, Path], candidate: dict[str, Path]) -> str:
+    """One stderr block describing the observed diff shape for the next record."""
+    lines = ["bpf-noninterference: no allowed-change transition matches; observed shape:"]
+    for name in OBJECT_NAMES:
+        try:
+            verdict = _strict_verdict(name, baseline[name], candidate[name], _btf_c_dump_sorted)
+        except CheckError:
+            pass
+        else:
+            lines.append(f"  {name}: {verdict}")
+            continue
+        try:
+            base_sizes = section_sizes(baseline[name], name)
+            cand_sizes = section_sizes(candidate[name], name)
+        except CheckError as error:
+            lines.append(f"  {name}: differs (unparsed: {error})")
+            continue
+        added = sorted(section for section in cand_sizes if section not in base_sizes)
+        removed = sorted(section for section in base_sizes if section not in cand_sizes)
+        deltas = {section: cand_sizes[section] - base_sizes[section]
+                  for section in sorted(set(base_sizes) & set(cand_sizes))
+                  if cand_sizes[section] != base_sizes[section]}
+        lines.append(f"  {name}: differs deltas={deltas} added={added} removed={removed}")
+    return "\n".join(lines)
 
 
 def compare_with_allowed_changes(baseline: dict[str, Path], candidate: dict[str, Path],
@@ -627,7 +735,7 @@ def compare_with_allowed_changes(baseline: dict[str, Path], candidate: dict[str,
     try:
         return compare_objects(baseline, candidate, dump_c), None
     except CheckError:
-        matched = match_allowed_change(transitions, baseline, candidate)
+        matched = match_allowed_change(transitions, baseline, candidate, dump_c)
         if matched is None:
             raise
         verdicts = {}
@@ -984,7 +1092,11 @@ def main() -> int:
             verdicts = compare_objects(left, right)
             allowed = None
         else:
-            verdicts, allowed = compare_with_allowed_changes(left, right, transitions)
+            try:
+                verdicts, allowed = compare_with_allowed_changes(left, right, transitions)
+            except CheckError:
+                print(observed_shape_summary(left, right), file=sys.stderr)
+                raise
         mode = "repeat-baseline" if options.repeat_baseline else "integration"
         comparison = {"mode": mode,
                       "baseline": baseline, "candidate": candidate,

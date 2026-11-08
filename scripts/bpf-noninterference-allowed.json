@@ -1,36 +1,34 @@
 {
   "transitions": [
     {
-      "baseline": {
-        "p11scope-ebpf": {
-          "sha256": "8fe9c179f48fe4d1fa193517bd8fcb2e15f55ee004e079e1a391e05d07a709da",
-          "size": 1376992
-        },
-        "p11scope-ebpf-inventory": {
-          "sha256": "29fa0b5c873164aa572ecad76e61c8aa4e69cfcf7c5878b9ed4b92fbc3b25661",
-          "size": 357696
-        },
-        "p11scope-ebpf-inventory-callers": {
-          "sha256": "f23aac06fd1ba5360e4120bd3b35d2ef5b5f315344c82632d820f90fe027ee80",
-          "size": 422752
-        }
-      },
       "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
-      "candidate": {
+      "candidate_revision": "v0.7.0 rc line (measured at 14232461e2b29578b41d701e54e23670abcdfe94; the record pins the run-independent diff shape)",
+      "changed": {
         "p11scope-ebpf": {
-          "sha256": "4acc34abb1b55975c5b9266e4b0f353c998f4982dd2161f79be0fc10b1160492",
-          "size": 1377880
-        },
-        "p11scope-ebpf-inventory": {
-          "sha256": "29fa0b5c873164aa572ecad76e61c8aa4e69cfcf7c5878b9ed4b92fbc3b25661",
-          "size": 357696
-        },
-        "p11scope-ebpf-inventory-callers": {
-          "sha256": "f23aac06fd1ba5360e4120bd3b35d2ef5b5f315344c82632d820f90fe027ee80",
-          "size": 422752
+          "added": {},
+          "deltas": {
+            ".BTF.ext": -32,
+            ".debug_abbrev": 26,
+            ".debug_addr": -32,
+            ".debug_info": -50,
+            ".debug_line": 92,
+            ".debug_loclists": 352,
+            ".debug_rnglists": 136,
+            ".debug_str": 13,
+            ".debug_str_offsets": 4,
+            ".rel.BTF.ext": -32,
+            ".rel.debug_addr": -64,
+            ".rel.debug_str_offsets": 16,
+            ".text": 416,
+            "uprobe": 40
+          },
+          "removed": []
         }
       },
-      "candidate_revision": "v0.7.0 rc line (measured at 14232461e2b29578b41d701e54e23670abcdfe94; the record is content-addressed)",
+      "identical": [
+        "p11scope-ebpf-inventory",
+        "p11scope-ebpf-inventory-callers"
+      ],
       "lane": "PQC parameter-set metadata (F16/7.05)",
       "rationale": "CKA_PARAMETER_SET (0x061d) joins the shared object classifier as attribute kind 7: the Detailed object gains .text (+416 B) and uprobe (+40 B) from the new classifier arms (safe_attribute_kind, classify_attribute_scalar, kind_from_code, safe_kind_code) and the slot-kind bound moves 6 to 7; both Inventory objects are byte-identical and maps, license and .BTF are unchanged."
     }

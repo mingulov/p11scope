@@ -140,6 +140,7 @@ RUN = [
     ("test_object_observations.py", []),
     ("test_object_observations_v5.py", []),
     ("test_observed_key_operations.py", []),
+    ("test_openssl_pkcs11_cells.py", []),
     ("test_operator_output_qualification.py", []),
     ("test_package_release.py", []),
     ("test_package_preview.py", []),

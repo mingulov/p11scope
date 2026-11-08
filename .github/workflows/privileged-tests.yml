@@ -805,7 +805,7 @@ jobs:
           test -d "$work" && test ! -L "$work" && test -O "$work"
           test "$(stat -c %a "$work")" = 700
           echo "TMPDIR=$work" >>"$GITHUB_ENV"
-      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq libpcsclite1 opensc opensc-pkcs11 p11-kit-modules procps python3 softhsm2 util-linux
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc gnutls-bin jq libengine-pkcs11-openssl libpcsclite1 opensc opensc-pkcs11 openssl p11-kit-modules pkcs11-provider procps python3 softhsm2 util-linux
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -869,6 +869,19 @@ jobs:
           scripts/verify-spy-forwarding.sh \
             --binary "$RUNNER_TEMP/release-inputs/p11scope" \
             --work "$TMPDIR/spy-forwarding"
+      # OpenSSL through PKCS#11: provider/engine/proxy signs, TLS, and the
+      # pkcs11-tool/p11tool self-test cells, all against SoftHSM under the
+      # release observer in strict mode (a missing prerequisite fails).
+      - name: Run OpenSSL PKCS#11 cells (strict)
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          in="$RUNNER_TEMP/release-inputs"
+          chmod +x "$in/p11scope"
+          mkdir -m 700 "$TMPDIR/openssl-tmp"
+          P11SCOPE_BIN="$in/p11scope" P11SCOPE_OPENSSL_STRICT=1 TMPDIR="$TMPDIR/openssl-tmp" \
+            python3 -I tests/python/test_openssl_pkcs11_cells.py -v 2>&1 | tee "$TMPDIR/openssl-cells.log"
       - name: Validate the four capture records
         shell: bash
         run: |
@@ -918,6 +931,7 @@ jobs:
           path: |
             /var/tmp/p11scope-ws-tmp/doctor.txt
             /var/tmp/p11scope-ws-tmp/doctor-status.txt
+            /var/tmp/p11scope-ws-tmp/openssl-cells.log
             /var/tmp/p11scope-ws-tmp/system-scale/matrix.json
             /var/tmp/p11scope-ws-tmp/system-scale/*/summary.txt
             /var/tmp/p11scope-ws-tmp/system-scale/*/stderr.txt

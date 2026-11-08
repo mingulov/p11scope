@@ -14,7 +14,7 @@ const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Parameterized wrap schedule: `counted` A rounds, `shared` shared rounds,
 /// then the fence/proof pair. The G21 wrap gate runs `WRAP_SCHEDULE` at the
-/// declared accelerated cadence (`WRAP_POLL_INTERVAL_MS`, R-17); the short
+/// declared accelerated cadences (250ms pid / 50ms system, R-17); the short
 /// full-transition pilot runs `PILOT_SCHEDULE` (32/4/540s) at default cadence
 /// and default diagnostic capacities. The pilot makes no wrap claim: it
 /// measures settling, gap shapes and footer production. Every validator that
@@ -52,10 +52,13 @@ const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
     deadline_ms: 900_000,
 };
 
-/// Declared accelerated inter-pass cadence for the live wrap legs (R-17),
+/// Declared accelerated inter-pass cadences for the live wrap legs (R-17),
 /// applied through the existing test-only scoped override. Production builds
-/// and all unselected tests retain the 1 s cadence.
-const WRAP_POLL_INTERVAL_MS: u64 = 250;
+/// and all unselected tests retain the 1 s cadence. The system leg scans the
+/// whole machine per pass, so it uses a faster cadence to fit the same 900 s
+/// per-leg bound; both cadences are declared up front per run.
+const WRAP_PID_POLL_INTERVAL_MS: u64 = 250;
+const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 50;
 
 /// Workload trailing CLI arguments `[NONCE, DEADLINE_MS, COUNTED, SHARED]`
 /// for a schedule, with the fixture binary's own bounds enforced first
@@ -4938,24 +4941,21 @@ fn check_paired_parity_schedule(
     Ok(())
 }
 
-/// Run one wrap-parity cell at the declared accelerated cadence (R-17),
+/// Run one wrap-parity cell at its declared accelerated cadence (R-17),
 /// through the existing test-only scoped override. Production cadence is
 /// untouched; the run declares its cadence up front.
-fn with_wrap_cadence<T>(action: impl FnOnce() -> T) -> T {
+fn with_wrap_cadence<T>(interval_ms: u64, action: impl FnOnce() -> T) -> T {
     eprintln!(
         "{}",
-        declare_gate_poll_interval(
-            "wrap-leg fixed",
-            Duration::from_millis(WRAP_POLL_INTERVAL_MS),
-        )
+        declare_gate_poll_interval("wrap-leg fixed", Duration::from_millis(interval_ms),)
     );
-    with_inventory_test_poll_interval(Duration::from_millis(WRAP_POLL_INTERVAL_MS), action)
+    with_inventory_test_poll_interval(Duration::from_millis(interval_ms), action)
 }
 
 #[test]
 #[ignore = "root-owned BPF lane; prebuilt32-object fixture, paired default-ring wrap at declared 250ms cadence"]
 fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
-    with_wrap_cadence(|| {
+    with_wrap_cadence(WRAP_PID_POLL_INTERVAL_MS, || {
         let (disabled, dk) = run_wrap(false)?;
         let (enabled, ek) = run_wrap(true)?;
         check_paired_parity_schedule(&disabled, dk, &enabled, ek, WRAP_COUNTED)
@@ -4964,11 +4964,11 @@ fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Resu
 
 /// Bounded system wrap pair (cell 3): the identical 32-object schedule
 /// under unfiltered system capture, with owned-caller validators and
-/// the same strict paired off/on parity, at the declared accelerated cadence.
+/// the same strict paired off/on parity, at the declared 50ms cadence.
 #[test]
-#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 250ms cadence"]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 50ms cadence"]
 fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
-    with_wrap_cadence(|| {
+    with_wrap_cadence(WRAP_SYSTEM_POLL_INTERVAL_MS, || {
         let (disabled, dk) = run_wrap_system(false)?;
         let (enabled, ek) = run_wrap_system(true)?;
         check_paired_parity_schedule(&disabled, dk, &enabled, ek, WRAP_COUNTED)

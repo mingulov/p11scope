@@ -226,16 +226,16 @@ standalone validator checks; do not run the old long gate as a substitute.
 ## Paired default-ring useful wrap
 
 The wrap oracle pins the per-edge projection (Sol round-3 ruling): each of
-the 32 A edges reads 1, 2, 3 after rounds 1-3 and 400 after round 400 on
-the ordinary path, or 1, 1, 2 and 399 all-32-fenced, with exact1-increments
+the 32 A edges reads 1, 2, 3 after rounds 1-3 and 260 after round 260 on
+the ordinary path, or 1, 1, 2 and 259 all-32-fenced, with exact1-increments
 after; each B edge reads exactly 1 (its own pair's proof, with no batching
 premise). The validated disposition (k of32pairs fenced, all-or-none)
 carries into final per-edge expectations and strict paired comparison:
 both legs must share one disposition and compare exactly equal, with no
-count replacement. Totals are independently fixed at 12,800-k across A
+count replacement. Totals are independently fixed at 8,320-k across A
 and 32 across B. Per-pair physical reconciliation stays separate from any
-one edge: eligible A growth 12,800-k, withheld 8,288+k, terminal proof
-660/base 659/staged 1 per pair with staged sum 32. A caller/object pair
+one edge: eligible A growth 8,320-k, withheld 160+k, terminal proof
+266/base 265/staged 1 per pair with staged sum 32. A caller/object pair
 excludes function offset, so the fixture provides one slot body per
 distinct physical object (`libdemotion-common-00..31.so`):32genuine pairs,
 each advancing one unit per round on its own A/B provider pair. The
@@ -302,18 +302,18 @@ an owned module. Foreign-only presence is allowed, but any foreign diagnostic
 record fails the cell, so run it on a quiet host. The same paired off/on
 parity (one validated disposition, exact owned facts) applies.
 
-Each disabled/enabled run issues exactly400counted rounds,258shared rounds,
+Each disabled/enabled run issues exactly260counted rounds,4shared rounds,
 then one fence and one proof round, each32indexed calls (one per pair). Native
-ACKs and an independent per-slot ledger bind all21120calls. Each next counted
+ACKs and an independent per-slot ledger bind all8512calls. Each next counted
 round waits for all32A edges at the actual committed production count
 milestone validated against caller-bound gap evidence; each shared round
-waits for its caller-bound retirement range `(400+r-1,400+r]`, with no module
+waits for its caller-bound retirement range `(260+r-1,260+r]`, with no module
 identity and exactly32folded disclosures; load-B remains inside the existing observer callback
-between passes. Expected primary edge projections are A400 ordinary / 399
+between passes. Expected primary edge projections are A260 ordinary / 259
 fenced per edge (k validated fenced pairs) and B1 per edge (each its own
 pair's proof). Per-pair physical reconciliation from the schedule plus ledger
-gives 12,800-k eligible A growth, 8,256 shared-withheld, 32 fence-withheld
-and staged sum 32: 8,288+k withheld entries over 21,120 physical calls.
+gives 8,320-k eligible A growth, 128 shared-withheld, 32 fence-withheld
+and staged sum 32: 160+k withheld entries over 8,512 physical calls.
 Actual32Bplacements (each edge_total 1 on its own pair edge) and their
 selected withheld fence prefixes must remain useful in the exported
 diagnostics.
@@ -338,7 +338,7 @@ the exact caller ranges `(32+r-1,32+r]` repeated32, A32 ordinary /31fenced per
 edge, B1 per edge, complete unwrapped diagnostic history and the independent
 native schedule/ledger. Missing, malformed, evicted or mismatched history and
 shared/fence/proof deviations fail qualification. It reports measured settling;
-it does not qualify660rounds, behavior beyond150rounds, ring wrap or cost.
+it does not qualify the264-round wrap schedule, ring wrap or cost.
 
 Both default rings must really evict: CountObservation eviction proves the
 ordinary ring filled, and OwnershipTransition/CaptureHealth eviction proves
@@ -357,9 +357,17 @@ Run the same independent schedule with diagnostics disabled/enabled and compare
 primary count, entry observation, saturation/inflight, capture, presence,
 coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
 Both legs must validate the same startup disposition; counts compare exactly
-with no replacement. Each run has an explicit900s bound; the pair is
-approximately22minutes at the current one-second pass cadence. Report actual
+with no replacement. Each run has an explicit900s bound; the pair runs at its
+declared accelerated cadence (R-17):250ms for the pid cell,50ms for the
+system cell (whole-machine scan load), about12minutes per pid cell (two
+~6-minute legs) on the reference host. This qualifies wrapping at the declared
+cadence, not default CLI cadence, performance or cost. Report actual
 runtime/output bytes. Controlled RSS/CPU/performance cost is a separate T10 gate.
+
+The 400/258 default-cadence schedule (KI-1/KI-2: ~1326 passes/leg exceeding
+900s at1s cadence on any host) is retired; the shortened264-round schedule
+above replaces it with identical wrap and parity assertions, parameterized to
+the live schedule. Both default-ring capacities stay24576/8192.
 
 Readable stderr accepts either complete once-only main-control-thread marker:
 `p11scope: cancel: loop exited on signal N after T ticks` or the truthful late

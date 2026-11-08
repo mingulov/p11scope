@@ -106,6 +106,7 @@ RUN = [
     ("test_image_bank_object.py", []),
     ("test_inventory_capacity_oracle.py", []),
     ("test_inventory_count_only_hooks.py", []),
+    ("test_inventory_mt_oracle.py", []),
     ("test_inventory_output_readiness.py", []),
     ("test_inventory_provider_identity.py", []),
     ("test_inventory_readiness_cadence.py", []),

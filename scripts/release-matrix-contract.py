@@ -160,6 +160,7 @@ PUBLIC = {
     "mt-metrics": "owned-provider-counts", "mt-errors": "owned-provider-counts",
     "mt-shared": "owned-provider-counts", "mt-churn": "owned-provider-counts",
     "mt-system": "owned-provider-counts", "counter-latency-mt": "owned-provider-counts",
+    "inventory-mt-pid": "owned-edge-usage-counts", "inventory-mt-system": "owned-edge-usage-counts",
     "names-pid": "semantic-names", "verdict-pid": "verdict-consistency",
     "doctor": "command-contract", "sigint": "command-contract",
     "second-sigint": "command-contract", "fifo-refused": "command-contract",

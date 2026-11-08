@@ -38,8 +38,8 @@ fi
 # shellcheck disable=SC2086
 for _cell in ${P11SCOPE_PUBLIC_CLI_CELLS:-}; do
   case $_cell in
-    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|counter-latency-mt) ;;
-    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system counter-latency-mt)" >&2; exit 64 ;;
+    profile-pid|metrics-pid|trace-pid|mt-exact|system|mt-metrics|mt-errors|mt-shared|mt-churn|mt-trace|mt-system|counter-latency-mt|inventory-mt-pid|inventory-mt-system) ;;
+    *) echo "unsupported subset cell: $_cell (supported: profile-pid metrics-pid trace-pid mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace mt-system counter-latency-mt inventory-mt-pid inventory-mt-system)" >&2; exit 64 ;;
   esac
 done
 unset _cell
@@ -275,7 +275,12 @@ judge() {
     extra=(--allow-pid-descendant-gaps)
   fi
   local out rc
-  out=$(python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}"); rc=$?
+  case "${4:-}" in
+    inventory-mt-*)
+      out=$(python3 -I "$HERE/inventory-mt-oracle.py" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" --event-log "$4.eventlog.jsonl" "${extra[@]}"); rc=$? ;;
+    *)
+      out=$(python3 -I "$ORACLE" --report "$1" --ledger "$2" --receipt "$3" --cell "$4" "${extra[@]}"); rc=$? ;;
+  esac
   emit_judged "$4" "$rc" "$out"
 }
 # The real lifecycle is also the unprivileged seam: clean every prior artifact,
@@ -284,7 +289,7 @@ gated() {
   local cell=$1 scope=$2 fixture=$3; shift 3
   local gate=$OUT/$cell.gate ext=json
   case "$cell" in trace-*|mt-trace) ext=txt;; esac
-  rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json"
+  rm -f -- "$gate" "$cell.$ext" "$cell.wl" "$cell.stderr" "$cell.stdout" "$cell.receipt.json" "$cell.eventlog.jsonl"
   local output; output=$(product_output "$cell.$ext")
   [ "$LOCAL_OUTPUT" = "$OUT" ] || rm -f -- "$output"
   local before after gen='' readygen='' wl pp='' ready=0 capturing=0 released=0 observer_rc=125 workload_rc=125
@@ -300,17 +305,41 @@ gated() {
     mt-trace) asuser "$fixture" "$MODULE" 8 100 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     counter-latency-mt) asuser "$fixture" "$MODULE" 8 500 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
     mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
+    inventory-mt-pid) asuser "$fixture" "$MODULE" 8 1000 "$gate" sessions 0 > "$cell.wl" 2>&1 & ;;
+    inventory-mt-system) asuser "$fixture" "$MODULE" 4 8 250 "$gate" 0 > "$cell.wl" 2>&1 & ;;
     *) asuser "$fixture" "$MODULE" "$ITERS" 200 "$gate" > "$cell.wl" 2>&1 & ;;
   esac
   wl=$!; register "$wl" && gen=${CHILDREN[$wl]}
   if waitfor "$cell.wl" "^READY pid=$wl$" "$wl" "$READY_TICKS"; then
     ready=1; readygen=$(generation "$wl")
     local args=("${@//@PID@/$wl}")
-    for ((i=0;i<${#args[@]}-1;i++)); do [ "${args[$i]}" != -o ] || args[$((i+1))]=$output; done
+    local evlog
+    evlog=$(product_output "$cell.eventlog.jsonl")
+    for ((i=0;i<${#args[@]}-1;i++)); do
+      [ "${args[$i]}" != -o ] || args[$((i+1))]=$output
+      [ "${args[$i]}" != --event-log ] || args[$((i+1))]=$evlog
+    done
     "$P" "${args[@]}" > "$cell.stdout" 2> "$cell.stderr" & pp=$!; register "$pp" || true
-    if "$poll" "$cell.stderr" 'p11scope: capturing:' "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
+    local ready_needle='p11scope: capturing:'
+    case "$cell" in inventory-mt-*) ready_needle='native usage lane active';; esac
+    if "$poll" "$cell.stderr" "$ready_needle" "$pp" "$READY_TICKS" && alive "$wl" && alive "$pp"; then
       capturing=1
-      if "$release" "$gate"; then
+      # Inventory counts only calls made after an edge is native-matched, so
+      # the inventory-mt cells hold the workload gate until every workload
+      # edge is matched in the event stream (fail loud on timeout).
+      local match_ok=1 match_timeout=0
+      case "$cell" in
+        inventory-mt-pid) match_timeout=10 ;;
+        inventory-mt-system) match_timeout=20 ;;
+      esac
+      if [ "$match_timeout" != 0 ]; then
+        if python3 -I "$HERE/inventory-mt-gate.py" --event-log "$evlog" --wl "$cell.wl" --timeout "$match_timeout"; then
+          match_ok=1
+        else
+          match_ok=0
+        fi
+      fi
+      if [ "$match_ok" = 1 ] && "$release" "$gate"; then
         released=1
         if "$poll" "$cell.wl" '^LEDGER ' "$wl" "$LEDGER_TICKS" 1; then
           if "$settle" "$pp" "$EXIT_TICKS"; then observer_rc=$LAST_EXIT; else observer_rc=124; fi
@@ -335,6 +364,7 @@ gated() {
   after=$(pin) || after='null'
   receipt || { result "$cell" 0 'receipt publication failed' failed; return 1; }
   publish_output "$cell.$ext" || { result "$cell" 0 'output copy failed' failed; return 1; }
+  case "$cell" in inventory-mt-*) publish_output "$cell.eventlog.jsonl" || { result "$cell" 0 'event-log copy failed' failed; return 1; };; esac
   judge "$cell.$ext" "$cell.wl" "$cell.receipt.json" "$cell"
 }
 system_cell() {
@@ -969,6 +999,8 @@ if [ -n "${P11SCOPE_PUBLIC_CLI_CELLS:-}" ]; then
       mt-trace) gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt" ;;
       counter-latency-mt) gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json" ;;
       mt-system) gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json" ;;
+      inventory-mt-pid) MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 12 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json" ;;
+      inventory-mt-system) MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 25 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json" ;;
     esac
   done
   summary "$@"; exit $?
@@ -1025,6 +1057,10 @@ gated mt-churn pid "$MTM" profile --pid @PID@ --duration 12 -o "$OUT/mt-churn.js
 gated mt-trace pid "$MTM" trace --pid @PID@ --duration 12 -o "$OUT/mt-trace.txt"
 gated counter-latency-mt pid "$MTM" profile --mode metrics --counter-mode latency --pid @PID@ --duration 12 -o "$OUT/counter-latency-mt.json"
 gated mt-system system "$MTF" profile --system --module "$MODULE" --duration 25 -o "$OUT/mt-system.json"
+# Inventory MT-exact cells: the held workload keeps its process alive across
+# inventory passes; per-edge usage and the event-log stream are judged exact.
+MT_MIXED_HOLD=1 gated inventory-mt-pid pid "$MTM" inventory --pid @PID@ --capture native --duration 12 --event-log "$OUT/inventory-mt-pid.eventlog.jsonl" -o "$OUT/inventory-mt-pid.json"
+MT_MIXED_HOLD=1 gated inventory-mt-system system "$MTF" inventory --system --module "$MODULE" --capture native --duration 25 --event-log "$OUT/inventory-mt-system.eventlog.jsonl" -o "$OUT/inventory-mt-system.json"
 # SIGINT exact: the workload does exactly K calls, emits LEDGER, then holds.
 # SIGINT arrives after the ledger is complete; require exact counts, a proven
 # drain and exact observation via the oracle.
@@ -1135,5 +1171,5 @@ startup_cell() {
   result "$cell" 1 "$detail"
 }
 startup_cell
-summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
+summary doctor profile-pid names-pid verdict-pid metrics-pid trace-pid run-short run-cover run-prearm parent-chain mt-exact system mt-metrics mt-errors mt-shared mt-churn mt-trace counter-latency-mt mt-system inventory-mt-pid inventory-mt-system sigint second-sigint fifo-refused inventory-event-stdout profile-cgroup metrics-cgroup trace-cgroup inventory-cgroup counter-counts-pid counter-timestamps-pid counter-latency-pid counter-counts-system counter-timestamps-system counter-latency-system select-endpoint-pid select-endpoint-system profile-pid-ia32 run-ia32 startup-to-capturing
 exit $?

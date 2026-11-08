@@ -1028,6 +1028,7 @@ jobs:
               --require mt-exact --require system --require sigint --require second-sigint \
               --require mt-metrics --require mt-errors --require mt-shared --require mt-churn \
               --require mt-trace --require counter-latency-mt --require mt-system \
+              --require inventory-mt-pid --require inventory-mt-system \
               --require fifo-refused --require inventory-event-stdout \
               >"$RUNNER_TEMP/qual.log" 2>&1 || rc=$?
             sudo -n chown -R "$(id -un):$(id -gn)" "$out"
@@ -1077,6 +1078,7 @@ jobs:
                   "run-short", "run-cover", "run-prearm", "parent-chain", "mt-exact", "system", "sigint", "second-sigint",
                   "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace",
                   "counter-latency-mt", "mt-system",
+                  "inventory-mt-pid", "inventory-mt-system",
                   "fifo-refused", "inventory-event-stdout",
                   "profile-cgroup", "metrics-cgroup", "trace-cgroup", "inventory-cgroup",
                   "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",

@@ -94,18 +94,19 @@ before calling a rerun green.
   Future work (out of scope): collapse-order determinism across span
   passes.
 
-### `D1-span-base-drops-stale-edge` (R3 A/B, base pre-fix behavior)
+### `D1-span-base-drops-stale-edge` (R3 A/B, base pre-lane behavior)
 
 - Signature: base span-kernel edges B-pre to the old module only;
   the new-module edge is missing and the span gate refuses
   (`B-pre stale edge`, got None). B-pre carries
   `original_file_unproven: the kernel witness proved another file`.
-- Mechanism: pre-R3 pair admission drops the proven-pre entry when
-  the witness proves another file. Not a flake: R3 A/B base 0/10
-  keep the edge, tip 10/10 keep it (F5 order-free admission spares
-  proven pres). Recorded so a future base rerun is judged against
-  this systematic difference, not averaged with tip.
-- Disposition: documents the fixed behavior; no gate change.
+- Mechanism: base 5fd133239 predates the lane's lower-file join;
+  B-pre keeps the pre-lane `original_file_unproven` gap, so the
+  lane-written span gate refuses on base by construction —
+  expected, not a flake or regression. R3 A/B: base 0/10 keep the
+  edge, tip 10/10 keep it. Recorded so a future base rerun is
+  judged against this systematic difference, not averaged with tip.
+- Disposition: documents the pre-lane base behavior; no gate change.
 
 ### `D1-span-b2-entries-race` (R3 A/B, lineage-neutral)
 

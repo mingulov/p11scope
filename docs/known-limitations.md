@@ -765,9 +765,11 @@ detail during a counter capture (`--select-endpoint`).
   (heuristic mode, explicit userspace) the stale join stays `unknown`
   with the `original_file_unproven` gap; a spent witness budget and
   lower candidates no query proves (unopenable, unreadable, escaped, or
-  simply another file) keep that gap with each candidate's refusal
-  named by index, never silent; in collapse mode spanning upper ranges
-  stay unprobed with the miss disclosed, never counted.
+  simply another file) keep that gap with the refused count and each
+  refusal's stage words (first eight, in stack order, rest counted);
+  no path or index is published, never silent; in collapse mode
+  spanning upper ranges stay unprobed with the miss disclosed, never
+  counted.
 - Post-quantum key details, cluster aggregation, telemetry,
   enforcement, AArch64, extra capture fields and syscall/network
   correlation.

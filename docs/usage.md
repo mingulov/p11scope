@@ -352,11 +352,12 @@ Default stderr keeps the readiness line (`p11scope: capturing:`, which says
 what the capture waits for while nothing is attached) and real warnings:
 errors, actionable warnings, the owned child's nonzero status
 (`command exited with status N`), and the outcome signals scripts match
-(the first pass headline, `capture ended:`, the semantic-lane seal, the
-stop summaries). Progress,
-statistics and all-clear lines — loader readiness, clean long-run reports,
-the `p11scope: discovery:` completion summary, per-module repeats, cleanup
-progress — print under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
+(lane activation, the first pass headline, `capture ended:`, the
+semantic-lane seal, the stop and cleanup-completed summaries). Progress
+detail — per-second cleanup progress, the detach estimate, per-pass lines
+after the first, per-PID chatter, loader readiness, clean long-run
+reports, the `p11scope: discovery:` completion summary, per-module
+repeats — prints under `-v` or with `P11SCOPE_CAPTURE_DIAGNOSTICS=1`.
 `run` on a terminal never clears the screen: the final frame prints once
 after the command exits.
 

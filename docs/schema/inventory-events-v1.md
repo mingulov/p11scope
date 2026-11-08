@@ -22,7 +22,9 @@ Every line carries the same envelope plus its `kind`-specific `event`:
 
 - `seq`: zero-based per-run sequence. Contiguous across rotations while
   every file is retained; retention evictions account exact seq ranges
-  in `retention_evicted` events (see below), never silently.
+  in `retention_evicted` events (see below), never silently. Dropped
+  stdout lines keep their consumed seq, so a slow or closed reader
+  shows as seq gaps accounted by `stdout_lost`.
 - `at_ns`: `CLOCK_MONOTONIC` nanoseconds, the capture clock.
 - `kind`: one of the values below.
 
@@ -183,12 +185,14 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   value the report already carries: the section lengths, the coverage
   line, the layer entry totals, the key-operation row counts, the
   emitter deferred queues still waiting after the commit, and the
-  writer accounting. At most one per pass, trailing its
-  `pass_committed`; the cadence is phase-locked to actual emissions
-  (a late pass moves the next due date by one interval instead of
-  bursting catch-ups), rides the existing pass ticks with no new
-  thread, and never delays stop. The stop commit emits none: `ended`
-  and the final report already carry the final counts.
+  writer accounting (`stdout_lost` reads zero on file streams, which
+  never shed; `ended` carries it on stdout streams only). At most one
+  per pass, trailing its `pass_committed`; the cadence is phase-locked
+  to actual emissions (a late pass moves the next due date by one
+  interval instead of bursting catch-ups), rides the existing pass
+  ticks with no new thread, and never delays stop. The stop commit
+  emits none: `ended` and the final report already carry the final
+  counts.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,
@@ -438,9 +442,14 @@ is terminated before the next line so every delivered line still
 starts at a line boundary. A line that does not parse as JSON is a
 shed fragment: skip it; its `seq` gap and `stdout_lost` account for
 it. Capture continues to its normal stop. Only an stdout that
-cannot be acquired at all (an unsupported fd type) fails fast
-before scanning; a stdout closed at exec is presented as
-`/dev/null`, so the stream is discarded and the run succeeds.
+cannot be acquired at all fails fast before scanning: an
+unsupported fd type, a named FIFO with no reader, or a pipe or
+terminal the observer may not write; an anonymous pipe with no
+reader instead sheds every line and exits 1. A stdout closed at
+exec is presented as `/dev/null`, so the stream is discarded and
+the run succeeds. With `docker run -t` or Kubernetes `tty: true`,
+stderr shares the container stream; CRI log collectors must select
+`stream=stdout` to read events only.
 
 ## Privacy and loss accounting
 

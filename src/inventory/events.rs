@@ -393,11 +393,13 @@ impl EventWriter {
     /// `p11scope/inventory-events/v1` lines, never rotated, with one
     /// bounded wait per commit batch and shed-with-counters past it.
     /// Tests drive pipes here; production passes fd 1 with
-    /// [`crate::sink::SINK_TICK_BUDGET`]. Fails fast only when the fd
-    /// cannot be acquired at all (closed or an unsupported type); an
-    /// open pipe whose reader is gone (already, or mid-run) sheds
-    /// every line with broken-pipe counters instead, and capture
-    /// continues to its normal stop.
+    /// [`crate::sink::SINK_TICK_BUDGET`]. Fails fast when the fd
+    /// cannot be acquired at all: an unsupported type, a named FIFO
+    /// with no reader (ENXIO on the non-blocking reopen), or a pipe
+    /// or terminal the observer may not write (permission denied).
+    /// An anonymous pipe whose reader is gone sheds every line with
+    /// broken-pipe counters instead (already gone, or mid-run), and
+    /// capture continues to its normal stop.
     pub(crate) fn create_stdout_on_fd(fd: RawFd, budget: Duration) -> Result<Self, String> {
         let inner = crate::sink::stdout_transport_on_fd(fd)
             .map_err(|error| format!("opening inventory event stream on stdout failed: {error}"))?;
@@ -428,8 +430,11 @@ impl EventWriter {
 
     /// Open the bounded wait for one commit batch on the stdout sink
     /// (a no-op for files, which flush per line). Every commit
-    /// emitter begins its batch explicitly; appends outside a batch
-    /// share one implicit single-line batch each.
+    /// emitter begins its batch explicitly; the first append before
+    /// any batch opens one implicit batch, while later appends
+    /// outside a batch draw from the last batch's deadline (expired,
+    /// so they shed immediately under backpressure). No production
+    /// code appends outside a batch.
     pub(crate) fn begin_batch(&mut self) {
         if let EventSink::Stdout(stdout) = &mut self.sink {
             stdout.begin_batch();
@@ -465,8 +470,9 @@ impl EventWriter {
 
     /// Append one event line: `{"schema","seq","at_ns","kind","event"}`.
     /// Stdout lines join the current commit batch
-    /// ([`EventWriter::begin_batch`]); outside a batch each append
-    /// spends one implicit single-line batch.
+    /// ([`EventWriter::begin_batch`]); the first append before any
+    /// batch opens one implicit batch, while later appends outside a
+    /// batch draw from the last batch's expired deadline.
     pub(crate) fn append(
         &mut self,
         kind: &str,

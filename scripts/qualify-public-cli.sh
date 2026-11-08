@@ -442,7 +442,7 @@ inventory_event_stdout() {
   rm -f event-stdout.jsonl event-stdout.stderr event-epipe.stderr event-epipe.head event-stdout.wl
   asuser "$GATED" "$MODULE" 100000000 1000 - > event-stdout.wl 2>&1 & wl=$!; register "$wl" || true
   if waitfor event-stdout.wl '^READY pid=' "$wl" "$READY_TICKS"; then
-    timeout 120 "$P" inventory --pid "$wl" --duration 6 -o "$full_out" --event-log - --event-interval 2s > event-stdout.jsonl 2> event-stdout.stderr; rc1=$?
+    timeout 120 "$P" inventory --pid "$wl" --duration 6 -o "$full_out" --event-log - --event-interval 2s 2> event-stdout.stderr | cat > event-stdout.jsonl; rc1=${PIPESTATUS[0]}
     timeout 120 "$P" inventory --pid "$wl" --duration 4 -o "$epipe_out" --event-log - 2> event-epipe.stderr | head -c 200 > event-epipe.head; rc2=${PIPESTATUS[0]}
   fi
   terminate "$wl"
@@ -489,6 +489,8 @@ for row in totals:
     marker = [r for r in stream[:position] if r["kind"] == "pass_committed"][-1]["event"]
     assert marker["pass"] == row["event"]["pass"], (marker["pass"], row["event"])
     assert row["event"]["passes"] == row["event"]["pass"] + 1, row["event"]
+    for key in ["callers", "modules", "edges"]:
+        assert row["event"][key] == marker["totals"][key], (key, row["event"], marker["totals"])
     if last_at:
         assert row["at_ns"] - last_at >= 2_000_000_000, row
     last_at = row["at_ns"]

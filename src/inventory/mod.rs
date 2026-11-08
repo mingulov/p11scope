@@ -553,7 +553,7 @@ impl EventLogState {
             let reason = writer.stdout_loss_reason().unwrap_or("unknown");
             self.stdout_loss = Some(format!(
                 "p11scope: inventory event log stdout shed {total_lines} lines \
-                 ({total_bytes} bytes; first: {reason}); capture continues"
+                 ({total_bytes} bytes; first: {reason}); capture continued to its normal stop"
             ));
             return Some(format!(
                 "p11scope: inventory event log stdout shed {lines} lines ({bytes} bytes) \
@@ -649,6 +649,7 @@ pub(crate) fn start_event_log_guarded<Source: ProcessSource>(
 #[derive(Debug)]
 pub(crate) struct FinalOutputOutcome {
     event_log_confirmed: Option<bool>,
+    event_log_stdout: bool,
     report_committed: Option<bool>,
     stdout_result: Option<StdoutResult>,
     failures: Vec<String>,
@@ -694,7 +695,13 @@ impl FinalOutputOutcome {
         let mut statuses = Vec::new();
         if let Some(confirmed) = self.event_log_confirmed {
             statuses.push(if confirmed {
-                "event log complete and synced"
+                if self.event_log_stdout {
+                    "event log complete"
+                } else {
+                    "event log complete and synced"
+                }
+            } else if self.event_log_stdout {
+                "event log incomplete"
             } else {
                 "event log incomplete or sync unconfirmed"
             });
@@ -1496,10 +1503,9 @@ fn run_with_terminal_budget(
         None => None,
     };
     let writer = match event_log {
-        Some(path) if event_stdout => Some(
+        Some(_) if event_stdout => Some(
             crate::inventory_events::EventWriter::create_stdout()
-                .map_err(|error| anyhow::anyhow!("{error}"))
-                .with_context(|| format!("opening inventory event stream {}", path.display()))?,
+                .map_err(|error| anyhow::anyhow!("{error}"))?,
         ),
         Some(path) => Some(
             crate::inventory_events::EventWriter::create(
@@ -7332,6 +7338,7 @@ pub(crate) fn finish_output(
         diagnostics_failed: false,
         event_log_confirmed: event_requested
             .then(|| stream.first_error().is_none() && stream.stdout_loss().is_none()),
+        event_log_stdout: stream.stdout_requested(),
         report_committed: None,
         stdout_result: None,
         failures: stream

@@ -8228,8 +8228,14 @@ fn run_dashboard(
                         display.notice(&crate::render::escape_controls(&error));
                     }
                     // The pass line is progress; its events and gaps
-                    // must outlive the screen.
-                    for (index, line) in progress_lines(coordinator, report).iter().enumerate() {
+                    // must outlive the screen. The attach-decision tail
+                    // stays verbose-only, like on the stderr path, so
+                    // admission notes cannot evict real warnings from
+                    // the replay buffer at default verbosity.
+                    let lines = progress_lines(coordinator, report);
+                    let verbose = crate::cli::text_is_verbose();
+                    for (index, line) in dashboard_visible_lines(&lines, verbose).iter().enumerate()
+                    {
                         if index == 0 {
                             display.log(line);
                         } else {
@@ -8508,12 +8514,31 @@ fn attach_note_text(note: &crate::discovery::inventory_attach_set::AttachDecisio
     text
 }
 
+/// True for the attach-decision tail of [`progress_lines`]: the
+/// per-object/module `attach …` notes and the `attach notes capped`
+/// count. Pinned to the `p11scope: pass N: ` prefix with a numeric
+/// pass, so a target-controlled event reason mentioning attach notes
+/// can neither hide a warning nor forge a note.
+fn is_attach_progress_line(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("p11scope: pass ") else {
+        return false;
+    };
+    let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+    if digits == 0 || !rest[digits..].starts_with(": ") {
+        return false;
+    }
+    rest[digits + 2..].starts_with("attach ")
+}
+
 /// The dashboard sink of [`progress_lines`]: the headline plus events
 /// and gaps always; the attach-decision tail only when verbose, so a
 /// large scope's admission notes cannot evict real gap warnings from
 /// the replay buffer at default verbosity.
-fn dashboard_visible_lines(lines: &[String], _verbose: bool) -> Vec<&String> {
-    lines.iter().collect()
+fn dashboard_visible_lines(lines: &[String], verbose: bool) -> Vec<&String> {
+    lines
+        .iter()
+        .filter(|line| verbose || !is_attach_progress_line(line))
+        .collect()
 }
 
 /// Per-pass progress lines (stdout stays parseable): what the pass
@@ -14731,6 +14756,31 @@ mod tests {
             lines.len(),
             "verbose dashboard keeps every line"
         );
+    }
+
+    #[test]
+    fn dashboard_attach_filter_matches_only_attach_shapes() {
+        // The filter pins the `p11scope: pass N: ` prefix, so a
+        // target-controlled reason mentioning attach notes stays
+        // visible and cannot forge a note-shaped line.
+        for line in [
+            "p11scope: pass 6: attach blocked-no-companion /upper/libsofthsm2.so key=0:84:42 retained=sha-s incoming=sha-s pre=n",
+            "p11scope: pass 6: attach verdict-admitted /upper/libsofthsm2.so key=0:84:42 retained=none incoming=sha-s pre=y endpoints=68",
+            "p11scope: pass 6: attach notes capped (3 dropped)",
+        ] {
+            assert!(is_attach_progress_line(line), "{line}");
+        }
+        for line in [
+            "p11scope: pass 6: 128 scanned (0 maps-matched; 0 native, 128 scan-pinned)",
+            "p11scope: pass 6: 2 gaps (1 budget refusal, 0 suppressed)",
+            "p11scope: pass 6: stage timings: scan 1 ms",
+            "p11scope: pass 6: caller c1 exited: attach blocked-no-companion forged",
+            "p11scope: pass 6: 1 caller admissions failed; first: pid 9: attach notes capped (1 dropped)",
+            "p11scope: pass six: attach blocked-no-companion forged",
+            "attach blocked-no-companion /upper/libsofthsm2.so key=0:84:42 retained=sha-s incoming=sha-s pre=n",
+        ] {
+            assert!(!is_attach_progress_line(line), "{line}");
+        }
     }
 
     /// DR-K8S-4 through the real per-pass emitter: one identical gap over

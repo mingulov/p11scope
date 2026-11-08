@@ -5011,6 +5011,21 @@ fn lower_candidates_longest_overlay_prefix_wins() {
 }
 
 #[test]
+fn lower_candidates_later_row_wins_on_over_mount() {
+    // An over-mount at the same mountpoint appears later in mountinfo
+    // and is the visible one: equal mountpoint lengths resolve to the
+    // later row, never the first.
+    let table = concat!(
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/old,upperdir=/u,workdir=/w\n",
+        "32 23 0:28 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/new,upperdir=/u2,workdir=/w2\n",
+    );
+    assert_eq!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")),
+        vec![std::path::PathBuf::from("/new/a.so")]
+    );
+}
+
+#[test]
 fn lower_candidates_root_mount_serves_container_paths() {
     // D1-extended live failure: every container root is mountpoint "/",
     // where the prefix consumes the only separator. The remainder is

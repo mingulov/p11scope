@@ -430,9 +430,10 @@ notices and the nonzero exit), and a shed that leaves a partial line
 is terminated before the next line so every delivered line still
 starts at a line boundary. A line that does not parse as JSON is a
 shed fragment: skip it; its `seq` gap and `stdout_lost` account for
-it. Capture continues to its normal stop;
-only an stdout that cannot be acquired at all (closed or
-unsupported) fails fast before scanning.
+it. Capture continues to its normal stop. Only an stdout that
+cannot be acquired at all (an unsupported fd type) fails fast
+before scanning; a stdout closed at exec is presented as
+`/dev/null`, so the stream is discarded and the run succeeds.
 
 ## Privacy and loss accounting
 

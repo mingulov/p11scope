@@ -1436,8 +1436,9 @@ Limits that matter in pods:
   with counters reported on stderr, in `totals`/`ended`, and the exit
   status, while capture continues to its normal stop. A line that
   does not parse as JSON is a shed fragment: skip it; its `seq` gap
-  and `stdout_lost` account for it. Only an stdout
-  that cannot be acquired at all fails fast before scanning.
+  and `stdout_lost` account for it. Only an unsupported stdout fd
+  type fails fast before scanning; a stdout closed at exec reads as
+  `/dev/null`, so the stream is discarded and the run succeeds.
   `--event-interval <dur>` (off by default; e.g. `10s`) adds a periodic
   `totals` snapshot of the current report counts to either sink, at most
   one per pass and never on the stop commit. For example, an observer

@@ -1876,3 +1876,41 @@ fn event_log_dash_refuses_stdout_rivals_up_front() {
         );
     }
 }
+
+/// `--event-log -` with stdout closed still succeeds: the runtime
+/// presents a closed stdout as `/dev/null`, so the stream is
+/// discarded while the summary lands on stderr and nothing sheds.
+/// `sh -c 'exec ... >&-'` closes fd 1 without unsafe `pre_exec`.
+/// The observer scans its own pid, which needs no privileges.
+/// Only an unsupported stdout fd type fails fast (unit-covered).
+#[test]
+fn event_log_dash_with_closed_stdout_discards_the_stream_and_succeeds() {
+    let pid = std::process::id().to_string();
+    let output = Command::new("sh")
+        .args(["-c", "exec \"$0\" \"$@\" >&-"])
+        .arg(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory", "--pid", &pid, "--capture", "scan", "--event-log", "-",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "a closed stdout discards the stream: {output:?}"
+    );
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("--event-log - owns stdout"),
+        "the move is announced: {stderr}"
+    );
+    assert!(
+        stderr.contains(&format!("inventory pid:{pid} (")),
+        "the text summary moved to stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("opening inventory event stream -"),
+        "no open failure: {stderr}"
+    );
+}

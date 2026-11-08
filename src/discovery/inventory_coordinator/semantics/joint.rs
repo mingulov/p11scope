@@ -27,6 +27,88 @@ pub(in crate::discovery::engine::inventory_coordinator) struct JointCommitInput<
     finish: Option<FinishCommitOutput<'a>>,
 }
 
+/// Diagnostic-only joint-seal telemetry: attempts by progress kind
+/// plus refusal count and the latest refusal label. Counts and one
+/// frozen label only; disclosed beside the stop line while stage
+/// timings are requested, never a contract.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SealDiagnosis {
+    pub(crate) attempts: u64,
+    pub(crate) local_pending: u64,
+    pub(crate) await_future_input: u64,
+    pub(crate) delivery_ready: u64,
+    pub(crate) complete: u64,
+    pub(crate) refused: u64,
+    pub(crate) last_refusal: &'static str,
+}
+
+impl Default for SealDiagnosis {
+    fn default() -> Self {
+        Self {
+            attempts: 0,
+            local_pending: 0,
+            await_future_input: 0,
+            delivery_ready: 0,
+            complete: 0,
+            refused: 0,
+            last_refusal: "none",
+        }
+    }
+}
+
+impl SealDiagnosis {
+    pub(crate) fn record(&mut self, outcome: &Result<QuantumSealProgress, RawQuantumRefusal>) {
+        self.attempts = self.attempts.saturating_add(1);
+        match outcome {
+            Ok(QuantumSealProgress::LocalPending) => {
+                self.local_pending = self.local_pending.saturating_add(1);
+            }
+            Ok(QuantumSealProgress::AwaitFutureInput) => {
+                self.await_future_input = self.await_future_input.saturating_add(1);
+            }
+            Ok(QuantumSealProgress::DeliveryReady) => {
+                self.delivery_ready = self.delivery_ready.saturating_add(1);
+            }
+            Ok(QuantumSealProgress::Complete) => {
+                self.complete = self.complete.saturating_add(1);
+            }
+            Err(refusal) => {
+                self.refused = self.refused.saturating_add(1);
+                self.last_refusal = seal_refusal_label(refusal);
+            }
+        }
+    }
+}
+
+/// Frozen refusal labels for [`SealDiagnosis`]: variant names only,
+/// payloads folded. Diagnostic-only, never a contract.
+pub(crate) fn seal_refusal_label(refusal: &RawQuantumRefusal) -> &'static str {
+    match refusal {
+        RawQuantumRefusal::Capacity => "Capacity",
+        RawQuantumRefusal::H0Active => "H0Active",
+        RawQuantumRefusal::ForeignDescriptors => "ForeignDescriptors",
+        RawQuantumRefusal::ForeignDrain => "ForeignDrain",
+        RawQuantumRefusal::ForeignCapture => "ForeignCapture",
+        RawQuantumRefusal::ForeignLedger => "ForeignLedger",
+        RawQuantumRefusal::DrainUnbound => "DrainUnbound",
+        RawQuantumRefusal::H0Undelivered => "H0Undelivered",
+        RawQuantumRefusal::IdentityExhausted => "IdentityExhausted",
+        RawQuantumRefusal::InvalidLimit => "InvalidLimit",
+        RawQuantumRefusal::Resource(_) => "Resource",
+        RawQuantumRefusal::Ledger(_) => "Ledger",
+        RawQuantumRefusal::Allocation => "Allocation",
+        RawQuantumRefusal::Admission => "Admission",
+        RawQuantumRefusal::StaleFrontier => "StaleFrontier",
+        RawQuantumRefusal::DispositionMismatch => "DispositionMismatch",
+        RawQuantumRefusal::H3Undisposed => "H3Undisposed",
+        RawQuantumRefusal::ClosureStale => "ClosureStale",
+        RawQuantumRefusal::Stopped => "Stopped",
+        RawQuantumRefusal::Cut(_) => "Cut",
+        RawQuantumRefusal::Cursor(_) => "Cursor",
+        RawQuantumRefusal::Fault(_) => "Fault",
+    }
+}
+
 struct FinishCommitOutput<'a> {
     disposed: &'a mut Option<DisposedJointQuantum>,
     completed: &'a mut Option<CompletedJointFinish>,
@@ -398,13 +480,23 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let fault = BorrowedFault(fault);
         while *remaining != 0 {
             let before = *remaining;
-            {
+            // Seal and delivery take separate port scopes (ports are
+            // re-created per scope elsewhere too) so the seal outcome
+            // records its diagnostic before any refusal propagates.
+            let outcome = {
                 let mut ports = self
                     .joint_frame_ports(producers)
                     .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
                 let held = frame.as_mut().expect("same original service frame");
                 held.seal_next_bounded(&mut ports, &mut births, &fault, remaining)
-                    .map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
+            };
+            self.seal_diagnosis.record(&outcome);
+            outcome.map_err(|reason| anyhow::anyhow!("Joint seal refused: {reason:?}"))?;
+            {
+                let mut ports = self
+                    .joint_frame_ports(producers)
+                    .map_err(|reason| anyhow::anyhow!("Joint service ports refused: {reason:?}"))?;
+                let held = frame.as_mut().expect("same original service frame");
                 held.deliver_next_bounded(&mut ports, remaining)
                     .map_err(|reason| anyhow::anyhow!("Joint delivery refused: {reason:?}"))?;
             }

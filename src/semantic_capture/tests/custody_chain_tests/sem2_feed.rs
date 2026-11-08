@@ -14,7 +14,7 @@ use crate::attach::image_query::ImageQueryRefusal;
 use crate::discovery::instances::UnknownReason;
 use crate::inventory_semantics::{
     SCAN_REFUSAL_LABELS, admitted_mints_line, count_scan_refusals, image_query_refusal_index,
-    image_query_refusal_label, scan_refusals_gap_reason, semantic_stop_line,
+    image_query_refusal_label, joint_seals_line, scan_refusals_gap_reason, semantic_stop_line,
 };
 
 #[test]
@@ -244,5 +244,19 @@ fn admitted_mints_line_format_is_exact() {
     assert_eq!(
         admitted_mints_line(3, 1),
         "p11scope: admitted mints: reported=3 attached=1"
+    );
+}
+
+#[test]
+fn joint_seals_line_format_is_exact() {
+    assert_eq!(
+        joint_seals_line(0, 0, 0, 0, 0, 0, "none"),
+        "p11scope: joint seals: attempts=0 local_pending=0 await_future_input=0 \
+         delivery_ready=0 complete=0 refused=0 last_refusal=none"
+    );
+    assert_eq!(
+        joint_seals_line(12, 3, 7, 1, 1, 2, "Capacity"),
+        "p11scope: joint seals: attempts=12 local_pending=3 await_future_input=7 \
+         delivery_ready=1 complete=1 refused=2 last_refusal=Capacity"
     );
 }

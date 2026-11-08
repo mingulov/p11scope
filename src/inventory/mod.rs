@@ -3185,6 +3185,16 @@ fn disclose_semantic_stop(
             counts.admitted_reported,
             counts.admitted_attached,
         ));
+        let seals = coordinator.seal_diagnosis();
+        warn.emit(&crate::inventory_semantics::joint_seals_line(
+            seals.attempts,
+            seals.local_pending,
+            seals.await_future_input,
+            seals.delivery_ready,
+            seals.complete,
+            seals.refused,
+            seals.last_refusal,
+        ));
     }
 }
 

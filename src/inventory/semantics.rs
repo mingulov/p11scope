@@ -1576,6 +1576,28 @@ pub(crate) fn admitted_mints_line(reported: u64, attached: u64) -> String {
     format!("p11scope: admitted mints: reported={reported} attached={attached}")
 }
 
+/// One stderr line for the diagnostic joint-seal summary: seal
+/// attempts by progress kind plus refusal count and the latest
+/// refusal label. Counts and one frozen label only; no identities,
+/// paths or payloads. Diagnostic-only: printed beside the stop
+/// line only while stage timings are requested, never a contract.
+#[allow(clippy::too_many_arguments)] // One line, one call site, like semantic_stop_line.
+pub(crate) fn joint_seals_line(
+    attempts: u64,
+    local_pending: u64,
+    await_future_input: u64,
+    delivery_ready: u64,
+    complete: u64,
+    refused: u64,
+    last_refusal: &str,
+) -> String {
+    format!(
+        "p11scope: joint seals: attempts={attempts} local_pending={local_pending} \
+         await_future_input={await_future_input} delivery_ready={delivery_ready} \
+         complete={complete} refused={refused} last_refusal={last_refusal}"
+    )
+}
+
 /// The live lane: the owned Detailed `Session` (the sole retained EVENTS
 /// cursor, maps and links), its H0 `SemanticCapture` driver, the sealed
 /// attachment receipt, and the terminal ownership state. Counts only;

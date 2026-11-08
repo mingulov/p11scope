@@ -430,6 +430,9 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     promotion_finish: bool,
     /// Records discarded by the promotion route (diagnostics).
     promotion_records_discarded: u64,
+    /// Joint-seal outcomes by progress kind (diagnostics, disclosed
+    /// beside the stop line while stage timings are requested).
+    seal_diagnosis: semantics::SealDiagnosis,
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     engine_collected_finish_calls: u64,
@@ -1054,6 +1057,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             collected_finish_progressed: false,
             promotion_finish: false,
             promotion_records_discarded: 0,
+            seal_diagnosis: semantics::SealDiagnosis::default(),
             #[cfg(test)]
             engine_collected_finish_calls: 0,
             #[cfg(test)]
@@ -2997,6 +3001,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     #[allow(dead_code)] // Consumed by T12c.
     pub(crate) fn promotion_records_discarded(&self) -> u64 {
         self.promotion_records_discarded
+    }
+
+    /// Joint-seal outcomes by progress kind (diagnostics).
+    pub(crate) fn seal_diagnosis(&self) -> semantics::SealDiagnosis {
+        self.seal_diagnosis
     }
 
     /// Calls into `service_collected_finish_records_with` (test count).

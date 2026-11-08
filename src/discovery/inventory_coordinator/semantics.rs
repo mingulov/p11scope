@@ -9,6 +9,7 @@ mod finalizer;
 #[path = "semantics/joint.rs"]
 mod joint;
 pub(crate) use joint::CompletedJointFinish;
+pub(crate) use joint::SealDiagnosis;
 #[path = "semantics/promotion.rs"]
 mod promotion;
 #[cfg(test)]

@@ -44,8 +44,8 @@ use crate::discovery::caller_registry::{
     UnboundImage, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_attach_set::{
-    AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, ENDPOINT_RESOURCE, EndpointId,
-    InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
+    AbsorbOutcome, AttachModuleKey, AttachObjectId, AttachVerdict, DecisionLog, ENDPOINT_RESOURCE,
+    EndpointId, InventoryAttachSet, MEMBERSHIP_RESOURCE, ModuleMembers, TargetDelta,
 };
 use crate::discovery::native_binding::{
     BinderLimits, Binding, BoundImage, CallerLookup, CurrentBindingCheck, CurrentBindingRequest,
@@ -492,6 +492,10 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
     adapter: CallerAdapter<Source>,
     registry: CallerRegistry,
     attach_set: InventoryAttachSet,
+    /// This pass's attach-decision notes for the verbose per-pass
+    /// lines: replaced by every absorb, read by the progress
+    /// renderer. Empty passes (and old runs) render no lines.
+    last_pass_decisions: DecisionLog,
     /// Endpoints and objects the attach set added since the capture facade
     /// last took them. Bounded by the endpoint budget: every endpoint
     /// enters exactly once.
@@ -1068,6 +1072,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
             adapter,
             registry,
             attach_set: InventoryAttachSet::new(endpoint_budget),
+            last_pass_decisions: DecisionLog::default(),
             pending_targets: TargetDelta::default(),
             capture: None,
             binder: NativeBinder::new(BinderLimits::default()),
@@ -2580,6 +2585,19 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Whether the identity ticket budget spent itself.
     pub(crate) fn identity_budget_exhausted(&self) -> bool {
         self.identity_budget_exhausted
+    }
+
+    /// This pass's attach-decision notes, for the verbose per-pass
+    /// lines. Replaced by every absorb.
+    pub(crate) fn attach_decisions(&self) -> &DecisionLog {
+        &self.last_pass_decisions
+    }
+
+    /// Stages decision notes without an absorb, so the progress
+    /// renderer test can pin the verbose lines directly.
+    #[cfg(test)]
+    pub(crate) fn stage_decisions_for_test(&mut self, decisions: DecisionLog) {
+        self.last_pass_decisions = decisions;
     }
 
     /// The capture's `--exclude-module` report rows plus the inputs that
@@ -5928,6 +5946,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         absorbed: AbsorbOutcome,
     ) -> BTreeMap<AttachModuleKey, AttachVerdict> {
         self.pending_targets.append(absorbed.delta);
+        self.last_pass_decisions = absorbed.decisions;
         for gap in absorbed.gaps {
             self.registry.record_gap(RegistryGap {
                 caller: None,

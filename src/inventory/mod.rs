@@ -8479,6 +8479,35 @@ fn dashboard_stderr_line(account: &DisplayAccount) -> String {
     )
 }
 
+/// One attach-decision note as verbose text: the branch, the target
+/// path, the raw key, and the digests compared. Paths are
+/// target-controlled (maps spellings), so they render escaped like
+/// refusal reasons. Never matches the `pass N: M scanned` headline
+/// scripts count.
+fn attach_note_text(note: &crate::discovery::inventory_attach_set::AttachDecisionNote) -> String {
+    use crate::discovery::inventory_attach_set::PairLinkDirection;
+    let mut text = format!(
+        "attach {} {} key={}:{}:{} retained={} incoming={} pre={}",
+        note.branch,
+        crate::render::escape_controls(&note.path),
+        note.key.device.major,
+        note.key.device.minor,
+        note.key.inode,
+        note.retained.as_deref().unwrap_or("none"),
+        note.incoming,
+        if note.incoming_pre { "y" } else { "n" },
+    );
+    match note.direction {
+        Some(PairLinkDirection::RetainedPre) => text.push_str(" dir=retained-pre"),
+        Some(PairLinkDirection::RetainedPlain) => text.push_str(" dir=retained-plain"),
+        None => {}
+    }
+    if let Some(endpoints) = note.endpoints {
+        text.push_str(&format!(" endpoints={endpoints}"));
+    }
+    text
+}
+
 /// Per-pass progress lines (stdout stays parseable): what the pass
 /// scanned, which caller incarnations turned over, and what the pass
 /// cost — gaps, budget refusals, and suppressed gaps are reported, so a
@@ -8591,6 +8620,24 @@ fn progress_lines<Source: ProcessSource>(
             }
         };
         lines.push(format!("p11scope: pass {}: {line}", report.pass));
+    }
+    // This pass's attach decisions (verbose-only like every other
+    // per-pass line past the headline): which branch decided each
+    // noted object or module, and on which digests. Empty passes
+    // render nothing.
+    let decisions = coordinator.attach_decisions();
+    for note in &decisions.notes {
+        lines.push(format!(
+            "p11scope: pass {}: {}",
+            report.pass,
+            attach_note_text(note)
+        ));
+    }
+    if decisions.dropped > 0 {
+        lines.push(format!(
+            "p11scope: pass {}: attach notes capped ({} dropped)",
+            report.pass, decisions.dropped
+        ));
     }
     lines
 }
@@ -14499,6 +14546,104 @@ mod tests {
                 .iter()
                 .any(|line| line.ends_with("cannot pin /tmp/evil\\u{1b}[2J\\u{7}")),
             "{lines:?}"
+        );
+    }
+
+    #[test]
+    fn progress_lines_render_attach_decision_notes() {
+        use crate::discovery::engine::inventory_coordinator::PassReport;
+        use crate::discovery::inventory_attach_set::{
+            AttachDecisionNote, DecisionLog, PairLinkDirection,
+        };
+        use p11scope_manifest::maps::{Device, ObjectKey};
+        let mut staged = coordinator();
+        let mut decisions = DecisionLog::default();
+        decisions.push(AttachDecisionNote {
+            key: ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 81,
+                },
+                inode: 2299025,
+            },
+            path: "/usr/lib/softhsm/libsofthsm2.so".into(),
+            branch: "copyup-pair-proof",
+            retained: Some("sha-u".into()),
+            incoming: "sha-l".into(),
+            incoming_pre: true,
+            direction: Some(PairLinkDirection::RetainedPlain),
+            endpoints: None,
+        });
+        decisions.push(AttachDecisionNote {
+            key: ObjectKey {
+                device: Device {
+                    major: 0,
+                    minor: 81,
+                },
+                inode: 2299025,
+            },
+            path: "/tmp/evil\u{1b}[2J".into(),
+            branch: "verdict-admitted",
+            retained: None,
+            incoming: "sha-l".into(),
+            incoming_pre: true,
+            direction: None,
+            endpoints: Some(68),
+        });
+        decisions.dropped = 1;
+        staged.stage_decisions_for_test(decisions);
+        let report = PassReport {
+            pass: 3,
+            scanned: 254,
+            maps_matched: 0,
+            native_callers: 0,
+            scan_callers: 254,
+            engine_changed: false,
+            pending_refresh: Vec::new(),
+            events: Vec::new(),
+            timings: crate::timing::StageTimings::new(),
+        };
+        let lines = progress_lines(&staged, &report);
+        assert!(
+            lines.iter().any(|line| line
+                == "p11scope: pass 3: attach copyup-pair-proof /usr/lib/softhsm/libsofthsm2.so key=0:81:2299025 retained=sha-u incoming=sha-l pre=y dir=retained-plain"),
+            "{lines:?}"
+        );
+        let escaped = lines
+            .iter()
+            .find(|line| line.contains("attach verdict-admitted"))
+            .expect("a verdict line");
+        assert!(
+            escaped.ends_with("key=0:81:2299025 retained=none incoming=sha-l pre=y endpoints=68"),
+            "{escaped}"
+        );
+        assert!(!escaped.chars().any(char::is_control), "{escaped}");
+        assert!(
+            lines
+                .iter()
+                .any(|line| line == "p11scope: pass 3: attach notes capped (1 dropped)"),
+            "{lines:?}"
+        );
+        // The harness counts passes with `^p11scope: pass N: M scanned`:
+        // no decision line may match it.
+        for line in &lines {
+            if line.contains("attach ") || line.contains("attach notes") {
+                assert!(
+                    !line
+                        .strip_prefix("p11scope: pass 3: ")
+                        .is_some_and(|tail| tail
+                            .chars()
+                            .next()
+                            .is_some_and(|first| first.is_ascii_digit())),
+                    "{line}"
+                );
+            }
+        }
+        // An empty stash renders nothing.
+        let quiet = progress_lines(&coordinator(), &report);
+        assert!(
+            !quiet.iter().any(|line| line.contains("attach ")),
+            "{quiet:?}"
         );
     }
 

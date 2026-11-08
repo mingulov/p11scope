@@ -94,7 +94,7 @@ impl Chain {
         let parent_bin = gcc(
             dir,
             "chain-parent",
-            &fixture_source("parent-chain/chain-parent.c"),
+            &fixture_source("public-cli/chain-parent.c"),
             &["-O2", "-Wall", "-Wextra", "-Werror"],
             &[],
         );

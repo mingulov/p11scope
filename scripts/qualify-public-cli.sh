@@ -874,13 +874,17 @@ lb=c.get('launched_by')
 assert isinstance(lb,list) and 1<=len(lb)<=4, 'walk keeps 1..=4 ancestors'
 assert lb[0]['pid']==parent and lb[0]['exe']=='chain-parent' and lb[0]['start_time']==parent_gen, \
     'named parent first: %r' % (lb[0],)
+for a in lb:
+    assert a['pid']!=1, 'init is never shown as the launcher: %r' % (a,)
 for a in lb[1:]:
     assert a['pid']>0 and isinstance(a['start_time'],int), 'ancestor generation: %r' % (a,)
+assert c.get('launched_by_origin')=='chain', 'real chain origin: %r' % (c.get('launched_by_origin'),)
+assert c.get('launched_by_unit') is None, 'no unit beside a real chain'
 gap=c.get('launched_by_gap')
 if gap is not None:
     assert gap['subject']=='caller parent chain', gap
-    assert gap['reason'] in ('parent unknown: exited before read',
-        'parent unknown: unreadable /proc entry',
+    assert gap['reason'] in ('launcher exited before read',
+        'launcher hidden by /proc hidepid',
         'parent chain truncated after 4 ancestors',
         'parent chain not sampled in cgroup transaction'), gap
 concise_text=open(concise).read(); verbose_text=open(verbose).read()

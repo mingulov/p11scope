@@ -162,10 +162,11 @@ unidentified caller executables row of
 (`owner_image` returns `None` everywhere in production); only a future
 lane returning exact owner images would fill them, and publishing
 non-null values needs a new allowlist row.
-`callers[].launched_by` / `launched_by_gap` publish each ancestor's
-`pid`, `start_time` and exe basename under the caller launcher chain row
-of [privacy allowlist v3](../privacy/allowlist-v3.md); no command line,
-environment, argument or `comm` is read or published for ancestors.
+`callers[].launched_by` / `launched_by_gap` / `launched_by_origin` /
+`launched_by_unit` publish each ancestor's `pid`, `start_time` and exe
+basename under the caller launcher chain row of [privacy allowlist
+v3](../privacy/allowlist-v3.md); no command line, environment, argument
+or `comm` is read or published for ancestors.
 
 App-hint extension (additive within v1, owner ruling 2026-11-08 as
 corrected the same day): an admitted caller whose exe is a tabled
@@ -210,16 +211,27 @@ and never proves an app identity. See the app identity rows of
   `lifecycle` is `mapped`, `exited`, `exec_retired`, or `unknown`
   (with `lifecycle_reason` whenever the state is not plainly mapped).
   `launched_by` (additive within v1) names who launched the caller: up to
-  four ancestors, nearest first, each with its `pid`, `start_time`
+  four raw ancestors, nearest first, each with its `pid`, `start_time`
   (`clock_ticks_since_boot`, for generation comparison like the caller's
   own) and exe basename (`exe`), plus an optional `label` hook (absent
-  in v0.7.0; a future lane fills interpreter labels). The walk stops at
-  pid 1 and at ppid 0 (no parent in this pid namespace); any earlier
-  stop keeps the ancestors read so far plus `launched_by_gap`
-  (`subject` `caller parent chain` with a named `reason`: the parent
-  exited before read, its entry was unreadable, the chain was truncated
-  after four ancestors, or the cgroup transaction sampled no parentage).
-  Chains are frozen at admission; counts and caller identity never change.
+  in v0.7.0; a future lane fills interpreter labels). Init (pid 1),
+  the systemd user manager and container inits are never recorded; a
+  parent younger than its child proves pid reuse and stops the walk.
+  Runs of adjacent identical wrappers (same exe and label) collapse in
+  output: one link keeps the nearest `pid`/`start_time` with `folded`
+  counting the additional ancestors (absent when zero). An ancestor
+  whose exe link could not be read carries `exe: null` with the named
+  `exe_gap` reason. `launched_by_origin` is `chain` (real ancestors),
+  `init_parent` (the immediate parent is init-type; `launched_by` is
+  empty, no gap is emitted, and `launched_by_unit` carries the caller's
+  systemd unit/scope or null) or `gap` (empty chain with a stop gap).
+  The walk stops cleanly at ppid 0 (no parent in this pid namespace);
+  any earlier stop keeps the ancestors read so far plus
+  `launched_by_gap` (`subject` `caller parent chain` with a named
+  `reason`: the launcher exited before read, hid behind `/proc`
+  hidepid, the chain was truncated after four ancestors, or the cgroup
+  transaction sampled no parentage). Chains are frozen at admission;
+  counts and caller identity never change.
   Under `--system`, every process with attributable mappings registers
   as a caller on every pass, whatever `--max-scan-pids` is: a process
   the deep-scan cap left unselected registers when its `/proc/<pid>/maps`

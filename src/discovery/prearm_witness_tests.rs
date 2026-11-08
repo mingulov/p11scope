@@ -556,6 +556,58 @@ fn stale_open_pin(engine: &Engine, object: PinnedObjectId) -> crate::discovery::
     stale
 }
 
+/// A stale open-time pin differing by ctime only: the real race shape
+/// (same file, copied up between the witness start and the pin).
+fn stale_open_pin_ctime_only(
+    engine: &Engine,
+    object: PinnedObjectId,
+) -> crate::discovery::identity::Pin {
+    let baseline = engine.pinned.pin_for(object).expect("pin holds a baseline");
+    let (ino, size, (sec, nsec)) = baseline.test_parts();
+    let stale = baseline.test_with_ctime((sec.wrapping_add(1), nsec));
+    let (stale_ino, stale_size, stale_ctime) = stale.test_parts();
+    assert_eq!(
+        (stale_ino, stale_size),
+        (ino, size),
+        "the ctime-only variant keeps ino and size"
+    );
+    assert_ne!(stale_ctime, (sec, nsec), "the ctime must rotate");
+    stale
+}
+
+#[test]
+fn witness_slot_with_ctime_only_stale_open_pin_keys_to_no_object() {
+    // The real race shape: the fd identity matches while the open-time
+    // pin is stale by ctime only — the slot must still key to no
+    // object, so no proof can be assembled for it.
+    use crate::attach::prearm_witness::{WitnessSlot, WitnessVerdict};
+    let (_fixture, engine, _session, _declared) = prearm_mapped_engine_with_declared_stamps(900);
+    let object = watched_object(&engine);
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = engine
+        .pinned
+        .file_for(object)
+        .expect("pin holds an fd")
+        .metadata()
+        .expect("fstat the held fd");
+    let (dev, ino) = (meta.dev(), meta.ino());
+    let stale = stale_open_pin_ctime_only(&engine, object);
+    let verdict = WitnessVerdict {
+        active_ns: 40,
+        scope_start_ns: Some(50),
+        walk_started_ns: 1000,
+        slots: vec![WitnessSlot {
+            verdict: FileVerdict::Clear,
+            fd_dev: dev,
+            fd_ino: ino,
+            pin: stale,
+        }],
+    };
+    let map =
+        Engine::map_verdict_slots_to_objects(engine.prearm.watches(), &engine.pinned, &verdict);
+    assert!(map.is_empty(), "a ctime-only stale open pin keys nowhere");
+}
+
 #[test]
 fn witness_discover_plants_no_verdicts() {
     // Discover starts (or skips) the live witness, but verdicts only ever

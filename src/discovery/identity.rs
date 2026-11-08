@@ -73,6 +73,21 @@ pub(crate) fn pin_of_fd(fd: std::os::fd::BorrowedFd<'_>) -> Result<Pin, String> 
     })
 }
 
+impl Pin {
+    /// Test-only field access: the `(ino, size, ctime)` the pin pins.
+    #[cfg(test)]
+    pub(crate) fn test_parts(&self) -> (u64, u64, (i64, i64)) {
+        (self.ino, self.size, self.ctime)
+    }
+
+    /// Test-only copy with a replaced ctime: the real copy-up race
+    /// shape (same file, rotated ctime).
+    #[cfg(test)]
+    pub(crate) fn test_with_ctime(&self, ctime: (i64, i64)) -> Pin {
+        Pin { ctime, ..*self }
+    }
+}
+
 #[cfg(test)]
 pub(crate) mod provider_metadata_read_test {
     //! Observer for actual provider metadata reads (held-fd `fstat`/`fstatfs`

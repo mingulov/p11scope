@@ -6069,6 +6069,29 @@ fn privileged_witness_copyup_between_start_and_pin_refuses_proof() {
             witness.files[0].pin,
             pins.pin_for(object),
         );
+        // The race shape, pinned: the copy-up keeps the overlay
+        // identity while rotating the pin by ctime only (size is
+        // preserved) — that is why condition 4 must refuse.
+        assert_eq!(
+            (witness_dev, witness_ino),
+            (pin_meta.dev(), pin_meta.ino()),
+            "mode {mode:?}: the copy-up keeps the overlay identity"
+        );
+        let baseline = pins.pin_for(object).expect("pin holds a baseline");
+        assert_ne!(
+            witness.files[0].pin, baseline,
+            "mode {mode:?}: the copy-up rotates the pin"
+        );
+        let (_, witness_size, witness_ctime) = witness.files[0].pin.test_parts();
+        let (_, baseline_size, baseline_ctime) = baseline.test_parts();
+        assert_eq!(
+            witness_size, baseline_size,
+            "mode {mode:?}: the copy-up preserves size"
+        );
+        assert_ne!(
+            witness_ctime, baseline_ctime,
+            "mode {mode:?}: the copy-up rewrites ctime"
+        );
         if matched {
             joined.push(mode);
         }

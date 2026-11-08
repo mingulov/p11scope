@@ -459,72 +459,6 @@ fn launcher_read_gap<Source: ProcessSource>(source: &Source, pid: u32) -> Launch
     }
 }
 
-/// The systemd cgroup path in a `/proc/<pid>/cgroup` text: the cgroup-v2
-/// `0::` line, else the v1 `name=systemd` line.
-fn systemd_cgroup_path(cgroup: &str) -> Option<&str> {
-    let mut v1 = None;
-    for line in cgroup.lines() {
-        let mut parts = line.splitn(3, ':');
-        let (id, controllers, path) = (parts.next()?, parts.next()?, parts.next()?);
-        if controllers.is_empty() {
-            if id == "0" {
-                return Some(path);
-            }
-        } else if controllers.split(',').any(|c| c == "name=systemd") {
-            v1 = Some(path);
-        }
-    }
-    v1
-}
-
-/// The leafmost unit name in a systemd cgroup path, or `None` when the
-/// path carries none.
-fn unit_from_systemd_path(path: &str) -> Option<String> {
-    const UNIT_SUFFIXES: &[&str] = &[
-        ".service",
-        ".scope",
-        ".slice",
-        ".socket",
-        ".timer",
-        ".target",
-        ".path",
-        ".mount",
-        ".automount",
-        ".swap",
-        ".device",
-    ];
-    path.rsplit('/')
-        .filter(|segment| !segment.is_empty())
-        .find(|segment| {
-            UNIT_SUFFIXES
-                .iter()
-                .any(|suffix| segment.ends_with(suffix) && segment.len() > suffix.len())
-        })
-        .map(str::to_string)
-}
-
-/// The systemd unit or scope for a `/proc/<pid>/cgroup` text, following
-/// `sd_pid_get_unit` without a libsystemd link: the systemd cgroup path
-/// above, then its leafmost unit name. Components are returned verbatim
-/// (no cgroup unescaping); escaped names show escaped. Only the unit
-/// name is kept — full cgroup paths are never retained or published.
-pub(crate) fn parse_systemd_unit(cgroup: &str) -> Option<String> {
-    systemd_cgroup_path(cgroup).and_then(unit_from_systemd_path)
-}
-
-/// True when a `/proc/<pid>/cgroup` text places the pid in the systemd
-/// user manager itself: `user@<uid>.service/init.scope`.
-pub(crate) fn is_user_manager_cgroup(cgroup: &str) -> bool {
-    systemd_cgroup_path(cgroup).is_some_and(|path| {
-        let mut segments = path.rsplit('/').filter(|segment| !segment.is_empty());
-        matches!(
-            (segments.next(), segments.next()),
-            (Some("init.scope"), Some(manager))
-                if manager.starts_with("user@") && manager.ends_with(".service")
-        )
-    })
-}
-
 /// True when a `/proc/<pid>/status` text shows the pid as a container
 /// init: an `NSpid:` line whose innermost (last) value is 1 while the
 /// outermost is not (the observer's own pid 1 is caught by number).
@@ -600,7 +534,7 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
     let caller_unit = || {
         source
             .cgroup_text(caller_pid)
-            .and_then(|cgroup| parse_systemd_unit(&cgroup))
+            .and_then(|cgroup| crate::caller_metadata::systemd_unit_from_cgroup_text(&cgroup))
     };
     let init_parent = || CapturedLauncherChain {
         ancestors: Vec::new(),
@@ -680,7 +614,7 @@ pub(crate) fn capture_launcher_chain<Source: ProcessSource>(
         // long-lived, so a classification race is negligible.
         let is_user_manager = source
             .cgroup_text(ppid)
-            .is_some_and(|cgroup| is_user_manager_cgroup(&cgroup));
+            .is_some_and(|cgroup| crate::caller_metadata::is_user_manager_cgroup_text(&cgroup));
         if is_user_manager || source.is_container_init(ppid) {
             if ancestors.is_empty() {
                 return init_parent();
@@ -8351,98 +8285,6 @@ pub(crate) mod tests {
         let collapsed = collapse_launcher_chain(&chain);
         assert_eq!(collapsed.len(), 2);
         assert_eq!((collapsed[0].1, collapsed[1].1), (0, 0));
-    }
-
-    #[test]
-    fn launcher_systemd_unit_parses_v2_v1_and_user_manager() {
-        assert_eq!(
-            parse_systemd_unit("0::/system.slice/backup.service\n").as_deref(),
-            Some("backup.service")
-        );
-        assert_eq!(
-            parse_systemd_unit(
-                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
-            )
-            .as_deref(),
-            Some("app-gated.scope")
-        );
-        // cgroup v1: the systemd controller line carries the path.
-        assert_eq!(
-            parse_systemd_unit("11:memory:/system.slice/backup.service\n1:name=systemd:/system.slice/backup.service\n").as_deref(),
-            Some("backup.service")
-        );
-        // The user manager itself lives under init.scope.
-        assert!(
-            is_user_manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service/init.scope\n"),
-            "user@<uid>.service/init.scope is the user manager"
-        );
-        assert!(!is_user_manager_cgroup("0::/system.slice/backup.service\n"));
-        assert!(!is_user_manager_cgroup(
-            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
-        ));
-        // No unit when the path carries none.
-        assert_eq!(parse_systemd_unit("0::/\n").as_deref(), None);
-        assert_eq!(parse_systemd_unit("").as_deref(), None);
-    }
-
-    #[test]
-    fn launcher_systemd_unit_follows_the_first_component_rule() {
-        // systemd `cg_path_get_unit`: skip leading slices and take the
-        // first component — never the leafmost — with `_` unescaping,
-        // ` (deleted)` truncation and no v1 fallback.
-        assert_eq!(
-            parse_systemd_unit("0::/docker-abc.scope/backup.service\n").as_deref(),
-            Some("docker-abc.scope")
-        );
-        assert_eq!(parse_systemd_unit("0::/user.slice\n").as_deref(), None);
-        assert_eq!(
-            parse_systemd_unit("0::/system.slice/foo.service (deleted)\n").as_deref(),
-            Some("foo.service")
-        );
-        assert_eq!(
-            parse_systemd_unit("0::/system.slice/_foo.service\n").as_deref(),
-            Some("foo.service")
-        );
-        // The `0:` line alone carries the path; a v1-only file has no unit.
-        assert_eq!(
-            parse_systemd_unit(
-                "11:memory:/system.slice/backup.service\n1:name=systemd:/system.slice/backup.service\n"
-            )
-            .as_deref(),
-            None
-        );
-        // Outside the cgroup namespace: refused, never parsed.
-        assert_eq!(
-            parse_systemd_unit("0::/../system.slice/evil.service\n").as_deref(),
-            None
-        );
-    }
-
-    #[test]
-    fn launcher_systemd_unit_inside_user_manager_uses_the_user_unit() {
-        // Inside a user@<uid>.service subtree the unit is the first
-        // unit after the user manager (the `sd_pid_get_user_unit`
-        // rule), so a delegated leaf cannot rename the caller.
-        assert_eq!(
-            parse_systemd_unit(
-                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/evil.service/backup.service\n"
-            )
-            .as_deref(),
-            Some("evil.service")
-        );
-        // Nothing after the user manager: no user unit.
-        assert_eq!(
-            parse_systemd_unit("0::/user.slice/user-1000.slice/user@1000.service\n").as_deref(),
-            None
-        );
-        // The existing app-scope shape keeps working through the user rule.
-        assert_eq!(
-            parse_systemd_unit(
-                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
-            )
-            .as_deref(),
-            Some("app-gated.scope")
-        );
     }
 
     #[test]

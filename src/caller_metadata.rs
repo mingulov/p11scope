@@ -257,6 +257,132 @@ fn validate_escapes(component: &[u8]) -> Result<(), ParseReason> {
     Ok(())
 }
 
+/// Unit suffixes `cg_path_get_unit` accepts. `.slice` names the
+/// skipped leading slices and is never a unit itself.
+const SYSTEMD_UNIT_SUFFIXES: &[&str] = &[
+    ".service",
+    ".scope",
+    ".socket",
+    ".timer",
+    ".target",
+    ".path",
+    ".mount",
+    ".automount",
+    ".swap",
+    ".device",
+];
+
+/// The unified (`0:`) cgroup path in a `/proc/<pid>/cgroup` text, with
+/// systemd's `cg_pid_get_path` rules: the `0:` line alone (no v1
+/// fallback), a ` (deleted)` suffix truncated (a zombie), and a `/../`
+/// prefix refused (outside the cgroup namespace). Over-long input is
+/// refused under the shared bound; anything else fails closed to no
+/// path.
+fn unified_cgroup_path(cgroup: &str) -> Option<&str> {
+    if cgroup.len() > MAX_CGROUP_BYTES {
+        return None;
+    }
+    for line in cgroup.lines() {
+        let Some(remainder) = line.strip_prefix("0:") else {
+            continue;
+        };
+        let Some((_, path)) = remainder.split_once(':') else {
+            continue;
+        };
+        let path = path.strip_suffix(" (deleted)").unwrap_or(path);
+        if path.starts_with("/../") {
+            return None;
+        }
+        return Some(path);
+    }
+    None
+}
+
+/// systemd `cg_unescape`: a single leading `_` escapes
+/// kernel-conflicting names; strip one, never more.
+fn cg_unescape(name: &str) -> &str {
+    name.strip_prefix('_').unwrap_or(name)
+}
+
+/// Whether an unescaped component is a slice the unit walk skips: a
+/// non-empty control-free prefix with the `.slice` suffix.
+fn is_slice_name(name: &str) -> bool {
+    const SUFFIX: &str = ".slice";
+    name.len() > SUFFIX.len()
+        && name.ends_with(SUFFIX)
+        && !name[..name.len() - SUFFIX.len()]
+            .chars()
+            .any(char::is_control)
+}
+
+/// Whether an unescaped component is a unit `cg_path_get_unit`
+/// returns: a known non-slice suffix with a non-empty control-free
+/// prefix.
+fn is_unit_name(name: &str) -> bool {
+    SYSTEMD_UNIT_SUFFIXES.iter().any(|suffix| {
+        name.len() > suffix.len()
+            && name.ends_with(suffix)
+            && !name[..name.len() - suffix.len()]
+                .chars()
+                .any(char::is_control)
+    })
+}
+
+/// systemd `cg_path_get_unit` over `validate_path` components: skip
+/// leading slices, return the first unit. A first non-slice component
+/// that is no valid unit ends the walk with nothing — deeper names
+/// (which a delegated subtree owner can choose) never qualify.
+/// Non-UTF-8 components fail closed to no unit.
+fn unit_from_components(components: &[&[u8]]) -> Option<String> {
+    for component in components {
+        let name = cg_unescape(std::str::from_utf8(component).ok()?);
+        if is_slice_name(name) {
+            continue;
+        }
+        return is_unit_name(name).then(|| name.to_string());
+    }
+    None
+}
+
+/// Whether a raw component (never unescaped, per systemd) names a user
+/// manager service: `user@<uid>.service` with a numeric uid.
+fn is_user_manager_service(component: &[u8]) -> bool {
+    component
+        .strip_prefix(b"user@")
+        .and_then(|rest| rest.strip_suffix(b".service"))
+        .is_some_and(|uid| !uid.is_empty() && uid.iter().all(u8::is_ascii_digit))
+}
+
+/// The systemd unit for a `/proc/<pid>/cgroup` text, the way
+/// `sd_pid_get_unit` derives it without a libsystemd link: the `0:`
+/// line's path over `validate_path` components, leading slices
+/// skipped, first unit taken. Inside a `user@<uid>.service` subtree
+/// the `sd_pid_get_user_unit` rule applies instead: the first unit
+/// after the user manager, or nothing. Only the unit name is kept —
+/// full paths are never retained or published.
+pub(crate) fn systemd_unit_from_cgroup_text(cgroup: &str) -> Option<String> {
+    let path = unified_cgroup_path(cgroup)?;
+    let components = validate_path(path.as_bytes()).ok()?;
+    if let Some(at) = components.iter().position(|c| is_user_manager_service(c)) {
+        return unit_from_components(&components[at + 1..]);
+    }
+    unit_from_components(&components)
+}
+
+/// Whether a `/proc/<pid>/cgroup` text places the pid in the systemd
+/// user manager itself: the `0:` path ends in
+/// `user@<uid>.service/init.scope`.
+pub(crate) fn is_user_manager_cgroup_text(cgroup: &str) -> bool {
+    let Some(path) = unified_cgroup_path(cgroup) else {
+        return false;
+    };
+    let Ok(components) = validate_path(path.as_bytes()) else {
+        return false;
+    };
+    matches!(components.as_slice(), [.., manager, scope]
+        if is_user_manager_service(manager) && *scope == b"init.scope")
+}
+
 #[derive(Clone, Copy)]
 struct ContainerCandidate {
     hint: ContainerHint,
@@ -1043,6 +1169,102 @@ mod tests {
         assert!(
             refused > 0 && accepted > 0,
             "both outcomes must occur (refused {refused}, accepted {accepted})"
+        );
+    }
+
+    #[test]
+    fn launcher_systemd_unit_parses_v2_and_user_manager() {
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/backup.service\n").as_deref(),
+            Some("backup.service")
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
+            )
+            .as_deref(),
+            Some("app-gated.scope")
+        );
+        // The `0:` line alone carries the path: a v1-only file has no unit.
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "11:memory:/system.slice/backup.service\n1:name=systemd:/system.slice/backup.service\n"
+            )
+            .as_deref(),
+            None
+        );
+        // The user manager itself lives under init.scope.
+        assert!(
+            is_user_manager_cgroup_text(
+                "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n"
+            ),
+            "user@<uid>.service/init.scope is the user manager"
+        );
+        assert!(!is_user_manager_cgroup_text(
+            "0::/user.slice/user-1000.slice/user@notauid.service/init.scope\n"
+        ));
+        assert!(!is_user_manager_cgroup_text("0::/system.slice/backup.service\n"));
+        assert!(!is_user_manager_cgroup_text(
+            "0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"
+        ));
+        // No unit when the path carries none.
+        assert_eq!(systemd_unit_from_cgroup_text("0::/\n").as_deref(), None);
+        assert_eq!(systemd_unit_from_cgroup_text("").as_deref(), None);
+    }
+
+    #[test]
+    fn launcher_systemd_unit_follows_the_first_component_rule() {
+        // systemd `cg_path_get_unit`: skip leading slices and take the
+        // first component — never the leafmost — with `_` unescaping,
+        // ` (deleted)` truncation and no v1 fallback.
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/docker-abc.scope/backup.service\n").as_deref(),
+            Some("docker-abc.scope")
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/user.slice\n").as_deref(),
+            None
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/foo.service (deleted)\n").as_deref(),
+            Some("foo.service")
+        );
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/system.slice/_foo.service\n").as_deref(),
+            Some("foo.service")
+        );
+        // Outside the cgroup namespace: refused, never parsed.
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/../system.slice/evil.service\n").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn launcher_systemd_unit_inside_user_manager_uses_the_user_unit() {
+        // Inside a user@<uid>.service subtree the unit is the first
+        // unit after the user manager (the `sd_pid_get_user_unit`
+        // rule), so a delegated leaf cannot rename the caller.
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/evil.service/backup.service\n"
+            )
+            .as_deref(),
+            Some("evil.service")
+        );
+        // Nothing after the user manager: no user unit.
+        assert_eq!(
+            systemd_unit_from_cgroup_text("0::/user.slice/user-1000.slice/user@1000.service\n")
+                .as_deref(),
+            None
+        );
+        // The existing app-scope shape keeps working through the user rule.
+        assert_eq!(
+            systemd_unit_from_cgroup_text(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
+            )
+            .as_deref(),
+            Some("app-gated.scope")
         );
     }
 }

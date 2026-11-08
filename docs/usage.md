@@ -152,7 +152,7 @@ window. It is never proof of what the application *cannot* do — see
 
 ## Installing system packages
 
-The v0.7.0 release provides `p11scope_0.7.0_amd64.deb` (Debian/Ubuntu) and
+The v0.7.0 release will provide `p11scope_0.7.0_amd64.deb` (Debian/Ubuntu) and
 `p11scope-0.7.0-1.x86_64.rpm` (Fedora/RHEL) alongside the tarballs. The 0.7.0
 packages appear under the release tag when the release is published. Each
 installs the same static observer plus the glibc discovery helper to

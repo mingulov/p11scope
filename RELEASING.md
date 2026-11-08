@@ -411,8 +411,8 @@ locked dependency graph, including the statically linked Rust crates and musl
 libc. Retain license texts in the bundle even though the source export also
 contains them. The package directory also contains the versioned source
 archive, top-level `RELEASE.json` and `SHA256SUMS` (which covers the four
-archives plus `RELEASE.json`); those metadata files accompany the four
-archives on GitHub.
+archives, the `.deb`, the `.rpm` and `RELEASE.json`); those metadata
+files accompany the archives and packages on GitHub.
 
 Use `cargo-about` 0.9.2 and the official musl 1.2.5 source archive (the Rust 1.99.1 static target
 builds patched musl 1.2.5; the Alpine helper links musl 1.2.5-r13). Both pins
@@ -453,8 +453,8 @@ export. A separately assembled full offline export is documented in
 [docs/build-offline.md](docs/build-offline.md). GitHub's automatic source
 archive lacks even the two embedded Aya archives.
 
-Verify `SHA256SUMS` against the four versioned `.tar.gz` assets and top-level
-`RELEASE.json`:
+Verify `SHA256SUMS` against the four versioned `.tar.gz` assets, the `.deb`,
+the `.rpm` and top-level `RELEASE.json`:
 
 ```sh
 (cd /var/tmp/p11scope-release/v0.5.0-public-assets && sha256sum --check SHA256SUMS)

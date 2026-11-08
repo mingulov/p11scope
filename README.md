@@ -39,7 +39,7 @@ sudo p11scope doctor
 with no interim output; that is normal.)
 
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
-Container: the 0.7.0 release publishes `ghcr.io/mingulov/p11scope:0.7.0`;
+Container: once 0.7.0 ships, the release will publish `ghcr.io/mingulov/p11scope:0.7.0`;
 the tag appears when the release is published. Run `doctor` through it ([privileges](deploy/k8s/README.md)):
 
 ```sh
@@ -78,7 +78,9 @@ Text is concise by default; `-v` shows full detail and `--json` is always comple
 
 - Linux x86-64 with BTF (`/sys/kernel/btf/vmlinux`).
 - Kernel 6.6+ (or a working backport) for full live-capture support.
-- Root, or the [documented capabilities](docs/usage.md#privileges-per-environment) (`CAP_BPF`+`CAP_PERFMON` at `perf_event_paranoid` below 3, else `CAP_SYS_ADMIN`).
+- Root, or the [documented minimal capability set](docs/usage.md#run-without-sudo) (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`, `CAP_DAC_READ_SEARCH`, `CAP_PERFMON`, `CAP_SYS_PTRACE`; no `CAP_SYS_ADMIN` on the default lane).
+
+p11scope sends no telemetry and makes no network connections.
 
 ## Documentation
 

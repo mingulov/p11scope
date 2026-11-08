@@ -691,7 +691,7 @@ const RUN_HELP: &str = "usage:
 example:
   sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L  # Debian/Ubuntu
   sudo p11scope run --pause auto -- pkcs11-tool --module /usr/lib64/pkcs11/libsofthsm2.so -L  # Fedora/RHEL
-  sudo p11scope run --user alice -- pkcs11-tool --module ... -L
+  sudo p11scope run --pause auto --user alice -- pkcs11-tool --module ... -L
 
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
@@ -716,7 +716,7 @@ start (a provider loaded after start needs --prearm-module <provider.so>; with r
 required). The detail is the function's own counter values between selection and close; an exec of the owned child in between withholds it with a named reason
 while a leader exit that is the last lifecycle record ends the window cleanly.
 The selection attempt is recorded in the report; aggregate and detail counts are never summed.
---pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load.
+--pause never (default) does not pause the child; auto pauses only when it would load unobserved; always pauses on every load. The default becomes auto in a later release, so spelling out --pause auto keeps the command working either way.
 --kill-on-timeout ends the child when --duration expires instead of leaving it running.
 --track-short-lived also records exec-time detail (extra detail; default off): the kernel records exec-time
 executable identity and the child's own execs are grouped by linkage.

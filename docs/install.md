@@ -5,13 +5,13 @@ p11scope v0.4.0 was an [intermediate source tag](https://github.com/mingulov/p11
 with no binary bundles. v0.5.0 was published on 2026-10-29
 ([release tag](https://github.com/mingulov/p11scope/releases/tag/v0.5.0)).
 The [v0.6.0 release](https://github.com/mingulov/p11scope/releases/tag/v0.6.0)
-provides the bundle set below, and the v0.7.0 release provides the same set:
+provides the bundle set below, and the v0.7.0 release will provide the same set:
 a static x86-64 Linux observer bundle, optional glibc and musl discovery
 helper bundles, DEB and RPM system packages, and a source export. The examples below install **v0.7.0**;
 the 0.7.0 files appear on the
 [Releases page](https://github.com/mingulov/p11scope/releases) when the release
 is published. Download `SHA256SUMS` with the bundle you
-choose. The release also provides `RELEASE.json` with curated provenance;
+choose. The release will also provide `RELEASE.json` with curated provenance;
 each bundle contains its license notices and a copy of that record.
 Every release file carries a GitHub build-provenance attestation.
 Older bundles remain under their release tags. To build current source
@@ -85,12 +85,39 @@ The observer needs Linux x86-64 and the kernel and privilege requirements
 below. The helper needs the matching provider ABI and libc; a 32-bit provider
 requires a separately built 32-bit helper.
 
-The v0.7.0 release also includes `p11scope-0.7.0-source.tar.gz`. It contains the
+The v0.7.0 release will also include `p11scope-0.7.0-source.tar.gz`. It will contain the
 committed source and the two pinned Aya archives needed to reconstruct the
 local patches. Building it still needs network access for the remaining
 locked Cargo dependencies, plus the Rust/BPF and host build tools described
 above. The [offline build guide](build-offline.md) describes an optional
 full export assembled separately.
+
+### Uninstall
+
+The packages install only files (no services, set-id bits or file
+capabilities), so removing the package leaves nothing behind:
+
+```sh
+sudo apt remove p11scope  # DEB (Debian/Ubuntu)
+sudo dnf remove p11scope  # RPM (Fedora/RHEL)
+```
+
+A tarball install is the files you copied (`p11scope-discover` only if you
+installed the helper); file capabilities live on the binary and vanish
+with it:
+
+```sh
+sudo rm -f /usr/local/bin/p11scope /usr/local/bin/p11scope-discover
+```
+
+Remove a pulled observer image with:
+
+```sh
+docker rmi ghcr.io/mingulov/p11scope:0.7.0
+```
+
+The observer keeps no configuration or state files. Delete any `-o`
+reports and `--event-log` files you wrote yourself.
 
 ### Build locally from source
 
@@ -151,21 +178,20 @@ does not launch it automatically. Never give it capabilities or a set-id bit.
 
 **Kernel and privileges.** Live capture requires a Multi-capable Linux x86-64
 host (normally 6.6+ or a working backport), BTF (`/sys/kernel/btf/vmlinux`) and
-root or appropriate capabilities. General host eligibility is separate from
-the safe scoped attachment backend. With multi active,
-`CAP_BPF`+`CAP_PERFMON` suffice for the static probes of an unconfined
-`--pid` target (measured 136/136 at `perf_event_paranoid=4`); full capture
-at paranoid ≥ 3 (live discovery, uretprobe self-probe) needs `CAP_SYS_ADMIN`,
-and on the per-probe `perf_event` path a restrictive paranoid needs
-`CAP_SYS_ADMIN` too
-([roles and measured matrix](usage.md#privileges-per-environment)). A broad
-compatibility set is shown below. This is not a minimal set: `CAP_SYS_ADMIN`
-already covers the BPF/perf permission checks.
+root or the minimal capability set below: five file capabilities, no
+`CAP_SYS_ADMIN` at any `perf_event_paranoid` on the default lane (measured at
+paranoid 3 and 4; `CAP_BPF`+`CAP_PERFMON` alone cover only the static probes of
+an unconfined `--pid` target, and only an explicit `--attach-backend singles`
+fallback still needs `CAP_SYS_ADMIN` on restrictive hosts —
+[roles and measured matrix](usage.md#privileges-per-environment)):
 
 ```sh
-sudo setcap 'cap_sys_admin,cap_bpf,cap_perfmon,cap_sys_ptrace,cap_dac_read_search+ep' \
+sudo setcap 'cap_bpf,cap_checkpoint_restore,cap_dac_read_search,cap_perfmon,cap_sys_ptrace=ep' \
   /usr/local/bin/p11scope
 ```
+
+[Run without sudo](usage.md#run-without-sudo) adds the group hardening, the
+service unit, and the re-grant-after-upgrade rule.
 
 Anyone who can execute a capability-carrying observer can observe other
 users' processes, so restrict who may execute it (for example, a dedicated

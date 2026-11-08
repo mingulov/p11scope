@@ -60,8 +60,8 @@ which approves the widened read/retention contract below,
 and [offline CBOM export re-projection](#offline-cbom-export-re-projection-v070),
 which describes the implemented offline report and grants no capture authority,
 and [app identity hints](#app-identity-hints-owner-ruling-2026-11-08),
-which describes its development implementation pending privacy review and
-installed qualification,
+whose status is privacy review accepted 2026-11-08; owner
+approval/installed qualification pending,
 and [copy-up layer publication](#copy-up-layer-publication-f11-2026-11-07),
 which attributes a witness-proven pre-copy-up lower file as its own
 module row with the finite `pre_copy_up` marker,
@@ -1960,9 +1960,9 @@ fabricated or otherwise untrusted saved input.
 
 ## App identity hints (owner ruling 2026-11-08)
 
-**Status: development implementation on this branch; pending Opus privacy
-review, owner approval, and installed qualification (v0.7.0 if approved by
-2026-11-09 03:00, else v0.7.1).** Owner ruling recorded in
+**Status: privacy review accepted 2026-11-08; owner approval/installed
+qualification pending (v0.7.0 if approved by 2026-11-09 03:00, else
+v0.7.1).** Owner ruling recorded in
 `docs/superpowers/decisions/2026-11-06-schedule-dl10.md`, as corrected the
 same day: runtime basenames (`python3`, `java`, `node`, `perl`, `ruby`) do
 not tell the operator who called; a narrow app-identity extension is

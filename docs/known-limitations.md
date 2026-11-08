@@ -631,12 +631,6 @@ scanned` gap together with ambient churn, not in the per-caller
 gaps above. Per-caller attribution below the discovery floor needs
 exit-time identity the observer does not retain by default.
 
-In containers, a process that loaded a provider before the file was
-copied up is attributed to the copied-up file and its later calls are
-missed, with no marker in the output; restarting such processes is the
-workaround, and the kernel identity backend does not help (full entry
-below).
-
 Identity checks through the userspace backend need extra per-file checks on
 btrfs to identify mapped providers correctly. This affects
 `inventory --system --identity-backend userspace` and the userspace fallback

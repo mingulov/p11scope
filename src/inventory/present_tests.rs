@@ -3419,6 +3419,46 @@ fn concise_inventory_points_short_lived_misses_to_run() {
     );
 }
 
+/// Concise gap lines keep path tails and short names whole: distinct
+/// files must not collapse to one identical truncated prefix.
+#[test]
+fn concise_gap_lines_keep_path_tails_and_short_subjects_whole() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for path in [
+        "/usr/lib/x86_64-linux-gnu/libc.so.6",
+        "/usr/lib/x86_64-linux-gnu/libm.so.6",
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: (*path).into(),
+            reason: "opening object within retained target root: No such file or directory".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    presentation.gaps.push(GapView {
+        caller: None,
+        module: None,
+        pid: None,
+        subject: "native endpoint attach failed".into(),
+        reason: "native deficit detail line one with enough words to force truncation now".into(),
+        budget: None,
+        repeats: 1,
+    });
+    let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(out.contains("libc.so.6"), "libc basename visible: {out}");
+    assert!(out.contains("libm.so.6"), "libm basename visible: {out}");
+    assert!(
+        out.contains("native endpoint attach failed"),
+        "short subject kept whole: {out}"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

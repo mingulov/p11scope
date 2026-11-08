@@ -660,9 +660,27 @@ fn launcher_chain_collapses_wrappers_and_shows_init_parent_units() {
     let mut presentation = capture_for(&harness, &harness.render());
     presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/pkcs11-tool".into());
     presentation.callers[0].launched_by = vec![
-        LauncherAncestor { pid: 900, start_time: Some(90), exe: Some("sh".into()), label: None, exe_unreadable: false },
-        LauncherAncestor { pid: 890, start_time: Some(89), exe: Some("sh".into()), label: None, exe_unreadable: false },
-        LauncherAncestor { pid: 800, start_time: Some(80), exe: Some("cron".into()), label: None, exe_unreadable: false },
+        LauncherAncestor {
+            pid: 900,
+            start_time: Some(90),
+            exe: Some("sh".into()),
+            label: None,
+            exe_unreadable: false,
+        },
+        LauncherAncestor {
+            pid: 890,
+            start_time: Some(89),
+            exe: Some("sh".into()),
+            label: None,
+            exe_unreadable: false,
+        },
+        LauncherAncestor {
+            pid: 800,
+            start_time: Some(80),
+            exe: Some("cron".into()),
+            label: None,
+            exe_unreadable: false,
+        },
     ];
     presentation.callers[0].launcher_gap = None;
     presentation.callers[0].launched_by_origin = LauncherOrigin::Chain;
@@ -706,8 +724,8 @@ fn launcher_chain_collapses_wrappers_and_shows_init_parent_units() {
 #[test]
 fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
     use crate::discovery::caller_registry::{
-        LAUNCHER_GAP_EXE_UNREADABLE, LAUNCHER_GAP_EXITED, LAUNCHER_GAP_SUBJECT,
-        LauncherAncestor, LauncherGap, LauncherOrigin,
+        LAUNCHER_GAP_EXE_UNREADABLE, LAUNCHER_GAP_EXITED, LAUNCHER_GAP_SUBJECT, LauncherAncestor,
+        LauncherGap, LauncherOrigin,
     };
     let harness = varied_harness();
     let mut presentation = capture_for(&harness, &harness.render());
@@ -753,14 +771,23 @@ fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
     assert_eq!(caller_origin_suffix(&presentation, gap_only), None);
     let out = crate::inventory::render_json_from_presentation(&presentation);
     let rows = out["callers"].as_array().unwrap();
-    let prow = rows.iter().find(|row| row["id"] == partial.label()).unwrap();
-    assert_eq!(prow["launched_by"][0]["exe_gap"], LAUNCHER_GAP_EXE_UNREADABLE);
+    let prow = rows
+        .iter()
+        .find(|row| row["id"] == partial.label())
+        .unwrap();
+    assert_eq!(
+        prow["launched_by"][0]["exe_gap"],
+        LAUNCHER_GAP_EXE_UNREADABLE
+    );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
     assert!(
         verbose.contains("  pkcs11-tool <- pid 900 <- ? (launcher exited before read)\n"),
         "{verbose}"
     );
-    assert!(!verbose.contains("other <- "), "init_parent without a unit shows no chain: {verbose}");
+    assert!(
+        !verbose.contains("other <- "),
+        "init_parent without a unit shows no chain: {verbose}"
+    );
     assert!(
         !verbose.contains("launcher chain unknown"),
         "gap-only detail stays in JSON: {verbose}"

@@ -1375,7 +1375,9 @@ pub(crate) fn scripted_promotion_view_with_baseline_for_test(
     cookie: u64,
     exec_id: u64,
 ) -> std::sync::Arc<super::PromotionView> {
-    use crate::discovery::caller_registry::{CallerId, CallerLifecycle, ImageAuthority};
+    use crate::discovery::caller_registry::{
+        CallerId, CallerLifecycle, ImageAuthority, LauncherOrigin,
+    };
     let mut presentation = (**scripted_promotion_view_for_test().presentation()).clone();
     presentation
         .callers
@@ -1388,6 +1390,8 @@ pub(crate) fn scripted_promotion_view_with_baseline_for_test(
             app_hint: None,
             launched_by: Vec::new(),
             launcher_gap: None,
+            launched_by_origin: LauncherOrigin::Chain,
+            launched_by_unit: None,
             exec_observed: true,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

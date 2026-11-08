@@ -2687,8 +2687,8 @@ fn canary_capture() -> crate::render::CaptureMeta<'static> {
 /// prove the fact on representative bytes.
 fn canary_presentation() -> crate::inventory_present::Presentation {
     use crate::discovery::caller_registry::{
-        AdmissionState, CallerId, CallerLifecycle, ExeIdentity, ImageAuthority, MappingEvidence,
-        MappingState, ModuleId, ModuleLifecycle, UseCoverage,
+        AdmissionState, CallerId, CallerLifecycle, ExeIdentity, ImageAuthority, LauncherOrigin,
+        MappingEvidence, MappingState, ModuleId, ModuleLifecycle, UseCoverage,
     };
     use crate::inventory_present::{
         Activity, BudgetView, CallerView, Capture, EdgeSemanticsView, EdgeView, GapView,
@@ -2736,6 +2736,8 @@ fn canary_presentation() -> crate::inventory_present::Presentation {
             app_hint: None,
             launched_by: Vec::new(),
             launcher_gap: None,
+            launched_by_origin: LauncherOrigin::Chain,
+            launched_by_unit: None,
             exec_observed: false,
             authority: ImageAuthority::ScanPinned,
             lifecycle: CallerLifecycle::Mapped,

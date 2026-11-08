@@ -5,6 +5,7 @@
 use super::*;
 use crate::attach::capture::{CaptureHealth, CapturePhase, ScopeCustody};
 use crate::discovery::caller_registry::CallerLifecycle;
+use crate::discovery::caller_registry::LauncherOrigin;
 use crate::discovery::inventory_attach_set::{AttachObjectId, EndpointId};
 use p11scope_ebpf_common::{DiscoveryRecord, ImageIdentity};
 use std::collections::HashMap;
@@ -320,6 +321,8 @@ fn metadata_record(
         app_hint: None,
         launched_by: Vec::new(),
         launcher_gap: None,
+        launched_by_origin: LauncherOrigin::Chain,
+        launched_by_unit: None,
         exec_observed: false,
         authority: ImageAuthority::ScanPinned,
         lifecycle: CallerLifecycle::Mapped,

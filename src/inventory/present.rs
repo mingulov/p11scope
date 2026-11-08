@@ -25,9 +25,9 @@ use crate::discovery::caller_registry::instance_input::{InstanceLifecycle, Regis
 use crate::discovery::caller_registry::{
     AdmissionChange, AdmissionState, BudgetRefusal, CallerId, CallerLifecycle, CallerRecord,
     CallerRegistry, ExeIdentity, ExeResolution, ImageAuthority, JointPublicationPending,
-    LauncherAncestor, LauncherGap, MappingState, ModuleId, ModuleLifecycle, ModuleRecord,
-    NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnboundPid, UnknownReason, UseCoverage,
-    module_init,
+    LauncherAncestor, LauncherGap, LauncherOrigin, MappingState, ModuleId, ModuleLifecycle,
+    ModuleRecord, NO_MAPPING_EDGE, ProcessSource, SEMANTIC_UNKNOWN, UnboundPid,
+    UnknownReason, UseCoverage, collapse_launcher_chain, module_init,
 };
 use crate::discovery::engine::inventory_coordinator::semantics::InventoryReloadDisclosure;
 use crate::discovery::engine::inventory_coordinator::{InventoryCoordinator, PrearmReportRow};
@@ -253,6 +253,8 @@ pub(crate) struct CallerView {
     pub app_hint: Option<crate::app_hint::AppHint>,
     pub launched_by: Vec<LauncherAncestor>,
     pub launcher_gap: Option<LauncherGap>,
+    pub launched_by_origin: LauncherOrigin,
+    pub launched_by_unit: Option<String>,
     pub exec_observed: bool,
     pub authority: ImageAuthority,
     pub lifecycle: CallerLifecycle,
@@ -766,6 +768,8 @@ impl Presentation {
                 app_hint: record.app_hint.clone(),
                 launched_by: record.launched_by.clone(),
                 launcher_gap: record.launcher_gap.clone(),
+                launched_by_origin: record.launched_by_origin,
+                launched_by_unit: record.launched_by_unit.clone(),
                 exec_observed: record.exec_observed,
                 authority: record.authority,
                 lifecycle: record.lifecycle,
@@ -1453,16 +1457,33 @@ fn launcher_link_name(ancestor: &LauncherAncestor) -> String {
         .unwrap_or_else(|| format!("pid {}", ancestor.pid))
 }
 
-/// The `-v` launcher chain for one caller (`app <- parent <- ...`), or
-/// `None` when no ancestors were captured. A partial chain keeps the
-/// ancestors read plus the named gap; gap-only detail stays in JSON.
+/// The `-v` launcher chain for one caller (`app <- parent <- ...`,
+/// repeated identical wrappers collapsed as `sh (×2)`), or `None` when
+/// no ancestors were captured and no unit applies. A partial chain
+/// keeps the ancestors read plus the named gap; an init-only parent
+/// with a unit renders `app (from unit)`; gap-only detail stays in JSON.
 pub(crate) fn launcher_chain_text(presentation: &Presentation, caller: CallerId) -> Option<String> {
     let record = retained_caller(presentation, caller)?;
     if record.launched_by.is_empty() {
+        if record.launched_by_origin == LauncherOrigin::InitParent
+            && let Some(unit) = record.launched_by_unit.as_deref()
+        {
+            return Some(format!(
+                "{} (from {})",
+                application_label(presentation, caller),
+                escape_controls(unit)
+            ));
+        }
         return None;
     }
     let mut parts = vec![application_label(presentation, caller)];
-    parts.extend(record.launched_by.iter().map(launcher_link_name));
+    for (ancestor, folded) in collapse_launcher_chain(&record.launched_by) {
+        let mut link = launcher_link_name(&ancestor);
+        if folded > 0 {
+            link.push_str(&format!(" (×{})", folded + 1));
+        }
+        parts.push(link);
+    }
     let mut text = parts.join(" <- ");
     if let Some(gap) = record.launcher_gap.as_ref() {
         text.push_str(&format!(" <- ? ({})", escape_controls(&gap.reason)));
@@ -1470,19 +1491,25 @@ pub(crate) fn launcher_chain_text(presentation: &Presentation, caller: CallerId)
     Some(text)
 }
 
-/// The concise one-hop suffix (` (from cron)`), or `None` when the caller
-/// has no recorded parent or the parent is the init root (pid 1). One
-/// helper so the app-identity lane merges its label here.
+/// The concise one-hop suffix (` (from cron)`, or ` (from unit)` for an
+/// init-only parent with a systemd unit), or `None` when the caller has
+/// no recorded parent and no unit. Capture already filters init, the
+/// user manager and container inits, so any recorded first link is
+/// meaningful. One helper so the app-identity lane merges its label here.
 pub(crate) fn caller_origin_suffix(
     presentation: &Presentation,
     caller: CallerId,
 ) -> Option<String> {
     let record = retained_caller(presentation, caller)?;
-    let parent = record.launched_by.first()?;
-    if parent.pid == 1 {
-        return None;
+    if let Some(parent) = record.launched_by.first() {
+        return Some(format!(" (from {})", launcher_link_name(parent)));
     }
-    Some(format!(" (from {})", launcher_link_name(parent)))
+    if record.launched_by_origin == LauncherOrigin::InitParent
+        && let Some(unit) = record.launched_by_unit.as_deref()
+    {
+        return Some(format!(" (from {})", escape_controls(unit)));
+    }
+    None
 }
 
 /// One operation category's terminal counts across the proved and

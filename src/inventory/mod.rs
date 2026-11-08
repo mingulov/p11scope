@@ -15,8 +15,8 @@ use crate::attach::Scope;
 use crate::capacity::{InventoryBudget, inventory_endpoint_budget};
 use crate::cli::{CaptureMode, InspectScope};
 use crate::discovery::caller_registry::{
-    CallerEvent, ImageAuthority, ModuleId, OsProcessSource, ProcessSource, RegistryLimits,
-    UseCoverage, now_ns,
+    CallerEvent, ImageAuthority, LAUNCHER_GAP_EXE_UNREADABLE, ModuleId, OsProcessSource,
+    ProcessSource, RegistryLimits, UseCoverage, collapse_launcher_chain, now_ns,
 };
 #[cfg(test)]
 use crate::discovery::caller_registry::{CallerId, MappingState, ModuleKey};
@@ -8697,10 +8697,9 @@ fn caller_json(
             "path": exe.path,
         })
     });
-    let launched_by: Vec<serde_json::Value> = record
-        .launched_by
+    let launched_by: Vec<serde_json::Value> = collapse_launcher_chain(&record.launched_by)
         .iter()
-        .map(|ancestor| {
+        .map(|(ancestor, folded)| {
             let mut item = serde_json::json!({
                 "pid": ancestor.pid,
                 "start_time": ancestor.start_time,
@@ -8708,6 +8707,12 @@ fn caller_json(
             });
             if let Some(label) = ancestor.label.as_deref() {
                 item["label"] = serde_json::Value::from(label);
+            }
+            if ancestor.exe_unreadable {
+                item["exe_gap"] = serde_json::Value::from(LAUNCHER_GAP_EXE_UNREADABLE);
+            }
+            if *folded > 0 {
+                item["folded"] = serde_json::Value::from(*folded);
             }
             item
         })
@@ -8726,6 +8731,8 @@ fn caller_json(
         "incarnation": record.incarnation,
         "launched_by": launched_by,
         "launched_by_gap": launched_by_gap,
+        "launched_by_origin": record.launched_by_origin.label(),
+        "launched_by_unit": record.launched_by_unit,
         "image": {
             "authority": record.authority.label(),
             "task_cookie": task_cookie,

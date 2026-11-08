@@ -3459,6 +3459,45 @@ fn concise_gap_lines_keep_path_tails_and_short_subjects_whole() {
     );
 }
 
+/// Exited-process races on present system files read as the race,
+/// not as a missing library: calm plain words in both modes, with
+/// verbose keeping the machine error beside them.
+#[test]
+fn gap_reason_words_exited_process_races_calmly() {
+    let harness = varied_harness();
+    let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
+    presentation.gaps.clear();
+    presentation.gaps_suppressed = 0;
+    for reason in [
+        "opening object within retained target root: No such file or directory (os error 2)",
+        "opening object within retained target root: No such process (os error 3)",
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: None,
+            subject: "/usr/lib64/libc.so.6".into(),
+            reason: (*reason).into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(
+        concise.contains("process exited during scan"),
+        "concise words the race calmly: {concise}"
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("process exited during scan"),
+        "verbose leads with calm words: {verbose}"
+    );
+    assert!(
+        verbose.contains("opening object within retained target root"),
+        "verbose keeps the machine error beside them: {verbose}"
+    );
+}
+
 /// F1+F3: the concise gap summary uses plain words for the Joint
 /// seal/fallback/journal gaps, never the raw `S1` / `joint_*` tokens.
 #[test]

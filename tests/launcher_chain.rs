@@ -206,8 +206,8 @@ fn caller_for(doc: &Value, pid: u64) -> Vec<&Value> {
 
 const CHAIN_GAP_SUBJECT: &str = "caller parent chain";
 const KNOWN_CHAIN_REASONS: &[&str] = &[
-    "parent unknown: exited before read",
-    "parent unknown: unreadable /proc entry",
+    "launcher exited before read",
+    "launcher hidden by /proc hidepid",
     "parent chain truncated after 4 ancestors",
 ];
 
@@ -251,6 +251,12 @@ fn launcher_chain_json_names_the_named_parent_first() {
         assert!(ancestor["start_time"].as_u64().is_some());
         assert!(ancestor["exe"].is_string() || ancestor["exe"].is_null());
     }
+    assert!(
+        launched.iter().all(|ancestor| ancestor["pid"] != 1),
+        "init is never shown as the launcher: {launched:?}"
+    );
+    assert_eq!(caller["launched_by_origin"], "chain");
+    assert!(caller["launched_by_unit"].is_null());
     // A gap is either absent (a root was reached) or named.
     if !caller["launched_by_gap"].is_null() {
         assert_eq!(caller["launched_by_gap"]["subject"], CHAIN_GAP_SUBJECT);

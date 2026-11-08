@@ -2451,6 +2451,28 @@ int main(int argc, char **argv) {
         );
     }
 
+    /// One parse of one stat line yields both the generation and its
+    /// parent; a malformed ppid keeps the good start_time instead of
+    /// collapsing the pair, and comm soup never leaks into the fields.
+    #[test]
+    fn stat_pair_parses_once_and_degrades_fieldwise() {
+        let stat = "123 (a) b (c) S 1 2 3 4 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 300 0";
+        assert_eq!(stat_pair_from_stat(stat), (Some(300), Some(1)));
+        assert_eq!(start_time_from_stat(stat).unwrap(), 300);
+        assert_eq!(ppid_from_stat(stat), Some(1));
+        let bad_ppid = "123 (a) b (c) S xx 2 3 4 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 300 0";
+        assert_eq!(
+            stat_pair_from_stat(bad_ppid),
+            (Some(300), None),
+            "a malformed ppid keeps the good start_time"
+        );
+        let bad_start = "123 (a) b (c) S 1 2 3 4 -1 4194304 0 0 0 0 0 0 0 0 20 0 1 0 xx 0";
+        assert_eq!(stat_pair_from_stat(bad_start), (None, Some(1)));
+        assert_eq!(stat_pair_from_stat(""), (None, None));
+        assert_eq!(stat_pair_from_stat("123 no-paren-here"), (None, None));
+        assert_eq!(stat_pair_from_stat("123 (x) S 1"), (None, None));
+    }
+
     /// The single-read stat helper returns the same content
     /// `read_to_string` would: same comm, same state, same starttime
     /// (compared field-wise — fault and rss counters move between any

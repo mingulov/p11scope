@@ -7499,13 +7499,15 @@ pub(crate) mod tests {
         source.spawn(200, 22);
         source.set_ppid(200, 100);
         let id = adapter.admit(200, AUTHORITY, 10).unwrap();
-        let chain = &adapter.record(id).unwrap().launched_by;
-        assert_eq!(chain.len(), 3, "caller -> parent -> grand -> init");
+        let record = adapter.record(id).unwrap();
+        let chain = &record.launched_by;
+        assert_eq!(chain.len(), 2, "caller -> parent -> grand; init is never shown");
         assert_eq!((chain[0].pid, chain[0].start_time), (100, Some(11)));
         assert_eq!(chain[0].exe.as_deref(), Some("parent-a"));
         assert_eq!((chain[1].pid, chain[1].start_time), (50, Some(5)));
-        assert_eq!((chain[2].pid, chain[2].start_time), (1, Some(1)));
-        assert!(adapter.record(id).unwrap().launcher_gap.is_none());
+        assert!(record.launcher_gap.is_none());
+        assert_eq!(record.launched_by_origin.label(), "chain");
+        assert!(record.launched_by_unit.is_none());
         // The parent pid is reused by a new generation: a later admission
         // must record the live generation, never the stale one, while the
         // first caller's chain stays frozen evidence.
@@ -7536,8 +7538,9 @@ pub(crate) mod tests {
         assert!(record.launched_by.is_empty());
         assert_eq!(
             record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
-            Some("parent unknown: exited before read")
+            Some("launcher exited before read")
         );
+        assert_eq!(record.launched_by_origin.label(), "gap");
         // A live parent with an exited grandparent keeps the partial chain.
         source.spawn(101, 12);
         source.exec(101, 103, "/bin/parent");
@@ -7558,8 +7561,9 @@ pub(crate) mod tests {
         );
         assert_eq!(
             record2.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
-            Some("parent unknown: exited before read")
+            Some("launcher exited before read")
         );
+        assert_eq!(record2.launched_by_origin.label(), "chain");
     }
 
     #[test]
@@ -7574,9 +7578,10 @@ pub(crate) mod tests {
         source.set_ppid(310, 311);
         let id = adapter.admit(310, AUTHORITY, 10).unwrap();
         let record = adapter.record(id).unwrap();
-        assert_eq!(record.launched_by.len(), 2);
-        assert_eq!(record.launched_by[1].pid, 1);
+        assert_eq!(record.launched_by.len(), 1, "init is never recorded");
+        assert_eq!(record.launched_by[0].pid, 311);
         assert!(record.launcher_gap.is_none());
+        assert_eq!(record.launched_by_origin.label(), "chain");
         // Six ancestors: four are kept, the fifth is a named truncation.
         for pid in 301..=305 {
             source.spawn(pid, pid as u64);
@@ -7599,6 +7604,254 @@ pub(crate) mod tests {
             record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
             Some("parent chain truncated after 4 ancestors")
         );
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_reports_an_init_only_parent_with_its_unit() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1, 1);
+        source.exec(1, 1, "/sbin/init");
+        source.spawn(200, 22);
+        source.set_ppid(200, 1);
+        source.set_cgroup(
+            200,
+            "0::/system.slice/backup.service\n",
+        );
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(record.launched_by.is_empty(), "init is never shown as the launcher");
+        assert!(record.launcher_gap.is_none(), "init_parent is not a read failure");
+        assert_eq!(record.launched_by_origin.label(), "init_parent");
+        assert_eq!(record.launched_by_unit.as_deref(), Some("backup.service"));
+        // Without a unit, init_parent shows nothing but still claims neither
+        // "launched by a service manager" nor "reparented".
+        source.spawn(201, 23);
+        source.set_ppid(201, 1);
+        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
+        let record2 = adapter.record(id2).unwrap();
+        assert!(record2.launched_by.is_empty());
+        assert!(record2.launcher_gap.is_none());
+        assert_eq!(record2.launched_by_origin.label(), "init_parent");
+        assert!(record2.launched_by_unit.is_none());
+    }
+
+    #[test]
+    fn launcher_chain_suppresses_the_systemd_user_manager() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1500, 9);
+        source.exec(1500, 150, "/usr/lib/systemd/systemd");
+        source.set_cgroup(
+            1500,
+            "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n",
+        );
+        source.spawn(200, 22);
+        source.set_ppid(200, 1500);
+        source.set_cgroup(200, "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n");
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(
+            record.launched_by.is_empty(),
+            "the user manager is never shown as the launcher"
+        );
+        assert!(record.launcher_gap.is_none());
+        assert_eq!(record.launched_by_origin.label(), "init_parent");
+        assert_eq!(record.launched_by_unit.as_deref(), Some("app-gated.scope"));
+    }
+
+    #[test]
+    fn launcher_chain_suppresses_a_container_init() {
+        let (source, mut adapter) = adapter();
+        source.spawn(5000, 40);
+        source.exec(5000, 500, "/sbin/tini");
+        source.set_container_init(5000, true);
+        source.spawn(200, 50);
+        source.set_ppid(200, 5000);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(
+            record.launched_by.is_empty(),
+            "a container init is never shown as the launcher"
+        );
+        assert!(record.launcher_gap.is_none());
+        assert_eq!(record.launched_by_origin.label(), "init_parent");
+    }
+
+    #[test]
+    fn launcher_chain_refuses_a_parent_younger_than_its_child() {
+        let (source, mut adapter) = adapter();
+        // The parent pid was recycled after the caller started: the live
+        // generation cannot be the original parent.
+        source.spawn(100, 77);
+        source.exec(100, 102, "/bin/parent-b");
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(record.launched_by.is_empty());
+        assert_eq!(
+            record.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("launcher exited before read")
+        );
+        assert_eq!(record.launched_by_origin.label(), "gap");
+        // A recycled grandparent keeps the partial chain plus the gap.
+        source.spawn(101, 12);
+        source.exec(101, 103, "/bin/parent");
+        source.set_ppid(101, 102);
+        source.spawn(102, 90);
+        source.exec(102, 104, "/bin/recycled-grand");
+        source.spawn(201, 23);
+        source.set_ppid(201, 101);
+        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
+        let record2 = adapter.record(id2).unwrap();
+        assert_eq!(record2.launched_by.len(), 1);
+        assert_eq!(record2.launched_by[0].pid, 101);
+        assert_eq!(
+            record2.launcher_gap.as_ref().map(|gap| gap.reason.as_str()),
+            Some("launcher exited before read")
+        );
+        assert_eq!(record2.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_marks_an_unreadable_ancestor_exe_with_a_named_gap() {
+        let (source, mut adapter) = adapter();
+        source.spawn(100, 11);
+        source.exec(100, 101, "/bin/parent");
+        source.hide_ancestor_exe(100);
+        source.set_ppid(100, 0);
+        source.spawn(200, 22);
+        source.set_ppid(200, 100);
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(record.launched_by.len(), 1);
+        assert!(record.launched_by[0].exe.is_none());
+        assert!(
+            record.launched_by[0].exe_unreadable,
+            "a stat-readable ancestor with no exe read carries the exe gap"
+        );
+        assert!(record.launcher_gap.is_none(), "the chain itself stopped cleanly");
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_drops_an_exe_pinned_to_a_recycled_generation() {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::rc::Rc;
+        #[derive(Clone)]
+        struct FlappingSource {
+            stats: Rc<RefCell<HashMap<u32, Vec<(Option<u64>, Option<u32>)>>>>,
+        }
+        impl ProcessSource for FlappingSource {
+            type Pin = (u32, u64);
+            fn open(&mut self, pid: u32) -> Result<Self::Pin, String> {
+                Ok((pid, 22))
+            }
+            fn still_the_same(&self, _: &Self::Pin) -> bool {
+                true
+            }
+            fn start_time(&self, _: u32) -> Option<u64> {
+                Some(22)
+            }
+            fn exe_identity(&self, pid: u32) -> Option<ExeIdentity> {
+                if pid == 100 {
+                    return Some(ExeIdentity {
+                        dev: 1,
+                        ino: 999,
+                        mtime_secs: 20,
+                        mtime_nanos: 0,
+                        path: Some("/bin/recycled".into()),
+                    });
+                }
+                None
+            }
+            fn stat_pair(&self, pid: u32) -> (Option<u64>, Option<u32>) {
+                let mut stats = self.stats.borrow_mut();
+                let queue = stats.get_mut(&pid).expect("scripted stat queue");
+                assert!(!queue.is_empty(), "unexpected extra stat read of {pid}");
+                queue.remove(0)
+            }
+            fn gone(&self, _: u32) -> bool {
+                false
+            }
+        }
+        // Caller 200 (start 22) parented to 100. The first ancestor stat
+        // reads generation 11; the exe read then races a recycle, and the
+        // revalidation stat reads generation 77: the exe must be dropped.
+        let stats = Rc::new(RefCell::new(HashMap::from([
+            (200u32, vec![(Some(22), Some(100))]),
+            (100u32, vec![(Some(11), Some(0)), (Some(77), Some(0))]),
+        ])));
+        let source = FlappingSource { stats };
+        let captured = capture_launcher_chain(&source, 200, Some(22), Some(100));
+        assert_eq!(captured.ancestors.len(), 1);
+        assert_eq!(captured.ancestors[0].pid, 100);
+        assert_eq!(captured.ancestors[0].start_time, Some(11));
+        assert!(captured.ancestors[0].exe.is_none(), "the recycled exe is dropped");
+        assert!(captured.ancestors[0].exe_unreadable);
+        assert!(captured.gap.is_none());
+    }
+
+    #[test]
+    fn launcher_collapse_folds_adjacent_identical_wrappers() {
+        let chain = vec![
+            LauncherAncestor { pid: 100, start_time: Some(11), exe: Some("sh".into()), label: None, exe_unreadable: false },
+            LauncherAncestor { pid: 90, start_time: Some(9), exe: Some("sh".into()), label: None, exe_unreadable: false },
+            LauncherAncestor { pid: 80, start_time: Some(8), exe: Some("cron".into()), label: None, exe_unreadable: false },
+        ];
+        let collapsed = collapse_launcher_chain(&chain);
+        assert_eq!(collapsed.len(), 2);
+        assert_eq!(collapsed[0].0.pid, 100, "the nearest of the run is kept");
+        assert_eq!(collapsed[0].1, 1, "one additional wrapper folded");
+        assert_eq!(collapsed[1].0.pid, 80);
+        assert_eq!(collapsed[1].1, 0);
+        // Non-adjacent repeats do not fold; labels distinguish wrappers.
+        let chain = vec![
+            LauncherAncestor { pid: 100, start_time: Some(11), exe: Some("sh".into()), label: Some("a".into()), exe_unreadable: false },
+            LauncherAncestor { pid: 90, start_time: Some(9), exe: Some("cron".into()), label: None, exe_unreadable: false },
+            LauncherAncestor { pid: 80, start_time: Some(8), exe: Some("sh".into()), label: Some("a".into()), exe_unreadable: false },
+        ];
+        let collapsed = collapse_launcher_chain(&chain);
+        assert_eq!(collapsed.len(), 3);
+    }
+
+    #[test]
+    fn launcher_systemd_unit_parses_v2_v1_and_user_manager() {
+        assert_eq!(
+            parse_systemd_unit("0::/system.slice/backup.service\n").as_deref(),
+            Some("backup.service")
+        );
+        assert_eq!(
+            parse_systemd_unit("0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n").as_deref(),
+            Some("app-gated.scope")
+        );
+        // cgroup v1: the systemd controller line carries the path.
+        assert_eq!(
+            parse_systemd_unit("11:memory:/system.slice/backup.service\n1:name=systemd:/system.slice/backup.service\n").as_deref(),
+            Some("backup.service")
+        );
+        // The user manager itself lives under init.scope.
+        assert!(
+            is_user_manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service/init.scope\n"),
+            "user@<uid>.service/init.scope is the user manager"
+        );
+        assert!(!is_user_manager_cgroup("0::/system.slice/backup.service\n"));
+        assert!(!is_user_manager_cgroup("0::/user.slice/user-1000.slice/user@1000.service/app.slice/x.scope\n"));
+        // No unit when the path carries none.
+        assert_eq!(parse_systemd_unit("0::/\n").as_deref(), None);
+        assert_eq!(parse_systemd_unit("").as_deref(), None);
+    }
+
+    #[test]
+    fn launcher_container_init_reads_the_innermost_nspid() {
+        assert!(
+            status_nspid_is_container_init("Name:\ttini\nNSpid:\t5000\t1\n"),
+            "innermost NSpid 1 is a container init"
+        );
+        assert!(!status_nspid_is_container_init("Name:\tsh\nNSpid:\t900\n"));
+        assert!(!status_nspid_is_container_init("Name:\tsh\nNSpid:\t900\t42\n"));
+        assert!(!status_nspid_is_container_init("Name:\tsh\n"));
     }
 
     fn module_info(path: &str, ino: u64, admission: AdmissionState) -> ModuleInfo {

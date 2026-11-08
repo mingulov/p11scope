@@ -1617,5 +1617,200 @@ raise SystemExit('unknown owned tool '+name)
         self.assertFalse(any(row["tool"] in {"vng", "observer"} for row in events))
 
 
+RECORDER = ROOT / "scripts/record-verifier-budgets.py"
+
+
+class RecorderTests(unittest.TestCase):
+    """The budget recorder pins measured-plus-margin, never raw counts.
+
+    New kernel cells must carry the same 15% margin as the existing
+    ones (ceil(measured * 115 / 100) in integer arithmetic); a pin past
+    75% of the limit is refused (BUD-1: growth past 75% needs
+    restructuring, which also keeps every recorded pin inside the
+    file's 95% headroom cap). Drives
+    scripts/record-verifier-budgets.py through its real CLI on owned
+    fixtures: a budgets file plus report tables in the
+    scripts/bpf-load-report.py output format.
+    """
+
+    def setUp(self):
+        self.assertTrue(RECORDER.is_file(),
+                        "scripts/record-verifier-budgets.py is missing")
+        self.temporary = tempfile.TemporaryDirectory(prefix="record-budgets-")
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name)
+
+    def write_budgets_file(self, programs, limit=1000000, headroom=5):
+        path = self.root / "budgets.json"
+        document = {"limit": limit, "min_headroom_percent": headroom,
+                    "programs": programs}
+        path.write_text(json.dumps(document, indent=2) + "\n", encoding="ascii")
+        return path
+
+    def write_table(self, name, rows):
+        path = self.root / name
+        lines = ["# kernel=v7.4-rc1 observer-sha256=" + "ab" * 32
+                 + " result=PASS",
+                 "kernel program processed limit headroom_pct budget status detail",
+                 *rows]
+        path.write_text("\n".join(lines) + "\n", encoding="ascii")
+        return path
+
+    def run_recorder(self, *args):
+        return subprocess.run([sys.executable, "-I", str(RECORDER), *args],
+                              capture_output=True, text=True, timeout=30)
+
+    def read_cells(self, path):
+        return json.loads(path.read_text(encoding="ascii"))
+
+    def test_records_measured_plus_15_percent_margin(self):
+        budgets = self.write_budgets_file(
+            {"detailed/p11_entry": {"v7.3.1": 263440},
+             "detailed/p11_return": {"v7.3.1": 117404}})
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 202358 1000000 79.76 263440 PASS -",
+            "v7.4-rc1 detailed/p11_return 152013 1000000 84.80 117404 "
+            "FAIL processed 152013 over budget 117404",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = self.read_cells(budgets)
+        # Integer ceil: 202358 * 115 / 100 = 232711.7 -> 232712, and an
+        # over-budget FAIL row is still a measurement worth recording.
+        self.assertEqual(document["programs"]["detailed/p11_entry"]["v7.4-rc1"],
+                         232712)
+        self.assertEqual(document["programs"]["detailed/p11_return"]["v7.4-rc1"],
+                         174815)
+        # The old kernel column is untouched.
+        self.assertEqual(document["programs"]["detailed/p11_entry"]["v7.3.1"],
+                         263440)
+
+    def test_exact_multiples_stay_exact(self):
+        # Float 2000 * 1.15 can exceed 2300 by an ulp, which ceil would
+        # round to 2301; integer arithmetic pins exactly 2300.
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 2000 1000000 99.80 - PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = self.read_cells(budgets)
+        self.assertEqual(document["programs"]["detailed/p11_entry"]["v7.4-rc1"],
+                         2300)
+
+    def test_refuses_pins_past_75_percent_of_the_limit(self):
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        before = budgets.read_text(encoding="ascii")
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 700000 1000000 30.00 - PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detailed/p11_entry", result.stderr)
+        self.assertEqual(budgets.read_text(encoding="ascii"), before)
+
+    def test_refuses_to_overwrite_an_existing_kernel_column(self):
+        budgets = self.write_budgets_file(
+            {"detailed/p11_entry": {"v7.4-rc1": 202358}})
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 202358 1000000 79.76 202358 PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v7.4-rc1", result.stderr)
+        self.assertEqual(
+            self.read_cells(budgets)["programs"]["detailed/p11_entry"]["v7.4-rc1"],
+            202358)
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--update",
+                                   "--measured", str(table))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.read_cells(budgets)["programs"]["detailed/p11_entry"]["v7.4-rc1"],
+            232712)
+
+    def test_skips_expected_probe_rows(self):
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 202358 1000000 79.76 - PASS -",
+            "v7.4-rc1 detailed/unresolved 1 1000000 100.00 - EXPECTED "
+            "expected bpf_loop probe refusal errno=13",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        document = self.read_cells(budgets)
+        self.assertNotIn("detailed/unresolved", document["programs"])
+        self.assertEqual(document["programs"]["detailed/p11_entry"]["v7.4-rc1"],
+                         232712)
+
+    def test_refuses_refused_loads(self):
+        budgets = self.write_budgets_file(
+            {"detailed/p11_entry": {}, "detailed/p11_return": {}})
+        before = budgets.read_text(encoding="ascii")
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 202358 1000000 79.76 - PASS -",
+            "v7.4-rc1 detailed/p11_return 0 1000000 100.00 - FAIL refused errno=7",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detailed/p11_return", result.stderr)
+        self.assertEqual(budgets.read_text(encoding="ascii"), before)
+
+    def test_rejects_programs_missing_from_the_budgets_file(self):
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        before = budgets.read_text(encoding="ascii")
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 202358 1000000 79.76 - PASS -",
+            "v7.4-rc1 detailed/p11_typo 100 1000000 99.99 - PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detailed/p11_typo", result.stderr)
+        self.assertEqual(budgets.read_text(encoding="ascii"), before)
+
+    def test_rejects_rows_for_another_kernel(self):
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        before = budgets.read_text(encoding="ascii")
+        table = self.write_table("probe.txt", [
+            "v7.3.1 detailed/p11_entry 202358 1000000 79.76 - PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("v7.3.1", result.stderr)
+        self.assertEqual(budgets.read_text(encoding="ascii"), before)
+
+    def test_rejects_a_zero_count(self):
+        # A zero processed count is not a measurement; recording it
+        # would pin a zero budget, which the positivity check rejects.
+        budgets = self.write_budgets_file({"detailed/p11_entry": {}})
+        before = budgets.read_text(encoding="ascii")
+        table = self.write_table("probe.txt", [
+            "v7.4-rc1 detailed/p11_entry 0 1000000 100.00 - PASS -",
+        ])
+        result = self.run_recorder("--budgets", str(budgets),
+                                   "--kernel", "v7.4-rc1",
+                                   "--measured", str(table))
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("detailed/p11_entry", result.stderr)
+        self.assertEqual(budgets.read_text(encoding="ascii"), before)
+
+
 if __name__ == "__main__":
     unittest.main()

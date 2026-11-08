@@ -525,8 +525,15 @@ jobs:
       # lane (405739005) adds CKA_PARAMETER_SET as shared classifier kind
       # 7. The default Detailed object gains .text (+416 B) and uprobe
       # (+40 B) from the new classifier arms; both Inventory objects are
-      # byte-identical, and maps, license and .BTF are unchanged. No other
-      # BPF input changed since v0.6.0.
+      # byte-identical, and maps, license and .BTF are unchanged.
+      # A second recorded transition covers the run-tree cgroup scope
+      # and the inventory-callers exe identity: scope_auth's cgroup arm
+      # reads PID_FILTER[owned child] as its generation token (Detailed
+      # .text +88 B, cumulative +504 B, one new .rel.text entry), the
+      # inventory gating compiles that read only for non-inventory
+      # builds (plain Inventory stays code-identical), and the Callers
+      # flavor accepts the exe-identity bit (Callers .text +64 B). No
+      # other BPF input changed since v0.6.0.
       # Allowed-change process: when kernel code changes on purpose, run
       # scripts/check-bpf-noninterference.py locally for the baseline tag
       # versus the candidate, take the per-section size deltas of the two

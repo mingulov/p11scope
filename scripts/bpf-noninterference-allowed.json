@@ -31,6 +31,60 @@
       ],
       "lane": "PQC parameter-set metadata (F16/7.05)",
       "rationale": "CKA_PARAMETER_SET (0x061d) joins the shared object classifier as attribute kind 7: the Detailed object gains .text (+416 B) and uprobe (+40 B) from the new classifier arms (safe_attribute_kind, classify_attribute_scalar, kind_from_code, safe_kind_code) and the slot-kind bound moves 6 to 7; both Inventory objects are byte-identical and maps, license and .BTF are unchanged."
+    },
+    {
+      "baseline_revision": "v0.6.0 (105497f45c241b372623c0c23e1c51befda30401)",
+      "candidate_revision": "v0.7.0 rc line (measured at f71f0b820440600a5b980936f7841c7aea3d271b; the record pins the run-independent diff shape)",
+      "changed": {
+        "p11scope-ebpf": {
+          "added": {},
+          "deltas": {
+            ".BTF.ext": 48,
+            ".debug_abbrev": 6,
+            ".debug_addr": -8,
+            ".debug_info": 177,
+            ".debug_line": 149,
+            ".debug_loclists": 434,
+            ".debug_rnglists": 137,
+            ".debug_str": 13,
+            ".debug_str_offsets": 4,
+            ".rel.BTF.ext": 48,
+            ".rel.debug_addr": -16,
+            ".rel.debug_info": 80,
+            ".rel.debug_str_offsets": 16,
+            ".rel.text": 16,
+            ".text": 504,
+            "uprobe": 40
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory": {
+          "added": {},
+          "deltas": {
+            ".debug_abbrev": -21,
+            ".debug_info": -3,
+            ".debug_line": -4,
+            ".debug_str": 12
+          },
+          "removed": []
+        },
+        "p11scope-ebpf-inventory-callers": {
+          "added": {},
+          "deltas": {
+            ".BTF.ext": 16,
+            ".debug_abbrev": -21,
+            ".debug_info": 31,
+            ".debug_loclists": 15,
+            ".debug_rnglists": 10,
+            ".rel.BTF.ext": 16,
+            ".text": 64
+          },
+          "removed": []
+        }
+      },
+      "identical": [],
+      "lane": "run-tree cgroup scope and inventory-callers exe identity",
+      "rationale": "Run-tree pause token plus inventory gating plus inventory-callers exe identity, on top of the PQC transition above: scope_auth's cgroup arm reads PID_FILTER[owned child] as its generation token, so the Detailed object gains .text (+88 B, one map read: cumulative +504 B with PQC's +416 B) with one new .rel.text entry (+16 B); the gating compiles that read only for non-inventory builds and non-Callers inventory builds keep exact flag compares, so the plain Inventory object stays code-identical (only .debug_* moves with added source lines); the Callers flavor accepts the exe-identity bit beside one scope (masked base plus compares), so the Callers object gains .text (+64 B) with .BTF.ext (+16 B). uprobe (+40 B) is PQC's alone; no map or program is added or removed, symbol sets are unchanged, and only .BTF.ext line info and .debug_* move with the added source lines."
     }
   ],
   "version": 1

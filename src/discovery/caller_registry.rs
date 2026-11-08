@@ -8386,6 +8386,66 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn launcher_systemd_unit_follows_the_first_component_rule() {
+        // systemd `cg_path_get_unit`: skip leading slices and take the
+        // first component — never the leafmost — with `_` unescaping,
+        // ` (deleted)` truncation and no v1 fallback.
+        assert_eq!(
+            parse_systemd_unit("0::/docker-abc.scope/backup.service\n").as_deref(),
+            Some("docker-abc.scope")
+        );
+        assert_eq!(parse_systemd_unit("0::/user.slice\n").as_deref(), None);
+        assert_eq!(
+            parse_systemd_unit("0::/system.slice/foo.service (deleted)\n").as_deref(),
+            Some("foo.service")
+        );
+        assert_eq!(
+            parse_systemd_unit("0::/system.slice/_foo.service\n").as_deref(),
+            Some("foo.service")
+        );
+        // The `0:` line alone carries the path; a v1-only file has no unit.
+        assert_eq!(
+            parse_systemd_unit(
+                "11:memory:/system.slice/backup.service\n1:name=systemd:/system.slice/backup.service\n"
+            )
+            .as_deref(),
+            None
+        );
+        // Outside the cgroup namespace: refused, never parsed.
+        assert_eq!(
+            parse_systemd_unit("0::/../system.slice/evil.service\n").as_deref(),
+            None
+        );
+    }
+
+    #[test]
+    fn launcher_systemd_unit_inside_user_manager_uses_the_user_unit() {
+        // Inside a user@<uid>.service subtree the unit is the first
+        // unit after the user manager (the `sd_pid_get_user_unit`
+        // rule), so a delegated leaf cannot rename the caller.
+        assert_eq!(
+            parse_systemd_unit(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/evil.service/backup.service\n"
+            )
+            .as_deref(),
+            Some("evil.service")
+        );
+        // Nothing after the user manager: no user unit.
+        assert_eq!(
+            parse_systemd_unit("0::/user.slice/user-1000.slice/user@1000.service\n").as_deref(),
+            None
+        );
+        // The existing app-scope shape keeps working through the user rule.
+        assert_eq!(
+            parse_systemd_unit(
+                "0::/user.slice/user-1000.slice/user@1000.service/app.slice/app-gated.scope\n"
+            )
+            .as_deref(),
+            Some("app-gated.scope")
+        );
+    }
+
+    #[test]
     fn launcher_container_init_reads_the_innermost_nspid() {
         assert!(
             status_nspid_is_container_init("Name:\ttini\nNSpid:\t5000\t1\n"),

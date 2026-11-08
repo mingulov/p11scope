@@ -26403,8 +26403,7 @@ mod seal_readiness_tests {
         driver.scan_seal_pending = true;
         let scope = InspectScope::Pid(std::process::id());
         let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
-        let two: BTreeSet<PinnedObjectId> =
-            BTreeSet::from([PinnedObjectId(0), PinnedObjectId(1)]);
+        let two: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0), PinnedObjectId(1)]);
         let mut peeks = vec![Some(one), None];
         peeks.extend(std::iter::repeat_n(
             Some(two),

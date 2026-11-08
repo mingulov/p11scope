@@ -20780,6 +20780,133 @@ exit 0
     }
 
     #[test]
+    fn shared_cancel_cites_the_held_read_instead_of_an_unknown_prefix() {
+        // The live G21 transition pilot folds every shared unit's retained
+        // read into the unknown withheld prefix (after=32, through=33,
+        // absolute=null) while the classified held emit is suppressed, so
+        // no shared unit keeps its original-read citation. A cancel whose
+        // held read covers the flushed tip must emit the classified unit
+        // and leave no unknown row overlapping it.
+        use crate::inventory_diagnostics::{
+            CaptureOutcome, CaptureSettlement, RetainedIdentityView,
+        };
+        struct SilentView;
+        impl RetainedIdentityView for SilentView {
+            fn application(&self, _: u32) -> Option<&str> {
+                None
+            }
+            fn module(&self, _: u32) -> Option<&str> {
+                None
+            }
+        }
+        let pid = std::process::id();
+        let mut coordinator = InventoryCoordinator::new(
+            Scope::Pid(pid),
+            HookRegistry::builtin(),
+            Vec::new(),
+            vec![],
+            OsProcessSource,
+            RegistryLimits::default_limits(),
+        )
+        .unwrap();
+        coordinator
+            .enable_diagnostics(DiagnosticConfig {
+                ordinary_capacity: 8,
+                exceptional_capacity: 8,
+                ..DiagnosticConfig::default()
+            })
+            .unwrap();
+        let key = PairKey {
+            image: DomainCookie::scripted(NativeDomainId::mint(), 41),
+            exec: 7,
+            object: 3,
+        };
+        // The retained original observation for the shared unit.
+        let mut observation =
+            DiagnosticRecord::new(DiagnosticKind::CountObservation).with_pair(key.diagnostic_key());
+        observation.absolute = Some(33);
+        observation.pre = Some(100);
+        observation.post = Some(110);
+        let observed = coordinator
+            .diagnostics
+            .as_mut()
+            .unwrap()
+            .record(observation)
+            .unwrap();
+        let read = PairCount {
+            count: 33,
+            first_ns: 90,
+            anchor_ns: 100,
+            last_ns: 110,
+            retirement_usable: true,
+            diagnostic_observation: observed,
+            diagnostic_transition: 0,
+        };
+        // Live cancel state: the watermark is behind the shared unit while
+        // a folded read already advanced the withheld tip onto it.
+        let mut recovery = PairRecovery {
+            caller: CallerId(1),
+            endpoint: EndpointId(1),
+            carrier: ModuleId(1),
+            ordinary_checkpoint: 0,
+            epoch: None,
+            scan: None,
+            sighting: None,
+            fence: None,
+            pending_reads: [None, None, None],
+            withheld_through: 33,
+            discarded_through: 32,
+            watermark: 32,
+            blocked: true,
+            recovered: false,
+            deferred_count: false,
+            receipt_refused: false,
+            epoch_pending: false,
+            diagnostic: RecoveryDiagnostics::default(),
+        };
+        coordinator.cancel_retirement_candidate(
+            key,
+            &mut recovery,
+            Some(read),
+            DiagnosticReason::SharedOwner,
+        );
+        let finished = coordinator
+            .take_diagnostics(DiagnosticOutcome {
+                capture_outcome: CaptureOutcome::Completed,
+                capture_settlement: CaptureSettlement::Unsettled,
+            })
+            .unwrap();
+        let mut buf = Vec::new();
+        finished
+            .write_jsonl(&mut buf, &SilentView, || false)
+            .unwrap();
+        let rows: Vec<serde_json::Value> = buf
+            .split(|byte| *byte == b'\n')
+            .filter(|line| !line.is_empty())
+            .map(serde_json::from_slice)
+            .collect::<Result<_, _>>()
+            .unwrap();
+        let withheld: Vec<_> = rows
+            .iter()
+            .filter(|row| row["kind"] == "count_decision" && row["decision"] == "withheld")
+            .collect();
+        assert_eq!(
+            withheld.len(),
+            1,
+            "one classified unit, no unknown prefix: {withheld:?}"
+        );
+        let unit = withheld[0];
+        assert_eq!(unit["reason"], "shared_owner");
+        assert_eq!(unit["after"], 32);
+        assert_eq!(unit["through"], 33);
+        assert_eq!(unit["absolute"], 33);
+        assert_eq!(unit["pre"], 100);
+        assert_eq!(unit["post"], 110);
+        assert_eq!(unit["observation_ref"]["status"], "retained");
+        assert_eq!(unit["observation_ref"]["seq"], observed);
+    }
+
+    #[test]
     fn staged_but_unpublished_sharer_withholds_count_only_growth() {
         // P3 sharing window (round 3, F3-01): the pair binds to A while
         // A is the sole owner and commits Bound(A) with its history;

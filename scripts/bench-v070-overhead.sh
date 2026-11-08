@@ -75,6 +75,9 @@ PASS_TIMEOUT_S=${PASS_TIMEOUT_S:-180}
 POST_PID_S=${POST_PID_S:-3}
 POST_SYS_S=${POST_SYS_S:-20}
 ATTACH_TIMEOUT_S=${ATTACH_TIMEOUT_S:-60}
+CEIL_ATTACH_TIMEOUT_S=${CEIL_ATTACH_TIMEOUT_S:-180}
+FOREIGN_WAIT_S=${FOREIGN_WAIT_S:-600}
+SUDO_BIN=${SUDO_BIN:-sudo}
 WARMUP_TIMEOUT_S=${WARMUP_TIMEOUT_S:-30}
 PARTS=${PARTS:-"percall ramp ceiling"}
 CONDITIONS=${CONDITIONS:-"unobserved metrics profile trace inv-pid inv-system inv-pid-keys"}
@@ -668,9 +671,13 @@ PYEOF
 record() {
     ns_per_call=$(( $7 / $6 ))
     cpu_s=$(awk -v t="$8" -v hz="$CLK_TCK" 'BEGIN{printf "%.3f", t/hz}')
+    rnotes=${13}
+    case "$4" in metrics|profile|trace|inv-pid|inv-system|inv-pid-keys|inv-system-keys)
+        [ "${FQUIET-1}" = 0 ] && rnotes="$rnotes FOREIGN-RISK";;
+    esac
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$ns_per_call" "$8" "$cpu_s" "$9" "${10}" "${11}" "${12}" "${13}" >> "$RESULTS"
-    echo "CELL $1/$2/$3/$4 r$5: n=$6 wall_ns=$7 ns/call=$ns_per_call cpu_s=$cpu_s exact=${10} loss=${11} ${13}"
+        "$1" "$2" "$3" "$4" "$5" "$6" "$7" "$ns_per_call" "$8" "$cpu_s" "$9" "${10}" "${11}" "${12}" "$rnotes" >> "$RESULTS"
+    echo "CELL $1/$2/$3/$4 r$5: n=$6 wall_ns=$7 ns/call=$ns_per_call cpu_s=$cpu_s exact=${10} loss=${11} $rnotes"
 }
 
 # --- sample runners ---
@@ -735,19 +742,89 @@ uprobe_kind() {
     elif grep -Fq "per-offset" "$1" 2>/dev/null; then echo "per-offset";
     else echo "unknown"; fi
 }
-# start_observer <tag> [p11scope args...]: SPID set, attach gate passed.
-start_observer() {
-    tag=$1; shift
-    sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" "$@" \
-        > "$WORK/$tag.obs.log" 2>&1 &
-    SPID=$!
-    wait_for_observer_attach "$WORK/$tag.obs.log" "$ATTACH_TIMEOUT_S" \
-        || { echo "$tag: attach gate failed" >&2; return 1; }
+# is_descendant <pid>: true when $$ is the pid itself or an ancestor.
+# A vanished pid reads as foreign (safe direction: wait, then lapse).
+is_descendant() {
+    a=$1
+    while :; do
+        [ "$a" = "$$" ] && return 0
+        [ "$a" = 1 ] && return 1
+        a=$(ps -o ppid= -p "$a" 2>/dev/null | tr -d ' ') || return 1
+        [ -z "$a" ] && return 1
+    done
+}
+# foreign_observers: live p11scope PIDs that are not this script's own
+# observers. Scan-only captures attach nothing and are ignored, as in
+# the startup guard.
+foreign_observers() {
+    pgrep -x p11scope 2>/dev/null | while read -r p; do
+        is_descendant "$p" && continue
+        ps -o args= -p "$p" 2>/dev/null | grep -q -- "--capture scan" && continue
+        echo "$p"
+    done
+}
+FQUIET=1
+# wait_for_no_foreign_observer <tag> <timeout_s>: another lane's live
+# capture would charge our samples with its own traps. Wait for it to
+# end; after the timeout proceed with FQUIET=0 so record() flags the
+# cell FOREIGN-RISK instead of silently blending the costs.
+wait_for_no_foreign_observer() {
+    wfn_end=$(( $(date +%s) + $2 ))
+    while :; do
+        f=$(foreign_observers | tr '\n' ' ')
+        if [ -z "$f" ]; then FQUIET=1; return 0; fi
+        if [ "$(date +%s)" -ge "$wfn_end" ]; then
+            echo "$1: FOREIGN p11scope still live after $2s ($f); proceeding, cell flagged" >&2
+            FQUIET=0; return 0
+        fi
+        sleep 5
+    done
+}
+# start_observer_timeout <tag> <timeout_s> [p11scope args...]: SPID set,
+# attach gate passed. Waits out foreign captures first; on a gate
+# failure respawns the observer once (a singleton silent observer death
+# aborted a 3h matrix; the workload still waits at its gate, so a
+# respawn is sound). Refuses to double-spawn over a stuck observer.
+# SUDO_BIN overrides the sudo wrapper (self-test uses a flag-stripping shim).
+start_observer_timeout() {
+    tag=$1; to=$2; shift 2
+    wait_for_no_foreign_observer "$tag" "$FOREIGN_WAIT_S" || return 1
+    attempt=1
+    while :; do
+        if [ "$attempt" = 1 ]; then
+            "$SUDO_BIN" --preserve-env=SOFTHSM2_CONF "$P11SCOPE" "$@" \
+                > "$WORK/$tag.obs.log" 2>&1 &
+        else
+            echo "$tag: attach gate failed, respawning observer once" >&2
+            echo "--- observer respawn (attempt 2) ---" >> "$WORK/$tag.obs.log"
+            "$SUDO_BIN" --preserve-env=SOFTHSM2_CONF "$P11SCOPE" "$@" \
+                >> "$WORK/$tag.obs.log" 2>&1 &
+        fi
+        SPID=$!
+        if wait_for_observer_attach "$WORK/$tag.obs.log" "$to"; then
+            break
+        fi
+        kill "$SPID" 2>/dev/null || true
+        wt_end=$(( $(date +%s) + 15 ))
+        while kill -0 "$SPID" 2>/dev/null && [ "$(date +%s)" -lt "$wt_end" ]; do sleep 0.2; done
+        if kill -0 "$SPID" 2>/dev/null; then
+            echo "$tag: stuck observer would not die; refusing double-spawn" >&2
+            return 1
+        fi
+        SPID=
+        if [ "$attempt" = 1 ]; then attempt=2; sleep 5; continue; fi
+        echo "$tag: attach gate failed" >&2; return 1
+    done
     if grep -q "attach failed" "$WORK/$tag.obs.log"; then
         echo "ATTACH FAILURE in $tag:" >&2
         cat "$WORK/$tag.obs.log" >&2
         return 1
     fi
+}
+# start_observer <tag> [p11scope args...]: SPID set, attach gate passed.
+start_observer() {
+    tag=$1; shift
+    start_observer_timeout "$tag" "$ATTACH_TIMEOUT_S" "$@"
 }
 stop_observer() {
     kill -INT "$SPID" 2>/dev/null || true
@@ -931,6 +1008,7 @@ sample_inv() {
     held_wpid=$WPID
     if [ "$6" = "pid" ]; then scope_args="--pid $held_wpid"; else scope_args="--system"; fi
     if [ "$keyops" = 1 ]; then key_args="--key-operations"; else key_args=""; fi
+    wait_for_no_foreign_observer "$2" "$FOREIGN_WAIT_S" || return 1
     # shellcheck disable=SC2086
     sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory $scope_args --capture native \
         --manifest "$5" $key_args --duration 240 -o "$WORK/$2.json" \
@@ -1088,6 +1166,48 @@ if [ "$SELF_TEST" = 1 ]; then
     printf '%s\n' '0: C_Initialize' '1: C_GenerateRandom' '2: C_GenerateRandom' > "$SELF_TEST_WORK/spy.log"
     python3 -I "$VPY" spycount "$SELF_TEST_WORK/spy.log" | grep -q "calls_total=3" \
         || { echo "self-test: spycount wrong" >&2; exit 1; }
+    is_descendant "$$" || { echo "self-test: self not descendant" >&2; exit 1; }
+    is_descendant 1 && { echo "self-test: init reads descendant" >&2; exit 1; }
+    printf '%s\n' '#include <unistd.h>' 'int main(void){sleep(30);return 0;}' > "$SELF_TEST_WORK/sleeper.c"
+    gcc -O2 -o "$SELF_TEST_WORK/p11scope" "$SELF_TEST_WORK/sleeper.c" \
+        || { echo "self-test: sleeper compile failed" >&2; exit 1; }
+    "$SELF_TEST_WORK/p11scope" &
+    fakepid=$!
+    pgrep -x p11scope | grep -q "^$fakepid$" \
+        || { echo "self-test: fake comm not visible to pgrep" >&2; kill $fakepid 2>/dev/null; exit 1; }
+    foreign_observers | grep -q "^$fakepid$" \
+        && { echo "self-test: own child reads foreign" >&2; kill $fakepid 2>/dev/null; exit 1; }
+    kill $fakepid 2>/dev/null || true
+    wait $fakepid 2>/dev/null || true
+    FOREIGN_WAIT_SAVE2=$FOREIGN_WAIT_S; FOREIGN_WAIT_S=0
+    wait_for_no_foreign_observer "selftest" 0 2>/dev/null \
+        || { echo "self-test: foreign wait failed" >&2; exit 1; }
+    FOREIGN_WAIT_S=$FOREIGN_WAIT_SAVE2
+    case $FQUIET in 0|1) ;; *) echo "self-test: bad FQUIET $FQUIET" >&2; exit 1;; esac
+    FQUIET=1
+    printf '#!/bin/sh\nshift\nexec "$@"\n' > "$SELF_TEST_WORK/fake-sudo"
+    chmod +x "$SELF_TEST_WORK/fake-sudo"
+    printf '#!/bin/sh\necho "p11scope: capturing: 3 probes attached"\nsleep 60\n' > "$SELF_TEST_WORK/fake-obs"
+    chmod +x "$SELF_TEST_WORK/fake-obs"
+    WORK_SAVE=$WORK; SUDO_BIN_SAVE=$SUDO_BIN; P11SCOPE_SAVE=${P11SCOPE-}
+    FOREIGN_WAIT_SAVE3=$FOREIGN_WAIT_S
+    WORK=$SELF_TEST_WORK; SUDO_BIN=$SELF_TEST_WORK/fake-sudo; FOREIGN_WAIT_S=0
+    P11SCOPE=/bin/false
+    start_observer "selftest-fail" ignored 2>"$SELF_TEST_WORK/retry.err" \
+        && { echo "self-test: failing observer accepted" >&2; exit 1; }
+    grep -q "respawning observer once" "$SELF_TEST_WORK/retry.err" \
+        || { echo "self-test: no respawn attempt" >&2; exit 1; }
+    grep -q "attempt 2" "$SELF_TEST_WORK/selftest-fail.obs.log" \
+        || { echo "self-test: respawn marker missing" >&2; exit 1; }
+    P11SCOPE=$SELF_TEST_WORK/fake-obs
+    start_observer "selftest-ok" ignored 2>"$SELF_TEST_WORK/ok.err" \
+        || { echo "self-test: good observer rejected" >&2; exit 1; }
+    [ -n "${SPID-}" ] || { echo "self-test: SPID unset" >&2; exit 1; }
+    kill "$SPID" 2>/dev/null || true
+    wait "$SPID" 2>/dev/null || true
+    SPID=
+    WORK=$WORK_SAVE; SUDO_BIN=$SUDO_BIN_SAVE; P11SCOPE=$P11SCOPE_SAVE
+    FOREIGN_WAIT_S=$FOREIGN_WAIT_SAVE3
     echo "bench-v070-overhead self-test: OK"
     exit 0
 fi
@@ -1135,6 +1255,7 @@ sample_mt() {
             ;;
         inv-pid|inv-system)
             if [ "$5" = "inv-pid" ]; then scope_args="--pid $mt_wpid"; else scope_args="--system"; fi
+            wait_for_no_foreign_observer "$2" "$FOREIGN_WAIT_S" || return 1
             # shellcheck disable=SC2086
             sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory $scope_args --capture native \
                 --manifest "$4" --duration "$mt_dur" -o "$WORK/$2.json" \
@@ -1361,12 +1482,13 @@ sample_ceil() {
         case "$3" in
             inv-system|inv-system-keys)
                 if [ "$3" = "inv-system-keys" ]; then key_args="--key-operations"; else key_args=""; fi
+                wait_for_no_foreign_observer "$2" "$FOREIGN_WAIT_S" || return 1
                 # shellcheck disable=SC2086
                 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
                     $man_args $key_args --duration "$dur" -o "$WORK/$2.json" \
                     > "$WORK/$2.obs.log" 2>&1 &
                 SPID=$!
-                wait_for_inv_ready "$WORK/$2.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                wait_for_inv_ready "$WORK/$2.obs.log" "$CEIL_ATTACH_TIMEOUT_S" || return 1
                 if grep -q "attach failed" "$WORK/$2.obs.log"; then
                     echo "ATTACH FAILURE in $2:" >&2; cat "$WORK/$2.obs.log" >&2; return 1
                 fi
@@ -1376,30 +1498,27 @@ sample_ceil() {
                 sleep "$ADMIT_S"
                 ;;
             metrics)
-                # shellcheck disable=SC2086
-                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile --system --mode metrics \
-                    $man_args --duration "$dur" -o "$WORK/$2.json" \
-                    > "$WORK/$2.obs.log" 2>&1 &
-                SPID=$!
-                wait_for_observer_attach "$WORK/$2.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                start_observer_timeout "$2" "$CEIL_ATTACH_TIMEOUT_S" profile --system \
+                    --mode metrics --manifest "$WORK/manifest-nullA.json" \
+                    --manifest "$WORK/manifest-nullB.json" \
+                    --manifest "$WORK/manifest-soft.json" \
+                    --duration "$dur" -o "$WORK/$2.json" || return 1
                 ukind=""
                 ;;
             profile)
-                # shellcheck disable=SC2086
-                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" profile --system --mode profile \
-                    $man_args --duration "$dur" -o "$WORK/$2.json" \
-                    > "$WORK/$2.obs.log" 2>&1 &
-                SPID=$!
-                wait_for_observer_attach "$WORK/$2.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                start_observer_timeout "$2" "$CEIL_ATTACH_TIMEOUT_S" profile --system \
+                    --mode profile --manifest "$WORK/manifest-nullA.json" \
+                    --manifest "$WORK/manifest-nullB.json" \
+                    --manifest "$WORK/manifest-soft.json" \
+                    --duration "$dur" -o "$WORK/$2.json" || return 1
                 ukind=""
                 ;;
             trace)
-                # shellcheck disable=SC2086
-                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace --system \
-                    $man_args --duration "$dur" -o "$WORK/$2.txt" \
-                    > "$WORK/$2.obs.log" 2>&1 &
-                SPID=$!
-                wait_for_observer_attach "$WORK/$2.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                start_observer_timeout "$2" "$CEIL_ATTACH_TIMEOUT_S" trace --system \
+                    --manifest "$WORK/manifest-nullA.json" \
+                    --manifest "$WORK/manifest-nullB.json" \
+                    --manifest "$WORK/manifest-soft.json" \
+                    --duration "$dur" -o "$WORK/$2.txt" || return 1
                 ukind=""
                 ;;
             *) echo "$2: bad condition $3" >&2; return 1 ;;
@@ -1626,6 +1745,7 @@ sample_spy() {
         maps_gated_stop "$P11PID" "$(basename "$MODULE")" 60 || return 1
         case "$2" in
             inv-pid)
+                wait_for_no_foreign_observer "$1" "$FOREIGN_WAIT_S" || return 1
                 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
                     --capture native --manifest "$WORK/manifest-soft.json" --duration 600 \
                     -o "$WORK/$1.json" > "$WORK/$1.obs.log" 2>&1 &
@@ -1775,6 +1895,7 @@ tool_k() {
 sample_toolloop() {
     n=${TOOL_N:-50}
     if [ "$3" = "inv-system" ]; then
+        wait_for_no_foreign_observer "$1" "$FOREIGN_WAIT_S" || return 1
         sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
             --manifest "$WORK/manifest-soft.json" --duration 600 -o "$WORK/$1.json" \
             > "$WORK/$1.obs.log" 2>&1 &

@@ -1500,7 +1500,11 @@ Limits that matter in pods:
   module-level use by an unidentified caller; an edge whose provider
   entries were all attached and whose health stayed proven reads
   `watched_no_use` over that interval, or `uncounted` once a pair insert
-  failed (absence proves nothing then). A native run states
+  failed (absence proves nothing then). The manual-only privileged
+  harness `scripts/verify-unidentified-exe-name.sh` exercises this
+  naming on indexed, loop-mounted (`--tool` with `--teach`/`--linger`)
+  and container (`--docker`) binaries; the campaign's permanent cell
+  is the Rust privileged test. A native run states
   `observation.lane: "native"`,
   `observation.settlement: "unsettled"` (Inventory has no quiescence
   protocol, so a call in flight at stop may still be unrecorded), and

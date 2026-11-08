@@ -670,17 +670,21 @@ fn scope_gap(reason: &str) -> PidGap {
 }
 
 /// Whether one member gap marks its whole cgroup transaction incomplete.
-/// A scan that ran to completion but refused a file join with a disclosed,
-/// finite-vocabulary `original_file_unproven` proof outcome degrades per
-/// caller (the gap stays on the member), never per transaction: nothing
-/// was cut short, and poisoning the shared transaction would block every
+/// A scan that ran to completion but refused a file join with a
+/// diagnosed Unavailable proof outcome degrades per caller (the gap
+/// stays on the member), never per transaction: nothing was cut
+/// short, and poisoning the shared transaction would block every
 /// other member's native activation behind one member's proof refusal
-/// (JK-22). Every other truncation signal keeps the
-/// scan-to-live-candidate boundary, and retirement still withholds
-/// absence authority for these members through `CompleteMemberScan`.
+/// (JK-22). Only that family is exempt: scoped collection early-outs
+/// before any witness query, so proven-stale, spent-budget and failed
+/// anchor outcomes are unproducible here, and they keep truncating so
+/// a future witness in this path fails closed. Every other truncation
+/// signal keeps the scan-to-live-candidate boundary, and retirement
+/// still withholds absence authority for these members through
+/// `CompleteMemberScan`.
 fn member_gap_truncates_transaction(reason: &str) -> bool {
     scan_skip_truncates(reason)
-        && !reason.starts_with(crate::discovery::overlay_witness::ORIGINAL_FILE_UNPROVEN)
+        && !crate::discovery::overlay_witness::witness_unavailable_refusal(reason)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -508,7 +508,6 @@ fn stage_for_witness_unavailable(
 /// Whether a gap reason is the unavailable refusal: the canonical
 /// reason or any enriched one. Retries and degraded-mode arms match
 /// the family, never one spelling.
-#[cfg(test)]
 pub(crate) fn witness_unavailable_refusal(reason: &str) -> bool {
     reason.starts_with(GAP_WITNESS_UNAVAILABLE)
 }

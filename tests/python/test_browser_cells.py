@@ -811,6 +811,32 @@ class BrowserCells(unittest.TestCase):
             "p11scope: loader readiness: 1 active hook(s)"))
         self.assertIsNone(cells._parse_capture_ready("unrelated line"))
 
+    def test_soft_call_stop_parsing(self):
+        """Unit: the bg caller's STOP line parses to its completed calls."""
+        self.assertEqual(
+            cells.soft_call_completed(
+                "READY module=m interval=1 pid=1\nCALLS n=30 last_rv=0 slots=1\n"
+                "STOP n=87\n"),
+            87)
+        self.assertIsNone(cells.soft_call_completed(
+            "READY module=m interval=1 pid=1\n"))
+        self.assertIsNone(cells.soft_call_completed("INIT rv=3\n"))
+
+    def test_observer_first_waits_for_capture_ready(self):
+        """Unit: the observer-first wait returns on pass 0, fails loud."""
+        err = self.work / "observer.err"
+        err.write_text("p11scope: pass 0: 6 scanned (0 native, 6 scan-pinned)\n")
+        running = SimpleNamespace(poll=lambda: None, returncode=None)
+        cells.wait_for_observer_line(
+            err, running, "p11scope: pass 0:", 5.0, "capture")
+        exited = SimpleNamespace(poll=lambda: 1, returncode=1)
+        with self.assertRaises(cells.CellError):
+            cells.wait_for_observer_line(
+                err, exited, "p11scope: pass 0:", 5.0, "capture")
+        with self.assertRaises(cells.CellError):
+            cells.wait_for_observer_line(
+                err, running, "p11scope: never:", 0.0, "capture")
+
     def test_oracle_builder_healthy_accepted(self):
         """Guard: the twin builder's healthy doc passes the common oracle."""
         sha = "0" * 64
@@ -1563,6 +1589,50 @@ def live_cells_missing_s1(source):
     return found, missing
 
 
+def system_first_cells_missing_oracle(source):
+    """Observer-first system cells and those lacking the rows oracle.
+
+    Parses ``source`` (this suite file), finds every
+    @gate_system-decorated method of BrowserCells, and returns
+    (found, missing): all observer-first system cells, and those
+    whose body has no observe_first_system drive call plus the two
+    headline oracle legs (the ``bootstrap_unavailable`` reason pin
+    and a ``browser_rows`` assertion). The S1 proof cannot cover
+    this family: its oracle rejects Joint content, while these cells
+    assert populated key-operation rows from an inventory report.
+    """
+    found, missing = [], []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.ClassDef) or node.name != "BrowserCells":
+            continue
+        for item in node.body:
+            if not isinstance(item, ast.FunctionDef):
+                continue
+            gated = any(
+                (isinstance(expr, ast.Call)
+                 and isinstance(expr.func, ast.Name)
+                 and expr.func.id == "gate_system")
+                or (isinstance(expr, ast.Name) and expr.id == "gate_system")
+                for expr in item.decorator_list)
+            if not gated:
+                continue
+            found.append(item.name)
+            calls = [call for call in ast.walk(item)
+                     if isinstance(call, ast.Call)]
+            driven = any(
+                isinstance(call.func, ast.Attribute)
+                and call.func.attr == "observe_first_system"
+                for call in calls)
+            constants = {const.value for const in ast.walk(item)
+                         if isinstance(const, ast.Constant)}
+            names = {name.id for name in ast.walk(item)
+                     if isinstance(name, ast.Name)}
+            if not (driven and "bootstrap_unavailable" in constants
+                     and "browser_rows" in names):
+                missing.append(item.name)
+    return found, missing
+
+
 def attach_cells_with_opened_floor(source):
     """``@gate`` attach-drive cells whose ``s1=`` may set ``sessions_opened_min``.
 
@@ -1760,6 +1830,12 @@ class BrowserS1Oracle(unittest.TestCase):
         found, missing = live_cells_missing_s1(
             Path(__file__).read_text())
         self.assertEqual(len(found), 5)
+        self.assertEqual(missing, [])
+
+    def test_system_first_cells_wire_browser_rows_oracle(self):
+        found, missing = system_first_cells_missing_oracle(
+            Path(__file__).read_text())
+        self.assertEqual(len(found), 1)
         self.assertEqual(missing, [])
 
     def test_attach_cells_require_no_opened_floor(self):

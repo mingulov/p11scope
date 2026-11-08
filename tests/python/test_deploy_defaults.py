@@ -55,7 +55,16 @@ class DeployDefaultsTests(unittest.TestCase):
         self.assertNotIn("dropping any of them refuses", text,
                          "the cell proves two removals, not every flag")
         self.assertIn("or `SYS_PTRACE` refuses", text)
-        self.assertIn("Privileges and why", text)
+        self.assertIn("measured DaemonSet set", text,
+                      "the run is the measured set, not a claimed minimum")
+        self.assertIn("stands in for", text,
+                      "SYS_ADMIN is the narrow-capability stand-in")
+        self.assertIn("unmeasured", text,
+                      "the narrow five-capability variant is named as unmeasured")
+        self.assertNotIn("minimal container run", text,
+                         "the old minimal wording contradicts the product term")
+        self.assertNotIn("Privileges and why", text,
+                         "the kind-table citation no longer applies")
 
     def test_rebuild_recipe_keeps_full_features(self):
         self.assertNotIn("--no-default-features", DEPLOY_README.read_text(),

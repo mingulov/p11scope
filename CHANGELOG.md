@@ -13,6 +13,13 @@ versioned separately and are opaque, exact dispatch keys.
   stdout (same schema, never interleaved; the text summary moves to
   stderr), and `--event-interval <dur>` adds periodic `totals`
   snapshots to file and stdout streams alike.
+- The observer image is published as `ghcr.io/mingulov/p11scope:<version>`
+  on releases (see `RELEASING.md` step 7.4), built from the verified
+  release tarball with licenses, notices and `RELEASE.json` inside. Its
+  entrypoint is now `p11scope`, so plain `docker run IMAGE <p11scope args>`
+  reaches the observer; this changes behaviour for `docker run IMAGE`
+  with in-cluster entry-script arguments (address the entry script by
+  explicit name instead).
 
 ### Changed
 

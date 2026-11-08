@@ -534,19 +534,33 @@ On the commit that steps 3–6 ran on:
    once known, like the CHANGELOG qualification row; the body links to
    it), not into the body. Keep candidate-only results explicitly
    historical. Check the uploaded assets and notes after publication.
-4. Publish the container image: pushing the tag triggers
-   `container-publish` (tags `v*`, this repository only), which rebuilds
-   the FULL observer image from the tag bytes, builds
-   `p11scope-observer:preview` with `--network=none` and smokes it, then —
-   on a final `vX.Y.Z` tag only — publishes
-   `ghcr.io/mingulov/p11scope:<X.Y.Z>` and `:latest`. Prerelease tags
-   build and smoke without publishing; any other ref builds nothing. If
-   the tag-push run fails transiently, re-dispatch `container-publish` on
-   the tag (Actions → container-publish → Run workflow, "Use workflow
-   from" the tag). Record the run URL and the image digest from the push
-   receipt, then verify with `docker pull` and the `docker run` recipe in
-   [deploy/README.md](deploy/README.md). That push makes live the DaemonSet
-   default retargeted to this tag in step 1.
+4. Publish the container image: publishing the release triggers
+   `container-publish` (release `published`, plus a tag-gated manual
+   dispatch for retries; this repository only), which downloads the musl
+   tarball, `SHA256SUMS` and `RELEASE.json` for the tag, verifies the
+   checksum and asserts the `RELEASE.json` head against the tag commit,
+   then builds `p11scope-observer:preview` from the verified tarball with
+   `deploy/Dockerfile.observer-release` (`--network=none`), smokes it
+   (`--version` matched to the tag, `doctor`, `inventory --system`) and
+   proves capture on the built bytes with the permanent cell. On a final
+   `vX.Y.Z` tag only it publishes `ghcr.io/mingulov/p11scope:<X.Y.Z>`
+   (and `:latest` only when the tag is the newest stable); prerelease
+   tags build, smoke and prove the registry login without publishing;
+   any other `v*` tag fails closed. If the run fails transiently, use
+   "Re-run failed jobs" on the same run (it reuses the same tarball and
+   image ID); do not re-dispatch, which would rebuild different bytes
+   and can overwrite the tag with a new digest. A re-push to an existing
+   version tag is refused. Record the run URL and the image digest from
+   the push receipt. On the first publish the owner sets the package to
+   Public and confirms its repository link (owner step: new GHCR
+   packages are private by default). Then verify as an anonymous client
+   with a clean config plus the `docker run` recipe in
+   [deploy/README.md](deploy/README.md):
+   ```sh
+   DOCKER_CONFIG=$(mktemp -d) docker pull ghcr.io/mingulov/p11scope:<X.Y.Z>
+   ```
+   That push makes live the DaemonSet default retargeted to this tag in
+   step 1.
 
 ## After the tag
 

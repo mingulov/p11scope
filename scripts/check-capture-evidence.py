@@ -1059,6 +1059,9 @@ def exact_evidence_keys(evidence, *, profile, terminal=False, child=False, histo
     if not historical and not terminal and "unmatched_excludes" in evidence:
         wanted.add("unmatched_excludes")
         exact_unmatched_excludes(evidence["unmatched_excludes"])
+    if not historical and not terminal and "unmatched_forwarding" in evidence:
+        wanted.add("unmatched_forwarding")
+        exact_unmatched_forwarding(evidence["unmatched_forwarding"])
     if not historical and not terminal and "legacy_collection" in evidence:
         wanted.add("legacy_collection")
         exact_legacy_collection(evidence["legacy_collection"])
@@ -1117,6 +1120,13 @@ def exact_unmatched_excludes(value):
     no mapped file, in operator order."""
     require(isinstance(value, list) and all(isinstance(item, str) for item in value),
             f"unmatched_excludes must be a string array: {value!r}")
+
+
+def exact_unmatched_forwarding(value):
+    """The additive --forwarding-module miss list: operator inputs that
+    matched no mapped file, in operator order."""
+    require(isinstance(value, list) and all(isinstance(item, str) for item in value),
+            f"unmatched_forwarding must be a string array: {value!r}")
 
 
 def exact_counter_bank_gaps(gaps):

@@ -762,6 +762,10 @@ non-null values needs a new allowlist row.
   lists one row per distinct excluded file (`path`, `dev`, `ino`,
   `processes`); `unmatched_excludes` lists the inputs that matched no
   mapped file. A declared operator choice, never a gap or a loss.
+- `unmatched_forwarding` (additive within v1): present only when
+  `--forwarding-module` is passed and at least one input matched no
+  mapped file. Lists those inputs in operator order. A declared
+  operator choice, never a gap or a loss.
 
 ## Semantic instances (additive within v1)
 

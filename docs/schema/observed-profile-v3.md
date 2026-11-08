@@ -161,6 +161,12 @@ feed shares, verdicts, `gap_classes` or `completeness`: excluded
 modules are a declared choice, not a loss, and the rest of the capture
 can still be `exact`.
 
+When a capture passes `--forwarding-module`, its evidence also contains
+the optional additive `unmatched_forwarding` key, listing the inputs
+that matched no mapped file, in operator order. Captures without the
+flag, or whose every declaration matched, omit it. Like the keys above,
+it never feeds shares, verdicts, `gap_classes` or `completeness`.
+
 Under the default `allowlisted` policy, every emitted mechanism has
 `params: null` with `params_omitted: "policy"` beside it, and
 `templates.operations` is always empty. Every `params: null` carries a

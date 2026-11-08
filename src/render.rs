@@ -677,10 +677,10 @@ pub struct DiscoveryEvidence {
     /// the JSON layer split travels in `functions[]` and `layer_totals`.
     #[serde(skip)]
     pub forwarding_declared: Vec<ModuleId>,
-    /// `--forwarding-module` inputs that matched no mapped file. Text-only
-    /// (the serialized twin is `unmatched_excludes`): a declared input
-    /// that matched nothing must never silently do nothing.
-    #[serde(skip)]
+    /// `--forwarding-module` inputs that matched no mapped file, in
+    /// operator order. Omitted when empty. A declared input that matched
+    /// nothing must never silently do nothing.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unmatched_forwarding: Vec<String>,
     /// 6.14 Option A exit-time mapping split, `None` unless extensive
     /// mode armed. Serde-skipped carrier: the profile lane and the
@@ -2556,9 +2556,8 @@ fn forwarding_suggestion(
 
 /// Declared-but-unmatched forwarding inputs, echoed whenever present: a
 /// `--forwarding-module` input that matched no mapped file must never
-/// silently do nothing. Text-only (the serialized twin is
-/// `unmatched_excludes`); never a coverage gap, so it never forces
-/// `PARTIAL`.
+/// silently do nothing. The JSON twin is the `unmatched_forwarding` key;
+/// never a coverage gap, so it never forces `PARTIAL`.
 fn unmatched_forwarding_lines(ev: &Evidence) -> String {
     if ev.discovery.unmatched_forwarding.is_empty() {
         return String::new();

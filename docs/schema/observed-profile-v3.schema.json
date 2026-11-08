@@ -336,6 +336,10 @@
           "type": "array",
           "items": {"type": "string"}
         },
+        "unmatched_forwarding": {
+          "type": "array",
+          "items": {"type": "string"}
+        },
         "operation_state_imports": {"type": "integer", "minimum": 0},
         "orphan_ops": {"type": "integer", "minimum": 0},
         "p11scope_env": {

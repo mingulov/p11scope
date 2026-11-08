@@ -2837,12 +2837,13 @@ int main(int argc, char **argv) {
                     + [([f"C_Uncalled_{index}"], 0) for index in range(79)])
                 for row in report["functions"]:
                     get, count = row["names"] == ["C_GetAttributeValue"], row["calls"]
+                    rvs = (0, 17, 18, 336, 5, 1) if get else (0,) if count else ()
                     row.update(forwarding_layer=False,
                                errors=5 if get else 0, pending_returns=0, in_flight=0,
                         latency_ns={"approximate": True, "p50": 1 if count else None, "p95": 1 if count else None,
                                     "p99": 1 if count else None, "total": count, "max": int(count > 0)},
-                        rv_counts=({f"0x{rv:016x}": 1 for rv in (0, 17, 18, 336, 5, 1)} if get
-                                   else {"0x0000000000000000": 1} if count else {}))
+                        rv_counts={f"0x{rv:016x}": 1 for rv in rvs},
+                        rv_names={f"0x{rv:016x}": capture["OBJECT_CANARY_RV_NAMES"][rv] for rv in rvs})
                     if row["names"][0] in ordinals:
                         row["ordinals"] = [{"table_file_offset": None, "ordinal": ordinals[row["names"][0]]}]
                 capture["settle_fixture_verdict"](report)

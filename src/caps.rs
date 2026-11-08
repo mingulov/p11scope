@@ -915,17 +915,21 @@ mod tests {
         assert_eq!(keep_mask_for_command(&parse(&["--version"])), 0);
     }
 
-    /// Scan-only inventory loads no BPF and links nothing, so it keeps
-    /// only the target-read/map-files bits plus `-o` extras, never the
-    /// BPF pair or the singles `SYS_ADMIN` transient.
+    /// Scan-only inventory keeps the BPF pair for the kernel identity
+    /// witness (controller ruling 2026-11-08, r2 F1): the shared scan
+    /// loads the witness for overlay/9p original-file proofs, so
+    /// shedding `CAP_BPF`/`CAP_PERFMON` turns every overlay provider
+    /// into an "identity BPF load refused (permission)" gap — worse
+    /// than v0.6.0, which never shed. Scan keeps the full live set
+    /// exactly like inspect, plus `-o` extras; never the singles
+    /// `SYS_ADMIN` transient.
     #[test]
-    fn scan_inventory_drops_load_and_sys_admin_it_never_uses() {
+    fn scan_inventory_keeps_witness_caps_for_overlay_proofs() {
         let live = minimal_live_mask();
-        let scan_keep = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
         let file_out =
             (1u64 << CAP_CHOWN_BIT) | (1u64 << CAP_DAC_OVERRIDE_BIT) | (1u64 << CAP_FOWNER_BIT);
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
-        // Scan in every scope keeps only target-read/map-files.
+        // Scan in every scope keeps the full live set (r2 F1).
         for argv in [
             vec!["inventory", "--system", "--capture", "scan"],
             vec!["inventory", "--pid", "1", "--capture", "scan"],
@@ -938,11 +942,21 @@ mod tests {
             ],
         ] {
             let mask = keep_mask_for_command(&parse(&argv));
-            assert_eq!(mask, scan_keep, "{argv:?}");
-            assert_eq!(
-                mask & ((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | sys_admin),
+            assert_eq!(mask, live, "{argv:?}");
+            assert_ne!(
+                mask & (1u64 << CAP_BPF_BIT),
                 0,
-                "{argv:?} must not keep load or sys_admin"
+                "{argv:?} must keep CAP_BPF for the witness (r2 F1)"
+            );
+            assert_ne!(
+                mask & (1u64 << CAP_PERFMON_BIT),
+                0,
+                "{argv:?} must keep CAP_PERFMON for the witness (r2 F1)"
+            );
+            assert_eq!(
+                mask & sys_admin,
+                0,
+                "{argv:?} must not keep the singles sys_admin transient"
             );
         }
         // Scan with `-o` adds only file extras.
@@ -955,7 +969,7 @@ mod tests {
                 "-o",
                 "out.json"
             ])),
-            scan_keep | file_out
+            live | file_out
         );
         // Auto/native still need live plus the transient.
         for argv in [
@@ -1113,9 +1127,11 @@ mod tests {
                 "{argv:?} with the minimal set must not keep SYS_ADMIN"
             );
         }
-        // Scan needs map_files only: the DaemonSet lacks
-        // CHECKPOINT_RESTORE, so SYS_ADMIN stays; the minimal set holds
-        // it, so SYS_ADMIN goes.
+        // Scan needs the BPF pair plus map_files exactly like inspect
+        // (controller ruling 2026-11-08, r2 F1: the shared scan loads
+        // the kernel identity witness): the DaemonSet lacks all three,
+        // so SYS_ADMIN stays; the minimal set holds them, so SYS_ADMIN
+        // goes.
         for argv in [
             vec!["inventory", "--system", "--capture", "scan"],
             vec!["inventory", "--pid", "1", "--capture", "scan"],
@@ -1124,7 +1140,7 @@ mod tests {
             assert_ne!(
                 keep_mask_for_command_in(daemonset, &command) & sys_admin,
                 0,
-                "{argv:?} under the DaemonSet set must keep SYS_ADMIN for map_files"
+                "{argv:?} under the DaemonSet set must keep SYS_ADMIN for the witness"
             );
             assert_eq!(
                 keep_mask_for_command_in(live, &command) & sys_admin,
@@ -1132,25 +1148,25 @@ mod tests {
                 "{argv:?} with the minimal set must not keep SYS_ADMIN"
             );
         }
-        // The distinguishing twin: a set that holds map_files but lacks
-        // the BPF pair must keep SYS_ADMIN for inspect (the witness load
-        // needs the pair, F2) but not for scan (map_files only).
+        // Scan keeps the witness BPF pair exactly like inspect
+        // (controller ruling 2026-11-08, r2 F1): a set that holds
+        // map_files but lacks the BPF pair must keep SYS_ADMIN for
+        // both inspect (F2) and scan (r2 F1), the only grant the
+        // kernel accepts for the witness load.
         let no_bpf = live & !(1u64 << CAP_BPF_BIT);
-        for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
+        for argv in [
+            vec!["inspect", "--pid", "1"],
+            vec!["inspect", "--system"],
+            vec!["inventory", "--system", "--capture", "scan"],
+            vec!["inventory", "--pid", "1", "--capture", "scan"],
+        ] {
             let command = parse(&argv);
             assert_ne!(
                 keep_mask_for_command_in(no_bpf, &command) & sys_admin,
                 0,
-                "{argv:?} without CAP_BPF must keep SYS_ADMIN for the witness (F2)"
+                "{argv:?} without CAP_BPF must keep SYS_ADMIN for the witness"
             );
         }
-        let argv = vec!["inventory", "--system", "--capture", "scan"];
-        let command = parse(&argv);
-        assert_eq!(
-            keep_mask_for_command_in(no_bpf, &command) & sys_admin,
-            0,
-            "{argv:?} without CAP_BPF must not keep SYS_ADMIN (map_files held)"
-        );
         // Live `--system` capture keeps SYS_ADMIN either way (the singles
         // fallback), so the DaemonSet twin pins the kept bit.
         for argv in [

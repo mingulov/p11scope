@@ -702,10 +702,10 @@ pub(crate) fn read_comm(pid: u32) -> Option<String> {
     Some(text.trim_end_matches(['\n', '\0']).to_string())
 }
 
-/// Bounded prefix of `/proc/<pid>/cmdline` (at most
+/// One bounded `/proc/<pid>/cmdline` prefix read (at most
 /// `CMDLINE_PREFIX_BYTES` plus one probe byte). The whole file is never
 /// loaded: argv can approach `ARG_MAX`.
-pub(crate) fn read_cmdline_prefix(pid: u32) -> Option<Vec<u8>> {
+fn read_cmdline_once(pid: u32) -> Option<Vec<u8>> {
     use std::io::Read as _;
     let file = std::fs::File::open(format!("/proc/{pid}/cmdline")).ok()?;
     let mut prefix = Vec::new();
@@ -714,6 +714,23 @@ pub(crate) fn read_cmdline_prefix(pid: u32) -> Option<Vec<u8>> {
         .ok()?;
     prefix.truncate(CMDLINE_PREFIX_BYTES);
     Some(prefix)
+}
+
+/// Agreeing pair of cmdline reads, else nothing: one sample is
+/// several `read()` calls, so a title rewrite landing mid-sample can
+/// tear original argv bytes and title bytes into one token. Two
+/// byte-equal samples prove the title was stable across the reads.
+fn stable_cmdline_sample(
+    first: Option<Vec<u8>>,
+    _second: Option<Vec<u8>>,
+) -> Option<Vec<u8>> {
+    first
+}
+
+/// Bounded prefix of `/proc/<pid>/cmdline`, sampled twice: the two
+/// samples must agree byte for byte, else there is no usable sample.
+pub(crate) fn read_cmdline_prefix(pid: u32) -> Option<Vec<u8>> {
+    stable_cmdline_sample(read_cmdline_once(pid), read_cmdline_once(pid))
 }
 
 /// `/proc/<pid>/cgroup` text, defensively bounded (the file is a few

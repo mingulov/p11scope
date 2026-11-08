@@ -358,7 +358,7 @@ primary count, entry observation, saturation/inflight, capture, presence,
 coverage/loss and settlement facts after normalizing run-local IDs/timestamps.
 Both legs must validate the same startup disposition; counts compare exactly
 with no replacement. Each run has an explicit900s bound; the pair runs at its
-declared accelerated cadence (R-17):250ms for the pid cell,10ms for the
+declared accelerated cadence (R-17):250ms for the pid cell,50ms for the
 system cell (whole-machine scan load), about12minutes per pid cell (two
 ~6-minute legs) and about27minutes per system cell on the reference host.
 This qualifies wrapping at the declared

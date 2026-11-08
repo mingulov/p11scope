@@ -14,7 +14,7 @@ const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Parameterized wrap schedule: `counted` A rounds, `shared` shared rounds,
 /// then the fence/proof pair. The G21 wrap gate runs `WRAP_SCHEDULE` at the
-/// declared accelerated cadences (250ms pid / 10ms system, R-17); the short
+/// declared accelerated cadences (250ms pid / 50ms system, R-17); the short
 /// full-transition pilot runs `PILOT_SCHEDULE` (32/4/540s) at default cadence
 /// and default diagnostic capacities. The pilot makes no wrap claim: it
 /// measures settling, gap shapes and footer production. Every validator that
@@ -61,7 +61,7 @@ const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
 /// whole machine per pass, so it uses a faster cadence to fit the same 900 s
 /// per-leg bound; both cadences are declared up front per run.
 const WRAP_PID_POLL_INTERVAL_MS: u64 = 250;
-const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 10;
+const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 50;
 
 /// Workload trailing CLI arguments `[NONCE, DEADLINE_MS, COUNTED, SHARED]`
 /// for a schedule, with the fixture binary's own bounds enforced first
@@ -4971,9 +4971,9 @@ fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Resu
 
 /// Bounded system wrap pair (cell 3): the identical 32-object schedule
 /// under unfiltered system capture, with owned-caller validators and
-/// the same strict paired off/on parity, at the declared 10ms cadence.
+/// the same strict paired off/on parity, at the declared 50ms cadence.
 #[test]
-#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 10ms cadence"]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 50ms cadence"]
 fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
     with_wrap_cadence(WRAP_SYSTEM_POLL_INTERVAL_MS, || {
         let (disabled, dk) = run_wrap_system(false)?;

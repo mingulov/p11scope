@@ -1320,7 +1320,7 @@
     {
       "file": "src/inventory/privileged_tests/operator_diagnostics_wrap.rs",
       "path": "inventory::privileged_tests::operator_diagnostics_wrap::privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64",
-      "reason": "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 10ms cadence",
+      "reason": "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 50ms cadence",
       "cell": "privileged"
     },
     {

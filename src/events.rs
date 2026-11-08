@@ -507,7 +507,8 @@ enum StagedItem {
 ///   exactly; malformed counts at decode, never at staging;
 /// - the move stops at the entry/byte caps (the ring keeps the rest,
 ///   reported as saturation) and never past `stop` when bounded, so a
-///   finish restages only pre-Q bytes and post-Q commits still flag.
+///   bounded move stages only pre-Q bytes while post-Q commits still
+///   flag.
 ///
 /// Public because the public [`OwnedDrain`] names it; construction and
 /// staging stay crate-private.
@@ -2540,7 +2541,7 @@ mod tests {
     }
 
     #[test]
-    fn staged_events_stop_bounds_finish_restage() {
+    fn staged_events_stop_bounds_staging() {
         // Six scripted records end at byte offset 48; the stop bounds
         // the move there without tripping saturation.
         let pushed: Vec<Vec<u8>> = (0..6).map(numbered_call).collect();

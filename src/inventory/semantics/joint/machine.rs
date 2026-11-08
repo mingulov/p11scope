@@ -458,8 +458,8 @@ pub(crate) trait JointMachineIo {
         work: usize,
     ) -> Result<DispatchPoll, RawQuantumRefusal>;
     /// Drain up to `quantum` EVENTS records off the kernel ring into the
-    /// lane's bounded userspace staging queue, never past `stop` when the
-    /// finish bounds the move. The machine service calls this on every
+    /// lane's bounded userspace staging queue, never past `stop` when a
+    /// stop bounds the move. The machine service calls this on every
     /// service, whatever the seal state, so a seal awaiting future input
     /// or a binding never wedges the ring behind it; collection consumes
     /// the queue first. The default stages nothing (existing scripted
@@ -1750,7 +1750,9 @@ impl LiveJointMachine {
                 return Ok(JointCommitProgress::Pending);
             }
         }
-        stage_events_ahead(io, lane, coordinator, budget, Some(q.events_stop()));
+        // No restage here: the finish gated the lane before Q and the
+        // producers are already gated, so there is no ring pressure
+        // during finish; the bounded drain below consumes directly.
         while budget.available() {
             // The owned Finish guard above permits only its first genuine
             // Raw-minted grant after an observed None. Q itself stays

@@ -125,6 +125,22 @@ probe_module() {
 }
 MODULE=${MODULE:-$(probe_module)}
 
+# Spy coverage helpers: coverage-only, not count-exact. Count agreement
+# vs the spy ground-truth total uses an explicit ±8 pre-STOP sneak budget
+# (fail closed beyond it), checked post-hoc in the notes; the historical
+# spy exact column records coverage only. Lossy or non-COMPLETE coverage
+# is never exact (fail closed).
+spy_inv_exact() {
+    case "$1" in *"state=counted"*) ;; *) return 1;; esac
+    case "$1" in *"lossy=False"*) return 0;; *) return 1;; esac
+}
+spy_metrics_exact() {
+    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
+}
+spy_trace_exact() {
+    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
+}
+
 usage() { echo "usage: PARTS='percall ramp ceiling spy' P11SCOPE=... DISCOVER=... $0 [--self-test]" >&2; }
 
 # --- wait helpers (same gates as bench-overhead.sh) ---
@@ -597,7 +613,16 @@ def cmd_tracetotal(path):
     except OSError as e: return fail(f"unreadable trace {path}: {e}")
     m = re.search(r"COUNT_EVIDENCE[^\n]*?\"raw_calls\"\s*[:=]\s*(\d+)", text)
     if not m: return fail("trace has no COUNT_EVIDENCE raw_calls")
-    print(f"raw_calls={m.group(1)}")
+    ev_loss, compl = "?", "?"
+    em = re.search(r"^EVIDENCE (\{.*\})$", text, re.M)
+    if em:
+        try:
+            ev = json.loads(em.group(1))
+            ev_loss = ev.get("event_loss", "?")
+            compl = ev.get("completeness", "?")
+        except ValueError:
+            pass
+    print(f"raw_calls={m.group(1)} event_loss={ev_loss} completeness={compl}")
     return VALID
 
 def cmd_invcount(path, pid, module_path):
@@ -1752,20 +1777,6 @@ primary_substr() {
         aes) echo "CKM_AES_ECB) using aes-128" ;;
         *) echo "unknown coverage $1" >&2; return 1 ;;
     esac
-}
-
-# Spy coverage helpers: coverage-only, not count-exact. Count agreement
-# vs the spy ground-truth total uses an explicit ±8 pre-STOP sneak budget
-# (fail closed beyond it), checked post-hoc in the notes; the historical
-# spy exact column records coverage only.
-spy_inv_exact() {
-    case "$1" in *"state=counted"*) return 0;; *) return 1;; esac
-}
-spy_metrics_exact() {
-    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
-}
-spy_trace_exact() {
-    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
 }
 
 # sample_spy <tag> <config> <cov> <threads>

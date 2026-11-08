@@ -641,21 +641,42 @@ fn calibration_backing_accepted_with(
         }
     };
     let merged = std::fs::canonicalize(merged).unwrap_or_else(|_| merged.to_path_buf());
-    // One backing file's inode, read without following symlinks: only a
-    // regular layer file counts as an existing entry.
-    fn backing_ino(path: &std::path::Path) -> Option<u64> {
+    // One layer entry's backing inode: `Ok(None)` when the layer holds
+    // no entry at all, `Ok(Some)` for a regular file, `Err` for a
+    // non-regular entry (whiteout, symlink, directory) — the topmost
+    // existing entry selects the backing file, so a non-regular topmost
+    // entry refuses instead of falling through. Read with
+    // `symlink_metadata`, which only skips the last path component;
+    // intermediate symlinks are still followed.
+    fn layer_entry(path: &std::path::Path) -> Result<Option<u64>, ()> {
         use std::os::unix::fs::MetadataExt as _;
-        std::fs::symlink_metadata(path)
-            .ok()
-            .filter(|meta| meta.file_type().is_file())
-            .map(|meta| meta.ino())
+        let meta = match std::fs::symlink_metadata(path) {
+            Ok(meta) => meta,
+            Err(_) => return Ok(None),
+        };
+        if meta.file_type().is_file() {
+            Ok(Some(meta.ino()))
+        } else {
+            Err(())
+        }
     }
     let upper = crate::discovery::scan::upper_candidate_from_mountinfo(table, &merged);
-    let upper_ino = upper.as_deref().and_then(backing_ino);
-    let lower_ino = crate::discovery::scan::lower_candidates_from_mountinfo(table, &merged)
-        .iter()
-        .filter_map(|candidate| backing_ino(candidate))
-        .next();
+    let upper_ino = match upper.as_deref().map(layer_entry) {
+        None | Some(Ok(None)) => None,
+        Some(Ok(Some(ino))) => Some(ino),
+        Some(Err(())) => return false,
+    };
+    let mut lower_ino = None;
+    for candidate in crate::discovery::scan::lower_candidates_from_mountinfo(table, &merged) {
+        match layer_entry(&candidate) {
+            Ok(None) => continue,
+            Ok(Some(ino)) => {
+                lower_ino = Some(ino);
+                break;
+            }
+            Err(()) => return false,
+        }
+    }
     match (upper_ino, lower_ino) {
         // The topmost existing entry selects the backing file.
         (Some(upper), _) if slot_ino == upper => true,

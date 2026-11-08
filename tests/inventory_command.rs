@@ -1938,3 +1938,197 @@ fn event_log_dash_with_closed_stdout_discards_the_stream_and_succeeds() {
         "no open failure: {stderr}"
     );
 }
+
+/// A `-v` summary larger than 64 KiB under `--event-log -` arrives
+/// on stderr byte-identical to the plain-stdout run: the move uses
+/// the same bounded rule as stdout, not a truncated diagnostic.
+#[test]
+fn event_log_dash_moves_large_verbose_summary_to_stderr_byte_identical() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-stderr-large");
+    let driver = gcc(
+        &dir,
+        "large-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let template = gcc(
+        &dir,
+        "large-template.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let many = dir.join("many");
+    std::fs::create_dir_all(&many).unwrap();
+    let mut providers = Vec::new();
+    for index in 0..150 {
+        let dest = many.join(format!("prov-{index:03}.so"));
+        std::fs::copy(&template, &dest).unwrap();
+        providers.push(dest);
+    }
+    let ready = dir.join("large.ready");
+    let child = Command::new(&driver)
+        .arg("--ready")
+        .arg(&ready)
+        .arg("--call")
+        .arg("--sleep")
+        .arg("60")
+        .args(&providers)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let mut live = LiveDriver {
+        child: Some(child),
+        pid: 0,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&ready)
+            && let Some(pid) = text.split_whitespace().nth(1)
+        {
+            break pid.parse::<u32>().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    {
+        let child = live.child.as_mut().expect("the driver owns its child");
+        assert_eq!(pid, child.id(), "ready pid is the spawned driver");
+    }
+    live.pid = pid;
+    let pid_text = pid.to_string();
+    // Plain run: the summary owns stdout.
+    let plain = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", &pid_text, "--capture", "scan", "-v"])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        plain.status.success(),
+        "plain run failed: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+    assert!(
+        plain.stdout.len() > 65536,
+        "the fixture must exceed one sink buffer: {} bytes",
+        plain.stdout.len()
+    );
+    // Moved run: events own stdout, the summary moves to stderr.
+    let moved = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args([
+            "inventory",
+            "--pid",
+            &pid_text,
+            "--capture",
+            "scan",
+            "-v",
+            "--event-log",
+            "-",
+        ])
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert!(
+        moved.status.success(),
+        "moved run failed: {}",
+        String::from_utf8_lossy(&moved.stderr)
+    );
+    let body = String::from_utf8(moved.stdout).unwrap();
+    assert!(body.lines().count() >= 3, "started, a pass marker and ended");
+    let stderr = String::from_utf8(moved.stderr).unwrap();
+    let marker = format!("inventory pid:{pid} (");
+    let start = stderr
+        .find(&marker)
+        .expect("the text summary moved to stderr");
+    assert_eq!(
+        stderr[start..].as_bytes(),
+        plain.stdout.as_slice(),
+        "the moved summary is byte-identical to the plain run"
+    );
+}
+
+/// A failed stderr move fails the command: with stderr refusing
+/// bytes (`/dev/full`), the run exits 1 and still commits `-o`.
+#[test]
+fn event_log_dash_stderr_move_failure_fails_the_command() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-event-stderr-full");
+    let ready = dir.join("full.ready");
+    let driver = gcc(
+        &dir,
+        "full-driver",
+        &fixture_source("catalog-driver.c"),
+        &["-O2", "-Wall", "-Wextra", "-Werror"],
+        &["-ldl"],
+    );
+    let prov = gcc(
+        &dir,
+        "full-prov.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let child = Command::new(&driver)
+        .arg("--ready")
+        .arg(&ready)
+        .arg("--call")
+        .arg("--sleep")
+        .arg("60")
+        .arg(&prov)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let mut live = LiveDriver {
+        child: Some(child),
+        pid: 0,
+    };
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let pid = loop {
+        if let Ok(text) = std::fs::read_to_string(&ready)
+            && let Some(pid) = text.split_whitespace().nth(1)
+        {
+            break pid.parse::<u32>().unwrap();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "fixture never became ready"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    {
+        let child = live.child.as_mut().expect("the driver owns its child");
+        assert_eq!(pid, child.id(), "ready pid is the spawned driver");
+    }
+    live.pid = pid;
+    let private = private_dir();
+    let document_path = private.path().join("full.json");
+    let stream_path = dir.join("full.jsonl");
+    let stream_out = std::fs::File::create(&stream_path).unwrap();
+    let full = std::fs::File::create("/dev/full").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_p11scope"))
+        .args(["inventory", "--pid", &pid.to_string(), "--capture", "scan"])
+        .arg("-o")
+        .arg(&document_path)
+        .arg("--event-log")
+        .arg("-")
+        .stdin(Stdio::null())
+        .stdout(stream_out)
+        .stderr(full)
+        .status()
+        .unwrap();
+    assert_eq!(status.code(), Some(1), "a failed move exits 1");
+    let doc: Value =
+        serde_json::from_str(&std::fs::read_to_string(&document_path).unwrap()).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+}

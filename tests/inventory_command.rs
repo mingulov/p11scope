@@ -1847,6 +1847,11 @@ fn event_interval_adds_periodic_totals_to_the_file_stream() {
             pass,
             "totals.pass trails its pass_committed: {line} vs {marker}"
         );
+        assert_eq!(
+            line["event"]["passes"].as_u64().unwrap(),
+            pass + 1,
+            "totals.passes counts completed passes: {line}"
+        );
         last_pass = pass;
         let at_ns = line["at_ns"].as_u64().unwrap();
         if last_at != 0 {

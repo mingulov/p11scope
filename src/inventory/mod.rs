@@ -7673,6 +7673,7 @@ pub(crate) fn emit_pass_events(
 fn emit_totals_if_due(
     writer: &mut EventWriter,
     state: &mut StreamState,
+    report_pass: u64,
     presentation: &Presentation,
     now_ns: u64,
 ) -> Result<bool, String> {
@@ -7683,8 +7684,12 @@ fn emit_totals_if_due(
     if !due {
         return Ok(false);
     }
-    let payload =
-        crate::inventory_events::totals_payload(presentation, &state.last_deferred, writer);
+    let payload = crate::inventory_events::totals_payload(
+        report_pass,
+        presentation,
+        &state.last_deferred,
+        writer,
+    );
     writer.append("totals", payload, now_ns)?;
     if let Some(cadence) = state.totals.as_mut() {
         cadence.mark_emitted(now_ns);
@@ -7768,7 +7773,7 @@ fn emit_commit(
         key_operation_events: key_operations.deferred as u64,
     };
     if !stop {
-        emit_totals_if_due(writer, state, presentation, now_ns)?;
+        emit_totals_if_due(writer, state, report.pass, presentation, now_ns)?;
     }
     Ok(())
 }
@@ -11489,7 +11494,9 @@ mod tests {
     }
 
     /// One fake-clock pass through the real commit path, for totals
-    /// cadence tests: no threads, no sleeps, just `now_ns`.
+    /// cadence tests: no threads, no sleeps, just `now_ns`. The
+    /// presentation carries `pass + 1` completed passes, as
+    /// production's `coordinator.passes()` does after pass `pass`.
     fn totals_test_pass(
         writer: &mut EventWriter,
         state: &mut StreamState,
@@ -11497,7 +11504,7 @@ mod tests {
         pass: u64,
         now_ns: u64,
     ) {
-        let presentation = Presentation::capture(coordinator, "system", 1, now_ns, pass);
+        let presentation = Presentation::capture(coordinator, "system", 1, now_ns, pass + 1);
         let report = PassReport {
             pass,
             scanned: 1,
@@ -11551,6 +11558,8 @@ mod tests {
         }
         assert_eq!(totals[0].1["event"]["pass"], 10);
         assert_eq!(totals[1].1["event"]["pass"], 20);
+        assert_eq!(totals[0].1["event"]["passes"], 11);
+        assert_eq!(totals[1].1["event"]["passes"], 21);
         for (index, line) in &totals {
             let marker = &lines[index - 1];
             assert_eq!(
@@ -11576,9 +11585,11 @@ mod tests {
             semantic_edge_events: 7,
             key_operation_events: 11,
         };
-        let totals = crate::inventory_events::totals_payload(&presentation, &deferred, &writer);
+        let totals = crate::inventory_events::totals_payload(0, &presentation, &deferred, &writer);
         // Every section mirrors a count the report already carries.
-        assert_eq!(totals["pass"], presentation.passes);
+        // `pass` trails the pass marker; `passes` counts completed passes.
+        assert_eq!(totals["pass"], 0);
+        assert_eq!(totals["passes"], presentation.passes);
         assert_eq!(totals["callers"], presentation.callers.len() as u64);
         assert_eq!(totals["modules"], presentation.modules.len() as u64);
         assert_eq!(totals["edges"], presentation.edges.len() as u64);
@@ -11662,6 +11673,7 @@ mod tests {
         assert_eq!(totals.len(), 1);
         assert_eq!(totals[0]["schema"], "p11scope/inventory-events/v1");
         assert_eq!(totals[0]["event"]["pass"], 10);
+        assert_eq!(totals[0]["event"]["passes"], 11);
     }
 
     #[test]

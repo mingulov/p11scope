@@ -2828,8 +2828,11 @@ pub(crate) struct DeferredCounts {
 /// The periodic `totals` payload: the current report-summary counts
 /// (callers, modules, edges, entries, key rows, coverage), the
 /// emitter deferred queues, and the writer accounting — all values
-/// the report already carries, as a mid-run snapshot.
+/// the report already carries, as a mid-run snapshot. `pass` is the
+/// trailing pass number (the preceding `pass_committed`'s `pass`);
+/// `passes` is the completed-pass count, matching `ended`.
 pub(crate) fn totals_payload(
+    pass: u64,
     presentation: &Presentation,
     deferred: &DeferredCounts,
     writer: &EventWriter,
@@ -2838,7 +2841,8 @@ pub(crate) fn totals_payload(
     let (logical, forwarding) = layer_entry_totals(presentation);
     let (stdout_lines, stdout_bytes) = writer.stdout_lost();
     serde_json::json!({
-        "pass": presentation.passes,
+        "pass": pass,
+        "passes": presentation.passes,
         "callers": presentation.callers.len(),
         "modules": presentation.modules.len(),
         "edges": presentation.edges.len(),

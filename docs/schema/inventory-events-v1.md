@@ -169,24 +169,26 @@ Every line carries the same envelope plus its `kind`-specific `event`:
   below it), `object_status` (that publication's status) and the
   additive `object_version` (that publication's H9 section version;
   absent means 1). Consumers refuse unknown versions.
-- `totals` (additive): `{pass, callers, modules, edges, instances,
-  semantic_edges, gaps, gaps_suppressed, refusals, entries: {logical,
-  forwarding}, key_operations: {revision, status, objects, known_rows,
-  unknown_rows}, deferred: {edge_events, instance_events,
-  semantic_edge_events, key_operation_events}, stream: {rotations,
-  evicted_events, evicted_bytes}, stdout_lost: {lines, bytes}}` — a
-  periodic snapshot of the current report-summary counts, emitted
-  behind `--event-interval` (off by default) on file and stdout
-  sinks alike. Every count mirrors a value the report already
-  carries: the section lengths, the coverage line, the layer entry
-  totals, the key-operation row counts, the emitter deferred queues
-  still waiting after the commit, and the writer accounting. At most
-  one per pass, trailing its `pass_committed`; the cadence is
-  phase-locked to actual emissions (a late pass moves the next due
-  date by one interval instead of bursting catch-ups), rides the
-  existing pass ticks with no new thread, and never delays stop. The
-  stop commit emits none: `ended` and the final report already carry
-  the final counts.
+- `totals` (additive): `{pass, passes, callers, modules, edges,
+  instances, semantic_edges, gaps, gaps_suppressed, refusals,
+  entries: {logical, forwarding}, key_operations: {revision, status,
+  objects, known_rows, unknown_rows}, deferred: {edge_events,
+  instance_events, semantic_edge_events, key_operation_events},
+  stream: {rotations, evicted_events, evicted_bytes}, stdout_lost:
+  {lines, bytes}}` — a periodic snapshot of the current
+  report-summary counts, emitted behind `--event-interval` (off by
+  default) on file and stdout sinks alike. `pass` is the trailing
+  pass number (the preceding `pass_committed`'s `pass`); `passes` is
+  the completed-pass count, matching `ended`. Every count mirrors a
+  value the report already carries: the section lengths, the coverage
+  line, the layer entry totals, the key-operation row counts, the
+  emitter deferred queues still waiting after the commit, and the
+  writer accounting. At most one per pass, trailing its
+  `pass_committed`; the cadence is phase-locked to actual emissions
+  (a late pass moves the next due date by one interval instead of
+  bursting catch-ups), rides the existing pass ticks with no new
+  thread, and never delays stop. The stop commit emits none: `ended`
+  and the final report already carry the final counts.
 - `edge_observed`: one edge as the snapshot `edges[]` entry verbatim,
   plus the three derived presentation states `presence`, `capture`,
   `activity` and additive `identity_context` — computed from the same model the dashboard renders,

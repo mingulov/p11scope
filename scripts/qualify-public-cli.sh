@@ -485,6 +485,10 @@ assert 1 <= len(totals) <= 4, "totals count %d" % len(totals)
 last_at = 0
 for row in totals:
     assert row["event"]["pass"] >= 1, row
+    position = stream.index(row)
+    marker = [r for r in stream[:position] if r["kind"] == "pass_committed"][-1]["event"]
+    assert marker["pass"] == row["event"]["pass"], (marker["pass"], row["event"])
+    assert row["event"]["passes"] == row["event"]["pass"] + 1, row["event"]
     if last_at:
         assert row["at_ns"] - last_at >= 2_000_000_000, row
     last_at = row["at_ns"]

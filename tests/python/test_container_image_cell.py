@@ -235,6 +235,48 @@ class ContainerImageCellTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, text)
 
+    def test_observer_build_pulls_every_pinned_base(self):
+        # The release Dockerfile has one FROM per stage; the cell must pull
+        # each unique digest-pinned base instead of demanding a single FROM.
+        # Runs the real script copy up to the pull (truncated there: the legs
+        # need a daemon) with stub docker/file and real coreutils.
+        (self.fake / "deploy").mkdir()
+        shutil.copy2(ROOT / "deploy/Dockerfile.observer-release",
+                     self.fake / "deploy/Dockerfile.observer-release")
+        shutil.copy2(ROOT / "LICENSE", self.fake / "LICENSE")
+        (self.fake / "LICENSES").mkdir()
+        for text in (ROOT / "LICENSES").glob("*.txt"):
+            shutil.copy2(text, self.fake / "LICENSES" / text.name)
+        shutil.copy2(ROOT / "scripts/k8s-profile-entry.sh",
+                     self.fake / "scripts/k8s-profile-entry.sh")
+        anchor = 'OBS_IMAGE="p11scope-container-observer:$RUN_ID"'
+        script = self.entry.read_text()
+        self.assertEqual(script.count(anchor), 1, "the pull seam moved")
+        self.entry.write_text(script.replace(
+            anchor, "exit 0 # TRUNCATED BY TEST at the pull seam\n" + anchor))
+        for name in ("sha256sum", "cp", "tar", "gzip", "cut", "tee", "sed",
+                     "awk", "sort", "xargs", "timeout"):
+            target = shutil.which(name)
+            self.assertIsNotNone(target, f"host lacks coreutil {name}")
+            (self.tools / name).symlink_to(target)
+        # Any host timeout runs the pull here: the stub exits at once, so
+        # the GNU-vs-uutils stop-forwarding difference never manifests.
+        self.write_stub("file", "#!/bin/sh\necho 'static-pie linked'\n")
+        calls = self.base / "docker-calls.log"
+        self.write_stub("docker", "#!/bin/sh\necho \"docker $*\" >>\"$FAKE_CALLS\"\nexit 0\n")
+        result = self.run_cell("--observer-bin", str(self.observer),
+                               "--out", str(self.outdir),
+                               env={"FAKE_CALLS": str(calls)})
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+        bases = {line.split()[1] for line in
+                 (ROOT / "deploy/Dockerfile.observer-release").read_text().splitlines()
+                 if line.startswith("FROM ")}
+        self.assertEqual(len(bases), 1, "the stages share one pinned base")
+        pulls = [line for line in calls.read_text().splitlines()
+                 if line.startswith("docker pull ")]
+        self.assertEqual(pulls, [f"docker pull {bases.pop()}"],
+                         "each unique base is pulled exactly once")
+
     def test_observer_build_uses_the_release_dockerfile_from_a_tarball(self):
         # The cell qualifies the exact release recipe: --observer-bin packs
         # its binary into a tarball and builds deploy/Dockerfile.observer-release

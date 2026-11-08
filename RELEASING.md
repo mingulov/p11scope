@@ -58,7 +58,9 @@ describing an old CI run as an exact-new-commit result.
   an ancestor of that branch, use a fast-forward to preserve the candidate
   commit. A merge commit, squash, rebase or history rewrite changes its
   identity; reconcile source-bound receipts and run the affected gates on
-  the final commit before tagging.
+  the final commit before tagging. Exception (REL-1): a `main` join commit
+  whose tree equals the qualified candidate's tree keeps the candidate's
+  gated identity, so the gates that ran on the candidate still cover it.
   The tree must be clean, including untracked files:
   `git status --porcelain=v1 --untracked-files=all` prints nothing.
 - Confirm the versions: `Cargo.toml` and `crates/discover/Cargo.toml` both
@@ -506,18 +508,20 @@ Record commands and outcomes before claiming any recipient build passed.
 
 ## 7. Tag
 
-On the commit that steps 3–6 ran on:
+On the commit to tag: the candidate from steps 3–6, or under REL-1 the
+`main` join commit
+`git commit-tree <candidate>^{tree} -p main -p <candidate>`:
 
 1. Check that the tag commit's tree equals the `tree` fact in the receipt's
    `facts.log` and the source export's recorded tree, that the packaged
    `head` is an ancestor of the tag commit, and that the green CI run from
-   step 3 covered this source. Verify the package bundles contain the
-   binaries from that receipt and that `SHA256SUMS` matches the files to
-   upload.
+   step 3 passed on the packaged `head` SHA. Verify the package bundles
+   contain the binaries from that receipt and that `SHA256SUMS` matches
+   the files to upload.
 2. Create an annotated (optionally signed) tag and push `main` and the tag:
 
    ```sh
-   git tag -a v0.5.0 -m 'p11scope v0.5.0'    # or -s to sign
+   git tag -a v0.5.0 <tag-commit> -m 'p11scope v0.5.0'    # or -s to sign
    git push origin main v0.5.0
    ```
 
@@ -543,8 +547,10 @@ On the commit that steps 3–6 ran on:
    tarball, `SHA256SUMS` and `RELEASE.json` for the tag, verifies the
    tarball and `RELEASE.json` lines explicitly, and asserts the
    `RELEASE.json` tree against the tag commit's tree, the head as an
-   ancestor of the tag commit, and the version against the tag,
-   then builds `p11scope-observer:preview` from the verified tarball with
+   ancestor of the tag commit, and the version against the tag, binds the
+   packaged head to that tree, and refuses absolute or parent-climbing
+   tarball members, then builds `p11scope-observer:preview` from the
+   verified tarball with
    `deploy/Dockerfile.observer-release` (`--network=none`), smokes it
    (`--version` matched to the tag, `doctor`, `inventory --system`) and
    proves capture on the built bytes with the permanent cell. On a final

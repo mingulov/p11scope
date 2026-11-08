@@ -5,7 +5,37 @@
 import json
 import os
 from pathlib import Path
+import struct
 import sys
+
+
+def elf_object(sections):
+    """A minimal 64-bit little-endian relocatable for section-shape tests."""
+    names = list(sections)
+    shstrtab = b"\x00"
+    offsets = {}
+    for name in names + [".shstrtab"]:
+        offsets[name] = len(shstrtab)
+        shstrtab += name.encode("ascii") + b"\x00"
+    blob = bytearray(b"\x7fELF\x02\x01\x01\x00" + b"\x00" * 8)
+    blob += struct.pack("<HHIQQQIHHHHHH", 1, 247, 1, 0, 0, 0, 0, 64, 0, 0, 64, 0, 0)
+    bodies = {name: sections[name] for name in names}
+    bodies[".shstrtab"] = shstrtab
+    layout = {}
+    for name, body in bodies.items():
+        layout[name] = (len(blob), len(body))
+        blob += body
+    headers = [b"\x00" * 64]
+    for name in list(bodies):
+        offset, size = layout[name]
+        headers.append(struct.pack("<IIQQQQIIQQ", offsets[name], 1, 0, 0, offset, size,
+                                   0, 0, 1, 0))
+    blob += b"".join(headers)
+    struct.pack_into("<Q", blob, 0x28, len(blob) - 64 * len(headers))
+    struct.pack_into("<H", blob, 0x3C, len(headers))
+    struct.pack_into("<H", blob, 0x3E, len(headers) - 1)
+    return bytes(blob)
+
 
 tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
@@ -109,7 +139,10 @@ elif tool == "cargo" and "build" in args:
             payload += str(manifest).encode()
         if name == control.get("mutate_flavor"):
             payload += (cwd / "object-source").read_bytes()
-        (out / name).write_bytes(payload)
+        if control.get("elf_objects") and name == control.get("mutate_flavor"):
+            (out / name).write_bytes(elf_object({".text": payload, ".maps": b"mapsmaps"}))
+        else:
+            (out / name).write_bytes(payload)
     if control.get("output") == "empty":
         (out / names[0]).write_bytes(b"")
     if control.get("output") == "missing":

@@ -6,7 +6,6 @@ The Git snapshots and filesystem operations are real. Only the expensive
 external compiler/Cargo commands use tiny command fixtures.
 """
 
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -344,7 +343,13 @@ class CanonicalBtfTests(unittest.TestCase):
 
 
 class AllowedChangeTests(unittest.TestCase):
-    """The reviewed allowed-change record: strict load, content matching."""
+    """The reviewed allowed-change record: strict load, shape matching.
+
+    Disambiguator hashes vary across runs (Cargo bakes the work path into
+    -C metadata), so the record pins the run-independent diff shape:
+    per-section size deltas plus added and removed sections, with every
+    other object byte-identical within the run.
+    """
 
     def setUp(self):
         self.assertTrue(SCRIPT.is_file(), "the noninterference driver is missing")
@@ -354,30 +359,31 @@ class AllowedChangeTests(unittest.TestCase):
         self.root = Path(self.temporary.name)
         self.repo = self.root / "repo"
         self.repo.mkdir()
-        self.baseline = self.objects("baseline", b"baseline bytes")
-        self.candidate = self.objects("candidate", b"candidate bytes")
+        self.counter = 0
 
-    def objects(self, directory, payload):
-        parent = self.root / directory
-        parent.mkdir()
-        result = {}
-        for index, name in enumerate(NAMES):
-            result[name] = parent / name
-            result[name].write_bytes(payload + bytes([index]))
-        return result
-
-    def triple(self, objects):
-        return {name: {"sha256": hashlib.sha256(objects[name].read_bytes()).hexdigest(),
-                       "size": objects[name].stat().st_size}
-                for name in NAMES}
+    def pair(self, base_sections, cand_sections, changed=NAMES[0]):
+        """A baseline/candidate triple differing only in one object's sections."""
+        self.counter += 1
+        left, right = {}, {}
+        for name in NAMES:
+            left[name] = self.root / f"baseline-{self.counter}-{name}"
+            right[name] = self.root / f"candidate-{self.counter}-{name}"
+            if name == changed:
+                left[name].write_bytes(CanonicalBtfTests.elf(base_sections))
+                right[name].write_bytes(CanonicalBtfTests.elf(cand_sections))
+            else:
+                blob = CanonicalBtfTests.elf(base_sections)
+                left[name].write_bytes(blob)
+                right[name].write_bytes(blob)
+        return left, right
 
     def entry(self, **overrides):
-        record = {"baseline": self.triple(self.baseline),
-                  "candidate": self.triple(self.candidate),
-                  "lane": "fixture lane",
+        record = {"lane": "fixture lane",
                   "rationale": "fixture rationale",
                   "baseline_revision": "v0.6.0",
-                  "candidate_revision": "fixture candidate"}
+                  "candidate_revision": "fixture candidate",
+                  "identical": [NAMES[1], NAMES[2]],
+                  "changed": {NAMES[0]: {"deltas": {".text": 4}, "added": {}, "removed": []}}}
         record.update(overrides)
         return record
 
@@ -445,6 +451,11 @@ class AllowedChangeTests(unittest.TestCase):
                 with self.assertRaises(self.driver.CheckError):
                     self.load({"version": 1, "transitions": transitions})
 
+    def test_too_many_transitions_are_refused(self):
+        transitions = [self.entry(lane=f"lane-{index}") for index in range(65)]
+        with self.assertRaises(self.driver.CheckError):
+            self.load({"version": 1, "transitions": transitions})
+
     def test_entry_shape_violations_are_refused(self):
         valid = self.entry()
         entries = [{key: value for key, value in valid.items() if key != "lane"},
@@ -455,38 +466,59 @@ class AllowedChangeTests(unittest.TestCase):
                 with self.assertRaises(self.driver.CheckError):
                     self.load({"version": 1, "transitions": [entry]})
 
-    def test_object_map_violations_are_refused(self):
-        valid = self.triple(self.baseline)
-        dropped = {key: value for key, value in valid.items() if key != NAMES[0]}
-        sides = [({"baseline": dropped, "candidate": self.triple(self.candidate)}),
-                 ({"baseline": valid, "candidate": {**self.triple(self.candidate), "extra": valid[NAMES[0]]}}),
-                 ({"baseline": "triple", "candidate": self.triple(self.candidate)}),
-                 ({"baseline": {**valid, NAMES[0]: "object"}, "candidate": self.triple(self.candidate)}),
-                 ({"baseline": {**valid, NAMES[0]: {"sha256": valid[NAMES[0]]["sha256"]}},
-                   "candidate": self.triple(self.candidate)}),
-                 ({"baseline": {**valid, NAMES[0]: {**valid[NAMES[0]], "extra": 1}},
-                   "candidate": self.triple(self.candidate)})]
-        for sides in sides:
-            with self.subTest(sides=sides):
+    def test_partition_violations_are_refused(self):
+        spec = {"deltas": {".text": 4}, "added": {}, "removed": []}
+        cases = [({"identical": [NAMES[0], NAMES[1]],
+                   "changed": {NAMES[0]: spec, NAMES[2]: spec}}),
+                 ({"identical": [NAMES[1]], "changed": {NAMES[2]: spec}}),
+                 ({"identical": ["unknown", NAMES[1]], "changed": {NAMES[0]: spec, NAMES[2]: spec}}),
+                 ({"identical": [NAMES[1], NAMES[1]], "changed": {NAMES[0]: spec, NAMES[2]: spec}}),
+                 ({"identical": NAMES[1], "changed": {NAMES[0]: spec, NAMES[2]: spec}}),
+                 ({"identical": [NAMES[1], NAMES[2]], "changed": [spec]})]
+        for case in cases:
+            with self.subTest(case=case):
                 with self.assertRaises(self.driver.CheckError):
-                    self.load({"version": 1, "transitions": [self.entry(**sides)]})
+                    self.load({"version": 1, "transitions": [self.entry(**case)]})
 
-    def test_digest_and_size_violations_are_refused(self):
-        valid = self.triple(self.baseline)[NAMES[0]]
-        digests = ["0" * 63, valid["sha256"].upper(), "z" * 64, 123]
-        sizes = [0, -5, True, "12"]
-        for digest in digests:
-            with self.subTest(digest=digest):
-                triple = self.triple(self.baseline)
-                triple[NAMES[0]] = {"sha256": digest, "size": valid["size"]}
+    def test_changed_shape_violations_are_refused(self):
+        spec = {"deltas": {".text": 4}, "added": {}, "removed": []}
+        cases = [({"identical": [NAMES[0], NAMES[1], NAMES[2]], "changed": {}}),
+                 ({"identical": [NAMES[1], NAMES[2]], "changed": {"unknown": spec}}),
+                 ({"identical": [NAMES[1], NAMES[2]], "changed": {NAMES[0]: "spec"}}),
+                 ({"identical": [NAMES[1], NAMES[2]],
+                   "changed": {NAMES[0]: {"added": {}, "removed": []}}}),
+                 ({"identical": [NAMES[1], NAMES[2]],
+                   "changed": {NAMES[0]: {**spec, "extra": 1}}})]
+        for case in cases:
+            with self.subTest(case=case):
                 with self.assertRaises(self.driver.CheckError):
-                    self.load({"version": 1, "transitions": [self.entry(baseline=triple)]})
-        for size in sizes:
-            with self.subTest(size=size):
-                triple = self.triple(self.baseline)
-                triple[NAMES[0]] = {"sha256": valid["sha256"], "size": size}
+                    self.load({"version": 1, "transitions": [self.entry(**case)]})
+
+    def test_delta_violations_are_refused(self):
+        bad_deltas = [{".text": 0}, {".text": True}, {".text": "4"}, {".text": 4.5},
+                      {"": 4}, {"tëxt": 4}, {"x" * 129: 4},
+                      {f".s{index}": 1 for index in range(513)}]
+        for deltas in bad_deltas:
+            with self.subTest(deltas=deltas if len(deltas) < 8 else f"{len(deltas)} deltas"):
+                spec = {"deltas": deltas, "added": {}, "removed": []}
                 with self.assertRaises(self.driver.CheckError):
-                    self.load({"version": 1, "transitions": [self.entry(baseline=triple)]})
+                    self.load({"version": 1, "transitions": [self.entry(changed={NAMES[0]: spec})]})
+
+    def test_added_removed_violations_are_refused(self):
+        specs = [{"deltas": {}, "added": {".extra": 0}, "removed": []},
+                 {"deltas": {}, "added": {".extra": -1}, "removed": []},
+                 {"deltas": {}, "added": {".extra": True}, "removed": []},
+                 {"deltas": {}, "added": [".extra"], "removed": []},
+                 {"deltas": {}, "added": {}, "removed": ".maps"},
+                 {"deltas": {}, "added": {}, "removed": [".maps", ".maps"]},
+                 {"deltas": {}, "added": {}, "removed": [7]},
+                 {"deltas": {".text": 1}, "added": {".text": 8}, "removed": []},
+                 {"deltas": {".text": 1}, "added": {}, "removed": [".text"]},
+                 {"deltas": {}, "added": {".extra": 8}, "removed": [".extra"]}]
+        for spec in specs:
+            with self.subTest(spec=spec):
+                with self.assertRaises(self.driver.CheckError):
+                    self.load({"version": 1, "transitions": [self.entry(changed={NAMES[0]: spec})]})
 
     def test_text_violations_are_refused(self):
         for entry in (self.entry(lane=""),
@@ -497,64 +529,149 @@ class AllowedChangeTests(unittest.TestCase):
                 with self.assertRaises(self.driver.CheckError):
                     self.load({"version": 1, "transitions": [entry]})
 
-    def test_noop_transition_is_refused(self):
-        triple = self.triple(self.baseline)
-        with self.assertRaises(self.driver.CheckError):
-            self.load({"version": 1, "transitions": [self.entry(baseline=triple, candidate=triple)]})
-
     def test_duplicate_transitions_are_refused(self):
         with self.assertRaises(self.driver.CheckError):
             self.load({"version": 1, "transitions": [self.entry(), self.entry()]})
 
-    def test_matching_triple_returns_the_entry(self):
-        entry = self.entry()
-        self.assertEqual(self.driver.match_allowed_change([entry], self.baseline, self.candidate),
-                         entry)
+    def test_section_sizes_reports_content_sizes(self):
+        path = self.root / "sized.o"
+        path.write_bytes(CanonicalBtfTests.elf({".text": b"1111", ".maps": b"mmmmmmmm"}))
+        self.assertEqual(self.driver.section_sizes(path, "sized"),
+                         {".text": 4, ".maps": 8, ".shstrtab": 23})
 
-    def test_mismatched_triples_return_none(self):
+    def test_section_sizes_rejects_malformed_objects(self):
+        path = self.root / "broken.o"
+        path.write_bytes(b"not an elf")
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.section_sizes(path, "broken")
+
+    def test_matching_shape_returns_the_entry(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.compare_objects(left, right)
+        self.assertEqual(self.driver.match_allowed_change([self.entry()], left, right), self.entry())
+
+    def test_mismatched_delta_returns_none(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        for deltas in ({".text": 5}, {}):
+            with self.subTest(deltas=deltas):
+                entry = self.entry(changed={NAMES[0]: {"deltas": deltas, "added": {}, "removed": []}})
+                self.assertIsNone(self.driver.match_allowed_change([entry], left, right))
+
+    def test_changed_object_matching_strictly_returns_none(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, dict(base))
+        self.assertIsNone(self.driver.match_allowed_change([self.entry()], left, right))
+
+    def test_identical_object_differing_returns_none(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        spec = {"deltas": {".text": 1}, "added": {}, "removed": []}
+        entry = self.entry(identical=[NAMES[0], NAMES[1]], changed={NAMES[2]: spec})
+        self.assertIsNone(self.driver.match_allowed_change([entry], left, right))
+
+    def test_added_removed_sections_match_exactly(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cases = [("match", {".text": b"1111", ".extra": b"eeeeeeee"},
+                  {"deltas": {".shstrtab": 1}, "added": {".extra": 8}, "removed": [".maps"]},
+                  True),
+                 ("wrong added size", {".text": b"1111", ".extra": b"eeeeeeee"},
+                  {"deltas": {}, "added": {".extra": 9}, "removed": [".maps"]}, False),
+                 ("missing removed", {".text": b"1111", ".extra": b"eeeeeeee"},
+                  {"deltas": {}, "added": {".extra": 8}, "removed": []}, False),
+                 ("unrecorded section", {".text": b"1111", ".maps": b"mmmmmmmm", ".extra": b"ee"},
+                  {"deltas": {}, "added": {}, "removed": []}, False)]
+        for label, cand, spec, expected in cases:
+            with self.subTest(label):
+                left, right = self.pair(base, cand)
+                entry = self.entry(changed={NAMES[0]: spec})
+                if expected:
+                    self.assertEqual(self.driver.match_allowed_change([entry], left, right), entry)
+                else:
+                    self.assertIsNone(self.driver.match_allowed_change([entry], left, right))
+
+    def test_malformed_objects_never_match(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        right[NAMES[0]].write_bytes(b"not an elf")
+        self.assertIsNone(self.driver.match_allowed_change([self.entry()], left, right))
+
+    def test_identical_object_keeps_btf_order_only_verdict(self):
+        left_btf = CanonicalBtfTests.btf(b"AAAABBBB", [b"alpha", b"beta"])
+        right_btf = CanonicalBtfTests.btf(b"BBBBAAAA", [b"alpha", b"beta"])
+        ext = CanonicalBtfTests.btf_ext([(8, 3), (16, 4)])
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        left[NAMES[1]].write_bytes(CanonicalBtfTests.elf(
+            {".text": b"code", ".BTF": left_btf, ".BTF.ext": ext}))
+        right[NAMES[1]].write_bytes(CanonicalBtfTests.elf(
+            {".text": b"code", ".BTF": right_btf, ".BTF.ext": ext}))
+        def dump(path, name):
+            return "same sorted dump"
         entry = self.entry()
-        original = self.candidate[NAMES[0]].read_bytes()
-        try:
-            self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
-            self.assertIsNone(self.driver.match_allowed_change([entry], self.baseline, self.candidate))
-        finally:
-            self.candidate[NAMES[0]].write_bytes(original)
-        self.assertIsNone(self.driver.match_allowed_change([entry], self.candidate, self.baseline))
+        self.assertEqual(self.driver.match_allowed_change([entry], left, right, dump), entry)
+        verdicts, matched = self.driver.compare_with_allowed_changes(left, right, [entry], dump)
+        self.assertEqual(matched, entry)
+        self.assertEqual(verdicts, {NAMES[0]: "allowed-change",
+                                    NAMES[1]: "btf-order-only", NAMES[2]: "exact"})
 
     def test_strict_pass_ignores_an_empty_record(self):
-        identical = self.objects("identical", b"baseline bytes")
-        verdicts, matched = self.driver.compare_with_allowed_changes(self.baseline, identical, [])
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, dict(base))
+        verdicts, matched = self.driver.compare_with_allowed_changes(left, right, [])
         self.assertEqual(verdicts, {name: "exact" for name in NAMES})
         self.assertIsNone(matched)
 
     def test_matching_record_labels_only_the_differing_object(self):
-        same = self.objects("same", b"baseline bytes")
-        same[NAMES[0]].write_bytes(same[NAMES[0]].read_bytes() + b"recorded")
-        entry = self.entry(candidate=self.triple(same))
-        verdicts, matched = self.driver.compare_with_allowed_changes(self.baseline, same, [entry])
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        entry = self.entry()
+        verdicts, matched = self.driver.compare_with_allowed_changes(left, right, [entry])
         self.assertEqual(matched, entry)
         self.assertEqual(verdicts, {NAMES[0]: "allowed-change",
                                     NAMES[1]: "exact", NAMES[2]: "exact"})
 
     def test_nonmatching_record_reraises_the_strict_failure(self):
-        entry = self.entry()
-        original = self.candidate[NAMES[0]].read_bytes()
-        self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
-        try:
-            with self.assertRaisesRegex(self.driver.CheckError,
-                                        "default object differs: p11scope-ebpf"):
-                self.driver.compare_with_allowed_changes(self.baseline, self.candidate, [entry])
-        finally:
-            self.candidate[NAMES[0]].write_bytes(original)
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        entry = self.entry(changed={NAMES[0]: {"deltas": {".text": 5}, "added": {}, "removed": []}})
+        with self.assertRaisesRegex(self.driver.CheckError,
+                                    "default object differs: p11scope-ebpf"):
+            self.driver.compare_with_allowed_changes(left, right, [entry])
 
     def test_empty_transition_list_cannot_allow_a_difference(self):
-        original = self.candidate[NAMES[0]].read_bytes()
-        self.candidate[NAMES[0]].write_bytes(original + b"unrecorded")
-        try:
-            with self.assertRaises(self.driver.CheckError):
-                self.driver.compare_with_allowed_changes(self.baseline, self.candidate, [])
-        finally:
-            self.candidate[NAMES[0]].write_bytes(original)
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        with self.assertRaises(self.driver.CheckError):
+            self.driver.compare_with_allowed_changes(left, right, [])
+
+    def test_observed_shape_summary_reports_verdicts_and_deltas(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        self.assertEqual(self.driver.observed_shape_summary(left, right),
+                         "bpf-noninterference: no allowed-change transition matches; observed shape:\n"
+                         f"  {NAMES[0]}: differs deltas={{'.text': 4}} added=[] removed=[]\n"
+                         f"  {NAMES[1]}: exact\n"
+                         f"  {NAMES[2]}: exact")
+
+    def test_observed_shape_summary_marks_unparsed_objects(self):
+        base = {".text": b"1111", ".maps": b"mmmmmmmm"}
+        cand = {".text": b"11112222", ".maps": b"mmmmmmmm"}
+        left, right = self.pair(base, cand)
+        right[NAMES[0]].write_bytes(b"not an elf")
+        summary = self.driver.observed_shape_summary(left, right)
+        self.assertIn(f"{NAMES[0]}: differs (unparsed:", summary)
 
 
 class BuildDriverTests(unittest.TestCase):
@@ -1137,13 +1254,8 @@ class BuildDriverTests(unittest.TestCase):
                 self.assertIn(name, result.stderr)
                 self.assertTrue((self.work / "candidate" / "sections.txt").is_file())
 
-    def built_triple(self, objects):
-        return {name: {"sha256": hashlib.sha256((objects / name).read_bytes()).hexdigest(),
-                       "size": (objects / name).stat().st_size}
-                for name in NAMES}
-
     def mutate_first_flavor(self):
-        self.configure(mutate_flavor=NAMES[0])
+        self.configure(mutate_flavor=NAMES[0], elf_objects=True)
         (self.repo / "object-source").write_text("changed " + NAMES[0], encoding="utf-8")
         self.git("add", ".")
         self.candidate = self.commit("mutated " + NAMES[0])
@@ -1153,13 +1265,23 @@ class BuildDriverTests(unittest.TestCase):
         result = self.invoke(work=self.root / "unrecorded")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(NAMES[0], result.stderr)
+        driver = load_path(SCRIPT)
+        base_sizes = driver.section_sizes(
+            self.root / "unrecorded" / "baseline" / "objects" / NAMES[0], NAMES[0])
+        cand_sizes = driver.section_sizes(
+            self.root / "unrecorded" / "candidate" / "objects" / NAMES[0], NAMES[0])
+        self.assertEqual(set(base_sizes), set(cand_sizes))
+        deltas = {section: cand_sizes[section] - base_sizes[section] for section in base_sizes
+                  if cand_sizes[section] != base_sizes[section]}
+        # The fixture grows only .text, by the source-length step 9 -> 21.
+        self.assertEqual(deltas, {".text": 12})
         record = {"version": 1, "transitions": [{
-            "baseline": self.built_triple(self.root / "unrecorded" / "baseline" / "objects"),
-            "candidate": self.built_triple(self.root / "unrecorded" / "candidate" / "objects"),
             "lane": "fixture recorded change",
             "rationale": "fixture: the first flavor gains source bytes",
             "baseline_revision": self.baseline,
-            "candidate_revision": self.candidate}]}
+            "candidate_revision": self.candidate,
+            "identical": [NAMES[1], NAMES[2]],
+            "changed": {NAMES[0]: {"deltas": deltas, "added": {}, "removed": []}}}]}
         path = self.repo / "allowed.json"
         path.write_text(json.dumps(record), encoding="utf-8")
         result = self.invoke(work=self.root / "recorded", record=path)
@@ -1172,18 +1294,18 @@ class BuildDriverTests(unittest.TestCase):
 
     def test_unrecorded_difference_with_a_nonmatching_record_still_fails(self):
         self.mutate_first_flavor()
-        wrong = {name: {"sha256": hashlib.sha256(b"wrong baseline").hexdigest(), "size": 5}
-                 for name in NAMES}
-        also_wrong = {name: {"sha256": hashlib.sha256(b"wrong candidate").hexdigest(), "size": 6}
-                      for name in NAMES}
-        record = {"version": 1, "transitions": [{"baseline": wrong, "candidate": also_wrong,
-                                                 "lane": "fixture", "rationale": "fixture",
-                                                 "baseline_revision": "a", "candidate_revision": "b"}]}
+        record = {"version": 1, "transitions": [{
+            "lane": "fixture", "rationale": "fixture",
+            "baseline_revision": "a", "candidate_revision": "b",
+            "identical": [NAMES[1], NAMES[2]],
+            "changed": {NAMES[0]: {"deltas": {".text": 99999}, "added": {}, "removed": []}}}]}
         path = self.repo / "allowed.json"
         path.write_text(json.dumps(record), encoding="utf-8")
         result = self.invoke(record=path)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(NAMES[0], result.stderr)
+        self.assertIn("no allowed-change transition matches", result.stderr)
+        self.assertIn(".text", result.stderr)
         self.assertFalse((self.work / "comparison.json").exists())
 
     def test_repeat_baseline_refuses_an_allowed_change_record(self):

@@ -11545,9 +11545,9 @@ fn hosted_pipeline_names_every_unrun_privileged_lane() {
 /// The published observer image runs the observer by default: `docker run
 /// IMAGE <p11scope args>` must reach p11scope, while the in-cluster entry
 /// script stays available by explicit name for `kubectl exec`. The image
-/// stays minimal (one digest-pinned base, the staged static binary, the
-/// entry script, the license texts) and keeps its build-time smoke of the
-/// binaries and the licenses.
+/// stays minimal (one digest-pinned base plus a scratch runtime, the staged
+/// static binary, the entry script, the license texts) and keeps its
+/// build-time smoke of the binaries and the licenses.
 #[test]
 fn observer_image_runs_p11scope_by_default() {
     let dockerfile = read("deploy/Dockerfile.observer");
@@ -11631,6 +11631,81 @@ fn observer_image_runs_p11scope_by_default() {
         }),
         "observer image must COPY COPYRIGHT to the installed path"
     );
+}
+
+/// The observer images ship the smallest runtime with the same behaviour: a
+/// scratch final stage, one digest-pinned static busybox installed only as
+/// /bin/sh plus the applets the pod needs, the static observer, the entry
+/// script and the license texts. No package manager, no TLS/crypto
+/// libraries, no shell beyond busybox. The busybox pin, its notice and the
+/// applet allowlist stay identical in both files; widening the set is a
+/// contract change, not a quiet edit.
+#[test]
+fn observer_images_run_on_scratch_with_pinned_busybox() {
+    // sh runs the entry script, the DaemonSet idle command and the posture
+    // probes; cat/chmod/dirname/find/grep/mkdir/mktemp/printf/rm/test/tr are
+    // what k8s-profile-entry.sh (including --self-test) invokes; sleep idles
+    // the DaemonSet pod; touch proves the read-only root; tar serves
+    // `kubectl cp`. `[` is test under its other name. `id` has no in-pod
+    // consumer; `exec` is a shell builtin, not an applet.
+    let applets = [
+        "[", "cat", "chmod", "dirname", "find", "grep", "mkdir", "mktemp", "printf", "rm", "sh",
+        "sleep", "tar", "test", "touch", "tr",
+    ];
+    let busybox_pin = "busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478";
+    for path in [
+        "deploy/Dockerfile.observer",
+        "deploy/Dockerfile.observer-release",
+    ] {
+        let dockerfile = read(path);
+        let froms: Vec<&str> = dockerfile
+            .lines()
+            .filter(|line| line.starts_with("FROM "))
+            .collect();
+        assert!(!froms.is_empty(), "{path} has no FROM line");
+        assert_eq!(
+            froms[froms.len() - 1],
+            "FROM scratch",
+            "{path} must run its final stage FROM scratch"
+        );
+        assert_eq!(
+            froms
+                .iter()
+                .filter(|line| line.contains(busybox_pin))
+                .count(),
+            1,
+            "{path} must pin exactly one busybox base"
+        );
+        for marker in [
+            "COPY --from=",
+            "/bin/busybox",
+            "notices/BUSYBOX.md",
+            "ENV PATH=",
+            "BusyBox v1.37.0",
+        ] {
+            require_contract_marker(&dockerfile, marker, path)
+                .expect("observer scratch runtime contract");
+        }
+        for banned in ["apk add", "apt-get", "alpine:"] {
+            assert!(
+                !dockerfile.contains(banned),
+                "{path} must not carry {banned:?}"
+            );
+        }
+        let allowlist = dockerfile
+            .lines()
+            .find_map(|line| line.trim_start().strip_prefix("APPLETS='"))
+            .and_then(|rest| rest.split('\'').next());
+        assert!(
+            allowlist.is_some(),
+            "{path} must state its busybox applet allowlist"
+        );
+        let allowlist: Vec<&str> = allowlist.unwrap_or_default().split_whitespace().collect();
+        assert_eq!(
+            allowlist, applets,
+            "{path} installs exactly the applets the pod needs"
+        );
+    }
 }
 
 /// A step cannot read its own job's log, and a `tee` wrapper would break every

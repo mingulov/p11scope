@@ -236,10 +236,11 @@ class ContainerImageCellTests(unittest.TestCase):
                 self.assertIn(marker, text)
 
     def test_observer_build_pulls_every_pinned_base(self):
-        # The release Dockerfile has one FROM per stage; the cell must pull
-        # each unique digest-pinned base instead of demanding a single FROM.
-        # Runs the real script copy up to the pull (truncated there: the legs
-        # need a daemon) with stub docker/file and real coreutils.
+        # The release Dockerfile runs FROM scratch with one digest-pinned
+        # busybox stage; the cell must pull each unique digest-pinned base
+        # and never try to pull scratch. Runs the real script copy up to
+        # the pull (truncated there: the legs need a daemon) with stub
+        # docker/file and real coreutils.
         (self.fake / "deploy").mkdir()
         shutil.copy2(ROOT / "deploy/Dockerfile.observer-release",
                      self.fake / "deploy/Dockerfile.observer-release")
@@ -271,11 +272,14 @@ class ContainerImageCellTests(unittest.TestCase):
         bases = {line.split()[1] for line in
                  (ROOT / "deploy/Dockerfile.observer-release").read_text().splitlines()
                  if line.startswith("FROM ")}
-        self.assertEqual(len(bases), 1, "the stages share one pinned base")
+        pinned = {base for base in bases if base != "scratch"}
+        self.assertEqual(bases, pinned | {"scratch"},
+                         "the runtime stage runs FROM scratch")
+        self.assertEqual(len(pinned), 1, "the stages share one pinned base besides scratch")
         pulls = [line for line in calls.read_text().splitlines()
                  if line.startswith("docker pull ")]
-        self.assertEqual(pulls, [f"docker pull {bases.pop()}"],
-                         "each unique base is pulled exactly once")
+        self.assertEqual(pulls, [f"docker pull {pinned.pop()}"],
+                         "each unique pinned base is pulled exactly once; scratch is never pulled")
 
     def test_observer_build_uses_the_release_dockerfile_from_a_tarball(self):
         # The cell qualifies the exact release recipe: --observer-bin packs

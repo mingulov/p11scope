@@ -512,7 +512,8 @@ else:
                        "TARBALL_SHA256",
                        "--build-arg",
                        "docker pull",
-                       "docker build --network=none"):
+                       "docker build --network=none",
+                       "scratch"):
             self.assertIn(marker, bodies, f"container-image must {marker}")
         # The image builds from the packaged tarball with the release
         # Dockerfile: the staging step copies the tarball and the entry

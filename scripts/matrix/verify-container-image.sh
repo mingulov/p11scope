@@ -237,12 +237,16 @@ if [ -n "$OBSERVER_BIN" ]; then
     cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
     BASES=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
     test -n "$BASES" || { echo "Dockerfile has no FROM line" >&2; exit 2; }
-    if printf '%s\n' "$BASES" | grep -vq '@sha256:'; then
+    # The runtime stage is FROM scratch: nothing to pull. Every other base
+    # must be digest-pinned and is pulled exactly once.
+    PULLS=$(printf '%s\n' "$BASES" | grep -v '^scratch$' || true)
+    test -n "$PULLS" || { echo "Dockerfile has no pullable base" >&2; exit 2; }
+    if printf '%s\n' "$PULLS" | grep -vq '@sha256:'; then
         echo "a base is not digest-pinned:" >&2
-        printf '%s\n' "$BASES" >&2
+        printf '%s\n' "$PULLS" >&2
         exit 2
     fi
-    printf '%s\n' "$BASES" | sort -u | xargs -r -I{} \
+    printf '%s\n' "$PULLS" | sort -u | xargs -r -I{} \
         timeout --signal=TERM --kill-after=10s 600s docker pull {} || exit 2
     OBS_IMAGE="p11scope-container-observer:$RUN_ID"
     TARBALL_SHA256="$CELL_TARBALL_SHA256"

@@ -1,5 +1,6 @@
 # p11scope observer image for development: a static musl binary plus the
-# in-cluster entry script, on Alpine. The image runs the observer by
+# in-cluster entry script, on scratch with a pinned static busybox for the
+# entry script. The image runs the observer by
 # default, so one-host use is plain `docker run` with p11scope arguments:
 #   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
 #     --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
@@ -27,25 +28,64 @@
 #     --target x86_64-unknown-linux-musl --bin p11scope
 # (musl-tools provides the linker; the target-scoped env var keeps the
 # nested bpfel-unknown-none build inside build.rs on its own linker.)
-# Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
-# Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
+# Base rationale (see deploy/k8s/README.md): the observer is static-pie and
+# the entry script's shell is a pinned static busybox, so the runtime needs
+# no distribution: the final stage is FROM scratch holding only /bin/busybox,
+# the applet symlinks the pod needs (APPLETS below), the observer, the entry
+# script and the license texts. No package manager, no TLS or crypto
+# libraries, no CA bundle, no shell beyond busybox. The BUSYBOX.md notice
+# names the same version; bump the pin, the notice check and APPLETS together
+# with Dockerfile.observer-release and scripts/cold-pod-e2e.sh.
 # No curl/jq: the observer never talks to the Kubernetes API.
-# The base is pinned by digest (multi-arch index of alpine:3.24 as published
-# 2026-10-03); bump tag and digest together. Layer timestamps float, so the
-# image is repeatable, not bit-reproducible; the container-publish push
+# The base is pinned by digest (multi-arch index of busybox:1.37.0-musl as
+# published 2026-10-27); bump tag and digest together. Layer timestamps float,
+# so the image is repeatable, not bit-reproducible; the container-publish push
 # job re-identifies the exact bytes by image ID instead of trusting the tag.
-FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+FROM busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478 AS busybox
+FROM scratch
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+COPY --from=busybox /bin/busybox /bin/busybox
 COPY target/x86_64-unknown-linux-musl/release/p11scope /usr/local/bin/p11scope
 COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
 COPY LICENSE /usr/share/licenses/p11scope/LICENSE
 COPY COPYRIGHT /usr/share/licenses/p11scope/COPYRIGHT
 COPY LICENSES/ /usr/share/licenses/p11scope/LICENSES/
-RUN chmod 0755 /usr/local/bin/k8s-profile-entry \
-    && /usr/local/bin/p11scope --help >/dev/null \
-    && /usr/local/bin/k8s-profile-entry --self-test \
-    && test -f /usr/share/licenses/p11scope/LICENSE \
-    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt \
-    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt
+# The pod's busybox applet allowlist, sorted: sh runs the entry script, the
+# DaemonSet idle command and the posture probes; cat, chmod, dirname, find,
+# grep, mkdir, mktemp, printf, rm, test and tr are what
+# k8s-profile-entry.sh (including --self-test) invokes; sleep idles the
+# DaemonSet pod; touch proves the read-only root; tar serves `kubectl cp`.
+# Widening this list is a contract change (tests/artifact_contracts.rs pins
+# it); `id` has no in-pod consumer and `exec` is a shell builtin, not an
+# applet. The final stage has no shell until busybox lands, so a bootstrap
+# RUN links /bin/ash through the copied binary first (shellcheck cannot
+# parse a /bin/busybox SHELL spelling, so the bootstrap stays a single
+# pipeless command); the main RUN uses SHELL /bin/ash, the spelling
+# hadolint recognizes for pipefail on busybox. ash is removed before the
+# /bin count check, so the shipped allowlist stays exactly APPLETS.
+SHELL ["/bin/busybox", "sh", "-c"]
+# hadolint ignore=SC1008
+RUN /bin/busybox ln -s busybox /bin/ash
+SHELL ["/bin/ash", "-o", "pipefail", "-c"]
+# hadolint ignore=SC2086
+RUN set -eu; \
+    APPLETS='[ cat chmod dirname find grep mkdir mktemp printf rm sh sleep tar test touch tr'; \
+    /bin/busybox chmod 0755 /bin/busybox /usr/local/bin/p11scope /usr/local/bin/k8s-profile-entry; \
+    for applet in $APPLETS; do /bin/busybox ln -s busybox "/bin/$applet"; test -x "/bin/$applet" || exit 1; done; \
+    rm /bin/ash; \
+    [ "$(/bin/busybox ls /bin | grep -c .)" -eq 17 ] || { echo "unexpected /bin contents:" >&2; /bin/busybox ls -la /bin >&2; exit 1; }; \
+    [ "$(/bin/busybox ls /bin | grep -c .)" -eq 17 ] || { echo "unexpected /bin contents:" >&2; /bin/busybox ls -la /bin >&2; exit 1; }; \
+    BUSYBOX_LINE=$(/bin/busybox | /bin/busybox sed -n '1p'); \
+    case $BUSYBOX_LINE in 'BusyBox v1.37.0 '*) ;; *) echo "busybox version drifted: $BUSYBOX_LINE" >&2; exit 1;; esac; \
+    mkdir -p /usr/share/licenses/p11scope/notices /tmp; \
+    chmod 1777 /tmp; \
+    printf '%s\n' "$BUSYBOX_LINE" 'Copyright: many authors 1998-2015, see https://busybox.net' 'License: GNU General Public License version 2 only (GPL-2.0-only).' 'Full text: /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt' 'Upstream: https://busybox.net' 'Installed: /bin/sh plus the applet symlinks the pod needs;' 'no other busybox applets are linked.' > /usr/share/licenses/p11scope/notices/BUSYBOX.md; \
+    /usr/local/bin/p11scope --help >/dev/null; \
+    /usr/local/bin/k8s-profile-entry --self-test; \
+    test -f /usr/share/licenses/p11scope/LICENSE; \
+    test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt; \
+    test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt; \
+    test -f /usr/share/licenses/p11scope/notices/BUSYBOX.md
 # The image runs as root: Docker's --cap-add is only effective for uid 0
 # without ambient capabilities.
 ENTRYPOINT ["/usr/local/bin/p11scope"]

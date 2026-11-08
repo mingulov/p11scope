@@ -7,7 +7,8 @@
 - `Dockerfile.observer-release` — the published observer image: the
   verified release tarball's static musl `p11scope`,
   `scripts/k8s-profile-entry.sh`, licenses, notices and `RELEASE.json` on
-  Alpine. No shell tools beyond busybox, no API client.
+  scratch with a pinned static busybox for the entry script. No package
+  manager, no TLS or crypto libraries, no API client.
   `scripts/kind-e2e.sh` uses it when `P11SCOPE_K8S_RELEASE_TARBALL` is set,
   with required `P11SCOPE_K8S_RELEASE_SHA256SUMS` verification; the checked
   hash is passed as `TARBALL_SHA256` and re-verified inside the build.

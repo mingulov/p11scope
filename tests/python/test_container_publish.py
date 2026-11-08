@@ -95,7 +95,8 @@ class ContainerPublishTests(unittest.TestCase):
         for marker in ("gh release download", "SHA256SUMS", "RELEASE.json",
                        "sha256sum --check", "deploy/Dockerfile.observer-release",
                        "TARBALL_SHA256", "docker pull",
-                       "docker build --network=none"):
+                       "docker build --network=none",
+                       "scratch"):
             self.assertIn(marker, bodies, f"build must {marker}")
         self.assertIn("GITHUB_SHA", bodies, "build must bind the RELEASE check to the tag commit")
         for marker in ("^{tree}", "merge-base --is-ancestor", "GITHUB_REF_NAME#v"):

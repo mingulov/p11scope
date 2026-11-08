@@ -401,18 +401,27 @@ other privileged work on the host. Evidence lands in a 0700 directory under
   does). `kubectl apply -f deploy/k8s/` failing with `namespaces "p11scope"
   not found` means an unnumbered manifest sorted before `00-namespace.yaml`.
 
-## Image base rationale (measured 2026-09-15)
+## Image base rationale (measured 2026-09-15; slimmed 2026-11-09)
 
-- **Observer: `alpine:3.24` + musl-static binary.** The observer's deps are
-  pure Rust + `libc` (BPF via aya, no libbpf C library), so a static-pie build
-  works: `file` says `static-pie linked`. Static needs no libc, so Alpine's
-  musl is fine and the binary runs anywhere. No curl/jq since the observer
-  stopped using the API.
-- **Not distroless**: the entry script needs a shell; Alpine keeps the size
-  small while keeping `kubectl exec` debuggability. Revisit only if a
-  shell-free policy demands it.
+- **Observer: `scratch` + musl-static binary + pinned static busybox.**
+  The observer's deps are pure Rust + `libc` (BPF via aya, no libbpf C
+  library), so a static-pie build works: `file` says `static-pie linked`.
+  The runtime holds only the observer, the entry script, `/bin/busybox`
+  (static, from digest-pinned `busybox:1.37.0-musl`) installed as `/bin/sh`
+  plus the 16 applet symlinks the pod needs, and the license texts: no
+  package manager, no TLS or crypto libraries, no CA bundle, no shell
+  beyond busybox. The former Alpine runtime carried ~8 MB of packages the
+  static binary never uses (apk, libcrypto/libssl, ssl_client, zlib, the CA
+  bundle, scanelf, musl-utils); the busybox binary is ~1.2 MB. No curl/jq
+  since the observer stopped using the API.
+- **Not pure distroless**: the entry script needs a shell, and the DaemonSet
+  idle command, the posture probes and `kubectl cp` need their applets, so
+  the image carries busybox with a pinned applet allowlist (APPLETS in
+  `Dockerfile.observer`) instead of a full shell distribution.
 - **Holder: `ubuntu:26.04` (test-only)**, multi-stage: gcc builds the
   ledgered client, the final stage carries only SoftHSM2 and the client.
-- **Maintenance note**: bump `alpine:3.24` and its pinned digest together in
-  `Dockerfile.observer` and `Dockerfile.observer-release` when EOL approaches
-  (one line per file + e2e re-run); the holder pins `ubuntu:26.04` the same way.
+- **Maintenance note**: bump `busybox:1.37.0-musl` and its pinned digest
+  together in `Dockerfile.observer` and `Dockerfile.observer-release`
+  (one line per file, plus the BUSYBOX.md version check in the same files
+  and `OBSERVER_BASE` in `scripts/cold-pod-e2e.sh`, then an e2e re-run);
+  the holder pins `ubuntu:26.04` the same way.

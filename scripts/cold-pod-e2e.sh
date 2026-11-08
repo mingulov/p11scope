@@ -36,7 +36,7 @@ ORACLE=scripts/kind-e2e-oracle.py
 OBSERVER_DOCKERFILE=deploy/Dockerfile.observer
 # Pinned bases reused from the Dockerfiles; the self-test requires each
 # Dockerfile to carry exactly its digest.
-OBSERVER_BASE=alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+OBSERVER_BASE=busybox:1.37.0-musl@sha256:f6a95d611e0a8780fabdb2aec43e31275b2720dfefa3e41b16835bfc42454478
 HOLDER_DOCKERFILE=deploy/Dockerfile.holder
 HOLDER_BASE=ubuntu:26.04@sha256:3595d7fc4286a33fad0fd853a4063e654287a9c3787437d7937c94ca3f7a804e
 WORKLOADS=deploy/k8s/e2e/workloads.yaml

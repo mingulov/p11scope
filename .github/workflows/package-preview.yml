@@ -310,12 +310,16 @@ jobs:
           umask 022
           bases=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release | awk '{print $1}')
           test -n "$bases"
-          if printf '%s\n' "$bases" | grep -vq '@sha256:'; then
+          # The runtime stage is FROM scratch: nothing to pull. Every other
+          # base must be digest-pinned and is pulled exactly once.
+          pulls=$(printf '%s\n' "$bases" | grep -v '^scratch$' || true)
+          test -n "$pulls"
+          if printf '%s\n' "$pulls" | grep -vq '@sha256:'; then
             echo "a base is not digest-pinned:" >&2
-            printf '%s\n' "$bases" >&2
+            printf '%s\n' "$pulls" >&2
             exit 1
           fi
-          printf '%s\n' "$bases" | sort -u | xargs -r -I{} docker pull {}
+          printf '%s\n' "$pulls" | sort -u | xargs -r -I{} docker pull {}
           tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
           tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
           docker build --network=none -f deploy/Dockerfile.observer-release \

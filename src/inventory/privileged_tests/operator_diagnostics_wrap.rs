@@ -14,7 +14,7 @@ const INPUT_LIMIT: u64 = 16 * 1024 * 1024;
 
 /// Parameterized wrap schedule: `counted` A rounds, `shared` shared rounds,
 /// then the fence/proof pair. The G21 wrap gate runs `WRAP_SCHEDULE` at the
-/// declared accelerated cadences (250ms pid / 50ms system, R-17); the short
+/// declared accelerated cadences (250ms pid / 10ms system, R-17); the short
 /// full-transition pilot runs `PILOT_SCHEDULE` (32/4/540s) at default cadence
 /// and default diagnostic capacities. The pilot makes no wrap claim: it
 /// measures settling, gap shapes and footer production. Every validator that
@@ -40,10 +40,10 @@ const PILOT_SCHEDULE: WrapSchedule = WrapSchedule {
 /// Both default rings must still actually wrap (per-kind evicted counters),
 /// and paired parity stays exact. Pilot footer (C=32/S=4, k=32): ordinary
 /// 3232 (96/A-round, 32/S-round), exceptional 3897 (101/A-round,
-/// 69/S-round); C=260/S=4 yields ordinary ~25.2k and exceptional ~26.9k,
-/// both over the 24576/8192 capacities with margin. The 900 s per-leg
-/// bound is unchanged.
-const WRAP_COUNTED: u64 = 260;
+/// 69/S-round); C=286/S=4 yields ordinary ~27.3k and exceptional ~29.5k,
+/// both over the 24576/8192 capacities with >=10% ordinary margin. The
+/// 900 s per-leg bound is unchanged.
+const WRAP_COUNTED: u64 = 286;
 const WRAP_SHARED: u64 = 4;
 const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
     counted: WRAP_COUNTED,
@@ -58,7 +58,7 @@ const WRAP_SCHEDULE: WrapSchedule = WrapSchedule {
 /// whole machine per pass, so it uses a faster cadence to fit the same 900 s
 /// per-leg bound; both cadences are declared up front per run.
 const WRAP_PID_POLL_INTERVAL_MS: u64 = 250;
-const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 50;
+const WRAP_SYSTEM_POLL_INTERVAL_MS: u64 = 10;
 
 /// Ordinary-ring capacity and required 10% wrap margin for the live gate.
 /// The C=260 schedule leaves 224 records (<1%); any product change reducing
@@ -1486,8 +1486,8 @@ fn ambiguity_repeats(gaps: &[GapEvidence], module: &str) -> u64 {
 /// ambiguity gaps are mid-run exact and must read exactly `round` on each
 /// of the 64 sharer modules (one pair per module, one disclosure per
 /// round). Between checkpoints any value passes (power-of-two lower bounds
-/// cannot gate); the pre-`ended` flush verifies the exact final 258 per
-/// module retrospectively.
+/// cannot gate); the pre-`ended` flush verifies the exact final 4 per
+/// module retrospectively (live S=4).
 fn check_shared_checkpoint(
     round: u64,
     gaps: &[GapEvidence],
@@ -2368,7 +2368,7 @@ fn primary_facts_core_schedule(
         ensure!(module_ids.insert(edge["module"].as_str().context("module ID")?.to_owned()));
         let (label, a) = provider_label(module)?;
         // Per-edge expectations come from the independently issued schedule.
-        // Full cells keep400/399 on A and1 on each B; the short pilot keeps
+        // Full cells keep286/285 on A and1 on each B; the short pilot keeps
         // its declared C projection. Diagnostics never supply these totals.
         let expected = if a { expected_a(counted, k) } else { 1 };
         let entries = &edge["entries"];
@@ -4986,9 +4986,9 @@ fn privileged_native_lane_pid_diagnostics_wrap_and_primary_parity_lp64() -> Resu
 
 /// Bounded system wrap pair (cell 3): the identical 32-object schedule
 /// under unfiltered system capture, with owned-caller validators and
-/// the same strict paired off/on parity, at the declared 50ms cadence.
+/// the same strict paired off/on parity, at the declared 10ms cadence.
 #[test]
-#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 50ms cadence"]
+#[ignore = "root-owned BPF lane; prebuilt32-object fixture, bounded system default-ring wrap pair at declared 10ms cadence"]
 fn privileged_native_lane_system_diagnostics_wrap_and_primary_parity_lp64() -> Result<()> {
     with_wrap_cadence(WRAP_SYSTEM_POLL_INTERVAL_MS, || {
         let (disabled, dk) = run_wrap_system(false)?;

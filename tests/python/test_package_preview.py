@@ -508,13 +508,17 @@ else:
         for marker in ("sha256sum --check SHA256SUMS",
                        "p11scope-[0-9]*-x86_64-linux-musl.tar.gz",
                        "static-pie linked",
-                       "deploy/Dockerfile.observer",
+                       "deploy/Dockerfile.observer-release",
+                       "TARBALL_SHA256",
+                       "--build-arg",
                        "docker pull",
                        "docker build --network=none"):
             self.assertIn(marker, bodies, f"container-image must {marker}")
-        # The image ships the license texts: the staging step copies them
-        # into the minimal context beside the binary and the entry script.
-        for marker in ('"$GITHUB_WORKSPACE/LICENSE"', '"$GITHUB_WORKSPACE/LICENSES"'):
+        # The image builds from the packaged tarball with the release
+        # Dockerfile: the staging step copies the tarball and the entry
+        # script, and the Dockerfile installs licenses, notices and
+        # RELEASE.json from the verified tarball bytes.
+        for marker in ("k8s-profile-entry.sh", "TARBALL="):
             self.assertIn(marker, bodies, f"container-image staging must {marker}")
         # The base image reference stays single-sourced in the Dockerfile;
         # the job parses it out instead of carrying its own copy.

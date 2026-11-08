@@ -4,9 +4,9 @@
 
 Pins two honesties: the DaemonSet default is runnable from the checkout
 (the local dev image, or the published tag of the version in Cargo.toml,
-never a tag from a future release), and deploy/README.md shows the proven
-minimal `docker run` recipe and claims only the refusals the
-container-image cell actually proves.
+which stays unpublished until the release step 7.4 push makes it live),
+and deploy/README.md shows the proven minimal `docker run` recipe and
+claims only the refusals the container-image cell actually proves.
 """
 
 import re

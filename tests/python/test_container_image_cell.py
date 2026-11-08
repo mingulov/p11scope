@@ -235,6 +235,18 @@ class ContainerImageCellTests(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, text)
 
+    def test_observer_build_uses_the_release_dockerfile_from_a_tarball(self):
+        # The cell qualifies the exact release recipe: --observer-bin packs
+        # its binary into a tarball and builds deploy/Dockerfile.observer-release
+        # with TARBALL_SHA256, so the Dockerfile verification, extraction and
+        # license/notice/RELEASE install run on every cell.
+        text = ENTRY.read_text()
+        for marker in ("deploy/Dockerfile.observer-release",
+                       "TARBALL_SHA256",
+                       "--build-arg"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, text)
+
 
 if __name__ == "__main__":
     unittest.main()

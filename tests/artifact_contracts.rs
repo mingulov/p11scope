@@ -11495,6 +11495,7 @@ fn observer_image_runs_p11scope_by_default() {
         "/usr/local/bin/p11scope --help >/dev/null",
         "/usr/local/bin/k8s-profile-entry --self-test",
         "test -f /usr/share/licenses/p11scope/LICENSE",
+        "only effective for uid 0",
     ] {
         require_contract_marker(&dockerfile, marker, "observer image")
             .expect("observer image contract");
@@ -11511,6 +11512,49 @@ fn observer_image_runs_p11scope_by_default() {
         !dockerfile.contains("ENTRYPOINT [\"/usr/local/bin/k8s-profile-entry\"]"),
         "the cluster entry script must not swallow docker run arguments"
     );
+    let release = read("deploy/Dockerfile.observer-release");
+    for marker in [
+        "ENTRYPOINT [\"/usr/local/bin/p11scope\"]",
+        "CMD [\"--help\"]",
+        "ARG TARBALL",
+        "ARG TARBALL_SHA256",
+        "COPY ${TARBALL}",
+        "COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry",
+        "sha256sum -c",
+        "/usr/local/bin/p11scope --help >/dev/null",
+        "/usr/local/bin/k8s-profile-entry --self-test",
+        "test -f /usr/share/licenses/p11scope/LICENSE",
+        "test -f /usr/share/licenses/p11scope/notices/NOTICES.md",
+        "RELEASE.json",
+        "org.opencontainers.image.source",
+        "only effective for uid 0",
+    ] {
+        require_contract_marker(&release, marker, "observer release image")
+            .expect("observer release image contract");
+    }
+    let release_from = release
+        .lines()
+        .find(|line| line.starts_with("FROM "))
+        .expect("the release image has one base");
+    assert!(
+        release_from.contains("@sha256:"),
+        "the release base must stay digest-pinned: {release_from}"
+    );
+    assert!(
+        !release.contains("ENTRYPOINT [\"/usr/local/bin/k8s-profile-entry\"]"),
+        "the cluster entry script must not swallow docker run arguments"
+    );
+    if std::path::Path::new("COPYRIGHT").exists() {
+        for (name, body) in [
+            ("observer image", dockerfile.as_str()),
+            ("observer release image", release.as_str()),
+        ] {
+            assert!(
+                body.contains("COPYRIGHT"),
+                "{name} must install COPYRIGHT once the root file exists"
+            );
+        }
+    }
 }
 
 /// A step cannot read its own job's log, and a `tee` wrapper would break every

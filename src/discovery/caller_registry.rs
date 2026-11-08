@@ -204,9 +204,16 @@ pub(crate) trait ProcessSource {
     fn exe_maps_identity(&self, pid: u32) -> Option<ExeIdentity> {
         read_exe_maps_identity(pid)
     }
-    /// Display-only app hint beside the already-read `exe`. The default
-    /// samples nothing: scripted sources gain no process authority here.
-    fn app_hint(&self, _pid: u32, _exe: Option<&ExeIdentity>) -> Option<crate::app_hint::AppHint> {
+    /// Display-only app hint beside the already-read `exe`, for the
+    /// `admitted_start_time` generation only: sampled facts belong to
+    /// that generation or the hint is dropped. The default samples
+    /// nothing: scripted sources gain no process authority here.
+    fn app_hint(
+        &self,
+        _pid: u32,
+        _exe: Option<&ExeIdentity>,
+        _admitted_start_time: Option<u64>,
+    ) -> Option<crate::app_hint::AppHint> {
         None
     }
     /// True when `pid` names no live process: reaped, never existed, or
@@ -342,8 +349,13 @@ impl ProcessSource for OsProcessSource {
         read_exe_identity(pid)
     }
 
-    fn app_hint(&self, pid: u32, exe: Option<&ExeIdentity>) -> Option<crate::app_hint::AppHint> {
-        crate::app_hint::sample_for_pid(pid, exe)
+    fn app_hint(
+        &self,
+        pid: u32,
+        exe: Option<&ExeIdentity>,
+        admitted_start_time: Option<u64>,
+    ) -> Option<crate::app_hint::AppHint> {
+        crate::app_hint::sample_for_pid(pid, exe, admitted_start_time)
     }
 
     fn gone(&self, pid: u32) -> bool {
@@ -982,7 +994,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = cold_exe.or_else(|| self.source.exe_identity(pid));
-        let app_hint = self.source.app_hint(pid, exe.as_ref());
+        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
         let pin = SharedCallerPin::new(pin, &self.source, &self.custody_reserver)
             .map_err(|_| anyhow!("original process custody storage refused before allocation"))?;
         let id = self.mint()?;
@@ -1153,9 +1165,11 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             prepared.generation.exe.is_some(),
             "scoped admission gates carry an exe identity to the mint"
         );
-        let app_hint = self
-            .source
-            .app_hint(prepared.pid, prepared.generation.exe.as_ref());
+        let app_hint = self.source.app_hint(
+            prepared.pid,
+            prepared.generation.exe.as_ref(),
+            prepared.generation.start_time,
+        );
         self.callers.insert(
             id,
             TrackedCaller {
@@ -1263,7 +1277,9 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
             .map_err(|_| failed("caller ID space exhausted"))?;
         let incarnation = self.incarnations.get(&pid).copied().unwrap_or(0);
         self.incarnations.insert(pid, incarnation.saturating_add(1));
-        let app_hint = self.source.app_hint(pid, generation.exe.as_ref());
+        let app_hint = self
+            .source
+            .app_hint(pid, generation.exe.as_ref(), generation.start_time);
         self.callers.insert(
             id,
             TrackedCaller {
@@ -1660,7 +1676,7 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         }
         let start_time = self.source.start_time(pid);
         let exe = self.source.exe_identity(pid);
-        let app_hint = self.source.app_hint(pid, exe.as_ref());
+        let app_hint = self.source.app_hint(pid, exe.as_ref(), start_time);
         // Per-incarnation detection (F7a): after the validation above.
         let admitted_ns = match detected() {
             Some(stamp) => stamp.max(now_ns),

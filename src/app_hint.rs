@@ -741,13 +741,15 @@ fn sampled_generation_intact(before: Option<u64>, after: Option<u64>) -> bool {
 /// cgroup text are read only for a tabled runtime, comm only for
 /// python/perl/ruby; shells and native exes get no read at all. The exe
 /// identity and the process start time are re-read after sampling and
-/// must match, so an exec or pid reuse under the reads drops the hint
-/// instead of attributing one image's or generation's facts to another.
+/// must match `admitted_start_time` — the generation admission pinned
+/// — so an exec or pid reuse under the reads drops the hint instead of
+/// attributing one image's or generation's facts to another.
 /// The label is sampled once: a same-binary re-exec inside the sample
 /// window keeps a stale label.
 pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
+    _admitted_start_time: Option<u64>,
 ) -> Option<AppHint> {
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
@@ -1536,19 +1538,21 @@ mod tests {
     #[test]
     fn sampler_needs_an_exe_and_a_matching_identity() {
         use crate::discovery::caller_registry::read_exe_identity;
+        use crate::process::process_start_time;
         let pid = std::process::id();
-        assert_eq!(sample_for_pid(pid, None), None);
+        let admitted = process_start_time(pid).ok();
+        assert_eq!(sample_for_pid(pid, None, admitted), None);
         let mut exe = read_exe_identity(pid).expect("own exe identity");
         exe.ino = exe.ino.wrapping_add(1);
         assert_eq!(
-            sample_for_pid(pid, Some(&exe)),
+            sample_for_pid(pid, Some(&exe), admitted),
             None,
             "a changed identity drops the hint"
         );
         let exe = read_exe_identity(pid).expect("own exe identity");
         let cgroup = read_cgroup_text(pid);
         assert_eq!(
-            sample_for_pid(pid, Some(&exe)),
+            sample_for_pid(pid, Some(&exe), admitted),
             app_hint_for(exe.path.as_deref(), None, None, cgroup.as_deref()),
             "a non-interpreter test binary samples nothing at all"
         );

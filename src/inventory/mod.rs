@@ -11304,7 +11304,105 @@ mod tests {
                 message.contains("--event-log -"),
                 "the refusal names the owner: {message}"
             );
+            assert!(
+                !std::path::Path::new("-").exists(),
+                "the refused run must not create a file named `-`"
+            );
         }
+    }
+
+    #[test]
+    fn event_stdout_runtime_refuses_rotation() {
+        // The parser refuses these combinations; the runner repeats
+        // the refusal for programmatic callers, before any sink
+        // opens (no `-` file may appear).
+        for (rotate, files) in [
+            (Some(1024u64), None),
+            (None, Some(2usize)),
+            (Some(1024), Some(2)),
+        ] {
+            let mut stdout = Vec::new();
+            let error = super::run_with_writer(
+                super::InspectScope::System,
+                &[],
+                &super::HookRegistry::builtin(),
+                false,
+                Some(1),
+                None,
+                None,
+                None,
+                false,
+                Some(std::path::Path::new("-")),
+                rotate,
+                files,
+                super::CaptureMode::Scan,
+                crate::attach::BackendSelection::Auto,
+                &|| false,
+                &|| {},
+                false,
+                &mut super::WriterStdout(&mut stdout),
+            )
+            .expect_err("rotation beside --event-log - must fail");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("--event-rotate-bytes/--event-max-files")
+                    && message.contains("stdout is not rotated"),
+                "the refusal names the rotation conflict: {message}"
+            );
+            assert!(
+                !std::path::Path::new("-").exists(),
+                "the refused run must not create a file named `-`"
+            );
+        }
+    }
+
+    #[test]
+    fn event_interval_without_stream_is_refused_at_runtime() {
+        // The parser refuses a cadence without a stream; the runner
+        // repeats the refusal for programmatic callers, before any
+        // sink opens. Driven through the budget seam: the writer
+        // seam takes no interval yet.
+        let mut stdout = Vec::new();
+        let error = super::run_with_terminal_budget(
+            super::InspectScope::System,
+            &[],
+            &[],
+            &[],
+            &[],
+            &super::HookRegistry::builtin(),
+            false,
+            Some(1),
+            None,
+            super::inventory_endpoint_budget(None).unwrap(),
+            None,
+            None,
+            false,
+            None,
+            None,
+            None,
+            Some(std::time::Duration::from_secs(10)),
+            super::CaptureMode::Scan,
+            crate::attach::BackendSelection::Auto,
+            None,
+            false,
+            &|| false,
+            &|| {},
+            false,
+            &mut super::WriterStdout(&mut stdout),
+            &super::DashboardIo::stdio(),
+            super::DiagnosticRequest::disabled(),
+            None,
+            &|| Ok(crate::attach::MultiCapableHost::for_test()),
+            None,
+            None,
+            false,
+        )
+        .expect_err("a cadence without --event-log must fail");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("--event-interval requires --event-log"),
+            "the refusal names the missing stream: {message}"
+        );
     }
 
     #[test]

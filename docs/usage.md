@@ -1445,8 +1445,10 @@ Limits that matter in pods:
   observer may not write; an anonymous pipe with no reader instead
   sheds every line and exits 1. A stdout closed at exec reads as
   `/dev/null`, so the stream is discarded and the run succeeds.
-  With `docker run -t` or Kubernetes `tty: true`, stderr shares the
-  container stream; CRI log collectors must select `stream=stdout`.
+  Do not allocate a TTY (`docker run -t`, Kubernetes `tty: true`):
+  stderr then joins the one stream, so the moved summary and
+  diagnostics interleave with events. Without a TTY, CRI log
+  collectors select `stream=stdout`.
   `--event-interval <dur>` (off by default; e.g. `10s`) adds a periodic
   `totals` snapshot of the current report counts to either sink, at most
   one per pass and never on the stop commit. For example, an observer

@@ -447,9 +447,10 @@ unsupported fd type, a named FIFO with no reader, or a pipe or
 terminal the observer may not write; an anonymous pipe with no
 reader instead sheds every line and exits 1. A stdout closed at
 exec is presented as `/dev/null`, so the stream is discarded and
-the run succeeds. With `docker run -t` or Kubernetes `tty: true`,
-stderr shares the container stream; CRI log collectors must select
-`stream=stdout` to read events only.
+the run succeeds. Do not allocate a TTY (`docker run -t`,
+Kubernetes `tty: true`): stderr then joins the one stream, so the
+moved summary and diagnostics interleave with events. Without a
+TTY, CRI log collectors select `stream=stdout`.
 
 ## Privacy and loss accounting
 

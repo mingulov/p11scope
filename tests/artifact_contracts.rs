@@ -646,17 +646,14 @@ fn assert_hosted_bpf_noninterference(ci: &str) -> Result<(), String> {
         "install bpf-linker --version \"$CI_TOOL_BPF_LINKER\" --locked",
         "- name: Install packaged bpftool",
         "set -euo pipefail",
-        // Pinned baseline 3681a1ab7: the keygen return-path gate
-        // (Detailed .text +128 B in the two inlined return functions;
-        // the unsafe entry flag compiles out of default builds) and the
-        // round-10 inventory ring raise (one `maps` word per Inventory
-        // object; code byte-identical), on top of 873adf5c4 (6.14
-        // exit-time mapping summaries); all enumerated in the ci.yml
-        // comment.
-        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        // Pinned baseline v0.6.0 tag: the v0.6.0 release objects, plus
+        // the reviewed PQC parameter-set allowed transition for the
+        // v0.7.0 line; all enumerated in the ci.yml comment.
+        "BASELINE_TAG=v0.6.0",
         "python3 -I scripts/check-bpf-noninterference.py \\",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$BASELINE\"",
         "--repo \"$GITHUB_WORKSPACE\" --baseline \"$BASELINE\" --candidate \"$GITHUB_SHA\"",
+        "--allowed-change-record \"$GITHUB_WORKSPACE/scripts/bpf-noninterference-allowed.json\"",
         "--work \"$comparison_root/integration\"\n",
         "test -s \"$comparison_root/repeat-baseline/comparison.json\"",
         "test -s \"$comparison_root/integration/comparison.json\"",
@@ -10167,14 +10164,11 @@ fn hosted_pipeline_requires_exact_default_bpf_comparison() {
         "needs: [dedupe, tests]",
         "!cancelled() && needs.dedupe.outputs.run == 'true'",
         "fetch-depth: 0",
-        // Pinned baseline 3681a1ab7: the keygen return-path gate
-        // (Detailed .text +128 B in the two inlined return functions;
-        // the unsafe entry flag compiles out of default builds) and the
-        // round-10 inventory ring raise (one `maps` word per Inventory
-        // object; code byte-identical), on top of 873adf5c4 (6.14
-        // exit-time mapping summaries); all enumerated in the ci.yml
-        // comment.
-        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        // Pinned baseline v0.6.0 tag: the v0.6.0 release objects, plus
+        // the reviewed PQC parameter-set allowed transition for the
+        // v0.7.0 line; all enumerated in the ci.yml comment.
+        "BASELINE_TAG=v0.6.0",
+        "--allowed-change-record \"$GITHUB_WORKSPACE/scripts/bpf-noninterference-allowed.json\"",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"\n",

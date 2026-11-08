@@ -150,18 +150,15 @@ fn validate_ci_toolchain_selectors(ci: &str) -> Result<(), String> {
     let integration = r#"
           python3 -I scripts/check-bpf-noninterference.py \
             --repo "$GITHUB_WORKSPACE" --baseline "$BASELINE" --candidate "$GITHUB_SHA" \
+            --allowed-change-record "$GITHUB_WORKSPACE/scripts/bpf-noninterference-allowed.json" \
             --work "$comparison_root/integration"
 "#;
     if !comparison
         .lines()
-        // Pinned baseline 3681a1ab7: the keygen return-path gate
-        // (Detailed .text +128 B in the two inlined return functions;
-        // the unsafe entry flag compiles out of default builds) and the
-        // round-10 inventory ring raise (one `maps` word per Inventory
-        // object; code byte-identical), on top of 873adf5c4 (6.14
-        // exit-time mapping summaries); all enumerated in the ci.yml
-        // comment.
-        .any(|line| line == "          BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81")
+        // Pinned baseline v0.6.0 tag: the v0.6.0 release objects, plus
+        // the reviewed PQC parameter-set allowed transition for the
+        // v0.7.0 line; all enumerated in the ci.yml comment.
+        .any(|line| line == "          BASELINE_TAG=v0.6.0")
         || !comparison.contains(repeat)
         || !comparison.contains(integration)
         || comparison.contains("--host-compiler-transition")
@@ -241,14 +238,11 @@ fn ci_comparison_job_keeps_the_exact_moved_baseline_calls() {
         "a renamed comparison job must be rejected"
     );
     for marker in [
-        // Pinned baseline 3681a1ab7: the keygen return-path gate
-        // (Detailed .text +128 B in the two inlined return functions;
-        // the unsafe entry flag compiles out of default builds) and the
-        // round-10 inventory ring raise (one `maps` word per Inventory
-        // object; code byte-identical), on top of 873adf5c4 (6.14
-        // exit-time mapping summaries); all enumerated in the ci.yml
-        // comment.
-        "BASELINE=3681a1ab75f4cb79e8432378589aeb0a0a0e2f81",
+        // Pinned baseline v0.6.0 tag: the v0.6.0 release objects, plus
+        // the reviewed PQC parameter-set allowed transition for the
+        // v0.7.0 line; all enumerated in the ci.yml comment.
+        "BASELINE_TAG=v0.6.0",
+        "--allowed-change-record \"$GITHUB_WORKSPACE/scripts/bpf-noninterference-allowed.json\"",
         "--repeat-baseline",
         "--candidate \"$GITHUB_SHA\"",
         "--work \"$comparison_root/integration\"",

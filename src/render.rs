@@ -9345,6 +9345,26 @@ pub(crate) mod tests {
         );
     }
 
+    /// Zero calls with only attribution gaps (counts complete) must use
+    /// one consistent coverage statement, not "coverage incomplete"
+    /// beside "coverage: counts complete".
+    #[test]
+    fn scope_summary_with_zero_calls_and_attribution_only_gaps_is_consistent() {
+        let mut ev = evidence();
+        ev.discovery.modules = vec![discovered_fixture()];
+        ev.semantic_unverified_slots = 1;
+        ev.verdict();
+        assert_eq!(ev.completeness, "PARTIAL");
+        assert_eq!(ev.verdict_detail, VERDICT_ATTRIBUTION_ONLY);
+        let text =
+            scope_summary_with_verbosity("pid", &[], &ev, crate::cli::TextVerbosity::Concise);
+        assert!(text.contains("counts complete"), "{text}");
+        assert!(
+            !text.contains("coverage incomplete"),
+            "one consistent coverage statement: {text}"
+        );
+    }
+
     /// No unverified slots, or every mapped provider attested (partial
     /// manifest coverage): the machine fragment alone stands, with no
     /// provider-manifest note.

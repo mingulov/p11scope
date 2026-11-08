@@ -2736,6 +2736,41 @@ mod tests {
     }
 
     #[test]
+    fn start_open_failure_reports_calibration_class() {
+        // An open failure inside the per-file loop refuses with the
+        // calibration class, not btf: no BTF problem is involved. The
+        // file stats (pre-open pin) but does not open (mode 000). Which
+        // claim applies is decided by what this process can actually do
+        // (root opens mode-000 files): both configurations assert.
+        let (_dir, path) = temp_prearm_file("libopenfail.so");
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).expect("chmod");
+        let denied = std::fs::File::open(&path).is_err();
+        let backend = ScriptBackend::new(calib_for(&path), 1);
+        let outcome = super::start_with(
+            std::slice::from_ref(&path),
+            3,
+            0,
+            0,
+            false,
+            super::DepartFamily::Pair,
+            backend,
+            || 7,
+            &mut crate::discovery::scan::CaptureWorkBudget::default(),
+        );
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("restore");
+        if !denied {
+            assert!(outcome.is_ok(), "an openable file starts");
+            return;
+        }
+        let err = match outcome {
+            Ok(_) => panic!("an unopenable path must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.class(), "calibration");
+    }
+
+    #[test]
     fn start_reads_mountinfo_only_on_calibration_mismatch() {
         // Laziness: a direct-match calibration never touches the mount
         // table, so the budget records no table IO.

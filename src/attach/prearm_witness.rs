@@ -580,27 +580,32 @@ fn map_file_identity(start: u64, end: u64) -> std::result::Result<(u64, u64), St
 /// marks those with the `trusted.overlay.metacopy` xattr. Presence is
 /// the marker — the value is empty on current kernels (measured
 /// 7.0.0-38: the xattr lists, reads 0 bytes, and the file serves the
-/// lower data). Any read failure (unprivileged `trusted.*` reads, no
-/// xattr) reports false — the fallback then refuses a lower match,
-/// fail closed.
+/// lower data), or 4 bytes plus the digest with verity; the probe reads
+/// presence only, so both forms report true. Any probe failure
+/// (unprivileged `trusted.*` reads, no xattr) reports false — the
+/// fallback then refuses a lower match, fail closed.
 pub(crate) fn upper_is_metacopy(upper: &std::path::Path) -> bool {
+    upper_is_metacopy_with(upper, |path, name| {
+        // SAFETY: path and name are NUL-terminated; a NULL value with
+        // size 0 probes presence (returns the value size, 0 for the
+        // empty marker). lgetxattr never follows a trailing symlink.
+        unsafe { libc::lgetxattr(path.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) }
+    })
+}
+
+/// [`upper_is_metacopy`] with an injectable presence probe (unprivileged
+/// unit tests cannot fabricate a `trusted.*` xattr).
+fn upper_is_metacopy_with(
+    upper: &std::path::Path,
+    probe: impl Fn(&std::ffi::CStr, &std::ffi::CStr) -> libc::ssize_t,
+) -> bool {
     use std::os::unix::ffi::OsStrExt as _;
     let path = match std::ffi::CString::new(upper.as_os_str().as_bytes()) {
         Ok(path) => path,
         Err(_) => return false,
     };
     let name = c"trusted.overlay.metacopy";
-    let mut value = [0u8; 16];
-    // SAFETY: path and name are NUL-terminated; value is a valid 16-byte buffer.
-    let read = unsafe {
-        libc::getxattr(
-            path.as_ptr(),
-            name.as_ptr(),
-            value.as_mut_ptr().cast(),
-            value.len(),
-        )
-    };
-    read >= 0
+    probe(path.as_c_str(), name) >= 0
 }
 
 /// Backing-vs-backing acceptance for an overlay split: the BPF slot
@@ -2592,6 +2597,20 @@ mod tests {
         std::fs::write(&plain, [0xACu8; 64]).expect("write");
         assert!(!super::upper_is_metacopy(&plain));
         assert!(!super::upper_is_metacopy(&root.path().join("absent.so")));
+    }
+
+    #[test]
+    fn upper_is_metacopy_accepts_any_present_value_size() {
+        // The presence probe reports the value size: 0 for the empty
+        // marker, 4-plus-digest with verity. Any non-negative size is a
+        // metacopy; only a failed probe is not. (A fixed 16-byte value
+        // read fails the verity form with ERANGE.)
+        let root = tempfile::tempdir().expect("tempdir");
+        let upper = root.path().join("upper.so");
+        std::fs::write(&upper, [0xAEu8; 64]).expect("write");
+        assert!(super::upper_is_metacopy_with(&upper, |_, _| 0));
+        assert!(super::upper_is_metacopy_with(&upper, |_, _| 40));
+        assert!(!super::upper_is_metacopy_with(&upper, |_, _| -1));
     }
 
     #[test]

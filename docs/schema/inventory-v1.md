@@ -316,11 +316,14 @@ non-null values needs a new allowlist row.
   learned or indexed: only known collisions disclose. The concise
   `unidentified executables` line groups the run-wide images by
   executable with call counts (five groups, five host pids each, the rest
-  counted), ambiguous groups marked `(ambiguous, N candidates)`; the
-  verbose per-module line names every collected
-  executable with its host pid, `dev major:minor`/`ino`, resolution source,
-  first-call time, and — when ambiguous — every other verified
-  spelling. Absent in captures that predate exe naming.
+  counted); an ambiguous group keeps the executable name first with the
+  candidates' full paths beside it (`tool (ambiguous: /snap/a/tool,
+  /snap/b/tool)`, the sorted-first two plus `(+N more)` past two —
+  controls escaped, counts unchanged); the verbose per-module line
+  names every collected executable with its host pid, `dev
+  major:minor`/`ino`, resolution source, first-call time, and — when
+  ambiguous — every other verified spelling. Absent in captures that
+  predate exe naming.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records
   instead a `native witness without mapping evidence` gap naming the

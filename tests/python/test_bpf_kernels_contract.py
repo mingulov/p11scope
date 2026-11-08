@@ -146,7 +146,10 @@ def deb_matches_kernel(deb, kernel):
     Release candidates ship the dotted triplet instead (v7.4-rc1 ships
     7.4.0-070400rc1 debs), so the triplet prefix plus the same rc
     marker must match, never another rc number (mirrors
-    scripts/bpf-guest-release.sh)."""
+    scripts/bpf-guest-release.sh). Every marker occurrence is
+    examined, like the shell glob: the name matches when any
+    occurrence carries no digit tail. Shared vectors in
+    tests/fixtures/rc-match-vectors.json pin the agreement."""
     numeric = kernel[1:] if kernel.startswith("v") else kernel
     if numeric in deb:
         return True
@@ -158,10 +161,12 @@ def deb_matches_kernel(deb, kernel):
         return False
     marker = f"rc{tag}"
     pos = deb.find(marker, at)
-    if pos < 0:
-        return False
-    tail = deb[pos + len(marker):pos + len(marker) + 1]
-    return tail == "" or not tail.isdigit()
+    while pos >= 0:
+        tail = deb[pos + len(marker):pos + len(marker) + 1]
+        if tail == "" or not tail.isdigit():
+            return True
+        pos = deb.find(marker, pos + 1)
+    return False
 
 
 def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):

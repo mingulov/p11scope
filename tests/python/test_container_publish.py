@@ -24,6 +24,8 @@ import yaml
 
 ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = ROOT / ".github/workflows/container-publish.yml"
+RELEASE_DOCKERFILE = ROOT / "deploy/Dockerfile.observer-release"
+RUNBOOK = ROOT / "RELEASING.md"
 IMAGE_ID = "sha256:" + "ab12" * 16
 VERSION_DIGEST = "sha256:" + "11" * 32
 
@@ -101,9 +103,23 @@ class ContainerPublishTests(unittest.TestCase):
                           f"build must check {marker} (tree, ancestry, version)")
         self.assertIn("tag_version%%-*}", bodies,
                       "build must strip the RC suffix for the version check")
+        self.assertIn("$release_head^{tree}", bodies,
+                      "build must bind the packaged head to the RELEASE tree, not just the tag commit")
+        self.assertIn("release_vars=$(python3", bodies,
+                      "build must capture the RELEASE parse so a Python failure fails the step")
+        self.assertIn('eval "$release_vars"', bodies,
+                      "build must eval the captured RELEASE assignments")
+        self.assertNotIn('eval "$(python3', bodies,
+                         "eval must not hide a Python failure behind its own zero exit")
+        self.assertLess(bodies.index('$2 == "RELEASE.json"'),
+                        bodies.index("python3 -I - RELEASE.json"),
+                        "the RELEASE.json checksum must verify before the file is parsed")
         self.assertIn("--pattern", bodies, "build must download only the needed assets")
         self.assertIn('$2 == "RELEASE.json"', bodies,
                       "build must verify the RELEASE.json line explicitly")
+        for marker in ("GNU tar", "tar -tzf", "tarball-members", "unsafe members"):
+            self.assertIn(marker, bodies,
+                          f"build must list raw tarball members with GNU tar ({marker})")
         self.assertNotIn("sha256sum --check SHA256SUMS", bodies,
                          "SHA256SUMS covers files not downloaded; verify the needed lines only")
         self.assertNotIn("cargo build", bodies,
@@ -129,6 +145,34 @@ class ContainerPublishTests(unittest.TestCase):
         self.assertEqual(uploads[0]["with"].get("if-no-files-found"), "error")
         self.assertIn("image-id", bodies)
         self.assertIn("is-latest", bodies, "build must record whether the tag is newest stable")
+
+    def test_release_dockerfile_defers_member_check_to_the_gnu_tar_step(self):
+        self.assertTrue(RELEASE_DOCKERFILE.is_file(), "the release Dockerfile is missing")
+        release = RELEASE_DOCKERFILE.read_text()
+        self.assertNotIn("tar -tzf /tmp/release.tar.gz | grep", release,
+                         "busybox tar strips unsafe members in the listing, "
+                         "so the in-image grep never fires")
+        self.assertIn("GNU tar", release,
+                      "the Dockerfile must point at the workflow download step "
+                      "that lists raw member names")
+
+    def test_runbook_latest_recovery_and_tag_identity(self):
+        self.assertTrue(RUNBOOK.is_file(), "the release runbook is missing")
+        runbook = RUNBOOK.read_text()
+        for marker in ("--prefer-index=false", "{{.Manifest.Digest}}",
+                       "write:packages", "delete the GHCR package version",
+                       "removes every tag on that digest",
+                       "record its digest by hand",
+                       "the build step's image ID",
+                       "line from `docker push`"):
+            self.assertIn(marker, runbook, f"the runbook recovery must say {marker}")
+        self.assertNotIn("delete the version tag", runbook,
+                         "recovery deletes the GHCR package version, not one tag")
+        for marker in ("tag commit's tree equals",
+                       "is an ancestor of the tag commit"):
+            self.assertIn(marker, runbook, f"step 7.1 must say {marker}")
+        self.assertNotIn("`git rev-parse HEAD` equals the `head` fact", runbook,
+                         "step 7.1 must not require HEAD to equal the packaged head")
 
     def test_push_logs_in_from_step_env_and_names_tags_behind_the_final_gate(self):
         self.assertTrue(WORKFLOW.is_file(), "the release publish workflow is missing")

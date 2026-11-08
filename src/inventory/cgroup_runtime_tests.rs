@@ -689,6 +689,7 @@ fn run_public_selection(
         events,
         None,
         None,
+        None,
         if diagnostics.is_some() {
             CaptureMode::Auto
         } else {

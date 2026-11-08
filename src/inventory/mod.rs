@@ -782,6 +782,7 @@ pub fn run(
     event_log: Option<&Path>,
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
+    event_interval: Option<Duration>,
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     diagnostics: Option<&Path>,
@@ -849,6 +850,7 @@ pub fn run(
         event_log,
         event_rotate_bytes,
         event_max_files,
+        event_interval,
         capture,
         attach_backend,
         identity,
@@ -1063,6 +1065,7 @@ fn run_with_terminal_diagnostics(
         event_log,
         event_rotate_bytes,
         event_max_files,
+        None,
         capture,
         attach_backend,
         identity,
@@ -1329,6 +1332,7 @@ fn run_with_terminal_budget(
     event_log: Option<&Path>,
     event_rotate_bytes: Option<u64>,
     event_max_files: Option<usize>,
+    event_interval: Option<Duration>,
     capture: CaptureMode,
     attach_backend: crate::attach::BackendSelection,
     identity: Option<crate::cli::IdentityBackendSelection>,
@@ -1402,6 +1406,12 @@ fn run_with_terminal_budget(
             "--event-rotate-bytes/--event-max-files cannot be combined with --event-log - \
              (stdout is not rotated)"
         );
+    }
+    // A cadence without a stream has nowhere to go: refused, never
+    // silently ignored (the parser refuses it too; this covers
+    // programmatic callers).
+    if event_log.is_none() && event_interval.is_some() {
+        anyhow::bail!("--event-interval requires --event-log <f.jsonl|->");
     }
     // Stdout aliases nothing on disk: the `-` stream skips the
     // report/rotation alias checks below.
@@ -1620,6 +1630,7 @@ fn run_with_terminal_budget(
                         duration,
                         json,
                         attach_backend,
+                        event_interval,
                     },
                     coordinator,
                     lane,
@@ -1663,6 +1674,7 @@ fn run_with_terminal_budget(
         (_, error) => error,
     };
     let mut stream_state = StreamState::new();
+    stream_state.totals = event_interval.map(|interval| TotalsCadence::new(interval, started_ns));
     // The opening prior for pending views and the final: the same
     // pass-zero read as the prologue, so a final always has a prior
     // even when no pass completed.
@@ -7645,6 +7657,34 @@ pub(crate) fn emit_pass_events(
 /// (capped per pass; `finish_output` sweeps the rest), then the pass
 /// marker with its loss accounting, edge record counts and unbound row
 /// counts; `final` marks the native stop's commit.
+/// Append one `totals` event when the `--event-interval` cadence is
+/// due at this pass (pass commits only: the stop commit's `ended`
+/// and the final report already carry the final counts). Returns
+/// whether a line was appended. Rides the existing pass tick — one
+/// small append inside the pass's own commit batch — so there is no
+/// new thread and stop never waits for it.
+fn emit_totals_if_due(
+    writer: &mut EventWriter,
+    state: &mut StreamState,
+    presentation: &Presentation,
+    now_ns: u64,
+) -> Result<bool, String> {
+    let due = state
+        .totals
+        .as_ref()
+        .is_some_and(|cadence| cadence.due(now_ns));
+    if !due {
+        return Ok(false);
+    }
+    let payload =
+        crate::inventory_events::totals_payload(presentation, &state.last_deferred, writer);
+    writer.append("totals", payload, now_ns)?;
+    if let Some(cadence) = state.totals.as_mut() {
+        cadence.mark_emitted(now_ns);
+    }
+    Ok(true)
+}
+
 fn emit_commit(
     writer: &mut EventWriter,
     state: &mut StreamState,
@@ -7711,7 +7751,19 @@ fn emit_commit(
     if stop {
         payload["final"] = serde_json::Value::Bool(true);
     }
-    writer.append("pass_committed", payload, now_ns)
+    writer.append("pass_committed", payload, now_ns)?;
+    // The queues still waiting after this commit: the next totals
+    // snapshot reports them as `deferred`.
+    state.last_deferred = DeferredCounts {
+        edge_events: edges.deferred as u64,
+        instance_events: instances.instance_deferred as u64,
+        semantic_edge_events: instances.edge_deferred as u64,
+        key_operation_events: key_operations.deferred as u64,
+    };
+    if !stop {
+        emit_totals_if_due(writer, state, presentation, now_ns)?;
+    }
+    Ok(())
 }
 
 /// Append the native stop's commit to the event stream: the incarnation
@@ -7788,6 +7840,7 @@ struct DashboardRun {
     duration: Option<Duration>,
     json: bool,
     attach_backend: crate::attach::BackendSelection,
+    event_interval: Option<Duration>,
 }
 
 /// The event stream's view of a pass: the classic cumulative window, on
@@ -8020,9 +8073,11 @@ fn run_dashboard(
         duration,
         json,
         attach_backend,
+        event_interval,
     } = run;
     let quit = display.quit_flag();
     let mut stream_state = StreamState::new();
+    stream_state.totals = event_interval.map(|interval| TotalsCadence::new(interval, started_ns));
     // The opening prior for pending views and the final: the same
     // pass-zero read as the prologue, so a final always has a prior
     // even when no pass completed.
@@ -9375,6 +9430,7 @@ mod tests {
                         Some(&events),
                         None,
                         None,
+                        None,
                         mode,
                         backend,
                         None,
@@ -9429,6 +9485,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -9594,6 +9651,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     CaptureMode::Auto,
                     crate::attach::BackendSelection::Singles,
                     None,
@@ -9685,6 +9743,7 @@ mod tests {
                     None,
                     None,
                     None,
+                    None,
                     CaptureMode::Auto,
                     crate::attach::BackendSelection::Singles,
                     None,
@@ -9746,6 +9805,7 @@ mod tests {
                     None,
                     false,
                     event_log,
+                    None,
                     None,
                     None,
                     CaptureMode::Auto,
@@ -10251,6 +10311,7 @@ mod tests {
             None,
             None,
             None,
+            None,
             CaptureMode::Scan,
             crate::attach::BackendSelection::Singles,
             None,
@@ -10297,6 +10358,7 @@ mod tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,
@@ -10410,6 +10472,7 @@ mod tests {
                     None,
                     None,
                     false,
+                    None,
                     None,
                     None,
                     None,
@@ -10753,6 +10816,7 @@ mod tests {
                     Some(&report),
                     dashboard,
                     Some(&event_log),
+                    None,
                     None,
                     None,
                     capture,
@@ -11382,7 +11446,7 @@ mod tests {
             .filter(|(_, line)| line["kind"] == "totals")
             .collect();
         assert_eq!(totals.len(), 2, "totals at 10s and 20s only");
-        for (index, line) in &totals {
+        for (_, line) in &totals {
             assert_eq!(line["schema"], "p11scope/inventory-events/v1");
         }
         assert_eq!(totals[0].1["event"]["pass"], 10);
@@ -27467,6 +27531,7 @@ mod seal_readiness_tests {
             Some(&shared),
             None,
             None,
+            None,
             CaptureMode::Auto,
             crate::attach::BackendSelection::Auto,
             None,
@@ -27509,6 +27574,7 @@ mod seal_readiness_tests {
             None,
             None,
             false,
+            None,
             None,
             None,
             None,

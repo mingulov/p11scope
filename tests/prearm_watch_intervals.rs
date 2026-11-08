@@ -852,6 +852,7 @@ fn inventory_prearm_section_empty_without_flag() {
         None,
         None,
         None,
+        None,
         CaptureMode::Scan,
         BackendSelection::default(),
         None,

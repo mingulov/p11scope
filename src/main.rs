@@ -228,6 +228,7 @@ fn run() -> Result<i32> {
                 a.event_log.as_deref(),
                 a.event_rotate_bytes,
                 a.event_max_files,
+                a.event_interval,
                 a.capture,
                 a.attach_backend,
                 a.diagnostics.as_deref(),

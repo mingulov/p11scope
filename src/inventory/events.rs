@@ -25,6 +25,7 @@ use crate::inventory_event_identity::{IdentityIndex, bounded_context, context_bu
 use crate::inventory_present::GapView;
 use crate::inventory_present::{
     Activity, Capture, EdgeView, InstanceSemanticView, InstanceView, Presence, Presentation,
+    layer_entry_totals,
 };
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::fs::File;
@@ -2803,10 +2804,8 @@ impl TotalsCadence {
     }
 
     /// Whether a totals event is due at this pass.
-    pub(crate) fn due(&self, _now_ns: u64) -> bool {
-        // Scaffold: the comparison lands with the totals commit.
-        let _ = (self.interval_ns, self.next_due_ns);
-        false
+    pub(crate) fn due(&self, now_ns: u64) -> bool {
+        now_ns >= self.next_due_ns
     }
 
     /// Phase the cadence to an emission: the next totals is due one
@@ -2831,12 +2830,50 @@ pub(crate) struct DeferredCounts {
 /// emitter deferred queues, and the writer accounting — all values
 /// the report already carries, as a mid-run snapshot.
 pub(crate) fn totals_payload(
-    _presentation: &Presentation,
-    _deferred: &DeferredCounts,
-    _writer: &EventWriter,
+    presentation: &Presentation,
+    deferred: &DeferredCounts,
+    writer: &EventWriter,
 ) -> serde_json::Value {
-    // Scaffold: the payload lands with the totals commit.
-    serde_json::json!({})
+    let observations = &presentation.object_observations;
+    let (logical, forwarding) = layer_entry_totals(presentation);
+    let (stdout_lines, stdout_bytes) = writer.stdout_lost();
+    serde_json::json!({
+        "pass": presentation.passes,
+        "callers": presentation.callers.len(),
+        "modules": presentation.modules.len(),
+        "edges": presentation.edges.len(),
+        "instances": presentation.instances.len(),
+        "semantic_edges": presentation.semantic_edges.len(),
+        "gaps": presentation.gaps.len(),
+        "gaps_suppressed": presentation.gaps_suppressed,
+        "refusals": presentation.budgets.refusals(),
+        "entries": {
+            "logical": logical,
+            "forwarding": forwarding,
+        },
+        "key_operations": {
+            "revision": observations.revision,
+            "status": observations.status.label(),
+            "objects": observations.objects.len(),
+            "known_rows": observations.key_operations.len(),
+            "unknown_rows": observations.unknown_key_operations.len(),
+        },
+        "deferred": {
+            "edge_events": deferred.edge_events,
+            "instance_events": deferred.instance_events,
+            "semantic_edge_events": deferred.semantic_edge_events,
+            "key_operation_events": deferred.key_operation_events,
+        },
+        "stream": {
+            "rotations": writer.rotations(),
+            "evicted_events": writer.evicted_events(),
+            "evicted_bytes": writer.evicted_bytes(),
+        },
+        "stdout_lost": {
+            "lines": stdout_lines,
+            "bytes": stdout_bytes,
+        },
+    })
 }
 
 #[cfg(test)]

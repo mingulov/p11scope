@@ -669,6 +669,12 @@ fn scope_gap(reason: &str) -> PidGap {
     }
 }
 
+/// Whether one member gap marks its whole cgroup transaction incomplete.
+/// Transaction-level truncation boundary for one member gap; see tests.
+fn member_gap_truncates_transaction(reason: &str) -> bool {
+    scan_skip_truncates(reason)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CollectionStage {
     Traversed,
@@ -937,7 +943,7 @@ fn collect_with(
                 || member
                     .gaps
                     .iter()
-                    .any(|gap| scan_skip_truncates(&gap.reason)))
+                    .any(|gap| member_gap_truncates_transaction(&gap.reason)))
         {
             outcome = ScopedCollectionOutcome::Incomplete(ScopedCollectionGap::ScanIncomplete);
         }
@@ -1864,5 +1870,74 @@ mod tests {
         );
         drop(collection);
         assert!(original.upgrade().is_none());
+    }
+
+    #[test]
+    fn unproven_member_gap_degrades_per_caller_without_incompleting_transaction() {
+        use crate::discovery::overlay_witness::{
+            GAP_ANCHOR_BINDING_FAILED, GAP_BUDGET_EXHAUSTED, GAP_WITNESS_REFUSED,
+            GAP_WITNESS_UNAVAILABLE,
+        };
+        // Every original-file proof refusal is a disclosed per-caller
+        // outcome: the member scan ran to completion, so none marks the
+        // shared transaction incomplete (JK-22: degrade, never stop).
+        for reason in [
+            GAP_WITNESS_UNAVAILABLE,
+            GAP_WITNESS_REFUSED,
+            GAP_BUDGET_EXHAUSTED,
+            GAP_ANCHOR_BINDING_FAILED,
+            // The diagnosed scoped-collection variant from the failing
+            // inventory-cgroup cell (overlay provider, witness deactivated).
+            "original_file_unproven: kernel witness unavailable: scoped collection deactivates the kernel proof",
+        ] {
+            assert!(
+                !member_gap_truncates_transaction(reason),
+                "unproven proof outcome must not truncate its transaction: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn cut_short_member_gaps_still_incomplete_their_transaction() {
+        use crate::discovery::scan::{
+            IO_CEILING_REASON, MAPPING_CHANGED_REASON, SCAN_DEADLINE_REASON, WORK_CEILING_REASON,
+        };
+        // Twin: scans cut short (ceilings, deadlines, changed mappings,
+        // guard mismatches, unknown reasons) keep failing closed.
+        for reason in [
+            IO_CEILING_REASON,
+            WORK_CEILING_REASON,
+            SCAN_DEADLINE_REASON,
+            MAPPING_CHANGED_REASON,
+            "opened object identity 1:2 inode 3 does not match mapped object 1:2 inode 4",
+            "some future unknown omission",
+        ] {
+            assert!(
+                member_gap_truncates_transaction(reason),
+                "cut-short signal must truncate its transaction: {reason}"
+            );
+        }
+    }
+
+    #[test]
+    fn benign_member_gaps_stay_non_truncating() {
+        use crate::discovery::scan::{
+            HINT_NOT_MAPPED_REASON, NO_ABSOLUTE_PATHNAME_REASON, NO_TABLE_FOUND_MARKER,
+        };
+        // Twin: verified-absence vocabulary never truncated and still must not.
+        let no_table = format!("libfoo.so: {NO_TABLE_FOUND_MARKER}; action suffix");
+        for reason in [
+            no_table.as_str(),
+            HINT_NOT_MAPPED_REASON,
+            NO_ABSOLUTE_PATHNAME_REASON,
+            "ambiguous \\012 pathname",
+            "deleted mapping",
+            "non-UTF-8 pathname",
+        ] {
+            assert!(
+                !member_gap_truncates_transaction(reason),
+                "benign absence must not truncate its transaction: {reason}"
+            );
+        }
     }
 }

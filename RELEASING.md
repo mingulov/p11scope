@@ -508,10 +508,12 @@ Record commands and outcomes before claiming any recipient build passed.
 
 On the commit that steps 3–6 ran on:
 
-1. Check that `git rev-parse HEAD` equals the `head` fact in the receipt's
-   `facts.log`, the source export's recorded revision, and the SHA of the
-   green CI run. Verify the package bundles contain the binaries from that
-   receipt and that `SHA256SUMS` matches the files to upload.
+1. Check that the tag commit's tree equals the `tree` fact in the receipt's
+   `facts.log` and the source export's recorded tree, that the packaged
+   `head` is an ancestor of the tag commit, and that the green CI run from
+   step 3 covered this source. Verify the package bundles contain the
+   binaries from that receipt and that `SHA256SUMS` matches the files to
+   upload.
 2. Create an annotated (optionally signed) tag and push `main` and the tag:
 
    ```sh
@@ -561,12 +563,20 @@ On the commit that steps 3–6 ran on:
    version tag is refused, as is any registry probe that fails for a
    reason other than "not found". After a partial push (the version tag
    exists but `:latest` or the receipt is missing), compare the existing
-   tag's digest with the digest the failed attempt logged: if they match,
-   finish `:latest` registry-side with
-   `docker buildx imagetools create -t ghcr.io/mingulov/p11scope:latest
-   ghcr.io/mingulov/p11scope:<X.Y.Z>`; otherwise delete the version tag
-   first, then re-run. Record the run URL and the image digest from
-   the push receipt. The package is public and linked to
+   tag's digest with the digest the failed attempt logged (the
+   `<X.Y.Z>: digest: sha256:...` line from `docker push`, or the build step's image ID):
+   if they match, finish `:latest` registry-side with a maintainer login
+   holding `write:packages`:
+   `docker buildx imagetools create --prefer-index=false
+   -t ghcr.io/mingulov/p11scope:latest
+   ghcr.io/mingulov/p11scope:<X.Y.Z>`, then check that
+   `docker buildx imagetools inspect --format '{{.Manifest.Digest}}'
+   ghcr.io/mingulov/p11scope:latest` equals the version digest; otherwise
+   delete the GHCR package version first, then re-run: deleting the package
+   version removes every tag on that digest. The registry-side copy
+   produces no receipt, so record its digest by hand. Record the run URL
+   and the image digest from the push receipt. The package is public and
+   linked to
    `mingulov/p11scope` since 2026-11-08; confirm visibility at each
    release with the anonymous clean-client pull below (the controller
    deletes the `0.7.0-test.*` versions only after the real 0.7.0 push),

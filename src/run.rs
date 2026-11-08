@@ -3490,7 +3490,7 @@ fn capture_with_host(
         .start_session(policy, a.ring_bytes, a.attach_backend)
         .map_err(attach_session_context)?;
     session
-        .drop_post_setup_capabilities()
+        .drop_post_setup_capabilities(false)
         .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
     run_loop(
         &mut engine,
@@ -4805,8 +4805,10 @@ fn run_owned_inner_with_host(
         .start_owned_session(policy, &mut child, args.ring_bytes, args.attach_backend)
         .map_err(attach_session_context)
         .map_err(|error| combine_setup_failure(error, &mut child))?;
+    // Owned never sheds: post-setup attach/confirm/discovery still needs
+    // CAP_SYS_ADMIN (controller ruling 2026-11-08, F1).
     session
-        .drop_post_setup_capabilities()
+        .drop_post_setup_capabilities(true)
         .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))
         .map_err(|error| combine_setup_failure(error, &mut child))?;
 

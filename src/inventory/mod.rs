@@ -7118,7 +7118,8 @@ fn open_native_lane_with(
             if multi {
                 let sets = crate::caps::read_sets_via_capget()
                     .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;
-                let keep = crate::caps::post_setup_keep(multi, true, sets.effective);
+                // Inventory lanes are never owned `run` sessions.
+                let keep = crate::caps::post_setup_keep(multi, true, false, sets.effective);
                 if crate::caps::post_setup_shed_needed(keep, sets) {
                     crate::caps::drop_to_keep(keep)
                         .map_err(|error| anyhow::anyhow!("post-setup capability drop: {error}"))?;

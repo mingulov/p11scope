@@ -11065,11 +11065,14 @@ impl Session {
 
     /// Shed the transient startup grant once attach is complete; see
     /// [`drop_post_setup_capabilities_for`]. Callers invoke this after
-    /// their session starts, before the capture loop.
-    pub(crate) fn drop_post_setup_capabilities(&self) -> std::io::Result<()> {
+    /// their session starts, before the capture loop. `owned` is true
+    /// for `run` (the observer owns the child): owned sessions never
+    /// shed (controller ruling 2026-11-08, F1).
+    pub(crate) fn drop_post_setup_capabilities(&self, owned: bool) -> std::io::Result<()> {
         drop_post_setup_capabilities_for(
             self.backend,
             self.dynamic_multi,
+            owned,
             self.cleanup_worker.as_ref(),
         )
     }
@@ -11080,7 +11083,10 @@ impl Session {
 /// `perf_event_open` remains past attach — measured lane F15: dynamic
 /// links need `CAP_BPF`+`CAP_PERFMON`, never sysadmin); a singles
 /// session, or a multi session whose dynamics stay on perf (an unproven
-/// pid filter), keeps it for dynamic perf re-attach. The sets come from
+/// pid filter), keeps it for dynamic perf re-attach. An owned `run`
+/// session (`owned`) never sheds: its attach/confirm/discovery work
+/// after multi setup still needs `CAP_SYS_ADMIN` (controller ruling
+/// 2026-11-08, F1; the shed broke owned pause_auto). The sets come from
 /// `capget`, never `/proc` (a broken `/proc` must not zero the shed).
 /// The shed is per-thread, so the pre-spawned cleanup worker sheds to
 /// the same keep. Sets already at keep skip the drop entirely (no
@@ -11089,14 +11095,16 @@ impl Session {
 pub(crate) fn drop_post_setup_capabilities_for(
     backend: AttachBackend,
     dynamic_multi: bool,
+    owned: bool,
     worker: Option<&CleanupWorker>,
 ) -> std::io::Result<()> {
+    let _ = owned;
     let multi = backend == AttachBackend::Multi;
     if !multi || !dynamic_multi {
         return Ok(());
     }
     let sets = crate::caps::read_sets_via_capget()?;
-    let keep = crate::caps::post_setup_keep(multi, dynamic_multi, sets.effective);
+    let keep = crate::caps::post_setup_keep(multi, dynamic_multi, owned, sets.effective);
     if !crate::caps::post_setup_shed_needed(keep, sets) {
         return Ok(());
     }
@@ -11129,11 +11137,33 @@ mod post_setup_shed_tests {
             seen_clone.lock().unwrap().push(keep);
             Ok(())
         }));
-        drop_post_setup_capabilities_for(AttachBackend::Multi, true, Some(&worker))
+        drop_post_setup_capabilities_for(AttachBackend::Multi, true, false, Some(&worker))
             .expect("a no-op shed succeeds");
         assert!(
             seen.lock().unwrap().is_empty(),
             "the worker drop must not run when the shed changes nothing"
+        );
+    }
+
+    /// An owned `run` session never sheds, including the worker drop:
+    /// its attach/confirm/discovery work after multi setup still needs
+    /// `CAP_SYS_ADMIN` (controller ruling 2026-11-08, F1; the shed
+    /// broke owned pause_auto, so owned keeps the full set like
+    /// v0.6.0). Non-vacuous as root (a root test thread holds
+    /// `CAP_SYS_ADMIN` to shed); unprivileged threads skip either way.
+    #[test]
+    fn post_setup_shed_skips_owned_runs_entirely() {
+        let seen: Arc<Mutex<Vec<u64>>> = Arc::new(Mutex::new(Vec::new()));
+        let seen_clone = Arc::clone(&seen);
+        let worker = CleanupWorker::pre_start_with_drop_fn(Arc::new(move |keep: u64| {
+            seen_clone.lock().unwrap().push(keep);
+            Ok(())
+        }));
+        drop_post_setup_capabilities_for(AttachBackend::Multi, true, true, Some(&worker))
+            .expect("an owned no-op shed succeeds");
+        assert!(
+            seen.lock().unwrap().is_empty(),
+            "the worker drop must not run for an owned session (F1)"
         );
     }
 }

@@ -219,8 +219,16 @@ pub(crate) fn note_lacking(bits: &[u32]) {
 /// three), so later dynamic links and identity proofs still need it.
 /// A singles session, or a multi session whose dynamics stay on perf
 /// (an unproven pid filter on 6.6-6.9 without the backport), keeps it
-/// for dynamic perf re-attach.
-pub(crate) fn post_setup_keep(multi: bool, dynamic_multi: bool, effective: u64) -> u64 {
+/// for dynamic perf re-attach. An owned `run` session (`owned`) always
+/// keeps it: attach/confirm/discovery work after multi setup still
+/// needs it there (controller ruling 2026-11-08, F1).
+pub(crate) fn post_setup_keep(
+    multi: bool,
+    dynamic_multi: bool,
+    owned: bool,
+    effective: u64,
+) -> u64 {
+    let _ = owned;
     let narrow =
         (1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT) | (1u64 << CAP_CHECKPOINT_RESTORE_BIT);
     if multi && dynamic_multi && effective & narrow == narrow {
@@ -663,32 +671,49 @@ mod tests {
     /// Post-setup least privilege: multi with linked dynamics sheds the
     /// transient `CAP_SYS_ADMIN`, singles keeps it, multi with perf
     /// dynamics (an unproven pid filter) keeps it for re-attach, and a
-    /// setcap process without it is untouched either way.
+    /// setcap process without it is untouched either way. An owned `run`
+    /// always keeps it: its attach/confirm/discovery work after multi
+    /// setup still needs it (controller ruling 2026-11-08: the shed
+    /// broke owned pause_auto, F1; least privilege must never behave
+    /// worse than v0.6.0).
     #[test]
     fn post_setup_keep_sheds_only_the_transient_sys_admin() {
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
         let live = minimal_live_mask();
-        assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
-        assert_eq!(post_setup_keep(true, true, live), live);
-        assert_eq!(post_setup_keep(true, true, u64::MAX), !sys_admin);
+        assert_eq!(post_setup_keep(true, true, false, live | sys_admin), live);
+        assert_eq!(post_setup_keep(true, true, false, live), live);
+        assert_eq!(post_setup_keep(true, true, false, u64::MAX), !sys_admin);
         assert_eq!(
-            post_setup_keep(false, false, live | sys_admin),
+            post_setup_keep(false, false, false, live | sys_admin),
             live | sys_admin
         );
-        assert_eq!(post_setup_keep(false, false, live), live);
+        assert_eq!(post_setup_keep(false, false, false, live), live);
         // Multi backend with perf dynamics: the pid-filter probe failed,
         // so dynamic re-attach still needs SYS_ADMIN.
         assert_eq!(
-            post_setup_keep(true, false, live | sys_admin),
+            post_setup_keep(true, false, false, live | sys_admin),
             live | sys_admin
         );
-        assert_eq!(post_setup_keep(true, false, u64::MAX), u64::MAX);
+        assert_eq!(post_setup_keep(true, false, false, u64::MAX), u64::MAX);
+        // Owned keeps SYS_ADMIN even when multi+linked would shed it.
+        assert_eq!(
+            post_setup_keep(true, true, true, live | sys_admin),
+            live | sys_admin,
+            "owned multi must keep SYS_ADMIN for post-setup attach (F1)"
+        );
+        assert_eq!(
+            post_setup_keep(true, true, true, u64::MAX),
+            u64::MAX,
+            "owned multi keeps the full set (F1)"
+        );
     }
 
     /// Post-setup keeps `CAP_SYS_ADMIN` unless the narrow BPF, PERFMON
     /// and CHECKPOINT_RESTORE grants all survive it: later dynamic
     /// links still need BPF/PERFMON, and later identity proofs still
     /// need map_files, so any missing narrow grant keeps the fallback.
+    /// Owned always keeps it regardless of the narrow grants
+    /// (controller ruling 2026-11-08, F1).
     #[test]
     fn post_setup_keep_requires_bpf_perfmon_and_cr_to_shed() {
         let sys_admin = 1u64 << CAP_SYS_ADMIN_BIT;
@@ -698,16 +723,22 @@ mod tests {
         for bit in [CAP_BPF_BIT, CAP_PERFMON_BIT, CAP_CHECKPOINT_RESTORE_BIT] {
             let without = (live & !(1u64 << bit)) | sys_admin;
             assert_eq!(
-                post_setup_keep(true, true, without),
+                post_setup_keep(true, true, false, without),
                 without,
                 "missing bit {bit} must keep SYS_ADMIN"
             );
         }
         // All three held sheds; none held (the DaemonSet shape) keeps.
-        assert_eq!(post_setup_keep(true, true, live | sys_admin), live);
+        assert_eq!(post_setup_keep(true, true, false, live | sys_admin), live);
         let daemonset =
             sys_admin | (1u64 << CAP_SYS_PTRACE_BIT) | (1u64 << CAP_DAC_READ_SEARCH_BIT);
-        assert_eq!(post_setup_keep(true, true, daemonset), daemonset);
+        assert_eq!(post_setup_keep(true, true, false, daemonset), daemonset);
+        // Owned keeps even with all narrow grants held (F1).
+        assert_eq!(
+            post_setup_keep(true, true, true, live | sys_admin),
+            live | sys_admin,
+            "owned keeps SYS_ADMIN with full narrow grants (F1)"
+        );
     }
 
     /// The post-setup shed runs exactly when `drop_to_keep` would change
@@ -762,7 +793,10 @@ mod tests {
     /// CHOWN for the handoff, the singles fallback needs SYS_ADMIN,
     /// `run` always keeps SETUID/SETGID/KILL for the sudo-drop identity
     /// change and signalling its re-owned child);
-    /// `inspect` drops the BPF pair it never uses; `diff` keeps file IO
+    /// `inspect` keeps the full live set including the BPF pair: it
+    /// loads the kernel identity witness for overlay/9p proofs
+    /// (controller ruling 2026-11-08, F2; dropping CAP_BPF broke every
+    /// vng INV with `maps_matched` 0); `diff` keeps file IO
     /// only; `--version` keeps nothing. A setcap user never holds the
     /// extras, so the same masks shed them there automatically.
     #[test]
@@ -831,9 +865,22 @@ mod tests {
                 "{argv:?}"
             );
         }
-        let inspect = live & !((1u64 << CAP_BPF_BIT) | (1u64 << CAP_PERFMON_BIT));
+        // Inspect keeps the BPF pair for the identity witness load
+        // (F2): without CAP_BPF the witness bpf() fails EPERM and every
+        // overlay/9p join refuses, so maps_matched drops to 0.
         for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
-            assert_eq!(keep_mask_for_command(&parse(&argv)), inspect, "{argv:?}");
+            let mask = keep_mask_for_command(&parse(&argv));
+            assert_eq!(mask, live, "{argv:?} must keep the full live set (F2)");
+            assert_ne!(
+                mask & (1u64 << CAP_BPF_BIT),
+                0,
+                "{argv:?} must keep CAP_BPF for the witness (F2)"
+            );
+            assert_ne!(
+                mask & (1u64 << CAP_PERFMON_BIT),
+                0,
+                "{argv:?} must keep CAP_PERFMON for the witness (F2)"
+            );
         }
         // Doctor needs no SYS_ADMIN: its self-probe links on multi
         // hosts, and the perf fallback only degrades a row elsewhere.
@@ -1002,7 +1049,8 @@ mod tests {
 
     /// The startup entry keeps exactly the command's keep set intersected
     /// with what the process holds (non-vacuous as root: `inspect` keeps
-    /// three of the five minimal capabilities there).
+    /// the full live set there, including the BPF pair for the identity
+    /// witness — controller ruling 2026-11-08, F2).
     #[test]
     fn drop_unneeded_for_command_applies_per_command_keep_sets() {
         let parent_before = read_effective();
@@ -1042,12 +1090,28 @@ mod tests {
             0,
             "doctor with the minimal set must not keep SYS_ADMIN"
         );
-        // Inspect and scan need map_files only: the DaemonSet lacks
+        // Inspect loads the kernel identity witness (BPF), so it needs
+        // the BPF pair plus map_files: the DaemonSet lacks all three,
+        // so SYS_ADMIN stays; the minimal set holds them, so SYS_ADMIN
+        // goes (controller ruling 2026-11-08, F2: inspect keeps CAP_BPF
+        // whenever it may load the witness).
+        for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
+            let command = parse(&argv);
+            assert_ne!(
+                keep_mask_for_command_in(daemonset, &command) & sys_admin,
+                0,
+                "{argv:?} under the DaemonSet set must keep SYS_ADMIN for the witness BPF load"
+            );
+            assert_eq!(
+                keep_mask_for_command_in(live, &command) & sys_admin,
+                0,
+                "{argv:?} with the minimal set must not keep SYS_ADMIN"
+            );
+        }
+        // Scan needs map_files only: the DaemonSet lacks
         // CHECKPOINT_RESTORE, so SYS_ADMIN stays; the minimal set holds
         // it, so SYS_ADMIN goes.
         for argv in [
-            vec!["inspect", "--pid", "1"],
-            vec!["inspect", "--system"],
             vec!["inventory", "--system", "--capture", "scan"],
             vec!["inventory", "--pid", "1", "--capture", "scan"],
         ] {
@@ -1061,6 +1125,26 @@ mod tests {
                 keep_mask_for_command_in(live, &command) & sys_admin,
                 0,
                 "{argv:?} with the minimal set must not keep SYS_ADMIN"
+            );
+        }
+        // The distinguishing twin: a set that holds map_files but lacks
+        // the BPF pair must keep SYS_ADMIN for inspect (the witness load
+        // needs the pair, F2) but not for scan (map_files only).
+        let no_bpf = live & !(1u64 << CAP_BPF_BIT);
+        for argv in [vec!["inspect", "--pid", "1"], vec!["inspect", "--system"]] {
+            let command = parse(&argv);
+            assert_ne!(
+                keep_mask_for_command_in(no_bpf, &command) & sys_admin,
+                0,
+                "{argv:?} without CAP_BPF must keep SYS_ADMIN for the witness (F2)"
+            );
+        }
+        for argv in [vec!["inventory", "--system", "--capture", "scan"]] {
+            let command = parse(&argv);
+            assert_eq!(
+                keep_mask_for_command_in(no_bpf, &command) & sys_admin,
+                0,
+                "{argv:?} without CAP_BPF must not keep SYS_ADMIN (map_files held)"
             );
         }
         // Live `--system` capture keeps SYS_ADMIN either way (the singles
@@ -1078,15 +1162,21 @@ mod tests {
         }
         // Post-setup: multi sheds only when CHECKPOINT_RESTORE survives
         // it; the DaemonSet lacks it, so the shed keeps SYS_ADMIN.
+        // Owned keeps regardless (controller ruling 2026-11-08, F1).
         assert_eq!(
-            post_setup_keep(true, true, daemonset),
+            post_setup_keep(true, true, false, daemonset),
             daemonset,
             "post-setup under the DaemonSet set must keep SYS_ADMIN for map_files"
         );
         assert_eq!(
-            post_setup_keep(true, true, live | sys_admin),
+            post_setup_keep(true, true, false, live | sys_admin),
             live,
             "post-setup with CHECKPOINT_RESTORE sheds SYS_ADMIN"
+        );
+        assert_eq!(
+            post_setup_keep(true, true, true, live | sys_admin),
+            live | sys_admin,
+            "owned post-setup keeps SYS_ADMIN (F1)"
         );
         // The capget read agrees with `/proc` (no silent divergence
         // between the shed's input and the observable set).

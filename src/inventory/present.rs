@@ -2230,10 +2230,12 @@ fn ellipsize_to(text: &str, max_chars: usize) -> String {
     format!("{kept}…")
 }
 
-/// One concise gap group line: `  {count} × {subject} — {reason}`. The
-/// subject (often a long path) shrinks first so the count and reason
-/// stay intact; only a reason overflowing on its own truncates the
-/// whole line.
+/// One concise gap group line: `  {count} × {subject} — {reason}`.
+/// Short subjects stay whole (cutting a machine name to `nati…`
+/// loses it while saving little); the reason gives way instead.
+/// Long paths keep their tail at a `/` boundary (`…/libc.so.6`) so
+/// distinct files stay distinct; other long subjects keep their head.
+/// Only a reason overflowing on its own truncates the whole line.
 fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     let head = format!("  {count} × ");
     let tail = format!(" — {reason}");
@@ -2242,11 +2244,30 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
         return format!("{head}{subject}{tail}");
     }
     let budget = SUMMARY_LINE_MAX_CHARS.saturating_sub(fixed);
-    if budget >= 2 {
-        let kept: String = subject.chars().take(budget - 1).collect();
-        return format!("{head}{kept}…{tail}");
+    /// Subjects at most this long are never cut: the whole-line
+    /// fallback below trims the reason instead.
+    const SHORT_SUBJECT_KEEP: usize = 32;
+    if subject.chars().count() <= SHORT_SUBJECT_KEEP || budget < 2 {
+        return ellipsize_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS);
     }
-    ellipsize_to(&format!("{head}{subject}{tail}"), SUMMARY_LINE_MAX_CHARS)
+    if subject.starts_with('/') {
+        let chars: Vec<char> = subject.chars().collect();
+        let tail_start = chars.len().saturating_sub(budget - 1);
+        let mut cut = tail_start;
+        while cut < chars.len() && chars[cut] != '/' {
+            cut += 1;
+        }
+        let shown: String = if cut < chars.len() {
+            chars[cut..].iter().collect()
+        } else {
+            chars[tail_start..].iter().collect()
+        };
+        if shown.chars().count() >= 2 {
+            return format!("{head}…{shown}{tail}");
+        }
+    }
+    let kept: String = subject.chars().take(budget - 1).collect();
+    format!("{head}{kept}…{tail}")
 }
 
 /// Gaps that count toward PARTIAL: every retained row except deleted

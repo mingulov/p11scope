@@ -645,14 +645,14 @@ fn concise_gap_summary_folds_denied_capture_refusal() {
         .push(named_gap("native usage feed unavailable", stored));
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     let block = gaps_block(&concise);
-    // The group line would run past 100 chars, so the subject truncates
-    // (marked) while the reason and its doctor remedy stay intact.
+    // The group line would run past 100 chars, so the reason gives way
+    // (marked) while the short machine-name subject stays whole.
     assert_eq!(
         block,
         vec![
             "gaps: 1",
-            "  1 × native usage feed unavai… — live capture refused (missing capabilities); run \
-             'p11scope doctor'",
+            "  1 × native usage feed unavailable — live capture refused (missing capabilities); run \
+             'p11scope do…",
         ],
         "the concise gaps block:\n{concise}"
     );

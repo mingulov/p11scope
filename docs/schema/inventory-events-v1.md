@@ -449,7 +449,10 @@ projection from the same revision; gap payloads equal
 snapshot gaps' identity fields (`repeats` replays from `gap_repeated`); no new capture exists anywhere in the stream. Gap
 retention (`gaps_suppressed`) and budget refusals mirror the snapshot
 document pass for pass.
-Inline placement and bounded rotation lifetime are authorized by the
+Inline placement, the bounded rotation lifetime for event files, and
+the `--event-log -` stdout transport (same records and limits, never
+rotated, retention set by the receiving pipeline with no p11scope
+lifetime bound) are authorized by the
 [P5U amendment](../privacy/allowlist-v3.md#inline-inventory-identity-p5u-2026-10-09).
 It adds no reads or capture and publishes no command line, environment, `comm`,
 raw native tgid, task cookie or exec ID in these compact contexts.

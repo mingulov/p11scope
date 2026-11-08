@@ -1448,7 +1448,9 @@ Limits that matter in pods:
   beside the workload container streams live events to the log driver
   with a 30 s heartbeat and no mounted file:
   `docker run ... p11scope inventory --system --event-log - --event-interval 30s`.
-  Final event completion,
+  Retention of the stdout stream is set by the receiving log pipeline
+  with no p11scope lifetime bound; the records and limits match the
+  event file. Final event completion,
   atomic `-o` commit and stdout are attempted independently; any returned
   sink error gives exit 1 with sink-specific diagnostics. The event file
   may contain a partial line, and `ended` is never fabricated or retried.

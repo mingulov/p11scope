@@ -2616,19 +2616,37 @@ fn render_unidentified_executables(pids: &[UnboundPid], dropped: u64) -> Option<
             }
             GroupKey::Unknown(..) => unknown_exe_label(&group.members[0].exe),
         };
-        // An ambiguous image keeps its shown path; the marker names
-        // the collision beside it (the most candidates in the group
-        // when members disagree). Counts never change.
-        let candidates = group
+        // An ambiguous image keeps its name first; the marker lists
+        // the candidates' full paths beside it -- the richest list in
+        // the group when members disagree, the first two with the
+        // rest counted. Counts never change.
+        let richest = group
             .members
             .iter()
-            .map(|pid| pid.exe.identity_candidates.len())
-            .max()
-            .unwrap_or(0);
-        let name = if candidates > 1 {
-            format!("{name} (ambiguous, {candidates} candidates)")
-        } else {
-            name
+            .copied()
+            .filter(|pid| pid.exe.identity_candidates.len() > 1)
+            .max_by_key(|pid| pid.exe.identity_candidates.len());
+        let name = match richest {
+            Some(pid) => {
+                let shown: Vec<String> = pid
+                    .exe
+                    .identity_candidates
+                    .iter()
+                    .take(2)
+                    .map(|candidate| escape_controls(candidate).into_owned())
+                    .collect();
+                let more = pid
+                    .exe
+                    .identity_candidates
+                    .len()
+                    .saturating_sub(shown.len());
+                if more > 0 {
+                    format!("{name} (ambiguous: {} (+{more} more))", shown.join(", "))
+                } else {
+                    format!("{name} (ambiguous: {})", shown.join(", "))
+                }
+            }
+            None => name,
         };
         let mut members = group.members.clone();
         members.sort_by(|a, b| {

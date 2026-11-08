@@ -1442,6 +1442,49 @@ pub(crate) fn caller_lifecycle_label(caller: &CallerView) -> Option<&'static str
     }
 }
 
+/// Display name of one launcher-chain link: the app-identity label when
+/// a future lane fills it, else the exe basename, else `pid N`.
+fn launcher_link_name(ancestor: &LauncherAncestor) -> String {
+    ancestor
+        .label
+        .as_deref()
+        .or(ancestor.exe.as_deref())
+        .map(|name| escape_controls(name).into_owned())
+        .unwrap_or_else(|| format!("pid {}", ancestor.pid))
+}
+
+/// The `-v` launcher chain for one caller (`app <- parent <- ...`), or
+/// `None` when no ancestors were captured. A partial chain keeps the
+/// ancestors read plus the named gap; gap-only detail stays in JSON.
+pub(crate) fn launcher_chain_text(presentation: &Presentation, caller: CallerId) -> Option<String> {
+    let record = retained_caller(presentation, caller)?;
+    if record.launched_by.is_empty() {
+        return None;
+    }
+    let mut parts = vec![application_label(presentation, caller)];
+    parts.extend(record.launched_by.iter().map(launcher_link_name));
+    let mut text = parts.join(" <- ");
+    if let Some(gap) = record.launcher_gap.as_ref() {
+        text.push_str(&format!(" <- ? ({})", escape_controls(&gap.reason)));
+    }
+    Some(text)
+}
+
+/// The concise one-hop suffix (` (from cron)`), or `None` when the caller
+/// has no recorded parent or the parent is the init root (pid 1). One
+/// helper so the app-identity lane merges its label here.
+pub(crate) fn caller_origin_suffix(
+    presentation: &Presentation,
+    caller: CallerId,
+) -> Option<String> {
+    let record = retained_caller(presentation, caller)?;
+    let parent = record.launched_by.first()?;
+    if parent.pid == 1 {
+        return None;
+    }
+    Some(format!(" (from {})", launcher_link_name(parent)))
+}
+
 /// One operation category's terminal counts across the proved and
 /// unknown buckets: completed, failed and active with the category's
 /// unit. Counts only — never object identity.
@@ -2712,7 +2755,11 @@ fn render_concise_edges(out: &mut String, presentation: &Presentation) {
         let mut names: BTreeSet<String> = BTreeSet::new();
         for edge in &edges {
             callers.insert(edge.caller);
-            names.insert(application_label(presentation, edge.caller));
+            let mut name = application_label(presentation, edge.caller);
+            if let Some(suffix) = caller_origin_suffix(presentation, edge.caller) {
+                name.push_str(&suffix);
+            }
+            names.insert(name);
         }
         let count = callers.len();
         let noun = if count == 1 {
@@ -3348,6 +3395,9 @@ fn render_snapshot_inner(
             ));
         }
         let _ = writeln!(out, "{caller_line}");
+        if let Some(chain) = launcher_chain_text(presentation, caller.id) {
+            let _ = writeln!(out, "  {chain}");
+        }
         if let Some(metadata) = metadata {
             let _ = writeln!(
                 out,

@@ -593,6 +593,140 @@ fn app_first_snapshot_joins_retained_identities_without_merging() {
     assert!(!empty.lines().any(|line| line.starts_with("application ")));
 }
 
+/// The `-v` launcher chain names the chain per caller; the concise
+/// default shows one hop beside the caller; JSON carries generations.
+#[test]
+fn launcher_chain_renders_verbose_chain_and_concise_hop() {
+    use crate::discovery::caller_registry::LauncherAncestor;
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/pkcs11-tool".into());
+    presentation.callers[0].launched_by = vec![
+        LauncherAncestor {
+            pid: 900,
+            start_time: Some(90),
+            exe: Some("sh".into()),
+            label: None,
+        },
+        LauncherAncestor {
+            pid: 800,
+            start_time: Some(80),
+            exe: Some("cron".into()),
+            label: None,
+        },
+        LauncherAncestor {
+            pid: 1,
+            start_time: Some(1),
+            exe: Some("systemd".into()),
+            label: None,
+        },
+    ];
+    presentation.callers[0].launcher_gap = None;
+    let id = presentation.callers[0].id;
+    assert_eq!(
+        launcher_chain_text(&presentation, id).as_deref(),
+        Some("pkcs11-tool <- sh <- cron <- systemd")
+    );
+    assert_eq!(
+        caller_origin_suffix(&presentation, id).as_deref(),
+        Some(" (from sh)")
+    );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("  pkcs11-tool <- sh <- cron <- systemd\n"),
+        "{verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("pkcs11-tool (from sh)"), "{concise}");
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let row = out["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == id.label())
+        .unwrap();
+    assert_eq!(row["launched_by"][0]["pid"], 900);
+    assert_eq!(row["launched_by"][0]["start_time"], 90);
+    assert_eq!(row["launched_by"][2]["exe"], "systemd");
+    assert!(row["launched_by_gap"].is_null());
+}
+
+/// A partial chain keeps the gap beside it; an init parent, a missing
+/// chain and a gap-only record print no hop; gap-only detail stays in
+/// JSON.
+#[test]
+fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
+    use crate::discovery::caller_registry::{
+        LAUNCHER_GAP_EXITED, LAUNCHER_GAP_SUBJECT, LauncherAncestor, LauncherGap,
+    };
+    let harness = varied_harness();
+    let mut presentation = capture_for(&harness, &harness.render());
+    presentation.callers[0].exe.as_mut().unwrap().path = Some("/usr/bin/pkcs11-tool".into());
+    presentation.callers[0].launched_by = vec![LauncherAncestor {
+        pid: 900,
+        start_time: Some(90),
+        exe: None,
+        label: None,
+    }];
+    presentation.callers[0].launcher_gap = Some(LauncherGap {
+        subject: LAUNCHER_GAP_SUBJECT,
+        reason: LAUNCHER_GAP_EXITED.into(),
+    });
+    presentation.callers[1].exe.as_mut().unwrap().path = Some("/usr/bin/other".into());
+    presentation.callers[1].launched_by = vec![LauncherAncestor {
+        pid: 1,
+        start_time: Some(1),
+        exe: Some("systemd".into()),
+        label: None,
+    }];
+    presentation.callers[1].launcher_gap = None;
+    presentation.callers[2].launcher_gap = Some(LauncherGap {
+        subject: LAUNCHER_GAP_SUBJECT,
+        reason: LAUNCHER_GAP_EXITED.into(),
+    });
+    let partial = presentation.callers[0].id;
+    let rooted = presentation.callers[1].id;
+    let gap_only = presentation.callers[2].id;
+    assert_eq!(
+        launcher_chain_text(&presentation, partial).as_deref(),
+        Some("pkcs11-tool <- pid 900 <- ? (parent unknown: exited before read)")
+    );
+    assert_eq!(
+        caller_origin_suffix(&presentation, partial).as_deref(),
+        Some(" (from pid 900)")
+    );
+    assert_eq!(launcher_chain_text(&presentation, gap_only), None);
+    assert_eq!(caller_origin_suffix(&presentation, rooted), None);
+    assert_eq!(caller_origin_suffix(&presentation, gap_only), None);
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(
+        verbose.contains("  pkcs11-tool <- pid 900 <- ? (parent unknown: exited before read)\n"),
+        "{verbose}"
+    );
+    assert!(verbose.contains("  other <- systemd\n"), "{verbose}");
+    assert!(
+        !verbose.contains("launcher chain unknown"),
+        "gap-only detail stays in JSON: {verbose}"
+    );
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    assert!(concise.contains("pkcs11-tool (from pid 900)"), "{concise}");
+    assert!(concise.contains("other"), "{concise}");
+    assert!(
+        !concise.contains("(from systemd)"),
+        "no hop beside an init-parent caller: {concise}"
+    );
+    let out = crate::inventory::render_json_from_presentation(&presentation);
+    let row = out["callers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == gap_only.label())
+        .unwrap();
+    assert!(row["launched_by"].as_array().unwrap().is_empty());
+    assert_eq!(row["launched_by_gap"]["subject"], LAUNCHER_GAP_SUBJECT);
+    assert_eq!(row["launched_by_gap"]["reason"], LAUNCHER_GAP_EXITED);
+}
+
 /// Item 24: the inventory coverage line uses the one lowercase
 /// format and omits zero counts — `coverage: complete`, or
 /// `coverage: partial — 2 gaps, 1 refused, 3 more not shown` with

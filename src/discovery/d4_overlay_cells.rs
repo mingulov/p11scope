@@ -5156,6 +5156,45 @@ fn upper_candidate_refuses_missing_upperdir_escapes_and_siblings() {
     );
 }
 
+#[test]
+fn upper_candidate_ignores_outer_upperdir_under_nested_lower_only_mount() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    // A lower-only overlay nested inside an overlay that has an
+    // upperdir: the covering row is the inner one, which names no
+    // upperdir — the outer upper must not leak into the answer.
+    let table = concat!(
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n",
+        "32 23 0:28 / /mnt/r/sub rw,relatime - overlay overlay rw,lowerdir=/l2\n",
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/sub/a.so")),
+        None
+    );
+    assert_eq!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/sub/a.so")),
+        vec![std::path::PathBuf::from("/l2/a.so")]
+    );
+}
+
+#[test]
+fn lower_candidates_ignore_outer_lowerdir_under_nested_upper_only_mount() {
+    use crate::discovery::scan::upper_candidate_from_mountinfo;
+    // The mirror: an upper-only overlay nested inside an overlay with
+    // a lower stack. The covering row is the inner one: no lowers,
+    // and the upper comes from the inner row.
+    let table = concat!(
+        "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l,upperdir=/u,workdir=/w\n",
+        "32 23 0:28 / /mnt/r/sub rw,relatime - overlay overlay rw,upperdir=/u2,workdir=/w2\n",
+    );
+    assert!(
+        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/sub/a.so")).is_empty()
+    );
+    assert_eq!(
+        upper_candidate_from_mountinfo(table, std::path::Path::new("/mnt/r/sub/a.so")),
+        Some(std::path::PathBuf::from("/u2/a.so"))
+    );
+}
+
 /// What the copy-up join mirror concluded over live inputs: the guard
 /// refused before any witness work (the legacy shape), the join proved
 /// (held or proven lower), or the join refused with the gap reason.

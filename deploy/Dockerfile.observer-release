@@ -51,7 +51,7 @@ RUN set -eu; \
     cp "$RELDIR/LICENSE" /usr/share/licenses/p11scope/LICENSE; \
     mkdir -p /usr/share/licenses/p11scope/LICENSES /usr/share/licenses/p11scope/notices; \
     cp "$RELDIR/LICENSES/"*.txt /usr/share/licenses/p11scope/LICENSES/; \
-    cp "$RELDIR/notices/"* /usr/share/licenses/p11scope/notices/; \
+    cp -r "$RELDIR/notices/." /usr/share/licenses/p11scope/notices/; \
     cp "$RELDIR/RELEASE.json" /usr/share/licenses/p11scope/RELEASE.json; \
     if [ -f "$RELDIR/COPYRIGHT" ]; then cp "$RELDIR/COPYRIGHT" /usr/share/licenses/p11scope/COPYRIGHT; chmod 0644 /usr/share/licenses/p11scope/COPYRIGHT; fi; \
     chmod 0644 /usr/share/licenses/p11scope/LICENSE /usr/share/licenses/p11scope/RELEASE.json; \

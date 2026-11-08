@@ -220,6 +220,7 @@ fn poll_finish_expired(scene: &mut MachineScene) -> Result<JointCommitProgress, 
         native,
         finish: finish.as_mut(),
         live_discovery: live_discovery.as_mut(),
+        stage_probe: None,
     };
     machine.poll_finish_with_io(
         &mut scene.real.lane,

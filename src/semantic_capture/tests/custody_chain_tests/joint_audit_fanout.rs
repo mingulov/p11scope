@@ -226,6 +226,15 @@ struct HeldMachineIo<'a> {
     native: &'a mut MachineNativeRows,
     finish: Option<&'a mut FinishMachineFixture>,
     live_discovery: Option<&'a mut LiveMachineDiscovery>,
+    stage_probe: Option<&'a mut StageFinishProbe>,
+}
+
+/// An optional staged EVENTS drain behind `HeldMachineIo::stage_events`,
+/// recording every stop the machine passes. `None` (every existing test)
+/// keeps the trait's no-op; only armed finish tests observe staging.
+struct StageFinishProbe {
+    drain: crate::events::EventDrain<crate::events::StagedEvents<crate::events::ScriptedRecords>>,
+    stops: Vec<Option<usize>>,
 }
 
 /// Original terminal I/O only. The machine owns Q, the final Raw, reports,
@@ -286,6 +295,19 @@ impl HeldMachineIo<'_> {
 impl crate::inventory_semantics::JointMachineIo for HeldMachineIo<'_> {
     fn producers(&self) -> &SessionDrainProducers {
         self.producers
+    }
+
+    fn stage_events(
+        &mut self,
+        _lane: &mut AttestedSemanticLane,
+        quantum: usize,
+        stop: Option<usize>,
+    ) -> crate::events::EventsStageOutcome {
+        let Some(probe) = self.stage_probe.as_mut() else {
+            return crate::events::EventsStageOutcome::default();
+        };
+        probe.stops.push(stop);
+        probe.drain.source_mut().stage(quantum, stop)
     }
 
     fn service_unlinked_discovery(
@@ -1190,6 +1212,126 @@ fn joint_service_names_staging_saturation() {
     );
 }
 
+/// A gated lane refuses service before staging: nothing moves into the
+/// queue and the ring keeps every record for the next ungated service.
+#[test]
+fn joint_gated_lane_service_stages_nothing() {
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    let pushed = stage_probe_push(&mut fixture.scene, 5000);
+    let mut io = StageProbeIo {
+        drain: crate::events::EventDrain::over_domain(
+            crate::events::StagedEvents::with_caps(
+                crate::events::ScriptedRecords::records(pushed, 5000),
+                8192,
+                8 * 1024 * 1024,
+            ),
+            fixture
+                .scene
+                .drain
+                .consumption_cut()
+                .expect("scene drain takes a cut")
+                .events()
+                .clone(),
+        ),
+        producers: fixture.scene.producers.clone(),
+    };
+    fixture.scene.real.lane.request_semantic_stop();
+    assert_eq!(
+        stage_probe_service(&mut fixture, &mut io),
+        Err(SemanticRefusal::Unavailable)
+    );
+    assert_eq!(io.drain.source_mut().staged_len(), 0);
+    assert_eq!(io.drain.source_mut().inner_mut().remaining(), 5000);
+}
+
+/// A finish service restages through the stop: bytes below Q's producer
+/// bound stage, bytes at or past it stay on the ring, and every staging
+/// call carries the same stop.
+#[test]
+fn joint_finish_service_stages_pre_q_only() {
+    let mut fixture = MachineScene::with_initial_files(1, &[0], true);
+    let probe_pushed = stage_probe_push(&mut fixture.scene, 256);
+    let pid = std::process::id();
+    for (name, sequence) in [("C_CreateObject", 1), ("C_SignInit", 2), ("C_SignFinal", 3)] {
+        fixture.scene.push(pid, 0, name, sequence);
+    }
+    fixture.enable_finish_fixture(Vec::new());
+    fixture.begin_finish().unwrap();
+    // Q observed the scene drain: its stop is the producer bound now.
+    let stop = fixture
+        .scene
+        .drain
+        .consumption_cut()
+        .expect("scene drain takes a cut")
+        .producer_bound();
+    // The scripted wire counts 8 bytes per record, so the stop cuts the
+    // probe after stop/8 records; the probe spans well past the stop.
+    let count = probe_pushed.len();
+    assert!(count * 8 > stop, "count={count} stop={stop}");
+    let expected = stop.div_ceil(8);
+    assert!(
+        expected > 0 && expected < count,
+        "expected={expected} count={count} stop={stop}"
+    );
+    let mut probe = StageFinishProbe {
+        drain: crate::events::EventDrain::over(crate::events::StagedEvents::with_caps(
+            crate::events::ScriptedRecords::records(probe_pushed, count),
+            8192,
+            8 * 1024 * 1024,
+        )),
+        stops: Vec::new(),
+    };
+    let MachineScene {
+        scene,
+        machine,
+        native,
+        finish,
+        live_discovery,
+    } = &mut fixture;
+    let mut io = HeldMachineIo {
+        drain: &mut scene.drain,
+        h0: &scene.real.h0,
+        producers: &scene.producers,
+        attached: scene.attached.as_ref().unwrap(),
+        native,
+        finish: finish.as_mut(),
+        live_discovery: live_discovery.as_mut(),
+        stage_probe: Some(&mut probe),
+    };
+    for _ in 0..64 {
+        let mut budget = crate::inventory_semantics::JointWorkBudget {
+            remaining_actions: 100_000,
+            deadline: Instant::now() + Duration::from_secs(60),
+        };
+        match machine.poll_finish_with_io(
+            &mut scene.real.lane,
+            &mut scene.real.scene.coordinator,
+            &mut io,
+            &mut budget,
+        ) {
+            Ok(
+                crate::discovery::engine::inventory_coordinator::JointCommitProgress::Published(_),
+            ) => break,
+            Ok(crate::discovery::engine::inventory_coordinator::JointCommitProgress::Pending) => {}
+            Err(reason) => panic!("finish polls pass, got {reason:?}"),
+        }
+    }
+    assert!(
+        !probe.stops.is_empty(),
+        "the finish service staged at least once"
+    );
+    assert!(
+        probe.stops.iter().all(|seen| *seen == Some(stop)),
+        "every staging call carries the stop {stop}: {:?}",
+        probe.stops
+    );
+    assert_eq!(probe.drain.source_mut().staged_len(), expected);
+    assert_eq!(
+        probe.drain.source_mut().inner_mut().remaining(),
+        count - expected
+    );
+}
+
 struct MachineScene {
     scene: JointScene,
     machine: crate::inventory_semantics::LiveJointMachine,
@@ -1555,6 +1697,7 @@ impl MachineScene {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         machine.service_with_io(
             &mut scene.real.lane,
@@ -1589,6 +1732,7 @@ impl MachineScene {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         machine.poll_commit_with_io(
             &mut scene.real.lane,
@@ -1623,6 +1767,7 @@ impl MachineScene {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         machine.resolve_pending_h0_at_q_with_io(
             &mut scene.real.lane,
@@ -1668,6 +1813,7 @@ impl MachineScene {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         machine.begin_finish_with_io(
             &mut scene.real.lane,
@@ -1696,6 +1842,7 @@ impl MachineScene {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         let mut budget = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: work,
@@ -7637,6 +7784,7 @@ fn joint_machine_collected_finish_rejects_foreign_stale_duplicate() {
             native,
             finish: finish.as_mut(),
             live_discovery: live_discovery.as_mut(),
+            stage_probe: None,
         };
         let mut work = crate::inventory_semantics::JointWorkBudget {
             remaining_actions: 1,
@@ -10857,6 +11005,7 @@ fn joint_machine_request_ack_tracks_actual_preparation_and_attempted_error() {
                 native,
                 finish: finish.as_mut(),
                 live_discovery: live_discovery.as_mut(),
+                stage_probe: None,
             };
             let mut budget = crate::inventory_semantics::JointWorkBudget {
                 remaining_actions: 0,

@@ -151,6 +151,19 @@ def gate(browser):
     return decorator
 
 
+def gate_system(browser):
+    """Same prerequisites as gate(), for observer-first system cells.
+
+    A distinct decorator name keeps the families apart: the S1 wiring
+    proof counts @gate cells (profile reports, Joint-free), while
+    @gate_system cells assert populated key-operation rows from an
+    inventory report and are pinned by the companion oracle meta-test.
+    Strict mode treats both identically (a missing prerequisite fails).
+    """
+
+    return gate(browser)
+
+
 def needs_chromium(test):
     """Skip unless Playwright and its Chromium build are present (no sudo)."""
 
@@ -447,7 +460,7 @@ class BrowserCells(unittest.TestCase):
                           allowed_gaps=_GAPS_ATTACHED_ABSENT, absent=_PINBOUND_ABSENT,
                           s1={})
 
-    @gate("firefox")
+    @gate_system("firefox")
     def test_ff_first_with_background_provider_covers_browser(self):
         """FF-FIRST-BG (v0.6.0 F1): observer-first key operations beside a
         pre-existing SoftHSM caller; the late browser's key rows populate

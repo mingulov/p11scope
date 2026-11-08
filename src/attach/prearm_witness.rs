@@ -2794,13 +2794,29 @@ mod tests {
         let backend = ScriptBackend::new(calib_for(&path), 1);
         let err = match super::open_race_test::observe(
             |victim| {
-                use std::os::unix::fs::PermissionsExt as _;
-                let mode = std::fs::metadata(victim)
-                    .expect("stat the victim")
-                    .permissions()
-                    .mode();
-                std::fs::set_permissions(victim, std::fs::Permissions::from_mode(mode ^ 0o100))
-                    .expect("chmod the victim");
+                use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                let before = std::fs::metadata(victim).expect("stat the victim");
+                let ctime = (before.ctime(), before.ctime_nsec());
+                let mode = before.permissions().mode();
+                // Before 6.13 ctime has clock-tick granularity: a single
+                // chmod usually lands in the file's creation tick, so the
+                // pin would not move and the twin would pass vacuously.
+                // Toggle the mode until the tick advances (bounded: 1 ms
+                // sleeps, ~2 s deadline). The pin still moves by ctime
+                // only — mode is not part of it.
+                let mut moved = false;
+                for i in 0..2000 {
+                    let next = if i % 2 == 0 { mode ^ 0o100 } else { mode };
+                    std::fs::set_permissions(victim, std::fs::Permissions::from_mode(next))
+                        .expect("chmod the victim");
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    let now = std::fs::metadata(victim).expect("re-stat the victim");
+                    if (now.ctime(), now.ctime_nsec()) != ctime {
+                        moved = true;
+                        break;
+                    }
+                }
+                assert!(moved, "the hook must move ctime for the twin to bite");
             },
             || {
                 super::start_with(

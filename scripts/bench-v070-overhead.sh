@@ -1153,8 +1153,14 @@ if [ "$SELF_TEST" = 1 ]; then
         || { echo "self-test: tracecheck valid rejected" >&2; exit 1; }
     python3 -I "$VPY" tracetotal "$SELF_TEST_WORK/trace.txt" | grep -q "raw_calls=105" \
         || { echo "self-test: tracetotal wrong" >&2; exit 1; }
+    python3 -I "$VPY" tracetotal "$SELF_TEST_WORK/trace.txt" | grep -q "completeness=COMPLETE" \
+        || { echo "self-test: tracetotal must emit completeness" >&2; exit 1; }
     python3 -I "$VPY" proftotals "$SELF_TEST_WORK/prof.json" | grep -q "calls_total=100" \
         || { echo "self-test: proftotals wrong" >&2; exit 1; }
+    spy_metrics_exact "$(python3 -I "$VPY" proftotals "$SELF_TEST_WORK/prof.json")" \
+        || { echo "self-test: COMPLETE profile reads inexact" >&2; exit 1; }
+    spy_trace_exact "$(python3 -I "$VPY" tracetotal "$SELF_TEST_WORK/trace.txt")" \
+        || { echo "self-test: COMPLETE trace reads inexact" >&2; exit 1; }
     nullsha=$(sha256sum "$SELF_TEST_WORK/null.so" | cut -d' ' -f1)
     printf '{"callers": [{"id": "c0", "pid": 1234}], "modules": [{"id": "m0", "identity": {"sha256": "%s"}}], "edges": [{"caller": "c0", "module": "m0", "entries": {"count": 42, "coverage": {"state": "counted", "lossy": false}}}], "gaps": []}' "$nullsha" > "$SELF_TEST_WORK/inv.json"
     python3 -I "$VPY" invcheck "$SELF_TEST_WORK/inv.json" 1234 "$SELF_TEST_WORK/null.so" 42 >/dev/null \
@@ -1163,6 +1169,11 @@ if [ "$SELF_TEST" = 1 ]; then
         || { echo "self-test: invsumcheck valid rejected" >&2; exit 1; }
     python3 -I "$VPY" invcount "$SELF_TEST_WORK/inv.json" 1234 "$SELF_TEST_WORK/null.so" | grep -q "edge_count=42" \
         || { echo "self-test: invcount wrong" >&2; exit 1; }
+    spy_inv_exact "$(python3 -I "$VPY" invcount "$SELF_TEST_WORK/inv.json" 1234 "$SELF_TEST_WORK/null.so")" \
+        || { echo "self-test: counted non-lossy edge reads inexact" >&2; exit 1; }
+    printf '{"callers": [{"id": "c0", "pid": 1234}], "modules": [{"id": "m0", "identity": {"sha256": "%s"}}], "edges": [{"caller": "c0", "module": "m0", "entries": {"count": 42, "coverage": {"state": "counted", "lossy": true}}}], "gaps": []}' "$nullsha" > "$SELF_TEST_WORK/inv-lossy.json"
+    spy_inv_exact "$(python3 -I "$VPY" invcount "$SELF_TEST_WORK/inv-lossy.json" 1234 "$SELF_TEST_WORK/null.so")" \
+        && { echo "self-test: lossy edge reads exact" >&2; exit 1; }
     printf '%s\n' 'sign OK: 7 ops (7 C_SignInit, 7 C_Sign)' 'sign warm-up: 3 ops' > "$SELF_TEST_WORK/sign.log"
     python3 -I "$VPY" signlog "$SELF_TEST_WORK/sign.log" 7 3 \
         || { echo "self-test: signlog valid rejected" >&2; exit 1; }
@@ -1743,6 +1754,20 @@ primary_substr() {
     esac
 }
 
+# Spy coverage helpers: coverage-only, not count-exact. Count agreement
+# vs the spy ground-truth total uses an explicit ±8 pre-STOP sneak budget
+# (fail closed beyond it), checked post-hoc in the notes; the historical
+# spy exact column records coverage only.
+spy_inv_exact() {
+    case "$1" in *"state=counted"*) return 0;; *) return 1;; esac
+}
+spy_metrics_exact() {
+    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
+}
+spy_trace_exact() {
+    case "$1" in *"completeness=COMPLETE"*) return 0;; *) return 1;; esac
+}
+
 # sample_spy <tag> <config> <cov> <threads>
 # config: plain|inv-pid|metrics|trace|spy-file|spy-null. Observed configs
 # STOP-start preloaded p11perftest so the observer covers the whole run;
@@ -1881,14 +1906,14 @@ sample_spy() {
                 || { echo "$1: invcount failed" >&2; return 1; }
             semline=$(grep -m1 "semantic calls:" "$WORK/$1.obs.log" 2>/dev/null || echo "semantic calls: n/a")
             notes="$notes :: uprobe=$ukind obs $info :: $semline"
-            case "$info" in *"state=counted"*) ;; *) exact=0;; esac
+            spy_inv_exact "$info" || exact=0
             ;;
         metrics)
             reclaim_root_output "$WORK/$1.json"
             info=$(python3 -I "$WORK/validate.py" proftotals "$WORK/$1.json") \
                 || { echo "$1: proftotals failed" >&2; return 1; }
             notes="$notes :: obs $info"
-            case "$info" in *"completeness=COMPLETE "*) ;; *) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
+            spy_metrics_exact "$info" || { exact=0; notes="$notes PARTIAL-COVERAGE"; }
             ;;
         trace)
             reclaim_root_output "$WORK/$1.txt"
@@ -1900,7 +1925,7 @@ sample_spy() {
                 head -c 1048576 "$WORK/$1.txt" > "$WORK/$1.txt.head"; rm -f "$WORK/$1.txt"
             fi
             notes="$notes :: obs $info bytes=$bytes init_seen=$init_seen"
-            case "$info" in *"completeness=COMPLETE") ;; *) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
+            spy_trace_exact "$info" || { exact=0; notes="$notes PARTIAL-COVERAGE"; }
             ;;
     esac
     record "spy" "spy-$3-t$4" "$(basename "$mod")" "$2" 1 "$headline_n" "$headline_wall" \

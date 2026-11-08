@@ -238,12 +238,12 @@ fn semantic_stop_line_format_is_exact() {
 #[test]
 fn admitted_mints_line_format_is_exact() {
     assert_eq!(
-        admitted_mints_line(0, 0),
-        "p11scope: admitted mints: reported=0 attached=0"
+        admitted_mints_line(0, 0, 0),
+        "p11scope: admitted mints: reported=0 attached=0 feeds=0"
     );
     assert_eq!(
-        admitted_mints_line(3, 1),
-        "p11scope: admitted mints: reported=3 attached=1"
+        admitted_mints_line(3, 1, 1),
+        "p11scope: admitted mints: reported=3 attached=1 feeds=1"
     );
 }
 

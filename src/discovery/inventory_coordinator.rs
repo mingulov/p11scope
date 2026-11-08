@@ -3008,6 +3008,11 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.seal_diagnosis
     }
 
+    /// Applied Joint-mode feeds (diagnostics).
+    pub(crate) fn joint_feeds(&self) -> usize {
+        self.registry.joint_feeds()
+    }
+
     /// Calls into `service_collected_finish_records_with` (test count).
     #[cfg(test)]
     #[allow(dead_code)] // Consumed by T12c.

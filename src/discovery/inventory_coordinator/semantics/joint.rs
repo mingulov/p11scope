@@ -74,38 +74,9 @@ impl SealDiagnosis {
             }
             Err(refusal) => {
                 self.refused = self.refused.saturating_add(1);
-                self.last_refusal = seal_refusal_label(refusal);
+                self.last_refusal = refusal.code();
             }
         }
-    }
-}
-
-/// Frozen refusal labels for [`SealDiagnosis`]: variant names only,
-/// payloads folded. Diagnostic-only, never a contract.
-pub(crate) fn seal_refusal_label(refusal: &RawQuantumRefusal) -> &'static str {
-    match refusal {
-        RawQuantumRefusal::Capacity => "Capacity",
-        RawQuantumRefusal::H0Active => "H0Active",
-        RawQuantumRefusal::ForeignDescriptors => "ForeignDescriptors",
-        RawQuantumRefusal::ForeignDrain => "ForeignDrain",
-        RawQuantumRefusal::ForeignCapture => "ForeignCapture",
-        RawQuantumRefusal::ForeignLedger => "ForeignLedger",
-        RawQuantumRefusal::DrainUnbound => "DrainUnbound",
-        RawQuantumRefusal::H0Undelivered => "H0Undelivered",
-        RawQuantumRefusal::IdentityExhausted => "IdentityExhausted",
-        RawQuantumRefusal::InvalidLimit => "InvalidLimit",
-        RawQuantumRefusal::Resource(_) => "Resource",
-        RawQuantumRefusal::Ledger(_) => "Ledger",
-        RawQuantumRefusal::Allocation => "Allocation",
-        RawQuantumRefusal::Admission => "Admission",
-        RawQuantumRefusal::StaleFrontier => "StaleFrontier",
-        RawQuantumRefusal::DispositionMismatch => "DispositionMismatch",
-        RawQuantumRefusal::H3Undisposed => "H3Undisposed",
-        RawQuantumRefusal::ClosureStale => "ClosureStale",
-        RawQuantumRefusal::Stopped => "Stopped",
-        RawQuantumRefusal::Cut(_) => "Cut",
-        RawQuantumRefusal::Cursor(_) => "Cursor",
-        RawQuantumRefusal::Fault(_) => "Fault",
     }
 }
 

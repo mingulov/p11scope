@@ -3184,6 +3184,7 @@ fn disclose_semantic_stop(
         warn.emit(&crate::inventory_semantics::admitted_mints_line(
             counts.admitted_reported,
             counts.admitted_attached,
+            coordinator.joint_feeds() as u64,
         ));
         let seals = coordinator.seal_diagnosis();
         warn.emit(&crate::inventory_semantics::joint_seals_line(

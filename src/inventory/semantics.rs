@@ -1572,8 +1572,8 @@ pub(crate) fn settlement_latency_line(
 /// attached the birth. Counts only; no identities, paths or payloads.
 /// Diagnostic-only: printed beside the stop line only while stage
 /// timings are requested, never a contract.
-pub(crate) fn admitted_mints_line(reported: u64, attached: u64) -> String {
-    format!("p11scope: admitted mints: reported={reported} attached={attached}")
+pub(crate) fn admitted_mints_line(reported: u64, attached: u64, feeds: u64) -> String {
+    format!("p11scope: admitted mints: reported={reported} attached={attached} feeds={feeds}")
 }
 
 /// One stderr line for the diagnostic joint-seal summary: seal

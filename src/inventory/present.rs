@@ -331,6 +331,7 @@ impl ModuleInitView {
             detail: judged.detail,
         }
     }
+}
 
 /// One mechanism id's published facts (S1), owned for rendering.
 /// The id stays verbatim; the name is `Some` iff registered.
@@ -2483,13 +2484,13 @@ fn render_concise_caller_scope_lines(out: &mut String, presentation: &Presentati
     if !presentation.caller_metadata.summary.enabled {
         return;
     }
-    let closure = closure_module_ids(presentation);
-    let active = provider_active_callers(presentation, &closure);
-    let refused = refused_backend_callers(presentation, &closure);
+    let forwarding = forwarding_module_ids(presentation);
+    let active = provider_active_callers(presentation, &forwarding);
+    let refused = refused_backend_callers(presentation, &forwarding);
     let mut totals: BTreeMap<CallerId, u64> = BTreeMap::new();
     for edge in &presentation.edges {
         let total = totals.entry(edge.caller).or_default();
-        if !edge_is_forwarding(edge, &closure, &active, &refused) {
+        if !edge_is_forwarding(edge, &forwarding, &active, &refused) {
             *total = total.saturating_add(edge.entry_count);
         }
     }

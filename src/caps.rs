@@ -463,6 +463,17 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
             };
             read | out(&a.out)
         }
+        // `cbom` converts one saved input offline, like `diff`: root
+        // keeps DAC_READ_SEARCH for unreadable inputs, anyone else
+        // sheds it.
+        Command::InventoryCbom(a) => {
+            let read = if unsafe { libc::geteuid() } == 0 {
+                1u64 << CAP_DAC_READ_SEARCH_BIT
+            } else {
+                0
+            };
+            read | out(&a.out)
+        }
         Command::Version => 0,
     }
 }
@@ -473,7 +484,7 @@ pub(crate) fn keep_mask_for_command(command: &crate::cli::Command) -> u64 {
 /// SYS_ADMIN, not the narrow caps), so the keep must retain it. Live
 /// capture keeps SYS_ADMIN already for the singles fallback; doctor needs
 /// the BPF pair for its self-probe link plus map_files; inspect and scan
-/// need map_files only; diff and version need none of the three.
+/// need map_files only; diff, cbom and version need none of the three.
 fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
     use crate::cli::Command;
     let bpf =
@@ -495,7 +506,7 @@ fn sys_admin_fallback_bits(command: &crate::cli::Command) -> u64 {
             bpf
         }
         Command::Inspect(_) => map_files,
-        Command::InventoryDiff(_) | Command::Version => 0,
+        Command::InventoryDiff(_) | Command::InventoryCbom(_) | Command::Version => 0,
     }
 }
 

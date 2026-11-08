@@ -14,12 +14,17 @@
  * exactly N+W C_GenerateRandom calls (profile) or N+W+5 total calls (trace:
  * Initialize, GetSlotList, OpenSession, CloseSession, Finalize plus the
  * random burst).
+ *
+ * P11SCOPE_HAMMER_RATE_PER_S (optional, default back-to-back): when set to
+ * a positive rate, the measured N calls are paced over N/rate seconds;
+ * the warm-up burst stays unpaced.
  */
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef unsigned long CK_RV, CK_ULONG, CK_SLOT_ID, CK_SESSION_HANDLE;
@@ -102,8 +107,29 @@ int main(int argc, char **argv)
         touch_file(warmed);
         wait_for_file(main_go);
     }
-    for (long i = 0; i < n; i++)
+    /* Optional pacing for throttled-rate cells: P11SCOPE_HAMMER_RATE_PER_S
+     * > 0 spaces the measured N calls over N/rate seconds with absolute
+     * deadlines (warm-up stays unpaced). Unset or 0 keeps the original
+     * back-to-back behavior. */
+    long rate = 0;
+    const char *rates = getenv("P11SCOPE_HAMMER_RATE_PER_S");
+    if (rates && *rates) {
+        rate = atol(rates);
+        if (rate < 0) { fprintf(stderr, "bad rate\n"); return 2; }
+    }
+    struct timespec deadline;
+    if (rate > 0)
+        clock_gettime(CLOCK_MONOTONIC, &deadline);
+    for (long i = 0; i < n; i++) {
         CHECK("C_GenerateRandom", ((fn_rand)fns[I_GenerateRandom])(sess, rnd, sizeof rnd));
+        if (rate > 0 && i + 1 < n) {
+            long long step = 1000000000LL / rate;
+            long long ns = (long long)deadline.tv_nsec + step;
+            deadline.tv_sec += ns / 1000000000LL;
+            deadline.tv_nsec = ns % 1000000000LL;
+            clock_nanosleep(CLOCK_MONOTONIC, TIMER_ABSTIME, &deadline, NULL);
+        }
+    }
 
     CHECK("C_CloseSession", ((fn_close)fns[I_CloseSession])(sess));
     CHECK("C_Finalize", ((fn_gen)fns[I_Finalize])(NULL));

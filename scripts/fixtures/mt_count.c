@@ -30,6 +30,7 @@
 #define _GNU_SOURCE
 #include <dlfcn.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -175,5 +176,10 @@ int main(int argc, char **argv)
 	}
 	printf("MT_COUNT ops=%lu wall_ns=%llu threads=%d pad=%d attempts=%lu failed=%lu\n",
 	       tot, t1 - t0, n, use_pad, tot, tot_failed);
+	fflush(stdout);
+	/* P11SCOPE_HOLD: stop instead of exiting (bench-v070 holds
+	 * inventory workloads through the post-burst binding pass). */
+	if (getenv("P11SCOPE_HOLD") && raise(SIGSTOP) != 0)
+		return 1;
 	return 0;
 }

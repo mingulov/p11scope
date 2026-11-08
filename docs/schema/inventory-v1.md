@@ -232,10 +232,13 @@ and never proves an app identity. See the app identity rows of
   init-type, or there is no parent in this pid namespace; `launched_by`
   is empty, no gap is emitted, and `launched_by_unit` carries the
   caller's systemd unit/scope or null) or `gap` (empty chain with a
-  stop gap). The unit follows `sd_pid_get_unit` (first unit past the
-  leading slices of the `0:` cgroup path), or `sd_pid_get_user_unit`
-  inside a `user@<uid>.service` subtree (the first unit after the user
-  manager, or nothing). A boundary above real ancestors ends the walk
+  stop gap). The unit follows `sd_pid_get_unit` (first valid unit past
+  the leading slices of the `0:` cgroup path, under systemd's
+  unit-name validity rules), or `sd_pid_get_user_unit` when
+  `user@<uid>.service` is the first non-slice component (the first unit
+  after the user manager, or nothing); a mid-path `user@` occurrence is
+  a delegated name and leaves the system rule in place. A boundary
+  above real ancestors ends the walk
   with no gap; any earlier stop keeps the ancestors read so far plus
   `launched_by_gap` (`subject` `caller parent chain` with a named
   `reason`: the launcher exited before read, hid behind `/proc`

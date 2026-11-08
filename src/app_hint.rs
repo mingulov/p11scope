@@ -696,6 +696,27 @@ mod tests {
     }
 
     #[test]
+    fn python_c_and_repl_yield_no_comm_hint() {
+        // `python3 -c` / REPL: comm is `python3` while the exe
+        // basename is `python3.14` — a useless label, and `-c` text
+        // must never be captured. No script-position token matches.
+        let mut cmd = b"python3\x00-c\x00print(1)\x00".to_vec();
+        no_hint(
+            Some("/usr/bin/python3.14"),
+            Some("python3"),
+            Some(&cmd),
+            None,
+        );
+        cmd = b"python3\x00".to_vec();
+        no_hint(
+            Some("/usr/bin/python3.14"),
+            Some("python3"),
+            Some(&cmd),
+            None,
+        );
+    }
+
+    #[test]
     fn python_versioned_binary_is_gated_but_threaded_is_not() {
         assert_eq!(argv("/usr/bin/python3.14", &["app.py"]).value, "app.py");
         let cmd = b"python3.13t\x00app.py\x00".to_vec();
@@ -775,9 +796,46 @@ mod tests {
             argv("/usr/bin/java", &["-Dkey=val", "-Xmx1g", "com.App"]).value,
             "com.App"
         );
+    }
+
+    #[test]
+    fn java_module_entry_never_captures_app_args() {
+        // `--module=<m>/<class>` is the main-entry option: the JDK
+        // launcher hands every later token to the application, so the
+        // parser must bail instead of capturing the first app arg.
+        let mut cmd = b"java\x00--module=app/com.Main\x00secretpw\x00--pin\x001234\x00".to_vec();
+        no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
+        cmd = b"java\x00--module=app/com.Main\x00login\x00admin\x00".to_vec();
+        no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
+        // Separate `-m` form: same bail (control).
+        cmd = b"java\x00-m\x00app/com.Main\x00secretpw\x00".to_vec();
+        no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
+        // Tabled self-contained `=` forms still skip to the class.
         assert_eq!(
-            argv("/usr/bin/java", &["--affinity=1", "com.App"]).value,
+            argv("/usr/bin/java", &["--class-path=lib/*", "com.App"]).value,
             "com.App"
+        );
+        assert_eq!(
+            argv(
+                "/usr/bin/java",
+                &["--add-opens=java.base/java.lang=ALL-UNNAMED", "com.App"]
+            )
+            .value,
+            "com.App"
+        );
+        assert_eq!(
+            argv(
+                "/usr/bin/java",
+                &["--enable-native-access=ALL-UNNAMED", "com.App"]
+            )
+            .value,
+            "com.App"
+        );
+        // `--source=` runs the next token as single-file source: the
+        // program file, like a script.
+        assert_eq!(
+            argv("/usr/bin/java", &["--source=8", "App.java"]).value,
+            "App.java"
         );
     }
 
@@ -788,6 +846,9 @@ mod tests {
         cmd = b"java\x00-Zfoo\x00com.App\x00".to_vec();
         no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
         cmd = b"java\x00--future\x00com.App\x00".to_vec();
+        no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
+        // Unknown `=` options are not self-contained until tabled.
+        cmd = b"java\x00--affinity=1\x00com.App\x00".to_vec();
         no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
         cmd = b"java\x0012bad\x00".to_vec();
         no_hint(Some("/usr/bin/java"), None, Some(&cmd), None);
@@ -821,6 +882,32 @@ mod tests {
         no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
         cmd = b"node\x00inspect\x00app.js\x00".to_vec();
         no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+    }
+
+    #[test]
+    fn node_run_equals_form_never_captures_script_args() {
+        // `node --run=deploy -- ./cfg/prod.json` runs the package.json
+        // script `deploy`; `./cfg/prod.json` is that script's argument,
+        // not a node script. Only tabled self-contained `=` forms skip.
+        let mut cmd = b"node\x00--run=deploy\x00--\x00./cfg/prod.json\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00--future=1\x00app.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        cmd = b"node\x00--run\x00deploy\x00app.js\x00".to_vec();
+        no_hint(Some("/usr/bin/node"), None, Some(&cmd), None);
+        // Tabled `=` forms still skip to the script.
+        assert_eq!(
+            argv("/usr/bin/node", &["--require=./preload.js", "app.js"]).value,
+            "app.js"
+        );
+        assert_eq!(
+            argv("/usr/bin/node", &["--inspect=127.0.0.1:9229", "app.js"]).value,
+            "app.js"
+        );
+        assert_eq!(
+            argv("/usr/bin/node", &["--test-timeout=5", "--test", "app.js"]).value,
+            "app.js"
+        );
     }
 
     #[test]
@@ -878,17 +965,37 @@ mod tests {
     }
 
     #[test]
-    fn comm_names_direct_shebang_perl_and_ruby_apps() {
-        // Direct shebang launches keep the script name in comm
-        // (measured: `direct-tool` for perl).
-        let hint = app_hint_for(Some("/usr/bin/perl"), Some("direct-tool"), None, None)
+    fn comm_names_flagged_shebang_perl_and_ruby_apps() {
+        // `#!/usr/bin/perl -w` puts the script at argv[2]: argv bails
+        // on the flag, but comm still names the script — measured
+        // live (comm `plain.pl`, probe-r3). The comm value must match
+        // the script-position token of the same cmdline sample; a
+        // rewritten title never matches (see below).
+        let mut cmd = b"perl\x00-w\x00/x/tool\x00--pin\x001\x00".to_vec();
+        let hint = app_hint_for(Some("/usr/bin/perl"), Some("tool"), Some(&cmd), None)
             .expect("perl comm hint");
-        assert_eq!(hint.value, "direct-tool");
+        assert_eq!(hint.value, "tool");
         assert_eq!(hint.source, AppHintSource::Comm);
-        let hint =
-            app_hint_for(Some("/usr/bin/ruby"), Some("myapp"), None, None).expect("ruby comm hint");
+        cmd = b"ruby\x00-w\x00/x/myapp\x00".to_vec();
+        let hint = app_hint_for(Some("/usr/bin/ruby"), Some("myapp"), Some(&cmd), None)
+            .expect("ruby comm hint");
         assert_eq!(hint.value, "myapp");
         assert_eq!(hint.source, AppHintSource::Comm);
+    }
+
+    #[test]
+    fn rewritten_title_comm_matches_no_script_token() {
+        // Blocking privacy case: a `perl -w` script runs
+        // `$0 = "sign --pin 4321"`. The rewritten cmdline arrives as
+        // one token, so there is no script-position token and comm —
+        // the process's own writable title — must never be published.
+        let cmd = b"sign --pin 4321\x00".to_vec();
+        no_hint(
+            Some("/usr/bin/perl"),
+            Some("sign --pin 4321"),
+            Some(&cmd),
+            None,
+        );
     }
 
     #[test]
@@ -923,11 +1030,40 @@ mod tests {
     }
 
     #[test]
-    fn comm_names_direct_shebang_apps() {
-        let hint = app_hint_for(Some("/usr/bin/python3"), Some("pkcs11-check"), None, None)
-            .expect("comm hint");
+    fn pin_values_after_module_entry_are_never_captured() {
+        // Module-entry extension of the `--pin` matrix: after
+        // `--module=`/`-m` every token belongs to the application, so
+        // there is no hint at all — the pin value is unreachable.
+        for args in [
+            vec!["--module=app/com.Main", "--pin", "1234"],
+            vec!["-m", "app/com.Main", "--pin", "1234"],
+        ] {
+            let mut cmd = b"java\x00".to_vec();
+            for arg in &args {
+                cmd.extend_from_slice(arg.as_bytes());
+                cmd.push(0);
+            }
+            assert_eq!(
+                app_hint_for(Some("/usr/bin/java"), None, Some(&cmd), None),
+                None,
+                "module-entry args for {args:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn comm_without_a_matching_cmdline_sample_is_not_a_hint() {
+        // Bare comm proves nothing: the process writes its own title
+        // (`$0`, prctl), so comm is a hint only when it equals the
+        // first 15 bytes of the script-position token's basename from
+        // the same cmdline sample. Direct shebangs resolve through
+        // argv instead (full basename, untruncated).
+        no_hint(Some("/usr/bin/python3"), Some("pkcs11-check"), None, None);
+        no_hint(Some("/usr/bin/perl"), Some("direct-tool"), None, None);
+        no_hint(Some("/usr/bin/ruby"), Some("myapp"), None, None);
+        let hint = argv("/usr/bin/python3", &["/opt/venv/bin/pkcs11-check"]);
         assert_eq!(hint.value, "pkcs11-check");
-        assert_eq!(hint.source, AppHintSource::Comm);
+        assert_eq!(hint.source, AppHintSource::Argv);
     }
 
     #[test]
@@ -1005,6 +1141,41 @@ mod tests {
             no_hint(Some("/usr/bin/python3"), None, None, Some(leaf));
         }
         no_hint(Some("/usr/bin/python3"), None, None, Some(""));
+    }
+
+    #[test]
+    fn container_ancestors_suppress_unit_hints() {
+        // Every `0::` component is screened: a service inside a
+        // container is never a default-on hint (DR04 owns container
+        // display under its opt-in).
+        for cg in [
+            "0::/system.slice/docker-0123abcd.scope/system.slice/hsm-agent.service\n",
+            "0::/lxc.payload.tenant-a/system.slice/billing-worker.service\n",
+            "0::/machine.slice/systemd-nspawn@tenant.service/payload/system.slice/sign.service\n",
+            "0::/machine.slice/systemd-nspawn@tenant.service\n",
+        ] {
+            no_hint(Some("/usr/bin/python3"), None, None, Some(cg));
+        }
+    }
+
+    #[test]
+    fn template_unit_instances_publish_the_template_only() {
+        // The instance part is effectively a unit argument
+        // (`job@tenant.service`): only `job@` is published.
+        let cg = "0::/system.slice/job@tenant-a.service\n";
+        let hint = app_hint_for(Some("/usr/bin/python3"), None, None, Some(cg)).expect("unit hint");
+        assert_eq!(hint.value, "job@");
+        assert_eq!(hint.source, AppHintSource::Unit);
+        let cg = "0::/system.slice/getty@tty1.service\n";
+        let hint = app_hint_for(Some("/usr/bin/python3"), None, None, Some(cg)).expect("unit hint");
+        assert_eq!(hint.value, "getty@");
+        // No template name at all: no hint.
+        no_hint(
+            Some("/usr/bin/python3"),
+            None,
+            None,
+            Some("0::/system.slice/@foo.service\n"),
+        );
     }
 
     #[test]

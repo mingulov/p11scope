@@ -2644,3 +2644,129 @@ fn inventory_snapshot_labels_a_console_script_and_never_its_pin_value() {
         "concise label carries the hint: {text}"
     );
 }
+
+#[test]
+fn inventory_snapshot_rewritten_perl_title_yields_no_comm_hint() {
+    let _guard = serial_guard();
+    let dir = tmp("inventory-command-app-hint-perl");
+    let private = private_dir();
+    let file = private.path().join("snapshot.json");
+    let ready = dir.join("app-hint-perl.ready");
+    let text_file = dir.join("snapshot.txt");
+    // A `perl -w` script that rewrites its own title (`$0`) to carry a
+    // `--pin`-style value, then maps the provider: comm holds the
+    // rewritten title, the cmdline is a single token, and neither may
+    // source a hint. perl is a base-system interpreter on the test
+    // hosts (Debian/Fedora/CI images), like sh.
+    let perl = {
+        let out = Command::new("sh")
+            .args(["-c", "command -v perl"])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "perl is required for this cell");
+        let path = String::from_utf8(out.stdout).unwrap();
+        path.trim().to_string()
+    };
+    assert!(perl.starts_with('/'), "perl path: {perl}");
+    let script_name = "app-hint-sign";
+    let script = dir.join(script_name);
+    std::fs::write(
+        &script,
+        format!(
+            "#!{perl} -w\n\
+             use strict;\n\
+             use warnings;\n\
+             use DynaLoader ();\n\
+             my ($ready, $prov, $pin, $sleep_s) = (undef, undef, undef, 30);\n\
+             my @args = @ARGV;\n\
+             my $i = 0;\n\
+             while ($i < @args) {{\n\
+             \x20   my $arg = $args[$i];\n\
+             \x20   if ($arg eq \"--ready\") {{ $ready = $args[$i + 1]; $i += 2; }}\n\
+             \x20   elsif ($arg eq \"--sleep\") {{ $sleep_s = $args[$i + 1]; $i += 2; }}\n\
+             \x20   elsif ($arg eq \"--pin\") {{ $pin = $args[$i + 1]; $i += 2; }}\n\
+             \x20   elsif ($arg =~ /^-/) {{ $i += 1; }}\n\
+             \x20   else {{ $prov = $arg; $i += 1; }}\n\
+             }}\n\
+             die \"usage\" unless defined $ready && defined $prov && defined $pin;\n\
+             $0 = \"sign --pin $pin\";\n\
+             DynaLoader::dl_load_file($prov, 0) or die \"dlopen $prov failed\";\n\
+             open(my $fh, \">\", $ready) or die \"ready $ready: $!\";\n\
+             print $fh \"READY $$\\n\";\n\
+             close $fh;\n\
+             sleep($sleep_s);\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let provider = gcc(
+        &dir,
+        "app-hint-perl-provider.so",
+        &matrix_source(),
+        &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
+        &[],
+    );
+    let pin = "perl-pin-7331";
+    let output = Command::new("sh")
+        .arg(fixture_source("inventory-observe-app-hint.sh"))
+        .args(["--capture", "scan", "-o"])
+        .arg(&file)
+        .env("INV_DRIVER", &script)
+        .env("INV_PROV", &provider)
+        .env("INV_READY", &ready)
+        .env("INV_OUT", &text_file)
+        .env("INV_PIN", pin)
+        .env("P11SCOPE_BIN", env!("CARGO_BIN_EXE_p11scope"))
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let ready_text = std::fs::read_to_string(&ready).unwrap();
+    let pid: u32 = ready_text
+        .split_whitespace()
+        .nth(1)
+        .unwrap()
+        .parse()
+        .unwrap();
+    let _driver_guard = FixtureGuard { pids: vec![pid] };
+    assert!(output.status.success(), "{output:?}");
+    // The driver must still carry the rewritten title: otherwise this
+    // cell would pass without exercising the refusal.
+    let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
+    assert!(
+        comm.starts_with("sign --pin "),
+        "driver rewrote its title: {comm:?}"
+    );
+    let text = std::fs::read_to_string(&text_file).unwrap();
+    let raw = std::fs::read(&file).unwrap();
+    let doc: Value = serde_json::from_slice(&raw).unwrap();
+    assert_eq!(doc["schema"], "p11scope/inventory/v1");
+    let callers = doc["callers"].as_array().unwrap();
+    assert_eq!(callers.len(), 1, "single-PID scope keeps one caller");
+    let caller = &callers[0];
+    assert_eq!(caller["pid"], pid);
+    // A rewritten title never matches the (single-token) cmdline, so it
+    // sources no argv/comm hint. A cgroup unit/snap fact, if the host
+    // ever yields one, is independent of the rewrite and stays allowed.
+    if let Some(hint) = caller.get("app_hint") {
+        let source = hint["source"].as_str().unwrap();
+        assert!(
+            source == "unit" || source == "snap",
+            "rewritten title must never source a hint: {hint}"
+        );
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for (name, surface) in [
+        ("json", String::from_utf8_lossy(&raw).into_owned()),
+        ("text", text.clone()),
+        ("stderr", stderr.into_owned()),
+    ] {
+        assert!(
+            !surface.contains(pin),
+            "pin value leaked into {name}: {}",
+            surface
+                .lines()
+                .find(|line| line.contains(pin))
+                .unwrap_or("")
+        );
+    }
+}

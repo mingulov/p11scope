@@ -670,6 +670,44 @@ fn calibration_backing_accepted_with(
     }
 }
 
+/// Test seam: an observer fired between the witness `open()` and its
+/// fstat in `start_with`, so unprivileged twins can mutate the file in
+/// that window (the live copy-up the pre-open pin refuses). Production
+/// builds fire nothing.
+#[cfg(test)]
+pub(crate) mod open_race_test {
+    use std::cell::RefCell;
+
+    type Observer = Box<dyn FnMut(&std::path::Path)>;
+    thread_local! {
+        static OBSERVER: RefCell<Option<Observer>> = RefCell::new(None);
+    }
+
+    struct Restore(Option<Observer>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            OBSERVER.with(|observer| observer.replace(self.0.take()));
+        }
+    }
+
+    pub(crate) fn observe<T>(
+        observer: impl FnMut(&std::path::Path) + 'static,
+        run: impl FnOnce() -> T,
+    ) -> T {
+        let previous = OBSERVER.with(|current| current.replace(Some(Box::new(observer))));
+        let _restore = Restore(previous);
+        run()
+    }
+
+    pub(super) fn fired(path: &std::path::Path) {
+        OBSERVER.with(|observer| {
+            if let Some(observer) = observer.borrow_mut().as_mut() {
+                observer(path);
+            }
+        });
+    }
+}
+
 /// Start the witness: open + calibrate each file, departure calibration,
 /// insert keys, activate. Pure over the backend seam; file syscalls are
 /// real (temp files in tests, provider paths in production).
@@ -703,6 +741,8 @@ pub(crate) fn start_with<B: WitnessBackend>(
             .custom_flags(libc::O_NONBLOCK | libc::O_NOCTTY | libc::O_CLOEXEC)
             .open(path)
             .map_err(|_| Unavailable::Btf(format!("witness cannot open {}", path.display())))?;
+        #[cfg(test)]
+        open_race_test::fired(path);
         let meta = file
             .metadata()
             .map_err(|_| Unavailable::Btf("witness fstat failed".into()))?;
@@ -2639,6 +2679,45 @@ mod tests {
             crate::discovery::identity::pin_of(&std::fs::File::open(&path).expect("open"))
                 .expect("pin");
         assert_eq!(witnessed.files[0].pin, expected);
+    }
+
+    #[test]
+    fn start_refuses_when_file_changes_between_open_and_fstat() {
+        // A copy-up landing between open() and the open-time pin must
+        // refuse with the calibration class: the calibration mmap maps
+        // the pre-copy-up file while the pin would read post-copy-up
+        // state. The hook chmods the file in that window (a ctime-only
+        // change, like a copy-up).
+        let (_dir, path) = temp_prearm_file("libopenrace.so");
+        let backend = ScriptBackend::new(calib_for(&path), 1);
+        let err = match super::open_race_test::observe(
+            |victim| {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = std::fs::metadata(victim)
+                    .expect("stat the victim")
+                    .permissions()
+                    .mode();
+                std::fs::set_permissions(victim, std::fs::Permissions::from_mode(mode ^ 0o100))
+                    .expect("chmod the victim");
+            },
+            || {
+                super::start_with(
+                    std::slice::from_ref(&path),
+                    3,
+                    0,
+                    0,
+                    false,
+                    super::DepartFamily::Pair,
+                    backend,
+                    || 7,
+                    &mut crate::discovery::scan::CaptureWorkBudget::default(),
+                )
+            },
+        ) {
+            Ok(_) => panic!("a change between open and fstat must refuse"),
+            Err(err) => err,
+        };
+        assert_eq!(err.class(), "calibration");
     }
 
     #[test]

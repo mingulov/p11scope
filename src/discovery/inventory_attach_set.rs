@@ -276,6 +276,20 @@ impl DecisionLog {
         }
     }
 
+    /// Drops this pass's fresh-by-content notes for `key` naming
+    /// `digest` with the given pre flag. Joint arbitration recalls
+    /// the premature fresh notes it downgrades to refusals, so the
+    /// log reads like the sequential pass it converges to; notes
+    /// already dropped by the cap have nothing to recall.
+    pub(crate) fn recall_fresh(&mut self, key: ObjectKey, digest: &str, incoming_pre: bool) {
+        self.notes.retain(|note| {
+            note.branch != "fresh-by-content"
+                || note.key != key
+                || note.incoming != digest
+                || note.incoming_pre != incoming_pre
+        });
+    }
+
     /// Moves another pass's probe notes in, honoring the same cap
     /// (a discarded routing probe must not overflow the log).
     pub(crate) fn append(&mut self, mut other: DecisionLog) {
@@ -865,6 +879,76 @@ impl InventoryAttachSet {
                 };
             }
         }
+        // Joint same-digest pairs: two fresh identities under a key
+        // that holds no live member, one witness-proven pre-copy-up
+        // and one plain, naming one digest. Each resolved Fresh
+        // against the empty key, so the pair-proof gate never ran —
+        // but no proof can link one digest, and sequential passes
+        // refuse the plain side. The plain side is refused here too,
+        // whichever plan order it resolved in, and its premature
+        // fresh note is recalled; the pass then reads exactly like
+        // the sequential one it converges to. Anything else keeps
+        // today's routing: divergent digests with the split are what
+        // the proof links (sequential passes admit both too), and a
+        // live member anchors the key through the paths above.
+        {
+            let mut fresh_by_key: BTreeMap<ObjectKey, Vec<(PinnedObjectId, String, String, bool)>> =
+                BTreeMap::new();
+            for slot in plan.slots.iter().filter(|slot| plan.is_active(slot.index)) {
+                if matches!(resolved.get(&slot.object), Some(Resolution::Fresh))
+                    && let Some(summary) = pins.summary(slot.object)
+                {
+                    fresh_by_key.entry(summary.key).or_default().push((
+                        slot.object,
+                        summary.path.to_string(),
+                        summary.sha256.to_string(),
+                        summary.pre_copy_up,
+                    ));
+                }
+            }
+            for (key, fresh) in &fresh_by_key {
+                if fresh.len() < 2
+                    || self
+                        .by_raw
+                        .get(key)
+                        .is_some_and(|members| !members.is_empty())
+                {
+                    continue;
+                }
+                let digest = fresh[0].2.clone();
+                if fresh.iter().any(|(_, _, sha, _)| *sha != digest) {
+                    continue;
+                }
+                let plains: Vec<(PinnedObjectId, String)> = fresh
+                    .iter()
+                    .filter(|(_, _, _, pre)| !pre)
+                    .map(|(id, path, _, _)| (*id, path.clone()))
+                    .collect();
+                if plains.is_empty() || plains.len() == fresh.len() {
+                    continue;
+                }
+                outcome.decisions.recall_fresh(*key, &digest, false);
+                for (id, path) in plains {
+                    resolved.insert(
+                        id,
+                        Resolution::Blocked {
+                            reason: Self::no_companion_reason(&path),
+                            recorded: false,
+                        },
+                    );
+                    outcome.decisions.push(AttachDecisionNote {
+                        key: *key,
+                        path,
+                        branch: "blocked-no-companion",
+                        retained: Some(digest.clone()),
+                        incoming: digest.clone(),
+                        incoming_pre: false,
+                        direction: None,
+                        endpoints: None,
+                    });
+                }
+            }
+        }
         // Each module's demand: the exact targets of the active slots it
         // owns. A target two modules claim is one endpoint in both.
         let owners: BTreeMap<ModuleId, PinnedObjectId> = plan
@@ -1154,11 +1238,7 @@ impl InventoryAttachSet {
                     endpoints: None,
                 });
                 return Resolution::Blocked {
-                    reason: format!(
-                        "{}: the witness-proven pre-copy-up observation has no proven companion \
-                         in this pass; it was not admitted",
-                        summary.path
-                    ),
+                    reason: Self::no_companion_reason(summary.path),
                     recorded: false,
                 };
             }
@@ -1195,6 +1275,17 @@ impl InventoryAttachSet {
                 self.by_raw.remove(key);
             }
         }
+    }
+
+    /// The deferred-companion refusal both the sequential
+    /// single-member path and the joint arbitration below report: a
+    /// proven side is present, but nothing proved its companion in
+    /// this pass.
+    fn no_companion_reason(path: &str) -> String {
+        format!(
+            "{path}: the witness-proven pre-copy-up observation has no proven companion \
+             in this pass; it was not admitted"
+        )
     }
 
     /// Whether this pass's aggregate pairs `retained` with `incoming`
@@ -2531,7 +2622,19 @@ pub(crate) mod tests {
         offsets: &[u64],
         pre: Option<u32>,
     ) -> ReconciledModule {
-        let object = id_of_sha(pins, sha256);
+        copyup_module_for(pins, merge, id_of_sha(pins, sha256), offsets, pre)
+    }
+
+    /// A pair module for an explicitly addressed plan object: same-digest
+    /// joint pairs hold two summaries under one digest, which
+    /// [`id_of_sha`] cannot tell apart.
+    fn copyup_module_for(
+        pins: &PinnedObjects,
+        merge: &Path,
+        object: PinnedObjectId,
+        offsets: &[u64],
+        pre: Option<u32>,
+    ) -> ReconciledModule {
         let key = pins.summary(object).unwrap().key;
         let merge = merge.to_str().unwrap().to_string();
         let entries: Vec<ScannedEntry> = offsets
@@ -3222,6 +3325,175 @@ pub(crate) mod tests {
         assert_eq!(note.retained, None);
         assert_eq!(note.incoming, "sha-t");
         assert!(!note.incoming_pre);
+    }
+
+    /// A same-digest pair aggregate (the D1 same-bytes shape): the
+    /// plain upper and the proven lower name one digest under one
+    /// key. Returns the pins, the key, and the (plain, proven) plan
+    /// object ids.
+    fn same_digest_pair_pins(
+        upper: &Path,
+        lower: &Path,
+    ) -> (PinnedObjects, ObjectKey, PinnedObjectId, PinnedObjectId) {
+        use crate::discovery::identity::test_fixture::{
+            mark_pre_copy_up, real_scan_pin, repath_single_pin,
+        };
+        let mut pins = PinnedObjects::empty();
+        assert!(
+            pins.absorb(real_scan_pin(upper, None, 1, "sha-s"))
+                .is_empty()
+        );
+        let key = pins.pinned().next().unwrap().key;
+        let plain = pins.pinned().next().unwrap().id;
+        let mut lower_pins = real_scan_pin(lower, Some(key), 1, "sha-s");
+        mark_pre_copy_up(&mut lower_pins);
+        repath_single_pin(&mut lower_pins, upper.to_str().unwrap());
+        assert!(pins.absorb(lower_pins).is_empty());
+        assert_eq!(pins.pinned().count(), 2);
+        let proven = pins
+            .pinned()
+            .find(|summary| summary.pre_copy_up)
+            .unwrap()
+            .id;
+        assert_ne!(plain, proven, "the pair needs two plan objects");
+        (pins, key, plain, proven)
+    }
+
+    #[test]
+    fn joint_same_digest_pair_refuses_plain_when_pre_first() {
+        // Trip-8 shape, pre slot first: both sides arrive in one pass
+        // under an empty key with one digest. No pair proof can link
+        // them, so the plain side is refused exactly like a
+        // sequential pass refuses it — only the pre side's endpoints
+        // attach.
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pins, key, plain, proven) = same_digest_pair_pins(&upper_path, &lower_path);
+        let plan = lower(
+            &[
+                copyup_module_for(&pins, &upper_path, proven, &offsets(3), Some(0)),
+                copyup_module_for(&pins, &upper_path, plain, &offsets(3), None),
+            ],
+            &pins,
+            policy,
+        );
+        let pass1 = set.absorb(&plan, &pins);
+        assert_eq!(set.len(), 3, "only the pre side's endpoints attach");
+        assert!(
+            pass1.decisions.notes.iter().any(|note| {
+                note.branch == "fresh-by-content" && note.incoming_pre && note.incoming == "sha-s"
+            }),
+            "the pre side admits fresh: {:?}",
+            pass1.decisions.notes
+        );
+        assert!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .all(|note| { note.branch != "fresh-by-content" || note.incoming_pre }),
+            "no plain fresh note survives arbitration: {:?}",
+            pass1.decisions.notes
+        );
+        let refused = pass1
+            .decisions
+            .notes
+            .iter()
+            .find(|note| note.branch == "blocked-no-companion")
+            .expect("the plain side refuses for want of a companion");
+        assert_eq!(refused.key, key);
+        assert_eq!(refused.retained.as_deref(), Some("sha-s"));
+        assert_eq!(refused.incoming, "sha-s");
+        assert!(!refused.incoming_pre);
+        // The next pass converges to the sequential steady shape.
+        let pass2 = set.absorb(&plan, &pins);
+        assert_eq!(set.len(), 3, "the plain side stays refused");
+        assert!(
+            pass2
+                .decisions
+                .notes
+                .iter()
+                .any(|note| { note.branch == "known-by-identity" && note.incoming_pre }),
+            "the pre side resolves known: {:?}",
+            pass2.decisions.notes
+        );
+        assert!(
+            pass2
+                .decisions
+                .notes
+                .iter()
+                .any(|note| { note.branch == "blocked-no-companion" && !note.incoming_pre }),
+            "the plain side refuses again: {:?}",
+            pass2.decisions.notes
+        );
+    }
+
+    #[test]
+    fn joint_same_digest_pair_refuses_plain_when_plain_first() {
+        // Same joint pair, plain slot first: the plan order must not
+        // matter — the plain side is still the refused one, and only
+        // the pre side's endpoints attach.
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pins, key, plain, proven) = same_digest_pair_pins(&upper_path, &lower_path);
+        let plan = lower(
+            &[
+                copyup_module_for(&pins, &upper_path, plain, &offsets(3), None),
+                copyup_module_for(&pins, &upper_path, proven, &offsets(3), Some(0)),
+            ],
+            &pins,
+            policy,
+        );
+        let pass1 = set.absorb(&plan, &pins);
+        assert_eq!(set.len(), 3, "only the pre side's endpoints attach");
+        let refused = pass1
+            .decisions
+            .notes
+            .iter()
+            .find(|note| note.branch == "blocked-no-companion" && !note.incoming_pre)
+            .expect("the plain side refuses for want of a companion");
+        assert_eq!(refused.key, key);
+        assert_eq!(refused.retained.as_deref(), Some("sha-s"));
+        assert_eq!(refused.incoming, "sha-s");
+    }
+
+    #[test]
+    fn joint_divergent_pair_still_admits_both() {
+        // Divergent digests with the pre/plain split are exactly what
+        // the pair proof links: a joint divergent pair keeps both
+        // sides — the arbitration only quiets the unprovable
+        // same-digest shape.
+        let dir = tempfile::tempdir().unwrap();
+        let upper_path = provider(&dir, "upper.so", "provider-upper");
+        let lower_path = provider(&dir, "lower.so", "provider-lower");
+        let mut set = InventoryAttachSet::new(budget(4096));
+        let policy = AdmissionPolicy::Inventory(set.budget());
+        let (pair_pins, _) = copyup_pair_pins(&upper_path, &lower_path);
+        let plan = lower(
+            &[
+                copyup_module(&pair_pins, &upper_path, "sha-u", &offsets(3), None),
+                copyup_module(&pair_pins, &upper_path, "sha-l", &offsets(3), Some(0)),
+            ],
+            &pair_pins,
+            policy,
+        );
+        let pass1 = set.absorb(&plan, &pair_pins);
+        assert_eq!(set.len(), 6, "both divergent sides admit");
+        assert!(
+            pass1
+                .decisions
+                .notes
+                .iter()
+                .all(|note| !note.branch.starts_with("blocked-")),
+            "nothing refuses: {:?}",
+            pass1.decisions.notes
+        );
     }
 
     #[test]

@@ -171,18 +171,25 @@ def check_no_tag_triggers(text):
 
     Release tags ride the same commit a branch push already ran
     (RELEASING.md pushes main and the tag together), so a tag run only
-    duplicates the matrix on an identical SHA. Returns a problem list,
-    like the other check_* helpers.
+    duplicates the matrix on an identical SHA. GitHub runs nothing for
+    an undefined ref type, so the push block must allow every branch
+    explicitly next to tags-ignore; tags-ignore alone stops branch
+    pushes too. Returns a problem list, like the other check_* helpers.
     """
     problems = []
     push = re.search(r"^  push:\n((?:    .*\n)+)", text, re.M)
     if not push:
         return ["no indented push: trigger block"]
     block = push.group(1)
-    if "tags-ignore:" not in block or "'**'" not in block:
+    branches = re.search(r"^    branches:\n((?:      .*\n)+)", block, re.M)
+    if not branches or "'**'" not in branches.group(1):
+        problems.append("push: does not run every branch push")
+    ignored = re.search(r"^    tags-ignore:\n((?:      .*\n)+)",
+                        block, re.M)
+    if not ignored or "'**'" not in ignored.group(1):
         problems.append("push: does not ignore tags")
-    if re.search(r"^    (tags|branches):", block, re.M):
-        problems.append("push: restricts branches or allows tags")
+    if re.search(r"^    tags:", block, re.M):
+        problems.append("push: allows tag pushes")
     if "\n  pull_request:\n" not in text:
         problems.append("pull_request trigger missing")
     return problems
@@ -233,6 +240,30 @@ class BpfKernelsContractTests(unittest.TestCase):
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], check_no_tag_triggers(self.bpf))
         self.assertEqual([], check_no_tag_triggers(self.ci))
+
+    def test_trigger_check_catches_branch_and_tag_regressions(self):
+        base = ("on:\n  push:\n    branches:\n      - '**'\n"
+                "    tags-ignore:\n      - '**'\n  pull_request:\n")
+        self.assertEqual([], check_no_tag_triggers(base))
+        dropped_branches = base.replace("    branches:\n      - '**'\n",
+                                        "")
+        self.assertIn("push: does not run every branch push",
+                      check_no_tag_triggers(dropped_branches))
+        restricted = base.replace("      - '**'\n", "      - 'main'\n", 1)
+        self.assertIn("push: does not run every branch push",
+                      check_no_tag_triggers(restricted))
+        dropped_ignore = base.replace("    tags-ignore:\n      - '**'\n",
+                                      "")
+        self.assertIn("push: does not ignore tags",
+                      check_no_tag_triggers(dropped_ignore))
+        allowed_tags = base.replace("    tags-ignore:\n",
+                                    "    tags:\n      - '**'\n"
+                                    "    tags-ignore:\n")
+        self.assertIn("push: allows tag pushes",
+                      check_no_tag_triggers(allowed_tags))
+        dropped_pr = base.replace("  pull_request:\n", "")
+        self.assertIn("pull_request trigger missing",
+                      check_no_tag_triggers(dropped_pr))
 
     def test_lib_cells_run_in_66_and_612_guests(self):
         match = re.search(r"lib-cells-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",

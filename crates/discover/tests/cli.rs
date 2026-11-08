@@ -1350,7 +1350,9 @@ fn isolation_target_name_holding_a_hard_link_is_refused() {
 fn inode_flags(path: &Path) -> i32 {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt as _;
-    const FS_IOC_GETFLAGS: libc::c_ulong = 0x8008_6601;
+    // `libc::Ioctl` is the request parameter's own type (c_int on musl,
+    // c_ulong on glibc); the `as` cast keeps the identical bit pattern.
+    const FS_IOC_GETFLAGS: libc::Ioctl = 0x8008_6601_u32 as libc::Ioctl;
     let raw = CString::new(path.as_os_str().as_bytes()).unwrap();
     let fd = unsafe { libc::open(raw.as_ptr(), libc::O_RDONLY) };
     assert!(fd >= 0, "cannot open {} for flags", path.display());

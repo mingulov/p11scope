@@ -123,6 +123,21 @@ def matrix_kernels(bpf_text):
             if kernel.strip()]
 
 
+def gate1_kernels(bpf_text):
+    """The bpf-load-gate1-kernels matrix values.
+
+    The gate-0 pin reads the first kernel list only, so a cell dropped
+    from the gate-1 job alone would pass it; this reads the gate-1
+    job's own matrix instead.
+    """
+    match = re.search(r"bpf-load-gate1-kernels:.*?matrix:\n\s+kernel: \[(.*?)\]",
+                      bpf_text, re.S)
+    if not match:
+        return []
+    return [kernel.strip() for kernel in match.group(1).split(",")
+            if kernel.strip()]
+
+
 def deb_matches_kernel(deb, kernel):
     """True when a vng deb filename belongs to a matrix kernel tag.
 
@@ -276,6 +291,22 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)
         self.assertIn("if: matrix.refusal_control != true", self.bpf)
         self.assertIn("if: matrix.refusal_control == true", self.bpf)
+
+    def test_gate1_matrix_pins_the_newest_mainline_cell(self):
+        expected = ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
+                    "v7.4-rc1"]
+        self.assertEqual(gate1_kernels(self.bpf), expected)
+        # Negative control: dropping the cell from the gate-1 job
+        # alone must change what this pin reads, while the gate-0 pin
+        # still sees all five (it reads the first list only).
+        match = re.search(r"bpf-load-gate1-kernels:.*?kernel: \[(.*?)\]",
+                          self.bpf, re.S)
+        self.assertTrue(match, "bpf-load-gate1-kernels names no matrix")
+        dropped = (self.bpf[:match.start(1)]
+                   + match.group(1).replace(", v7.4-rc1", "")
+                   + self.bpf[match.end(1):])
+        self.assertEqual(gate1_kernels(dropped), expected[:-1])
+        self.assertEqual(matrix_kernels(dropped), expected)
 
     def test_tag_pushes_trigger_nothing(self):
         self.assertEqual([], check_no_tag_triggers(self.bpf))

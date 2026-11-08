@@ -31390,6 +31390,7 @@ mod maps_skip_memory_tests {
             build_id: None,
             identity_source: None,
             note: None,
+            pre_copy_up: false,
             mappings: Vec::new(),
             observations: Vec::new(),
             admission: AdmissionRecord::Admitted {
@@ -31476,6 +31477,7 @@ mod maps_skip_memory_tests {
             build_id: None,
             identity_source: None,
             note: None,
+            pre_copy_up: false,
             mappings: Vec::new(),
             observations: Vec::new(),
             admission,
@@ -31543,6 +31545,7 @@ mod maps_skip_memory_tests {
             build_id: None,
             identity_source: None,
             note: None,
+            pre_copy_up: false,
             mappings: Vec::new(),
             observations: Vec::new(),
             admission,

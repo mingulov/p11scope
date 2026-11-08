@@ -77,6 +77,12 @@ LIVE_IMAGE_MAP_FLAGS = {"IMAGE_CONTINUITY": 1, "IMAGE_TGID_INDEX": 1}
 # other live value still fails.
 AGGREGATE_ONLY_SINGLETON_MAPS = frozenset({
     "IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"})
+# Owned (`run`-tree) lanes capture in Scope::Cgroup, where
+# discovery_ring_bytes (src/attach.rs) sizes DISCOVERY at
+# SHARED_SCOPE_DISCOVERY_BYTES instead of the 64 KiB Pid-scope size the
+# pinned ELF policy declares. The live comparison below expects exactly
+# the loader's report on owned lanes. Change both together.
+OWNED_DISCOVERY_MAX_ENTRIES = 2_097_152
 STOP_SECONDS = 30
 # Declared per-kernel canary readiness bounds: declared, measured and
 # disclosed test parameters per kernel/host (correctness and zero loss stay
@@ -505,7 +511,8 @@ class LiveMaps:
         held = {id(row) for row in kept}
         maps = [dumper.normalize_map_metadata(row, map_id)
                 for map_id, row in fetched if id(row) in held]
-        validate_inventory(maps, self.config.variant, self.config.privacy)
+        validate_inventory(maps, self.config.variant, self.config.privacy,
+                           self.config.workload_origin)
         group.snapshot(deadline)
         return sorted(maps, key=lambda item: item['name'])
 
@@ -651,7 +658,8 @@ def partition_identity_maps(rows, origin):
     return capture, identity
 
 
-def validate_inventory(maps, variant, privacy='allowlisted'):
+def validate_inventory(maps, variant, privacy='allowlisted', workload_origin='external'):
+    require(workload_origin in ('owned', 'external'), f'unknown workload origin {workload_origin!r}')
     expected = definitions.SAFE_MAPS if variant == 'default' else definitions.UNSAFE_MAPS
     require(isinstance(maps, list) and len(maps) == len(expected)
             and {item['name'] for item in maps} == set(expected)
@@ -663,12 +671,14 @@ def validate_inventory(maps, variant, privacy='allowlisted'):
         live_max = (1 if privacy == 'aggregate-only'
                     and item['name'] in AGGREGATE_ONLY_SINGLETON_MAPS
                     else wanted['max_entries'])
+        if workload_origin == 'owned' and item['name'] == 'DISCOVERY':
+            live_max = OWNED_DISCOVERY_MAX_ENTRIES
         require((item['type'], item['bytes_key'], item['bytes_value'], item['max_entries'], item['map_flags'])
                 == (MAP_TYPES[wanted['type']], wanted['key_size'], wanted['value_size'], live_max, live_flags),
                 f'map definition mismatch name={item["name"]}')
 
 
-def continuity_map_category(maps, ordinary, *, variant, privacy):
+def continuity_map_category(maps, ordinary, *, variant, privacy, workload_origin='external'):
     """Finite setup facts from the selected observer's already retained maps.
 
     Full inventory validation binds IMAGE/instance maps to this acquisition;
@@ -680,7 +690,7 @@ def continuity_map_category(maps, ordinary, *, variant, privacy):
         if (type(maps) is not list or type(ordinary) is not dict
                 or any(type(item) is not dict for item in maps)):
             return 'unknown'
-        validate_inventory(maps, variant, privacy)
+        validate_inventory(maps, variant, privacy, workload_origin)
         by_name = {item['name']: item for item in maps}
         decoded = {name: dumper.normalize_map_dump(ordinary[name], by_name[name])
                    for name in ('INSTANCE_GEN', 'SLOT_FILE', 'WATCHED_FILES')}
@@ -719,8 +729,10 @@ def continuity_map_category(maps, ordinary, *, variant, privacy):
     return 'map-facts-present'
 
 
-def retained_ring_records(source, positions, maps, ordinary, *, variant, privacy):
-    category = continuity_map_category(maps, ordinary, variant=variant, privacy=privacy)
+def retained_ring_records(source, positions, maps, ordinary, *, variant, privacy,
+                          workload_origin='external'):
+    category = continuity_map_category(maps, ordinary, variant=variant, privacy=privacy,
+                                       workload_origin=workload_origin)
     try:
         return source.ring_records(positions)
     except evidence.RingRecordRefusal as error:
@@ -1046,7 +1058,8 @@ class Coordinator:
             values[item['name']] = raw
         self.check('retained-rings', deadline)
         rings = retained_ring_records(source, positions, maps, ordinary,
-                                      variant=cfg.variant, privacy=cfg.privacy)
+                                      variant=cfg.variant, privacy=cfg.privacy,
+                                      workload_origin=cfg.workload_origin)
         for name, rows in rings.items():
             # Frame each record with its 8-byte ring header (length plus
             # zero flags) so mixed 368/608-byte EVENTS forms split exactly

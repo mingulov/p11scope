@@ -2115,44 +2115,49 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         and an unknown origin fails closed.
         """
         owned_discovery = 2_097_152
+        singletons = {"IMAGE_CONTINUITY", "IMAGE_TGID_INDEX", "IMAGE_QUERY_REQUESTS"}
 
-        def owned_inventory():
+        def owned_inventory(privacy):
             maps = self.live_inventory()
-            next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = owned_discovery
+            for item in maps:
+                if item['name'] == 'DISCOVERY':
+                    item['max_entries'] = owned_discovery
+                elif privacy == 'aggregate-only' and item['name'] in singletons:
+                    item['max_entries'] = 1
             return maps
 
         self.assertEqual(capture.definitions.SAFE_MAPS['DISCOVERY']['max_entries'], 65_536)
         self.assertEqual(capture.OWNED_DISCOVERY_MAX_ENTRIES, owned_discovery)
-        capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'owned')
-        capture.validate_inventory(owned_inventory(), 'default', 'allowlisted', 'owned')
+        capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'owned')
+        capture.validate_inventory(owned_inventory('allowlisted'), 'default', 'allowlisted', 'owned')
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=DISCOVERY'):
-            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only')
+            capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only')
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=DISCOVERY'):
-            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'external')
+            capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'external')
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=DISCOVERY'):
             capture.validate_inventory(self.live_inventory(), 'default', 'aggregate-only', 'owned')
         for size in (1, 65_536, 65_537, 4_194_304):
             with self.subTest(size=size):
-                maps = owned_inventory()
+                maps = owned_inventory('aggregate-only')
                 next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = size
                 with self.assertRaisesRegex(capture.CaptureError,
                                             'map definition mismatch name=DISCOVERY'):
                     capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
-        maps = owned_inventory()
+        maps = owned_inventory('aggregate-only')
         next(item for item in maps if item['name'] == 'DISCOVERY')['bytes_value'] = 8
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=DISCOVERY'):
             capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
-        maps = owned_inventory()
+        maps = owned_inventory('aggregate-only')
         next(item for item in maps if item['name'] == 'CONFIG')['max_entries'] = 1
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=CONFIG'):
             capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
         with self.assertRaisesRegex(capture.CaptureError, 'unknown workload origin'):
-            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'cgroup')
+            capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'cgroup')
 
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.

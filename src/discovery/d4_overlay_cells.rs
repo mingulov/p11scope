@@ -5226,9 +5226,7 @@ fn lower_candidates_refuse_legacy_data_only_separator() {
     // the row refuses like `datadir`. Leading/trailing colons stay
     // tolerated (no layer between).
     let table = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1::/l2,upperdir=/u,workdir=/w\n";
-    assert!(
-        lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")).is_empty()
-    );
+    assert!(lower_candidates_from_mountinfo(table, std::path::Path::new("/mnt/r/a.so")).is_empty());
     let trailing = "31 23 0:27 / /mnt/r rw,relatime - overlay overlay rw,lowerdir=/l1:,upperdir=/u,workdir=/w\n";
     assert_eq!(
         lower_candidates_from_mountinfo(trailing, std::path::Path::new("/mnt/r/a.so")),

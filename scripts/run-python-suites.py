@@ -137,6 +137,7 @@ RUN = [
     ("test_measure_e03.py", []),
     ("test_merge_checksum_ledgers.py", []),
     ("test_narrow_scope_oracle.py", []),
+    ("test_nodata_matrix_oracle.py", []),
     ("test_object_journal_qualification.py", []),
     ("test_object_observations.py", []),
     ("test_object_observations_v5.py", []),

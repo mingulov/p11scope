@@ -1129,7 +1129,16 @@ impl<Source: ProcessSource> CallerAdapter<Source> {
         let incarnation = self.incarnations.get(&prepared.pid).copied().unwrap_or(0);
         self.incarnations
             .insert(prepared.pid, incarnation.saturating_add(1));
+        // Derived, not literal: the mint reads `exec_observed` from
+        // the carried exe identity via `scoped_mint_exec_observed`,
+        // pinned by `scoped_mint_leaves_unreadable_exe_unobserved`.
+        // Reverting this call orphans the seam, which the `-D warnings`
+        // gate refuses as dead code on the non-test target.
         let exec_observed = scoped_mint_exec_observed(&prepared.generation);
+        debug_assert!(
+            prepared.generation.exe.is_some(),
+            "scoped admission gates carry an exe identity to the mint"
+        );
         self.callers.insert(
             id,
             TrackedCaller {

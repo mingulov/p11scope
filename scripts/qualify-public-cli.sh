@@ -465,7 +465,7 @@ cgroup_capture() {
   printf 'directories.tokendir = %s/outside/tokens\nobjectstore.backend = file\nlog.level = ERROR\n' "$tokdir" > "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
   SOFTHSM2_CONF=$tokdir/child/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
   SOFTHSM2_CONF=$tokdir/outside/softhsm2.conf softhsm2-util --init-token --free --label qual --so-pin 5678 --pin 1234 >/dev/null || { result "$cell" 0 'cgroup token init failed' failed; return 1; }
-  chown -R "$RUNUID:$RUNGID" "$tokdir/child/tokens" "$tokdir/outside/tokens" 2>/dev/null || true
+  chown -R "$RUNUID:$RUNGID" "$tokdir/child/tokens" "$tokdir/outside/tokens" || { result "$cell" 0 'cgroup token chown failed' failed; return 1; }
   chmod 644 "$tokdir/child/softhsm2.conf" "$tokdir/outside/softhsm2.conf" || { result "$cell" 0 'cgroup token conf failed' failed; return 1; }
   P11SCOPE_CGROUP_FORK_CHILD_CONF=$tokdir/child/softhsm2.conf asuser "$CFORK" "$MODULE" 250 200 "$inside_gate" > "$cell-inside.wl" 2>&1 & inside=$!; register "$inside" && gen=${CHILDREN[$inside]}
   asuser_conf "$tokdir/outside/softhsm2.conf" "$GATED" "$MODULE" 500 200 "$outside_gate" > "$cell-outside.wl" 2>&1 & outside=$!; register "$outside" || true

@@ -163,18 +163,20 @@ unidentified caller executables row of
 lane returning exact owner images would fill them, and publishing
 non-null values needs a new allowlist row.
 
-App-hint extension (additive within v1, owner ruling 2026-11-08): an
-admitted caller may carry an optional `app_hint: {"value", "source"}`
-(`source` one of `argv`, `comm`, `unit`, `snap`), sampled once at
-admission beside the exe read — one grammar-proven interpreter argv
-token (script, `-m` module, `-jar` jar, main class), comm for
-python/sh direct-shebang launches, or the cgroup leaf (snap name,
-service unit, app scope). The key is absent when unknown, never null.
-No environment, `-c`/`-e` text, or flag value is read or published;
-non-interpreter exes get no argv/comm read; container/pod shapes stay
-under the `--caller-metadata` opt-in. The hint is a display label
-only: it never keys, merges, or splits callers, edges, or admissions.
-See the app identity rows of [privacy allowlist v3](../privacy/allowlist-v3.md).
+App-hint extension (additive within v1, owner ruling 2026-11-08 as
+corrected the same day): an admitted caller whose exe is a tabled
+runtime (python, java, node, perl, ruby) may carry an optional
+`app_hint: {"value", "source"}` (`source` one of `argv`, `comm`,
+`unit`, `snap`), sampled once at admission beside the exe read — one
+grammar-proven argv token (script, `-m` module, `-jar` jar, main
+class), comm for python/perl/ruby direct-shebang launches, or the
+cgroup leaf (snap name, service unit, app scope). Shells and native
+executables get no hint and no read; the key is absent when unknown,
+never null. No environment, `-c`/`-e` text, or flag value is read or
+published; container/pod shapes stay under the `--caller-metadata`
+opt-in. The hint is a display label only: it never keys, merges, or
+splits callers, edges, or admissions. See the app identity rows of
+[privacy allowlist v3](../privacy/allowlist-v3.md).
 
 ## Clock and units
 

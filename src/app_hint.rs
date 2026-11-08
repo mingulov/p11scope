@@ -39,13 +39,16 @@ pub(crate) const CMDLINE_PREFIX_BYTES: usize = 4096;
 /// Hint values are basenames or identifiers, never longer than `NAME_MAX`.
 pub(crate) const HINT_VALUE_MAX_BYTES: usize = 255;
 
-/// Which interpreter grammar gates the argv/comm reads.
+/// Which interpreter grammar gates the argv/comm/cgroup reads: only
+/// runtimes that load the PKCS#11 provider into their own process
+/// (owner ruling 2026-11-08; shells and native exes get no labels).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Interpreter {
     Python,
-    Shell,
     Java,
     Node,
+    Perl,
+    Ruby,
 }
 
 /// Last nonempty `/`-separated component, if any.
@@ -53,15 +56,18 @@ fn basename_of(path: &str) -> Option<&str> {
     path.rsplit('/').find(|part| !part.is_empty())
 }
 
-/// Exact interpreter table (Section 4 of the design): extension needs a
-/// reviewed allowlist change. `python3.<N>` is digits-only; anything
-/// else (`python3.13t`, `python2`, wrappers) is not an interpreter.
+/// Exact interpreter table (final ruling 2026-11-08): extension needs
+/// a reviewed allowlist change. `python3.<N>` is digits-only; anything
+/// else (`python3.13t`, `python2`, wrappers, versioned `ruby3.x`) is
+/// not an interpreter. Shells are excluded: a shell cannot load a
+/// provider, so sh/bash/dash get no label at all.
 fn classify_interpreter(basename: &str) -> Option<Interpreter> {
     match basename {
         "python" | "python3" => Some(Interpreter::Python),
-        "sh" | "dash" | "bash" => Some(Interpreter::Shell),
         "java" => Some(Interpreter::Java),
         "node" | "nodejs" => Some(Interpreter::Node),
+        "perl" => Some(Interpreter::Perl),
+        "ruby" => Some(Interpreter::Ruby),
         _ => {
             if let Some(rest) = basename.strip_prefix("python3.")
                 && !rest.is_empty()
@@ -115,7 +121,7 @@ fn capture_dotted_ident(token: &[u8]) -> Option<String> {
 /// `-c` aborts (program text is never captured); `-m` captures the
 /// module; `-W`/`-X` consume their value; unknown shapes bail.
 fn python_token(tokens: &[&[u8]]) -> Option<String> {
-    const NO_ARG: &[u8] = b"Bb?dEhiIOPqsSuvVx";
+    const NO_ARG: &[u8] = b"Bb?dEhiIOPRqsSuvVx";
     let mut index = 0;
     loop {
         let token = *tokens.get(index)?;
@@ -170,11 +176,14 @@ fn python_token(tokens: &[&[u8]]) -> Option<String> {
     }
 }
 
-/// Shell walker: only the direct `sh script …` shape (argv[1] without a
-/// leading `-`/`+`). Every flag shape — `-c`, `-o`, `-x`, … — bails.
-fn shell_token(tokens: &[&[u8]]) -> Option<String> {
+/// Direct-shape walker for perl/ruby: only `perl script …` /
+/// `ruby script …` (argv[1] without a leading `-`). Every flag shape —
+/// `-e`/`-E` program text, `-w`, `-c`, … — bails to a safe miss; comm
+/// and cgroup still apply. Flagged argv grammars are a documented
+/// later step, not a guess.
+fn direct_script_token(tokens: &[&[u8]]) -> Option<String> {
     let script = tokens.first()?;
-    if script.starts_with(b"-") || script.starts_with(b"+") {
+    if script.starts_with(b"-") {
         return None;
     }
     capture_basename(script)
@@ -331,6 +340,14 @@ fn node_token(tokens: &[&[u8]]) -> Option<String> {
         }
         if token.starts_with(b"--") {
             if token.contains(&b'=') {
+                // `--eval=<code>` / `--print=<expr>` evaluate inline
+                // text: no script runs (after `--print=` the next token
+                // is itself evaluated as code), so bail before the
+                // generic self-contained skip.
+                let name = token.split(|byte| *byte == b'=').next()?;
+                if name == b"--eval" || name == b"--print" {
+                    return None;
+                }
                 index = index.checked_add(1)?;
                 continue;
             }
@@ -360,9 +377,9 @@ fn argv_token(interpreter: Interpreter, cmdline: &[u8]) -> Option<String> {
     let args = tokens.get(1..)?;
     match interpreter {
         Interpreter::Python => python_token(args),
-        Interpreter::Shell => shell_token(args),
         Interpreter::Java => java_token(args),
         Interpreter::Node => node_token(args),
+        Interpreter::Perl | Interpreter::Ruby => direct_script_token(args),
     }
 }
 
@@ -386,6 +403,16 @@ fn is_name_word(text: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
 }
 
+/// Compose a hint, enforcing the `NAME_MAX` bound on the final value:
+/// composed values such as `snap <snap>` are longer than the leaf they
+/// parse from, so the bound is checked here, not just at the leaf.
+fn bounded_hint(value: String, source: AppHintSource) -> Option<AppHint> {
+    if value.len() > HINT_VALUE_MAX_BYTES {
+        return None;
+    }
+    Some(AppHint { value, source })
+}
+
 /// Leaf-of-`0::` cgroup hint: `snap <snap>` for snap scopes, the unit
 /// name for services, the opaque leaf for `app-*.scope`. Generic
 /// sessions, slices, and container shapes yield nothing.
@@ -405,16 +432,10 @@ fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
             if !is_name_word(snap) || !is_name_word(app) {
                 return None;
             }
-            return Some(AppHint {
-                value: format!("snap {snap}"),
-                source: AppHintSource::Snap,
-            });
+            return bounded_hint(format!("snap {snap}"), AppHintSource::Snap);
         }
         if leaf.starts_with("app-") {
-            return Some(AppHint {
-                value: scope.to_string(),
-                source: AppHintSource::Unit,
-            });
+            return bounded_hint(scope.to_string(), AppHintSource::Unit);
         }
         return None;
     }
@@ -422,20 +443,19 @@ fn cgroup_hint(cgroup: &str) -> Option<AppHint> {
         if unit.is_empty() || unit.starts_with("user@") {
             return None;
         }
-        return Some(AppHint {
-            value: unit.to_string(),
-            source: AppHintSource::Unit,
-        });
+        return bounded_hint(unit.to_string(), AppHintSource::Unit);
     }
     None
 }
 
 /// Pure selection over already-read facts.
 ///
-/// Precedence: grammar-proven argv token, then comm (python/sh only),
-/// then the cgroup leaf (every exe). A hint equal to the exe basename
-/// carries no information and is dropped. `None` (missing/unreadable)
-/// inputs yield `None`: the bare interpreter label as today.
+/// Only a tabled runtime gets any hint: shells and native exes keep
+/// the plain name (owner ruling 2026-11-08). Precedence: grammar-proven
+/// argv token, then comm (python/perl/ruby direct-shebang launches),
+/// then the cgroup leaf of an admitted runtime. A hint equal to the
+/// exe basename carries no information and is dropped. `None`
+/// (missing/unreadable) inputs yield `None`: the bare label as today.
 pub(crate) fn app_hint_for(
     exe_path: Option<&str>,
     comm: Option<&str>,
@@ -443,27 +463,27 @@ pub(crate) fn app_hint_for(
     cgroup: Option<&str>,
 ) -> Option<AppHint> {
     let basename = exe_path.and_then(basename_of)?;
-    let interpreter = classify_interpreter(basename);
-    if let Some(which) = interpreter {
-        if let Some(cmdline) = cmdline
-            && let Some(value) = argv_token(which, cmdline)
-            && value != basename
-        {
+    let interpreter = classify_interpreter(basename)?;
+    if let Some(cmdline) = cmdline
+        && let Some(value) = argv_token(interpreter, cmdline)
+        && value != basename
+    {
+        return Some(AppHint {
+            value,
+            source: AppHintSource::Argv,
+        });
+    }
+    if matches!(
+        interpreter,
+        Interpreter::Python | Interpreter::Perl | Interpreter::Ruby
+    ) && let Some(comm) = comm
+    {
+        let comm = comm.trim_end_matches(['\n', '\0']);
+        if !comm.is_empty() && comm != basename && comm.len() <= HINT_VALUE_MAX_BYTES {
             return Some(AppHint {
-                value,
-                source: AppHintSource::Argv,
+                value: comm.to_string(),
+                source: AppHintSource::Comm,
             });
-        }
-        if matches!(which, Interpreter::Python | Interpreter::Shell)
-            && let Some(comm) = comm
-        {
-            let comm = comm.trim_end_matches(['\n', '\0']);
-            if !comm.is_empty() && comm != basename {
-                return Some(AppHint {
-                    value: comm.to_string(),
-                    source: AppHintSource::Comm,
-                });
-            }
         }
     }
     let hint = cgroup_hint(cgroup?)?;
@@ -505,11 +525,12 @@ pub(crate) fn read_cgroup_text(pid: u32) -> Option<String> {
 
 /// Sample one admission hint for `pid` beside its already-read `exe`.
 ///
-/// Without a readable exe there is no hint and no read. argv/comm are
-/// read only for a tabled interpreter; the cgroup leaf for every exe.
-/// The exe identity is re-read after sampling and must match, so an
-/// exec between the admission read and these reads drops the hint
-/// instead of attributing one image's facts to another.
+/// Without a readable exe there is no hint and no read. comm, argv and
+/// the cgroup leaf are read only for a tabled runtime; shells and
+/// native exes get no read at all. The exe identity is re-read after
+/// sampling and must match, so an exec between the admission read and
+/// these reads drops the hint instead of attributing one image's facts
+/// to another.
 pub(crate) fn sample_for_pid(
     pid: u32,
     exe: Option<&crate::discovery::caller_registry::ExeIdentity>,
@@ -517,11 +538,14 @@ pub(crate) fn sample_for_pid(
     let exe = exe?;
     let basename = exe.path.as_deref().and_then(basename_of);
     let interpreter = basename.and_then(classify_interpreter);
-    let (comm, cmdline) = match interpreter {
-        Some(_) => (read_comm(pid), read_cmdline_prefix(pid)),
-        None => (None, None),
+    let (comm, cmdline, cgroup) = match interpreter {
+        Some(_) => (
+            read_comm(pid),
+            read_cmdline_prefix(pid),
+            read_cgroup_text(pid),
+        ),
+        None => (None, None, None),
     };
-    let cgroup = read_cgroup_text(pid);
     let hint = app_hint_for(
         exe.path.as_deref(),
         comm.as_deref(),
@@ -1012,6 +1036,22 @@ mod tests {
     }
 
     #[test]
+    fn composed_values_are_bounded_at_construction() {
+        // The guard itself: a composed value over NAME_MAX never
+        // becomes a hint, whatever leaf it parsed from.
+        let overlong = "s".repeat(HINT_VALUE_MAX_BYTES + 1);
+        assert_eq!(bounded_hint(overlong, AppHintSource::Snap), None);
+        let fitting = "s".repeat(HINT_VALUE_MAX_BYTES);
+        assert_eq!(
+            bounded_hint(fitting.clone(), AppHintSource::Snap),
+            Some(AppHint {
+                value: fitting,
+                source: AppHintSource::Snap,
+            })
+        );
+    }
+
+    #[test]
     fn longest_valid_snap_label_stays_within_the_bound() {
         // `snap.<snap>.<app>-<id>.scope` needs 15 bytes besides the
         // snap name, so a 255-byte leaf holds at most a 240-char snap;
@@ -1064,7 +1104,7 @@ mod tests {
         assert_eq!(
             sample_for_pid(pid, Some(&exe)),
             app_hint_for(exe.path.as_deref(), None, None, cgroup.as_deref()),
-            "a non-interpreter test binary samples the cgroup leaf only"
+            "a non-interpreter test binary samples nothing at all"
         );
     }
 }

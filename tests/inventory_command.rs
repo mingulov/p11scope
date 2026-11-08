@@ -2689,7 +2689,7 @@ fn inventory_snapshot_rewritten_perl_title_yields_no_comm_hint() {
              \x20   else {{ $prov = $arg; $i += 1; }}\n\
              }}\n\
              die \"usage\" unless defined $ready && defined $prov && defined $pin;\n\
-             $0 = \"sign --pin $pin\";\n\
+             $0 = \"--pin $pin\";\n\
              DynaLoader::dl_load_file($prov, 0) or die \"dlopen $prov failed\";\n\
              open(my $fh, \">\", $ready) or die \"ready $ready: $!\";\n\
              print $fh \"READY $$\\n\";\n\
@@ -2706,7 +2706,9 @@ fn inventory_snapshot_rewritten_perl_title_yields_no_comm_hint() {
         &["-shared", "-fPIC", "-DLEGACY_MINOR=40"],
         &[],
     );
-    let pin = "perl-pin-7331";
+    // Nine bytes: the rewritten title `--pin <pin>` fits comm whole,
+    // so the pin-absence check below also bites on a comm leak.
+    let pin = "733198765";
     let output = Command::new("sh")
         .arg(fixture_source("inventory-observe-app-hint.sh"))
         .args(["--capture", "scan", "-o"])
@@ -2732,9 +2734,10 @@ fn inventory_snapshot_rewritten_perl_title_yields_no_comm_hint() {
     // The driver must still carry the rewritten title: otherwise this
     // cell would pass without exercising the refusal.
     let comm = std::fs::read_to_string(format!("/proc/{pid}/comm")).unwrap();
-    assert!(
-        comm.starts_with("sign --pin "),
-        "driver rewrote its title: {comm:?}"
+    assert_eq!(
+        comm,
+        format!("--pin {pin}\n"),
+        "driver rewrote its title into comm"
     );
     let text = std::fs::read_to_string(&text_file).unwrap();
     let raw = std::fs::read(&file).unwrap();

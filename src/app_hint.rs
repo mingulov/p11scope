@@ -1145,6 +1145,19 @@ mod tests {
     }
 
     #[test]
+    fn perl_title_padding_is_never_a_whitespace_hint() {
+        // Live bytes: a `#!/usr/bin/perl -w` script doing
+        // `$0="tool --pin 99"`, run under `env -i`. The rewritten
+        // title token plus a 54-space padding token: an
+        // all-whitespace basename is refused, never published.
+        let mut cmd = b"tool --pin 99\x00".to_vec();
+        cmd.extend_from_slice(&[b' '; 54]);
+        cmd.push(0);
+        assert_eq!(capture_basename(&[b' '; 54]), None);
+        no_hint(Some("/usr/bin/perl"), None, Some(&cmd), None);
+    }
+
+    #[test]
     fn perl_and_ruby_never_eval_text() {
         let mut cmd = b"perl\x00-e\x00script.pl\x00".to_vec();
         no_hint(Some("/usr/bin/perl"), None, Some(&cmd), None);
@@ -1346,14 +1359,35 @@ mod tests {
 
     #[test]
     fn container_ancestors_suppress_unit_hints() {
-        // Every `0::` component is screened: a service inside a
-        // container is never a default-on hint (DR04 owns container
-        // display under its opt-in).
+        // Structural rule: a leaf is accepted only when every ancestor
+        // component ends in `.slice`, except at most one
+        // `user@<digits>.service`. The name list below stays as a second
+        // check. A service inside a container is never a default-on
+        // hint (DR04 owns container display under its opt-in).
         for cg in [
             "0::/system.slice/docker-0123abcd.scope/system.slice/hsm-agent.service\n",
             "0::/lxc.payload.tenant-a/system.slice/billing-worker.service\n",
             "0::/machine.slice/systemd-nspawn@tenant.service/payload/system.slice/sign.service\n",
             "0::/machine.slice/systemd-nspawn@tenant.service\n",
+            // nixos-container layout: nspawn with `--keep-unit` under
+            // `machine.slice/container@<name>.service`.
+            "0::/machine.slice/container@tenant.service/system.slice/hsm-agent.service\n",
+            // Docker cgroupfs driver on cgroup v2.
+            "0::/docker/0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef/system.slice/hsm-agent.service\n",
+            // nspawn registered with machined (`payload` level present
+            // or not).
+            "0::/machine.slice/machine-tenant.scope/payload/system.slice/sign.service\n",
+            "0::/machine.slice/machine-tenant.scope/system.slice/sign.service\n",
+            // libvirt-lxc scope, legacy cgroupfs parent, nerdctl scope,
+            // and an unknown custom parent: the rule is structural, so
+            // no name list can enumerate them all.
+            "0::/machine.slice/machine-lxc\\x2dtenant.scope/system.slice/agent.service\n",
+            "0::/lxc/tenant/system.slice/agent.service\n",
+            "0::/system.slice/nerdctl-0123456789abcdef.scope/system.slice/agent.service\n",
+            "0::/tenant-a/system.slice/agent.service\n",
+            // At most one `user@<digits>.service` ancestor: a nested
+            // second one is not a plain user session.
+            "0::/user.slice/user-1000.slice/user@1000.service/user@1001.service/agent.service\n",
         ] {
             no_hint(Some("/usr/bin/python3"), None, None, Some(cg));
         }

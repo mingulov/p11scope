@@ -1613,16 +1613,17 @@ sample_spy() {
         CPU_TICKS=0; CPU_RSS=0
         ;;
     *)
-        case "$2" in inv-pid) preload=1;; *) preload="";; esac
-        env ${preload:+LD_PRELOAD=$MODULE} ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
+        # All observed configs preload the provider and STOP at the
+        # maps gate: without the preload, trace/metrics miss the
+        # initial burst (attach gap) and the headline rate blends
+        # unobserved + observed calls. Proven by the preload probe
+        # (trace coverage COMPLETE, every timed call observed).
+        env LD_PRELOAD=$MODULE ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
             "$P11PERFTEST" -l "$mod" -s 0 -p 1234 -t "$4" -i "$iters" --skip "$skip" \
             -v "$SPY_VEC" -c "$3" -j -o "$WORK/$1.p11t.json" > "$WORK/$1.p11t.log" 2>&1 &
         P11PID=$!
         WPID=$P11PID
-        case "$2" in
-            inv-pid) maps_gated_stop "$P11PID" "$(basename "$MODULE")" 60 || return 1;;
-            *) kill -STOP "$P11PID" 2>/dev/null || { echo "$1: STOP failed" >&2; return 1; };;
-        esac
+        maps_gated_stop "$P11PID" "$(basename "$MODULE")" 60 || return 1
         case "$2" in
             inv-pid)
                 sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \

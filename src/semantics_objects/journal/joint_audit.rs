@@ -141,9 +141,12 @@ pub(crate) enum QuantumSealProgress {
 /// Diagnostic-only deliver-side telemetry: active-seal delivery
 /// outcomes with progress sums plus entry snapshots that separate
 /// budget starvation (zero at entry) from a stale seal (effects
-/// already exhausted at entry). Counts only; disclosed beside the
-/// stop line while stage timings are requested, never a contract.
-#[derive(Debug, Clone, Copy, Default)]
+/// already exhausted at entry), with the failure-path record
+/// (visits, cleared/progress/retried/stuck, last delivered gap)
+/// and the early/other-arm count. Counts and one frozen label
+/// only; disclosed beside the stop line while stage timings are
+/// requested, never a contract.
+#[derive(Debug, Clone, Copy)]
 pub(crate) struct DeliverDiagnosis {
     pub(crate) complete: u64,
     pub(crate) yielded: u64,
@@ -152,9 +155,72 @@ pub(crate) struct DeliverDiagnosis {
     pub(crate) disposed: u64,
     pub(crate) entry_zero: u64,
     pub(crate) entry_exhausted: u64,
+    pub(crate) f_visits: u64,
+    pub(crate) f_cleared: u64,
+    pub(crate) f_progress: u64,
+    pub(crate) f_retried: u64,
+    pub(crate) f_stuck: u64,
+    pub(crate) f_last_gap: &'static str,
+    pub(crate) d_other: u64,
+}
+
+impl Default for DeliverDiagnosis {
+    fn default() -> Self {
+        Self {
+            complete: 0,
+            yielded: 0,
+            held: 0,
+            replayed: 0,
+            disposed: 0,
+            entry_zero: 0,
+            entry_exhausted: 0,
+            f_visits: 0,
+            f_cleared: 0,
+            f_progress: 0,
+            f_retried: 0,
+            f_stuck: 0,
+            f_last_gap: "none",
+            d_other: 0,
+        }
+    }
 }
 
 impl DeliverDiagnosis {
+    /// One failure-path visit delivering this gap.
+    pub(crate) fn note_failure_visit(&mut self, gap: JournalGap) {
+        self.f_visits = self.f_visits.saturating_add(1);
+        self.f_last_gap = gap.label();
+    }
+
+    /// The visit cleared the active (negative delivered, degraded,
+    /// or fell back).
+    pub(crate) fn note_failure_cleared(&mut self) {
+        self.f_cleared = self.f_cleared.saturating_add(1);
+    }
+
+    /// The visit advanced a pending visit without clearing the active.
+    pub(crate) fn note_failure_progress(&mut self) {
+        self.f_progress = self.f_progress.saturating_add(1);
+    }
+
+    /// The visit refunded its spend for a same-span retry.
+    pub(crate) fn note_failure_retried(&mut self) {
+        self.f_retried = self.f_retried.saturating_add(1);
+    }
+
+    /// The visit kept the active with no advance (held, yielded, or
+    /// a completeness hold that did not qualify).
+    pub(crate) fn note_failure_stuck(&mut self) {
+        self.f_stuck = self.f_stuck.saturating_add(1);
+    }
+
+    /// A deliver visit that reached neither the positive arm nor the
+    /// failure path (early returns, disposed-negative service, or a
+    /// pending-H3 visit charge).
+    pub(crate) fn note_other(&mut self) {
+        self.d_other = self.d_other.saturating_add(1);
+    }
+
     pub(crate) fn record(
         &mut self,
         outcome: &crate::semantics_key_use::SealBatchProgress,
@@ -194,6 +260,15 @@ impl DeliverDiagnosis {
         self.disposed = self.disposed.saturating_add(other.disposed);
         self.entry_zero = self.entry_zero.saturating_add(other.entry_zero);
         self.entry_exhausted = self.entry_exhausted.saturating_add(other.entry_exhausted);
+        self.f_visits = self.f_visits.saturating_add(other.f_visits);
+        self.f_cleared = self.f_cleared.saturating_add(other.f_cleared);
+        self.f_progress = self.f_progress.saturating_add(other.f_progress);
+        self.f_retried = self.f_retried.saturating_add(other.f_retried);
+        self.f_stuck = self.f_stuck.saturating_add(other.f_stuck);
+        if other.f_visits != 0 {
+            self.f_last_gap = other.f_last_gap;
+        }
+        self.d_other = self.d_other.saturating_add(other.d_other);
     }
 }
 
@@ -1705,9 +1780,11 @@ impl IngestedJointQuantum {
             return Err(RawQuantumRefusal::DispositionMismatch);
         }
         if self.pending == 0 {
+            diagnosis.note_other();
             return Ok(self.progress());
         }
         if self.cursor == self.consumers.len() {
+            diagnosis.note_other();
             return Ok(QuantumSealProgress::LocalPending);
         }
         let index = self
@@ -1760,10 +1837,12 @@ impl IngestedJointQuantum {
         ) else {
             if matches!(self.ingress, FrameIngress::Disposed(_)) && self.failure.is_none() {
                 if *remaining == 0 {
+                    diagnosis.note_other();
                     return Ok(QuantumSealProgress::DeliveryReady);
                 }
                 let (registry, owner, _, _) = ports.read();
                 if registry.joint_staged_count(&target) != Some(0) {
+                    diagnosis.note_other();
                     return Ok(QuantumSealProgress::LocalPending);
                 }
                 let state = if owner
@@ -1780,6 +1859,7 @@ impl IngestedJointQuantum {
                 };
                 *remaining -= 1;
                 self.advance_consumer(state);
+                diagnosis.note_other();
                 return Ok(self.progress());
             }
             // A truthful pending audit has no positive work to perform at an
@@ -1795,10 +1875,13 @@ impl IngestedJointQuantum {
             {
                 *remaining -= 1;
                 self.advance_pending_visit();
+                diagnosis.note_other();
                 return Ok(QuantumSealProgress::DeliveryReady);
             }
+            diagnosis.note_other();
             return Ok(QuantumSealProgress::LocalPending);
         };
+        diagnosis.note_failure_visit(audited.failure().gap);
         let fallback = audited.disposition() == SealFailureDisposition::Fallback
             && ports.read().0.joint_history_mode(&target) == Some(FeedMode::Joint)
             && matches!(
@@ -1846,6 +1929,7 @@ impl IngestedJointQuantum {
                 }
                 self.active = None;
                 self.advance_consumer(ConsumerState::LossDelivered);
+                diagnosis.note_failure_cleared();
                 Ok(self.progress())
             }
             FailureBatchProgress::Complete(
@@ -1856,6 +1940,7 @@ impl IngestedJointQuantum {
                 }
                 self.active = None;
                 self.advance_consumer(ConsumerState::LossDelivered);
+                diagnosis.note_failure_cleared();
                 Ok(self.progress())
             }
             FailureBatchProgress::Complete(FailureApplyOutcome::Retried) => {
@@ -1865,6 +1950,7 @@ impl IngestedJointQuantum {
                 // same spans: no progress, so the running Audited bound
                 // can end a seal that only ever retries.
                 *remaining = before;
+                diagnosis.note_failure_retried();
                 Ok(QuantumSealProgress::LocalPending)
             }
             FailureBatchProgress::Complete(FailureApplyOutcome::HeldForCompleteness) => {
@@ -1881,17 +1967,26 @@ impl IngestedJointQuantum {
                     // later affected consumers their original spans too.
                     *remaining -= 1;
                     self.advance_pending_visit();
+                    diagnosis.note_failure_progress();
                     Ok(QuantumSealProgress::DeliveryReady)
                 } else {
+                    diagnosis.note_failure_stuck();
                     Ok(QuantumSealProgress::LocalPending)
                 }
             }
-            FailureBatchProgress::Held => Ok(QuantumSealProgress::LocalPending),
-            #[cfg(test)]
-            FailureBatchProgress::Complete(FailureApplyOutcome::Ignored) => {
+            FailureBatchProgress::Held => {
+                diagnosis.note_failure_stuck();
                 Ok(QuantumSealProgress::LocalPending)
             }
-            FailureBatchProgress::Yielded => Ok(QuantumSealProgress::DeliveryReady),
+            #[cfg(test)]
+            FailureBatchProgress::Complete(FailureApplyOutcome::Ignored) => {
+                diagnosis.note_failure_stuck();
+                Ok(QuantumSealProgress::LocalPending)
+            }
+            FailureBatchProgress::Yielded => {
+                diagnosis.note_failure_stuck();
+                Ok(QuantumSealProgress::DeliveryReady)
+            }
         }
     }
 

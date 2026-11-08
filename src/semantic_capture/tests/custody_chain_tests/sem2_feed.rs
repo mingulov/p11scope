@@ -250,17 +250,45 @@ fn admitted_mints_line_format_is_exact() {
 #[test]
 fn joint_seals_line_format_is_exact() {
     assert_eq!(
-        joint_seals_line(0, 0, 0, 0, 0, 0, "none", 0, 0, 0, 0, 0, 0, 0),
+        joint_seals_line(
+            0, 0, 0, 0, 0, 0, "none", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, "none", 0
+        ),
         "p11scope: joint seals: attempts=0 local_pending=0 await_future_input=0 \
          delivery_ready=0 complete=0 refused=0 last_refusal=none \
          d_complete=0 d_yielded=0 d_held=0 d_replayed=0 d_disposed=0 \
-         d_entry_zero=0 d_entry_exhausted=0"
+         d_entry_zero=0 d_entry_exhausted=0 \
+         f_visits=0 f_cleared=0 f_progress=0 f_retried=0 f_stuck=0 \
+         f_last_gap=none d_other=0"
     );
     assert_eq!(
-        joint_seals_line(12, 3, 7, 1, 1, 2, "Capacity", 4, 5, 6, 70, 8, 9, 10),
+        joint_seals_line(
+            12,
+            3,
+            7,
+            1,
+            1,
+            2,
+            "Capacity",
+            4,
+            5,
+            6,
+            70,
+            8,
+            9,
+            10,
+            11,
+            12,
+            13,
+            14,
+            15,
+            "h3_pending",
+            16
+        ),
         "p11scope: joint seals: attempts=12 local_pending=3 await_future_input=7 \
          delivery_ready=1 complete=1 refused=2 last_refusal=Capacity \
          d_complete=4 d_yielded=5 d_held=6 d_replayed=70 d_disposed=8 \
-         d_entry_zero=9 d_entry_exhausted=10"
+         d_entry_zero=9 d_entry_exhausted=10 \
+         f_visits=11 f_cleared=12 f_progress=13 f_retried=14 f_stuck=15 \
+         f_last_gap=h3_pending d_other=16"
     );
 }

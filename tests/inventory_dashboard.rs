@@ -521,6 +521,89 @@ fn dashboard_keeps_its_stderr_lines_in_a_file_and_on_the_terminal() {
     }
 }
 
+/// The startup stdio save must not bypass the dashboard's stderr
+/// capture: the non-root `script` reproduction — `inventory --system
+/// --capture scan --dashboard` on a terminal, where a capability note
+/// is written while the capture runs. It must be captured and replayed
+/// after the restore — never drawn on the alternate screen. Needs a
+/// caller with at least one unreadable process (any non-root user on a
+/// normal host or CI runner), so the note fires at all.
+#[test]
+fn dashboard_capture_holds_diagnostics_written_while_it_runs() {
+    let dir = private_dir();
+    let typescript = dir.path().join("typescript");
+    let binary = env!("CARGO_BIN_EXE_p11scope");
+    // `script` owns the terminal: the observer's stdout and stderr both
+    // land on the pty slave, and the typescript records the session.
+    let command = format!("{binary} inventory --system --capture scan --dashboard --duration 4s");
+    let status = Command::new("script")
+        .args(["-qec", &command])
+        .arg(&typescript)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("script runs the dashboard session");
+    let _ = status;
+    let output = std::fs::read(&typescript).expect("script wrote the typescript");
+    let text = String::from_utf8_lossy(&output);
+    let enter = b"\x1b[?1049h";
+    let leave = b"\x1b[?1049l";
+    let entered = output
+        .windows(enter.len())
+        .position(|bytes| bytes == enter)
+        .expect("the dashboard took the alternate screen");
+    let left = output
+        .windows(leave.len())
+        .rposition(|bytes| bytes == leave)
+        .expect("the dashboard restored the screen");
+    assert!(entered < left, "screen restore follows the takeover");
+    // The trigger fired at all: without it the screen check is vacuous.
+    assert!(
+        text.contains("p11scope: needs"),
+        "a capability note fired during the run: {}",
+        text.chars().take(3000).collect::<String>()
+    );
+    // Nothing reached the screen: the note stayed in the capture.
+    let screen = &output[entered..left];
+    assert!(
+        !screen
+            .windows(b"p11scope: needs".len())
+            .any(|bytes| bytes == b"p11scope: needs"),
+        "no capability note on the alternate screen"
+    );
+    // ... and was replayed after the restore, at least one line.
+    let tail: String = text
+        .chars()
+        .skip(text.chars().count().saturating_sub(1500))
+        .collect();
+    assert!(
+        text.contains("stderr while the dashboard ran ("),
+        "captured lines replayed after the restore: {tail}"
+    );
+    let needle = b"lines replayed";
+    let at = output
+        .windows(needle.len())
+        .position(|bytes| bytes == needle)
+        .expect("the stderr account names replayed lines");
+    let digits: Vec<u8> = output[..at]
+        .iter()
+        .rev()
+        .take_while(|byte| byte.is_ascii_digit())
+        .copied()
+        .collect();
+    assert!(!digits.is_empty(), "the account carries a replay count");
+    let replayed: u64 = digits
+        .iter()
+        .rev()
+        .map(|digit| (digit - b'0') as u64)
+        .fold(0, |count, digit| count * 10 + digit);
+    assert!(
+        replayed >= 1,
+        "at least one line replayed, got {replayed}: {tail}"
+    );
+}
+
 /// C5.3 review L1: Ctrl-S (raw mode keeps IXON) then `q` sheds the
 /// restore; once the report is written the restore is tried again, so
 /// after Ctrl-Q the shell is not left in the alternate screen.

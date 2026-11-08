@@ -1418,6 +1418,77 @@ fn pty_a_captured_stderr_is_replayed_on_the_real_stderr_at_the_restore() {
     assert!(stderr.text().ends_with("after the restore\n"));
 }
 
+/// The save-then-capture twin: the observer saves its stdio descriptions
+/// at startup, then the dashboard captures a terminal stderr. A
+/// diagnostic written while the capture runs must land in the capture —
+/// never bypass it through the saved copy. The child owns fd 2 (a fresh
+/// `OnceLock`, a pty stderr), so only it may run this.
+const STDIO_CAPTURE_CHILD: &str = "P11SCOPE_DASHBOARD_STDIO_CHILD";
+const STDIO_CAPTURE_LINE: &str = "dashboard-stdio-twin marker";
+
+fn stdio_capture_child() {
+    if std::env::var(STDIO_CAPTURE_CHILD).is_err() {
+        return;
+    }
+    let mut pty = Pty::open();
+    // SAFETY: `dup2` of our own pty slave onto fd 2.
+    assert_eq!(unsafe { libc::dup2(pty.slave.as_raw_fd(), 2) }, 2);
+    // fd 2 is the terminal, as in production: the save preserves it.
+    let mut stat: libc::stat = unsafe { std::mem::zeroed() };
+    assert_eq!(unsafe { libc::fstat(2, &raw mut stat) }, 0);
+    assert_eq!(stat.st_mode & libc::S_IFMT, libc::S_IFCHR);
+    crate::sink::preserve_stdio_private_descriptions();
+    let capture = StderrCapture::begin(2).expect("capture begins on the pty stderr");
+    crate::sink::try_stderr_line(STDIO_CAPTURE_LINE).expect("diagnostic writes");
+    let end = capture.finish(Duration::from_secs(5));
+    println!(
+        "captured while the save was active: {:?} (drained={})",
+        end.lines, end.drained
+    );
+    assert!(
+        end.lines.iter().any(|line| line == STDIO_CAPTURE_LINE),
+        "the capture must hold the diagnostic, not bypass it to the saved pty: {:?}",
+        end.lines
+    );
+    // And the bypass target — the pty itself — must not have seen it.
+    let leaked = drain(&mut pty, Duration::from_millis(100));
+    assert!(
+        !leaked
+            .windows(STDIO_CAPTURE_LINE.len())
+            .any(|bytes| bytes == STDIO_CAPTURE_LINE.as_bytes()),
+        "the diagnostic bypassed the capture to the pty: {:?}",
+        String::from_utf8_lossy(&leaked)
+    );
+    println!("STDIO_CAPTURE_OK");
+    std::process::exit(0);
+}
+
+#[test]
+fn pty_a_saved_stdio_copy_does_not_bypass_the_stderr_capture() {
+    stdio_capture_child();
+    let module = module_path!().split_once("::").unwrap().1;
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            &format!(
+                "{module}::pty_a_saved_stdio_copy_does_not_bypass_the_stderr_capture"
+            ),
+            "--nocapture",
+        ])
+        .env(STDIO_CAPTURE_CHILD, "1")
+        .stdout(std::process::Stdio::piped())
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "the capture must hold the diagnostic: {output:?}"
+    );
+    assert!(
+        String::from_utf8_lossy(&output.stdout).contains("STDIO_CAPTURE_OK"),
+        "the child never confirmed the capture: {output:?}"
+    );
+}
+
 /// Review M1 (F8): a panic under the dashboard writes its message into the
 /// capture; the unwind restores the screen and replays it.
 #[test]

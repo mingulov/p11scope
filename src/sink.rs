@@ -1273,6 +1273,66 @@ mod tests {
                 Ok(_) => panic!("unpreserved stdout must use the reopen"),
                 Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EACCES)),
             },
+            "retarget" => {
+                preserve_stdio_private_descriptions();
+                // A fresh pipe takes over fd 1, the way the dashboard's
+                // capture pipe takes over fd 2: the fd still names a
+                // FIFO, but a different file than the saved one.
+                let mut ends = [0; 2];
+                assert_eq!(
+                    unsafe { libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC) },
+                    0,
+                    "pipe2 failed: {}",
+                    io::Error::last_os_error()
+                );
+                // SAFETY: both ends are fresh descriptors owned here.
+                let (read, write) = unsafe {
+                    (
+                        std::fs::File::from_raw_fd(ends[0]),
+                        std::fs::File::from_raw_fd(ends[1]),
+                    )
+                };
+                // SAFETY: `dup2` of our own pipe end onto fd 1.
+                assert_eq!(unsafe { libc::dup2(write.as_raw_fd(), 1) }, 1);
+                drop(write);
+                let mut transport =
+                    stdout_transport_on_fd(1).expect("retargeted stdout must open");
+                transport.write_all(PRESERVED_LINE).unwrap();
+                transport.flush().unwrap();
+                drop(transport);
+                // fd 1 still holds the new pipe's write end, so the read
+                // end never sees EOF: poll it nonblocking instead.
+                // SAFETY: flag change on our own pipe end.
+                let flags = unsafe { libc::fcntl(read.as_raw_fd(), libc::F_GETFL) };
+                assert!(
+                    unsafe {
+                        libc::fcntl(read.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK)
+                    } >= 0,
+                    "O_NONBLOCK failed: {}",
+                    io::Error::last_os_error()
+                );
+                let mut got = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut read = read;
+                loop {
+                    match read.read(&mut chunk) {
+                        Ok(0) => break,
+                        Ok(read) => got.extend_from_slice(&chunk[..read]),
+                        Err(error)
+                            if error.kind() == io::ErrorKind::WouldBlock =>
+                        {
+                            break
+                        }
+                        Err(error) => panic!("new pipe read failed: {error}"),
+                    }
+                }
+                assert!(
+                    got.windows(PRESERVED_LINE.len())
+                        .any(|bytes| bytes == PRESERVED_LINE),
+                    "the transport must write the retargeted fd 1, not the saved \
+                     description: new pipe held {got:?}",
+                );
+            }
             other => panic!("unknown preserve child mode {other:?}"),
         }
         std::process::exit(0);
@@ -1301,6 +1361,35 @@ mod tests {
                 .windows(PRESERVED_LINE.len())
                 .any(|bytes| bytes == PRESERVED_LINE),
             "preserved stdout never delivered the line: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    /// A retargeted stdio fd must not use the saved description: after
+    /// the save, a fresh pipe takes over fd 1 (the dashboard's capture
+    /// takes over fd 2 the same way), and the transport must write the
+    /// new pipe — never the startup file. The child asserts the line
+    /// reached the new pipe; the parent asserts it never reached the
+    /// saved one (the child's original stdout).
+    #[test]
+    fn retargeted_stdout_ignores_the_preserved_description() {
+        preserve_child();
+        let output = preserve_command(
+            "retargeted_stdout_ignores_the_preserved_description",
+            "retarget",
+        )
+        .output()
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "retargeted stdout must write the new pipe: {output:?}"
+        );
+        assert!(
+            !output
+                .stdout
+                .windows(PRESERVED_LINE.len())
+                .any(|bytes| bytes == PRESERVED_LINE),
+            "retargeted stdout must not write the saved description: {:?}",
             String::from_utf8_lossy(&output.stdout)
         );
     }

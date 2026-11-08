@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: GPL-3.0-or-later
 # witness-cli-vng.sh TESTBIN OUTDIR KERNEL — run the P2-8 witness CLI
 # cells as root inside one virtme-ng guest booted on KERNEL (a mainline
-# tag such as v6.6.157) via scripts/ci/run-witness-cli.sh, and judge the
+# tag such as v6.6.157, or a release candidate such as v7.4-rc1) via
+# scripts/ci/run-witness-cli.sh, and judge the
 # rows exactly like the host leg (exit 0 plus six qualified rows).
 #
 # The guest shares the host rootfs read-only and hides /tmp and /var/tmp,
@@ -37,7 +38,7 @@ set -u
 TESTBIN=$(realpath -e -- "$1") || exit 2
 OUT=$2
 KERNEL=$3
-case "$KERNEL" in v[0-9]*.[0-9]*.[0-9]*) ;; *)
+case "$KERNEL" in v[0-9]*.[0-9]*.[0-9]*|v[0-9]*.[0-9]*-rc[0-9]*) ;; *)
     echo "witness-cli-vng.sh: use an explicit stock kernel release: $KERNEL" >&2; exit 2;;
 esac
 command -v vng >/dev/null || { echo "witness-cli-vng.sh: vng not on PATH" >&2; exit 77; }
@@ -51,6 +52,9 @@ fi
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 2
 RUNNER="$HERE/run-witness-cli.sh"
 [ -x "$RUNNER" ] || { echo "witness-cli-vng.sh: cell runner missing: $RUNNER" >&2; exit 2; }
+# Guest release match, shared with the BPF load drivers.
+[ -f "$HERE/../bpf-guest-release.sh" ] || { echo "release match not found: $HERE/../bpf-guest-release.sh" >&2; exit 2; }
+. "$HERE/../bpf-guest-release.sh"
 umask 022; mkdir -p "$OUT" && chmod 755 "$OUT"; OUT=$(realpath -e -- "$OUT") || exit 2
 # Stage the booted kernel's config for the guest LTO gate: the vng cache
 # holds exactly one config per kernel tag.
@@ -111,15 +115,12 @@ if [ ! -f "$OUT/uname.txt" ]; then
     exit 2
 fi
 release=$(cat "$OUT/uname.txt")
-case "$release" in
-    "${KERNEL#v}"|"${KERNEL#v}-"*)
-        echo "# guest release $release (expected $KERNEL)"
-        ;;
-    *)
-        echo "witness-cli-vng.sh: guest booted $release, expected $KERNEL" >&2
-        exit 2
-        ;;
-esac
+if release_ok "$KERNEL" "$release"; then
+    echo "# guest release $release (expected $KERNEL)"
+else
+    echo "witness-cli-vng.sh: guest booted $release, expected $KERNEL" >&2
+    exit 2
+fi
 case "$witness_exit" in
     0|1) ;;
     *)

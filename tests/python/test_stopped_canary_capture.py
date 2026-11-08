@@ -1405,6 +1405,23 @@ class RetainedRingDiagnosticTests(unittest.TestCase):
                 self.assertEqual(self.sanitized_ring(error), [
                     f'retained-rings: ring=EVENTS refusal=discard continuity={expected}'])
 
+    def test_continuity_accepts_owned_discovery_size(self):
+        """The continuity diagnostic stays available on owned lanes.
+
+        Owned lanes load DISCOVERY at the shared-scope size; the
+        diagnostic must bind those maps instead of degrading to
+        'unknown', which would drop map facts from EVENTS-discard
+        refusal annotations on owned lanes.
+        """
+        maps, ordinary = self.continuity_fixture()
+        next(row for row in maps if row['name'] == 'DISCOVERY')['max_entries'] = \
+            capture.OWNED_DISCOVERY_MAX_ENTRIES
+        self.assertEqual(capture.continuity_map_category(
+            maps, ordinary, variant='default', privacy='allowlisted',
+            workload_origin='owned'), 'map-facts-present')
+        self.assertEqual(capture.continuity_map_category(
+            maps, ordinary, variant='default', privacy='allowlisted'), 'unknown')
+
     def test_continuity_context_cannot_override_ring_scope_or_spoof_fields(self):
         maps, ordinary = self.continuity_fixture()
         for name, category in (('EVENTS', 'healthy'), ('DISCOVERY', 'healthy'),
@@ -2084,6 +2101,58 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError,
                                     'map definition mismatch name=CONFIG'):
             capture.validate_inventory(maps, 'default', 'aggregate-only')
+
+    def test_owned_inventory_expects_shared_scope_discovery_size(self):
+        """Owned (`run`-tree) lanes load DISCOVERY at the shared-scope size.
+
+        Since the run-tree cgroup scope, `run` captures in Scope::Cgroup
+        and discovery_ring_bytes (src/attach.rs) sizes DISCOVERY at
+        SHARED_SCOPE_DISCOVERY_BYTES (2 MiB) there instead of the 64 KiB
+        Pid-scope size. The pinned ELF policy still declares 64 KiB; the
+        live comparison expects exactly the loader's 2 MiB report on
+        owned lanes. Any other size, any other field drift, or any other
+        map's drift still fails, external lanes still require 64 KiB,
+        and an unknown origin fails closed.
+        """
+        owned_discovery = 2_097_152
+
+        def owned_inventory():
+            maps = self.live_inventory()
+            next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = owned_discovery
+            return maps
+
+        self.assertEqual(capture.definitions.SAFE_MAPS['DISCOVERY']['max_entries'], 65_536)
+        self.assertEqual(capture.OWNED_DISCOVERY_MAX_ENTRIES, owned_discovery)
+        capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'owned')
+        capture.validate_inventory(owned_inventory(), 'default', 'allowlisted', 'owned')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=DISCOVERY'):
+            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=DISCOVERY'):
+            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'external')
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=DISCOVERY'):
+            capture.validate_inventory(self.live_inventory(), 'default', 'aggregate-only', 'owned')
+        for size in (1, 65_536, 65_537, 4_194_304):
+            with self.subTest(size=size):
+                maps = owned_inventory()
+                next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = size
+                with self.assertRaisesRegex(capture.CaptureError,
+                                            'map definition mismatch name=DISCOVERY'):
+                    capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
+        maps = owned_inventory()
+        next(item for item in maps if item['name'] == 'DISCOVERY')['bytes_value'] = 8
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=DISCOVERY'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
+        maps = owned_inventory()
+        next(item for item in maps if item['name'] == 'CONFIG')['max_entries'] = 1
+        with self.assertRaisesRegex(capture.CaptureError,
+                                    'map definition mismatch name=CONFIG'):
+            capture.validate_inventory(maps, 'default', 'aggregate-only', 'owned')
+        with self.assertRaisesRegex(capture.CaptureError, 'unknown workload origin'):
+            capture.validate_inventory(owned_inventory(), 'default', 'aggregate-only', 'cgroup')
 
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.

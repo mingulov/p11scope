@@ -7955,6 +7955,128 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn launcher_chain_four_real_plus_init_stops_cleanly() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1, 1);
+        source.exec(1, 1, "/sbin/init");
+        // Four real ancestors with init directly above the fourth: the
+        // fifth link is a boundary, not a truncated ancestor.
+        for pid in 302..=305 {
+            source.spawn(pid, pid as u64);
+            source.set_ppid(pid, pid - 1);
+        }
+        source.set_ppid(302, 1);
+        source.spawn(300, 390);
+        source.set_ppid(300, 305);
+        let id = adapter.admit(300, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(
+            record
+                .launched_by
+                .iter()
+                .map(|ancestor| ancestor.pid)
+                .collect::<Vec<_>>(),
+            vec![305, 304, 303, 302]
+        );
+        assert!(
+            record.launcher_gap.is_none(),
+            "init above the fourth ancestor ends the walk, never truncates it: {:?}",
+            record.launcher_gap
+        );
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_four_real_plus_user_manager_stops_cleanly() {
+        let (source, mut adapter) = adapter();
+        source.spawn(1500, 9);
+        source.exec(1500, 150, "/usr/lib/systemd/systemd");
+        source.set_cgroup(
+            1500,
+            "0::/user.slice/user-1000.slice/user@1000.service/init.scope\n",
+        );
+        for pid in 302..=305 {
+            source.spawn(pid, pid as u64);
+            source.set_ppid(pid, pid - 1);
+        }
+        source.set_ppid(302, 1500);
+        source.spawn(300, 390);
+        source.set_ppid(300, 305);
+        let id = adapter.admit(300, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(
+            record
+                .launched_by
+                .iter()
+                .map(|ancestor| ancestor.pid)
+                .collect::<Vec<_>>(),
+            vec![305, 304, 303, 302]
+        );
+        assert!(
+            record.launcher_gap.is_none(),
+            "the user manager above the fourth ancestor ends the walk: {:?}",
+            record.launcher_gap
+        );
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_four_real_plus_container_init_stops_cleanly() {
+        let (source, mut adapter) = adapter();
+        source.spawn(5000, 40);
+        source.exec(5000, 500, "/sbin/tini");
+        source.set_container_init(5000, true);
+        for pid in 302..=305 {
+            source.spawn(pid, pid as u64);
+            source.set_ppid(pid, pid - 1);
+        }
+        source.set_ppid(302, 5000);
+        source.spawn(300, 390);
+        source.set_ppid(300, 305);
+        let id = adapter.admit(300, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert_eq!(
+            record
+                .launched_by
+                .iter()
+                .map(|ancestor| ancestor.pid)
+                .collect::<Vec<_>>(),
+            vec![305, 304, 303, 302]
+        );
+        assert!(
+            record.launcher_gap.is_none(),
+            "a container init above the fourth ancestor ends the walk: {:?}",
+            record.launcher_gap
+        );
+        assert_eq!(record.launched_by_origin.label(), "chain");
+    }
+
+    #[test]
+    fn launcher_chain_ppid_zero_is_an_init_parent() {
+        let (source, mut adapter) = adapter();
+        // No parent in this pid namespace: a boundary, never an empty chain.
+        source.spawn(200, 22);
+        source.set_cgroup(200, "0::/system.slice/backup.service\n");
+        let id = adapter.admit(200, AUTHORITY, 10).unwrap();
+        let record = adapter.record(id).unwrap();
+        assert!(
+            record.launched_by.is_empty(),
+            "no parent in this namespace means no launcher links"
+        );
+        assert!(record.launcher_gap.is_none());
+        assert_eq!(record.launched_by_origin.label(), "init_parent");
+        assert_eq!(record.launched_by_unit.as_deref(), Some("backup.service"));
+        // Without a unit, init_parent still claims neither launch nor reparent.
+        source.spawn(201, 23);
+        let id2 = adapter.admit(201, AUTHORITY, 11).unwrap();
+        let record2 = adapter.record(id2).unwrap();
+        assert!(record2.launched_by.is_empty());
+        assert!(record2.launcher_gap.is_none());
+        assert_eq!(record2.launched_by_origin.label(), "init_parent");
+        assert!(record2.launched_by_unit.is_none());
+    }
+
+    #[test]
     fn launcher_chain_reports_an_init_only_parent_with_its_unit() {
         let (source, mut adapter) = adapter();
         source.spawn(1, 1);

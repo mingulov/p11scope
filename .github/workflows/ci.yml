@@ -1409,6 +1409,7 @@ jobs:
           tar -xzf "$tools/kubeconform.tar.gz" -C "$tools" kubeconform
           chmod 755 "$tools/kubeconform"
       - run: '"$RUNNER_TEMP/release-tools/hadolint" deploy/Dockerfile.observer'
+      - run: '"$RUNNER_TEMP/release-tools/hadolint" deploy/Dockerfile.observer-release'
       - run: '"$RUNNER_TEMP/release-tools/hadolint" deploy/Dockerfile.holder'
       # The full receipt, logs and capture stay in ephemeral runner storage.
       # Only selected public outputs below are uploaded as artifacts.

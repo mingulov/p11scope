@@ -1,78 +1,96 @@
 name: container-publish
 on:
-  push:
-    tags:
-      - 'v*'
+  release:
+    types: [published]
   workflow_dispatch:
 permissions:
   contents: read
-env:
-  CI_TOOL_BPF_LINKER: 0.10.4
+concurrency:
+  group: container-publish
+  cancel-in-progress: false
 jobs:
-  # Rebuild the observer image from the tag bytes: the FULL musl binary is
-  # built from this commit with the pinned release toolchain (the same recipe
-  # the privileged container-image cell qualifies), staged with the entry
-  # script and license texts, and built with --network=none after pulling the
-  # Dockerfile-pinned base by digest. The smoke runs the image with the
-  # documented minimal flags (--version, doctor, a short inventory --system
-  # with SoftHSM on the runner). Nothing here pushes: the push job owns the
-  # registry write, final-tag-gated. Every v* tag of this repository builds
-  # and smokes, so release candidates validate without publishing.
+  # Publish the observer image from the release assets: the musl tarball,
+  # SHA256SUMS and RELEASE.json for the tag are downloaded, the checksum
+  # is verified and the RELEASE head is asserted against GITHUB_SHA, then
+  # the reconciled release Dockerfile builds with --network=none after
+  # pulling its pinned base by digest. The smoke runs the image with the
+  # documented measured flags (--version with a tag match, doctor, a short
+  # inventory --system with SoftHSM on the runner) and the permanent cell
+  # proves capture on the built bytes. Nothing here pushes: the push job
+  # owns the registry write, final-tag-gated. Every v* tag of this
+  # repository builds and smokes, so release candidates validate (including
+  # the login) without publishing.
   build:
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'mingulov/p11scope' }}
+    if: ${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'mingulov/p11scope' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-26.04
-    timeout-minutes: 45
+    timeout-minutes: 75
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
-      - run: rustup toolchain install "$(cat .release-rust-version)" --profile minimal --component rustfmt,clippy
-      - run: rustup toolchain install nightly-2026-05-20 --profile minimal --component rust-src
-      - run: rustup target add --toolchain "$(cat .release-rust-version)" x86_64-unknown-linux-musl
-      - run: cargo +"$(cat .release-rust-version)" install bpf-linker --version "$CI_TOOL_BPF_LINKER" --locked
-      - run: sudo apt-get update && sudo apt-get install -y clang-18 file gcc jq llvm musl-tools python3 softhsm2
-      - name: Reconstruct pinned dependency sources
-        run: python3 -I scripts/prepare-dependencies.py
-      - run: cargo +"$(cat .release-rust-version)" fetch --locked --manifest-path Cargo.toml
-      - run: cargo +nightly-2026-05-20 fetch --locked --manifest-path crates/ebpf/Cargo.toml
-      - name: Prove the default build environment
+      - name: Verify the publish checkout
         shell: bash
         run: |
-          if env | grep -E '^(P11SCOPE_SMALL_|P11SCOPE_JOURNAL=|P11SCOPE_JOURNAL_PROOF=|P11SCOPE_BIRTH_MARKER=|RUSTFLAGS=|CARGO_ENCODED_RUSTFLAGS=)'; then
-            echo "refusing: size-override or flavor environment is set" >&2
-            exit 1
-          fi
-      - name: Build the FULL musl observer from the tag bytes
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "$GITHUB_SHA"
+          test -z "$(git status --porcelain=v1 --untracked-files=all)"
+      - run: sudo apt-get update && sudo apt-get install -y file gcc python3 softhsm2
+      - name: Download and verify the release assets
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           umask 022
-          export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc
-          cargo +"$(cat .release-rust-version)" build --locked --offline --release \
-            --target x86_64-unknown-linux-musl --bin p11scope
-          bin=target/x86_64-unknown-linux-musl/release/p11scope
-          test -f "$bin" && test -x "$bin" && test ! -L "$bin"
-          file -b "$bin" | grep -q "static-pie linked"
-          sha256sum "$bin" | tee "$RUNNER_TEMP/built-observer.sha256"
+          tag="$GITHUB_REF_NAME"
+          assets="$RUNNER_TEMP/release-assets"
+          mkdir -p "$assets"
+          gh release download "$tag" --repo "mingulov/p11scope" --dir "$assets" --clobber
+          cd "$assets"
+          sha256sum --check SHA256SUMS
+          python3 -I - RELEASE.json "$GITHUB_SHA" <<'PY'
+          import json
+          import sys
+          release = json.loads(open(sys.argv[1], encoding="utf-8").read())
+          assert release.get("head") == sys.argv[2], "RELEASE head must equal GITHUB_SHA"
+          print(f"RELEASE head ok: {sys.argv[2][:12]}")
+          PY
+          set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
+          test "$#" -eq 1
+          test -f "$1"
+          tarball="$1"
+          tarball_sha256=$(awk -v want="$tarball" '$2 == want {print $1}' SHA256SUMS)
+          test -n "$tarball_sha256"
+          printf '%s  %s\n' "$tarball_sha256" "$tarball" | sha256sum --check
+          echo "$tarball" >"$RUNNER_TEMP/observer-tarball-name.txt"
+          echo "$tarball_sha256" >"$RUNNER_TEMP/observer-tarball-sha256.txt"
           ctx="$RUNNER_TEMP/container-publish-ctx"
-          mkdir -p "$ctx/target/x86_64-unknown-linux-musl/release" "$ctx/scripts"
-          cp "$bin" "$ctx/target/x86_64-unknown-linux-musl/release/p11scope"
+          mkdir -p "$ctx/scripts"
+          cp "$assets/$tarball" "$ctx/"
           cp "$GITHUB_WORKSPACE/scripts/k8s-profile-entry.sh" "$ctx/scripts/"
-          cp "$GITHUB_WORKSPACE/LICENSE" "$ctx/"
-          cp -r "$GITHUB_WORKSPACE/LICENSES" "$ctx/"
+          latest=$(git -C "$GITHUB_WORKSPACE" tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ "$tag" = "$latest" ]; then
+            echo "true" >"$RUNNER_TEMP/is-latest.txt"
+          else
+            echo "false" >"$RUNNER_TEMP/is-latest.txt"
+          fi
+          echo "tag $tag (latest stable: ${latest:-none}, is-latest: $(cat "$RUNNER_TEMP/is-latest.txt"))"
       - name: Build the observer image with no network
         shell: bash
         run: |
           set -euo pipefail
           umask 022
-          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer)
+          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
           test -n "$base"
           test "$(printf '%s\n' "$base" | wc -l)" -eq 1
           case "$base" in *@sha256:*) ;; *) echo "base is not digest-pinned: $base" >&2; exit 1 ;; esac
           docker pull "$base"
-          docker build --network=none -f deploy/Dockerfile.observer \
+          tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
+          tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
+          docker build --network=none -f deploy/Dockerfile.observer-release \
+            --build-arg "TARBALL=$tarball" --build-arg "TARBALL_SHA256=$tarball_sha256" \
             -t p11scope-observer:preview "$RUNNER_TEMP/container-publish-ctx"
           docker inspect --format '{{.Id}}' p11scope-observer:preview \
             | tee "$RUNNER_TEMP/image-id.txt"
@@ -87,7 +105,11 @@ jobs:
           printf 'directories.tokendir = %s/container-publish-tokens\nobjectstore.backend = file\nlog.level = ERROR\n' \
             "$RUNNER_TEMP" >"$SOFTHSM2_CONF"
           softhsm2-util --init-token --free --label smoke --so-pin 5678 --pin 1234
-          docker run --rm p11scope-observer:preview --version
+          v="${GITHUB_REF_NAME#v}"
+          expected="p11scope ${v%%-*}"
+          actual=$(docker run --rm p11scope-observer:preview --version | head -n 1)
+          test "$actual" = "$expected"
+          echo "version ok: $actual"
           flags=(--pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH)
           if [ -r /sys/module/apparmor/parameters/enabled ] \
             && grep -q Y /sys/module/apparmor/parameters/enabled 2>/dev/null; then
@@ -115,6 +137,17 @@ jobs:
           assert scanned and max(scanned) > 0, "the smoke must scan host processes"
           print(f"smoke ok: schema p11scope/inventory/v1, scanned {max(scanned)}")
           PY
+      - name: Prove capture on the built bytes
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          bash scripts/matrix/verify-container-image.sh --image p11scope-observer:preview \
+            --out "$RUNNER_TEMP/cell"
+          test -s "$RUNNER_TEMP/cell/results.jsonl"
+          python3 -I scripts/ci/check-cell-results.py "$RUNNER_TEMP/cell/results.jsonl" \
+            --require host-exact --require container-exact \
+            --require refusal-pidns --require refusal-cap
       - name: Save the image for the push job
         shell: bash
         run: |
@@ -124,7 +157,7 @@ jobs:
           mkdir -p "$out"
           docker save p11scope-observer:preview -o "$out/observer.tar"
           cp "$RUNNER_TEMP/image-id.txt" "$out/image-id.txt"
-          cp "$RUNNER_TEMP/built-observer.sha256" "$out/built-observer.sha256"
+          cp "$RUNNER_TEMP/is-latest.txt" "$out/is-latest.txt"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: container-publish-tarball
@@ -135,37 +168,42 @@ jobs:
   # re-identified by image ID after loading, published to
   # ghcr.io/mingulov/p11scope only when this run was triggered on a final
   # release tag (vX.Y.Z, this repository). Prerelease tags (vX.Y.Z-...)
-  # build and smoke but skip the push; any other v* tag fails closed.
-  # packages: write is scoped to this job; the top level stays read-only.
+  # load, check the image ID and prove the login, then stop without
+  # tagging or pushing; any other v* tag fails closed. The version tag is
+  # refused when it already exists (a re-push would overwrite it with
+  # different bytes); :latest publishes only when the tag is the newest
+  # stable. packages: write is scoped to this job; the top level stays
+  # read-only and this job checks out nothing.
   push:
     needs: build
-    if: ${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'mingulov/p11scope' }}
+    if: ${{ github.ref_type == 'tag' && startsWith(github.ref, 'refs/tags/v') && github.repository == 'mingulov/p11scope' && (github.event_name == 'release' || github.event_name == 'workflow_dispatch') }}
     runs-on: ubuntu-26.04
     timeout-minutes: 15
     permissions:
-      contents: read
       packages: write
     steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ github.sha }}
-          fetch-depth: 0
-          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           name: container-publish-tarball
           path: ./publish-in
       - name: Push the exact built image on the release tag
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REGISTRY_USER: ${{ github.actor }}
         shell: bash
         run: |
           set -euo pipefail
           umask 022
           cd publish-in
-          test -f observer.tar && test -f image-id.txt
+          test -f observer.tar && test -f image-id.txt && test -f is-latest.txt
           grep -Eq '^sha256:[0-9a-f]{64}$' image-id.txt
+          docker load -i observer.tar
+          loaded=$(docker inspect --format '{{.Id}}' p11scope-observer:preview)
+          test "$loaded" = "$(cat image-id.txt)"
           if [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
             echo "final release tag $GITHUB_REF_NAME: publishing"
           elif [[ "$GITHUB_REF_NAME" =~ ^v[0-9]+\.[0-9]+\.[0-9]+- ]]; then
+            printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
             echo "prerelease tag $GITHUB_REF_NAME: build and smoke only, not publishing"
             {
               echo "image: (not published: prerelease $GITHUB_REF_NAME)"
@@ -181,32 +219,49 @@ jobs:
             echo "refusing: tag $GITHUB_REF_NAME is not a version tag" >&2
             exit 1
           fi
-          docker load -i observer.tar
-          loaded=$(docker inspect --format '{{.Id}}' p11scope-observer:preview)
-          test "$loaded" = "$(cat image-id.txt)"
           tag="${GITHUB_REF_NAME#v}"
           version_dest="ghcr.io/mingulov/p11scope:$tag"
           latest_dest="ghcr.io/mingulov/p11scope:latest"
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io -u "$REGISTRY_USER" --password-stdin
+          if docker buildx imagetools inspect "$version_dest" >existing-inspect.txt 2>&1; then
+            existing=$(grep -o 'sha256:[0-9a-f]\{64\}' existing-inspect.txt | head -1)
+            echo "refusing: $version_dest already exists (${existing:-unknown digest})" >&2
+            exit 1
+          fi
           docker tag p11scope-observer:preview "$version_dest"
-          docker tag p11scope-observer:preview "$latest_dest"
-          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-          docker push "$version_dest" | tee push-version.log
-          docker push "$latest_dest" | tee push-latest.log
-          version_digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' push-version.log | tail -1)
-          latest_digest=$(sed -n 's/.*digest: \(sha256:[0-9a-f]\{64\}\).*/\1/p' push-latest.log | tail -1)
+          docker push "$version_dest"
+          version_digest=$(docker buildx imagetools inspect --format '{{.Manifest.digest}}' "$version_dest")
           test -n "$version_digest"
-          test "$version_digest" = "$latest_digest"
-          {
-            echo "image: $version_dest"
-            echo "image: $latest_dest"
-            echo "digest: $version_digest"
-            echo "source: $GITHUB_SHA"
-          } | tee receipt.txt
-          {
-            echo "## container-publish"
-            echo ""
-            echo "published \`$version_dest\` and \`$latest_dest\` \`$version_digest\` from \`$GITHUB_SHA\`."
-          } >>"$GITHUB_STEP_SUMMARY"
+          if [ "$(cat is-latest.txt)" = "true" ]; then
+            docker tag p11scope-observer:preview "$latest_dest"
+            docker push "$latest_dest"
+            latest_digest=$(docker buildx imagetools inspect --format '{{.Manifest.digest}}' "$latest_dest")
+            test -n "$latest_digest"
+            test "$version_digest" = "$latest_digest"
+            {
+              echo "image: $version_dest"
+              echo "image: $latest_dest"
+              echo "digest: $version_digest"
+              echo "source: $GITHUB_SHA"
+            } | tee receipt.txt
+            {
+              echo "## container-publish"
+              echo ""
+              echo "published \`$version_dest\` and \`$latest_dest\` \`$version_digest\` from \`$GITHUB_SHA\`."
+            } >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "not the newest stable: skipping :latest"
+            {
+              echo "image: $version_dest"
+              echo "digest: $version_digest"
+              echo "source: $GITHUB_SHA"
+            } | tee receipt.txt
+            {
+              echo "## container-publish"
+              echo ""
+              echo "published \`$version_dest\` \`$version_digest\` from \`$GITHUB_SHA\` (not newest stable, :latest skipped)."
+            } >>"$GITHUB_STEP_SUMMARY"
+          fi
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: container-publish-receipt

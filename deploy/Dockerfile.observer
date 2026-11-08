@@ -1,28 +1,28 @@
-# p11scope observer image: the released static musl binary plus the
+# p11scope observer image for development: a static musl binary plus the
 # in-cluster entry script, on Alpine. The image runs the observer by
 # default, so one-host use is plain `docker run` with p11scope arguments:
 #   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
 #     --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
-#     ghcr.io/mingulov/p11scope:0.7.0 inventory --system
-# (see deploy/README.md for the minimal flags and what each one is for).
-# The in-cluster entry script stays available by explicit name for
+#     p11scope-observer:dev inventory --system
+# (see deploy/README.md for the measured DaemonSet set and what each grant is
+# for). The in-cluster entry script stays available by explicit name for
 # `kubectl exec` into the DaemonSet pod; the DaemonSet overrides the
 # container command with its idle agent anyway.
+# Published images build from the release tarball with
+# deploy/Dockerfile.observer-release (licenses, notices and RELEASE.json from
+# the verified release bytes); this file is for local and kind builds from a
+# staged binary.
 #
-# Build from a staged minimal context holding exactly the released bytes:
+# Build from a staged minimal context holding the binary and licenses:
 #   OCTX=$(mktemp -d) && mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts"
-#   cp <released-p11scope> "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+#   cp <static-p11scope> "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
 #   cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
 #   cp LICENSE "$OCTX/" && cp -r LICENSES "$OCTX/"
 #   docker build --network=none -f deploy/Dockerfile.observer -t <tag> "$OCTX"
 # (Stage a root COPYRIGHT file the same way once one exists.)
 # Pre-pull the pinned base first; --network=none proves the build takes no
 # network. scripts/kind-e2e.sh stages the same layout from its static
-# binary; package-preview stages the packaged FULL musl binary for its
-# smoke, and container-publish rebuilds the FULL musl binary from the tag
-# bytes for the published image. A locally built binary also builds (the
-# FULL static recipe below), but publish only images built from tagged
-# release bytes:
+# binary. A locally built binary uses the FULL static recipe below:
 #   CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER=musl-gcc \
 #     cargo +"$(cat .release-rust-version)" build --locked --release \
 #     --target x86_64-unknown-linux-musl --bin p11scope
@@ -46,5 +46,7 @@ RUN chmod 0755 /usr/local/bin/k8s-profile-entry \
     && test -f /usr/share/licenses/p11scope/LICENSE \
     && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt \
     && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt
+# The image runs as root: Docker's --cap-add is only effective for uid 0
+# without ambient capabilities.
 ENTRYPOINT ["/usr/local/bin/p11scope"]
 CMD ["--help"]

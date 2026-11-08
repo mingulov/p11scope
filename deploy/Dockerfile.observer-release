@@ -1,21 +1,39 @@
-# p11scope node-observer image from a release tarball: the same Alpine base,
-# entry script and checks as Dockerfile.observer, but the static binary comes
-# from the exact release bytes instead of a local build.
+# p11scope observer image from a release tarball: the exact released static
+# musl bytes plus the in-cluster entry script, on Alpine. The image runs the
+# observer by default, so one-host use is plain `docker run` with p11scope
+# arguments:
+#   docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE \
+#     --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro \
+#     ghcr.io/mingulov/p11scope:0.7.0 inventory --system
+# (see deploy/README.md for the measured DaemonSet set and what each grant is
+# for). The in-cluster entry script stays available by explicit name for
+# `kubectl exec` into the DaemonSet pod; the DaemonSet overrides the
+# container command with its idle agent anyway.
+#
 # Built from a staged minimal context holding the tarball and the entry script:
-#   docker build -f p11scope/deploy/Dockerfile.observer-release \
+#   docker build --network=none -f deploy/Dockerfile.observer-release \
 #     --build-arg TARBALL=p11scope-0.7.0-x86_64-linux-musl.tar.gz \
 #     --build-arg TARBALL_SHA256=<sha256 from SHA256SUMS> \
-#     -t p11scope-observer:1 ctx/
-# (ctx/p11scope-0.7.0-x86_64-linux-musl.tar.gz, ctx/scripts/k8s-profile-entry.sh).
-# scripts/kind-e2e.sh stages exactly this when P11SCOPE_K8S_RELEASE_TARBALL is
-# set, after verifying the tarball against SHA256SUMS, and passes the checked
-# hash as TARBALL_SHA256. The build re-verifies the copied bytes against that
-# hash before unpacking, so a tarball swapped after staging is refused. The
-# tarball must hold exactly one `*/p11scope` regular file (the release
-# layout); anything else is refused. Its RELEASE.json rides along for
-# provenance when present.
+#     -t <tag> "$CTX"
+# (CTX/<tarball>, CTX/scripts/k8s-profile-entry.sh).
+# container-publish downloads the release tarball, SHA256SUMS and RELEASE.json,
+# verifies the checksum and the RELEASE head, and passes the checked hash as
+# TARBALL_SHA256. The build re-verifies the copied bytes against that hash
+# before unpacking, so a tarball swapped after staging is refused. The tarball
+# must hold exactly one `*/p11scope` regular file (the release layout);
+# anything else is refused. LICENSE, LICENSES/, notices/ and RELEASE.json
+# ride along from the same verified bytes for provenance (COPYRIGHT too, once
+# the root file exists).
 # The base tag+digest stay matched with Dockerfile.observer.
+# Base rationale (see deploy/k8s/README.md): static-pie needs no libc, so
+# Alpine's musl is fine; the sh entrypoint keeps distroless out (no shell).
+# No curl/jq: the observer never talks to the Kubernetes API.
+# The base is pinned by digest (multi-arch index of alpine:3.24 as published
+# 2026-10-03); bump tag and digest together. Layer timestamps float, so the
+# image is repeatable, not bit-reproducible; the container-publish push
+# job re-identifies the exact bytes by image ID instead of trusting the tag.
 FROM alpine:3.24@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6
+LABEL org.opencontainers.image.source=https://github.com/mingulov/p11scope
 ARG TARBALL
 ARG TARBALL_SHA256
 COPY ${TARBALL} /tmp/release.tar.gz
@@ -23,16 +41,30 @@ COPY scripts/k8s-profile-entry.sh /usr/local/bin/k8s-profile-entry
 RUN set -eu; \
     [ -n "${TARBALL_SHA256:-}" ] || { echo "TARBALL_SHA256 build arg is required" >&2; exit 1; }; \
     echo "${TARBALL_SHA256}  /tmp/release.tar.gz" | sha256sum -c -; \
-    mkdir -p /tmp/rel /usr/local/share/p11scope; \
+    mkdir -p /tmp/rel /usr/share/licenses/p11scope; \
     if tar -tzf /tmp/release.tar.gz | grep -qE '(^/|(^|/)\.\.(/|$))'; then echo "tarball has unsafe members" >&2; exit 1; fi; \
     tar -xzf /tmp/release.tar.gz -C /tmp/rel; \
     if [ "$(find /tmp/rel -type f -path '*/p11scope' | head -n 2 | grep -c .)" -ne 1 ]; then echo "tarball must hold exactly one p11scope binary" >&2; exit 1; fi; \
     cp "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)" /usr/local/bin/p11scope; \
     chmod 0755 /usr/local/bin/p11scope; \
-    if [ "$(find /tmp/rel -type f -name RELEASE.json | head -n 2 | grep -c .)" -eq 1 ]; then cp "$(find /tmp/rel -type f -name RELEASE.json | head -n 1)" /usr/local/share/p11scope/RELEASE.json; chmod 0644 /usr/local/share/p11scope/RELEASE.json; fi; \
+    RELDIR="$(dirname "$(find /tmp/rel -type f -path '*/p11scope' | head -n 1)")"; \
+    cp "$RELDIR/LICENSE" /usr/share/licenses/p11scope/LICENSE; \
+    mkdir -p /usr/share/licenses/p11scope/LICENSES /usr/share/licenses/p11scope/notices; \
+    cp "$RELDIR/LICENSES/"*.txt /usr/share/licenses/p11scope/LICENSES/; \
+    cp "$RELDIR/notices/"* /usr/share/licenses/p11scope/notices/; \
+    cp "$RELDIR/RELEASE.json" /usr/share/licenses/p11scope/RELEASE.json; \
+    if [ -f "$RELDIR/COPYRIGHT" ]; then cp "$RELDIR/COPYRIGHT" /usr/share/licenses/p11scope/COPYRIGHT; chmod 0644 /usr/share/licenses/p11scope/COPYRIGHT; fi; \
+    chmod 0644 /usr/share/licenses/p11scope/LICENSE /usr/share/licenses/p11scope/RELEASE.json; \
     rm -rf /tmp/rel /tmp/release.tar.gz; \
     chmod 0755 /usr/local/bin/k8s-profile-entry \
     && /usr/local/bin/p11scope --help >/dev/null \
-    && /usr/local/bin/k8s-profile-entry --self-test
-ENTRYPOINT ["/usr/local/bin/k8s-profile-entry"]
+    && /usr/local/bin/k8s-profile-entry --self-test \
+    && test -f /usr/share/licenses/p11scope/LICENSE \
+    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-only.txt \
+    && test -f /usr/share/licenses/p11scope/LICENSES/GPL-2.0-or-later.txt \
+    && test -f /usr/share/licenses/p11scope/notices/NOTICES.md \
+    && test -f /usr/share/licenses/p11scope/RELEASE.json
+# The image runs as root: Docker's --cap-add is only effective for uid 0
+# without ambient capabilities.
+ENTRYPOINT ["/usr/local/bin/p11scope"]
 CMD ["--help"]

@@ -244,18 +244,19 @@ jobs:
             test ! -e /usr/bin/p11scope
             test ! -e /usr/bin/p11scope-discover
           '
-  # The published observer image, built from the packaged FULL musl binary
-  # on this runner: the FULL public package is verified and extracted, the
-  # pinned base is pulled by digest, and the image builds with
-  # --network=none, so no binary is fetched and no dev build can leak in.
-  # The smoke runs the image with the documented minimal flags (--version,
+  # The observer image recipe, qualified here from the packaged FULL musl
+  # tarball: the FULL public package is verified, the observer tarball is
+  # selected and its static-pie shape is checked, then the release
+  # Dockerfile builds with --network=none after the pinned base is pulled
+  # by digest, so no binary is fetched and no dev build can leak in. The
+  # smoke runs the image with the documented measured flags (--version,
   # doctor, a short inventory --system with SoftHSM on the runner). Deep
   # positives (exact counts, attribution, refusals) live in the permanent
   # privileged-tests container-image cell, not here. The image holds the
-  # FULL binary, so this job waits for the whole package matrix: like the
+  # FULL bytes, so this job waits for the whole package matrix: like the
   # release, a P0 failure withholds the image. A p0-only dispatch has no
   # FULL bytes and skips the job instead of building from anything else.
-  # Nothing here pushes: registry publishing lives in the tag-triggered
+  # Nothing here pushes: registry publishing lives in the release-triggered
   # container-publish workflow, so this reusable workflow (called by
   # ordinary push CI) never needs packages:write.
   container-image:
@@ -283,29 +284,39 @@ jobs:
           set -- p11scope-[0-9]*-x86_64-linux-musl.tar.gz
           test "$#" -eq 1
           test -f "$1"
-          tar -xzf "$1"
-          set -- p11scope-[0-9]*-x86_64-linux-musl/p11scope
+          tarball="$1"
+          tarball_sha256=$(awk -v want="$tarball" '$2 == want {print $1}' SHA256SUMS)
+          test -n "$tarball_sha256"
+          printf '%s  %s\n' "$tarball_sha256" "$tarball" | sha256sum --check
+          echo "$tarball" >"$RUNNER_TEMP/observer-tarball-name.txt"
+          echo "$tarball_sha256" >"$RUNNER_TEMP/observer-tarball-sha256.txt"
+          check="$RUNNER_TEMP/tarball-static-check"
+          rm -rf "$check"
+          mkdir -p "$check"
+          tar -xzf "$tarball" -C "$check"
+          set -- "$check"/p11scope-[0-9]*-x86_64-linux-musl/p11scope
           test "$#" -eq 1
           test -f "$1" && test -x "$1" && test ! -L "$1"
           file -b "$1" | grep -q "static-pie linked"
           sha256sum "$1" | tee "$RUNNER_TEMP/packaged-observer.sha256"
           ctx="$RUNNER_TEMP/container-image-ctx"
-          mkdir -p "$ctx/target/x86_64-unknown-linux-musl/release" "$ctx/scripts"
-          cp "$1" "$ctx/target/x86_64-unknown-linux-musl/release/p11scope"
+          mkdir -p "$ctx/scripts"
+          cp "$tarball" "$ctx/"
           cp "$GITHUB_WORKSPACE/scripts/k8s-profile-entry.sh" "$ctx/scripts/"
-          cp "$GITHUB_WORKSPACE/LICENSE" "$ctx/"
-          cp -r "$GITHUB_WORKSPACE/LICENSES" "$ctx/"
       - name: Build the observer image with no network
         shell: bash
         run: |
           set -euo pipefail
           umask 022
-          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer)
+          base=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
           test -n "$base"
           test "$(printf '%s\n' "$base" | wc -l)" -eq 1
           case "$base" in *@sha256:*) ;; *) echo "base is not digest-pinned: $base" >&2; exit 1 ;; esac
           docker pull "$base"
-          docker build --network=none -f deploy/Dockerfile.observer \
+          tarball=$(cat "$RUNNER_TEMP/observer-tarball-name.txt")
+          tarball_sha256=$(cat "$RUNNER_TEMP/observer-tarball-sha256.txt")
+          docker build --network=none -f deploy/Dockerfile.observer-release \
+            --build-arg "TARBALL=$tarball" --build-arg "TARBALL_SHA256=$tarball_sha256" \
             -t p11scope-observer:preview "$RUNNER_TEMP/container-image-ctx"
           docker inspect --format '{{.Id}}' p11scope-observer:preview \
             | tee "$RUNNER_TEMP/image-id.txt"

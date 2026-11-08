@@ -11,11 +11,13 @@
 #
 # Usage:
 #   verify-container-image.sh (--observer-bin ABS|--image NAME) --out DIR
-# --observer-bin stages the musl binary (must be static-pie) plus the entry
-# script into a minimal context and builds with --network=none after pulling
-# the Dockerfile's pinned base (the CI path). --image uses an already-loaded
-# image (the fedora path: the caller delivers the tarball, checks its sha256
-# and loads it). --out collects every log, report and results.jsonl.
+# --observer-bin packs the musl binary (must be static-pie) into a
+# release-layout tarball and builds deploy/Dockerfile.observer-release with
+# --network=none after pulling its pinned base (the CI path, qualifying the
+# exact release recipe with cell-stub notices/RELEASE). --image uses an
+# already-loaded image (the fedora path and the publish smoke: the caller
+# delivers the tarball, checks its sha256 and loads it). --out collects
+# every log, report and results.jsonl.
 #
 # Rows in OUT/results.jsonl (judged with scripts/ci/check-cell-results.py):
 #   host-exact        containerized profile --pid of a host workload: both
@@ -208,20 +210,42 @@ if [ -n "$OBSERVER_BIN" ]; then
         exit 2
     }
     sha256sum "$OBSERVER_BIN" | tee "$OUT/packaged-observer.sha256"
+    # Pack the binary into a release-layout tarball so the cell qualifies
+    # the exact release Dockerfile (verification, extraction, and the
+    # license/notice/RELEASE install). Notices and RELEASE.json are cell
+    # stubs: the packaged preview tarball qualifies the real contents.
+    CELL_PREFIX="p11scope-cell-$RUN_ID"
+    CELL_STAGING="$OUT/cell-tarball-staging"
+    rm -rf "$CELL_STAGING"
+    mkdir -p "$CELL_STAGING/$CELL_PREFIX/notices" "$CELL_STAGING/$CELL_PREFIX/LICENSES"
+    cp "$OBSERVER_BIN" "$CELL_STAGING/$CELL_PREFIX/p11scope"
+    chmod 0755 "$CELL_STAGING/$CELL_PREFIX/p11scope"
+    cp LICENSE "$CELL_STAGING/$CELL_PREFIX/LICENSE"
+    cp LICENSES/*.txt "$CELL_STAGING/$CELL_PREFIX/LICENSES/"
+    printf '# Cell notices stub (the preview tarball qualifies the real notices).\n' \
+        >"$CELL_STAGING/$CELL_PREFIX/notices/NOTICES.md"
+    printf '{"cell_stub": true}\n' >"$CELL_STAGING/$CELL_PREFIX/notices/notices.json"
+    printf '{"cell_stub": true, "binary": "cell-observer"}\n' >"$CELL_STAGING/$CELL_PREFIX/RELEASE.json"
+    if [ -f COPYRIGHT ]; then cp COPYRIGHT "$CELL_STAGING/$CELL_PREFIX/COPYRIGHT"; fi
+    CELL_TARBALL="$OUT/cell-observer.tar.gz"
+    tar -czf "$CELL_TARBALL" -C "$CELL_STAGING" "$CELL_PREFIX"
+    CELL_TARBALL_SHA256=$(sha256sum "$CELL_TARBALL" | cut -d' ' -f1)
+    echo "$CELL_TARBALL_SHA256  $CELL_TARBALL" | tee "$OUT/cell-tarball.sha256"
     OCTX="$OUT/context-observer"
-    mkdir -p "$OCTX/target/x86_64-unknown-linux-musl/release" "$OCTX/scripts"
-    cp "$OBSERVER_BIN" "$OCTX/target/x86_64-unknown-linux-musl/release/p11scope"
+    mkdir -p "$OCTX/scripts"
+    cp "$CELL_TARBALL" "$OCTX/cell-observer.tar.gz"
     cp scripts/k8s-profile-entry.sh "$OCTX/scripts/"
-    cp LICENSE "$OCTX/"
-    cp -r LICENSES "$OCTX/"
-    BASE=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer)
+    BASE=$(sed -n 's/^FROM //p' deploy/Dockerfile.observer-release)
     test -n "$BASE" || { echo "Dockerfile has no FROM line" >&2; exit 2; }
     test "$(printf '%s\n' "$BASE" | wc -l)" -eq 1 || { echo "Dockerfile has no single base" >&2; exit 2; }
     case $BASE in *@sha256:*) ;; *) echo "base is not digest-pinned: $BASE" >&2; exit 2 ;; esac
     timeout --signal=TERM --kill-after=10s 600s docker pull "$BASE" || exit 2
     OBS_IMAGE="p11scope-container-observer:$RUN_ID"
+    TARBALL_SHA256="$CELL_TARBALL_SHA256"
     timeout --signal=TERM --kill-after=10s 600s docker build --network=none -q \
-        -f deploy/Dockerfile.observer -t "$OBS_IMAGE" "$OCTX" >"$OUT/observer-build.log" 2>&1 || {
+        -f deploy/Dockerfile.observer-release --build-arg TARBALL=cell-observer.tar.gz \
+        --build-arg "TARBALL_SHA256=$TARBALL_SHA256" \
+        -t "$OBS_IMAGE" "$OCTX" >"$OUT/observer-build.log" 2>&1 || {
         tail -n 30 "$OUT/observer-build.log" >&2 || true
         exit 2
     }

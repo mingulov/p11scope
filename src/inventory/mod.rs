@@ -5678,6 +5678,18 @@ mod seal_startup_test {
         start: Option<StartVerdict>,
         run: impl FnOnce() -> R,
     ) -> R {
+        with_peek_queue(peeks, prepares, start.into_iter().collect(), run)
+    }
+    /// Queue settle peeks plus several live-start verdicts, consumed
+    /// in order: the failed-peek twin scripts the fall-through's
+    /// journal refusal and ordinary retry behind the final seat. Like
+    /// `with`, leftovers are cleared.
+    pub(super) fn with_peek_queue<R>(
+        peeks: Vec<PeekScript>,
+        prepares: Vec<Preparation>,
+        starts: Vec<StartVerdict>,
+        run: impl FnOnce() -> R,
+    ) -> R {
         struct RestorePeek;
         impl Drop for RestorePeek {
             fn drop(&mut self) {
@@ -5686,7 +5698,7 @@ mod seal_startup_test {
         }
         PEEK.with(|queued| queued.borrow_mut().extend(peeks));
         let _restore = RestorePeek;
-        with_start_queue(prepares, start.into_iter().collect(), run)
+        with_start_queue(prepares, starts, run)
     }
 }
 
@@ -26372,6 +26384,77 @@ mod seal_readiness_tests {
         assert!(
             gaps_for_subject(&mut *driver.coordinator, "scan seal settled").is_empty(),
             "an unchanged set discloses no settle"
+        );
+    }
+
+    /// A failed peek falls through to the ordinary start and keeps
+    /// change memory: A, a mint failure whose start refuses, then B
+    /// seats over B and still discloses the settle the seal outlasted.
+    #[test]
+    fn deferred_scan_seal_failed_peek_falls_through_and_keeps_change_memory() {
+        use super::promotion_driver_tests::{driver_with_display, headless_display};
+        use crate::discovery::identity::PinnedObjectId;
+        use std::collections::BTreeSet;
+        take_sealed_for_test();
+        let mut coordinator = coordinator();
+        let headless = headless_display();
+        let mut driver = driver_with_display(&mut coordinator, headless.display);
+        driver.scan_seal_pending = true;
+        let scope = InspectScope::Pid(std::process::id());
+        let one: BTreeSet<PinnedObjectId> = BTreeSet::from([PinnedObjectId(0)]);
+        let two: BTreeSet<PinnedObjectId> =
+            BTreeSet::from([PinnedObjectId(0), PinnedObjectId(1)]);
+        let mut peeks = vec![Some(one), None];
+        peeks.extend(std::iter::repeat_n(
+            Some(two),
+            super::SCAN_SEAL_STABLE_PEEKS as usize,
+        ));
+        let attempts = peeks.len();
+        let mut prepares = refused_attempt_preparations();
+        prepares.extend([some_preparation(), some_preparation()]);
+        seal_startup_test::with_peek_queue(
+            peeks,
+            prepares,
+            vec![
+                Err(SemanticRefusal::Unavailable),
+                Err(SemanticRefusal::Unavailable),
+                Ok(joint_lane(WindDownIo::completing(), false)),
+            ],
+            || {
+                driver.attempt_deferred_scan_seal(scope);
+                assert!(driver.semantic.is_none(), "attempt 1 still settles");
+                assert!(driver.scan_seal_pending, "attempt 1 keeps pending");
+                driver.attempt_deferred_scan_seal(scope);
+                assert!(
+                    driver.semantic.is_none(),
+                    "a refused fall-through never seats"
+                );
+                assert!(
+                    driver.scan_seal_pending,
+                    "a refused fall-through keeps pending"
+                );
+                assert!(
+                    take_sealed_for_test().is_empty(),
+                    "a refused fall-through notes no seal line"
+                );
+                for n in 3..attempts {
+                    driver.attempt_deferred_scan_seal(scope);
+                    assert!(driver.semantic.is_none(), "attempt {n} still settles");
+                    assert!(driver.scan_seal_pending, "attempt {n} keeps pending");
+                }
+                driver.attempt_deferred_scan_seal(scope);
+            },
+        );
+        assert!(
+            driver.semantic.as_ref().is_some_and(|lane| lane.is_live()),
+            "the post-failure set seats"
+        );
+        assert!(!driver.scan_seal_pending, "a seated lane clears the flag");
+        let settled = gaps_for_subject(&mut *driver.coordinator, "scan seal settled");
+        assert_eq!(
+            settled.len(),
+            1,
+            "the outlasted change discloses its settle: {settled:?}"
         );
     }
 

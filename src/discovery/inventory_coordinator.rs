@@ -29705,7 +29705,8 @@ int main(void) {
     }
 
     /// Concise ambiguity: two teacher spellings for one pair keep
-    /// a shown path with an `(ambiguous, 2 candidates)` marker; the
+    /// the executable name first with an `(ambiguous: <path>,
+    /// <path>)` marker listing the candidates' full paths; the
     /// count headline still counts one caller, and JSON keeps the
     /// path with the additive ambiguity keys. The hardlinked pair
     /// shares its mapped identity like snapshot clones share
@@ -29734,11 +29735,14 @@ int main(void) {
         native.execs(vec![exec_record(41, 9, 100, dev, ino)]);
         native.witness(vec![native.row(41, 1, 9, 210, 0)]);
         let (text, document) = slice_one_views(&native);
-        let line =
-            "unidentified executables: tool-a (ambiguous, 2 candidates) (1 call, host pid 9)";
+        let line = format!(
+            "unidentified executables: tool-a (ambiguous: {}, {}) (1 call, host pid 9)",
+            first.display(),
+            second.display()
+        );
         assert!(
             text.lines().any(|candidate| candidate == line),
-            "concise marks the collision beside its shown path:\n{text}"
+            "concise keeps the name first with the candidates' full paths:\n{text}"
         );
         let headline = "unidentified callers: at least 1 call from 1 caller process never identified (exited or never scanned); host pids 9 (not running now or never scanned)";
         assert!(

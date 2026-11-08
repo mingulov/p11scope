@@ -6,8 +6,8 @@
 
 use super::*;
 use crate::discovery::caller_registry::{
-    AdmissionState, CallerId, CoverageNote, ImageAuthority, ModuleInfo, ModuleKey, RegistryGap,
-    RegistryLimits, UnknownReason, UseCoverage,
+    AdmissionState, CallerId, CoverageNote, ExeResolution, ImageAuthority, ModuleInfo, ModuleKey,
+    RegistryGap, RegistryLimits, UnboundExe, UnboundPid, UnknownReason, UseCoverage,
 };
 use crate::discovery::inventory_workload::{Harness, ScaleSpec};
 use crate::inventory::{render_json, render_text};
@@ -4119,5 +4119,95 @@ fn concise_never_sampled_historical_counts_unknown() {
         out.lines()
             .any(|line| line == "caller context: 1 unknown (-v for details)"),
         "never-sampled historical counts unknown: {out}"
+    );
+}
+
+fn ambiguous_exe(shown: &str, candidates: &[&str]) -> UnboundExe {
+    UnboundExe {
+        dev: 35,
+        ino: 99,
+        path: Some(shown.to_string()),
+        resolution: ExeResolution::ScanLearned,
+        identity_candidates: candidates.iter().map(|path| path.to_string()).collect(),
+    }
+}
+
+fn unbound_image(pid_host: u32, first_call_ns: u64, calls: u64, exe: UnboundExe) -> UnboundPid {
+    UnboundPid {
+        pid_host,
+        first_call_ns,
+        calls_at_least: calls,
+        exe,
+    }
+}
+
+/// The executable name stays visible first: the concise marker
+/// lists the candidates' full paths beside the kept name, and
+/// counts never change.
+#[test]
+fn concise_ambiguous_marker_lists_candidate_paths_beside_the_name() {
+    let exe = ambiguous_exe("/snap/a/tool", &["/snap/a/tool", "/snap/b/tool"]);
+    let line =
+        render_unidentified_executables(&[unbound_image(9, 210, 1, exe)], 0).expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool) (1 call, host pid 9)"
+    );
+}
+
+/// Past two candidates the concise marker keeps the first two
+/// (sorted) and counts the rest; the name still leads.
+#[test]
+fn concise_ambiguous_marker_counts_candidates_past_two() {
+    let exe = ambiguous_exe(
+        "/snap/a/tool",
+        &[
+            "/snap/a/tool",
+            "/snap/b/tool",
+            "/snap/c/tool",
+            "/snap/d/tool",
+        ],
+    );
+    let line =
+        render_unidentified_executables(&[unbound_image(9, 210, 3, exe)], 0).expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool (+2 more)) (3 calls, host pid 9)"
+    );
+}
+
+/// Control characters in candidate paths escape exactly like the
+/// group name; the marker never leaks a raw control.
+#[test]
+fn concise_ambiguous_marker_escapes_controls_in_candidates() {
+    let exe = ambiguous_exe("/snap/a/tool", &["/snap/a/tool", "/snap/b\x01tool"]);
+    let line =
+        render_unidentified_executables(&[unbound_image(9, 210, 1, exe)], 0).expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b\\u{1}tool) (1 call, host pid 9)"
+    );
+}
+
+/// Members that disagree keep the richest candidate list beside
+/// the shared name; folded counts still read exactly.
+#[test]
+fn concise_ambiguous_marker_uses_richest_member_when_members_disagree() {
+    let thin = ambiguous_exe("/snap/a/tool", &["/snap/a/tool", "/snap/b/tool"]);
+    let rich = ambiguous_exe(
+        "/snap/a/tool",
+        &["/snap/a/tool", "/snap/b/tool", "/snap/c/tool"],
+    );
+    let line = render_unidentified_executables(
+        &[
+            unbound_image(9, 210, 1, thin),
+            unbound_image(10, 220, 2, rich),
+        ],
+        0,
+    )
+    .expect("one group");
+    assert_eq!(
+        line,
+        "unidentified executables: tool (ambiguous: /snap/a/tool, /snap/b/tool (+1 more)) (3 calls, host pids 9, 10)"
     );
 }

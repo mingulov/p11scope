@@ -1826,7 +1826,7 @@ class IgnoredTestsTests(unittest.TestCase):
             "ALTERNATIVE_TESTS=2",
             "LONG_TESTS=17",
             "BTRFS_TESTS=17",
-            "OVERLAY_TESTS=11",
+            "OVERLAY_TESTS=14",
             "EXPECTED_FAILURE_TESTS=3",
             "SKIP_TESTS=37",
             "COUNTER_FIXTURE_TESTS=27",

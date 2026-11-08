@@ -17507,6 +17507,66 @@ mod tests {
         );
     }
 
+    /// 7.10b widening wins (controller ruling): an owned `run` accepts
+    /// `--track-short-lived` and arms the PID target-exec consumer for its
+    /// direct child via `engine.arm_extensive(..., Some(pid))` (pinned by
+    /// `owned_run_under_cgroup_scope_arms_pid_consumer_for_direct_child`);
+    /// the old pre-fork "records nothing beside run" refusal is gone. With
+    /// a runnable command the flag reaches host admission: a refusing host
+    /// is consulted and its refusal surfaces, never the flag message.
+    #[test]
+    fn owned_run_track_short_lived_reaches_host_admission() {
+        use crate::attach::{MultiHostRefusal, MultiHostStage};
+        let mut args = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+        args.track_short_lived = true;
+        let probes = std::cell::Cell::new(0);
+        let refusal =
+            MultiHostRefusal::for_test(MultiHostStage::ProgramLoad, Some(libc::EACCES));
+        let host = || {
+            probes.set(probes.get() + 1);
+            Err(refusal)
+        };
+        let error = run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &host)
+            .err()
+            .unwrap();
+        assert_eq!(
+            error.downcast_ref::<MultiHostRefusal>(),
+            Some(&refusal),
+            "{error:#}"
+        );
+        assert_eq!(probes.get(), 1);
+    }
+
+    /// 7.10b widening keeps the documented counter-mode refusal: beside
+    /// `--counter-mode` the flag is refused by name at policy selection,
+    /// before anything is forked or the host is consulted.
+    #[test]
+    fn owned_run_track_short_lived_refuses_beside_counter_mode_before_fork() {
+        use p11scope_ebpf_common::CounterMode;
+        for mode in [
+            CounterMode::Counts,
+            CounterMode::Timestamps,
+            CounterMode::Latency,
+        ] {
+            let mut args = run_args(cli::PausePolicy::Never, &["/bin/true"]);
+            args.metrics = true;
+            args.counter_mode = Some(mode);
+            args.track_short_lived = true;
+            let error =
+                run_owned_inner_with_host(&args, Arc::new(SignalState::new()), &|| {
+                    panic!("host admission must not run for a refused flag combination")
+                })
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains(&format!(
+                    "--track-short-lived cannot be combined with --counter-mode {}",
+                    mode.name()
+                )),
+                "{mode:?}: {error:#}"
+            );
+        }
+    }
+
     #[test]
     fn counter_capture_and_run_require_host_after_build_policy_validation() {
         use crate::attach::{MultiHostRefusal, MultiHostStage};

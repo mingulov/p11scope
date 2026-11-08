@@ -53,7 +53,7 @@
 #   PASS_TIMEOUT_S=180 POST_PID_S=3 POST_SYS_S=20 (post-burst binding hold)
 #   Spy part: P11PERFTEST (required), P11_LD_PATH (its LD_LIBRARY_PATH),
 #   SPY_SO (default probed), SPY_COV="rand ecdsa rsa aes", SPY_VEC=64,
-#   SPY_ITERS="rand:30000 ecdsa:3000 rsa:400 aes:15000",
+#   SPY_ITERS="rand:100000 ecdsa:3000 rsa:400 aes:15000",
 #   SPY_THREADS_BASE="1 2 4" (+nproc), TOOL_N=50,
 #   SPY_CONDITIONS="plain inv-pid metrics trace spy-file spy-null tool"
 #   PARTS="percall ramp ceiling" THREADS="1 2 4 8" RAMP_SECS=10
@@ -87,7 +87,7 @@ want_spy() {
 }
 SPY_THREADS_BASE=${SPY_THREADS_BASE:-"1 2 4"}
 SPY_COV=${SPY_COV:-"rand ecdsa rsa aes"}
-SPY_ITERS=${SPY_ITERS:-"rand:30000 ecdsa:3000 rsa:400 aes:15000"}
+SPY_ITERS=${SPY_ITERS:-"rand:100000 ecdsa:3000 rsa:400 aes:15000"}
 SPY_VEC=${SPY_VEC:-64}
 P11_LD_PATH=${P11_LD_PATH:-}
 probe_spy() {
@@ -1678,7 +1678,14 @@ sample_spy() {
         spy-file)
             spyinfo=$(python3 -I "$WORK/validate.py" spycount "$WORK/$1.spy.log") \
                 || { echo "$1: spy log invalid" >&2; return 1; }
-            notes="$notes :: spy $spyinfo"
+            spybytes=$(wc -c < "$WORK/$1.spy.log")
+            if [ "$spybytes" -gt 52428800 ]; then
+                spylines=$(wc -l < "$WORK/$1.spy.log")
+                head -c 1048576 "$WORK/$1.spy.log" > "$WORK/$1.spy.log.head"
+                rm -f "$WORK/$1.spy.log"
+                echo "$1: spy log truncated after counting ($spybytes bytes, $spylines lines)"
+            fi
+            notes="$notes :: spy $spyinfo bytes=$spybytes"
             ;;
         inv-pid)
             reclaim_root_output "$WORK/$1.json"
@@ -1735,25 +1742,32 @@ tool_bg() {
             ;;
     esac
 }
-# tool_k <tool>: PKCS#11 calls per tool op, via one STOP-started trace.
+# tool_k <tool>: PKCS#11 calls per tool op, via pkcs11-spy (in-process:
+# no attach race against a ~15ms process; the spy forwards 1:1 so the
+# marker count is the op's exact call count).
 tool_k() {
-    tool_bg "$1" "toolk-$1"
-    TOOLPID=$TOOLOP_PID
-    WPID=$TOOLPID
-    maps_gated_stop "$TOOLPID" "$(basename "$MODULE")" 60 || return 1
-    sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace --manifest "$WORK/manifest-soft.json" \
-        --pid "$TOOLPID" --duration 120 -o "$WORK/toolk-$1.txt" \
-        > "$WORK/toolk-$1.obs.log" 2>&1 &
-    SPID=$!
-    wait_for_observer_attach "$WORK/toolk-$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
-    kill -CONT "$TOOLPID" 2>/dev/null || { echo "toolk-$1: CONT failed" >&2; return 1; }
-    wait_for_pid_exit "$TOOLPID" 120 || return 1
-    if wait "$TOOLPID"; then WPID=; else status=$?; WPID=; echo "toolk-$1: tool failed: $status" >&2; return "$status"; fi
-    stop_observer "toolk-$1" || return 1
-    reclaim_root_output "$WORK/toolk-$1.txt"
-    info=$(python3 -I "$WORK/validate.py" tracetotal "$WORK/toolk-$1.txt") \
-        || { echo "toolk-$1: tracetotal failed" >&2; return 1; }
-    echo "$info" | sed -n 's/raw_calls=\([^ ]*\).*/\1/p'
+    case $1 in
+        pkcs11-tool)
+            PKCS11SPY="$MODULE" PKCS11SPY_OUTPUT="$WORK/toolk-$1.spy.log" \
+            pkcs11-tool --module "$SPY_SO" --login --pin 1234 --sign \
+                --mechanism SHA256-HMAC --label hmackey \
+                --input-file "$WORK/tool-data.bin" --output-file "$WORK/toolk-$1.sig" \
+                > "$WORK/toolk-$1.op.log" 2>&1 \
+            || { echo "toolk-$1: tool via spy failed" >&2; tail -3 "$WORK/toolk-$1.op.log" >&2; return 1; }
+            ;;
+        p11tool)
+            PKCS11SPY="$MODULE" PKCS11SPY_OUTPUT="$WORK/toolk-$1.spy.log" \
+            p11tool --provider "$SPY_SO" --login --set-pin=1234 --test-sign \
+                --hash=SHA256 --outfile="$WORK/toolk-$1.sig" \
+                "pkcs11:token=v070bench;object=rsakey;type=private" < /dev/null \
+                > "$WORK/toolk-$1.op.log" 2>&1 \
+            || { echo "toolk-$1: tool via spy failed" >&2; tail -3 "$WORK/toolk-$1.op.log" >&2; return 1; }
+            ;;
+        *) echo "toolk-$1: unknown tool" >&2; return 1 ;;
+    esac
+    info=$(python3 -I "$WORK/validate.py" spycount "$WORK/toolk-$1.spy.log") \
+        || { echo "toolk-$1: spycount failed" >&2; return 1; }
+    echo "$info" | sed -n 's/calls_total=\([^ ]*\).*/\1/p'
 }
 
 # sample_toolloop <tag> <tool> <mode:unobserved|inv-system>

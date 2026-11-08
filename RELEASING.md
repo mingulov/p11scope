@@ -521,7 +521,6 @@ On the commit that steps 3–6 ran on:
    git push origin main v0.5.0
    ```
 
-<<<<<<< HEAD
 3. Create the GitHub release with every file named in `SHA256SUMS`
    (the four versioned `.tar.gz` assets, the `.deb`, the `.rpm` and
    `RELEASE.json`), plus `SHA256SUMS` itself. Keep the release body short — a human

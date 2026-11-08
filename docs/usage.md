@@ -1431,7 +1431,10 @@ Limits that matter in pods:
   Loki) with no file mount. The stdout stream is never rotated (the
   rotation options are refused beside `-`), `--json` and `--dashboard`
   are refused beside it as fellow stdout owners, and
-  the text summary moves to stderr. A stdout that stops reading or is
+  the text summary moves to stderr. The move uses stdout's own rule
+  (five seconds without progress fails it with exit 1, counting
+  accepted bytes), so a large summary arrives whole or fails
+  explicitly. A stdout that stops reading or is
   closed never stalls capture: each commit batch waits bounded, then sheds lines
   with counters reported on stderr, in `totals`/`ended`, and the exit
   status, while capture continues to its normal stop. A line that

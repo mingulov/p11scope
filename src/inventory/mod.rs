@@ -7356,7 +7356,9 @@ pub(crate) fn finish_output(
     }
     // `--event-log -` owns stdout for the event stream: the human
     // document moves to stderr instead, verbatim, so stdout stays
-    // pure JSONL (a stopped stderr may shed it, like any diagnostic).
+    // pure JSONL. The move uses stdout's own rule (give up only
+    // after 5 s without progress, counting accepted bytes); a failed
+    // or partial move fails the command like a stdout failure.
     // `--json` beside `-` is refused before the run; a programmatic
     // caller that still combines them gets the document on stderr
     // too, never interleaved onto the stream.
@@ -7369,8 +7371,16 @@ pub(crate) fn finish_output(
             text = render_snapshot(presentation);
             text.as_bytes()
         };
-        if let Ok(moved) = std::str::from_utf8(bytes) {
-            let _ = crate::sink::try_stderr_text(moved);
+        let mut stderr = FdStdout::new(2, &|| 0);
+        if let Err(error) = stderr.write_document(bytes) {
+            let reason = match &error.reason {
+                StdoutFailureReason::NoProgress => "no progress for 5 seconds".to_string(),
+                StdoutFailureReason::Cancelled => "cancelled by a later signal".to_string(),
+                StdoutFailureReason::Io(error) => format!("I/O error: {error}"),
+            };
+            outcome.failures.push(format!(
+                "p11scope: inventory stderr failed: {reason}; accepted {} of {} bytes; remaining {} not written",
+                error.accepted, error.total, error.total - error.accepted));
         }
     }
     if (json || !silent_text) && !stdout_requested {

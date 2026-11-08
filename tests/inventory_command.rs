@@ -1993,10 +1993,7 @@ fn event_log_dash_moves_large_verbose_summary_to_stderr_byte_identical() {
         {
             break pid.parse::<u32>().unwrap();
         }
-        assert!(
-            Instant::now() < deadline,
-            "fixture never became ready"
-        );
+        assert!(Instant::now() < deadline, "fixture never became ready");
         std::thread::sleep(Duration::from_millis(50));
     };
     {
@@ -2042,14 +2039,17 @@ fn event_log_dash_moves_large_verbose_summary_to_stderr_byte_identical() {
         String::from_utf8_lossy(&moved.stderr)
     );
     let body = String::from_utf8(moved.stdout).unwrap();
-    assert!(body.lines().count() >= 3, "started, a pass marker and ended");
+    assert!(
+        body.lines().count() >= 3,
+        "started, a pass marker and ended"
+    );
     let stderr = String::from_utf8(moved.stderr).unwrap();
     let marker = format!("inventory pid:{pid} (");
     let start = stderr
         .find(&marker)
         .expect("the text summary moved to stderr");
     assert_eq!(
-        stderr[start..].as_bytes(),
+        &stderr.as_bytes()[start..],
         plain.stdout.as_slice(),
         "the moved summary is byte-identical to the plain run"
     );
@@ -2100,10 +2100,7 @@ fn event_log_dash_stderr_move_failure_fails_the_command() {
         {
             break pid.parse::<u32>().unwrap();
         }
-        assert!(
-            Instant::now() < deadline,
-            "fixture never became ready"
-        );
+        assert!(Instant::now() < deadline, "fixture never became ready");
         std::thread::sleep(Duration::from_millis(50));
     };
     {

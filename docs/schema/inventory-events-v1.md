@@ -422,10 +422,13 @@ stdout stream is never rotated, and the rotation options are refused
 beside `-`. One complete JSON object per line, flushed per commit
 batch, never interleaved with other stdout text: `--json` and
 `--dashboard` (which also own stdout) are refused beside `-`, and
-the text summary moves to stderr. A stdout that stops reading or is
-closed (EPIPE, slow reader) never stalls capture: each commit batch
-shares one bounded wait, past which lines shed with counters — never
-retried, never silent. Shed lines keep their consumed sequence
+the text summary moves to stderr. The move uses stdout's own rule
+(five seconds without progress fails it with exit 1, counting
+accepted bytes), so a large summary arrives whole or fails
+explicitly. A stdout that stops reading or is closed (EPIPE, slow
+reader) never stalls capture: each commit batch shares one bounded
+wait, past which lines shed with counters — never retried, never
+silent. Shed lines keep their consumed sequence
 numbers, so a slow or closed reader shows as seq gaps accounted by
 `stdout_lost` (in `totals` and the terminal `ended`, plus the stderr
 notices and the nonzero exit), and a shed that leaves a partial line

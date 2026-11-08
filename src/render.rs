@@ -2866,7 +2866,13 @@ pub fn scope_summary_with_verbosity(
             text.push_str("Aggregate across the selected scope; counts are not per application.\n");
         }
         if calls == 0 && fwd_calls == 0 {
-            text.push_str(if ev.completeness == "COMPLETE" {
+            // One coverage statement: counts-complete windows (COMPLETE
+            // or attribution-only PARTIAL) read as a quiet result here,
+            // with the coverage line below carrying the verdict. Only
+            // observation/semantics gaps claim "coverage incomplete".
+            let counts_complete =
+                ev.completeness == "COMPLETE" || ev.verdict_detail == VERDICT_ATTRIBUTION_ONLY;
+            text.push_str(if counts_complete {
                 "No completed calls observed during this window.\n"
             } else {
                 "No completed calls observed; coverage incomplete.\n"

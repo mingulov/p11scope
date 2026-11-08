@@ -576,7 +576,11 @@ report format.
   Calls it forwards are counted at the attached backend providers, named
   with counts on the gap line; calls the layer answered itself, including
   its errors, appear only on the separate forwarding line, and one layer
-  call that reaches several providers counts at each. An operator-named
+  call that reaches several providers counts at each. Single-table
+  forwarding shims (such as `pkcs11-spy`) are corroborated providers, not
+  closure arrays: declare them with `--forwarding-module <path-or-name>`
+  for the same split, else their calls count per layer with a `Possible
+  forwarding` hint when two layers coincide. An operator-named
   layer (`--module <path>`) is the sole exception: it keeps a
   reserve-capped leading-templates prefix, because a remote client's
   tables are handed out before any export probe can observe the return.

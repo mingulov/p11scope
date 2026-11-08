@@ -850,10 +850,13 @@ fn native_semantic_resource_final_types_pinned() {
     // unmatched inputs), +48.
     // B17 leg 2: the staged reload disclosure `Option` adds 40 B inline,
     // 1176 -> 1216.
+    // v0.7.0 `--forwarding-module`: one more inline Vec (unmatched
+    // inputs), +24; operator-bounded (one short string per CLI input),
+    // rendered once beside `unmatched_excludes`.
     pin!(
         crate::inventory_present::Presentation,
         1240 + size_of::<crate::inventory_present::PresentationRenderIndex>()
-            + 3 * size_of::<Vec<u8>>()
+            + 4 * size_of::<Vec<u8>>()
     );
     // Supporting payload: RoutedCall carries one EventRecord.
     pin!(p11scope_ebpf_common::EventRecord, 368);

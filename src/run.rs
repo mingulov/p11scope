@@ -4550,7 +4550,7 @@ fn run_owned_inner_with_host(
         exclude_modules: args.exclude_modules.clone(),
         manifests: args.manifests.clone(),
         prearm_modules: args.prearm_modules.clone(),
-        forwarding_modules: Vec::new(),
+        forwarding_modules: args.forwarding_modules.clone(),
         hooks: args.hooks.clone(),
         scope: ScopeArg::Pid(pid),
         metrics: args.metrics,

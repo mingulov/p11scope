@@ -926,6 +926,24 @@ impl Presentation {
         let (observed_edges, saturated_edges) = registry.counter_census();
         let render_index = PresentationRenderIndex::build(&instances, &semantic_edges);
         let (excluded_modules, unmatched_excludes) = coordinator.excluded_snapshot();
+        let module_keys: Vec<(ModuleId, String, (u64, u64), u64)> = modules
+            .iter()
+            .map(|module| {
+                (
+                    module.id,
+                    module.paths.first().cloned().unwrap_or_default(),
+                    (module.device_major, module.device_minor),
+                    module.inode,
+                )
+            })
+            .collect();
+        let (forwarding_declared, unmatched_forwarding) =
+            crate::render::match_forwarding_inputs(coordinator.forwarding_inputs(), &module_keys);
+        let declared: std::collections::BTreeSet<ModuleId> =
+            forwarding_declared.into_iter().collect();
+        for module in &mut modules {
+            module.operator_forwarding = declared.contains(&module.id);
+        }
         Ok(Self {
             scope_label: scope_label.to_string(),
             started_ns,
@@ -946,7 +964,7 @@ impl Presentation {
             gaps_suppressed: registry.gaps_suppressed(),
             excluded_modules,
             unmatched_excludes,
-            unmatched_forwarding: Vec::new(),
+            unmatched_forwarding,
             semantic_capture: crate::inventory_semantics::SemanticCaptureSummary::default(),
             // No Joint evidence reaches the live registry today
             // (live-loop carry): the projection is honestly
@@ -1801,19 +1819,22 @@ pub(crate) fn render_snapshot_summary(presentation: &Presentation) -> String {
     render_snapshot_inner(presentation, true, crate::cli::TextVerbosity::Quiet)
 }
 
-/// Closure-array (forwarding-layer) module ids, by admission class.
-/// Matches the planner's `closure_array` label and its hyphenated test
-/// spelling. The split set; whether an edge at one splits out is per
-/// caller ([`provider_active_callers`], minus [`refused_backend_callers`]).
-fn closure_module_ids(presentation: &Presentation) -> std::collections::BTreeSet<ModuleId> {
+/// Forwarding-layer module ids: closure arrays by admission class (plus its
+/// hyphenated test spelling) and operator-declared `--forwarding-module`
+/// shims by marker. The split set; whether an edge at one splits out is
+/// per caller ([`provider_active_callers`], minus
+/// [`refused_backend_callers`]). A declared single-table shim splits
+/// exactly like a closure array, and never without the declaration.
+fn forwarding_module_ids(presentation: &Presentation) -> std::collections::BTreeSet<ModuleId> {
     presentation
         .modules
         .iter()
         .filter(|module| {
-            matches!(
-                module.admission_class.as_deref(),
-                Some("closure_array" | "closure-array")
-            )
+            module.operator_forwarding
+                || matches!(
+                    module.admission_class.as_deref(),
+                    Some("closure_array" | "closure-array")
+                )
         })
         .map(|module| module.id)
         .collect()
@@ -1826,12 +1847,12 @@ fn closure_module_ids(presentation: &Presentation) -> std::collections::BTreeSet
 /// observed them.
 fn provider_active_callers(
     presentation: &Presentation,
-    closure: &std::collections::BTreeSet<ModuleId>,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
 ) -> std::collections::BTreeSet<CallerId> {
     presentation
         .edges
         .iter()
-        .filter(|edge| !closure.contains(&edge.module) && edge.entry_count > 0)
+        .filter(|edge| !forwarding.contains(&edge.module) && edge.entry_count > 0)
         .map(|edge| edge.caller)
         .collect()
 }
@@ -1842,7 +1863,7 @@ fn provider_active_callers(
 /// calls — even when the caller also entered an unrelated active provider.
 fn refused_backend_callers(
     presentation: &Presentation,
-    closure: &std::collections::BTreeSet<ModuleId>,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
 ) -> std::collections::BTreeSet<CallerId> {
     use std::collections::{BTreeMap, BTreeSet};
     let admission: BTreeMap<ModuleId, AdmissionState> = presentation
@@ -1854,7 +1875,7 @@ fn refused_backend_callers(
         .edges
         .iter()
         .filter(|edge| {
-            !closure.contains(&edge.module)
+            !forwarding.contains(&edge.module)
                 && admission.get(&edge.module) == Some(&AdmissionState::Refused)
         })
         .map(|edge| edge.caller)
@@ -1867,11 +1888,11 @@ fn refused_backend_callers(
 /// refused backend (which keeps the layer logical).
 fn edge_is_forwarding(
     edge: &EdgeView,
-    closure: &std::collections::BTreeSet<ModuleId>,
+    forwarding: &std::collections::BTreeSet<ModuleId>,
     active: &std::collections::BTreeSet<CallerId>,
     refused: &std::collections::BTreeSet<CallerId>,
 ) -> bool {
-    closure.contains(&edge.module)
+    forwarding.contains(&edge.module)
         && active.contains(&edge.caller)
         && !refused.contains(&edge.caller)
 }
@@ -1883,20 +1904,20 @@ fn edge_is_forwarding(
 /// provider-active callers without a refused backend count here (see
 /// [`provider_active_callers`] and [`refused_backend_callers`]).
 pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(String, u64)> {
-    let closure = closure_module_ids(presentation);
-    let active = provider_active_callers(presentation, &closure);
-    let refused = refused_backend_callers(presentation, &closure);
+    let forwarding = forwarding_module_ids(presentation);
+    let active = provider_active_callers(presentation, &forwarding);
+    let refused = refused_backend_callers(presentation, &forwarding);
     let mut layers: Vec<(String, u64)> = presentation
         .modules
         .iter()
-        .filter(|module| closure.contains(&module.id))
+        .filter(|module| forwarding.contains(&module.id))
         .map(|module| {
             let entries = presentation
                 .edges
                 .iter()
                 .filter(|edge| {
                     edge.module == module.id
-                        && edge_is_forwarding(edge, &closure, &active, &refused)
+                        && edge_is_forwarding(edge, &forwarding, &active, &refused)
                 })
                 .map(|edge| edge.entry_count)
                 .fold(0u64, u64::saturating_add);
@@ -1913,19 +1934,87 @@ pub(crate) fn forwarding_entry_layers(presentation: &Presentation) -> Vec<(Strin
     layers
 }
 
+/// Advisory hint when one caller entered two attached non-layer modules
+/// exactly equally (the undeclared-shim shape — every shim entry
+/// re-observed at the backend). Edges carry no per-function breakdown,
+/// so inventory cannot check containment and requires exact equality of
+/// at least three entries instead. The observer never splits on
+/// coincidence; it names both modules and the `--forwarding-module`
+/// remedy instead. Text-only and count-neutral, like the render-lane
+/// hint. Declared and closure layers never suggest.
+fn forwarding_suggestion(presentation: &Presentation) -> Option<String> {
+    use std::collections::{BTreeMap, BTreeSet};
+    let forwarding = forwarding_module_ids(presentation);
+    let admitted: BTreeSet<ModuleId> = presentation
+        .modules
+        .iter()
+        .filter(|module| {
+            !forwarding.contains(&module.id) && module.admission != AdmissionState::Refused
+        })
+        .map(|module| module.id)
+        .collect();
+    // Per-caller entry totals at admitted non-layer modules.
+    let mut per_caller: BTreeMap<CallerId, BTreeMap<ModuleId, u64>> = BTreeMap::new();
+    for edge in &presentation.edges {
+        if !admitted.contains(&edge.module) || edge.entry_count == 0 {
+            continue;
+        }
+        *per_caller
+            .entry(edge.caller)
+            .or_default()
+            .entry(edge.module)
+            .or_default() += edge.entry_count;
+    }
+    let mut pairs: Vec<(ModuleId, ModuleId)> = Vec::new();
+    for totals in per_caller.values() {
+        let ids: Vec<ModuleId> = totals.keys().copied().collect();
+        for (i, left) in ids.iter().enumerate() {
+            for right in &ids[i + 1..] {
+                if totals[left] >= 3 && totals[left] == totals[right] {
+                    pairs.push((*left, *right));
+                }
+            }
+        }
+    }
+    pairs.sort();
+    pairs.dedup();
+    let (first, second) = *pairs.first()?;
+    let path = |id: ModuleId| {
+        presentation
+            .modules
+            .iter()
+            .find(|module| module.id == id)
+            .and_then(|module| module.paths.first().cloned())
+            .unwrap_or_else(|| id.label())
+    };
+    let mut hint = format!(
+        "Possible forwarding: entries at {} coincide with entries at {}; if one forwards to the other, declare it with --forwarding-module <path-or-name> so entry totals count each application call once.",
+        escape_controls(&path(first)),
+        escape_controls(&path(second))
+    );
+    if pairs.len() > 1 {
+        hint.push_str(&format!(
+            " ({} more module pair{} coincide)",
+            pairs.len() - 1,
+            if pairs.len() == 2 { "" } else { "s" }
+        ));
+    }
+    Some(hint)
+}
+
 /// Logical vs forwarding-layer entry totals over every edge. Provider
 /// edges, plus the layer edges of callers with no entries at any
 /// non-closure module or with a refused backend, are logical;
 /// closure-array edges of provider-active callers without a refused
 /// backend are forwarding observations of those same calls.
 pub(crate) fn layer_entry_totals(presentation: &Presentation) -> (u64, u64) {
-    let closure = closure_module_ids(presentation);
-    let active = provider_active_callers(presentation, &closure);
-    let refused = refused_backend_callers(presentation, &closure);
+    let forwarding = forwarding_module_ids(presentation);
+    let active = provider_active_callers(presentation, &forwarding);
+    let refused = refused_backend_callers(presentation, &forwarding);
     let mut logical = 0u64;
     let mut forwarding_entries = 0u64;
     for edge in &presentation.edges {
-        if edge_is_forwarding(edge, &closure, &active, &refused) {
+        if edge_is_forwarding(edge, &forwarding, &active, &refused) {
             forwarding_entries = forwarding_entries.saturating_add(edge.entry_count);
         } else {
             logical = logical.saturating_add(edge.entry_count);
@@ -2772,6 +2861,9 @@ fn render_snapshot_inner(
             );
         }
     }
+    if let Some(hint) = forwarding_suggestion(presentation) {
+        let _ = writeln!(out, "{hint}");
+    }
     // Verbose keeps one line per edge with internal ids; concise and
     // quiet group per provider (see `render_concise_edges`). Concise
     // adds one scope line per labeled caller when the cgroup metadata
@@ -2796,6 +2888,7 @@ fn render_snapshot_inner(
         &mut out,
         &presentation.excluded_modules,
         &presentation.unmatched_excludes,
+        &presentation.unmatched_forwarding,
     );
     if summary_only {
         return out;
@@ -3035,6 +3128,7 @@ fn render_excluded_lines(
     out: &mut String,
     excluded_modules: &[crate::render::ExcludedOut],
     unmatched_excludes: &[String],
+    unmatched_forwarding: &[String],
 ) {
     use std::fmt::Write as _;
     if !excluded_modules.is_empty() {
@@ -3056,6 +3150,18 @@ fn render_excluded_lines(
             "Unmatched exclusions ({}): {}",
             unmatched_excludes.len(),
             unmatched_excludes
+                .iter()
+                .map(|input| escape_controls(input))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+    if !unmatched_forwarding.is_empty() {
+        let _ = writeln!(
+            out,
+            "Unmatched forwarding declarations ({}): {}",
+            unmatched_forwarding.len(),
+            unmatched_forwarding
                 .iter()
                 .map(|input| escape_controls(input))
                 .collect::<Vec<_>>()

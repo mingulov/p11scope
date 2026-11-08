@@ -1139,6 +1139,10 @@ pub struct CaptureWorkBudget {
     /// encounter. Accumulated across member scans; the caller aggregates by
     /// file identity for process counts after all scans complete.
     excluded: Vec<ExcludedRecord>,
+    /// `--forwarding-module` inputs for this capture (set once before
+    /// scanning). Unlike excludes they filter nothing: evidence assembly
+    /// matches them against mapped files to mark declared layers.
+    forwarding: Vec<PathBuf>,
     /// Explicit `--identity-backend userspace`: the deep-scan witness
     /// stays off (no BPF load) and refused overlay ranges keep a named
     /// reason instead of proving.
@@ -1199,6 +1203,7 @@ impl CaptureWorkBudget {
             scan_stop_reported: false,
             excludes: Vec::new(),
             excluded: Vec::new(),
+            forwarding: Vec::new(),
             explicit_userspace: false,
         }
     }
@@ -1218,6 +1223,15 @@ impl CaptureWorkBudget {
     /// Set the capture's `--exclude-module` inputs before scanning.
     pub(crate) fn set_excludes(&mut self, excludes: Vec<PathBuf>) {
         self.excludes = excludes;
+    }
+
+    /// Set the capture's `--forwarding-module` inputs before scanning.
+    pub(crate) fn set_forwarding(&mut self, forwarding: Vec<PathBuf>) {
+        self.forwarding = forwarding;
+    }
+
+    pub(crate) fn forwarding(&self) -> &[PathBuf] {
+        &self.forwarding
     }
 
     pub(crate) fn excludes(&self) -> &[PathBuf] {

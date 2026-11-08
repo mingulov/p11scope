@@ -1288,7 +1288,7 @@ fn capture_fact_stage_publishes_once_or_rolls_back_whole() {
     );
     engine.capture_facts.rollback_stage();
     engine.capture_facts.apply_to_plan(&mut engine.plan);
-    engine.discovery = engine.capture_facts.discovery(&engine.plan, &[], &[]);
+    engine.discovery = engine.capture_facts.discovery(&engine.plan, &[], &[], &[]);
     assert_eq!(
         engine.discovery.modules.len(),
         1,
@@ -39713,8 +39713,8 @@ fn merge_preflight_success_implies_identical_merge_results() {
     assert_eq!(plan_a.skipped, plan_b.skipped);
     assert_eq!(plan_a.entries_seen, plan_b.entries_seen);
     assert_eq!(
-        format!("{:?}", first.discovery(&plan_a, &[], &[])),
-        format!("{:?}", second.discovery(&plan_b, &[], &[])),
+        format!("{:?}", first.discovery(&plan_a, &[], &[], &[])),
+        format!("{:?}", second.discovery(&plan_b, &[], &[], &[])),
         "merges publish identical discovery"
     );
 }

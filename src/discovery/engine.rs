@@ -2740,9 +2740,10 @@ impl CaptureFacts {
         plan: &plan::AttachPlan,
         excluded: &[crate::discovery::scan::ExcludedRecord],
         excludes: &[std::path::PathBuf],
+        forwarding: &[std::path::PathBuf],
     ) -> render::DiscoveryEvidence {
         let history = self.visible_history();
-        let modules = history
+        let modules: Vec<render::DiscoveredModule> = history
             .modules
             .values()
             .cloned()
@@ -2773,8 +2774,16 @@ impl CaptureFacts {
             .filter(|outcome| corroboration_corroborates(**outcome))
             .count() as u64;
         let (excluded_modules, unmatched_excludes) = render::aggregate_excluded(excluded, excludes);
+        let module_keys: Vec<(plan::ModuleId, String, (u64, u64), u64)> = modules
+            .iter()
+            .map(|module| (module.id, module.path.clone(), module.dev, module.ino))
+            .collect();
+        let (forwarding_declared, unmatched_forwarding) =
+            render::match_forwarding_inputs(forwarding, &module_keys);
         render::DiscoveryEvidence {
             modules,
+            forwarding_declared,
+            unmatched_forwarding,
             conflicts: history.conflicts.saturating_add(derived_conflicts),
             uncorroborated: history
                 .uncorroborated
@@ -6862,6 +6871,9 @@ fn discover_plan(
     discovered.hooks = a.hooks.clone();
     discovered.module_hints = a.modules.clone();
     discovered.budget.set_excludes(a.exclude_modules.clone());
+    discovered
+        .budget
+        .set_forwarding(a.forwarding_modules.clone());
     // P-C phase 2 (§6.2): start the pre-arm witness BEFORE the scope-start
     // stamp, so its hooks precede every observation. No pre-arm modules
     // or an unavailable startup leaves no witness: today's output.
@@ -13665,9 +13677,10 @@ impl Engine {
         // ends: clone the small vecs (excluded files are few).
         let excluded_records = self.budget.excluded().to_vec();
         let excludes = self.budget.excludes().to_vec();
-        self.discovery = self
-            .capture_facts
-            .discovery(&self.plan, &excluded_records, &excludes);
+        let forwarding = self.budget.forwarding().to_vec();
+        self.discovery =
+            self.capture_facts
+                .discovery(&self.plan, &excluded_records, &excludes, &forwarding);
         self.stage_timings.span(
             crate::timing::StageKind::Projection,
             "project_facts",
@@ -29923,6 +29936,19 @@ impl Engine {
         &[std::path::PathBuf],
     ) {
         (self.budget.excluded(), self.budget.excludes())
+    }
+
+    /// Set the capture's `--forwarding-module` inputs on the engine
+    /// budget (inventory path; the capture path sets it in
+    /// `discover_plan`).
+    pub(crate) fn set_forwarding(&mut self, forwarding: Vec<std::path::PathBuf>) {
+        self.budget.set_forwarding(forwarding);
+    }
+
+    /// The capture's `--forwarding-module` inputs for evidence-time
+    /// matching against mapped files.
+    pub(crate) fn forwarding_inputs(&self) -> &[std::path::PathBuf] {
+        self.budget.forwarding()
     }
 
     /// Cancels every pre-arm watch at scope end (packet 6.13, R2-D1-7):

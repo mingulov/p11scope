@@ -2243,6 +2243,20 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         crate::render::aggregate_excluded(records, excludes)
     }
 
+    /// Set the capture's `--forwarding-module` inputs after construction
+    /// (a setter, not a constructor parameter, so the 78 existing
+    /// construction sites keep their shape). Read once at presentation
+    /// build to mark declared layers; unlike excludes it filters nothing.
+    pub(crate) fn set_forwarding(&mut self, forwarding: Vec<std::path::PathBuf>) {
+        self.engine.set_forwarding(forwarding);
+    }
+
+    /// The capture's `--forwarding-module` inputs for evidence-time
+    /// matching against mapped files.
+    pub(crate) fn forwarding_inputs(&self) -> &[std::path::PathBuf] {
+        self.engine.forwarding_inputs()
+    }
+
     /// Fold an inventory-native pass's `--exclude-module` records into
     /// the engine budget, where `excluded_snapshot` reports them. The
     /// collector budgets that record these are per-pass copies; the

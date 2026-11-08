@@ -109,7 +109,7 @@ pub struct CaptureArgs {
     pub prearm_modules: Vec<PathBuf>,
     /// `--forwarding-module` inputs; empty ⇒ no declared layers.
     /// Repeatable. A full path (contains `/`) declares exactly that file
-    /// by identity; a bare name declares every file with that basename.
+    /// by path and inode; a bare name declares every file with that basename.
     /// Declared modules split out of headline totals exactly like a
     /// closure-array forwarding layer under the same gates.
     pub forwarding_modules: Vec<PathBuf>,
@@ -577,7 +577,7 @@ exit codes: 0 ok; 1 the command failed; 2 wrong arguments. run exits with its co
 ";
 /// `p11scope profile --help`: scoped syntax, examples and evidence limits.
 const PROFILE_HELP: &str = "usage:
-  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope profile [--pid <n> | --cgroup <path> | --system] [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--mode profile|metrics] [--counter-mode counts|timestamps|latency] [--select-endpoint <FUNCTION>] [--duration <30|30s|5m|1h>] [-o <out.json>]
                    [--hook-symbol <NAME[:functionlist|interfacelist|interface]>]...
                    [--unsafe-unvalidated-metadata]
@@ -597,6 +597,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+--forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Aggregate across the selected scope; counts are not per application.
@@ -639,6 +640,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+--forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 Trace reports completed call events; PID/TID are diagnostic identifiers.
@@ -684,6 +686,7 @@ notes: discovery scans the target's mapped memory — no manifest and no helper 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
+--forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 scan-only discovery names functions from the standard table without confirming them; aggregate counts/RVs/latency remain available. Scanning continues for the life of the capture, not just at attach.
 Provider identity is pinned by SHA-256 at attach and checked for in-place change during capture.
 run starts CMD itself and captures exactly that command; it takes no --pid/--cgroup/--system.
@@ -752,19 +755,19 @@ exit codes: 0 every requested lane passed; 1 a requested lane is unavailable (--
 
 /// `p11scope inventory --help`: scoped syntax, examples and evidence limits.
 const INVENTORY_HELP_HEAD: &str = "usage:
-  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope inventory --pid <n> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope inventory --cgroup <path> [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--dashboard]
                    [--event-log <f.jsonl> [--event-rotate-bytes <n[K|M]>] [--event-max-files <n>]]
                    [--diagnostics <f.jsonl> [--diagnostics-pid <n>]]
-  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]...
+  p11scope inventory --system [--module <provider.so>]... [--exclude-module <path-or-name>]... [--manifest <m.json>]... [--prearm-module <provider.so>]... [--forwarding-module <path-or-name>]...
                    [--key-operations] [--hook-symbol <…>]... [--duration <…>] [--json] [--quiet] [-v] [-o <out.json>]
                    [--max-scan-pids <n>] [--max-gaps <n>] [--max-endpoints <n>] [--capture auto|scan|native] [--caller-metadata none|cgroup]
                    [--attach-backend auto|multi|singles] [--identity-backend auto|userspace|kernel] [--dashboard]
@@ -786,6 +789,7 @@ Cgroup discovery is bounded and cooperative; --max-scan-pids limits deep scans, 
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
 --manifest is repeatable explicit operator attestation for the optional Detailed subset; requires auto or native.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads through the inventory lane, with one interval row per input; requires auto or native.
+--forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
 --key-operations also tracks which key each operation used (needs --capture auto or native; start the observer before the application for best coverage). Without it you still get per-provider function and mechanism counts.
 Per-key results appear under object_observations in --json and in the key operations: line.
 Inventory separates mapped modules from observed usage entries; entries are not completed calls.
@@ -1108,7 +1112,32 @@ pub fn validate_prearm_excludes(prearm: &[PathBuf], excludes: &[PathBuf]) -> Res
 /// refused — an excluded file gets no probes, so there is nothing to
 /// split. Bare names need no existence: they match by basename at
 /// evidence assembly.
-pub fn validate_forwarding(_forwarding: &[PathBuf], _excludes: &[PathBuf]) -> Result<(), String> {
+pub fn validate_forwarding(forwarding: &[PathBuf], excludes: &[PathBuf]) -> Result<(), String> {
+    use std::os::unix::ffi::OsStrExt as _;
+    for input in forwarding {
+        // A declaration that contradicts an exclusion is refused first: it
+        // names the operator's intent conflict, not a typo.
+        for exclude in excludes {
+            if let Some(reason) = include_exclude_conflict("--forwarding-module", input, exclude) {
+                return Err(reason);
+            }
+        }
+        if let Some(matched) = crate::discovery::scan::startup_exclude_conflict(input, excludes) {
+            return Err(format!(
+                "--forwarding-module {} is matched by --exclude-module {} (opened file); refusing a module that is both included and excluded",
+                input.display(),
+                matched.display()
+            ));
+        }
+        // A full path must resolve: a typo'd declaration must fail here,
+        // not surface later as an unmatched declaration.
+        if input.as_os_str().as_bytes().contains(&b'/') && std::fs::metadata(input).is_err() {
+            return Err(format!(
+                "--forwarding-module {} does not exist",
+                input.display()
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -1343,6 +1372,9 @@ fn capture_option(
         "--prearm-module" => common
             .prearm_modules
             .push(require_path(args, "--prearm-module")?),
+        "--forwarding-module" => common
+            .forwarding_modules
+            .push(require_path(args, "--forwarding-module")?),
         "--hook-symbol" => add_hook(&mut common.hooks, args)?,
         "--mode" => {
             if common.metrics.is_some() {
@@ -1811,6 +1843,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
     let mut exclude_modules = Vec::new();
     let mut manifests = Vec::new();
     let mut prearm_modules = Vec::new();
+    let mut forwarding_modules = Vec::new();
     let mut key_operations = false;
     let mut hooks = HookRegistry::builtin();
     let mut json = false;
@@ -1899,6 +1932,9 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
             }
             "--manifest" => manifests.push(require_path(&mut args, "--manifest")?),
             "--prearm-module" => prearm_modules.push(require_path(&mut args, "--prearm-module")?),
+            "--forwarding-module" => {
+                forwarding_modules.push(require_path(&mut args, "--forwarding-module")?)
+            }
             "--key-operations" => key_operations = true,
             "--hook-symbol" => add_hook(&mut hooks, &mut args)?,
             "--json" => json = true,
@@ -2093,7 +2129,7 @@ fn parse_inventory(mut args: impl Iterator<Item = OsString>) -> Result<Inventory
         exclude_modules,
         manifests,
         prearm_modules,
-        forwarding_modules: Vec::new(),
+        forwarding_modules,
         key_operations,
         hooks,
         json,
@@ -5966,13 +6002,15 @@ mod tests {
         .unwrap() else {
             panic!("expected run")
         };
-        assert_eq!(
-            r.forwarding_modules,
-            vec![PathBuf::from("pkcs11-spy.so")]
-        );
-        let Command::Trace(t) = parse(args(&["trace", "--pid", "42", "--forwarding-module", "s.so"]))
-            .unwrap()
-        else {
+        assert_eq!(r.forwarding_modules, vec![PathBuf::from("pkcs11-spy.so")]);
+        let Command::Trace(t) = parse(args(&[
+            "trace",
+            "--pid",
+            "42",
+            "--forwarding-module",
+            "s.so",
+        ]))
+        .unwrap() else {
             panic!("expected trace")
         };
         assert_eq!(t.forwarding_modules, vec![PathBuf::from("s.so")]);
@@ -5985,17 +6023,20 @@ mod tests {
         .unwrap() else {
             panic!("expected inventory")
         };
-        assert_eq!(
-            v.forwarding_modules,
-            vec![PathBuf::from("pkcs11-spy.so")]
-        );
+        assert_eq!(v.forwarding_modules, vec![PathBuf::from("pkcs11-spy.so")]);
     }
 
     /// The declaration only affects counting, and `inspect` never counts:
     /// the flag is refused there, keeping the scan surface unchanged.
     #[test]
     fn forwarding_module_is_refused_on_inspect() {
-        let result = parse(args(&["inspect", "--pid", "42", "--forwarding-module", "s.so"]));
+        let result = parse(args(&[
+            "inspect",
+            "--pid",
+            "42",
+            "--forwarding-module",
+            "s.so",
+        ]));
         assert!(
             result.is_err(),
             "inspect takes no --forwarding-module: {result:?}"
@@ -6043,7 +6084,12 @@ mod tests {
 
     #[test]
     fn forwarding_module_help_names_flag() {
-        for topic in [HelpTopic::Profile, HelpTopic::Run, HelpTopic::Trace, HelpTopic::Inventory] {
+        for topic in [
+            HelpTopic::Profile,
+            HelpTopic::Run,
+            HelpTopic::Trace,
+            HelpTopic::Inventory,
+        ] {
             assert!(
                 topic.text().contains("--forwarding-module"),
                 "{topic:?} help names the flag"

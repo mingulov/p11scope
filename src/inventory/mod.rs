@@ -718,6 +718,7 @@ pub fn run(
     excludes: &[PathBuf],
     manifests: &[PathBuf],
     prearm_modules: &[PathBuf],
+    forwarding_modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -784,6 +785,7 @@ pub fn run(
         excludes,
         manifests,
         prearm_modules,
+        forwarding_modules,
         hooks,
         json,
         max_scan_pids,
@@ -994,6 +996,7 @@ fn run_with_terminal_diagnostics(
     run_with_terminal_budget(
         scope,
         modules,
+        &[],
         &[],
         &[],
         &[],
@@ -1262,6 +1265,7 @@ fn run_with_terminal_budget(
     excludes: &[PathBuf],
     manifests: &[PathBuf],
     prearm_modules: &[PathBuf],
+    forwarding_modules: &[PathBuf],
     hooks: &HookRegistry,
     json: bool,
     max_scan_pids: Option<usize>,
@@ -1430,6 +1434,7 @@ fn run_with_terminal_budget(
         coordinator.enable_caller_metadata(started_ns)?;
     }
     coordinator.set_manifests(manifests.to_vec());
+    coordinator.set_forwarding(forwarding_modules.to_vec());
     coordinator.set_key_operations_requested(key_operations);
     // Packet 6.13 round-2 (F5): the startup pinning above is retained
     // for the run, its proved offsets lower into the run's attach set
@@ -9027,6 +9032,7 @@ mod tests {
                         &[],
                         &[],
                         &[],
+                        &[],
                         &HookRegistry::builtin(),
                         true,
                         Some(1),
@@ -9083,6 +9089,7 @@ mod tests {
             &[],
             &[],
             &[PathBuf::from("a.so")],
+            &[],
             &HookRegistry::builtin(),
             true,
             None,
@@ -9244,6 +9251,7 @@ mod tests {
                     &[],
                     &[],
                     &[provider],
+                    &[],
                     &HookRegistry::builtin(),
                     true,
                     Some(1),
@@ -9334,6 +9342,7 @@ mod tests {
                     &[],
                     &[],
                     &[provider],
+                    &[],
                     &HookRegistry::builtin(),
                     true,
                     Some(1),
@@ -9396,6 +9405,7 @@ mod tests {
                     &[],
                     &[],
                     prearm,
+                    &[],
                     &HookRegistry::builtin(),
                     true,
                     Some(1),
@@ -9898,6 +9908,7 @@ mod tests {
             &[PathBuf::from("/missing/p11scope-provider")],
             &[],
             &[],
+            &[],
             &HookRegistry::builtin(),
             true,
             Some(1),
@@ -9943,6 +9954,7 @@ mod tests {
         let code = run_with_terminal_budget(
             InspectScope::Pid(std::process::id()),
             &[PathBuf::from("/missing/p11scope-provider")],
+            &[],
             &[],
             &[],
             &[],
@@ -10054,6 +10066,7 @@ mod tests {
             || {
                 run_with_terminal_budget(
                     InspectScope::Pid(std::process::id()),
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -10395,6 +10408,7 @@ mod tests {
             for dashboard in [false, true] {
                 let error = run(
                     InspectScope::System,
+                    &[],
                     &[],
                     &[],
                     &[],
@@ -26423,6 +26437,7 @@ mod seal_readiness_tests {
             &[],
             &[],
             &[],
+            &[],
             &HookRegistry::builtin(),
             true,
             None,
@@ -26463,6 +26478,7 @@ mod seal_readiness_tests {
         use crate::cli::{CallerMetadataMode, IdentityBackendSelection, ScopeArg};
         let error = super::run(
             ScopeArg::Pid(std::process::id()),
+            &[],
             &[],
             &[],
             &[],

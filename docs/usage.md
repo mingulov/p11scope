@@ -268,6 +268,28 @@ deduplicated. Residual: render rows carry no caller in any scope, so the
 render gate applies capture-wide, and a misclassified provider beside another
 active provider would still split out.
 
+Single-table forwarding shims — interposing modules such as OpenSC
+`pkcs11-spy`, which the application loads in front of the real provider
+and which forwards every call — are corroborated providers, never
+closure arrays, so the split above does not apply to them on its own.
+Most also build their function table at run time (heap), so without a
+manifest or pre-arm the observer attaches them late or never: their
+calls then appear only at the backend below (totals stay correct; the
+shim is named with its zero rows). With `--manifest <shim.json>` or
+`--prearm-module <shim.so>` both layers attach fully and every
+forwarded call would count twice — declare the shim with repeatable
+`--forwarding-module <path-or-name>` (a full path matches by path and
+inode, a bare name by basename) to split its calls out of the headline totals
+exactly like a closure layer under the same gates. No declaration, no
+split: the observer never guesses a forwarding role from coincident
+counts. When two attached non-layer modules show exactly coincident
+vectors, the report instead prints a `Possible forwarding` hint naming
+both modules and the flag; like the `--manifest` hints it is advisory
+text only and changes no count. A `--forwarding-module` input that
+matched no mapped file is named as an unmatched declaration.
+`--forwarding-module` is refused beside a matching `--exclude-module`,
+and is not accepted by scan-only `inspect`.
+
 The commands below begin with **passive diagnostics**. Without an accepted
 manifest, scanned function slots are count-only: use their aggregate counts,
 return values and latency. Standard names require a typed legacy return, an

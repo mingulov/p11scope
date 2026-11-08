@@ -673,6 +673,7 @@ fn run_public_selection(
         &[],
         &[],
         &[],
+        &[],
         &HookRegistry::builtin(),
         true,
         Some(2),

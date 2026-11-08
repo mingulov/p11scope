@@ -760,18 +760,72 @@ pub(crate) fn aggregate_excluded(
 
 /// Match `--forwarding-module` inputs against mapped modules at evidence
 /// assembly. Each module is `(id, path, dev, ino)` with `dev` as
-/// `(major, minor)`. A full path (contains `/`) matches by file identity
-/// while the input still resolves, else by exact path string; a bare
-/// name matches every file with that basename. Returns matched module
-/// ids (deduped, in module order) plus the inputs that matched nothing.
-/// Bare names never match by ELF soname here — the scan-time exclusion
-/// matcher owns that; an unmatched soname is reported, not guessed.
-pub(crate) fn match_forwarding_inputs(
+/// `(major, minor)`; `dev` is carried for shape stability and never
+/// compared. A full path (contains `/`) matches the discovered
+/// target-view path, corroborated by inode while the input still
+/// resolves; a bare name matches every file with that basename. Returns
+/// matched module ids (deduped, in module order) plus the inputs that
+/// matched nothing. Bare names never match by ELF soname here — the
+/// scan-time exclusion matcher owns that; an unmatched soname is
+/// reported, not guessed. Generic over the module-id type: the render
+/// lane keys by [`ModuleId`](crate::plan::ModuleId), inventory by the
+/// caller registry's own id.
+pub(crate) fn match_forwarding_inputs<Id: Copy + Ord>(
     declared: &[std::path::PathBuf],
-    modules: &[(ModuleId, String, (u64, u64), u64)],
-) -> (Vec<ModuleId>, Vec<String>) {
-    let _ = (declared, modules);
-    (Vec::new(), Vec::new())
+    modules: &[(Id, String, (u64, u64), u64)],
+) -> (Vec<Id>, Vec<String>) {
+    use std::collections::BTreeSet;
+    use std::os::unix::ffi::OsStrExt as _;
+    let mut matched: BTreeSet<Id> = BTreeSet::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    for input in declared {
+        let text = input.as_os_str().as_bytes();
+        let is_path = text.contains(&b'/');
+        let mut hit = false;
+        // A full path matches the discovered target-view path (mirroring
+        // the scan-time --module hint gate, whose verbatim path match is
+        // sufficient even for an unopenable hint), corroborated by inode
+        // while the input still resolves: a rotation between startup
+        // validation and report time breaks the inode link and leaves the
+        // declaration unmatched (named, never applied to the new file).
+        // Device numbers are never compared: the module side renders a
+        // maps/mountinfo device while the input side is an observer
+        // fstat, and the two disagree for the same file (btrfs host:
+        // st_dev 37 vs mount 0:35).
+        let inode = if is_path {
+            std::fs::metadata(input).ok().map(|meta| {
+                use std::os::unix::fs::MetadataExt as _;
+                meta.ino()
+            })
+        } else {
+            None
+        };
+        let input_string = input.display().to_string();
+        for (id, path, _dev, ino) in modules {
+            let same = if is_path {
+                crate::discovery::identity::target_paths_equal(&input_string, path)
+                    && inode.is_none_or(|file_ino| *ino == file_ino)
+            } else {
+                std::path::Path::new(path)
+                    .file_name()
+                    .is_some_and(|base| base == input.as_os_str())
+            };
+            if same {
+                matched.insert(*id);
+                hit = true;
+            }
+        }
+        if !hit {
+            unmatched.push(input_string);
+        }
+    }
+    let mut ordered: Vec<Id> = modules
+        .iter()
+        .map(|(id, _, _, _)| *id)
+        .filter(|id| matched.contains(id))
+        .collect();
+    ordered.dedup();
+    (ordered, unmatched)
 }
 
 impl Default for DiscoveryEvidence {
@@ -2359,7 +2413,10 @@ fn closure_forwarding_hint(ev: &Evidence, reports: &[SlotReport], skipped_name: 
 /// (a lone remote client, a quiet provider, or backend rows observed only
 /// through unattributed rows) the layer's calls are the only attributed
 /// observation and stay logical, so the set is empty. Render rows carry no
-/// caller in any scope, so the gate applies capture-wide.
+/// caller in any scope, so the gate applies capture-wide. Modules the
+/// operator declared with `--forwarding-module` join the same candidate
+/// set under the same gate: a single-table shim (pkcs11-spy shape) splits
+/// exactly like a closure array once declared, and never without it.
 fn forwarding_module_ids(
     ev: &Evidence,
     reports: &[SlotReport],
@@ -2372,7 +2429,7 @@ fn forwarding_module_ids(
             names.insert(skipped.name.as_str());
         }
     }
-    let candidates: std::collections::BTreeSet<ModuleId> = ev
+    let mut candidates: std::collections::BTreeSet<ModuleId> = ev
         .discovery
         .modules
         .iter()
@@ -2381,6 +2438,9 @@ fn forwarding_module_ids(
         })
         .map(|module| module.id)
         .collect();
+    for id in &ev.discovery.forwarding_declared {
+        candidates.insert(*id);
+    }
     let backend_refused = ev.discovery.modules_skipped.iter().any(|skipped| {
         !crate::plan::is_partial_coverage(&skipped.reason)
             && !crate::plan::is_closure_array_refusal(&skipped.reason)
@@ -2419,6 +2479,95 @@ fn row_is_forwarding(
         });
     }
     false
+}
+
+/// Advisory hint when two attached non-layer modules show coincident call
+/// vectors: every per-function count of one is exactly contained in the
+/// other (the undeclared-shim shape — every shim call re-observed at the
+/// backend). The observer never splits on coincidence (a real provider
+/// pair can coincide); it names both modules and the `--forwarding-module`
+/// remedy instead. Text-only, like the `--manifest` hints; JSON stays
+/// complete on the per-layer facts and this changes no count. The
+/// contained side needs at least three calls across at least two
+/// functions, so a lone shared probe (init/finalize on two providers)
+/// stays silent. Declared and closure layers never suggest.
+fn forwarding_suggestion(
+    reports: &[SlotReport],
+    modules: &[DiscoveredModule],
+    forwarding: &std::collections::BTreeSet<ModuleId>,
+) -> Option<String> {
+    use std::collections::BTreeMap;
+    let mut vectors: BTreeMap<ModuleId, BTreeMap<String, u64>> = BTreeMap::new();
+    for row in reports {
+        let Some(id) = row.module else {
+            continue;
+        };
+        if forwarding.contains(&id) || row.calls == 0 {
+            continue;
+        }
+        let mut names = row.names.clone();
+        names.sort();
+        *vectors
+            .entry(id)
+            .or_default()
+            .entry(names.join(" + "))
+            .or_default() += row.calls;
+    }
+    let ids: Vec<ModuleId> = vectors.keys().copied().collect();
+    let mut pairs: Vec<(ModuleId, ModuleId)> = Vec::new();
+    for (i, left) in ids.iter().enumerate() {
+        for right in &ids[i + 1..] {
+            let inner = &vectors[left];
+            let outer = &vectors[right];
+            let contained = |inner: &BTreeMap<String, u64>, outer: &BTreeMap<String, u64>| {
+                inner.len() >= 2
+                    && inner.values().sum::<u64>() >= 3
+                    && inner
+                        .iter()
+                        .all(|(name, calls)| outer.get(name).unwrap_or(&0) >= calls)
+            };
+            if contained(inner, outer) || contained(outer, inner) {
+                pairs.push((*left, *right));
+            }
+        }
+    }
+    let (first, second) = *pairs.first()?;
+    let path = |id: ModuleId| {
+        modules
+            .iter()
+            .find(|module| module.id == id)
+            .map(|module| module.path.as_str())
+            .unwrap_or("?")
+    };
+    let mut hint = format!(
+        "Possible forwarding: calls at {} coincide with calls at {}; if one forwards to the other, declare it with --forwarding-module <path-or-name> so headline totals count each application call once.",
+        path(first),
+        path(second)
+    );
+    if pairs.len() > 1 {
+        hint.push_str(&format!(
+            " ({} more module pair{} coincide)",
+            pairs.len() - 1,
+            if pairs.len() == 2 { "" } else { "s" }
+        ));
+    }
+    Some(hint)
+}
+
+/// Declared-but-unmatched forwarding inputs, echoed whenever present: a
+/// `--forwarding-module` input that matched no mapped file must never
+/// silently do nothing. Text-only (the serialized twin is
+/// `unmatched_excludes`); never a coverage gap, so it never forces
+/// `PARTIAL`.
+fn unmatched_forwarding_lines(ev: &Evidence) -> String {
+    if ev.discovery.unmatched_forwarding.is_empty() {
+        return String::new();
+    }
+    format!(
+        "Unmatched forwarding declarations ({}): {}\n",
+        ev.discovery.unmatched_forwarding.len(),
+        ev.discovery.unmatched_forwarding.join(", ")
+    )
 }
 
 /// Ownership-gap rows behind the headline: logical rows only, since
@@ -2665,6 +2814,10 @@ pub fn scope_summary_with_verbosity(
     text.push('\n');
     if verbosity != TextVerbosity::Quiet {
         text.push_str(&unattributed_provider_line(ev));
+        if let Some(hint) = forwarding_suggestion(reports, &ev.discovery.modules, &forwarding) {
+            text.push_str(&hint);
+            text.push('\n');
+        }
     }
     if verbose {
         text.push_str(&module_gap_lines(ev, reports));
@@ -2672,6 +2825,7 @@ pub fn scope_summary_with_verbosity(
         text.push_str(&concise_module_gap_lines(ev, reports));
     }
     text.push_str(&excluded_lines(ev));
+    text.push_str(&unmatched_forwarding_lines(ev));
     if verbose {
         for ((has_owner_gap, total), description) in [
             (
@@ -9515,9 +9669,7 @@ pub(crate) mod tests {
             "headline must not sum both layers: {text}"
         );
         assert!(
-            text.contains("/opt/libshim.so")
-                && text.contains("500")
-                && text.contains("forwarding"),
+            text.contains("/opt/libshim.so") && text.contains("500") && text.contains("forwarding"),
             "declared layer shown separately: {text}"
         );
         let document = json(&[outer, inner], &ev, &capture_fixture());
@@ -10030,7 +10182,7 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn forwarding_match_path_matches_by_identity() {
+    fn forwarding_match_path_matches_by_path_and_inode() {
         use std::os::unix::fs::MetadataExt as _;
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("libtarget.so.1");
@@ -10047,11 +10199,67 @@ pub(crate) mod tests {
         )];
         let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
         assert_eq!(matched, vec![ModuleId(3)]);
-        assert!(unmatched.is_empty(), "identity match leaves none: {unmatched:?}");
+        assert!(
+            unmatched.is_empty(),
+            "identity match leaves none: {unmatched:?}"
+        );
         // A different file never matches by path.
         let other = dir.path().join("libother.so.1");
         std::fs::write(&other, b"fake-b").unwrap();
         let (matched, unmatched) = match_forwarding_inputs(&[other], &modules);
+        assert!(matched.is_empty());
+        assert_eq!(unmatched.len(), 1);
+    }
+
+    #[test]
+    fn forwarding_match_path_ignores_maps_device_numbers() {
+        // Regression: the module side renders a maps/mountinfo device while
+        // the input side is an observer fstat, and the two disagree for
+        // the same file (btrfs host: st_dev 37 vs mount 0:35), so only
+        // the path and the inode corroborate the match, never the device.
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libshim.so.1");
+        std::fs::write(&target, b"fake-shim").unwrap();
+        let meta = std::fs::metadata(&target).unwrap();
+        let foreign = (
+            u64::from(libc::major(meta.dev())),
+            u64::from(libc::minor(meta.dev())).wrapping_add(1),
+        );
+        let modules = vec![(
+            ModuleId(3),
+            target.display().to_string(),
+            foreign,
+            meta.ino(),
+        )];
+        let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
+        assert_eq!(matched, vec![ModuleId(3)]);
+        assert!(
+            unmatched.is_empty(),
+            "path+inode match leaves none: {unmatched:?}"
+        );
+    }
+
+    #[test]
+    fn forwarding_match_path_rotation_breaks_the_inode_link() {
+        // Same path spelling, but the file on disk rotated after
+        // discovery: the inode no longer corroborates, so the declaration
+        // stays unmatched (named, never applied to the new file).
+        use std::os::unix::fs::MetadataExt as _;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("libshim.so.1");
+        std::fs::write(&target, b"fake-shim").unwrap();
+        let meta = std::fs::metadata(&target).unwrap();
+        let modules = vec![(
+            ModuleId(3),
+            target.display().to_string(),
+            (
+                u64::from(libc::major(meta.dev())),
+                u64::from(libc::minor(meta.dev())),
+            ),
+            meta.ino().wrapping_add(1),
+        )];
+        let (matched, unmatched) = match_forwarding_inputs(&[target], &modules);
         assert!(matched.is_empty());
         assert_eq!(unmatched.len(), 1);
     }
@@ -10064,8 +10272,10 @@ pub(crate) mod tests {
             (ModuleId(4), "/snap/liba.so".into(), (8, 2), 200),
             (ModuleId(5), "/opt/libb.so".into(), (8, 1), 300),
         ];
-        let (matched, unmatched) =
-            match_forwarding_inputs(&[PathBuf::from("liba.so"), PathBuf::from("nope.so")], &modules);
+        let (matched, unmatched) = match_forwarding_inputs(
+            &[PathBuf::from("liba.so"), PathBuf::from("nope.so")],
+            &modules,
+        );
         assert_eq!(matched, vec![ModuleId(3), ModuleId(4)]);
         assert_eq!(unmatched, vec!["nope.so".to_string()]);
     }

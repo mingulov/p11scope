@@ -100,6 +100,7 @@ fn run() -> Result<i32> {
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+                .and_then(|()| cli::validate_forwarding(&a.forwarding_modules, &a.exclude_modules))
             {
                 let topic = match a.kind {
                     cli::Kind::Profile => cli::HelpTopic::Profile,
@@ -119,6 +120,7 @@ fn run() -> Result<i32> {
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+                .and_then(|()| cli::validate_forwarding(&a.forwarding_modules, &a.exclude_modules))
             {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
@@ -192,6 +194,7 @@ fn run() -> Result<i32> {
             if let Err(message) = cli::validate_excludes(&a.modules, &a.exclude_modules)
                 .and_then(|()| cli::validate_prearm_excludes(&a.prearm_modules, &a.exclude_modules))
                 .and_then(|()| cli::validate_manifest_excludes(&a.manifests, &a.exclude_modules))
+                .and_then(|()| cli::validate_forwarding(&a.forwarding_modules, &a.exclude_modules))
             {
                 let _ = p11scope::try_stderr_line(&format!(
                     "{message}\n{}",
@@ -212,6 +215,7 @@ fn run() -> Result<i32> {
                 &a.exclude_modules,
                 &a.manifests,
                 &a.prearm_modules,
+                &a.forwarding_modules,
                 &a.hooks,
                 a.json,
                 a.max_scan_pids,

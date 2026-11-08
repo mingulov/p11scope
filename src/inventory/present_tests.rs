@@ -762,8 +762,9 @@ fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
         Some("pkcs11-tool <- pid 900 <- ? (launcher exited before read)")
     );
     assert_eq!(
-        caller_origin_suffix(&presentation, partial).as_deref(),
-        Some(" (from pid 900)")
+        caller_origin_suffix(&presentation, partial),
+        None,
+        "concise shows named links only; `pid N` stays in -v/JSON"
     );
     assert_eq!(launcher_chain_text(&presentation, gap_only), None);
     assert_eq!(launcher_chain_text(&presentation, rooted), None);
@@ -793,7 +794,8 @@ fn launcher_chain_suppresses_roots_and_keeps_partial_gaps() {
         "gap-only detail stays in JSON: {verbose}"
     );
     let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
-    assert!(concise.contains("pkcs11-tool (from pid 900)"), "{concise}");
+    assert!(!concise.contains("(from pid 900)"), "{concise}");
+    assert!(concise.contains("pkcs11-tool"), "{concise}");
     assert!(concise.contains("other"), "{concise}");
     assert!(
         !concise.contains("(from systemd)"),

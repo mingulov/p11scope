@@ -1492,20 +1492,25 @@ pub(crate) fn launcher_chain_text(presentation: &Presentation, caller: CallerId)
 }
 
 /// The concise one-hop suffix (` (from cron)`, or ` (from unit)` for an
-/// init-only parent with a systemd unit), or `None` when the caller has
-/// no recorded parent and no unit. Capture already filters init, the
-/// user manager and container inits, so any recorded first link is
-/// meaningful. One helper so the app-identity lane merges its label here.
+/// init-only parent with a `.service` systemd unit), or `None` when the
+/// caller has no named parent and no service unit. Concise shows named
+/// links and `.service` units only: a nameless first link (`pid N` in
+/// `-v`) and scopes/transient units print no suffix here and stay in
+/// `-v` and JSON. Capture already filters init, the user manager and
+/// container inits, so any recorded first link is meaningful. One
+/// helper so the app-identity lane merges its label here.
 pub(crate) fn caller_origin_suffix(
     presentation: &Presentation,
     caller: CallerId,
 ) -> Option<String> {
     let record = retained_caller(presentation, caller)?;
     if let Some(parent) = record.launched_by.first() {
-        return Some(format!(" (from {})", launcher_link_name(parent)));
+        let name = parent.label.as_deref().or(parent.exe.as_deref())?;
+        return Some(format!(" (from {})", escape_controls(name)));
     }
     if record.launched_by_origin == LauncherOrigin::InitParent
         && let Some(unit) = record.launched_by_unit.as_deref()
+        && unit.ends_with(".service")
     {
         return Some(format!(" (from {})", escape_controls(unit)));
     }

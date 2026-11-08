@@ -2032,6 +2032,22 @@ fn event_doc_pins_stdout_transport_and_totals_kind() {
         DOC.contains("phase-locked to actual emissions"),
         "the no-burst cadence rule is stated"
     );
+    // A shed that leaves a partial line is repaired with a newline,
+    // so the delivered head is a fragment line that does not parse
+    // as JSON: consumers must skip such lines.
+    assert!(
+        DOC.contains("does not parse as JSON")
+            && DOC.contains("shed fragment")
+            && DOC.contains("skip it"),
+        "the shed-fragment skip rule is stated"
+    );
+    const USAGE: &str = include_str!("../../docs/usage.md");
+    assert!(
+        USAGE.contains("does not parse as JSON")
+            && USAGE.contains("shed fragment")
+            && USAGE.contains("skip it"),
+        "usage states the shed-fragment skip rule"
+    );
 }
 
 #[test]

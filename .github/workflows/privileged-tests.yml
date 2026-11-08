@@ -939,8 +939,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Newest mainline first-class: add each new release (7.4 when it ships).
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+        # Newest mainline first-class: add each new release (7.4-rc1 now;
+        # re-point at the 7.4 final when it ships).
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -1392,7 +1393,7 @@ jobs:
   # profile/trace counts through the real command line against SoftHSM.
   # The P-B re-file is integrated, so the early-workload twin runs on
   # every leg including v6.6.157 (no pre-6.8 gate). One matrix like
-  # public-cli: the host runner kernel plus the four pinned guests; the
+  # public-cli: the host runner kernel plus the five pinned guests; the
   # guest legs run the same host-built test binary inside vng.
   witness-cli:
     runs-on: ubuntu-26.04
@@ -1400,7 +1401,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+        # Newest mainline first-class, like public-cli above.
+        kernel: [host, v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

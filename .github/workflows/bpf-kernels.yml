@@ -265,7 +265,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
         include:
           # Combined refusal controls, never an old positive campaign.
           - kernel: v6.1.188
@@ -521,7 +521,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1]
+        kernel: [v6.6.157, v6.12.111, v6.18.58, v7.3.1, v7.4-rc1]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

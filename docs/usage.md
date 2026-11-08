@@ -2122,8 +2122,9 @@ five-capability minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
 `inventory --system` named the SoftHSM module with a caller edge, and
 `run` counted completed calls (`scripts/ci/minimal-setcap.sh`; it has
 26 rows when the saved paranoid value is 3 or 4 and 33 otherwise, and
-runs on the CI host and the v6.6, v6.12, v6.18 and 7.3 guest kernels;
-all 33 rows passed in a local v6.6 guest on 2026-11-07). Stated plainly: at
+runs on the CI host and the v6.6, v6.12, v6.18, 7.3 and 7.4-rc1 guest
+kernels; all 33 rows passed in a local v6.6 guest on 2026-11-07).
+Stated plainly: at
 `perf_event_paranoid >= 3`, capturing on the default lane needs the
 minimal set, never `CAP_SYS_ADMIN`. Only `--attach-backend singles`
 keeps the old rule (2026-08-25: `CAP_BPF`+`CAP_PERFMON` attached 0/136,

@@ -796,7 +796,7 @@ jobs:
           test -d "$work" && test ! -L "$work" && test -O "$work"
           test "$(stat -c %a "$work")" = 700
           echo "TMPDIR=$work" >>"$GITHUB_ENV"
-      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq libpcsclite1 opensc-pkcs11 p11-kit-modules procps python3 softhsm2 util-linux
+      - run: sudo -n apt-get update && sudo -n apt-get install -y gcc jq libpcsclite1 opensc opensc-pkcs11 p11-kit-modules procps python3 softhsm2 util-linux
       - name: Download the release observer
         uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
@@ -847,6 +847,19 @@ jobs:
           scripts/verify-p11kit-pid-startup.sh \
             --binary "$RUNNER_TEMP/release-inputs/p11scope" \
             --work "$TMPDIR/p11kit-pid-startup"
+      # pkcs11-spy in front of SoftHSM: a declared run must count each
+      # application call once (logical == direct baseline), an undeclared
+      # run must keep honest per-layer counts with no silent split, and a
+      # spy with a dead backend must name the failure (error rows) or the
+      # miss (PARTIAL coverage), never crash.
+      - name: Run pkcs11-spy forwarding cell
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 022
+          scripts/verify-spy-forwarding.sh \
+            --binary "$RUNNER_TEMP/release-inputs/p11scope" \
+            --work "$TMPDIR/spy-forwarding"
       - name: Validate the four capture records
         shell: bash
         run: |

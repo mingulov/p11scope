@@ -1991,6 +1991,38 @@ fn record_selection_in(
     !was_truncated && history.selection_truncated
 }
 
+/// One active slot whose owners vanished before stable-ID binding: the
+/// provider exited between the scan and the bind, so its module is gone
+/// from the candidate while the slot is still active. `dropped` slots had
+/// no surviving owner and were deactivated; pruned slots kept their
+/// surviving owners. Retired history never reports here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SlotBindingLoss {
+    slot: u32,
+    unknown: Vec<plan::ModuleId>,
+    dropped: bool,
+}
+
+fn slot_binding_loss_skip(loss: &SlotBindingLoss) -> Skipped {
+    if loss.dropped {
+        Skipped {
+            subject: "discovery plan binding".into(),
+            reason: format!(
+                "slot {} dropped: its provider exited before binding; calls through it are not counted",
+                loss.slot
+            ),
+        }
+    } else {
+        Skipped {
+            subject: "discovery plan binding".into(),
+            reason: format!(
+                "slot {} lost a vanished provider owner; calls remain counted under survivors",
+                loss.slot
+            ),
+        }
+    }
+}
+
 impl CaptureFacts {
     fn record_selection_loss(&mut self, reason: &str) {
         insert_selection_loss(self.visible_history_mut(), reason);
@@ -2056,7 +2088,7 @@ impl CaptureFacts {
         modules: &[ReconciledModule],
         manifests: &[Manifest],
         pinned: &PinnedObjects,
-    ) -> Result<()> {
+    ) -> Result<Vec<SlotBindingLoss>> {
         let mut stable_by_object = BTreeMap::new();
         for object in modules
             .iter()
@@ -2097,31 +2129,53 @@ impl CaptureFacts {
                 bail!("candidate contains the same exact provider more than once");
             }
         }
-        let remapped_slots = candidate
-            .slots
-            .iter()
-            .map(|slot| {
+        let mut losses = Vec::new();
+        let mut remapped_slots = Vec::with_capacity(candidate.slots.len());
+        for slot in &candidate.slots {
+            if !candidate.is_active(slot.index) {
+                remapped_slots.push(slot.clone());
+                continue;
+            }
+            let mut remapped = Vec::with_capacity(slot.module_ids.len());
+            let mut unknown = Vec::new();
+            for id in &slot.module_ids {
+                match remap.get(id).copied() {
+                    Some(stable) => remapped.push(stable),
+                    None => unknown.push(*id),
+                }
+            }
+            if unknown.is_empty() {
                 let mut slot = slot.clone();
-                slot.module_ids = slot
-                    .module_ids
-                    .iter()
-                    .map(|id| {
-                        remap.get(id).copied().ok_or_else(|| {
-                            anyhow!(
-                                "slot {} refers to unknown candidate module {id:?}",
-                                slot.index
-                            )
-                        })
-                    })
-                    .collect::<Result<_>>()?;
-                Ok(slot)
-            })
-            .collect::<Result<Vec<_>>>()?;
+                slot.module_ids = remapped;
+                remapped_slots.push(slot);
+            } else if remapped.is_empty() {
+                losses.push(SlotBindingLoss {
+                    slot: slot.index,
+                    unknown,
+                    dropped: true,
+                });
+                remapped_slots.push(slot.clone());
+            } else {
+                losses.push(SlotBindingLoss {
+                    slot: slot.index,
+                    unknown,
+                    dropped: false,
+                });
+                let mut slot = slot.clone();
+                slot.module_ids = remapped;
+                remapped_slots.push(slot);
+            }
+        }
         candidate.rebind_module_ids(remapped_slots, &remap);
         for module in &mut candidate.modules {
             module.id = remap[&module.id];
         }
-        Ok(())
+        for loss in &losses {
+            if loss.dropped {
+                candidate.deactivate(loss.slot);
+            }
+        }
+        Ok(losses)
     }
 
     fn module_id_for_object(
@@ -8908,9 +8962,16 @@ fn rebuild_discovered(discovered: &mut Engine) -> Result<()> {
         counter_hint,
     )
     .inspect_err(|_| counters.report_notes())?;
-    discovered
+    let binding_losses = discovered
         .capture_facts
         .bind_plan_module_ids(&mut plan, &modules, &accepted, &pinned)?;
+    for loss in &binding_losses {
+        let skip = slot_binding_loss_skip(loss);
+        attribution::note(&skip);
+        if !counters.object_skips.contains(&skip) {
+            counters.object_skips.push(skip);
+        }
+    }
     let allocated = plan.clone();
     let (_, selection_refusals) = lower_manifest_selection_tables(
         &mut plan,
@@ -14205,12 +14266,16 @@ impl Engine {
         let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &pinned);
         self.prearm
             .create_watches(&rebuilt.modules, &declared, &pinned);
-        self.capture_facts.bind_plan_module_ids(
+        let binding_losses = self.capture_facts.bind_plan_module_ids(
             &mut rebuilt,
             &modules,
             &self.manifests,
             &pinned,
         )?;
+        for loss in &binding_losses {
+            let skip = slot_binding_loss_skip(loss);
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
         let manifest_inventory_slots = rebuilt
             .slots
             .iter()
@@ -23191,13 +23256,6 @@ impl Engine {
                 self.note_facts_mutated();
             }
         }
-        let mut plan_ids = self.plan.clone();
-        self.capture_facts.bind_plan_module_ids(
-            &mut plan_ids,
-            &self.modules,
-            &self.manifests,
-            &candidate_pins,
-        )?;
         let prearm_pieces = resolve_prearm_pieces(self.prearm_input.as_ref(), &candidate_pins);
         let declared = plan::operator_target_keys(&self.manifests, &prearm_pieces, &candidate_pins);
         self.prearm
@@ -23214,6 +23272,16 @@ impl Engine {
             self.mark_partial("offline interface selection", &reason);
         }
         let mut plan = self.plan.clone();
+        let binding_losses = self.capture_facts.bind_plan_module_ids(
+            &mut plan,
+            &self.modules,
+            &self.manifests,
+            &candidate_pins,
+        )?;
+        for loss in &binding_losses {
+            let skip = slot_binding_loss_skip(loss);
+            self.mark_partial(&skip.subject, &skip.reason);
+        }
         record_object_skips(
             &mut plan,
             &self.counters.object_skips,
@@ -31370,9 +31438,14 @@ impl Engine {
         }
         // Discovery allocates stable module IDs during admission; the seam
         // must too, or capture-facts publication cannot resolve them.
-        self.capture_facts
+        let losses = self
+            .capture_facts
             .bind_plan_module_ids(&mut plan, &modules, &self.manifests, &pinned)
             .expect("injected counter modules bind stable module IDs");
+        assert!(
+            losses.is_empty(),
+            "injected counter plans are consistent by construction"
+        );
         self.scope = scope;
         self.views = views;
         self.plan = plan;

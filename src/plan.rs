@@ -2261,7 +2261,10 @@ impl AttachPlan {
     /// The one infallible cleanup for a candidate that lost a process
     /// generation after its links were already mutated. Every endpoint whose
     /// exact pinned identity left with that generation stops accepting probes,
-    /// and its module and capacity refusal go with it. Allocated slot IDs are
+    /// and its module and capacity refusal go with it. An endpoint whose
+    /// target is still pinned but whose every owning module left loses its
+    /// vanished owners; with no owner left it retires like an unpinned one,
+    /// and with survivors it stays attached under them. Allocated slot IDs are
     /// never given back. A cell this candidate allocated itself — index at or
     /// past `accepted_slots` — was never accepted by anybody, so it may not
     /// keep a sole provider owner; an already-accepted owner and latched
@@ -2276,12 +2279,33 @@ impl AttachPlan {
             .retain(|module| pinned.summary(module.object).is_some());
         self.refused_module_objects
             .retain(|(object, _, _)| pinned.summary(*object).is_some());
-        let retired: Vec<Slot> = self
+        let surviving: BTreeSet<ModuleId> = self.modules.iter().map(|module| module.id).collect();
+        let mut orphaned: Vec<Slot> = Vec::new();
+        for (position, slot) in self.slots.iter_mut().enumerate() {
+            if self.retired_slots.contains(&position) {
+                continue;
+            }
+            if pinned.summary(slot.object).is_none() {
+                continue;
+            }
+            if slot.module_ids.iter().all(|id| surviving.contains(id)) {
+                continue;
+            }
+            slot.module_ids.retain(|id| surviving.contains(id));
+            if slot.module_ids.is_empty() {
+                orphaned.push(slot.clone());
+            }
+        }
+        let mut retired: Vec<Slot> = self
             .slots
             .iter()
-            .filter(|slot| self.is_active(slot.index) && pinned.summary(slot.object).is_none())
-            .cloned()
+            .enumerate()
+            .filter(|(position, slot)| {
+                !self.retired_slots.contains(position) && pinned.summary(slot.object).is_none()
+            })
+            .map(|(_, slot)| slot.clone())
             .collect();
+        retired.extend(orphaned);
         for slot in &retired {
             self.deactivate(slot.index);
             let position = slot.index as usize;

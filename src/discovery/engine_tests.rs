@@ -1110,6 +1110,80 @@ fn unchanged_rebuild_after_module_removal_keeps_retired_history_without_aborting
 }
 
 #[test]
+fn bind_drops_an_active_slot_whose_module_vanished_instead_of_aborting() {
+    let mut facts = CaptureFacts::default();
+    let mut plan = plan_with(1, 0);
+    plan.modules.clear();
+    let losses = facts
+        .bind_plan_module_ids(&mut plan, &[], &[], &PinnedObjects::empty())
+        .unwrap();
+    assert_eq!(losses.len(), 1);
+    assert_eq!(losses[0].slot, 0);
+    assert!(losses[0].dropped);
+    assert!(!plan.is_active(0), "the orphaned slot is dropped, not kept");
+    let skip = slot_binding_loss_skip(&losses[0]);
+    assert_eq!(skip.subject, "discovery plan binding");
+    assert!(
+        skip.reason.contains("slot 0 dropped"),
+        "the gap names the dropped slot: {:?}",
+        skip.reason
+    );
+}
+
+#[test]
+fn retire_prunes_vanished_owners_and_retires_orphaned_dependency_slots() {
+    let key_a = overlay_key(80);
+    let key_b = overlay_key(81);
+    let raw_a = overlay_module(key_a);
+    let mut raw_b = overlay_module(key_b);
+    raw_b.mount_namespace = raw_a.mount_namespace;
+    raw_b.tables[0].entries[0].object = key_a;
+    raw_b.tables[0].entries.push(ScannedEntry {
+        name: "C_CloseSession",
+        object: key_a,
+        object_path: OVERLAY_PATH.into(),
+        file_offset: 0x2000,
+    });
+    let mut pins = overlay_view_pin(&raw_a, 999, OVERLAY_SHA, 1, true);
+    let absorb_skips = pins.absorb(overlay_view_pin(&raw_b, 1000, OVERLAY_SHA, 1, true));
+    assert!(absorb_skips.is_empty(), "{absorb_skips:?}");
+    let (modules_a, skipped_a) = bind_scanned_modules(std::slice::from_ref(&raw_a), &mut pins);
+    assert!(skipped_a.is_empty(), "{skipped_a:?}");
+    let (modules_b, skipped_b) = bind_scanned_modules(std::slice::from_ref(&raw_b), &mut pins);
+    assert!(skipped_b.is_empty(), "{skipped_b:?}");
+    let modules = [modules_a, modules_b].concat();
+    let mut plan = plan::build_from_reconciled_modules(&modules);
+    assert_eq!(plan.modules.len(), 2);
+    assert_eq!(plan.slots.len(), 2);
+    let shared = plan
+        .slots
+        .iter()
+        .find(|slot| slot.file_offset == 0x1000)
+        .unwrap()
+        .clone();
+    assert_eq!(shared.module_ids.len(), 2, "both providers claim 0x1000");
+    let sole = plan
+        .slots
+        .iter()
+        .find(|slot| slot.file_offset == 0x2000)
+        .unwrap()
+        .clone();
+    assert_eq!(sole.module_ids.len(), 1, "only B claims 0x2000");
+    pins.remove_view(raw_b.view);
+    assert!(pins.summary(modules[1].object).is_none());
+    assert!(pins.summary(shared.object).is_some());
+    let retired = plan.retire_unpinned_targets(&pins, plan.slots.len());
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].file_offset, 0x2000);
+    assert!(!plan.is_active(sole.index));
+    assert!(plan.is_active(shared.index));
+    assert_eq!(plan.modules.len(), 1);
+    let survivors = &plan.slots[shared.index as usize].module_ids;
+    assert_eq!(survivors.len(), 1, "the vanished co-owner is pruned");
+    assert_eq!(*survivors, vec![plan.modules[0].id]);
+}
+
+#[test]
 fn accepted_capture_facts_survive_empty_and_deduplicate_exact_reload() {
     let (mut engine, _, _, _) = engine_with_overlay(40);
     engine

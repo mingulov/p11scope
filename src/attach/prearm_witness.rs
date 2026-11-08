@@ -599,9 +599,12 @@ pub(crate) fn upper_is_metacopy(upper: &std::path::Path) -> bool {
 /// Backing-vs-backing acceptance for an overlay split: the BPF slot
 /// carries the backing inode while the mapped-range identity carries
 /// the overlay (xino) inode, so direct equality can never hold there.
-/// Every layer file (upper first, then the lower stack) is a backing
-/// file, so its fstat inode is directly comparable to the slot —
-/// like-for-like kernel identities, never fstat against maps.
+/// Only the topmost existing layer entry selects the backing file —
+/// the upper when it exists, else the first lower that has the path —
+/// so a stale lower inode under a live upper copy refuses. A lower
+/// match under an existing upper is allowed only for a metacopy
+/// upper, which still backs reads from the lower file. Layer files
+/// are read with `symlink_metadata` and must be regular files.
 /// `mountinfo` overrides the live observer table for tests; `None`
 /// reads `/proc/self/mountinfo`. Fail closed: unreadable tables,
 /// unstatable candidates, escapes and non-overlay paths all refuse.
@@ -620,9 +623,8 @@ fn calibration_backing_accepted_with(
     merged: &std::path::Path,
     slot_ino: u64,
     mountinfo: Option<&str>,
-    _is_metacopy: impl Fn(&std::path::Path) -> bool,
+    is_metacopy: impl Fn(&std::path::Path) -> bool,
 ) -> bool {
-    use std::os::unix::fs::MetadataExt as _;
     let owned;
     let table = match mountinfo {
         Some(text) => text,
@@ -632,16 +634,33 @@ fn calibration_backing_accepted_with(
         }
     };
     let merged = std::fs::canonicalize(merged).unwrap_or_else(|_| merged.to_path_buf());
-    let mut layers = Vec::new();
-    if let Some(upper) = crate::discovery::scan::upper_candidate_from_mountinfo(table, &merged) {
-        layers.push(upper);
+    // One backing file's inode, read without following symlinks: only a
+    // regular layer file counts as an existing entry.
+    fn backing_ino(path: &std::path::Path) -> Option<u64> {
+        use std::os::unix::fs::MetadataExt as _;
+        std::fs::symlink_metadata(path)
+            .ok()
+            .filter(|meta| meta.file_type().is_file())
+            .map(|meta| meta.ino())
     }
-    layers.extend(crate::discovery::scan::lower_candidates_from_mountinfo(
-        table, &merged,
-    ));
-    layers
+    let upper = crate::discovery::scan::upper_candidate_from_mountinfo(table, &merged);
+    let upper_ino = upper.as_deref().and_then(backing_ino);
+    let lower_ino = crate::discovery::scan::lower_candidates_from_mountinfo(table, &merged)
         .iter()
-        .any(|candidate| std::fs::metadata(candidate).is_ok_and(|meta| meta.ino() == slot_ino))
+        .filter_map(|candidate| backing_ino(candidate))
+        .next();
+    match (upper_ino, lower_ino) {
+        // The topmost existing entry selects the backing file.
+        (Some(upper), _) if slot_ino == upper => true,
+        (None, Some(lower)) if slot_ino == lower => true,
+        // A metadata-only upper still backs reads from the lower file.
+        (Some(_), Some(lower))
+            if upper.as_deref().is_some_and(&is_metacopy) && slot_ino == lower =>
+        {
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Start the witness: open + calibrate each file, departure calibration,

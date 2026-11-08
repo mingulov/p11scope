@@ -301,6 +301,11 @@ printf 'part\tworkload\tmodule\tcondition\tround\tn_calls\twall_ns\tns_per_call\
 cleanup() {
     status=$?
     trap - EXIT INT TERM
+    # CONT first: a STOPped workload never dies on TERM and wait(1)
+    # would hang forever (observed on an aborted spy cell).
+    [ -z "$WPID" ] || kill -CONT "$WPID" 2>/dev/null || true
+    [ -z "$SPID" ] || kill -CONT "$SPID" 2>/dev/null || true
+    for cp in ${CEIL_PIDS-}; do kill -CONT "$cp" 2>/dev/null || true; done
     [ -z "$WPID" ] || kill "$WPID" 2>/dev/null || true
     [ -z "$SPID" ] || kill "$SPID" 2>/dev/null || true
     for cp in ${CEIL_PIDS-}; do kill "$cp" 2>/dev/null || true; done
@@ -1753,11 +1758,38 @@ sample_spy() {
         case "$2" in
             inv-pid)
                 wait_for_no_foreign_observer "$1" "$FOREIGN_WAIT_S" || return 1
-                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
-                    --capture native --manifest "$WORK/manifest-soft.json" --duration 600 \
-                    -o "$WORK/$1.json" > "$WORK/$1.obs.log" 2>&1 &
-                SPID=$!
-                wait_for_inv_ready "$WORK/$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                attempt=1
+                while :; do
+                    if [ "$attempt" = 1 ]; then
+                        sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
+                            --capture native --manifest "$WORK/manifest-soft.json" --duration 600 \
+                            -o "$WORK/$1.json" > "$WORK/$1.obs.log" 2>&1 &
+                    else
+                        echo "$1: inv lane never went active, respawning observer once" >&2
+                        echo "--- observer respawn (attempt 2) ---" >> "$WORK/$1.obs.log"
+                        sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
+                            --capture native --manifest "$WORK/manifest-soft.json" --duration 600 \
+                            -o "$WORK/$1.json" >> "$WORK/$1.obs.log" 2>&1 &
+                    fi
+                    SPID=$!
+                    if wait_for_inv_ready "$WORK/$1.obs.log" "$ATTACH_TIMEOUT_S"; then
+                        break
+                    fi
+                    kill "$SPID" 2>/dev/null || true
+                    wt_end=$(( $(date +%s) + 15 ))
+                    while kill -0 "$SPID" 2>/dev/null && [ "$(date +%s)" -lt "$wt_end" ]; do sleep 0.2; done
+                    if kill -0 "$SPID" 2>/dev/null; then
+                        echo "$1: stuck observer would not die; refusing double-spawn" >&2
+                        return 1
+                    fi
+                    SPID=
+                    if [ "$attempt" = 1 ]; then
+                        attempt=2
+                        wait_for_no_foreign_observer "$1" "$FOREIGN_WAIT_S" || return 1
+                        continue
+                    fi
+                    return 1
+                done
                 if grep -q "attach failed" "$WORK/$1.obs.log"; then
                     echo "ATTACH FAILURE in $1:" >&2; cat "$WORK/$1.obs.log" >&2; return 1
                 fi

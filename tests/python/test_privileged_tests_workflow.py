@@ -633,6 +633,10 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("scripts/matrix/verify-container-image.sh", job)
         self.assertIn("--observer-bin", job)
         self.assertIn("scripts/ci/check-cell-results.py", job)
+        # The checker is not executable (100644, like the other CI helpers);
+        # the judge step must run it through the interpreter, as the other
+        # lanes do, or the step dies with Permission denied on a green cell.
+        self.assertIn("python3 -I scripts/ci/check-cell-results.py", job)
         for cell in ("host-exact", "container-exact",
                      "refusal-pidns", "refusal-cap"):
             with self.subTest(cell=cell):

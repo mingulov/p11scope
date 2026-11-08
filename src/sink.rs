@@ -1269,12 +1269,10 @@ mod tests {
                 transport.write_all(PRESERVED_LINE).unwrap();
                 transport.flush().unwrap();
             }
-            "no-preserve" => {
-                match test_transport_with_reopen(1, |_| Err(eacces())) {
-                    Ok(_) => panic!("unpreserved stdout must use the reopen"),
-                    Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EACCES)),
-                }
-            }
+            "no-preserve" => match test_transport_with_reopen(1, |_| Err(eacces())) {
+                Ok(_) => panic!("unpreserved stdout must use the reopen"),
+                Err(error) => assert_eq!(error.raw_os_error(), Some(libc::EACCES)),
+            },
             other => panic!("unknown preserve child mode {other:?}"),
         }
         std::process::exit(0);

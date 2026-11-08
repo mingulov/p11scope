@@ -51,6 +51,11 @@
 #   CONDITIONS="unobserved metrics profile trace inv-pid inv-system inv-pid-keys"
 #   ADMIT_S=2 (settle after the first committed pass) ATTACH_TIMEOUT_S=60
 #   PASS_TIMEOUT_S=180 POST_PID_S=3 POST_SYS_S=20 (post-burst binding hold)
+#   Spy part: P11PERFTEST (required), P11_LD_PATH (its LD_LIBRARY_PATH),
+#   SPY_SO (default probed), SPY_COV="rand ecdsa rsa aes", SPY_VEC=64,
+#   SPY_ITERS="rand:30000 ecdsa:3000 rsa:400 aes:15000",
+#   SPY_THREADS_BASE="1 2 4" (+nproc), TOOL_N=50,
+#   SPY_CONDITIONS="plain inv-pid metrics trace spy-file spy-null tool"
 #   PARTS="percall ramp ceiling" THREADS="1 2 4 8" RAMP_SECS=10
 #   CEIL_SECS=10 CEIL_THREADS="1 2 4" (plus nproc when larger)
 #   LOCK=/var/tmp/p11scope-ws-tmp/privileged.lock (must be held by an
@@ -76,6 +81,23 @@ CONDITIONS=${CONDITIONS:-"unobserved metrics profile trace inv-pid inv-system in
 want_cond() {
     echo " $CONDITIONS " | grep -q " $1 "
 }
+SPY_CONDITIONS=${SPY_CONDITIONS:-"plain inv-pid metrics trace spy-file spy-null tool"}
+want_spy() {
+    echo " $SPY_CONDITIONS " | grep -q " $1 "
+}
+SPY_THREADS_BASE=${SPY_THREADS_BASE:-"1 2 4"}
+SPY_COV=${SPY_COV:-"rand ecdsa rsa aes"}
+SPY_ITERS=${SPY_ITERS:-"rand:30000 ecdsa:3000 rsa:400 aes:15000"}
+SPY_VEC=${SPY_VEC:-64}
+P11_LD_PATH=${P11_LD_PATH:-}
+probe_spy() {
+    for cand in "/usr/lib/x86_64-linux-gnu/pkcs11/pkcs11-spy.so" \
+            "/usr/lib64/pkcs11/pkcs11-spy.so"; do
+        if [ -f "$cand" ]; then echo "$cand"; return 0; fi
+    done
+    return 1
+}
+SPY_SO=${SPY_SO:-$(probe_spy)}
 THREADS=${THREADS:-"1 2 4 8"}
 RAMP_SECS=${RAMP_SECS:-10}
 TRACE_SECS=${TRACE_SECS:-5}
@@ -263,6 +285,9 @@ fi
 if echo " $PARTS " | grep -q " spy "; then
     [ -n "${P11PERFTEST-}" ] || { echo "P11PERFTEST is required for the spy part" >&2; exit 2; }
     [ -x "$P11PERFTEST" ] || { echo "P11PERFTEST not executable: $P11PERFTEST" >&2; exit 2; }
+    [ -n "$SPY_SO" ] || { echo "pkcs11-spy.so not found (set SPY_SO)" >&2; exit 2; }
+    command -v pkcs11-tool >/dev/null || { echo "pkcs11-tool required for the spy part" >&2; exit 2; }
+    command -v p11tool >/dev/null || { echo "p11tool required for the spy part" >&2; exit 2; }
 fi
 
 WORK=$(mktemp -d "${TMPDIR:-/tmp}/p11scope-v070bench-XXXXXX")
@@ -332,8 +357,12 @@ echo "mitigations: $(grep -h . /sys/devices/system/cpu/vulnerabilities/* 2>/dev/
 } > "$WORK/host.txt"
 cat "$WORK/host.txt"
 
+write_validate_py
+}
+
 # --- validation: same fail-closed contract as lane-bench-overhead-oracle-3:
 # exit 0 exact, 10 well-formed but mismatched (INVALID), 1 malformed ---
+write_validate_py() {
 cat > "$WORK/validate.py" <<'PYEOF'
 import json, os, re, sys
 
@@ -503,9 +532,122 @@ def cmd_profmodcheck(path, spec):
             return INVALID
     return VALID
 
+def cmd_p11tps(path, substr):
+    try:
+        with open(path, encoding="utf-8") as h: rep = json.load(h)
+    except FileNotFoundError: return fail(f"missing p11perftest json: {path}")
+    except (OSError, ValueError) as e: return fail(f"unreadable p11perftest json {path}: {e}")
+    if not isinstance(rep, dict): return fail("p11perftest json is not an object")
+    for test, suites in rep.items():
+        if substr not in test:
+            continue
+        for suite, vecs in (suites or {}).items():
+            for vec, m in (vecs or {}).items():
+                tps = ((m.get("tps") or {}).get("global") or {}).get("value")
+                wall = (m.get("wallclock") or {}).get("value")
+                tot = m.get("total iterations")
+                th = m.get("threads")
+                print(f"test={test[:60]} tps={tps} wall_ms={wall} total_iters={tot} threads={th} "
+                      f"ntests={len(rep)}")
+                return VALID
+    return fail(f"no p11perftest test matches {substr!r}")
+
+def cmd_spycount(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as h: text = h.read()
+    except OSError as e: return fail(f"unreadable spy log {path}: {e}")
+    counts = {}
+    for m in re.finditer(r"(?m)^[0-9]+: (C_[A-Za-z0-9_]+)", text):
+        counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    total = sum(counts.values())
+    if total == 0: return fail("spy log has no call markers")
+    top = ",".join(f"{k}={v}" for k, v in sorted(counts.items(), key=lambda kv: -kv[1])[:8])
+    print(f"calls_total={total} top={top}")
+    return VALID
+
+def cmd_proftotals(path):
+    try:
+        with open(path, encoding="utf-8") as h: rep = json.load(h)
+    except FileNotFoundError: return fail(f"missing profile report: {path}")
+    except (OSError, ValueError) as e: return fail(f"unreadable profile report {path}: {e}")
+    if not isinstance(rep, dict): return fail("profile report is not an object")
+    total, errors, byname = 0, 0, {}
+    for row in rep.get("functions", []):
+        total += row.get("calls", 0) or 0
+        errors += row.get("errors", 0) or 0
+        for name in row.get("names", []):
+            byname[name] = byname.get(name, 0) + (row.get("calls", 0) or 0)
+    ev = rep.get("evidence", {}) or {}
+    top = ",".join(f"{k}={v}" for k, v in sorted(byname.items(), key=lambda kv: -kv[1])[:8])
+    print(f"calls_total={total} errors={errors} event_loss={ev.get('event_loss', '?')} "
+          f"completeness={ev.get('completeness', '?')} init={byname.get('C_Initialize', 0)} top={top}")
+    return VALID
+
+def cmd_tracetotal(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as h: text = h.read()
+    except OSError as e: return fail(f"unreadable trace {path}: {e}")
+    m = re.search(r"COUNT_EVIDENCE[^\n]*?\"raw_calls\"\s*[:=]\s*(\d+)", text)
+    if not m: return fail("trace has no COUNT_EVIDENCE raw_calls")
+    print(f"raw_calls={m.group(1)}")
+    return VALID
+
+def cmd_invcount(path, pid, module_path):
+    try:
+        with open(path, encoding="utf-8") as h: rep = json.load(h)
+    except FileNotFoundError: return fail(f"missing inventory report: {path}")
+    except (OSError, ValueError) as e: return fail(f"unreadable inventory report {path}: {e}")
+    if not isinstance(rep, dict): return fail("inventory report is not an object")
+    import hashlib
+    try:
+        with open(module_path, "rb") as h: want_sha = hashlib.sha256(h.read()).hexdigest()
+    except OSError as e: return fail(f"cannot hash module {module_path}: {e}")
+    caller_ids = {c.get("id") for c in rep.get("callers", []) if str(c.get("pid")) == str(pid)}
+    module_ids = {m.get("id") for m in rep.get("modules", [])
+                  if (m.get("identity", {}) or {}).get("sha256") == want_sha}
+    for e in rep.get("edges", []):
+        if e.get("caller") in caller_ids and e.get("module") in module_ids:
+            entries = e.get("entries", {}) or {}
+            cov = entries.get("coverage", {}) or {}
+            print(f"edge_count={entries.get('count')} state={cov.get('state')} lossy={cov.get('lossy')}")
+            return VALID
+    return fail(f"no edge for pid {pid} module {module_path}")
+
+def cmd_invsumcheck(path, module_path, expected, pids):
+    try:
+        with open(path, encoding="utf-8") as h: rep = json.load(h)
+    except FileNotFoundError: return fail(f"missing inventory report: {path}")
+    except (OSError, ValueError) as e: return fail(f"unreadable inventory report {path}: {e}")
+    if not isinstance(rep, dict): return fail("inventory report is not an object")
+    import hashlib
+    try:
+        with open(module_path, "rb") as h: want_sha = hashlib.sha256(h.read()).hexdigest()
+    except OSError as e: return fail(f"cannot hash module {module_path}: {e}")
+    want_pids = set(pids.split(","))
+    caller_ids = {c.get("id") for c in rep.get("callers", []) if str(c.get("pid")) in want_pids}
+    module_ids = {m.get("id") for m in rep.get("modules", [])
+                  if (m.get("identity", {}) or {}).get("sha256") == want_sha}
+    total, edges, bad = 0, 0, 0
+    for e in rep.get("edges", []):
+        if e.get("caller") in caller_ids and e.get("module") in module_ids:
+            entries = e.get("entries", {}) or {}
+            cov = entries.get("coverage", {}) or {}
+            total += entries.get("count", 0) or 0
+            edges += 1
+            if cov.get("state") != "counted":
+                bad += 1
+    print(f"edge_sum={total} edges={edges} not_counted={bad} want_pids={len(want_pids)}")
+    if total != int(expected) or bad:
+        print(f"INVALID: edge sum {total} != expected {expected} (bad={bad})", file=sys.stderr)
+        return INVALID
+    return VALID
+
 CMDS = {"profcheck": (cmd_profcheck, 3), "tracecheck": (cmd_tracecheck, 2),
         "invcheck": (cmd_invcheck, 4), "signlog": (cmd_signlog, 3), "mtlog": (cmd_mtlog, 1),
-        "profmodcheck": (cmd_profmodcheck, 2)}
+        "profmodcheck": (cmd_profmodcheck, 2), "p11tps": (cmd_p11tps, 2),
+        "spycount": (cmd_spycount, 1), "proftotals": (cmd_proftotals, 1),
+        "tracetotal": (cmd_tracetotal, 1), "invcount": (cmd_invcount, 3),
+        "invsumcheck": (cmd_invsumcheck, 4)}
 
 def main(argv):
     if len(argv) < 2 or argv[1] not in CMDS:
@@ -911,6 +1053,41 @@ if [ "$SELF_TEST" = 1 ]; then
     kill -CONT "$WPID" 2>/dev/null || true
     wait "$WPID" || { echo "self-test: mt HOLD workload failed" >&2; exit 1; }
     WPID=
+    write_validate_py
+    VPY="$SELF_TEST_WORK/validate.py"
+    printf '%s' '{"functions": [{"names": ["C_GenerateRandom"], "calls": 100, "errors": 0, "rv_counts": {"0x0": 100}}], "evidence": {"event_loss": 0, "completeness": "COMPLETE", "verdict_detail": "x"}}' > "$SELF_TEST_WORK/prof.json"
+    python3 -I "$VPY" profcheck "$SELF_TEST_WORK/prof.json" "C_GenerateRandom=100" 0 >/dev/null \
+        || { echo "self-test: profcheck valid rejected" >&2; exit 1; }
+    python3 -I "$VPY" profcheck "$SELF_TEST_WORK/prof.json" "C_GenerateRandom=99" 0 >/dev/null 2>&1 \
+        && { echo "self-test: profcheck mismatch accepted" >&2; exit 1; }
+    [ $? = 10 ] || { echo "self-test: profcheck mismatch is not INVALID" >&2; exit 1; }
+    printf '%s\n' 'l0' 'COUNT_EVIDENCE {"raw_calls": 105}' 'EVIDENCE {"event_loss": 0, "completeness": "COMPLETE"}' > "$SELF_TEST_WORK/trace.txt"
+    python3 -I "$VPY" tracecheck "$SELF_TEST_WORK/trace.txt" 105 >/dev/null \
+        || { echo "self-test: tracecheck valid rejected" >&2; exit 1; }
+    python3 -I "$VPY" tracetotal "$SELF_TEST_WORK/trace.txt" | grep -q "raw_calls=105" \
+        || { echo "self-test: tracetotal wrong" >&2; exit 1; }
+    python3 -I "$VPY" proftotals "$SELF_TEST_WORK/prof.json" | grep -q "calls_total=100" \
+        || { echo "self-test: proftotals wrong" >&2; exit 1; }
+    nullsha=$(sha256sum "$SELF_TEST_WORK/null.so" | cut -d' ' -f1)
+    printf '{"callers": [{"id": "c0", "pid": 1234}], "modules": [{"id": "m0", "identity": {"sha256": "%s"}}], "edges": [{"caller": "c0", "module": "m0", "entries": {"count": 42, "coverage": {"state": "counted", "lossy": false}}}], "gaps": []}' "$nullsha" > "$SELF_TEST_WORK/inv.json"
+    python3 -I "$VPY" invcheck "$SELF_TEST_WORK/inv.json" 1234 "$SELF_TEST_WORK/null.so" 42 >/dev/null \
+        || { echo "self-test: invcheck valid rejected" >&2; exit 1; }
+    python3 -I "$VPY" invsumcheck "$SELF_TEST_WORK/inv.json" "$SELF_TEST_WORK/null.so" 42 "1234" >/dev/null \
+        || { echo "self-test: invsumcheck valid rejected" >&2; exit 1; }
+    python3 -I "$VPY" invcount "$SELF_TEST_WORK/inv.json" 1234 "$SELF_TEST_WORK/null.so" | grep -q "edge_count=42" \
+        || { echo "self-test: invcount wrong" >&2; exit 1; }
+    printf '%s\n' 'sign OK: 7 ops (7 C_SignInit, 7 C_Sign)' 'sign warm-up: 3 ops' > "$SELF_TEST_WORK/sign.log"
+    python3 -I "$VPY" signlog "$SELF_TEST_WORK/sign.log" 7 3 \
+        || { echo "self-test: signlog valid rejected" >&2; exit 1; }
+    printf '%s\n' 'READY gate' 'MT_COUNT ops=50 wall_ns=100 threads=2 pad=0 attempts=50 failed=0' > "$SELF_TEST_WORK/mt.log"
+    python3 -I "$VPY" mtlog "$SELF_TEST_WORK/mt.log" | grep -q "ops=50" \
+        || { echo "self-test: mtlog wrong" >&2; exit 1; }
+    printf '%s' '{"Generate random numbers (C_GenerateRandom()) using rand-128": {"rand-128": {"testvec0064": {"tps": {"global": {"value": "750000"}}, "wallclock": {"value": "0.23"}, "total iterations": 50, "threads": 1}}}}' > "$SELF_TEST_WORK/p11.json"
+    python3 -I "$VPY" p11tps "$SELF_TEST_WORK/p11.json" "C_GenerateRandom" | grep -q "tps=750000" \
+        || { echo "self-test: p11tps wrong" >&2; exit 1; }
+    printf '%s\n' '0: C_Initialize' '1: C_GenerateRandom' '2: C_GenerateRandom' > "$SELF_TEST_WORK/spy.log"
+    python3 -I "$VPY" spycount "$SELF_TEST_WORK/spy.log" | grep -q "calls_total=3" \
+        || { echo "self-test: spycount wrong" >&2; exit 1; }
     echo "bench-v070-overhead self-test: OK"
     exit 0
 fi
@@ -1359,9 +1536,273 @@ for t in $CEIL_T; do
 done
 fi
 
+# wait_for_pid_exit <pid> <timeout_s>: bounded wait (kills on timeout).
+wait_for_pid_exit() {
+    wfpe_end=$(( $(date +%s) + $2 ))
+    while kill -0 "$1" 2>/dev/null; do
+        [ "$(date +%s)" -lt "$wfpe_end" ] || {
+            echo "pid $1 still alive after $2s, killing" >&2
+            kill -9 "$1" 2>/dev/null || true
+            return 1
+        }
+        sleep 0.2
+    done
+    return 0
+}
+
+# iters_for_cov <cov>: iterations from SPY_ITERS ("rand:30000 ecdsa:3000 ...").
+iters_for_cov() {
+    for kv in $SPY_ITERS; do
+        case $kv in "$1:"*) echo "${kv#*:}"; return 0;; esac
+    done
+    echo "unknown coverage $1 in SPY_ITERS" >&2
+    return 1
+}
+# primary_substr <cov>: p11perftest primary test-name substring.
+primary_substr() {
+    case $1 in
+        rand) echo "C_GenerateRandom" ;;
+        ecdsa) echo "secp256r1" ;;
+        rsa) echo "rsa-2048" ;;
+        aes) echo "CKM_AES_ECB) using aes-128" ;;
+        *) echo "unknown coverage $1" >&2; return 1 ;;
+    esac
+}
+
+# sample_spy <tag> <config> <cov> <threads>
+# config: plain|inv-pid|metrics|trace|spy-file|spy-null. Observed configs
+# STOP-start p11perftest so the observer covers the whole run; coverage
+# is proven post-hoc (C_Initialize observed / edge counted).
+sample_spy() {
+    iters=$(iters_for_cov "$3") || return 1
+    skip=$(( iters / 10 ))
+    if [ "$skip" -lt 20 ]; then skip=20; fi
+    substr=$(primary_substr "$3") || return 1
+    case "$2" in
+        plain|inv-pid|metrics|trace) mod="$MODULE"; spy_out="" ;;
+        spy-file) mod="$SPY_SO"; spy_out="$WORK/$1.spy.log" ;;
+        spy-null) mod="$SPY_SO"; spy_out="/dev/null" ;;
+        *) echo "$1: bad spy config $2" >&2; return 1 ;;
+    esac
+    case "$2" in plain|spy-file|spy-null)
+        T0=$(date +%s%N)
+        env ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
+            ${spy_out:+PKCS11SPY=$MODULE} ${spy_out:+PKCS11SPY_OUTPUT=$spy_out} \
+            "$P11PERFTEST" -l "$mod" -s 0 -p 1234 -t "$4" -i "$iters" --skip "$skip" \
+            -v "$SPY_VEC" -c "$3" -j -o "$WORK/$1.p11t.json" > "$WORK/$1.p11t.log" 2>&1 \
+            || { echo "$1: p11perftest failed" >&2; tail -5 "$WORK/$1.p11t.log" >&2; return 1; }
+        T1=$(date +%s%N)
+        CPU_TICKS=0; CPU_RSS=0
+        ;;
+    *)
+        env ${P11_LD_PATH:+LD_LIBRARY_PATH=$P11_LD_PATH} \
+            "$P11PERFTEST" -l "$mod" -s 0 -p 1234 -t "$4" -i "$iters" --skip "$skip" \
+            -v "$SPY_VEC" -c "$3" -j -o "$WORK/$1.p11t.json" > "$WORK/$1.p11t.log" 2>&1 &
+        P11PID=$!
+        kill -STOP "$P11PID" 2>/dev/null || { echo "$1: STOP failed" >&2; return 1; }
+        case "$2" in
+            inv-pid)
+                sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --pid "$P11PID" \
+                    --capture native --manifest "$WORK/manifest-soft.json" --duration 600 \
+                    -o "$WORK/$1.json" > "$WORK/$1.obs.log" 2>&1 &
+                SPID=$!
+                wait_for_inv_ready "$WORK/$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+                if grep -q "attach failed" "$WORK/$1.obs.log"; then
+                    echo "ATTACH FAILURE in $1:" >&2; cat "$WORK/$1.obs.log" >&2; return 1
+                fi
+                ukind=$(uprobe_kind "$WORK/$1.obs.log")
+                echo "$ukind" > "$WORK/uprobe-kind.txt"
+                wait_for_inv_pass "$WORK/$1.obs.log" "$PASS_TIMEOUT_S" || return 1
+                sleep "$ADMIT_S"
+                is_inv=1
+                ;;
+            metrics)
+                start_observer "$1" profile --manifest "$WORK/manifest-soft.json" --pid "$P11PID" \
+                    --mode metrics --duration 600 -o "$WORK/$1.json" || return 1
+                is_inv=0; ukind=""
+                ;;
+            trace)
+                start_observer "$1" trace --manifest "$WORK/manifest-soft.json" --pid "$P11PID" \
+                    --duration 600 -o "$WORK/$1.txt" || return 1
+                is_inv=0; ukind=""
+                ;;
+        esac
+        cpu_window_begin "$1" || return 1
+        kill -CONT "$P11PID" 2>/dev/null || { echo "$1: CONT failed" >&2; return 1; }
+        T0=$(date +%s%N)
+        wait_for_pid_exit "$P11PID" 600 || return 1
+        if wait "$P11PID"; then :; else status=$?; echo "$1: p11perftest failed: $status" >&2; return "$status"; fi
+        T1=$(date +%s%N)
+        cpu_window_end "$1"
+        if [ "$is_inv" = 1 ]; then sleep "$POST_PID_S"; fi
+        stop_observer "$1" || return 1
+        ;;
+    esac
+    tpsinfo=$(python3 -I "$WORK/validate.py" p11tps "$WORK/$1.p11t.json" "$substr") \
+        || { echo "$1: p11perftest json invalid" >&2; return 1; }
+    tps=$(echo "$tpsinfo" | sed -n 's/.*tps=\([^ ]*\).*/\1/p')
+    wall_ms=$(echo "$tpsinfo" | sed -n 's/.*wall_ms=\([^ ]*\).*/\1/p')
+    headline_n=$(awk -v t="$tps" -v w="$wall_ms" 'BEGIN{printf "%d", t*w/1000}')
+    headline_wall=$(awk -v w="$wall_ms" 'BEGIN{printf "%d", w*1000000}')
+    notes="tps=$tps run_wall_ns=$((T1-T0)) $tpsinfo"
+    exact=1
+    case "$2" in
+        spy-file)
+            spyinfo=$(python3 -I "$WORK/validate.py" spycount "$WORK/$1.spy.log") \
+                || { echo "$1: spy log invalid" >&2; return 1; }
+            notes="$notes :: spy $spyinfo"
+            ;;
+        inv-pid)
+            reclaim_root_output "$WORK/$1.json"
+            info=$(python3 -I "$WORK/validate.py" invcount "$WORK/$1.json" "$P11PID" "$MODULE") \
+                || { echo "$1: invcount failed" >&2; return 1; }
+            notes="$notes :: uprobe=$ukind obs $info"
+            case "$info" in *"state=counted"*) ;; *) exact=0;; esac
+            ;;
+        metrics)
+            reclaim_root_output "$WORK/$1.json"
+            info=$(python3 -I "$WORK/validate.py" proftotals "$WORK/$1.json") \
+                || { echo "$1: proftotals failed" >&2; return 1; }
+            notes="$notes :: obs $info"
+            case "$info" in *"init=0 "*) exact=0; notes="$notes PARTIAL-COVERAGE";; esac
+            ;;
+        trace)
+            reclaim_root_output "$WORK/$1.txt"
+            info=$(python3 -I "$WORK/validate.py" tracetotal "$WORK/$1.txt") \
+                || { echo "$1: tracetotal failed" >&2; return 1; }
+            bytes=$(wc -c < "$WORK/$1.txt")
+            if grep -q "C_Initialize" "$WORK/$1.txt" 2>/dev/null; then init_seen=1; else init_seen=0; fi
+            if [ "$bytes" -gt 52428800 ]; then
+                head -c 1048576 "$WORK/$1.txt" > "$WORK/$1.txt.head"; rm -f "$WORK/$1.txt"
+            fi
+            notes="$notes :: obs $info bytes=$bytes init_seen=$init_seen"
+            if [ "$init_seen" = 0 ]; then exact=0; notes="$notes PARTIAL-COVERAGE"; fi
+            ;;
+    esac
+    record "spy" "spy-$3-t$4" "$(basename "$mod")" "$2" 1 "$headline_n" "$headline_wall" \
+        "$CPU_TICKS" "$CPU_RSS" "$exact" 0 "n/a" "$notes"
+}
+
+# tool_op <tool> <tag>: one CLI-tool signing operation (exit nonzero on failure).
+tool_op() {
+    case $1 in
+        pkcs11-tool)
+            pkcs11-tool --module "$MODULE" --login --pin 1234 --sign \
+                --mechanism SHA256-HMAC --label hmackey \
+                --input-file "$WORK/tool-data.bin" --output-file "$WORK/$2.sig" \
+                > "$WORK/$2.op.log" 2>&1
+            ;;
+        p11tool)
+            p11tool --provider "$MODULE" --login --set-pin=1234 --test-sign \
+                --hash=SHA256 --outfile="$WORK/$2.sig" \
+                "pkcs11:token=v070bench;object=rsakey;type=private" < /dev/null \
+                > "$WORK/$2.op.log" 2>&1
+            ;;
+    esac
+}
+# tool_k <tool>: PKCS#11 calls per tool op, via one STOP-started trace.
+tool_k() {
+    tool_op "$1" "toolk-$1" &
+    TOOLPID=$!
+    kill -STOP "$TOOLPID" 2>/dev/null || { echo "toolk-$1: STOP failed" >&2; return 1; }
+    sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" trace --manifest "$WORK/manifest-soft.json" \
+        --pid "$TOOLPID" --duration 120 -o "$WORK/toolk-$1.txt" \
+        > "$WORK/toolk-$1.obs.log" 2>&1 &
+    SPID=$!
+    wait_for_observer_attach "$WORK/toolk-$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+    kill -CONT "$TOOLPID" 2>/dev/null || { echo "toolk-$1: CONT failed" >&2; return 1; }
+    wait_for_pid_exit "$TOOLPID" 120 || return 1
+    if wait "$TOOLPID"; then :; else status=$?; echo "toolk-$1: tool failed: $status" >&2; return "$status"; fi
+    stop_observer "toolk-$1" || return 1
+    reclaim_root_output "$WORK/toolk-$1.txt"
+    info=$(python3 -I "$WORK/validate.py" tracetotal "$WORK/toolk-$1.txt") \
+        || { echo "toolk-$1: tracetotal failed" >&2; return 1; }
+    echo "$info" | sed -n 's/raw_calls=\([^ ]*\).*/\1/p'
+}
+
+# sample_toolloop <tag> <tool> <mode:unobserved|inv-system>
+sample_toolloop() {
+    n=${TOOL_N:-50}
+    if [ "$3" = "inv-system" ]; then
+        sudo --preserve-env=SOFTHSM2_CONF "$P11SCOPE" inventory --system --capture native \
+            --manifest "$WORK/manifest-soft.json" --duration 600 -o "$WORK/$1.json" \
+            > "$WORK/$1.obs.log" 2>&1 &
+        SPID=$!
+        wait_for_inv_ready "$WORK/$1.obs.log" "$ATTACH_TIMEOUT_S" || return 1
+        ukind=$(uprobe_kind "$WORK/$1.obs.log")
+        echo "$ukind" > "$WORK/uprobe-kind.txt"
+        wait_for_inv_pass "$WORK/$1.obs.log" "$PASS_TIMEOUT_S" || return 1
+        sleep "$ADMIT_S"
+        cpu_window_begin "$1" || return 1
+    fi
+    T0=$(date +%s%N)
+    TOOLPIDS=""
+    i=1
+    while [ "$i" -le "$n" ]; do
+        tool_op "$2" "$1" &
+        oppid=$!
+        if [ -z "$TOOLPIDS" ]; then TOOLPIDS="$oppid"; else TOOLPIDS="$TOOLPIDS,$oppid"; fi
+        if wait "$oppid"; then :; else status=$?; echo "$1: tool op $i failed: $status" >&2; return "$status"; fi
+        i=$((i + 1))
+    done
+    T1=$(date +%s%N)
+    if [ "$3" = "inv-system" ]; then
+        cpu_window_end "$1"
+        sleep "$POST_SYS_S"
+        stop_observer "$1" || return 1
+        reclaim_root_output "$WORK/$1.json"
+    else
+        CPU_TICKS=0; CPU_RSS=0
+    fi
+    if [ "$3" = "inv-system" ]; then
+        vstatus=0
+        info=$(python3 -I "$WORK/validate.py" invsumcheck "$WORK/$1.json" "$MODULE" \
+            $(( n * TOOLK )) "$TOOLPIDS") 2>"$WORK/$1.verdict" || vstatus=$?
+        notes="uprobe=$ukind $info K=$TOOLK"
+        if [ "$vstatus" = 10 ]; then exact=0; notes="INVALID: $(cat "$WORK/$1.verdict") :: $notes";
+        elif [ "$vstatus" = 0 ]; then exact=1;
+        else echo "$1: report validation failed" >&2; cat "$WORK/$1.verdict" >&2; return 1; fi
+    else
+        exact=1; notes=""
+    fi
+    record "spy" "tool-$2" "$(basename "$MODULE")" "$3" 1 "$n" "$((T1-T0))" \
+        "$CPU_TICKS" "$CPU_RSS" "$exact" 0 "n/a" "$notes"
+}
+
 if echo " $PARTS " | grep -q " spy "; then
-echo "spy part is not implemented yet (needs the p11perftest CLI probe)" >&2
-exit 1
+echo "=== part spy ==="
+SPY_THREADS="$SPY_THREADS_BASE"
+case " $SPY_THREADS " in *" $NPROC "*) ;; *) SPY_THREADS="$SPY_THREADS $NPROC" ;; esac
+echo "threads: $SPY_THREADS coverages: $SPY_COV"
+for cov in $SPY_COV; do
+    for t in $SPY_THREADS; do
+        echo "--- spy $cov threads=$t ---"
+        ROUND="spy-$cov-t$t"
+        if want_spy plain; then sample_spy "spy-$cov-t$t-plain" plain "$cov" "$t" || exit 1; fi
+        if want_spy inv-pid; then sample_spy "spy-$cov-t$t-invpid" inv-pid "$cov" "$t" || exit 1; fi
+        if want_spy metrics; then sample_spy "spy-$cov-t$t-metrics" metrics "$cov" "$t" || exit 1; fi
+        if want_spy trace; then sample_spy "spy-$cov-t$t-trace" trace "$cov" "$t" || exit 1; fi
+        if want_spy spy-file; then sample_spy "spy-$cov-t$t-spyfile" spy-file "$cov" "$t" || exit 1; fi
+        if want_spy spy-null; then sample_spy "spy-$cov-t$t-spynull" spy-null "$cov" "$t" || exit 1; fi
+    done
+done
+if want_spy tool; then
+echo "--- spy tool loops ---"
+echo "tool loop input data" > "$WORK/tool-data.bin"
+pkcs11-tool --module "$MODULE" --login --pin 1234 --keygen --key-type generic:32 \
+    --label hmackey --usage-sign > "$WORK/tool-keygen.log" 2>&1 \
+    || { echo "tool hmackey keygen failed" >&2; tail -3 "$WORK/tool-keygen.log" >&2; exit 1; }
+pkcs11-tool --module "$MODULE" --login --pin 1234 --keypairgen --key-type rsa:2048 \
+    --label rsakey --usage-sign > "$WORK/tool-keypairgen.log" 2>&1 \
+    || { echo "tool rsakey keypairgen failed" >&2; tail -3 "$WORK/tool-keypairgen.log" >&2; exit 1; }
+for tool in pkcs11-tool p11tool; do
+    TOOLK=$(tool_k "$tool") || exit 1
+    echo "tool $tool: K=$TOOLK calls/op"
+    ROUND="tool-$tool"
+    sample_toolloop "spy-tool-$tool-unobs" "$tool" unobserved || exit 1
+    sample_toolloop "spy-tool-$tool-invsys" "$tool" inv-system || exit 1
+done
+fi
 fi
 
 echo "=== results: $RESULTS ==="

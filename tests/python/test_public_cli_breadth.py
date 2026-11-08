@@ -157,6 +157,138 @@ def inputs_for_evidence():
     return report, ledger, report["evidence"]
 
 
+MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal",
+            "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
+MT_BOGUS_RV = 0xB3  # CKR_SESSION_HANDLE_INVALID from a bogus session handle
+
+
+def mt_rv_key(rv):
+    return "0x%016x" % rv
+
+
+def mt_row_ledger(name, calls, errors):
+    row = {"name": name, "attempts": calls, "successful": calls - errors,
+           "rv_counts": {mt_rv_key(0): calls - errors}}
+    if errors:
+        row["rv_counts"][mt_rv_key(MT_BOGUS_RV)] = errors
+    return row
+
+
+def inputs_mt(*, metrics=False, scope="pid", calls=24, errors=0, cell):
+    targets = [{"name": name, "dev": [8, 1], "ino": 71,
+                "file_offset": 4096 + i * 16} for i, name in enumerate(MT_NAMES)]
+    report = {"schema": "p11scope/observed-profile/v3",
+              "lane": "profile", "capture": {"scope": scope, "mode": "profile"},
+              "functions": [{"names": [name], "calls": calls,
+                             "errors": errors if i == 0 else 0,
+                             "in_flight": 0, "pending_returns": 0,
+                             "module": dict(OWNED), "module_ambiguous": False, "module_unresolved": False,
+                             "rv_counts": dict(mt_row_ledger(name, calls, errors if i == 0 else 0)["rv_counts"]),
+                             "target": {"object": dict(OWNED),
+                                        "file_offset": 4096 + i * 16}}
+                            for i, name in enumerate(MT_NAMES)],
+              "evidence": {"completeness": "COMPLETE", "verdict_detail": "clean_proven",
+                           "in_flight_at_end": 0, "event_loss": 0,
+                           "discovery": [dict(OWNED, path="/owned.so", tables=[{}])],
+                           "modules_skipped": []}}
+    report["evidence"].update({key: 0 for key in LOSS_COUNTERS + VERDICT_COUNTERS})
+    report["evidence"].update(
+        slots=8, scan_unavailable=None, attach_failures=[], skipped=[], surfaces=[], aliased=[],
+        interface_list="absent", provider_changed=False, templates_truncated=False,
+        pause="none", pause_attempts=0, pause_confirmed=0,
+        scheduling={"terminal_drain_truncated": False, "sink_dropped_bytes": 0},
+        loader_discovery={"strategies": {"debug_state_every_hit": 0, "dlopen_return": 0, "unavailable": 0},
+                          "dlopen_timing": {"qualified_pre_constructor": 0, "known_pre_relocation": 0,
+                                            "unproven": 0, "none": 0, "pause_protected": 0},
+                          "initial_set_timing": {"qualified_pre_constructor": 0, "known_pre_relocation": 0,
+                                                 "unproven": 0, "none": 0, "pause_protected": 0},
+                          "initial_set_capture": {"eligible": 0, "none": 0, "pause_protected": 0},
+                          "state_read_failures": 0, "hits": 0},
+        pid_namespace={"observer": "initial", "kernel_pids": "initial", "proc_pids": "observer"},
+        drain_proven=True, stop_quiescence={"state": "proven", "post_q_events": False, "post_q_discovery": False})
+    report["evidence"]["gap_classes"] = {
+        "observation": {"status": "exact", "causes": []},
+        "attribution": {"status": "attested", "causes": []},
+        "semantics": {"status": "complete", "causes": []},
+        "open_calls": 0, "settlement": "proven", "stdout_data_sink": False}
+    report["evidence"]["kernel_control"] = {
+        "capture_halted": False, "owner_poison": [], "owner_admission_failures": 0,
+        "identity_unavailable": 0, "identity_budget_exhausted": False,
+        "root_affiliation_failures": []}
+    report["evidence"].update(
+        interface_selection={"selection_truncated": False, "providers": [],
+                             "standard_exports": [], "inventory_surfaces": [], "tuples": []},
+        attach_mechanisms=["per-offset"],
+        attach_backend={"selection": "singles", "fallback": None,
+                        "scope_filter": None if scope == "system" else "perf-task+bpf"},
+        pid_descendant_gaps=0, multi_rebuild_gaps=0)
+    if metrics:
+        report["schema"] = "p11scope/observed-profile/v3-metrics"
+        report["lane"] = report["capture"]["mode"] = "metrics"
+        for key in PROFILE_FIELDS:
+            del report["evidence"][key]
+    ledger = ["TARGET " + json.dumps(row) for row in targets]
+    ledger += ["READY pid=123", "LEDGER " + json.dumps({
+        "schema": "p11scope/public-cli-ledger/v2", "pid": 123, "complete": True,
+        "functions": [mt_row_ledger(name, calls, errors if i == 0 else 0)
+                      for i, name in enumerate(MT_NAMES)]})]
+    receipt = {"schema": "p11scope/public-cli-receipt/v1", "cell": cell,
+               "scope": scope, "count_domain": "owned-provider",
+               "launched_pid": 123, "generation": 456,
+               "ready_pid": 123, "ready_generation": 456,
+               "workload_ready": True, "capture_ready": True, "gate_released": True,
+               "observer_exit": 0, "workload_exit": 0, "ledger_complete": True,
+               "provider_before": provider_pin(), "provider_after": provider_pin()}
+    return report, ledger, receipt
+
+
+def mutate_mt_ledger(ledger, index, *, attempts=None, successful=None, rv_counts=None):
+    payload = json.loads(ledger[-1][len("LEDGER "):])
+    row = payload["functions"][index]
+    if attempts is not None:
+        row["attempts"] = attempts
+    if successful is not None:
+        row["successful"] = successful
+    if rv_counts is not None:
+        row["rv_counts"] = rv_counts
+    ledger[-1] = "LEDGER " + json.dumps(payload)
+
+
+def trace_stream_mt(*, calls_per_function=8, lost=0, event_loss=0, semantic_failures=0,
+                    truncated=False, stats_returned=None, raw_calls=None):
+    total = calls_per_function * len(MT_NAMES)
+    if stats_returned is None:
+        stats_returned = total
+    if raw_calls is None:
+        raw_calls = total - event_loss
+    lines = ["CAPTURE privacy=allowlisted"]
+    seq = 0
+    for name in MT_NAMES:
+        for _ in range(calls_per_function):
+            seq += 1
+            lines.append(f"00:00:{seq // 60:02d}.{seq % 60:06d} pid 123 tid 456 {name} \u2192 CKR_OK 1.0us")
+    if lost:
+        lines.append(f"LOST {lost} events")
+    if truncated:
+        lines.append("TRUNCATED at 100 events")
+    lines.append("COUNT_EVIDENCE " + json.dumps({
+        "stats_entered": stats_returned, "stats_returned": stats_returned, "raw_calls": raw_calls}))
+    _, _, ev = inputs_for_evidence()
+    ev["event_loss"] = event_loss
+    ev["semantic_capture_failures"] = semantic_failures
+    ev["trace_truncated"] = truncated
+    ev["final_drain"] = True
+    if event_loss == 0 and not truncated:
+        ev["completeness"] = "COMPLETE"
+        ev["verdict_detail"] = "clean_proven"
+    else:
+        ev["completeness"] = "PARTIAL"
+        ev["verdict_detail"] = "attribution_only"
+        ev["gap_classes"]["attribution"] = {"status": "withheld", "causes": ["trace_text"]}
+    lines.append("EVIDENCE " + json.dumps(ev))
+    return "\n".join(lines) + "\n"
+
+
 class BreadthTests(unittest.TestCase):
     def run_case(self, mutate=None, *, cell, want=0, report_text=None):
         metrics = cell in {"metrics-pid", "metrics-cgroup"} or cell.startswith("counter-") or cell.startswith("select-endpoint-")
@@ -653,6 +785,163 @@ class Gated32FixtureTests(unittest.TestCase):
         for row in ledgers[0]["functions"]:
             self.assertEqual(row["attempts"], 3)
             self.assertEqual(row["successful"], 3)
+
+
+class MtOracleTests(unittest.TestCase):
+    """Multi-threaded same-provider exact cells: every count, error and
+    return-value assertion has a healthy twin and a failing twin."""
+
+    def run_case_mt(self, mutate=None, *, cell, want=0, calls=24, errors=0,
+                    report_text=None, allow_pid_descendant_gaps=False):
+        metrics = cell in {"mt-metrics", "counter-latency-mt"}
+        scope = "system" if cell == "mt-system" else "pid"
+        report, ledger, receipt = inputs_mt(metrics=metrics, scope=scope, calls=calls,
+                                            errors=errors if cell == "mt-errors" else 0,
+                                            cell=cell)
+        if cell == "counter-latency-mt":
+            report["evidence"]["counter_collection"] = {
+                "mode": "latency", "generation": 1,
+                "read_window": {"started_ns": 100, "finished_ns": 200},
+                "status": "fresh", "health": {"saturated": False, "contended": False},
+                "discontinuity": False, "failure": None}
+            for row in report["functions"]:
+                row["latency_ns"] = {"approximate": True, "p50": 50, "p95": 90, "p99": 95,
+                                     "total": 1000, "max": 100}
+        if mutate:
+            mutate(report, ledger, receipt)
+        with tempfile.TemporaryDirectory() as raw:
+            tmp = Path(raw)
+            paths = {}
+            for key, value in (("report", report), ("receipt", receipt)):
+                paths[key] = tmp / key
+                text = json.dumps(value)
+                if report_text is not None and key == "report":
+                    text = report_text
+                paths[key].write_text(text)
+            paths["ledger"] = tmp / "ledger"
+            paths["ledger"].write_text("\n".join(ledger) + "\n")
+            args = [sys.executable, "-I", str(ORACLE),
+                    "--cell", cell, *sum((["--" + key, str(path)]
+                                         for key, path in paths.items()), [])]
+            if allow_pid_descendant_gaps:
+                args.append("--allow-pid-descendant-gaps")
+            proc = subprocess.run(args, capture_output=True, text=True, timeout=5)
+        self.assertEqual(proc.returncode, want, proc.stdout + proc.stderr)
+        result = json.loads(proc.stdout)
+        self.assertEqual(result["cell"], cell)
+        self.assertEqual(result["pass"], want == 0)
+        return result
+
+    def test_mt_metrics_exact_passes(self):
+        self.run_case_mt(cell="mt-metrics")
+
+    def test_mt_errors_exact_passes(self):
+        self.run_case_mt(cell="mt-errors", errors=3)
+
+    def test_mt_shared_exact_passes(self):
+        self.run_case_mt(cell="mt-shared")
+
+    def test_mt_churn_exact_passes(self):
+        self.run_case_mt(cell="mt-churn")
+
+    def test_mt_system_exact_passes(self):
+        # The merged multi-process ledger is exact on its own terms; the
+        # single-workload 500-per-target system rule does not apply.
+        self.run_case_mt(cell="mt-system", calls=40)
+
+    def test_counter_latency_mt_exact_passes(self):
+        self.run_case_mt(cell="counter-latency-mt")
+
+    def test_mt_ledger_plus_one_fails(self):
+        # A coherent fixture ledger claiming one call more than the observer
+        # saw must fail on the observer-vs-ledger comparison, not on ledger
+        # self-consistency.
+        def mutate(d, l, r):
+            mutate_mt_ledger(l, 2, attempts=25, successful=25,
+                             rv_counts={mt_rv_key(0): 25})
+        result = self.run_case_mt(mutate, cell="mt-shared", want=1)
+        self.assertIn("owned target count differs from independent ledger",
+                      result["detail"])
+
+    def test_mt_report_overcount_fails(self):
+        self.run_case_mt(lambda d, l, r: d["functions"][5].update(calls=25),
+                         cell="mt-shared", want=1)
+
+    def test_mt_report_undercount_fails(self):
+        self.run_case_mt(lambda d, l, r: d["functions"][5].update(calls=23),
+                         cell="mt-metrics", want=1)
+
+    def test_mt_hidden_error_fails(self):
+        # The ledger proves 3 failed calls; an observer row claiming zero
+        # errors with a clean return map contradicts it.
+        def mutate(d, l, r):
+            d["functions"][0].update(errors=0, rv_counts={mt_rv_key(0): 24})
+        result = self.run_case_mt(mutate, cell="mt-errors", errors=3, want=1)
+        self.assertIn("owned target error count differs from independent ledger",
+                      result["detail"])
+
+    def test_mt_rv_drift_fails(self):
+        # Same totals, but one return moved between codes: the map must match exactly.
+        def mutate(d, l, r):
+            d["functions"][0]["rv_counts"] = {mt_rv_key(0): 22, mt_rv_key(MT_BOGUS_RV): 2}
+        result = self.run_case_mt(mutate, cell="mt-errors", errors=3, want=1)
+        self.assertIn("owned target return map differs from independent ledger",
+                      result["detail"])
+
+    def test_mt_missing_rv_counts_fails_closed(self):
+        self.run_case_mt(lambda d, l, r: d["functions"][1].pop("rv_counts"),
+                         cell="mt-shared", want=1)
+
+    def test_mt_unexpected_error_fails(self):
+        self.run_case_mt(lambda d, l, r: d["functions"][4].update(errors=1),
+                         cell="mt-churn", want=1)
+
+    def test_mt_v1_ledger_without_rv_proof_fails(self):
+        # MT cells require ledger v2: per-function return maps, not bare totals.
+        def mutate(d, l, r):
+            payload = json.loads(l[-1][len("LEDGER "):])
+            payload["schema"] = "p11scope/public-cli-ledger/v1"
+            for row in payload["functions"]:
+                row.pop("rv_counts", None)
+            l[-1] = "LEDGER " + json.dumps(payload)
+        self.run_case_mt(mutate, cell="mt-shared", want=1)
+
+    def test_mt_ledger_rv_sum_mismatch_fails(self):
+        def mutate(d, l, r):
+            mutate_mt_ledger(l, 0, rv_counts={mt_rv_key(0): 20})
+        self.run_case_mt(mutate, cell="mt-shared", want=1)
+
+    def test_mt_trace_loss_identity_passes_as_smoke(self):
+        text = trace_stream_mt(calls_per_function=3)
+        report, ledger, _ = inputs_mt(scope="pid", calls=3, cell="mt-trace")
+        payload = json.loads(ledger[-1][len("LEDGER "):])
+        self.assertEqual(payload["functions"][0]["attempts"], 3)
+        self.run_case_mt(cell="mt-trace", want=2, calls=3, report_text=text)
+
+    def test_mt_trace_wrong_line_count_fails(self):
+        text = trace_stream_mt(calls_per_function=2)
+        self.run_case_mt(cell="mt-trace", want=1, calls=3, report_text=text)
+
+    def test_mt_trace_malformed_stream_fails(self):
+        self.run_case_mt(cell="mt-trace", want=1, report_text="CALL \u2192 done\n" * 42)
+
+    def test_mt_system_runner_noise_disclosed(self):
+        def mutate(d, l, r):
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap",
+                                 pid_descendant_gaps=2)
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+        result = self.run_case_mt(mutate, cell="mt-system", calls=40, want=0,
+                                  allow_pid_descendant_gaps=True)
+        self.assertIn("disclosed runner noise", result["detail"])
+
+    def test_mt_system_runner_noise_strict_fails(self):
+        def mutate(d, l, r):
+            d["evidence"].update(completeness="PARTIAL", verdict_detail="concrete_gap",
+                                 pid_descendant_gaps=2)
+            d["evidence"]["gap_classes"]["observation"] = {
+                "status": "lossy", "causes": ["pid_descendant_gaps"]}
+        self.run_case_mt(mutate, cell="mt-system", calls=40, want=1)
 
 
 if __name__ == "__main__":

@@ -18,6 +18,14 @@ import sys
 
 NAMES = ("C_GenerateRandom", "C_DigestInit", "C_Digest",
          "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal")
+# Multi-threaded same-provider exact cells: N threads in one process (and, for
+# mt-system, several processes) call the same provider concurrently; the
+# fixture ledger carries per-function return maps (ledger v2), so every
+# count, error and CKR total is asserted exactly.
+MT_NAMES = ("C_GenerateRandom", "C_DigestInit", "C_DigestUpdate", "C_DigestFinal",
+            "C_FindObjectsInit", "C_FindObjects", "C_FindObjectsFinal", "C_GetSessionInfo")
+MT_CELLS = {"mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-trace", "mt-system",
+            "counter-latency-mt"}
 COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
                "names-pid", "verdict-pid",
                "run-short", "run-cover", "run-ia32", "sigint",
@@ -25,8 +33,10 @@ COUNT_CELLS = {"profile-pid", "metrics-pid", "mt-exact", "system",
                "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
                "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
                "select-endpoint-pid", "select-endpoint-system",
-               "profile-pid-ia32"}
-SMOKE_CELLS = {"trace-pid", "trace-cgroup"}
+               "profile-pid-ia32",
+               "mt-metrics", "mt-errors", "mt-shared", "mt-churn", "mt-system",
+               "counter-latency-mt"}
+SMOKE_CELLS = {"trace-pid", "trace-cgroup", "mt-trace"}
 RUN_CELLS = {"run-short", "run-cover", "run-ia32"}
 COUNTER_MODES = {
     "counter-counts-pid": "counts", "counter-timestamps-pid": "timestamps",
@@ -34,9 +44,10 @@ COUNTER_MODES = {
     "counter-counts-system": "counts", "counter-timestamps-system": "timestamps",
     "counter-latency-system": "latency",
     "select-endpoint-pid": "counts", "select-endpoint-system": "counts",
+    "counter-latency-mt": "latency",
 }
 CELL_SCOPES = {
-    "system": "system",
+    "system": "system", "mt-system": "system",
     "counter-counts-system": "system", "counter-timestamps-system": "system",
     "counter-latency-system": "system", "select-endpoint-system": "system",
     "profile-cgroup": "cgroup", "metrics-cgroup": "cgroup", "trace-cgroup": "cgroup",
@@ -47,7 +58,8 @@ CELL_SCOPES = {
 METRICS_CELLS = {"metrics-pid", "metrics-cgroup",
                  "counter-counts-pid", "counter-timestamps-pid", "counter-latency-pid",
                  "counter-counts-system", "counter-timestamps-system", "counter-latency-system",
-                 "select-endpoint-pid", "select-endpoint-system"}
+                 "select-endpoint-pid", "select-endpoint-system",
+                 "mt-metrics", "counter-latency-mt"}
 LOSS_COUNTERS = ("event_loss", "in_flight_at_end", "start_insert_failures", "unmatched_returns",
                  "rv_update_failures", "cgroup_scope_failures", "abi_refusals", "malformed_records",
                  "discovery_ring_loss", "discovery_state_failures", "discovery_read_failures",
@@ -218,20 +230,41 @@ def fixture(text, receipt, cell):
             "workload READY does not match launched PID")
     require(len(ledgers) == 1, "missing or duplicate complete LEDGER")
     ledger = ledgers[0]
-    require(ledger.get("schema") == "p11scope/public-cli-ledger/v1" and
-            ledger.get("pid") == pid and ledger.get("complete") is True,
+    mt = cell in MT_CELLS
+    schema = ledger.get("schema")
+    if mt:
+        require(schema == "p11scope/public-cli-ledger/v2",
+                "MT cells require a ledger v2 return-map proof")
+    else:
+        require(schema == "p11scope/public-cli-ledger/v1",
+                "invalid fixture ledger schema")
+    require(ledger.get("pid") == pid and ledger.get("complete") is True,
             "invalid or incomplete fixture ledger")
-    names = {NAMES[0]} if cell == "mt-exact" else set(NAMES)
+    names = {NAMES[0]} if cell == "mt-exact" else (set(MT_NAMES) if mt else set(NAMES))
     functions = ledger.get("functions")
     require(isinstance(functions, list), "missing ledger functions")
-    expected = {}
+    expected, errinfo = {}, {}
     for row in functions:
         name = row.get("name")
         require(name in names and name not in expected, "duplicate or unexpected ledger function")
         attempts, successes = row.get("attempts"), row.get("successful")
-        require(integer(attempts) and integer(successes) and attempts > 0 and attempts == successes,
-                "workload had failed calls or no successful calls")
-        if CELL_SCOPES.get(cell, "pid") == "system":
+        if mt:
+            require(integer(attempts) and integer(successes) and attempts > 0 and
+                    0 <= successes <= attempts, "invalid ledger attempts/successful: " + name)
+            counts = row.get("rv_counts")
+            require(isinstance(counts, dict) and counts and
+                    all(re.fullmatch(r"0x[0-9a-f]{16}", key) is not None and integer(value)
+                        for key, value in counts.items()),
+                    "invalid ledger return map: " + name)
+            require(sum(counts.values()) == attempts and
+                    counts.get("0x0000000000000000", 0) == successes,
+                    "ledger return map disagrees with attempts/successful: " + name)
+            errinfo[name] = (attempts - successes, dict(counts))
+        else:
+            require(integer(attempts) and integer(successes) and attempts > 0 and attempts == successes,
+                    "workload had failed calls or no successful calls")
+            errinfo[name] = (0, None)
+        if CELL_SCOPES.get(cell, "pid") == "system" and cell != "mt-system":
             require(attempts == 500, "strict SYSTEM requires 500 successful calls per target: " + name)
         expected[name] = attempts
     require(set(expected) == names, "missing fixture ledger function")
@@ -248,7 +281,7 @@ def fixture(text, receipt, cell):
         physical[name] = key
         seen.add(key)
     require(set(physical) == names, "missing fixture target")
-    return expected, physical
+    return expected, physical, errinfo
 
 
 def common(receipt, cell):
@@ -477,11 +510,11 @@ def run_judge(evidence):
 
 def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=False):
     require(cell in COUNT_CELLS | SMOKE_CELLS, "undeclared cell")
-    # Ruling CI-GAP-1: only the hosted-runner host system cell may disclose
+    # Ruling CI-GAP-1: only the hosted-runner host system cells may disclose
     # short-lived descendant exits as runner noise, via an explicit flag.
-    relaxed = cell == "system" and allow_pid_descendant_gaps is True
+    relaxed = cell in {"system", "mt-system"} and allow_pid_descendant_gaps is True
     common(receipt, cell)
-    expected, physical = fixture(ledger_text, receipt, cell)
+    expected, physical, errinfo = fixture(ledger_text, receipt, cell)
     if cell in SMOKE_CELLS:
         trace_judge(report_text, expected)
         raise Nonqualifying("trace delivery/count checked with loss identity; text lacks attributable physical targets")
@@ -568,18 +601,26 @@ def judge(report_text, ledger_text, receipt, cell, *, allow_pid_descendant_gaps=
     # A null-object row at the expected offset can only keep identity unknown; it
     # never supplies a qualifying match and never excuses a known row's deficit.
     for name, key in physical.items():
+        want_errors, want_rv = errinfo[name]
         if key not in observed:
             possible = [row for row in unknown if row["target"]["file_offset"] == key[-1]]
             require(any(row["calls"] == expected[name] and name in row["names"] and
-                        all(row[counter] == 0 for counter in ("errors", "in_flight", "pending_returns"))
+                        row["errors"] == want_errors and
+                        all(row[counter] == 0 for counter in ("in_flight", "pending_returns")) and
+                        (want_rv is None or row.get("rv_counts") == want_rv)
                         for row in possible), "missing owned physical target: " + name)
             continue
         row = observed[key]
         require(type(row.get("calls")) is int and row["calls"] == expected[name],
                 "owned target count differs from independent ledger: " + name)
-        for counter in ("errors", "in_flight", "pending_returns"):
+        require(type(row.get("errors")) is int and row["errors"] == want_errors,
+                "owned target error count differs from independent ledger: " + name)
+        for counter in ("in_flight", "pending_returns"):
             require(type(row.get(counter)) is int and row[counter] == 0,
-                    "owned target has failed or unsettled returns: " + name)
+                    "owned target has unsettled returns: " + name)
+        if want_rv is not None:
+            require(row.get("rv_counts") == want_rv,
+                    "owned target return map differs from independent ledger: " + name)
         require(isinstance(row.get("names"), list) and name in row["names"],
                 "physical target semantic name differs: " + name)
         owner = ownership(row)

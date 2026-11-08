@@ -123,6 +123,31 @@ def matrix_kernels(bpf_text):
             if kernel.strip()]
 
 
+def deb_matches_kernel(deb, kernel):
+    """True when a vng deb filename belongs to a matrix kernel tag.
+
+    Stable tags match by substring (v7.3.1 ships 7.3.1 debs).
+    Release candidates ship the dotted triplet instead (v7.4-rc1 ships
+    7.4.0-070400rc1 debs), so the triplet prefix plus the same rc
+    marker must match, never another rc number (mirrors
+    scripts/bpf-guest-release.sh)."""
+    numeric = kernel[1:] if kernel.startswith("v") else kernel
+    if numeric in deb:
+        return True
+    base, sep, tag = numeric.partition("-rc")
+    if not sep or not tag.isdigit():
+        return False
+    at = deb.find(f"{base}.0-")
+    if at < 0:
+        return False
+    marker = f"rc{tag}"
+    pos = deb.find(marker, at)
+    if pos < 0:
+        return False
+    tail = deb[pos + len(marker):pos + len(marker) + 1]
+    return tail == "" or not tail.isdigit()
+
+
 def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
     """Every matrix kernel has a well-formed sums file; no sums file
     names an unknown kernel; historical 5.15 checksums are retained."""
@@ -136,7 +161,6 @@ def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
         if not path.is_file():
             problems.append(f"missing sums file: {path.name}")
             continue
-        numeric = kernel[1:] if kernel.startswith("v") else kernel
         seen = set()
         for number, line in enumerate(
                 path.read_text(encoding="utf-8").splitlines(), 1):
@@ -152,7 +176,7 @@ def check_kernel_sums(bpf_text, sums_dir, other_kernels=()):
                 continue
             seen.add(deb)
             if "headers" in deb or not DEB_NAME.match(deb) \
-                    or numeric not in deb:
+                    or not deb_matches_kernel(deb, kernel):
                 problems.append(f"{path.name}:{number}: not a vng deb of "
                                 f"{kernel}: {deb!r}")
         if not seen:
@@ -228,9 +252,25 @@ class BpfKernelsContractTests(unittest.TestCase):
         self.assertTrue(others, "privileged-tests.yml names no guest kernels")
         self.assertEqual([], check_kernel_sums(self.bpf, SUMS_DIR, others))
 
+    def test_deb_names_match_stable_and_rc_tags(self):
+        stable = ("linux-image-unsigned-7.3.1-070301-generic_"
+                  "7.3.1-070301.202610301300_amd64.deb")
+        rc1 = ("linux-image-unsigned-7.4.0-070400rc1-generic_"
+               "7.4.0-070400rc1.202611012313_amd64.deb")
+        rc2 = rc1.replace("rc1", "rc2")
+        rc10 = rc1.replace("rc1", "rc10")
+        self.assertTrue(deb_matches_kernel(stable, "v7.3.1"))
+        self.assertFalse(deb_matches_kernel(stable, "v6.6.157"))
+        self.assertTrue(deb_matches_kernel(rc1, "v7.4-rc1"))
+        self.assertFalse(deb_matches_kernel(rc2, "v7.4-rc1"))
+        self.assertFalse(deb_matches_kernel(rc1, "v7.4-rc2"))
+        self.assertFalse(deb_matches_kernel(rc10, "v7.4-rc1"))
+        self.assertFalse(deb_matches_kernel(stable, "v7.4-rc1"))
+
     def test_active_positives_and_combined_stock_refusals_are_separate(self):
         self.assertEqual(matrix_kernels(self.bpf),
-                         ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1"])
+                         ["v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
+                          "v7.4-rc1"])
         controls = re.findall(r"- kernel: (v[0-9.]+)\n\s+refusal_control: true", self.bpf)
         self.assertEqual(controls, ["v6.1.188", "v5.15.221"])
         self.assertEqual(self.bpf.count("scripts/check-multi-host-refusal.py"), 1)

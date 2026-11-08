@@ -575,13 +575,14 @@ class PrivilegedTestsWorkflowTests(unittest.TestCase):
         self.assertIn("minimal-cells/logs/*.out", job)
         self.assertIn("minimal.log", job)
 
-    def test_witness_cli_matrix_runs_host_and_the_four_pinned_guests(self):
+    def test_witness_cli_matrix_runs_host_and_the_five_pinned_guests(self):
         job = job_body(self.yml, "witness-cli")
         match = re.search(r"kernel:\s*\[(.*?)\]", job)
         self.assertIsNotNone(match, "witness-cli has no kernel matrix")
         kernels = [kernel.strip() for kernel in match.group(1).split(",")]
         self.assertEqual(kernels,
-                         ["host", "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1"])
+                         ["host", "v6.6.157", "v6.12.111", "v6.18.58", "v7.3.1",
+                          "v7.4-rc1"])
         sums = ROOT / "tests" / "fixtures" / "vng-kernel-sha256sums"
         for kernel in kernels[1:]:
             self.assertTrue((sums / f"{kernel}.sums").is_file(),

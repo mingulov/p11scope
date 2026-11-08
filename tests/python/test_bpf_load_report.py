@@ -27,15 +27,16 @@ COUNTER_BUDGETS_FILE = ROOT / "tests/counter-bpf-verifier-budgets.json"
 KERNEL = "v6.1.188-test"
 OBSERVER = "ab" * 32
 # The driver's default kernel list (scripts/check-bpf-load-kernels.sh)
-# plus the 7.0 guest the budgets also cover. Variant-group members
-# split this set instead of carrying it whole (see below). Each
-# budget-key namespace (prefix before "/") pins its own kernel set;
-# all five namespaces currently cover the same measured 5-kernel set.
+# plus the 7.0 guest and the 7.4-rc1 newest-mainline cell the budgets
+# also cover. Variant-group members split this set instead of carrying
+# it whole (see below). Each budget-key namespace (prefix before "/")
+# pins its own kernel set; all five namespaces currently cover the
+# same measured 6-kernel set.
 EXPECTED_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
 })
 EXPECTED_GATE1_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
 })
 EXPECTED_BUDGET_KERNELS_BY_NAMESPACE = {
     "detailed": EXPECTED_BUDGET_KERNELS,
@@ -73,7 +74,7 @@ EXCLUSIVE_VARIANT_GROUPS = [
 # modes. Every loaded counter program has a cell for each 6.6+ kernel
 # and nothing else.
 EXPECTED_COUNTER_BUDGET_KERNELS = frozenset({
-    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1",
+    "v6.6.157", "v6.12.111", "v6.18.58", "v7.0.14", "v7.3.1", "v7.4-rc1",
 })
 _COUNTER_MODES = ("counts", "timestamps", "latency")
 _COUNTER_ROOTS = (

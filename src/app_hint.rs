@@ -625,8 +625,8 @@ fn comm_script_token<'a>(args: &[&'a [u8]]) -> Option<&'a [u8]> {
 /// Whether `comm` is the name the kernel set at exec: it must equal the
 /// first 15 bytes (`TASK_COMM_LEN`) of the basename of the
 /// script-position token from the same cmdline sample. comm is writable
-/// by the process (`$0`, prctl), and a rewritten title arrives as a
-/// single cmdline token with no script position — so an unmatched comm
+/// by the process (`$0`, prctl), and a rewritten title leaves no
+/// script-position token whose basename matches — so an unmatched comm
 /// is never published.
 fn comm_matches_script(comm: &str, cmdline: &[u8]) -> bool {
     let tokens = complete_tokens(cmdline);

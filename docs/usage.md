@@ -1990,7 +1990,7 @@ roles, and the exact set depends on the target, attach backend and host policy:
 | `CAP_SYS_PTRACE` | Read a target's memory when ptrace/Yama or cross-UID checks require it. |
 | `CAP_DAC_READ_SEARCH` | Open provider files or traverse target paths otherwise unreadable to the observer. |
 | `CAP_CHECKPOINT_RESTORE` or `CAP_SYS_ADMIN` | Follow target `map_files` for Inventory's past-scan-cap identity proof. |
-| `CAP_SYS_ADMIN` | Only the `--attach-backend singles` fallback on restrictive `perf_event_paranoid >= 3` hosts (per-probe `perf_event` uprobes); the default uprobe-multi lane needs none of it. Also covers the BPF/perf checks. |
+| `CAP_SYS_ADMIN` | The `--attach-backend singles` fallback on restrictive `perf_event_paranoid >= 3` hosts (per-probe `perf_event` uprobes); owned `run` sessions, which keep it for post-setup attach/confirm/discovery; and the DaemonSet-style fallback where the narrow BPF/perf/map_files grants are absent. The default non-owned uprobe-multi lane sheds it after setup. Also covers the BPF/perf checks. |
 
 This is a conditional roles list, not one portable minimum or a reason to grant
 all listed capabilities. Offline processing needs no BPF privileges. Capabilities
@@ -2215,9 +2215,14 @@ CAP_...` line rather than a raw errno. `run` as root additionally needs
 `CAP_SETUID`, `CAP_SETGID` and `CAP_KILL` in the invoking set for the
 identity drop and child signalling; the observer keeps them whenever
 they are held, and a container that drops them fails the child with an
-`EPERM` instead of a needs-line. After setup the observer drops
-capabilities the rest of the capture does not need, and a `run` child
-never inherits any. Dynamic loader/export probes link only where the
+`EPERM` instead of a needs-line. After setup a non-owned capture drops
+`CAP_SYS_ADMIN` when its narrow grants cover the rest of the run (multi
+backend with linked dynamics plus `CAP_BPF`, `CAP_PERFMON` and
+`CAP_CHECKPOINT_RESTORE` held); owned `run` sessions never shed it, and
+a `run` child never inherits any capability. `inspect` keeps the full
+live set including `CAP_BPF`/`CAP_PERFMON`: it loads the short-lived
+kernel identity witness for overlay/9p original-file proofs. Dynamic
+loader/export probes link only where the
 kernel's uprobe-multi pid filter is proven (a functional probe at startup;
 6.10+, or 6.9.12+/6.6.y with the backport) — where it is not, they stay on
 perf, which paranoid 3+ gates to `CAP_SYS_ADMIN`. The DEB/RPM packages set

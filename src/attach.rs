@@ -11098,7 +11098,9 @@ pub(crate) fn drop_post_setup_capabilities_for(
     owned: bool,
     worker: Option<&CleanupWorker>,
 ) -> std::io::Result<()> {
-    let _ = owned;
+    if owned {
+        return Ok(());
+    }
     let multi = backend == AttachBackend::Multi;
     if !multi || !dynamic_multi {
         return Ok(());

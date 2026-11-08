@@ -7,9 +7,11 @@
 //! `PinnedObjects` (the same `absorb` semantics, so aliases merge and
 //! same-path observations stay comparable), and the aggregate is lowered
 //! through the existing plan-lowering path — scan evidence only, no
-//! manifests — far enough to report per-object admission state. No BPF, no
-//! attach, no slot reservation, no history latching: `inspect` lowers under
-//! the Detailed policy and drops the plan with the catalog after rendering.
+//! manifests — far enough to report per-object admission state. No
+//! attach, no slot reservation, no history latching (the short-lived
+//! kernel identity witness BPF load for overlay/9p proofs excepted):
+//! `inspect` lowers under the Detailed policy and drops the plan with
+//! the catalog after rendering.
 //! The inventory command lowers the same collection under its Inventory
 //! policy instead and hands the plan and the aggregate pins to its attach
 //! set (`CatalogLowering`), so the pins this pass opened and hashed are

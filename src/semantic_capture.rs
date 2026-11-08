@@ -1771,9 +1771,21 @@ impl SemanticCapture {
         self.router.mark_admitted(image, file);
     }
 
+    /// Count coordinator admissions that found no binding for their
+    /// image (diagnostic-only funnel beside the mark counts).
+    pub(crate) fn note_admission_binding_misses_for(&mut self, misses: u64) {
+        self.router.note_admission_binding_misses(misses);
+    }
+
     /// Admitted-mint telemetry for the stop disclosure (counts only).
     pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
         self.router.admitted_mint_counts()
+    }
+
+    /// Diagnostic-only mark funnel for the stop disclosure (counts
+    /// only): attempts, duplicate refusals, cap refusals, misses.
+    pub(crate) fn admitted_mark_funnel_counts(&self) -> (u64, u64, u64, u64) {
+        self.router.admitted_mark_funnel_counts()
     }
     /// Test-only drain reach for the live twins: production `accept_scan`
     /// already consumes this queue into every TickReport, so live twins

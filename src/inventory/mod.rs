@@ -3119,6 +3119,10 @@ struct SemanticStopCounts {
     instances: u64,
     admitted_reported: u64,
     admitted_attached: u64,
+    marks_attempted: u64,
+    marks_refused_dup: u64,
+    marks_refused_cap: u64,
+    admission_binding_miss: u64,
 }
 
 impl SemanticStopCounts {
@@ -3132,6 +3136,8 @@ impl SemanticStopCounts {
         let bindings = coordinator.semantic_bindings_mut().len() as u64;
         let (hook_misses, eras, instances) = lane.semantic_era_counts();
         let (admitted_reported, admitted_attached) = lane.admitted_mint_counts();
+        let (marks_attempted, marks_refused_dup, marks_refused_cap, admission_binding_miss) =
+            lane.admitted_mark_funnel_counts();
         Self {
             refusals,
             collected,
@@ -3145,6 +3151,10 @@ impl SemanticStopCounts {
             instances,
             admitted_reported,
             admitted_attached: admitted_attached as u64,
+            marks_attempted,
+            marks_refused_dup,
+            marks_refused_cap,
+            admission_binding_miss,
         }
     }
 }
@@ -3185,6 +3195,10 @@ fn disclose_semantic_stop(
             counts.admitted_reported,
             counts.admitted_attached,
             coordinator.joint_feeds() as u64,
+            counts.marks_attempted,
+            counts.marks_refused_dup,
+            counts.marks_refused_cap,
+            counts.admission_binding_miss,
         ));
         let seals = coordinator.seal_diagnosis();
         warn.emit(&crate::inventory_semantics::joint_seals_line(
@@ -25258,6 +25272,10 @@ mod promotion_driver_tests {
             instances: 0,
             admitted_reported: 0,
             admitted_attached: 0,
+            marks_attempted: 0,
+            marks_refused_dup: 0,
+            marks_refused_cap: 0,
+            admission_binding_miss: 0,
         };
         disclose_semantic_stop(&counts, &mut coordinator, &mut warn);
         assert_eq!(

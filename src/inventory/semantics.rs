@@ -1568,12 +1568,27 @@ pub(crate) fn settlement_latency_line(
 }
 
 /// One stderr line for the diagnostic admitted-mint summary: continued
-/// observations that reported `AdmittedFirst`, and receipts that
-/// attached the birth. Counts only; no identities, paths or payloads.
-/// Diagnostic-only: printed beside the stop line only while stage
-/// timings are requested, never a contract.
-pub(crate) fn admitted_mints_line(reported: u64, attached: u64, feeds: u64) -> String {
-    format!("p11scope: admitted mints: reported={reported} attached={attached} feeds={feeds}")
+/// observations that reported `AdmittedFirst`, receipts that
+/// attached the birth, applied Joint feeds, and the mark funnel
+/// (mark attempts, duplicate refusals, cap refusals, admissions
+/// that found no binding for their image). Counts only; no
+/// identities, paths or payloads. Diagnostic-only: printed
+/// beside the stop line only while stage timings are requested,
+/// never a contract.
+pub(crate) fn admitted_mints_line(
+    reported: u64,
+    attached: u64,
+    feeds: u64,
+    marks_attempted: u64,
+    marks_refused_dup: u64,
+    marks_refused_cap: u64,
+    admission_binding_miss: u64,
+) -> String {
+    format!(
+        "p11scope: admitted mints: reported={reported} attached={attached} feeds={feeds} \
+         marks_attempted={marks_attempted} marks_refused_dup={marks_refused_dup} \
+         marks_refused_cap={marks_refused_cap} admission_binding_miss={admission_binding_miss}"
+    )
 }
 
 /// One stderr line for the diagnostic joint-seal summary: seal
@@ -1841,12 +1856,30 @@ impl AttestedSemanticLane {
         }
     }
 
+    /// Count coordinator admissions that found no binding for their
+    /// image. A shell lane stages without a capture and notes
+    /// nothing.
+    pub(crate) fn note_admission_binding_misses_for(&mut self, misses: u64) {
+        if let Some(live) = self.live.as_mut() {
+            live.capture.note_admission_binding_misses_for(misses);
+        }
+    }
+
     /// Admitted-mint telemetry for the stop disclosure: (reported,
     /// attached). Zeros without a live lane. Counts only.
     pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
         self.live
             .as_ref()
             .map_or((0, 0), |live| live.capture.admitted_mint_counts())
+    }
+
+    /// Diagnostic-only mark funnel for the stop disclosure:
+    /// (attempts, duplicate refusals, cap refusals, binding
+    /// misses). Zeros without a live lane. Counts only.
+    pub(crate) fn admitted_mark_funnel_counts(&self) -> (u64, u64, u64, u64) {
+        self.live.as_ref().map_or((0, 0, 0, 0), |live| {
+            live.capture.admitted_mark_funnel_counts()
+        })
     }
 
     /// Lane-stash pending floor for the finalizer's disposition: the

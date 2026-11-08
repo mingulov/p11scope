@@ -4106,6 +4106,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         // wasted. Kept beside the staged batch (the closure below
         // only borrows the lane through `subset`).
         let mut admitted_marks: Vec<(ImageIdentity, u32)> = Vec::new();
+        // Diagnostic-only funnel beside the marks: admissions that
+        // found no binding for their image. Counted here, armed on
+        // the lane's router after staging like the marks.
+        let mut binding_misses: u64 = 0;
         let staged: Vec<(
             Option<CallerId>,
             u64,
@@ -4126,7 +4130,10 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                     .semantic_bindings
                     .find_by_image(evidence.domain(), evidence.image());
                 let (caller, converted) = match found {
-                    None => (None, Err(ConversionRefusal::Custody)),
+                    None => {
+                        binding_misses = binding_misses.saturating_add(1);
+                        (None, Err(ConversionRefusal::Custody))
+                    }
                     Some(binding) => {
                         let caller = binding.caller();
                         if self.adapter.leader_exit_pending(caller) {
@@ -4199,6 +4206,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         for (image, file) in admitted_marks {
             lane.mark_admitted_for(image, file);
         }
+        lane.note_admission_binding_misses_for(binding_misses);
         Some(PreparedSemanticBatch::new(
             domain,
             staged.into_iter().map(PreparedAdmission::new).collect(),

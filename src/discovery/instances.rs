@@ -684,6 +684,15 @@ pub(crate) struct RouterCounters {
     /// reported `AdmittedFirst` (a subset of `continued`, which keeps
     /// its existing all-arms total).
     pub(crate) admitted_first: u64,
+    /// Diagnostic-only admitted-mark funnel: mark attempts, refusals
+    /// for an already-minted/pending key, refusals past the union
+    /// cap, and coordinator admissions that found no binding for
+    /// their image. Counts only; disclosed beside the stop line
+    /// while stage timings are requested, never a contract.
+    pub(crate) marks_attempted: u64,
+    pub(crate) marks_refused_dup: u64,
+    pub(crate) marks_refused_cap: u64,
+    pub(crate) admission_binding_miss: u64,
     pub(crate) coverage_faults: u64,
     pub(crate) eras: u64,
     /// Era advances latched by a hook-program miss the capture loop had not
@@ -912,15 +921,25 @@ impl InstanceRouter {
     /// and past the union cap (both fail closed to the old
     /// behavior: no quantum, no poison).
     pub(crate) fn mark_admitted(&mut self, image: ImageIdentity, file: u32) {
+        self.counters.marks_attempted = self.counters.marks_attempted.saturating_add(1);
         let key = (ImageKey::from(image), file);
         if self.admitted_minted.contains(&key) || self.admitted_pending.contains(&key) {
+            self.counters.marks_refused_dup = self.counters.marks_refused_dup.saturating_add(1);
             return;
         }
         let marked = self.admitted_pending.len() + self.admitted_minted.len();
         if marked >= self.limits.observed_keys {
+            self.counters.marks_refused_cap = self.counters.marks_refused_cap.saturating_add(1);
             return;
         }
         self.admitted_pending.insert(key);
+    }
+
+    /// Count coordinator admissions that found no binding for their
+    /// image (diagnostic-only funnel beside the mark counts).
+    pub(crate) fn note_admission_binding_misses(&mut self, misses: u64) {
+        self.counters.admission_binding_miss =
+            self.counters.admission_binding_miss.saturating_add(misses);
     }
 
     /// Record a successful admitted mint: later admissions for the
@@ -950,6 +969,18 @@ impl InstanceRouter {
     /// Counts only.
     pub(crate) fn admitted_mint_counts(&self) -> (u64, usize) {
         (self.counters.admitted_first, self.admitted_minted.len())
+    }
+
+    /// Diagnostic-only mark funnel beside [`Self::admitted_mint_counts`]:
+    /// mark attempts, duplicate refusals, cap refusals, and binding
+    /// misses. Counts only.
+    pub(crate) fn admitted_mark_funnel_counts(&self) -> (u64, u64, u64, u64) {
+        (
+            self.counters.marks_attempted,
+            self.counters.marks_refused_dup,
+            self.counters.marks_refused_cap,
+            self.counters.admission_binding_miss,
+        )
     }
 
     pub(crate) fn ranges_retained(&self) -> usize {

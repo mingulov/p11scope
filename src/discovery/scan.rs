@@ -4371,10 +4371,12 @@ fn overlay_row_for(mountinfo: &str, merged: &std::path::Path) -> Option<(String,
 /// Lower-layer candidates for a merged path, read back from a mount
 /// table: the overlay mount with the longest mountpoint prefix of the
 /// path contributes its `lowerdir` stack in order, each joined with the
-/// path's remainder. Empty when no overlay row covers the path, the row
-/// names no lowerdir, or the remainder escapes (fail closed): the caller
-/// keeps the named gap. Mountinfo escapes are decoded on both sides;
-/// the stack splits on `:` exactly like the kernel mount parser.
+/// path's remainder. fsconfig rows (`lowerdir+=` per layer) contribute
+/// in entry order; a row naming any `datadir` layer refuses outright.
+/// Empty when no overlay row covers the path, the row names no
+/// lowerdir, or the remainder escapes (fail closed): the caller keeps
+/// the named gap. Mountinfo escapes are decoded on both sides; the
+/// stack splits on `:` exactly like the kernel mount parser.
 ///
 /// The scan and the pin both compute this list — the scan to prove one
 /// candidate, the pin to reopen the proven index — so both must feed it
@@ -4389,6 +4391,11 @@ pub(crate) fn lower_candidates_from_mountinfo(
     };
     let mut lowers = Vec::new();
     for opt in super_opts.split(',') {
+        // A data-only lower layer this reader cannot resolve: the stack
+        // would be incomplete, so the row refuses outright.
+        if opt.starts_with("datadir") {
+            return Vec::new();
+        }
         if let Some(stack) = opt.strip_prefix("lowerdir=") {
             lowers.extend(
                 stack
@@ -4396,6 +4403,12 @@ pub(crate) fn lower_candidates_from_mountinfo(
                     .filter(|layer| !layer.is_empty())
                     .map(unescape_mountinfo_field),
             );
+        } else if let Some(dir) = opt.strip_prefix("lowerdir+=") {
+            // fsconfig mounts print one lowerdir+= per layer, in kernel
+            // order: each entry is one layer, never a colon stack.
+            if !dir.is_empty() {
+                lowers.push(unescape_mountinfo_field(dir));
+            }
         }
     }
     if lowers.is_empty() {

@@ -2540,7 +2540,7 @@ mod tests {
         }
         let deep_file = lower2.join("lib.so");
         std::fs::write(&deep_file, [0xADu8; 64]).expect("write");
-        std::os::unix::fs::symlink(&deep_file, &lower1.join("lib.so")).expect("symlink");
+        std::os::unix::fs::symlink(&deep_file, lower1.join("lib.so")).expect("symlink");
         let table = format!(
             "31 23 0:27 / {} rw,relatime - overlay overlay rw,lowerdir={}:{},upperdir={}\n",
             merged_root.display(),

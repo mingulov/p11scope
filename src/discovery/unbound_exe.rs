@@ -61,6 +61,29 @@ pub(crate) struct ProcReads<'a> {
 /// scripted closure in tests, the mapping probe in production.
 type VerifyProbe<'a> = Box<dyn Fn(&str) -> Option<(u64, u64)> + 'a>;
 
+/// The canonical spelling of a verified path for dedupe: the
+/// canonicalized path, so a merged-`/usr` `/bin/x` vs `/usr/bin/x`
+/// pair names one file. A path that verified moments ago but no
+/// longer canonicalizes (deleted under us) stays its own
+/// candidate under its raw spelling.
+fn canonical_spelling(path: &str) -> String {
+    std::fs::canonicalize(path)
+        .map(|path| path.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| path.to_string())
+}
+
+/// Distinct verified spellings by canonical path (first spelling
+/// kept per file), sorted for a stable order.
+fn dedupe_canonical(paths: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut distinct: Vec<String> = paths
+        .into_iter()
+        .filter(|path| seen.insert(canonical_spelling(path)))
+        .collect();
+    distinct.sort();
+    distinct
+}
+
 /// Open `path` for the mapping probe: close-on-exec, never a
 /// controlling terminal, never following a final-component symlink,
 /// never blocking on a FIFO or device open. A symlink (however
@@ -289,30 +312,42 @@ impl ExeResolver {
                 resolution: ExeResolution::ProcAlive,
             };
         }
-        if let Some(path) = Self::via_scan_learned(dev, ino, scan) {
-            return UnboundExe {
-                dev,
-                ino,
-                identity_candidates: vec![path.clone()],
-                path: Some(path),
-                resolution: ExeResolution::ScanLearned,
-            };
+        // Sources (b) and (c) pool their verified spellings: the
+        // shown path is the first learned spelling when the scan
+        // taught the pair (an admitted caller proved that spelling
+        // executes), else the first index spelling; every distinct
+        // canonical spelling lists as a candidate, sorted. One
+        // candidate reads unambiguous; two or more keep the shown
+        // path and read ambiguous, never unknown.
+        let learned = Self::scan_learned_hits(dev, ino, scan);
+        let indexed = self.system_index_hits(dev, ino);
+        let mut seen = std::collections::HashSet::new();
+        let mut candidates = Vec::new();
+        for path in learned.iter().chain(indexed.iter()) {
+            if seen.insert(canonical_spelling(path)) {
+                candidates.push(path.clone());
+            }
         }
-        if let Some(path) = self.via_system_index(dev, ino) {
-            return UnboundExe {
-                dev,
-                ino,
-                identity_candidates: vec![path.clone()],
-                path: Some(path),
-                resolution: ExeResolution::SystemIndex,
-            };
-        }
+        candidates.sort();
+        let (path, resolution) = match (learned.first(), indexed.first()) {
+            (Some(path), _) => (path, ExeResolution::ScanLearned),
+            (None, Some(path)) => (path, ExeResolution::SystemIndex),
+            (None, None) => {
+                return UnboundExe {
+                    dev,
+                    ino,
+                    path: None,
+                    resolution: ExeResolution::PathUnknown,
+                    identity_candidates: Vec::new(),
+                };
+            }
+        };
         UnboundExe {
             dev,
             ino,
-            path: None,
-            resolution: ExeResolution::PathUnknown,
-            identity_candidates: Vec::new(),
+            path: Some(path.clone()),
+            resolution,
+            identity_candidates: candidates,
         }
     }
 
@@ -359,33 +394,46 @@ impl ExeResolver {
         live.path
     }
 
-    /// Source (b): the scan already learned this maps-domain
-    /// `(dev, ino)` from an admitted caller; the learned path is
-    /// re-verified by the mapping probe (a replaced file refuses).
-    fn via_scan_learned(dev: u64, ino: u64, scan: &ScanLearned<'_>) -> Option<String> {
-        let path = scan.by_identity.get(&(dev, ino))?;
-        if (scan.verify)(path)? != (dev, ino) {
-            return None;
+    /// Source (b): every spelling the scan learned for this
+    /// maps-domain `(dev, ino)` — the primary plus every known
+    /// teacher spelling — re-verified by the mapping probe (a
+    /// replaced file refuses), distinct by canonical path, sorted.
+    fn scan_learned_hits(dev: u64, ino: u64, scan: &ScanLearned<'_>) -> Vec<String> {
+        let mut spellings = Vec::new();
+        if let Some(path) = scan.by_identity.get(&(dev, ino)) {
+            spellings.push(path.clone());
         }
-        Some(path.clone())
+        if let Some(all) = scan.all_by_identity
+            && let Some(paths) = all.get(&(dev, ino))
+        {
+            spellings.extend(paths.iter().cloned());
+        }
+        let verified: Vec<String> = spellings
+            .into_iter()
+            .filter(|path| (scan.verify)(path).is_some_and(|pair| pair == (dev, ino)))
+            .collect();
+        dedupe_canonical(verified)
     }
 
-    /// Source (c): the lazy system index. Same-ino candidates
-    /// are confirmed one by one against the joined pair in the
-    /// mapped device domain (a deleted or replaced binary refuses,
-    /// as does a stat-only pair on a split-device host).
-    fn via_system_index(&mut self, dev: u64, ino: u64) -> Option<String> {
+    /// Source (c): the lazy system index. Every same-ino candidate
+    /// is confirmed against the joined pair in the mapped device
+    /// domain (a deleted or replaced binary refuses, as does a
+    /// stat-only pair on a split-device host); hits list distinct
+    /// by canonical path, sorted.
+    fn system_index_hits(&mut self, dev: u64, ino: u64) -> Vec<String> {
         self.refresh_index_if_stale();
-        let candidates = self.entries.get(&ino)?;
-        for path in candidates {
-            if self
-                .maps_identity_of(path)
-                .is_some_and(|pair| pair == (dev, ino))
-            {
-                return Some(path.clone());
-            }
-        }
-        None
+        let Some(candidates) = self.entries.get(&ino) else {
+            return Vec::new();
+        };
+        let verified: Vec<String> = candidates
+            .iter()
+            .filter(|path| {
+                self.maps_identity_of(path)
+                    .is_some_and(|pair| pair == (dev, ino))
+            })
+            .cloned()
+            .collect();
+        dedupe_canonical(verified)
     }
 
     /// The maps-domain identity of one indexed path: the scripted
@@ -424,10 +472,10 @@ impl ExeResolver {
     }
 
     /// Walk the fixed roots (sorted, so same-ino candidates keep
-    /// walk order and the first mapped match wins deterministically),
-    /// skipping final-component symlinks and non-files, bounded by
-    /// the cap. Unreadable roots shed silently: the index is a hint,
-    /// and a miss degrades to unknown, never to an error.
+    /// walk order), skipping final-component symlinks and
+    /// non-files, bounded by the cap. Unreadable roots shed
+    /// silently: the index is a hint, and a miss degrades to
+    /// unknown, never to an error.
     fn rebuild(&mut self) {
         self.builds += 1;
         self.entries.clear();
@@ -943,6 +991,70 @@ mod tests {
             vec![first_text, second_text],
             "both candidates list in a stable order: {exe:?}"
         );
+    }
+
+    /// A learned spelling beats an index spelling for the shown
+    /// path (an admitted caller proved it executes) while both
+    /// list as candidates, sorted.
+    #[test]
+    fn learned_spelling_is_preferred_over_an_index_spelling() {
+        let dir = tempfile::tempdir().unwrap();
+        let indexed = dir.path().join("tool");
+        std::fs::write(&indexed, b"tool").unwrap();
+        let indexed_text = indexed.to_string_lossy().into_owned();
+        let ino = std::fs::metadata(&indexed).unwrap().ino();
+        let learned = "/snap/learned/tool";
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(vec![dir.path().to_path_buf()]);
+        resolver.set_scripted_maps_identities(HashMap::from([(indexed_text.clone(), (82, ino))]));
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        scan.learned(82, ino, learned, Some((82, ino)));
+        let exe = resolver.resolve(
+            7,
+            82,
+            ino,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert_eq!(exe.path.as_deref(), Some(learned));
+        assert!(exe.identity_ambiguous(), "{exe:?}");
+        let mut expected = vec![learned.to_string(), indexed_text];
+        expected.sort();
+        assert_eq!(exe.identity_candidates, expected, "{exe:?}");
+    }
+
+    /// Two spellings of one file (a symlinked parent dir, like a
+    /// merged-`/usr` `/bin/x` vs `/usr/bin/x` pair) name one
+    /// candidate: no false ambiguity.
+    #[test]
+    fn canonical_aliases_of_one_file_read_unambiguous() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        std::fs::write(real.join("tool"), b"tool").unwrap();
+        std::os::unix::fs::symlink(&real, dir.path().join("link")).unwrap();
+        let direct = real.join("tool").to_string_lossy().into_owned();
+        let aliased = dir.path().join("link/tool").to_string_lossy().into_owned();
+        let mut resolver = ExeResolver::new();
+        resolver.set_index_dirs(Vec::new());
+        let proc = ScriptedProc::dead();
+        let mut scan = ScriptedScan::empty();
+        scan.learned_multi(82, 257, &[&direct, &aliased]);
+        let exe = resolver.resolve(
+            7,
+            82,
+            257,
+            2_000_000_000,
+            &proc.reads(true, Some(3_000_000_000), Some(3_000_000_000)),
+            &scan.scan(),
+        );
+        assert_eq!(exe.resolution, ExeResolution::ScanLearned);
+        assert_eq!(exe.path.as_deref(), Some(direct.as_str()));
+        assert!(!exe.identity_ambiguous(), "{exe:?}");
+        assert_eq!(exe.identity_candidates, vec![direct], "{exe:?}");
     }
 
     /// (b): a learned path whose current maps-domain identity

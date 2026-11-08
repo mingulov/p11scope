@@ -298,16 +298,29 @@ non-null values needs a new allowlist row.
   `callers[].image.exe.dev`), `ino`, `resolution` (one of
   `proc_alive`, `scan_learned`, `system_index`, `path_unknown`,
   `exe_unavailable`, `no_exec_record`, `exec_record_lost`),
+  `identity_ambiguous` (true when two or more distinct canonical
+  paths verified to the same pair — btrfs snapshot clones across
+  subvolumes share one kernel identity), `identity_candidates`
+  (every verified spelling, sorted, the shown path included; the
+  single spelling when unambiguous, empty when unresolved),
   `pid_host`, `first_call_ns`, and `calls_at_least` (the folded
   entry-count lower bound over this image's rows on this module).
   A path reads exactly on the resolved verdicts; a nonzero
   `{major, minor}`/`ino` triple reads exactly when an EXEC joined
-  (all zero when no EXEC joined or the kernel read failed). The concise
+  (all zero when no EXEC joined or the kernel read failed). An
+  ambiguous image keeps its shown path (a learned spelling when the
+  scan taught the pair, else the first index spelling, each sorted)
+  and discloses the collision beside it — never `unknown` — while
+  the caller stays one caller with unchanged counts. A single
+  candidate still misattributes when the true spelling was never
+  learned or indexed: only known collisions disclose. The concise
   `unidentified executables` line groups the run-wide images by
   executable with call counts (five groups, five host pids each, the rest
-  counted); the verbose per-module line names every collected
-  executable with its host pid, `dev major:minor`/`ino`, resolution source, and
-  first-call time. Absent in captures that predate exe naming.
+  counted), ambiguous groups marked `(ambiguous, N candidates)`; the
+  verbose per-module line names every collected
+  executable with its host pid, `dev major:minor`/`ino`, resolution source,
+  first-call time, and — when ambiguous — every other verified
+  spelling. Absent in captures that predate exe naming.
   The first binder-reason row of a module records one `used by an
   unidentified caller image` gap; a `no_mapping_edge` row records
   instead a `native witness without mapping evidence` gap naming the

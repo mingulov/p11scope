@@ -783,6 +783,14 @@ struct StashedExec {
     pid_host: u32,
 }
 
+/// Scan-learned exe identities per build: the primary
+/// maps-domain `(dev, ino)` to path map plus every teacher
+/// spelling per pair (sorted, deduped).
+type LearnedExeMaps = (
+    HashMap<(u64, u64), String>,
+    HashMap<(u64, u64), Vec<String>>,
+);
+
 /// One staged native owner: all preparation I/O (fresh observation,
 /// warm view, guarded scan, prepared reconciliation, pin preflight)
 /// complete before the final membership sample, awaiting the
@@ -1350,7 +1358,9 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     /// Scan-learned exe identities visible to resolution:
     /// maps-domain `(dev, ino)` to path over tracked callers, each
     /// distinct path probed once per capture through the sticky
-    /// cache. First path wins per identity.
+    /// cache. The primary map keeps the first path per identity;
+    /// resolution also sees every teacher spelling (see
+    /// [`Self::scan_exe_candidates_cached`]).
     #[cfg(test)]
     pub(crate) fn scan_learned_exe_map(&mut self) -> std::collections::HashMap<(u64, u64), String> {
         Self::scan_exe_identities_cached(
@@ -1398,12 +1408,12 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         if !self.registry.has_unbound_image(cookie) {
             return;
         }
-        let learned = Self::scan_exe_identities_cached(
+        let (learned, all_learned) = Self::scan_exe_candidates_cached(
             &self.adapter,
             &mut self.exe_probe_cache,
             crate::discovery::unbound_exe::real_maps_identity,
         );
-        let exe = self.resolve_unbound_exe(exec, &learned);
+        let exe = self.resolve_unbound_exe(exec, &learned, &all_learned);
         self.registry.attach_unbound_exe(cookie, exe);
     }
 
@@ -1416,6 +1426,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         &mut self,
         exec: StashedExec,
         learned: &HashMap<(u64, u64), String>,
+        all_learned: &HashMap<(u64, u64), Vec<String>>,
     ) -> UnboundExe {
         let trusted = self.proc_reads_trusted();
         let mono_now = crate::attach::monotonic_ns();
@@ -1433,7 +1444,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let scan = ScanLearned {
             by_identity: learned,
             verify: Box::new(crate::discovery::unbound_exe::real_maps_identity),
-            all_by_identity: None,
+            all_by_identity: Some(all_learned),
         };
         self.exe_resolver.resolve(
             exec.pid_host,
@@ -1480,19 +1491,31 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         self.exec_loss_domains.contains(&domain) || self.binder.lifecycle_loss_noted(domain)
     }
 
-    /// Scan-learned exe identities with the probe cache: each
-    /// distinct caller path probes once (deduped by path across
-    /// callers sharing one binary) and the answer — pair or refusal —
-    /// is retained for the capture, so later backfills and staging
-    /// batches rebuild the map without re-probing. A full cache
-    /// stops retaining: the overflow tail probes per build, still
-    /// correct. First path wins per identity.
+    /// Scan-learned exe identities with the probe cache (the
+    /// primary map of [`Self::scan_exe_candidates_cached`]): each
+    /// distinct caller path probes once and the answer is retained
+    /// for the capture. Test-only: production builds both maps.
+    #[cfg(test)]
     fn scan_exe_identities_cached(
         adapter: &CallerAdapter<Source>,
         cache: &mut HashMap<String, Option<(u64, u64)>>,
         probe: impl Fn(&str) -> Option<(u64, u64)>,
     ) -> HashMap<(u64, u64), String> {
+        Self::scan_exe_candidates_cached(adapter, cache, probe).0
+    }
+
+    /// The primary learned map plus every teacher spelling per
+    /// pair (sorted, deduped), built in one walk: when two or more
+    /// distinct paths probe to one pair (snapshot clones across
+    /// subvolumes), resolution keeps a shown path and discloses
+    /// the collision instead of first-wins silence.
+    fn scan_exe_candidates_cached(
+        adapter: &CallerAdapter<Source>,
+        cache: &mut HashMap<String, Option<(u64, u64)>>,
+        probe: impl Fn(&str) -> Option<(u64, u64)>,
+    ) -> LearnedExeMaps {
         let mut learned = HashMap::new();
+        let mut all: HashMap<(u64, u64), Vec<String>> = HashMap::new();
         for record in adapter.records() {
             let Some(exe) = record.exe.as_ref() else {
                 continue;
@@ -1516,8 +1539,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             };
             learned.entry(pair).or_insert_with(|| path.clone());
+            all.entry(pair).or_default().push(path.clone());
         }
-        learned
+        for bucket in all.values_mut() {
+            bucket.sort();
+            bucket.dedup();
+        }
+        (learned, all)
     }
 
     /// Terminal refresh under a possibly unknown stop: when `unknown_stop`
@@ -6617,7 +6645,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
         let mut unresolved: Vec<String> = Vec::new();
         // Scan-learned exe identities, built at most once per call
         // and only when an unbound image stages.
-        let mut learned: Option<HashMap<(u64, u64), String>> = None;
+        let mut learned: Option<LearnedExeMaps> = None;
         for decision in decisions {
             if let Err(reason) = self.stage_witness(decision, &mut learned) {
                 self.registry.note_unresolved_witness();
@@ -8461,7 +8489,7 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
     fn stage_witness(
         &mut self,
         decision: Decision,
-        learned: &mut Option<HashMap<(u64, u64), String>>,
+        learned: &mut Option<LearnedExeMaps>,
     ) -> Result<(), String> {
         let Decision { row, binding } = decision;
         let modules = match self.witness_modules(&row) {
@@ -8496,14 +8524,14 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 // backfills it, later loss flips it).
                 let exe = match self.exec_exe.get(&cookie).copied() {
                     Some(stashed) => {
-                        let learned = learned.get_or_insert_with(|| {
-                            Self::scan_exe_identities_cached(
+                        let (learned, all_learned) = learned.get_or_insert_with(|| {
+                            Self::scan_exe_candidates_cached(
                                 &self.adapter,
                                 &mut self.exe_probe_cache,
                                 crate::discovery::unbound_exe::real_maps_identity,
                             )
                         });
-                        self.resolve_unbound_exe(stashed, learned)
+                        self.resolve_unbound_exe(stashed, learned, all_learned)
                     }
                     None if self.exec_evidence_lost(cookie.domain()) => UnboundExe {
                         dev: 0,

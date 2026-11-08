@@ -1900,7 +1900,10 @@ fn event_log_dash_refuses_stdout_rivals_up_front() {
 /// discarded while the summary lands on stderr and nothing sheds.
 /// `sh -c 'exec ... >&-'` closes fd 1 without unsafe `pre_exec`.
 /// The observer scans its own pid, which needs no privileges.
-/// Only an unsupported stdout fd type fails fast (unit-covered).
+/// Only an unacquirable stdout fails fast (an unsupported fd type,
+/// a named FIFO with no reader, or an unwritable pipe/terminal);
+/// an anonymous readerless pipe sheds instead, and closed stdout
+/// reads as `/dev/null`.
 #[test]
 fn event_log_dash_with_closed_stdout_discards_the_stream_and_succeeds() {
     let pid = std::process::id().to_string();
@@ -1934,7 +1937,7 @@ fn event_log_dash_with_closed_stdout_discards_the_stream_and_succeeds() {
         "the text summary moved to stderr: {stderr}"
     );
     assert!(
-        !stderr.contains("opening inventory event stream -"),
+        !stderr.contains("opening inventory event stream on stdout failed"),
         "no open failure: {stderr}"
     );
 }

@@ -2851,8 +2851,9 @@ pub fn scope_summary_with_verbosity(
 }
 
 /// Concise text shows at most this many failure reasons per function;
-/// verbose lists every distinct code.
-const CONCISE_REASONS_PER_FUNCTION: usize = 3;
+/// verbose lists every distinct code. Shared with the trace tail's
+/// per-caller roll-up, so both views bound concise reasons the same way.
+pub(crate) const CONCISE_REASONS_PER_FUNCTION: usize = 3;
 
 /// One `TABLE-NAME: reason xN, …` line per function row with errors, in
 /// table order. Verbose lists every distinct failure code; concise

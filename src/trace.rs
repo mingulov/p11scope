@@ -312,17 +312,23 @@ pub(crate) fn watches_unverified(plan: &AttachPlan) -> bool {
     plan.slots.is_empty() || plan.slots.iter().any(|slot| !slot.semantic_authorized)
 }
 
+/// One rendered caller identity: the process plus its verified-or-owned
+/// executable path (`None` for unknown callers).
+type CallerKey = (u32, Option<String>);
+
+/// One counted line: the function label plus its return code.
+type FunctionRv = (String, u64);
+
 /// Per-caller CKR attribution accumulated over rendered trace lines:
-/// `(pid, verified-or-owned exe path)` → `(function label, rv)` → count.
-/// A pure projection of the line stream — every counted line was
-/// rendered, every rendered line is counted — so the terminal roll-up
-/// can never disagree with the lines above it. Unknown callers key
-/// `(pid, None)`; threads group into their process (TID stays line
-/// detail). Labels rendered from these keys reuse the line quoting, so
-/// a roll-up row names exactly the caller the lines named.
+/// caller → (function, rv) → count. A pure projection of the line
+/// stream — every counted line was rendered, every rendered line is
+/// counted — so the terminal roll-up can never disagree with the lines
+/// above it. Threads group into their process (TID stays line detail).
+/// Labels rendered from these keys reuse the line quoting, so a roll-up
+/// row names exactly the caller the lines named.
 #[derive(Debug, Default)]
 pub(crate) struct CallerReasons {
-    calls: BTreeMap<(u32, Option<String>), BTreeMap<(String, u64), u64>>,
+    calls: BTreeMap<CallerKey, BTreeMap<FunctionRv, u64>>,
 }
 
 impl CallerReasons {
@@ -336,19 +342,150 @@ impl CallerReasons {
     }
 }
 
+/// A roll-up row's caller cell: the line's caller identity without
+/// the TID (threads group into their process), quoted exactly as the
+/// lines quote it — basename derivation, JSON quoting and control
+/// escaping all shared, never a second spelling.
+fn caller_cell(pid: u32, path: Option<&str>) -> String {
+    match path {
+        Some(path) => {
+            let basename = path
+                .rsplit('/')
+                .find(|part| !part.is_empty())
+                .unwrap_or(path);
+            format!(
+                "{} (PID {pid}) exe={}",
+                quote_executable(basename),
+                quote_executable(path)
+            )
+        }
+        None => format!("Unknown executable (PID {pid})"),
+    }
+}
+
+/// One (caller, function) row's sorted failure reasons plus its failure
+/// total, for worst-first ordering.
+struct FunctionRow {
+    function: String,
+    failures: u64,
+    reasons: Vec<(u64, u64)>,
+}
+
+/// One caller's sorted function rows plus its failure total.
+struct CallerRow<'a> {
+    pid: u32,
+    path: Option<&'a str>,
+    total: u64,
+    rows: Vec<FunctionRow>,
+}
+
 /// Terminal `CALLER ERROR REASONS:` section over the rendered lines:
 /// one row per failing (caller, function) pair with its `CKR_*` reasons
 /// (concise keeps three plus an `and N more` tail, verbose lists every
 /// distinct code), or a named gap when counted errors left no failure
 /// reasons among the rendered lines. Empty for a clean trace, so clean
-/// tails stay byte-identical.
+/// tails stay byte-identical. Success and pending returns are never
+/// reasons; unregistered codes keep the trace `CKR_UNKNOWN` spelling,
+/// matching the lines this section summarizes. Rows read worst-first:
+/// callers by failure count, then pid and path; functions within a
+/// caller by failure count, then name; reasons by count, then code.
 fn caller_reason_lines(
-    _reasons: &CallerReasons,
-    _verbose: bool,
-    _truncated: bool,
-    _errors: u64,
+    reasons: &CallerReasons,
+    verbose: bool,
+    truncated: bool,
+    errors: u64,
 ) -> Vec<String> {
-    Vec::new()
+    let ok = pkcs11_types::CkRv::OK.0;
+    let pending = pkcs11_types::CkRv::PENDING.0;
+    // Per caller: per function failure reasons, worst-first; the caller
+    // totals below sort the callers the same way.
+    let mut callers: Vec<CallerRow<'_>> = Vec::new();
+    for ((pid, path), calls) in &reasons.calls {
+        let mut functions: Vec<FunctionRow> = Vec::new();
+        for ((function, rv), count) in calls {
+            if *count == 0 || *rv == ok || *rv == pending {
+                continue;
+            }
+            match functions.iter_mut().find(|row| row.function == *function) {
+                Some(row) => row.reasons.push((*rv, *count)),
+                None => functions.push(FunctionRow {
+                    function: function.clone(),
+                    failures: 0,
+                    reasons: vec![(*rv, *count)],
+                }),
+            }
+        }
+        if functions.is_empty() {
+            continue;
+        }
+        let mut total = 0u64;
+        for row in &mut functions {
+            row.reasons
+                .sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+            row.failures = row
+                .reasons
+                .iter()
+                .fold(0u64, |sum, (_, count)| sum.saturating_add(*count));
+            total = total.saturating_add(row.failures);
+        }
+        functions.sort_by(|a, b| {
+            b.failures
+                .cmp(&a.failures)
+                .then(a.function.cmp(&b.function))
+        });
+        callers.push(CallerRow {
+            pid: *pid,
+            path: path.as_deref(),
+            total,
+            rows: functions,
+        });
+    }
+    callers.sort_by(|a, b| {
+        b.total
+            .cmp(&a.total)
+            .then(a.pid.cmp(&b.pid))
+            .then(a.path.cmp(&b.path))
+    });
+    let mut lines = Vec::new();
+    if callers.is_empty() {
+        if errors == 0 {
+            return lines;
+        }
+        lines.push("CALLER ERROR REASONS:".to_string());
+        let noun = if errors == 1 { "error" } else { "errors" };
+        lines.push(format!(
+            "({errors} {noun} counted; no failure reasons among rendered lines)"
+        ));
+    } else {
+        lines.push("CALLER ERROR REASONS:".to_string());
+        for caller in &callers {
+            let cell = caller_cell(caller.pid, caller.path);
+            for row in &caller.rows {
+                let shown = if verbose {
+                    row.reasons.len()
+                } else {
+                    row.reasons
+                        .len()
+                        .min(crate::render::CONCISE_REASONS_PER_FUNCTION)
+                };
+                let mut text = format!("{cell}: {}: ", render::escape_controls(&row.function));
+                for (i, &(rv, count)) in row.reasons[..shown].iter().enumerate() {
+                    if i > 0 {
+                        text.push_str(", ");
+                    }
+                    text.push_str(&format!("{} x{count}", rv_name(rv)));
+                }
+                if shown < row.reasons.len() {
+                    text.push_str(&format!(", and {} more", row.reasons.len() - shown));
+                }
+                lines.push(text);
+            }
+        }
+    }
+    if truncated {
+        lines.push("(caller reasons cover rendered lines only; trace truncated)".to_string());
+    }
+    lines
 }
 
 /// The human tail a trace ends with, after the machine-readable
@@ -1694,8 +1831,7 @@ mod tests {
         ev.event_loss = 1;
         ev.verdict();
         let callers = CallerReasons::default();
-        let concise =
-            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise, &callers);
+        let concise = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Concise, &callers);
         assert_eq!(
             concise,
             vec![
@@ -1705,16 +1841,14 @@ mod tests {
                 crate::cli::VERBOSE_HINT.to_string(),
             ]
         );
-        let verbose =
-            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose, &callers);
+        let verbose = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Verbose, &callers);
         assert_eq!(verbose.len(), 2);
         assert!(verbose[1].contains("(event_loss)"), "{verbose:?}");
         assert!(
             !verbose.iter().any(|line| line.contains("-v")),
             "{verbose:?}"
         );
-        let quiet =
-            terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet, &callers);
+        let quiet = terminal_summary(19, 0, 0, &ev, crate::cli::TextVerbosity::Quiet, &callers);
         assert_eq!(quiet.len(), 2);
         assert!(!quiet[1].contains("event_loss"), "{quiet:?}");
     }
@@ -1889,10 +2023,7 @@ mod tests {
                     .any(|line| line.contains("CALLER ERROR REASONS")),
                 "{tail:?}"
             );
-            assert!(
-                !tail.iter().any(|line| line.contains("PID 60")),
-                "{tail:?}"
-            );
+            assert!(!tail.iter().any(|line| line.contains("PID 60")), "{tail:?}");
         }
         assert_eq!(
             terminal_summary(
@@ -1916,10 +2047,7 @@ mod tests {
         let plan = test_plan();
         let mut state = State::new(&plan);
         let mut tracer = Tracer::new(&plan);
-        tracer.on_event(
-            &call_event(60, 0, pkcs11_types::CkRv::OK.0),
-            &mut state,
-        );
+        tracer.on_event(&call_event(60, 0, pkcs11_types::CkRv::OK.0), &mut state);
         let ev = complete_evidence();
         let tail = terminal_summary(
             4,
@@ -2085,12 +2213,8 @@ mod tests {
         tracer.set_owned_command(key.pid, "/other/binary".to_string());
         let mut ev = call_event(key.pid, 0, pkcs11_types::CkRv::DEVICE_ERROR.0);
         ev.ts_ns = 20;
-        let line = tracer.on_event_process_with_executable(
-            &ev,
-            key,
-            &mut state,
-            store.lookup(key, 20),
-        );
+        let line =
+            tracer.on_event_process_with_executable(&ev, key, &mut state, store.lookup(key, 20));
         assert!(line.contains("exe=\"/usr/bin/firefox\""), "{line}");
         assert!(!line.contains("other"), "{line}");
         let evidence = complete_evidence();

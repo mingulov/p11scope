@@ -49618,6 +49618,24 @@ fn terminal_discovery_failure_publishes_unfinished_terminal_work() {
     );
 }
 
+/// A capture loop that failed before its stop still seals its report:
+/// the failure is a named live loss, never a silent clean window.
+#[test]
+fn capture_loop_failure_names_its_gap() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    engine.note_capture_loop_failure();
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "capture loop"
+                && skip.reason.contains("failed before the stop")),
+        "the failure publishes a named gap: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// H5 combined-cap scenario: 4,096 live credits divided among the session
 /// FIFO (1,500 staged), engine pending (2,000 deferred), an active batch
 /// tail (500 pulled) and a nested collection (96), with the 4,097th raw

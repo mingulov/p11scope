@@ -30316,6 +30316,16 @@ impl Engine {
     /// files unfinished work and keeps the committed plan: the seal
     /// proceeds from partial state instead of suppressing the report
     /// the signal asked for.
+    /// Names a capture loop that failed before its stop: the report
+    /// still seals what was captured, so the loss is a named gap and
+    /// no causal claim spans the failure.
+    pub(crate) fn note_capture_loop_failure(&mut self) {
+        self.mark_live_loss(
+            "capture loop",
+            "the live capture loop failed before the stop; the report holds what was captured up to the failure",
+        );
+    }
+
     pub(crate) fn note_terminal_discovery_failure(&mut self) {
         self.discovery_truncated = self.discovery_truncated.saturating_add(1);
         self.mark_live_loss(

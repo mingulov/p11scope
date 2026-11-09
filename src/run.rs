@@ -6856,6 +6856,7 @@ fn report_quiescence_unproven(waited: Duration, in_flight: u64) {
 fn finish_capture_with<C, T>(
     context: &mut C,
     loop_result: Result<CaptureEnd>,
+    loop_gap: impl FnOnce(&mut C),
     finish: impl FnOnce(&mut C, Result<CaptureEnd>) -> Result<CaptureEnd>,
     detach: impl FnOnce(&mut C) -> Result<()>,
     terminal: impl FnOnce(&mut C, CaptureEnd, bool) -> Result<T>,
@@ -6864,10 +6865,38 @@ fn finish_capture_with<C, T>(
     // run BEFORE the producers detach, so the report never waits on link
     // teardown. The flag says detach has not run yet; quiescence reaches
     // the terminal callback through its captured `TerminalQuiescence`.
-    let end = finish(context, loop_result)?;
-    let terminal_result = terminal(context, end, false);
+    let loop_error = match loop_result {
+        Ok(end) => {
+            let end = finish(context, Ok(end))?;
+            let terminal_result = terminal(context, end, false);
+            let detach_result = detach(context);
+            return combine_detach(terminal_result, detach_result);
+        }
+        Err(loop_error) => loop_error,
+    };
+    // A failed capture loop behind a successful quiescence still seals
+    // what was captured, signalled or not: calls happened, so the report
+    // shows them and the run's error names what failed. Settlement runs
+    // as an error end first and gates the seal (the child's disposition
+    // is a fact the document reports, never a guess); a failed
+    // settlement has already detached inside `finish`. The loop error
+    // stays the outer error, so the exit status still reports it.
+    loop_gap(context);
+    if let Err(settle_error) = finish(context, Ok(CaptureEnd::Error)) {
+        return Err(also_failed(
+            loop_error,
+            settle_error,
+            "owned cleanup/settlement",
+        ));
+    }
+    let published = terminal(context, CaptureEnd::Error, false).map(|_| ());
     let detach_result = detach(context);
-    combine_detach(terminal_result, detach_result)
+    Err(combine_quiesce_failure(
+        loop_error,
+        Ok(()),
+        Some(published),
+        detach_result,
+    ))
 }
 
 // Explicit phase callbacks keep the terminal sequence visible at each caller.
@@ -7694,6 +7723,7 @@ fn capture_profile(
     let outcome = finish_capture_with(
         &mut finish_context,
         loop_result,
+        |context| context.0.note_capture_loop_failure(),
         |context, result| {
             poll_terminal_cancellation();
             finish_capture_loop(
@@ -7864,7 +7894,8 @@ fn capture_profile(
                             window,
                             facts,
                             clean: quiesced.is_some()
-                                && !consumers.stop_quiescence.post_q_discovery,
+                                && !consumers.stop_quiescence.post_q_discovery
+                                && end != CaptureEnd::Error,
                             tail_records: k0_tail_records.take(),
                             tail_malformed: k0_tail_malformed.take(),
                         }
@@ -8738,6 +8769,7 @@ fn capture_trace(
     finish_capture_with(
         &mut finish_context,
         loop_result,
+        |context| context.0.note_capture_loop_failure(),
         |context, result| {
             poll_terminal_cancellation();
             finish_capture_loop(
@@ -22180,6 +22212,10 @@ mod tests {
             assert!(
                 tail[..detach].contains("finish_capture_loop("),
                 "real finish callback for {function}"
+            );
+            assert!(
+                tail[..detach].contains("|context| context.0.note_capture_loop_failure(),"),
+                "{function}: a failed loop files its named gap before the seal"
             );
             // Supply order, not execution order: quiesce-then-publish runs
             // the terminal callback before detach (pinned at runtime by

@@ -403,6 +403,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
         let result = finish_capture_with(
             &mut phases,
             loop_result,
+            |phases| phases.push("gap"),
             |phases, result| {
                 phases.push("finish");
                 let end = result?;
@@ -433,7 +434,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
                 let message = format!("{:#}", result.unwrap_err());
                 assert!(message.contains("loop failure"), "{message}");
                 assert_eq!(observed, Some((CaptureEnd::Error, false)));
-                assert_eq!(phases, ["finish", "terminal", "detach"]);
+                assert_eq!(phases, ["gap", "finish", "terminal", "detach"]);
             }
             Case::LoopErrorSettleFails => {
                 // The settled disposition gates the seal: no report on a
@@ -444,7 +445,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
                     "{message}"
                 );
                 assert_eq!(observed, None);
-                assert_eq!(phases, ["finish"]);
+                assert_eq!(phases, ["gap", "finish"]);
             }
             Case::FinishError => {
                 assert_eq!(result.unwrap_err().to_string(), "finish failure");
@@ -1629,6 +1630,7 @@ fn stop_requests_the_gate_before_any_detach() {
     let result = finish_capture_with(
         &mut phases,
         Ok(CaptureEnd::DurationExpired),
+        |phases| phases.push("gap"),
         |phases, result| {
             phases.push("settle");
             result

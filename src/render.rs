@@ -1902,6 +1902,27 @@ fn never_stop_gaps_project_to_finite_reasons_without_paths() {
     }
 }
 
+/// Dropped inventory passes project to their own finite reason — in
+/// both the single and the aggregated form — instead of the generic
+/// discovery skip, without leaking the internal error chain.
+#[cfg(test)]
+#[test]
+fn dropped_pass_gaps_project_to_their_finite_reason() {
+    for reason in [
+        "pass 2 dropped: test-forced apply failure",
+        "passes 2-4 dropped (3x): test-forced apply failure",
+    ] {
+        let projected = capture_skipped_out(&Skipped {
+            subject: "live inventory pass".into(),
+            reason: reason.into(),
+        });
+        assert_eq!(projected.name, "discovery subject");
+        assert_eq!(projected.reason, "inventory pass unavailable");
+        let json = serde_json::to_string(&projected).unwrap();
+        assert!(!json.contains("test-forced"), "{json}");
+    }
+}
+
 impl Evidence {
     /// COMPLETE only when nothing was lost: every planned probe attached,
     /// nothing was skipped, no aliasing ambiguity, no call left in flight,

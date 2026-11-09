@@ -1,6 +1,6 @@
 {
   "schema": "p11scope/privileged-campaign/v1",
-  "default_floor": 227,
+  "default_floor": 228,
   "default_cells": [
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_ia32",
     "attach::async_value_flags_tests::privileged_async_getid_null_output_sets_value_unreadable_lp64",
@@ -131,6 +131,7 @@
     "discovery::pause::tests::privileged_pause_auto_shexec_wrapper_matches_direct_count_lp64",
     "discovery::pause::tests::privileged_pause_auto_shfork_wrapper_reports_honest_gap_lp64",
     "discovery::pause::tests::privileged_pause_never_env_wrapper_publishes_neutral_lattice_lp64",
+    "discovery::pause::tests::privileged_pause_default_flags_count_fast_child_exact_lp64",
     "discovery::unbound_exe::tests::privileged_shortlived_tool_run_names_its_executable",
     "discovery::sweep_attribution::tests::d4_ext4_cells::privileged_d4_ext4_inode_reuse_confirmation_parity",
     "discovery::sweep_attribution::tests::d4_overlay_cells::privileged_d4_overlay_xino_backend_parity",

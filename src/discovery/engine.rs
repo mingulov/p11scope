@@ -30886,6 +30886,14 @@ impl Engine {
         &self.plan
     }
 
+    /// Members fully scanned into retained views by [`Engine::discover`]:
+    /// the count the carved-out `--cgroup` empty line names. Read at the
+    /// empty-plan site only — later ticks admit and retire views.
+    #[allow(dead_code)] // Read at the empty-plan site by the fix commit.
+    pub(crate) fn scanned_view_count(&self) -> usize {
+        self.views.len()
+    }
+
     pub fn pinned(&self) -> &PinnedObjects {
         &self.pinned
     }

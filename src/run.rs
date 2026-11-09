@@ -5501,21 +5501,35 @@ fn pid_namespace_preflight(
     Ok(crate::pidns::nested_warning(numbering))
 }
 
-/// P1-3: the empty-plan line. A plan with zero modules but provider
-/// skips names what was found and why it cannot be counted, instead
-/// of claiming nothing was found. Refused whole modules are confirmed
-/// providers (admitted, then refused), as is a K1 skip — the witness
-/// runs only after hook exports were found, or the operator named the
-/// file with `--module`. Every other non-benign skip is a mapped file
-/// the scan could not examine, whose provider-ness is exactly what
-/// cannot be determined — except `capture discovery` stops (ceilings,
-/// stops, unavailable maps), which read as discovery events, never
-/// file counts. Verified absence (an examined file with no
-/// table, a hint verified absent) keeps the nothing-found hint, as
-/// does a proxy closure still awaiting publication (the start gate
-/// reads it like nothing mapped yet). Subjects and reasons are
-/// target-controlled bytes: escaped at this terminal boundary.
-fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
+/// One class per empty-plan skip: found-but-refused providers, mapped
+/// files the scan could not examine, and discovery stops (ceilings,
+/// stops, unavailable maps). Shared by [`empty_plan_hint`] and the
+/// DR-K8S-5 `--cgroup` proof ([`empty_plan_is_clean`]) so the stderr
+/// line and the refusal gate count found providers the same way.
+struct EmptyPlanClasses<'a> {
+    confirmed: Vec<&'a crate::discovery::scan::Skipped>,
+    unexamined: Vec<&'a crate::discovery::scan::Skipped>,
+    discovery_stops: Vec<&'a crate::discovery::scan::Skipped>,
+}
+
+impl EmptyPlanClasses<'_> {
+    fn is_clean(&self) -> bool {
+        self.confirmed.is_empty() && self.unexamined.is_empty() && self.discovery_stops.is_empty()
+    }
+}
+
+/// Classifies an empty plan's skips for the nothing-found line:
+/// refused whole modules are confirmed providers (admitted, then
+/// refused), as is a K1 skip — the witness runs only after hook
+/// exports were found, or the operator named the file with
+/// `--module`. Every other non-benign skip is a mapped file the scan
+/// could not examine, whose provider-ness is exactly what cannot be
+/// determined — except `capture discovery` stops, which read as
+/// discovery events, never file counts. Verified absence (an examined
+/// file with no table, a hint verified absent), a function entry in a
+/// decoded table, and a proxy closure still awaiting publication keep
+/// the nothing-found hint.
+fn classify_empty_plan(plan: &crate::plan::AttachPlan) -> EmptyPlanClasses<'_> {
     use crate::discovery::scan::Skipped;
     let mut confirmed: Vec<&Skipped> = plan
         .modules_skipped
@@ -5544,6 +5558,32 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
             unexamined.push(skip);
         }
     }
+    EmptyPlanClasses {
+        confirmed,
+        unexamined,
+        discovery_stops,
+    }
+}
+
+/// Whether an empty plan names nothing but verified absence: no
+/// found-but-refused provider, no unexamined file, no discovery stop.
+/// The DR-K8S-5 `--cgroup` carve-out requires this — anything else
+/// means a member was not fully proven readable.
+fn empty_plan_is_clean(plan: &crate::plan::AttachPlan) -> bool {
+    classify_empty_plan(plan).is_clean()
+}
+
+/// P1-3: the empty-plan line. A plan with zero modules but provider
+/// skips names what was found and why it cannot be counted, instead
+/// of claiming nothing was found (see [`classify_empty_plan`]).
+/// Subjects and reasons are target-controlled bytes: escaped at this
+/// terminal boundary.
+fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
+    let EmptyPlanClasses {
+        confirmed,
+        unexamined,
+        discovery_stops,
+    } = classify_empty_plan(plan);
     if confirmed.is_empty() && unexamined.is_empty() && discovery_stops.is_empty() {
         return no_modules_hint(scope);
     }
@@ -5727,6 +5767,53 @@ fn replaced_file_hint_lines(skipped: &[crate::discovery::scan::Skipped]) -> Vec<
         ));
     }
     lines
+}
+
+/// DR-K8S-5 `--cgroup` proof: whether this empty capture proved every
+/// cgroup member visible and readable from the observer's namespace.
+/// Only `--cgroup` can prove it: its membership is the held cgroup's
+/// `cgroup.procs` listing, where an invisible member reads as `0`
+/// (a loud loss, never a silent pid) and every listed member is
+/// either scanned into a view, provably gone, or a loud skip — so a
+/// clean plan with an available scan is proof, not absence of data.
+/// (RED stub: never proven.)
+#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
+fn cgroup_empty_proof(_scope: &ScopeArg, _engine: &Engine) -> bool {
+    false
+}
+
+/// DR-K8S-5 refusal with the `--cgroup` carve-out: a nested observer
+/// whose `--cgroup` capture proved every member visible and readable
+/// ends as an ordinary empty capture; every other empty nested
+/// capture refuses by name exactly as before.
+#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
+fn refuse_nested_empty_capture_for_scope(
+    numbering: &crate::pidns::PidNumbering,
+    scope: &ScopeArg,
+    what: &str,
+    engine: &Engine,
+) -> Result<()> {
+    if cgroup_empty_proof(scope, engine) {
+        return Ok(());
+    }
+    crate::pidns::refuse_nested_empty_capture(numbering, what, engine.plan().modules.is_empty())
+}
+
+/// The carved-out empty line: the existing nothing-found sentence
+/// plus the proof (data-always): how many members were scanned.
+#[allow(dead_code)] // Wired at the empty-plan site by the fix commit.
+fn proven_cgroup_empty_hint(path: &Path, scanned: usize) -> String {
+    let members = if scanned == 1 {
+        "1 process scanned".to_string()
+    } else {
+        format!("{scanned} processes scanned")
+    };
+    format!(
+        "p11scope: no PKCS#11 modules discovered in cgroup {0} ({members}); run \
+         `p11scope inspect --pid <n>` for a process in it or \
+         `p11scope doctor --cgroup {0}` to see why",
+        path.display()
+    )
 }
 
 /// Best-effort capture diagnostic on stderr through the bounded
@@ -20607,6 +20694,241 @@ int main(int argc, char **argv) {
         assert_eq!(evidence.completeness, "PARTIAL");
         let agreeing = terminal_evidence_for(render::SchedulingEvidence::default());
         assert_eq!(agreeing.pid_namespace.observer, "initial");
+    }
+
+    struct CgroupProofChild(std::process::Child);
+
+    impl Drop for CgroupProofChild {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn nested_own_numbering_for_test() -> crate::pidns::PidNumbering {
+        crate::pidns::PidNumbering {
+            observer: crate::pidns::ObserverPidNs::Nested,
+            proc_view: crate::pidns::ProcView::Own,
+        }
+    }
+
+    /// DR-K8S-5 carve-out: a nested observer, a `--cgroup` scope, an
+    /// empty plan, and every member visible and readable (two live
+    /// provider-free processes, the kind-e2e idle pod shape) ends as
+    /// an ordinary empty capture instead of the refusal.
+    #[test]
+    fn nested_cgroup_capture_with_all_members_proven_proceeds_empty() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let a = CgroupProofChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .die_with_parent()
+                .spawn()
+                .expect("sleep a"),
+        );
+        let b = CgroupProofChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .die_with_parent()
+                .spawn()
+                .expect("sleep b"),
+        );
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("{}\n{}\n", a.0.id(), b.0.id()),
+        )
+        .expect("a cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over two sleeps captures");
+        assert!(engine.plan().modules.is_empty(), "sleeps map no provider");
+        assert_eq!(
+            engine.scanned_view_count(),
+            2,
+            "both members scanned into views"
+        );
+        assert!(
+            engine.discovery().scan_unavailable.is_none(),
+            "the scan ran"
+        );
+        assert!(
+            empty_plan_is_clean(engine.plan()),
+            "no loss may hide behind the fixture: {:?} {:?}",
+            engine.plan().skipped,
+            engine.plan().modules_skipped
+        );
+        refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Cgroup(dir.path().to_path_buf()),
+            "a --cgroup capture",
+            &engine,
+        )
+        .expect("proven cgroup emptiness proceeds");
+    }
+
+    /// Twin: one cgroup member unreadable (its `cgroup.procs` denied)
+    /// keeps the refusal — the observer cannot tell "nothing there"
+    /// from "can't see". The denial probe mirrors the `scope_pids`
+    /// walk test: under a privilege that reads through mode 000 the
+    /// member is genuinely proven, so the capture genuinely proceeds.
+    #[test]
+    fn nested_cgroup_capture_with_an_unreadable_member_is_still_refused() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let leaf = dir.path().join("leaf.scope");
+        std::fs::create_dir(&leaf).expect("a leaf cgroup");
+        std::fs::write(leaf.join("cgroup.procs"), "99999999\n").expect("a cgroup.procs");
+        let mut permissions = std::fs::metadata(&leaf).unwrap().permissions();
+        permissions.set_mode(0o000);
+        std::fs::set_permissions(&leaf, permissions).unwrap();
+        let denied = std::fs::read_dir(&leaf).is_err();
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over a denied leaf captures");
+        std::fs::set_permissions(&leaf, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(
+            engine.plan().modules.is_empty(),
+            "nothing mapped means no modules either way"
+        );
+        let verdict = refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Cgroup(dir.path().to_path_buf()),
+            "a --cgroup capture",
+            &engine,
+        );
+        if !denied {
+            verdict.expect("nothing was denied, so the empty cgroup proceeds");
+            return;
+        }
+        let error = verdict.expect_err("a denied member keeps the refusal");
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("pid-namespace-mismatch: refusing a --cgroup capture:"),
+            "{text}"
+        );
+    }
+
+    /// Twin: a member listed as `0` (outside this PID namespace) is
+    /// not proven visible, so the refusal stays even when every other
+    /// member scanned cleanly.
+    #[test]
+    fn nested_cgroup_capture_with_an_invisible_member_is_still_refused() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        let a = CgroupProofChild(
+            std::process::Command::new("sleep")
+                .arg("120")
+                .die_with_parent()
+                .spawn()
+                .expect("sleep a"),
+        );
+        std::fs::write(
+            dir.path().join("cgroup.procs"),
+            format!("0\n{}\n", a.0.id()),
+        )
+        .expect("a cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over one sleep captures");
+        assert!(
+            engine.plan().modules.is_empty(),
+            "one sleep maps no provider"
+        );
+        let error = refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Cgroup(dir.path().to_path_buf()),
+            "a --cgroup capture",
+            &engine,
+        )
+        .expect_err("an invisible member keeps the refusal");
+        let text = format!("{error:#}");
+        assert!(
+            text.starts_with("pid-namespace-mismatch: refusing a --cgroup capture:"),
+            "{text}"
+        );
+    }
+
+    /// The carve-out is `--cgroup`-only: pid and system scopes keep
+    /// the refusal even over a proven-clean engine.
+    #[test]
+    fn nested_pid_and_system_captures_keep_the_refusal() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over an empty cgroup captures");
+        assert!(engine.plan().modules.is_empty());
+        assert!(empty_plan_is_clean(engine.plan()));
+        for (scope_arg, what) in [
+            (ScopeArg::System, "a --system capture"),
+            (ScopeArg::Pid(42), "--pid 42"),
+        ] {
+            let error = refuse_nested_empty_capture_for_scope(
+                &nested_own_numbering_for_test(),
+                &scope_arg,
+                what,
+                &engine,
+            )
+            .expect_err("pid/system scopes keep the refusal");
+            let text = format!("{error:#}");
+            assert!(
+                text.starts_with(&format!("pid-namespace-mismatch: refusing {what}:")),
+                "{text}"
+            );
+        }
+    }
+
+    /// An empty cgroup (no members at all, fully readable, no `0`
+    /// entries) proves vacuous emptiness: nothing is hidden, so the
+    /// capture proceeds and names its zero-member proof.
+    #[test]
+    fn nested_empty_cgroup_with_no_members_proceeds_vacuously() {
+        let dir = tempfile::tempdir().expect("a scope directory");
+        std::fs::write(dir.path().join("cgroup.procs"), "").expect("an empty cgroup.procs");
+        let scope = crate::scope::cgroup(dir.path()).expect("open scope directory");
+        let engine = Engine::discover(
+            &capture_args(ScopeArg::Cgroup(dir.path().to_path_buf())),
+            &scope,
+            None,
+        )
+        .expect("discovery over an empty cgroup captures");
+        assert!(engine.plan().modules.is_empty());
+        assert!(empty_plan_is_clean(engine.plan()));
+        assert_eq!(engine.scanned_view_count(), 0);
+        refuse_nested_empty_capture_for_scope(
+            &nested_own_numbering_for_test(),
+            &ScopeArg::Cgroup(dir.path().to_path_buf()),
+            "a --cgroup capture",
+            &engine,
+        )
+        .expect("an empty cgroup proves vacuous emptiness");
+    }
+
+    /// The carved-out empty line keeps the existing nothing-found
+    /// sentence and names its proof: how many members were scanned.
+    #[test]
+    fn proven_cgroup_emptiness_names_its_scanned_members() {
+        let hint = proven_cgroup_empty_hint(Path::new("/sys/fs/cgroup/x"), 2);
+        assert!(hint.contains("no PKCS#11 modules discovered"), "{hint}");
+        assert!(hint.contains("2 processes scanned"), "{hint}");
+        assert!(hint.contains("p11scope doctor --cgroup"), "{hint}");
+        let one = proven_cgroup_empty_hint(Path::new("/sys/fs/cgroup/x"), 1);
+        assert!(one.contains("1 process scanned"), "{one}");
+        assert!(!one.contains("processes scanned"), "{one}");
     }
 
     /// Design §10.3: exec, kill/reap, cancellation, pause, and environment

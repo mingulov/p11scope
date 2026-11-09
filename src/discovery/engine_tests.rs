@@ -37208,6 +37208,31 @@ fn cgroup_walk_reports_losses_under_the_operator_path_not_a_proc_fd_path() {
     assert!(!format!("{lost:?}").contains("/proc/self/fd"));
 }
 
+/// A member outside this observer's PID namespace is listed as 0
+/// in cgroup.procs: loud (a loss naming the namespace cause), never
+/// a pid 0 to scan — pid 0 reads as provably dead downstream, so a
+/// silent zero would let a nested `--cgroup` capture mistake
+/// invisibility for absence (DR-K8S-5 carve-out soundness).
+#[test]
+fn cgroup_walk_reports_zero_listed_members_as_invisible_losses() {
+    let root = tempfile::tempdir().unwrap();
+    let leaf = root.path().join("container.scope");
+    std::fs::create_dir(&leaf).unwrap();
+    std::fs::write(root.path().join("cgroup.procs"), "11\n0\n0\n").unwrap();
+    std::fs::write(leaf.join("cgroup.procs"), "22\n").unwrap();
+    let scope = crate::scope::cgroup(root.path()).unwrap();
+    let (pids, lost) = scope_pids(&scope);
+    assert_eq!(pids, vec![11, 22], "zero entries are not pids to scan");
+    assert_eq!(
+        lost.len(),
+        1,
+        "one loss for the invisible members: {lost:?}"
+    );
+    assert!(lost[0].reason.contains("listed as 0"), "{lost:?}");
+    assert!(lost[0].reason.contains("PID namespace"), "{lost:?}");
+    assert_eq!(lost[0].subject, root.path().display().to_string());
+}
+
 #[test]
 fn cgroup_scope_collects_pids_from_every_descendant() {
     let root = tempfile::tempdir().unwrap();

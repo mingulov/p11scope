@@ -2375,6 +2375,14 @@ impl PinnedObjects {
         self.changed.get()
     }
 
+    /// Latches the provider as changed when an identity revalidation
+    /// itself failed (fail closed): the report must not read clean on
+    /// unproven identity. Sticky like a detected change, so a later
+    /// check short-circuits instead of filing a second gap.
+    pub fn note_check_failed(&self) {
+        self.changed.set(true);
+    }
+
     /// Per-object held-fd `(ino, size, ctime)` check (packet 6.13, R2-D1-8):
     /// `Ok(true)` when this one object still matches its pin. Unlike the
     /// all-objects sticky bool, this attributes a change to one module.

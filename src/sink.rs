@@ -161,6 +161,16 @@ pub(crate) fn sink_on_fd(fd: RawFd) -> io::Result<SinkWriter<StdoutInner>> {
     stdout_sink_from(fd)
 }
 
+/// A closed capture stdout: the degraded sink a capture holds when fd 1
+/// is unusable at capture start, so the run continues (other transports
+/// still publish) instead of aborting before settlement. Callers start
+/// closed and never write through it, but a write is safe: bytes go to
+/// `/dev/null`.
+pub(crate) fn null_sink() -> io::Result<SinkWriter<StdoutInner>> {
+    let null = std::fs::OpenOptions::new().write(true).open("/dev/null")?;
+    Ok(SinkWriter::without_flag_change(StdoutInner::File(null)))
+}
+
 /// Best-effort diagnostics: use existing descriptor-safe transports and
 /// immediate nonblocking writes. A full pipe/socket must not delay cleanup.
 /// Callers must not treat a missing diagnostic as a successful measurement.

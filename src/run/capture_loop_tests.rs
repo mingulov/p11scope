@@ -735,6 +735,7 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
                         )
                     }
                 },
+                |_| {},
                 |context, consumers| {
                     context.phases.push("drain");
                     let sessions = consumers.state.sessions();
@@ -767,6 +768,7 @@ fn terminal_completed_root_reduces_and_retires_before_ordinary_drain_in_both_mod
                     }
                     Ok(())
                 },
+                |_| {},
                 |context, consumers| {
                     context.phases.push("snapshot");
                     let sessions = consumers.state.sessions();
@@ -861,7 +863,9 @@ fn terminal_absent_and_cancelled_roots_retain_pending_state() {
                         None,
                     )
                 },
+                |_| {},
                 |_, _| Ok(()),
+                |_| {},
                 |_, consumers| {
                     let sessions = consumers.state.sessions();
                     Ok((
@@ -950,10 +954,12 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
                 );
                 (result, write_error)
             },
+            |_| {},
             |context, _| {
                 context.phases.push("drain");
                 Ok(())
             },
+            |_| {},
             |context, _| {
                 context.phases.push("snapshot");
                 Ok(())
@@ -969,7 +975,7 @@ fn terminal_deferred_trace_writer_error_retires_then_skips_later_phases() {
 }
 
 #[test]
-fn terminal_errors_stop_at_the_current_attempt_boundary() {
+fn terminal_discovery_error_stops_but_root_and_drain_errors_still_seal() {
     for failure in ["discovery", "root", "drain"] {
         let plan = terminal_plan();
         let mut state = semantics::State::new(&plan);
@@ -1012,6 +1018,7 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
                         (Ok(OriginalRootDrain::Absent), None)
                     }
                 },
+                |_| {},
                 |_, _| {
                     phases.borrow_mut().push("drain");
                     if failure == "drain" {
@@ -1019,6 +1026,7 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
                     }
                     Ok(())
                 },
+                |_| {},
                 |_, _| {
                     phases.borrow_mut().push("snapshot");
                     Ok(())
@@ -1030,10 +1038,15 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
         if failure == "root" {
             assert!(error.contains("root writer failure"), "{error}");
         }
+        // Data-always (owner, binding, 2026-11-09): a run that collected
+        // data seals its report even when a terminal drain fails. Root
+        // and drain failures file a named gap, run the remaining phases,
+        // and fail after publication; only a discovery failure still
+        // stops the terminal.
         let expected = match failure {
             "discovery" => vec!["discovery"],
-            "root" => vec!["discovery", "root"],
-            _ => vec!["discovery", "root", "drain"],
+            "root" => vec!["discovery", "root", "drain", "snapshot"],
+            _ => vec!["discovery", "root", "drain", "snapshot"],
         };
         assert_eq!(*phases.borrow(), expected);
     }
@@ -1072,7 +1085,9 @@ fn terminal_errors_stop_at_the_current_attempt_boundary() {
                     None,
                 )
             },
+            |_| {},
             |_, _| Ok(()),
+            |_| {},
             |_, _| Err::<(), _>(anyhow::anyhow!("publication failure")),
         )
         .unwrap_err()
@@ -1112,7 +1127,9 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
             &mut diagnostics,
             |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
+            |_| {},
             |context, consumers| drain_tick(context, consumers),
+            |_| {},
             |_, consumers| Ok(consumers.state.sessions().opened),
         )
         .unwrap();
@@ -1143,7 +1160,9 @@ fn terminal_discovery_syncs_new_and_downgraded_slots_for_both_consumers() {
             &mut diagnostics,
             |context: &mut TickContext, _, _| Ok((true, &context.plan)),
             |_, _| (Ok(OriginalRootDrain::Absent), None),
+            |_| {},
             |context, consumers| drain_tick(context, consumers),
+            |_| {},
             |_, consumers| Ok(consumers.state.sessions().opened),
         )
         .unwrap();
@@ -1373,6 +1392,7 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
                 Ok((false, &context.plan))
             },
             |_, _| (Ok(OriginalRootDrain::Absent), None),
+            |_| {},
             |context, consumers| {
                 let (malformed, _) = drain_trace_events_from(
                     &mut context.drain,
@@ -1389,6 +1409,7 @@ fn capture_tick_limit_skips_live_snapshot_and_check_but_terminal_reduces_remaind
                 *consumers.malformed_records += malformed;
                 Ok(())
             },
+            |_| {},
             |_, consumers| Ok(consumers.state.sessions().opened),
         )
         .unwrap()
@@ -3500,5 +3521,376 @@ fn degraded_terminal_publishes_before_failing_with_terminal_error() {
     assert!(
         tail.contains("return Err(anyhow::Error::msg(error.to_string()))"),
         "the degraded terminal error returns Err after publishing"
+    );
+}
+
+/// The terminal-seal test context: a plan the discovery closure hands
+/// back, one gap flag per terminal drain, and a publication flag.
+struct TerminalSealContext {
+    plan: crate::plan::AttachPlan,
+    drain_gap: bool,
+    root_gap: bool,
+    published: bool,
+}
+
+impl TerminalSealContext {
+    fn new() -> Self {
+        Self {
+            plan: crate::plan::AttachPlan::from_slots(vec![]),
+            drain_gap: false,
+            root_gap: false,
+            published: false,
+        }
+    }
+}
+
+/// Owned terminal consumers: the state keeps no borrow on the plan it
+/// was built from, so the whole setup lives in one fixture.
+struct TerminalSealSetup {
+    plan: crate::plan::AttachPlan,
+    state: semantics::State,
+    tracker: process::Tracker,
+    malformed: u64,
+    scheduling: SchedulingAccumulator,
+}
+
+impl TerminalSealSetup {
+    fn new() -> Self {
+        let plan = crate::plan::AttachPlan::from_slots(vec![]);
+        let state = semantics::State::new(&plan);
+        let tracker =
+            process::Tracker::for_producer(crate::events::EventsDomain::test_standin(7), 16);
+        Self {
+            plan,
+            state,
+            tracker,
+            malformed: 0,
+            scheduling: SchedulingAccumulator::default(),
+        }
+    }
+
+    fn consumers(&mut self) -> CaptureConsumers<'_> {
+        CaptureConsumers {
+            state: &mut self.state,
+            tracker: &mut self.tracker,
+            tracer: None,
+            malformed_records: &mut self.malformed,
+            scheduling: &mut self.scheduling,
+            stop_quiescence: crate::render::StopQuiescence {
+                state: crate::render::QuiescenceState::NotReached,
+                post_q_events: false,
+                post_q_discovery: false,
+            },
+        }
+    }
+}
+
+/// A failed terminal events drain still seals: the named gap is filed,
+/// publication runs from partial state, and the drain error returns so
+/// the run exits nonzero.
+#[test]
+fn terminal_events_drain_failure_still_seals_with_a_named_gap() {
+    let mut setup = TerminalSealSetup::new();
+    let mut consumers = setup.consumers();
+    let mut context = TerminalSealContext::new();
+    let mut diagnostics = Vec::new();
+    let result: Result<()> = drain_capture_terminal_with(
+        &mut context,
+        &mut consumers,
+        None,
+        &mut diagnostics,
+        |context, _, _| Ok((false, &context.plan)),
+        |_, _| (Ok(OriginalRootDrain::Absent), None),
+        |context| context.root_gap = true,
+        |_, _| Err(anyhow::anyhow!("ring read failed")),
+        |context| context.drain_gap = true,
+        |context, _| {
+            context.published = true;
+            Ok(())
+        },
+    );
+    let error = result.expect_err("a failed terminal drain must fail the run");
+    assert!(
+        format!("{error:#}").contains("ring read failed"),
+        "the drain error must survive the seal: {error:#}"
+    );
+    assert!(
+        context.drain_gap,
+        "the drain failure must file its named gap"
+    );
+    assert!(!context.root_gap, "no root failure happened");
+    assert!(
+        context.published,
+        "a failed terminal drain must still publish"
+    );
+}
+
+/// Healthy twin: a healthy terminal events drain seals cleanly with no
+/// gap and no error.
+#[test]
+fn terminal_events_drain_success_seals_without_a_gap() {
+    let mut setup = TerminalSealSetup::new();
+    let mut consumers = setup.consumers();
+    let mut context = TerminalSealContext::new();
+    let mut diagnostics = Vec::new();
+    let result: Result<()> = drain_capture_terminal_with(
+        &mut context,
+        &mut consumers,
+        None,
+        &mut diagnostics,
+        |context, _, _| Ok((false, &context.plan)),
+        |_, _| (Ok(OriginalRootDrain::Absent), None),
+        |context| context.root_gap = true,
+        |_, _| Ok(()),
+        |context| context.drain_gap = true,
+        |context, _| {
+            context.published = true;
+            Ok(())
+        },
+    );
+    result.expect("a healthy terminal drain must seal cleanly");
+    assert!(
+        !context.drain_gap && !context.root_gap,
+        "a healthy seal files no gap"
+    );
+    assert!(context.published, "a healthy seal publishes");
+}
+
+/// A failed terminal original-root tail drain still seals: the named
+/// gap is filed, publication runs with no completed tail, and the root
+/// error returns so the run exits nonzero.
+#[test]
+fn terminal_root_drain_failure_still_seals_with_a_named_gap() {
+    let mut setup = TerminalSealSetup::new();
+    let mut consumers = setup.consumers();
+    let mut context = TerminalSealContext::new();
+    let mut diagnostics = Vec::new();
+    let result: Result<()> = drain_capture_terminal_with(
+        &mut context,
+        &mut consumers,
+        None,
+        &mut diagnostics,
+        |context, _, _| Ok((false, &context.plan)),
+        |_, _| (Err(anyhow::anyhow!("root ring read failed")), None),
+        |context| context.root_gap = true,
+        |_, _| Ok(()),
+        |context| context.drain_gap = true,
+        |context, _| {
+            context.published = true;
+            Ok(())
+        },
+    );
+    let error = result.expect_err("a failed root drain must fail the run");
+    assert!(
+        format!("{error:#}").contains("root ring read failed"),
+        "the root error must survive the seal: {error:#}"
+    );
+    assert!(context.root_gap, "the root failure must file its named gap");
+    assert!(!context.drain_gap, "no events-drain failure happened");
+    assert!(context.published, "a failed root drain must still publish");
+}
+
+/// Healthy twin: a healthy terminal root drain seals cleanly with no
+/// gap and no error.
+#[test]
+fn terminal_root_drain_success_seals_without_a_gap() {
+    let mut setup = TerminalSealSetup::new();
+    let mut consumers = setup.consumers();
+    let mut context = TerminalSealContext::new();
+    let mut diagnostics = Vec::new();
+    let result: Result<()> = drain_capture_terminal_with(
+        &mut context,
+        &mut consumers,
+        None,
+        &mut diagnostics,
+        |context, _, _| Ok((false, &context.plan)),
+        |_, _| (Ok(OriginalRootDrain::Absent), None),
+        |context| context.root_gap = true,
+        |_, _| Ok(()),
+        |context| context.drain_gap = true,
+        |context, _| {
+            context.published = true;
+            Ok(())
+        },
+    );
+    result.expect("a healthy root drain must seal cleanly");
+    assert!(
+        !context.drain_gap && !context.root_gap,
+        "a healthy seal files no gap"
+    );
+    assert!(context.published, "a healthy seal publishes");
+}
+
+/// An unusable capture stdout degrades to a closed sink: the named gap
+/// is filed, the run starts closed, and the deferred failure fails the
+/// run after publication.
+#[test]
+fn unavailable_capture_stdout_degrades_to_a_closed_sink_with_a_gap() {
+    let gap = std::cell::Cell::new(false);
+    let opened = open_capture_stdout(
+        || gap.set(true),
+        || {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "fd 1 closed",
+            ))
+        },
+    )
+    .expect("a degraded open must still hand back a sink");
+    assert!(gap.get(), "the failure must file its named gap");
+    assert!(!opened.open, "a degraded run starts with stdout closed");
+    let deferred = opened
+        .deferred
+        .expect("a degraded run must fail after publication");
+    assert!(
+        format!("{deferred:#}").contains("opening capture stdout"),
+        "the deferred failure must name the open: {deferred:#}"
+    );
+    // The degraded sink is safe to hold: nothing is written through it
+    // (callers start closed), but a write would reach /dev/null.
+    let mut sink = opened.sink;
+    use std::io::Write as _;
+    sink.write_all(b"x")
+        .expect("a degraded sink stays writable");
+}
+
+/// Healthy twin: a live stdout opens live with no gap and nothing
+/// deferred.
+#[test]
+fn available_capture_stdout_opens_live_with_no_gap() {
+    let gap = std::cell::Cell::new(false);
+    let opened = open_capture_stdout(|| gap.set(true), crate::sink::stdout_sink)
+        .expect("a live stdout must open");
+    assert!(!gap.get(), "a live open files no gap");
+    assert!(opened.open, "a live open stays open");
+    assert!(opened.deferred.is_none(), "a live open defers nothing");
+}
+
+/// A terminal identity revalidation whose `fstat` itself failed
+/// degrades to a named gap and fails after publication; the caller
+/// latches fail-closed identity beside it.
+#[test]
+fn failed_identity_revalidation_degrades_to_a_gap_and_fails() {
+    let gap = std::cell::Cell::new(false);
+    let error = terminal_identity_or_gap(
+        || gap.set(true),
+        Err("/prov/p11.so: Bad file descriptor".to_string()),
+    )
+    .expect_err("a failed revalidation must fail the run");
+    assert!(gap.get(), "the failure must file its named gap");
+    assert!(
+        format!("{error:#}").contains("revalidating pinned provider identity"),
+        "the failure must name the revalidation: {error:#}"
+    );
+}
+
+/// Healthy twins: a proven identity check — changed or not — passes
+/// through with no gap.
+#[test]
+fn proven_identity_checks_pass_through_without_a_gap() {
+    for changed in [false, true] {
+        let gap = std::cell::Cell::new(false);
+        terminal_identity_or_gap(|| gap.set(true), Ok(!changed))
+            .expect("a proven check must pass through");
+        assert!(!gap.get(), "a proven check files no gap");
+    }
+}
+
+/// A failure deferred past publication still fails the run: a sealed
+/// document keeps its error, and a failed seal keeps both errors.
+#[test]
+fn deferred_failure_fails_after_publication() {
+    assert!(
+        combine_deferred_failure::<()>(Ok(()), None).is_ok(),
+        "no deferral leaves a sealed result standing"
+    );
+    assert!(
+        combine_deferred_failure::<()>(Err(anyhow::anyhow!("seal failed")), None).is_err(),
+        "no deferral leaves a failed seal failing"
+    );
+    let error = combine_deferred_failure::<()>(Ok(()), Some(anyhow::anyhow!("stdout failed")))
+        .expect_err("a deferred failure must fail a sealed run");
+    assert!(
+        error.to_string().contains("stdout failed"),
+        "the deferred failure must survive: {error:#}"
+    );
+    let error = combine_deferred_failure::<()>(
+        Err(anyhow::anyhow!("seal failed")),
+        Some(anyhow::anyhow!("stdout failed")),
+    )
+    .expect_err("a deferred failure must fail a failed seal");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("stdout failed") && message.contains("seal failed"),
+        "either error dropped: {message}"
+    );
+}
+
+/// Both capture paths file the terminal-drain gaps, open stdout
+/// through the degrading opener, and report the deferred failure after
+/// publication (profile: quiesce-error and normal terminals; trace:
+/// the normal terminal — its quiesce path already fails).
+#[test]
+fn terminal_drain_and_stdout_degradations_are_wired_at_both_capture_paths() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .0;
+    let trace = source
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .1
+        .split_once("fn terminal_trace_count_line")
+        .unwrap()
+        .0;
+    for (function, body, deferred) in [("capture_profile", profile, 2), ("capture_trace", trace, 1)]
+    {
+        for site in [
+            "note_terminal_events_drain_failure()",
+            "note_terminal_original_root_drain_failure()",
+            "open_capture_stdout(",
+        ] {
+            assert!(body.contains(site), "{function} must wire {site}");
+        }
+        assert_eq!(
+            body.matches("combine_deferred_failure(").count(),
+            deferred,
+            "{function} must fail the deferred stdout error after publication"
+        );
+    }
+}
+
+/// Every terminal identity revalidation — one in the profile seal, two
+/// bracketing the trace map read — degrades through the shared helper.
+#[test]
+fn terminal_identity_degradation_is_wired_at_every_revalidation_site() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .0;
+    let trace = source
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .1
+        .split_once("fn terminal_trace_count_line")
+        .unwrap()
+        .0;
+    assert_eq!(
+        profile.matches("terminal_identity_or_gap(").count(),
+        1,
+        "the profile seal must degrade its revalidation"
+    );
+    assert_eq!(
+        trace.matches("terminal_identity_or_gap(").count(),
+        2,
+        "the trace seal must degrade both revalidations"
     );
 }

@@ -30857,6 +30857,50 @@ impl Engine {
         );
     }
 
+    /// A terminal events drain that failed at any stop files unfinished
+    /// work and keeps what was captured: the seal proceeds from partial
+    /// state and the caller fails after publication, so the report names
+    /// the gap and the run still exits nonzero.
+    pub(crate) fn note_terminal_events_drain_failure(&mut self) {
+        self.mark_live_loss(
+            "terminal events drain",
+            "the terminal events drain failed; the report holds what was captured up to the failure",
+        );
+    }
+
+    /// A terminal original-root tail drain that failed at any stop files
+    /// unfinished work: the seal proceeds with no completed tail and the
+    /// caller fails after publication.
+    pub(crate) fn note_terminal_original_root_drain_failure(&mut self) {
+        self.mark_live_loss(
+            "terminal original-root drain",
+            "the terminal original-root tail drain failed; the report holds what was captured up to the failure",
+        );
+    }
+
+    /// An unusable capture stdout the run degraded around (a closed sink
+    /// from the start): the other transports still publish, and the
+    /// terminal fails after publication so the degraded run exits
+    /// nonzero. Transport-only — no observation is lost — so causal
+    /// timing stands and only the gap is filed.
+    pub(crate) fn note_stdout_unavailable(&mut self) {
+        self.mark_partial(
+            "capture stdout",
+            "capture stdout was unusable; the run continued without it and the report holds what the other transports published",
+        );
+    }
+
+    /// A terminal provider-identity revalidation whose `fstat` itself
+    /// failed: fail closed (the provider counts as changed), file the
+    /// unfinished revalidation, and let the caller fail after publication.
+    pub(crate) fn note_terminal_identity_check_failed(&mut self) {
+        self.pinned().note_check_failed();
+        self.mark_partial(
+            "provider identity revalidation",
+            "the terminal held-fd identity check failed; the provider is treated as changed",
+        );
+    }
+
     /// Notes the current held occupancy (pending plus terminal plus the
     /// batch's in-flight records) into the diagnostic high-water mark.
     fn note_discovery_held_high_water(&mut self, in_flight: usize) {

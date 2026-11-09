@@ -5938,6 +5938,55 @@ fn seal_terminal_or_last_good<T: Clone>(
     }
 }
 
+/// An opened capture stdout: the sink, whether fd 1 backs it (false
+/// when the run degraded to a closed null sink), and the deferred
+/// failure the terminal reports after publication so a degraded run
+/// still exits nonzero.
+struct OpenedCaptureStdout {
+    sink: crate::sink::SinkWriter<crate::sink::StdoutInner>,
+    open: bool,
+    deferred: Option<anyhow::Error>,
+}
+
+/// Opens the capture stdout, degrading to a closed null sink when fd 1
+/// is unusable: the capture still runs (the other transports publish)
+/// with a named gap, and the terminal fails after publication so the
+/// run exits nonzero. Only a `/dev/null` failure itself still aborts
+/// before the loop — the caller routes that through settlement.
+fn open_capture_stdout(
+    _note_gap: impl FnOnce(),
+    open: impl FnOnce() -> std::io::Result<crate::sink::SinkWriter<crate::sink::StdoutInner>>,
+) -> std::io::Result<OpenedCaptureStdout> {
+    open().map(|sink| OpenedCaptureStdout {
+        sink,
+        open: true,
+        deferred: None,
+    })
+}
+
+/// Reports a failure deferred past publication (an unusable capture
+/// stdout the run degraded around): the sealed result stands, but the
+/// run still exits nonzero naming what was degraded.
+fn combine_deferred_failure<T>(sealed: Result<T>, deferred: Option<anyhow::Error>) -> Result<T> {
+    match (sealed, deferred) {
+        (result, None) => result,
+        (Ok(_), Some(deferred)) => Err(deferred),
+        (Err(sealed), Some(deferred)) => Err(also_failed(deferred, sealed, "terminal publication")),
+    }
+}
+
+/// A terminal provider-identity revalidation whose `fstat` itself failed
+/// degrades to a named gap with fail-closed identity: the provider
+/// counts as changed, the seal proceeds from partial state, and the
+/// caller fails after publication so the run still exits nonzero. A
+/// proven outcome — changed or not — keeps its existing path untouched.
+fn terminal_identity_or_gap(
+    _note_gap: impl FnOnce(),
+    check: std::result::Result<bool, String>,
+) -> Result<()> {
+    check.map(|_| ()).map_err(anyhow::Error::msg)
+}
+
 /// A marker probe is not wired in this slice, so the coordinator is told the
 /// protected marker was never reached. ponytail: fixed `false` until the Gate B
 /// protected-marker probe lands; swap for the real read then.
@@ -8631,7 +8680,9 @@ fn drain_capture_terminal_with<'state, C, T>(
         &mut C,
         &mut CaptureConsumers<'state>,
     ) -> (Result<OriginalRootDrain>, Option<anyhow::Error>),
+    _root_gap: impl FnOnce(&mut C),
     drain: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<()>,
+    _drain_gap: impl FnOnce(&mut C),
     snapshot_and_publish: impl FnOnce(&mut C, &mut CaptureConsumers<'state>) -> Result<T>,
 ) -> Result<T> {
     {
@@ -8731,7 +8782,25 @@ fn capture_profile(
     }
     let cancellation = CaptureCancellation::default();
     let live_display = LiveDisplay::for_capture(owned.is_some());
-    let mut stdout_sink = crate::sink::stdout_sink()?;
+    let OpenedCaptureStdout {
+        sink: mut stdout_sink,
+        open: stdout_open_init,
+        deferred: mut stdout_error,
+    } = match open_capture_stdout(
+        || engine.note_stdout_unavailable(),
+        crate::sink::stdout_sink,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Err(finish_capture_error(
+                anyhow::Error::new(error).context("opening capture stdout"),
+                engine,
+                session,
+                owned.as_deref_mut(),
+                interrupted,
+            ));
+        }
+    };
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
     let profile = policy.uses_events();
@@ -8829,7 +8898,7 @@ fn capture_profile(
         session.process_creation_tracking_unavailable().is_some(),
         session.lifecycle_tracking_unavailable().is_some(),
     );
-    let mut stdout_open = true;
+    let mut stdout_open = stdout_open_init;
     let wall_start = SystemTime::now();
     let mut scheduling = SchedulingAccumulator::default();
     scheduling.note_resource(crate::timing::ResourcePoint::Start, resource_start);
@@ -9411,7 +9480,7 @@ fn capture_profile(
                                 tail_records: Vec::new(),
                                 tail_malformed: 0,
                             });
-                    run_terminal(
+                    let published = run_terminal(
                         &mut terminal_context,
                         &mut consumers,
                         scope,
@@ -9435,7 +9504,8 @@ fn capture_profile(
                         &target_caller,
                         last_snapshot.as_ref(),
                     )
-                    .map(|_| ())
+                    .map(|_| ());
+                    combine_deferred_failure(published, stdout_error.take())
                 },
                 |context| {
                     let result = context.1.detach_producers_driven(
@@ -9498,7 +9568,7 @@ fn capture_profile(
                 scheduling: &mut scheduling,
                 stop_quiescence,
             };
-            drain_capture_terminal_with(
+            let sealed = drain_capture_terminal_with(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
@@ -9583,6 +9653,7 @@ fn capture_profile(
                         (Ok(OriginalRootDrain::Absent), None)
                     }
                 },
+                |context| context.0.note_terminal_original_root_drain_failure(),
                 |context, consumers| {
                     poll_terminal_cancellation();
                     context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -9610,6 +9681,7 @@ fn capture_profile(
                     collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
+                |context| context.0.note_terminal_events_drain_failure(),
                 |context, consumers| {
                     poll_terminal_cancellation();
                     // K0: the close boundary is clean only with proven
@@ -9653,7 +9725,8 @@ fn capture_profile(
                         last_snapshot.as_ref(),
                     )
                 },
-            )
+            );
+            combine_deferred_failure(sealed, stdout_error.take())
         },
     );
 
@@ -10244,7 +10317,25 @@ fn capture_trace(
     };
     let mut out_sink = out.map(buffered_sink);
     let out_file = &mut out_sink;
-    let mut stdout_sink = crate::sink::stdout_sink()?;
+    let OpenedCaptureStdout {
+        sink: mut stdout_sink,
+        open: stdout_open_init,
+        deferred: mut stdout_error,
+    } = match open_capture_stdout(
+        || engine.note_stdout_unavailable(),
+        crate::sink::stdout_sink,
+    ) {
+        Ok(opened) => opened,
+        Err(error) => {
+            return Err(finish_capture_error(
+                anyhow::Error::new(error).context("opening capture stdout"),
+                engine,
+                session,
+                owned.as_deref_mut(),
+                interrupted,
+            ));
+        }
+    };
     stdout_sink.set_cancel_flag(interrupted.cancel_flag());
     let stdout: &mut crate::sink::SinkWriter<crate::sink::StdoutInner> = &mut stdout_sink;
 
@@ -10278,7 +10369,7 @@ fn capture_trace(
     #[cfg(feature = "h6-reexec-diagnostic")]
     let reexec_diagnostic = session.reexec_diagnostic();
 
-    let mut stdout_open = true;
+    let mut stdout_open = stdout_open_init;
     let mut malformed_records: u64 = 0;
     let capture_tracking_degraded = initial_tracking_evidence(
         scope,
@@ -10795,7 +10886,7 @@ fn capture_trace(
                 scheduling: &mut scheduling,
                 stop_quiescence,
             };
-            drain_capture_terminal_with(
+            let sealed = drain_capture_terminal_with(
                 &mut terminal_context,
                 &mut consumers,
                 quiesced,
@@ -10873,6 +10964,7 @@ fn capture_trace(
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     (root_result, root_write_error)
                 },
+                |context| context.0.note_terminal_original_root_drain_failure(),
                 |context, consumers| {
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -10906,6 +10998,7 @@ fn capture_trace(
                     collect_sink_drops(context.5, consumers.scheduling, &mut None, Instant::now());
                     Ok(())
                 },
+                |context| context.0.note_terminal_events_drain_failure(),
                 |context, consumers| {
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -11159,7 +11252,8 @@ fn capture_trace(
                     }
                     Ok(evidence)
                 },
-            )
+            );
+            combine_deferred_failure(sealed, stdout_error.take())
         },
     )
 }
@@ -26428,7 +26522,7 @@ int main(int argc, char **argv) {
                 .find("let stop_quiescence = stop_quiescence_for(stop_state);")
                 .unwrap_or_else(|| panic!("{function} derives the outcome from its StopState"));
             let handed = body
-                .find("                stop_quiescence,\n            };\n            drain_capture_terminal_with(")
+                .find("                stop_quiescence,\n            };\n            let sealed = drain_capture_terminal_with(")
                 .unwrap_or_else(|| panic!("{function} hands the outcome to the terminal consumers"));
             assert!(derived < handed, "{function}");
             for (field, ring) in [

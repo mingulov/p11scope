@@ -12816,6 +12816,69 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn profile_and_metrics_pid_capture_name_the_caller() {
+        // A pid-scope capture names its caller — the target exe — or a
+        // named unknown reason. Scope-kind alone leaves the caller
+        // missing: the target pid and exe appear nowhere.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let capture = capture_fixture();
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            let named = caller
+                .get("exe")
+                .and_then(|exe| exe.as_str())
+                .is_some_and(|exe| !exe.is_empty());
+            let unknown = caller
+                .get("exe_unknown_reason")
+                .and_then(|reason| reason.as_str())
+                .is_some_and(|reason| !reason.is_empty());
+            assert!(
+                named || unknown,
+                "pid-scope capture names no caller: {}",
+                document["capture"]
+            );
+        }
+    }
+
+    #[test]
+    fn profile_and_metrics_non_pid_capture_name_no_single_caller() {
+        // Aggregate scopes name no single caller by design: counts are
+        // not per-application there, so no caller key is emitted even
+        // when the fixture carries pid-scope caller identity.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        for scope in ["cgroup", "system"] {
+            let capture = CaptureMeta {
+                scope,
+                ..capture_fixture()
+            };
+            for document in [
+                profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+                json(&[], &ev, &capture),
+            ] {
+                assert!(
+                    document["capture"].get("caller").is_none(),
+                    "{scope} capture names a single caller: {}",
+                    document["capture"]
+                );
+            }
+        }
+    }
+
+    #[test]
     fn cap_skip_forces_partial_in_profile_and_metrics() {
         // A scan-cap skip alone flips a clean evidence to PARTIAL, and the
         // public record stays categorical: no pid, path, or count details.

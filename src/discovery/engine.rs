@@ -12922,6 +12922,12 @@ impl Engine {
         }
     }
 
+    /// Test-only: dropped passes recorded for one error text.
+    #[cfg(test)]
+    fn dropped_pass_count_for_test(&self, error: &str) -> u64 {
+        self.dropped_pass_gaps.get(error).map_or(0, |gap| gap.count)
+    }
+
     pub(crate) fn selection_coverage(
         &self,
         provider: plan::ModuleId,

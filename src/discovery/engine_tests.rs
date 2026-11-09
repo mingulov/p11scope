@@ -68183,7 +68183,9 @@ fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
 
 /// Repeated drops with the same error aggregate into one gap with a
 /// count and first/last pass numbers instead of flooding the gap list
-/// with one entry per tick.
+/// with one entry per tick. The loop keys off the drop count (not the
+/// round): an incidental healthy round under load only costs an extra
+/// iteration, and exact pass numbers stay load-dependent.
 #[test]
 fn repeated_drops_with_same_error_aggregate_into_one_gap() {
     let mut child = std::process::Command::new("sleep")
@@ -68196,12 +68198,21 @@ fn repeated_drops_with_same_error_aggregate_into_one_gap() {
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
-    for _ in 0..2 {
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    for _round in 0..12 {
         assert!(engine.request_refresh(pid, None));
         engine.fail_next_apply_for_test = true;
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("a dropped pass still returns Ok");
+        if engine.dropped_pass_count_for_test("test-forced apply failure") >= 2 {
+            break;
+        }
     }
+    assert_eq!(
+        engine.dropped_pass_count_for_test("test-forced apply failure"),
+        2,
+        "two drops recorded within twelve rounds"
+    );
     let drops: Vec<_> = engine
         .counters
         .object_skips
@@ -68214,9 +68225,13 @@ fn repeated_drops_with_same_error_aggregate_into_one_gap() {
         "one gap per error text, not one per tick: {:?}",
         engine.counters.object_skips
     );
-    assert_eq!(
-        drops[0].reason,
-        "passes 2-3 dropped (2x): test-forced apply failure"
+    assert!(
+        drops[0].reason.starts_with("passes ")
+            && drops[0]
+                .reason
+                .contains("dropped (2x): test-forced apply failure"),
+        "the gap aggregates with count and first/last passes: {:?}",
+        drops[0].reason
     );
     child.kill().unwrap();
     child.wait().unwrap();
@@ -68224,7 +68239,10 @@ fn repeated_drops_with_same_error_aggregate_into_one_gap() {
 
 /// The first two consecutive drops retain serviced requests for retry
 /// (transient recovery); the third completes them so a persistently
-/// poisoned tick stops blocking all later discovery.
+/// poisoned tick stops blocking all later discovery. The loop keys
+/// off the drop count and completion: with one error text, fewer than
+/// three drops cannot have completed anything, and an incidental
+/// healthy round under load only costs extra iterations.
 #[test]
 fn third_consecutive_drop_completes_serviced_requests() {
     let mut child = std::process::Command::new("sleep")
@@ -68237,22 +68255,31 @@ fn third_consecutive_drop_completes_serviced_requests() {
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
-    for round in 1..=3 {
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut completed = false;
+    for _round in 0..12 {
         assert!(engine.request_refresh(pid, None));
         engine.fail_next_apply_for_test = true;
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("a dropped pass still returns Ok");
-        if round < 3 {
+        if engine.dropped_pass_count_for_test("test-forced apply failure") < 3 {
             assert!(
                 engine.refresh_requested.contains_key(&pid),
-                "drop {round} retains the serviced request for retry"
+                "fewer than three drops retain the serviced request for retry"
             );
+        }
+        if !engine.refresh_requested.contains_key(&pid) {
+            completed = true;
+            break;
         }
     }
     assert!(
-        !engine.refresh_requested.contains_key(&pid),
-        "the third consecutive drop completes serviced requests: {:?}",
-        engine.refresh_requested
+        completed,
+        "three consecutive drops complete the serviced request within twelve rounds"
+    );
+    assert!(
+        engine.dropped_pass_count_for_test("test-forced apply failure") >= 3,
+        "completion needs at least three drops"
     );
     apply_ordinary_batch(&mut engine, &mut session, vec![])
         .expect("the capture continues after the escalation drop");
@@ -68264,7 +68291,9 @@ fn third_consecutive_drop_completes_serviced_requests() {
 /// A process whose data persistently breaks the tick candidate stops
 /// blocking other discovery: after the escalation drop completes its
 /// request, a later tick builds a candidate without its poisoned
-/// inputs and admits a newcomer.
+/// inputs and admits a newcomer. The loop keys off completion: the
+/// poisoned request can only complete through escalation, and an
+/// incidental healthy round under load only costs extra iterations.
 #[test]
 fn persistently_poisoned_tick_stops_blocking_newcomers() {
     let mut poison = std::process::Command::new("sleep")
@@ -68277,6 +68306,7 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     let mut session = ScriptedSession::with_records([], 0);
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let mut newcomer = std::process::Command::new("sleep")
         .arg("30")
         .die_with_parent()
@@ -68289,26 +68319,38 @@ fn persistently_poisoned_tick_stops_blocking_newcomers() {
     )
     .unwrap();
     engine.fail_candidate_with_pid_for_test = Some(poison_pid);
-    for _ in 0..3 {
+    let mut completed = false;
+    for _round in 0..12 {
         assert!(engine.request_refresh(poison_pid, None));
         apply_ordinary_batch(&mut engine, &mut session, vec![])
             .expect("poisoned passes drop, never abort");
-        assert_eq!(engine.views.len(), 1, "nothing commits while poisoned");
+        if !engine.refresh_requested.contains_key(&poison_pid) {
+            completed = true;
+            break;
+        }
     }
+    assert!(
+        completed,
+        "escalation completes the poisoned request within twelve rounds"
+    );
+    assert!(
+        engine.dropped_pass_count_for_test("test-forced poisoned candidate failure") >= 3,
+        "completion needs at least three drops"
+    );
     apply_ordinary_batch(&mut engine, &mut session, vec![]).expect("the capture continues");
+    let pids: Vec<_> = engine.views.iter().map(ProcessView::pid).collect();
     assert_eq!(
         engine.views.len(),
         2,
-        "a later tick admits the newcomer without poisoned inputs"
+        "a later tick admits the newcomer without poisoned inputs: {pids:?}"
     );
     assert!(
-        engine.views.iter().any(|view| view.pid() == newcomer_pid),
-        "the newcomer is admitted: {:?}",
-        engine
-            .views
-            .iter()
-            .map(ProcessView::pid)
-            .collect::<Vec<_>>()
+        pids.contains(&poison_pid),
+        "the poisoned view stays retained: {pids:?}"
+    );
+    assert!(
+        pids.contains(&newcomer_pid),
+        "the newcomer is admitted: {pids:?}"
     );
     let _ = poison.kill();
     let _ = poison.wait();

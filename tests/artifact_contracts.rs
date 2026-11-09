@@ -9876,6 +9876,37 @@ fn allowlist_v3_names_the_pid_scope_caller_row() {
     }
 }
 
+/// The foreign target-root path in gap reasons has its own allowlist-v3
+/// row: the status paragraph lists the section, its anchor matches the
+/// heading, and the row names the `/proc/<pid>/root` source, the
+/// per-object and concise-fold outputs, and the never-published subjects.
+#[test]
+fn allowlist_v3_names_the_foreign_target_root_row() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## Foreign target root path in gap reasons (v0.7.0)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the foreign target root section"
+    );
+    assert!(
+        text.contains(
+            "[foreign target root path in gap reasons](#foreign-target-root-path-in-gap-reasons-v070)"
+        ),
+        "the status paragraph must list the foreign target root section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "target root",
+        "/proc/<pid>/root",
+        "differs from the observer root",
+        "per-object",
+        "concise",
+        "No PID, argv, environ",
+    ] {
+        assert!(flat.contains(marker), "the root row must name {marker:?}");
+    }
+}
+
 /// F16 residual (review item 1): the allowlist-v3 PQC section states the
 /// implemented publication rule — the field publishes the classified code
 /// `1..=12` whenever the word is in range, whatever the key type, and only

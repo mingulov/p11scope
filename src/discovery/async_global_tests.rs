@@ -300,6 +300,86 @@ fn async_global_owned_only_retire_detaches_synchronously_without_ticket() {
 }
 
 #[test]
+fn async_global_owned_only_retire_covers_split_identity_prearm_pin() {
+    use crate::discovery::identity::test_fixture::{module as fixture_module, real_scan_pin};
+    // Lane-A (pre-6.8 overlay) split twin of the owned-only sync retire:
+    // the retiring static slot hangs off the pre-arm pin — a distinct pin
+    // over identical bytes — while the owned-view module's entry objects
+    // name the scanned identity. Same file, same run capture: the retire
+    // must still detach synchronously inside the pause tick instead of
+    // parking an async global ticket (on 6.6 the ticket parked the tick
+    // incomplete, the pause went partial, and first-burst calls raced).
+    let mut case = Case::new();
+    case.engine.owned_run_pid = Some(case.child.id());
+    let slot_object = case.engine.plan.slots[0].object;
+    let summary = case.engine.pinned.summary(slot_object).unwrap();
+    let (path, sha) = (
+        summary.path.to_string(),
+        summary.sha256.to_string(),
+    );
+    assert!(!sha.is_empty(), "the accepted pin carries a digest");
+    assert!(
+        case.engine.modules[0]
+            .entry_objects
+            .iter()
+            .flatten()
+            .any(|id| *id == slot_object),
+        "entry objects name the scanned identity"
+    );
+    // The pre-arm-side pin: the same bytes seen through the overlay's
+    // other device (lane A renders the backing identity in maps while the
+    // pin holds the overlay one).
+    let mut split_key = summary.key;
+    split_key.device.minor = split_key.device.minor.wrapping_add(1);
+    let split = real_scan_pin(std::path::Path::new(&path), Some(split_key), 2, &sha);
+    let skips = case.engine.pinned.absorb(split);
+    assert!(skips.is_empty(), "{skips:?}");
+    let split_pin = case
+        .engine
+        .pinned
+        .id_for_scanned(&fixture_module(split_key), split_key, &path)
+        .unwrap();
+    assert_ne!(split_pin, slot_object, "the split mints a distinct pin");
+    let mut candidate = case.candidate();
+    // The retire delta carries the pre-arm pin identity, the way a live
+    // static→exact transition retires its static slots on the lane-A
+    // split; the committed plan keeps its scanned identity and stays
+    // attach-index valid.
+    assert_eq!(
+        candidate.delta.retire.len(),
+        1,
+        "the only retirement is the accepted slot"
+    );
+    candidate.delta.retire[0].object = split_pin;
+    let outcome = case
+        .engine
+        .apply_candidate(&mut case.session, candidate, &mut true, false, &[])
+        .unwrap();
+    assert_eq!(outcome.disposition, ApplyDisposition::Accepted);
+    assert!(
+        case.engine.pending_global_retirement.is_none(),
+        "split-identity owned retirement must not park an async global ticket"
+    );
+    assert_eq!(
+        case.session
+            .global_retirement
+            .as_ref()
+            .unwrap()
+            .borrow()
+            .begins,
+        0,
+        "split-identity owned retirement never begins the async worker"
+    );
+    assert!(
+        case.session
+            .detached_slot_indices
+            .iter()
+            .any(|slots| !slots.is_empty()),
+        "split-identity owned retirement detaches synchronously like an exact-PID capture"
+    );
+}
+
+#[test]
 fn async_global_unowned_retire_keeps_async_ticket() {
     // Guard twin: without an owned run child, the same candidate keeps
     // the ordinary async global path.

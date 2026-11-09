@@ -27,6 +27,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -132,6 +133,28 @@ def _reown_report(report: Path) -> None:
 PAUSE_POLICY = {"firefox": "auto", "chromium": "never"}
 
 
+#: A Unix socket path holds at most 107 bytes plus its NUL (``sun_path``).
+#: Chromium creates ``$TMPDIR/org.chromium.Chromium.XXXXXX/SingletonSocket``
+#: and aborts (FATAL "Socket path too long", SIGABRT) past that bound, so a
+#: deep cell work directory alone makes every run-direct Chromium launch
+#: abort, whatever the observer does.
+SUN_PATH_MAX = 107
+CHROMIUM_SOCKET_SUFFIX = "/org.chromium.Chromium.XXXXXX/SingletonSocket"
+
+
+def child_tmpdir(browser: str, workdir: Path) -> Path:
+    """The run-direct child's ``TMPDIR``: ``workdir/tmp``, except a short
+    owner-only directory under ``/var/tmp`` when Chromium's singleton
+    socket would not fit under the cell's own one. The caller removes a
+    directory outside ``workdir`` after the run."""
+    tmpdir = workdir / "tmp"
+    socket_bytes = len(os.fsencode(tmpdir)) + len(CHROMIUM_SOCKET_SUFFIX)
+    if browser == "chromium" and socket_bytes > SUN_PATH_MAX:
+        return Path(tempfile.mkdtemp(prefix="p11cr-", dir="/var/tmp"))
+    tmpdir.mkdir(exist_ok=True)
+    return tmpdir
+
+
 def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
                observe_module: Path, register_module: Path | None = None,
                browser_env: dict | None = None,
@@ -179,8 +202,7 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
     # SOFTHSM2_CONF passes through; HOME/TMPDIR ride via /usr/bin/env.
     # The owned child is the tree supervisor, not the browser directly
     # (see the module docstring); the browser inherits env through it.
-    tmpdir = workdir / "tmp"
-    tmpdir.mkdir(exist_ok=True)
+    tmpdir = child_tmpdir(browser, workdir)
     supervisor = Path(__file__).resolve().parent / "reap_tree.py"
     argv = ["sudo", "-n"]
     for key, value in (browser_env or {}).items():
@@ -199,8 +221,12 @@ def run_direct(name: str, browser: str, workdir: Path, flow_url: str,
         "--flow-done", str(screenshot),
         *browser_argv, *extra_browser_args,
     ]
-    proc = subprocess.run(argv, capture_output=True, text=True, check=False,
-                          timeout=duration_seconds + 120)
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True, check=False,
+                              timeout=duration_seconds + 120)
+    finally:
+        if workdir not in tmpdir.parents:
+            shutil.rmtree(tmpdir, ignore_errors=True)
     _reown_report(report)
     shot_bytes = screenshot.stat().st_size if screenshot.exists() else 0
     return CellResult(

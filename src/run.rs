@@ -15892,6 +15892,76 @@ mod tests {
         }
     }
 
+    /// A stop that lands during a held `auto` cycle cancels it; that is a
+    /// signal end, not a capture failure. The between-frames step hands the
+    /// tick back — the loop then observes the stop and still writes the
+    /// report — instead of failing the capture. The cancelled attempt counts
+    /// one partial, and the child is resumed, never stranded stopped. (The
+    /// gate already idles a stop that lands before the cycle; this covers a
+    /// stop that lands during it, which the gate cannot see.)
+    #[test]
+    fn a_stop_during_a_held_auto_cycle_hands_the_tick_back_for_a_signal_end() {
+        use crate::discovery::pause::PauseCounters;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let mut child = spawn(sleeper.to_str().unwrap(), &[]);
+        let signals = SignalState::new();
+        let mut held = HeldPause {
+            batch_changes_plan: true,
+            ..HeldPause::default()
+        };
+        let mut coordinator = {
+            let mut io = HeldPauseIo {
+                child: &child,
+                held: &mut held,
+                signals: &signals,
+            };
+            let mut coordinator =
+                PauseCoordinator::preflight(crate::cli::PausePolicy::Auto, &child, &mut io)
+                    .unwrap();
+            assert_eq!(coordinator.arm(&mut io).unwrap(), ArmResult::Armed);
+            coordinator
+        };
+        child.release().unwrap();
+        helper_stop(&child, &mut held);
+        // The operator stop lands while the child is held stopped.
+        assert!(
+            original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the helper stop must hold the child before the stop lands"
+        );
+        signals.observe(libc::SIGTERM);
+        let mut io = HeldPauseIo {
+            child: &child,
+            held: &mut held,
+            signals: &signals,
+        };
+        let handed = pending_stop_pass(&mut coordinator, &mut io);
+        drop(io);
+        let (plan_changed, paused) =
+            handed.expect("a stop during the hold ends the tick, not the capture");
+        assert!(!paused, "the cancelled cycle serviced nothing");
+        assert_eq!(
+            (plan_changed, paused),
+            (held.plan_changed, false),
+            "the tick reports whatever the cancelled cycle applied"
+        );
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            },
+            "the cancelled attempt counts one partial"
+        );
+        assert!(
+            !original_child_is_stopped(child.pin().pidfd().unwrap()),
+            "the cancelled cycle resumes the held child"
+        );
+        // Dropping the child kills and reaps it.
+    }
+
     /// U-19: the live discovery-noise summary is flushed on every
     /// `run_loop` exit, including a failed or second-signal-abandoned
     /// capture: no `?` may return between the capture call and the flush.

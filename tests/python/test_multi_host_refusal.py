@@ -33,11 +33,13 @@ if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='scan':
     pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps({'schema':'p11scope/inventory/v1'}));sys.exit(0)
 if a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='auto' and mode!='refuses-auto':
     if mode=='bad-fallback-doc':
-        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False},'gaps':[]}
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False,'passes':1},'gaps':[]}
     elif mode=='fallback-counts-claim':
-        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':True},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test'}]}
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':True,'passes':1},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test'}]}
+    elif mode=='empty-fallback':
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False,'passes':0},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test refuses at link'}]}
     else:
-        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test refuses at link'}]}
+        doc={'schema':'p11scope/inventory/v1','observation':{'usage_feed':False,'passes':1},'gaps':[{'subject':'native usage feed unavailable','reason':'call counts unavailable on this host: test refuses at link'}]}
     pathlib.Path(a[a.index('-o')+1]).write_text(json.dumps(doc))
     print('p11scope: native usage feed unavailable, continuing with the scan lane',file=sys.stderr);sys.exit(0)
 if mode=='native-exits-zero' and a[0]=='inventory' and '--capture' in a and a[a.index('--capture')+1]=='native':
@@ -106,6 +108,11 @@ class CombinedRefusalTests(unittest.TestCase):
 
     def test_fallback_must_not_claim_counts(self):
         with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "fallback-counts-claim"}):
+            with self.assertRaisesRegex(RuntimeError, "fallback"):
+                self.check(self.observer, self.work)
+
+    def test_fallback_must_keep_a_pass(self):
+        with patch.dict(os.environ, {"FAKE_MULTI_REFUSAL": "empty-fallback"}):
             with self.assertRaisesRegex(RuntimeError, "fallback"):
                 self.check(self.observer, self.work)
 

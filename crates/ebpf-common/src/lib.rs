@@ -1460,15 +1460,20 @@ pub mod capture {
 }
 
 /// Ring buffer capacity in bytes. Must be a power of two and page-aligned.
-/// 4 MiB holds 11155 current 368-byte event records (+8 header bytes each). The
-/// 256 KiB default held 780, which an unpaced burst overruns in ~6 ms —
-/// inside routine scheduling jitter under contention (audit F1). The
+/// 32 MiB holds 89,240 current 368-byte event records (+8 header bytes each),
+/// about 170 ms of observer stall at the fastest measured hosted-runner rate
+/// (about 528k calls/s, one record per call) and about 470 ms at 190k
+/// calls/s, which covers the 166-672 ms drain stalls seen on a loaded host
+/// for all but the worst. The 4 MiB default held 11,155 (about 21 ms) and
+/// overflowed on a fast runner during a 24 ms drain gap; the 256 KiB
+/// default before it held 780 (audit F1). One ring per capture session,
+/// shared by all CPUs, charged as locked kernel memory (about 33.6 MB). The
 /// `small-ring` feature (off by default; the default build is unaffected)
 /// shrinks this to one page so the induced-gap test (Task 7,
 /// `scripts/verify-induced-gaps.sh`) can force ring-buffer loss
 /// deliberately with a high call rate.
 #[cfg(not(feature = "small-ring"))]
-pub const RING_BYTES: u32 = 4 * 1024 * 1024;
+pub const RING_BYTES: u32 = 32 * 1024 * 1024;
 #[cfg(feature = "small-ring")]
 pub const RING_BYTES: u32 = 4096;
 
@@ -1476,9 +1481,10 @@ pub const RING_BYTES: u32 = 4096;
 /// lane is active, sized at load; every other capture keeps
 /// [`RING_BYTES`]. A journaled call writes a 224 B START and a 632 B END,
 /// so 4 MiB holds about 0.45 s at 10,000 calls/s, less than one large
-/// quantum's seal; 16 MiB holds about 1.9 s. Locked kernel memory: 12 MiB
-/// more than the default, only while that lane is active.
-pub const JOINT_RING_BYTES: u32 = 16 * 1024 * 1024;
+/// quantum's seal; 16 MiB holds about 1.9 s and 32 MiB about 3.9 s. Since
+/// the default ring grew to 32 MiB this equals [`RING_BYTES`] (never
+/// smaller), so the lane adds no locked kernel memory over the default.
+pub const JOINT_RING_BYTES: u32 = 32 * 1024 * 1024;
 const _: () = assert!(JOINT_RING_BYTES.is_power_of_two() && JOINT_RING_BYTES >= RING_BYTES);
 
 /// Maximum template attributes captured per event.
@@ -2646,17 +2652,17 @@ mod tests {
     }
 
     #[test]
-    fn default_ring_bytes_is_4mib() {
+    fn default_ring_bytes_is_32mib() {
         // Pins the default so the small-ring override (Cargo feature,
         // opt-in only) can never change it silently.
         #[cfg(not(feature = "small-ring"))]
-        assert_eq!(RING_BYTES, 4 * 1024 * 1024);
+        assert_eq!(RING_BYTES, 32 * 1024 * 1024);
     }
 
     /// Only a journal (Joint) capture loads the larger EVENTS ring.
     #[test]
-    fn joint_ring_bytes_is_16mib() {
-        assert_eq!(JOINT_RING_BYTES, 16 * 1024 * 1024);
+    fn joint_ring_bytes_is_32mib() {
+        assert_eq!(JOINT_RING_BYTES, 32 * 1024 * 1024);
         assert_eq!(JOINT_RING_BYTES % 4096, 0);
     }
 
@@ -3971,7 +3977,7 @@ mod tests {
         #[cfg(feature = "small-discovery-ring")]
         {
             assert_eq!(DISCOVERY_BYTES, 4_096);
-            assert_eq!(RING_BYTES, 4 * 1024 * 1024);
+            assert_eq!(RING_BYTES, 32 * 1024 * 1024);
         }
     }
 

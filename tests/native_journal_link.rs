@@ -346,7 +346,7 @@ fn journal_proof_private_elf_retains_real_producer_and_loss_dependencies() {
         ("OBJECT_START", (1, 16, 432, 16_384, 0)),
         ("INSTANCE_START", (9, 16, 24, 16_384, 0)),
         ("DESCRIPTORS", (2, 4, 18, 105, 128)),
-        ("EVENTS", (27, 0, 0, 4 * 1024 * 1024, 0)),
+        ("EVENTS", (27, 0, 0, 32 * 1024 * 1024, 0)),
         ("EVIDENCE", (6, 4, 8, 9, 0)),
     ] {
         let map = object
@@ -929,7 +929,7 @@ fn journal_production_elf_replaces_pair_and_retains_shapes() {
         ("OBJECT_START", (1, 16, 432, 16_384, 0)),
         ("INSTANCE_START", (9, 16, 24, 16_384, 0)),
         ("DESCRIPTORS", (2, 4, 18, 105, 128)),
-        ("EVENTS", (27, 0, 0, 4 * 1024 * 1024, 0)),
+        ("EVENTS", (27, 0, 0, 32 * 1024 * 1024, 0)),
         ("EVIDENCE", (6, 4, 8, 9, 0)),
     ] {
         let map = object

@@ -873,9 +873,9 @@ counter counts records, not calls: at system/cgroup scope a refused
 FORK marker counts too, and on a linked (`--key-operations`) capture
 one call writes up to two records (its journal BEGIN and its END, or
 an ABANDON in place of the END), so one lost call can count up to
-twice. A linked capture therefore loads a 16 MiB EVENTS ring (about
-1.9 s of 10,000 calls/s; every other capture keeps 4 MiB), which costs
-12 MiB more locked kernel memory while that lane is active. The Joint
+twice. A linked capture therefore loads a 32 MiB EVENTS ring (about
+3.9 s of 10,000 calls/s), the same size as the default every other
+capture keeps since v0.7.0, so the lane adds no locked kernel memory. The Joint
 service drains EVENTS into a bounded userspace staging queue on every
 service regardless of seal state, so a seal awaiting future input no
 longer wedges the ring behind it; the queue holds at most 131,072

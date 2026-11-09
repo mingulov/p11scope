@@ -135,9 +135,13 @@ pub const LIVE_POLL_QUANTUM: usize = 4096;
 
 /// Explicit record bound of the post-detach terminal `EVENTS` drain: the
 /// terminal poll takes at most this many records, and backlog past it is
-/// reported as truncation, never silently absorbed. Sixteen live quanta —
-/// several ringfuls at the largest supported ring — so a bound stop is a
-/// real detach-window backlog, not a calibration miss.
+/// reported as truncation, never silently absorbed. Sixteen live quanta:
+/// about 0.73 of a full ring at the 32 MiB default (89,240 records), kept
+/// because the schema pins the bound at 65536. A ring still holding more
+/// than that after detach is reported as `terminal_drain_truncated`; the
+/// same backlog would have been ring loss under the old 4 MiB ring, so the
+/// report is PARTIAL either way, and reaching it needs most of a full
+/// ring of detach-window backlog, not ordinary steady state.
 pub const TERMINAL_DRAIN_BOUND: usize = 65536;
 
 /// The bound one poll of the `EVENTS` ring gets: the quantum while producers
@@ -459,12 +463,14 @@ impl BoundedRecordSource for aya::maps::RingBuf<MapData> {
 
 /// Userspace staging bounds for the kernel EVENTS ring, sized from the
 /// existing pools: 131,072 records (32 live quanta) and 48 MiB of staged
-/// ring spans (3 joint rings). The byte bound dominates worst-case memory
+/// ring spans (three 16 MiB joint rings, the joint ring size when the bound
+/// was set; kept at 48 MiB when the rings grew to 32 MiB, so userspace
+/// staging memory did not grow with them). The byte bound dominates worst-case memory
 /// (48 MiB plus per-entry overhead); the entry bound caps the queue
 /// structure itself. Staging stops at either bound with the ring keeping
 /// the rest, exactly like the discovery staging FIFO.
 pub(crate) const EVENTS_STAGE_ENTRIES: usize = 32 * LIVE_POLL_QUANTUM;
-pub(crate) const EVENTS_STAGE_BYTES: usize = 3 * (p11scope_ebpf_common::JOINT_RING_BYTES as usize);
+pub(crate) const EVENTS_STAGE_BYTES: usize = 48 * 1024 * 1024;
 
 /// What one staging call moved: how many entries entered the queue
 /// (records plus kernel-discard markers), and whether staging stopped
@@ -3002,11 +3008,8 @@ mod tests {
     fn events_stage_bounds_derive_from_existing_pools() {
         assert_eq!(EVENTS_STAGE_ENTRIES, 131_072);
         assert_eq!(EVENTS_STAGE_ENTRIES, 32 * LIVE_POLL_QUANTUM);
-        assert_eq!(
-            EVENTS_STAGE_BYTES,
-            3 * (p11scope_ebpf_common::JOINT_RING_BYTES as usize)
-        );
         assert_eq!(EVENTS_STAGE_BYTES, 48 * 1024 * 1024);
+        assert!(EVENTS_STAGE_BYTES >= p11scope_ebpf_common::JOINT_RING_BYTES as usize);
     }
 
     #[test]

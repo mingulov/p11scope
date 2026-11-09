@@ -774,7 +774,7 @@ fn privileged_object_continuity_refusal_preserves_s1_base() -> Result<()> {
             bail!("expected native EVENTS ring buffer");
         };
         ensure!(
-            events_ring.info()?.max_entries() == 4 * 1024 * 1024,
+            events_ring.info()?.max_entries() == p11scope_ebpf_common::RING_BYTES,
             "requires the default FULL ring"
         );
         let before = crate::events::event_drain_positions(harness.session.event_drain()?);

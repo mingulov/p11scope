@@ -740,7 +740,7 @@ Observed attribute values live only on these surfaces, with these lifetimes:
 | Surface | What is retained | Lifetime |
 | --- | --- | --- |
 | Kernel `OBJECT_START` rows | At most 16,384 rows of 432 B: finite codes plus the Get template base, header-end and value pointers and capacity | Zeroed and deleted on every terminal path |
-| Kernel EVENTS ring | Tail records (616 B with header) | Stay in the 4 MiB ring until overwritten |
+| Kernel EVENTS ring | Tail records (616 B with header) | Stay in the EVENTS ring (32 MiB default since v0.7.0, 4 MiB before) until overwritten |
 | Observer memory | The validated tail (no Debug/Serialize) until ordinary decode or registry apply; the model holds at most 65,536 objects with six requested and six established fixed slots each (seven with F16) | The capture's lifetime |
 | Public inventory | Only `p11scope/inventory/v1` `object_observations` (objects requested, established, queries and label; key operations metadata at use) and inventory event kinds `object_observed`, `key_operations_observed` and `snapshot.object_observations` | The existing report-file and bounded event-file rotation lifetimes; the `--event-log -` stdout transport carries the same records under the same limits, never rotated, with retention set by the receiving pipeline and no p11scope lifetime bound |
 | Dashboard | Aggregate counts only | The rendered view |

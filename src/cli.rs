@@ -128,7 +128,7 @@ pub struct CaptureArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 32 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,
@@ -190,7 +190,7 @@ pub struct RunArgs {
     pub max_events: Option<u64>,
     /// `--max-scan-pids`: scope members scanned per pass; None ⇒ 256 default.
     pub max_scan_pids: Option<usize>,
-    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 4 MiB default.
+    /// `--ring-bytes`: EVENTS ringbuf size override; None ⇒ 32 MiB default.
     pub ring_bytes: Option<u32>,
     /// `--drain-interval-ms`: capture-loop tick override; None ⇒ per-mode default.
     pub drain_interval: Option<Duration>,
@@ -608,6 +608,7 @@ examples (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
+--ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 --forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
@@ -651,6 +652,7 @@ example (4242 is an example PID, not a detected target):
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
+--ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 --forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
@@ -698,6 +700,7 @@ example:
 notes: discovery scans the target's mapped memory — no manifest and no helper are required for providers whose function table is in the file. Providers that build the table at run time need a manifest: run p11scope-discover --module <provider.so> -o <manifest.json> and pass --manifest <manifest.json>.
 --module narrows the scan to named providers.
 --exclude-module <path-or-name> is repeatable and does the opposite: discovery stays automatic, except excluded files get no probes and use no slots.
+--ring-bytes <n[K|M]> sizes the capture's EVENTS ring (default 32M; 4K..64M, a power of two; one ring per capture, held as locked kernel memory). If a report counts lost events under very heavy call rates, raise it up to 64M.
 --manifest is explicit operator attestation of exact accepted function-name/offset claims; matching a digest is not attestation. Claims are checked against the scan when possible.
 --prearm-module <provider.so> is repeatable: it pins the named provider file before any mapping and watches the file from before it loads, using offsets already proven from the file or a manifest. It is not a scan filter (that is --module) and carries no function claims (that is --manifest).
 --forwarding-module <path-or-name> is repeatable: it declares named files as forwarding layers (interposing shims such as pkcs11-spy), splitting their calls out of headline totals exactly like a closure-array layer under the same gates. A full path matches by path and inode; a bare name matches by basename. Without the declaration the observer never guesses a forwarding role.
@@ -5986,7 +5989,11 @@ mod tests {
     fn help_documents_the_new_capture_flags() {
         let trace = trace_help();
         for help in [PROFILE_HELP, trace.as_str(), RUN_HELP] {
-            for statement in ["--ring-bytes", "--drain-interval-ms"] {
+            for statement in [
+                "--ring-bytes",
+                "--drain-interval-ms",
+                "(default 32M; 4K..64M",
+            ] {
                 assert!(help.contains(statement), "missing help text: {statement}");
             }
         }

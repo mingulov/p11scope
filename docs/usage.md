@@ -516,10 +516,17 @@ and run, and both are disclosed in every JSON report's `capture` block as
 produced it.
 
 - `--ring-bytes <n[K|M]>` — the EVENTS ring buffer size: a power of two from
-  4K to 64M (default 4M). A larger ring absorbs call bursts without loss; a
+  4K to 64M (default 32M, one ring per capture, held as about 34 MB of
+  locked kernel memory). A larger ring absorbs call bursts without loss; a
   smaller ring overflows sooner. Overflow never corrupts counts — the
   aggregate maps are the count authority — but it is disclosed as `event_loss`
-  with a `PARTIAL` verdict instead of `COMPLETE`.
+  with a `PARTIAL` verdict instead of `COMPLETE`. A profile record is 376 B
+  with its header and a counted call writes about one, so the ring holds
+  ring size / 376 records: the 32M default holds about 89,200, which
+  covers an observer stall of about 170 ms at 528,000 calls/s (the fastest
+  rate measured on a hosted CI runner) or about 470 ms at 190,000 calls/s.
+  If `event_loss` is nonzero under very heavy call rates, raise the ring
+  up to 64M.
 - `--drain-interval-ms <n>` — the frame interval: 5 to 60000 ms (defaults:
   profile 1000 ms, trace 200 ms). A shorter interval refreshes discovery,
   aggregate maps and live output more often, with more observer CPU cost.
@@ -536,7 +543,7 @@ produced it.
 
 ```bash
 # Burst-heavy workload: bigger ring, faster drain.
-sudo p11scope profile --pid 12345 --ring-bytes 4M --drain-interval-ms 100 \
+sudo p11scope profile --pid 12345 --ring-bytes 64M --drain-interval-ms 100 \
   --duration 60 -o observed-profile.json
 ```
 
@@ -548,7 +555,7 @@ Measured loss rates, from `scripts/bench-overhead.sh` runs (1M back-to-back
 calls; see "Overhead (measured)"). With the then-default 256K ring,
 `profile` (1s drain) lost 991,290-991,350 of 1,000,000 events (99.1%+), and
 `trace` (200ms drain) wrote only 122,348-145,383 lines. With the current
-4 MiB default ring (2026-09-28), both lost nothing. No other `--ring-bytes`
+4 MiB ring (the default then, 2026-09-28), both lost nothing. No other `--ring-bytes`
 value and no other `--drain-interval-ms` value has been bench-measured;
 tuning beyond these two points is unmeasured, not tuned-down.
 
@@ -2185,8 +2192,8 @@ There is no `CAP_SYS_RESOURCE` or `RLIMIT_MEMLOCK` requirement claim.
 Ring memory: BPF ring buffers are locked kernel memory, charged to the
 capturing process's memory cgroup. An `inventory` capture holds an 8 MiB
 lifecycle ring. A capture whose Joint key-operations lane is active loads a
-16 MiB EVENTS ring (12 MiB more than the 4 MiB default every other capture
-keeps); `--ring-bytes` still names an explicit size. While a pass collects
+32 MiB EVENTS ring, the same size as the default every other capture
+keeps; `--ring-bytes` still names an explicit size. While a pass collects
 or the semantic lane starts, the lifecycle lane may also hold up to 32,768
 drained records in user memory (about 29 MiB, allocated only as records
 arrive) plus up to 65,536 empty batch shells (about 6.6 MiB).
@@ -2546,7 +2553,7 @@ terms.
 updates. `profile` and `trace` also build and submit a per-call event,
 which costs another 1.4-2.6 µs per call here.
 
-**Event loss.** With the default 4 MiB ring buffer nothing was lost at
+**Event loss.** With the 4 MiB ring buffer (the default then) nothing was lost at
 this rate. Every `profile` run reported `event_loss` 0, and every `trace`
 run wrote all 1,001,005 calls (warm-up and setup included) with no `LOST`
 record. The earlier measurement, with a 256 KiB ring, lost over 99% of

@@ -100,7 +100,7 @@ self_test() {
         || { echo "observer base pin drifted" >&2; exit 1; }
     [ "$(grep -c "FROM $HOLDER_BASE" "$HOLDER_DOCKERFILE")" -eq 2 ] \
         || { echo "holder base pin drifted" >&2; exit 1; }
-    [ "$(grep -c 'image: p11scope-observer:1$' deploy/k8s/20-daemonset.yaml)" -eq 1 ] \
+    [ "$(grep -c 'image: ghcr.io/mingulov/p11scope:0.7.0$' deploy/k8s/20-daemonset.yaml)" -eq 1 ] \
         || { echo "daemonset lost its observer image anchor" >&2; exit 1; }
     [ "$(grep -c 'image: p11scope-holder:1$' "$WORKLOADS")" -eq 6 ] \
         || { echo "workloads.yaml lost an image anchor" >&2; exit 1; }
@@ -996,7 +996,7 @@ say "=== apply deploy/k8s as documented (directory apply; image names rendered) 
 MANIFESTS=$WORK/manifests
 mkdir -p "$MANIFESTS/k8s"
 for manifest in deploy/k8s/*.yaml; do
-    sed "s#image: p11scope-observer:1\$#image: $OBS_IMAGE#" "$manifest" > "$MANIFESTS/k8s/${manifest##*/}"
+    sed "s#image: ghcr.io/mingulov/p11scope:0.7.0\$#image: $OBS_IMAGE#" "$manifest" > "$MANIFESTS/k8s/${manifest##*/}"
 done
 grep -q "image: $OBS_IMAGE" "$MANIFESTS/k8s/20-daemonset.yaml" \
     || unrun "daemonset render lost its image anchor"

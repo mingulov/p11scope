@@ -235,7 +235,7 @@ self_test() {
     sh deploy/holder-entry.sh --self-test
     # Rendering replaces exactly these anchors; a manifest edit that drops one
     # would silently deploy the wrong image.
-    [ "$(cat deploy/k8s/*.yaml | grep -c 'image: p11scope-observer:1$')" -eq 1 ] \
+    [ "$(cat deploy/k8s/*.yaml | grep -c 'image: ghcr.io/mingulov/p11scope:0.7.0$')" -eq 1 ] \
         || { echo "deploy/k8s lost its single observer image anchor" >&2; exit 1; }
     # `kubectl apply -f deploy/k8s/` applies files in name order: the
     # namespace must sort before everything that lives in it.
@@ -566,7 +566,7 @@ echo "=== apply deploy/k8s as documented (directory apply; image names rendered)
 MANIFESTS=$WORK/manifests
 mkdir -p "$MANIFESTS/k8s"
 for manifest in deploy/k8s/*.yaml; do
-    sed "s#image: p11scope-observer:1\$#image: $OBS_IMAGE#" "$manifest" > "$MANIFESTS/k8s/${manifest##*/}"
+    sed "s#image: ghcr.io/mingulov/p11scope:0.7.0\$#image: $OBS_IMAGE#" "$manifest" > "$MANIFESTS/k8s/${manifest##*/}"
 done
 DAEMONSET=$MANIFESTS/k8s/20-daemonset.yaml
 grep -q "image: $OBS_IMAGE" "$DAEMONSET"

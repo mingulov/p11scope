@@ -14906,6 +14906,80 @@ mod tests {
         );
     }
 
+    /// Every settlement that can commit a handoff names the survivor on
+    /// stderr exactly once: the stored note is taken by one helper, which
+    /// the error paths, both quiesce-error settle closures, an error-end
+    /// loop settlement and the terminal block all call. No site reads the
+    /// note directly, so none can drop or repeat it.
+    #[test]
+    fn every_handoff_settlement_prints_the_stored_note_once() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production.matches("handoff_note.take()").count(),
+            1,
+            "one helper takes the stored note"
+        );
+        assert_eq!(
+            production.matches("owned.handoff_note").count(),
+            0,
+            "no site reads the stored note directly"
+        );
+        let mut quiesce_sites = 0;
+        for call in production.split("finish_quiesce_error(").skip(1) {
+            if call.starts_with("\n") {
+                quiesce_sites += 1;
+                let head: String = call.chars().take(700).collect();
+                assert!(
+                    head.contains("emit_stored_handoff_note(owned)"),
+                    "a quiesce-error settle closure must name its survivor: {head}"
+                );
+            }
+        }
+        assert_eq!(quiesce_sites, 2, "profile and trace quiesce-error sites");
+        let settle_loop = production
+            .split_once("fn finish_capture_loop(")
+            .unwrap()
+            .1
+            .split_once("\n}\n")
+            .unwrap()
+            .0;
+        assert!(
+            settle_loop.contains("if end == CaptureEnd::Error"),
+            "an error end settled by the loop names its survivor at settlement"
+        );
+        assert!(settle_loop.contains("emit_stored_handoff_note(owned)"));
+    }
+
+    /// The SIGKILL probe can never leave its sleeper behind: a guard armed
+    /// as soon as the orphan's pid is known kills and reaps it on every
+    /// exit path, panics included, and the fixture expires on its own if
+    /// the whole test binary is killed.
+    #[test]
+    fn sigkill_probe_cleans_up_its_orphan_on_every_exit_path() {
+        let source = include_str!("run.rs");
+        let probe = source
+            .split_once("fn sigkill_of_the_observer_resumes_a_stopped_owned_child() {")
+            .unwrap()
+            .1
+            .split_once("fn capture_end_only_allows_handoff_for_clean_duration_expiry")
+            .unwrap()
+            .0;
+        let read = probe.find("let orphan = u32::from_ne_bytes(pid);").unwrap();
+        let guard = probe
+            .find("let mut orphan_guard = ChildKillGuard::new(orphan as libc::pid_t);")
+            .expect("the probe arms a kill guard for its orphan");
+        assert!(guard > read, "the guard is armed once the pid is known");
+        assert!(
+            probe[read..guard].lines().count() <= 3,
+            "nothing may panic between learning the pid and arming the guard"
+        );
+        assert!(
+            probe.contains("build_bounded_sleeper(fixture_dir.path(), 120)"),
+            "the probe fixture expires on its own"
+        );
+    }
+
     /// A stop the operator requested still settles through the signal path
     /// on an observer-side end: the forwarded signal reaches the child.
     #[test]

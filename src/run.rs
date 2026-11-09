@@ -8778,9 +8778,10 @@ fn capture_profile(
             };
             poll_terminal_cancellation();
             let out_path = out_file.path().to_path_buf();
-            publish_profile_report_with_fallback(
+            publish_profile_report_with_drop_accounting(
                 context.3,
                 context.4,
+                consumers.scheduling,
                 &j,
                 Some(&out_path),
                 || {
@@ -8792,7 +8793,6 @@ fn capture_profile(
                 },
                 frame_error,
             )?;
-            collect_sink_drops(context.3, consumers.scheduling, &mut None, Instant::now());
         } else if let Some(error) = frame_error {
             return Err(error);
         }
@@ -8863,6 +8863,35 @@ where
             }
         }),
     }
+}
+
+/// Terminal publication with sink-drop accounting: the `-o` write plus
+/// the stdout rescue above, then the post-publish drain. The drain must
+/// run even when publication fails, and a rescue shed under backpressure
+/// must surface in the returned error (the JSON is already sealed).
+fn publish_profile_report_with_drop_accounting<W, F>(
+    sink: &mut crate::sink::SinkWriter<W>,
+    stdout_open: &mut bool,
+    scheduling: &mut SchedulingAccumulator,
+    json: &serde_json::Value,
+    out: Option<&Path>,
+    write_out: F,
+    frame_error: Option<anyhow::Error>,
+) -> Result<()>
+where
+    W: Write + std::os::fd::AsRawFd,
+    F: FnOnce() -> Result<()>,
+{
+    publish_profile_report_with_fallback(
+        sink as &mut dyn Write,
+        stdout_open,
+        json,
+        out,
+        write_out,
+        frame_error,
+    )?;
+    collect_sink_drops(sink, scheduling, &mut None, Instant::now());
+    Ok(())
 }
 
 /// The `-o` write or commit failed, so the already-rendered JSON document
@@ -10111,12 +10140,14 @@ fn sink_note_due(drops: &crate::sink::SinkDrops, last_note: Option<Instant>, now
 /// Drains a tick's sink drops into the accumulator and notes sustained
 /// stalls on stderr (throttled): stdout's own evidence line is
 /// best-effort under backpressure, so the note is the fallback record.
-fn collect_sink_drops(
-    sink: &mut crate::sink::SinkWriter<crate::sink::StdoutInner>,
+/// Returns the drained drops so terminal publication can name a rescue
+/// shed in its error (the JSON is already sealed by then).
+fn collect_sink_drops<W: Write + std::os::fd::AsRawFd>(
+    sink: &mut crate::sink::SinkWriter<W>,
     acc: &mut SchedulingAccumulator,
     last_note: &mut Option<Instant>,
     now: Instant,
-) {
+) -> crate::sink::SinkDrops {
     let drops = sink.take_drops();
     acc.note_sink_drops(&drops);
     if sink_note_due(&drops, *last_note, now) {
@@ -10128,6 +10159,7 @@ fn collect_sink_drops(
             crate::render::SINK_POLICY_BOUNDED_WAIT_DROP,
         ));
     }
+    drops
 }
 
 fn flush_stdout(writer: &mut dyn Write, open: &mut bool) -> Result<()> {
@@ -27056,6 +27088,59 @@ int main(int argc, char **argv) {
         let start = sink.iter().position(|byte| *byte == b'{').unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&sink[start..]).unwrap();
         assert_eq!(parsed, json);
+    }
+
+    /// A rescue shed by backpressure is drained and named: the terminal
+    /// tick budget is spent (the frame already used it), the socket buffer
+    /// is full, so the rescue flush drops with counters. The drop
+    /// accounting must still run on the `Err` path and the returned error
+    /// must name the shed — the JSON is already sealed, so stderr/error
+    /// text is the only honest record.
+    #[test]
+    fn terminal_publish_names_a_rescue_shed_under_backpressure() {
+        use std::io::Write as _;
+        use std::os::unix::net::UnixStream;
+        let (writer, reader) = UnixStream::pair().unwrap();
+        // Fill the socket buffer so no reader drains: the bounded flush
+        // must time out instead of blocking.
+        let mut filler = writer.try_clone().unwrap();
+        filler.set_nonblocking(true).unwrap();
+        let chunk = vec![7u8; 65536];
+        while filler.write(&chunk).is_ok() {}
+        let mut sink = crate::sink::SinkWriter::new(writer).unwrap();
+        // Spent terminal budget: the frame already used the tick's 250 ms.
+        sink.begin_tick(std::time::Duration::ZERO);
+        let mut sink_open = true;
+        let mut scheduling = SchedulingAccumulator::default();
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
+        let error = publish_profile_report_with_drop_accounting(
+            &mut sink,
+            &mut sink_open,
+            &mut scheduling,
+            &json,
+            Some(Path::new("/tmp/observed.json")),
+            || Err(anyhow!("simulated disk-full on -o write")),
+            None,
+        )
+        .expect_err("the -o failure still exits nonzero");
+        let text = format!("{error:#}");
+        assert!(text.contains("simulated disk-full"), "{text}");
+        assert!(
+            text.contains("shed") && text.contains("stdout fallback"),
+            "a backpressure shed rescue names its loss: {text}"
+        );
+        assert!(
+            scheduling.sink_dropped_bytes > 0 && scheduling.sink_timeouts > 0,
+            "the rescue shed is drained into the accumulator: {} bytes in {} timeouts",
+            scheduling.sink_dropped_bytes,
+            scheduling.sink_timeouts
+        );
+        assert_eq!(
+            sink.take_drops(),
+            crate::sink::SinkDrops::default(),
+            "the post-publish drain ran even on the rescue path"
+        );
+        drop(reader);
     }
 
     /// Both sinks failing surfaces both errors; stdout just hard-failed

@@ -8882,16 +8882,28 @@ where
     W: Write + std::os::fd::AsRawFd,
     F: FnOnce() -> Result<()>,
 {
-    publish_profile_report_with_fallback(
+    let published = publish_profile_report_with_fallback(
         sink as &mut dyn Write,
         stdout_open,
         json,
         out,
         write_out,
         frame_error,
-    )?;
-    collect_sink_drops(sink, scheduling, &mut None, Instant::now());
-    Ok(())
+    );
+    let drops = collect_sink_drops(sink, scheduling, &mut None, Instant::now());
+    match published {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            if drops.dropped_bytes > 0 {
+                Err(error.context(format!(
+                    "stdout fallback shed {} bytes in {} flush timeouts under backpressure",
+                    drops.dropped_bytes, drops.timeouts
+                )))
+            } else {
+                Err(error)
+            }
+        }
+    }
 }
 
 /// The `-o` write or commit failed, so the already-rendered JSON document

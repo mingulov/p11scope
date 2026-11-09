@@ -53,7 +53,8 @@ use crate::discovery::native_binding::{
     RetainedCaller, UnboundReason,
 };
 use crate::discovery::scan::{
-    InventoryDiscoveryLimits, InventoryRetainedLimits, InventoryWindowLimits, WindowId,
+    INVENTORY_WINDOW_IO_BYTES, InventoryDiscoveryLimits, InventoryRetainedLimits,
+    InventoryWindowLimits, WindowId,
 };
 use crate::discovery::sweep_attribution::AttributionLoss;
 use crate::discovery::unbound_exe::{ExeResolver, ProcReads, ScanLearned};
@@ -718,7 +719,7 @@ pub(crate) struct InventoryCoordinator<Source: ProcessSource> {
 }
 
 fn inventory_config(endpoint_budget: InventoryBudget) -> Result<InventoryDiscoveryConfig> {
-    let window = InventoryWindowLimits::new(16 << 20, 1 << 20, 4096, 32768, 4096)
+    let window = InventoryWindowLimits::new(INVENTORY_WINDOW_IO_BYTES, 1 << 20, 4096, 32768, 4096)
         .map_err(anyhow::Error::msg)?;
     let retained = InventoryRetainedLimits::new(8192, 32768, 8192, 128, 128, 16 << 20)
         .map_err(anyhow::Error::msg)?;

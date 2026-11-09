@@ -64,6 +64,10 @@ const MAX_MOUNTINFO_BYTES: u64 = 64 * 1024 * 1024;
 const MAX_MOUNTINFO_ENTRIES: usize = 1_048_576;
 // ponytail: this independent ceiling is the calibration knob if real providers hit it.
 const DEFAULT_WORK_CEILING: u64 = 16 * 1024 * 1024;
+/// Production Inventory per-pass attempted-I/O window: the calibration knob
+/// when real mapped closures hit it. May be raised when measured, never
+/// lowered: the closure-fit test below pins the measured floor.
+pub(crate) const INVENTORY_WINDOW_IO_BYTES: u64 = 16 << 20;
 pub(crate) const IO_CEILING_REASON: &str =
     "capture attempted-I/O ceiling reached; remaining provider bytes were not read";
 pub(crate) const WORK_CEILING_REASON: &str =
@@ -14341,6 +14345,50 @@ mod tests {
         assert_eq!(budget.attempted_io_bytes(), reserved);
         budget.finish_scan(scan).unwrap();
         budget.finish_window(window).unwrap();
+    }
+
+    #[test]
+    fn production_inventory_window_fits_a_measured_real_world_closure() {
+        // The trivial nodata harness maps 16.3 MiB of sub-8-MiB objects on
+        // Fedora (14.8 MiB on dev) plus ~1 MiB of provider pin and snapshot
+        // reads; a 16 MiB production window trips from pass 0 there and the
+        // cell attaches zero endpoints. The production window must admit an
+        // 18 MiB closure of distinct small ELFs through the real
+        // export-facts debit path. Floor only: the window may be raised,
+        // never lowered below the measured need.
+        const MEASURED_NEED_BYTES: u64 = 18 * 1024 * 1024;
+        assert!(
+            INVENTORY_WINDOW_IO_BYTES >= MEASURED_NEED_BYTES,
+            "production window {INVENTORY_WINDOW_IO_BYTES} must fit the measured {MEASURED_NEED_BYTES}-byte closure"
+        );
+        let per_file = File::open("/bin/sh").unwrap().metadata().unwrap().len();
+        assert!(per_file > 0 && per_file < 8 * 1024 * 1024);
+        let dir = tempfile::tempdir().unwrap();
+        let count = usize::try_from(MEASURED_NEED_BYTES.div_ceil(per_file)).unwrap();
+        let mut files = Vec::with_capacity(count);
+        for index in 0..count {
+            let path = dir.path().join(format!("closure-{index}.so"));
+            std::fs::copy("/bin/sh", &path).unwrap();
+            files.push(File::open(&path).unwrap());
+        }
+        let total = per_file * count as u64;
+        assert!(total >= MEASURED_NEED_BYTES);
+        let window =
+            InventoryWindowLimits::new(INVENTORY_WINDOW_IO_BYTES, 1 << 20, 4096, 32768, 4096)
+                .unwrap();
+        let retained = InventoryRetainedLimits::new(8192, 32768, 8192, 128, 128, 16 << 20).unwrap();
+        let limits = InventoryDiscoveryLimits::new(8 << 20, window, retained).unwrap();
+        let mut budget = CaptureWorkBudget::for_inventory(limits);
+        let token = budget.begin_window(WindowId::new(1), u64::MAX).unwrap();
+        let scan = budget.checkpoint(token.clone()).unwrap();
+        let wanted = ["C_GetFunctionList"];
+        for file in &files {
+            read_raw_scan_facts_budgeted(file, &wanted, &mut budget).unwrap();
+        }
+        assert_eq!(budget.stopped_reason(), None);
+        assert_eq!(budget.attempted_io_bytes(), total);
+        budget.finish_scan(scan).unwrap();
+        budget.finish_window(token).unwrap();
     }
 
     /// A scan-IO double that serves canned maps bytes but never stashes

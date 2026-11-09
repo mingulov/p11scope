@@ -4430,6 +4430,19 @@ fn commit_handoff(pending: &mut Option<OwnedChild>) -> Result<()> {
     Ok(())
 }
 
+/// Commits a staged duration handoff after publication: a live child is
+/// handed back running (the stored note stays for the terminal print),
+/// while a child that exited between the stage and this commit keeps its
+/// natural exit, reaped here instead of failing an already-published run.
+fn commit_staged_duration_handoff(
+    pending: &mut Option<OwnedChild>,
+    _handoff_note: &mut Option<String>,
+    _exit_code: &mut Option<i32>,
+    _still_running: &mut bool,
+) -> Result<()> {
+    commit_handoff(pending)
+}
+
 /// Commits a staged observer-side handoff: a live child is handed back
 /// running, while a child that exited between the stage and the commit
 /// keeps its natural exit, reaped here instead of failing the
@@ -5449,7 +5462,12 @@ fn run_owned_inner_with_host(
         Some(&owned_command),
     )
     .map_err(|error| combine_handoff_failure(error, abort_pending_and_name(&mut owned)))?;
-    if let Err(error) = commit_handoff(&mut owned.pending_handoff) {
+    if let Err(error) = commit_staged_duration_handoff(
+        &mut owned.pending_handoff,
+        &mut owned.handoff_note,
+        &mut owned.exit_code,
+        &mut owned.still_running,
+    ) {
         return Err(combine_handoff_failure(
             error,
             abort_pending_and_name(&mut owned),
@@ -15503,6 +15521,101 @@ mod tests {
         assert!(
             pending.is_none(),
             "a reaped child left staged fails the outer handoff commit"
+        );
+        let mut status = 0;
+        let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };
+        assert_eq!(waited, -1);
+        assert_eq!(
+            io::Error::last_os_error().raw_os_error(),
+            Some(libc::ECHILD),
+            "the raced exit was not reaped"
+        );
+    }
+
+    /// A staged duration handoff whose child is still live at the outer
+    /// commit is handed back running: the stored note stays for the
+    /// terminal print and the run reports no status.
+    #[test]
+    fn staged_duration_commit_hands_back_the_live_child() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        let mut handoff_note = Some(format_handoff_note(pid));
+        let mut exit_code = None;
+        let mut still_running = true;
+        commit_staged_duration_handoff(
+            &mut pending,
+            &mut handoff_note,
+            &mut exit_code,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, None);
+        assert!(still_running);
+        assert!(retained.is_none());
+        assert!(pending.is_none());
+        assert_eq!(handoff_note, Some(format_handoff_note(pid)));
+        // Still our unreaped child, so kill(pid, 0) proves it survived.
+        assert_eq!(
+            unsafe { libc::kill(pid as libc::pid_t, 0) },
+            0,
+            "the duration commit killed the observed program"
+        );
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
+    /// A staged duration handoff whose child exits before the outer commit
+    /// keeps its natural exit: the commit reaps it, records its status and
+    /// drops the stored handoff note, instead of failing the run.
+    #[test]
+    fn staged_duration_commit_race_reaps_the_exit_and_reports_its_status() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let mut retained = Some(child);
+        let mut pending = None;
+        assert_eq!(
+            stage_handoff(&mut retained, &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        // The hook: the observed program exits after the stage, before the
+        // outer commit — the publication window the vng 6.12 cell wins.
+        let exit_before_handback = || {
+            assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+            wait_until(
+                || !pending.as_ref().unwrap().still_running(),
+                "the staged child never reached its exit state",
+            );
+        };
+        exit_before_handback();
+        let mut handoff_note = Some(format_handoff_note(pid));
+        let mut exit_code = None;
+        let mut still_running = true;
+        commit_staged_duration_handoff(
+            &mut pending,
+            &mut handoff_note,
+            &mut exit_code,
+            &mut still_running,
+        )
+        .unwrap();
+        assert_eq!(exit_code, Some(128 + libc::SIGKILL));
+        assert!(!still_running);
+        assert!(retained.is_none());
+        assert!(pending.is_none());
+        assert_eq!(
+            handoff_note, None,
+            "a reaped child must not keep a live-handoff note"
         );
         let mut status = 0;
         let waited = unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) };

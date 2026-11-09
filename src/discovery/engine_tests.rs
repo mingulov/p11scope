@@ -5302,9 +5302,12 @@ fn terminal_drain_withdraws_a_counted_loss_whose_group_exited() {
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(60), child.id()).unwrap();
+    let view_exit_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    engine.queue_leader_exit_assessment(ProcessViewId(60), None);
+    engine.queue_leader_exit_assessment(ProcessViewId(60), Some(view_exit_ns));
+    // `Ok(false)` from a live group stands in for a sample landing
+    // mid-teardown: the timeout-0 pidfd poll cannot tell them apart.
     let polled = engine.views[0].original_exited();
     assert_eq!(polled, Ok(false));
     let assessment = settle_leader_exit_view(
@@ -5343,9 +5346,10 @@ fn terminal_drain_prunes_a_pending_assessment_whose_group_exited() {
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(61), child.id()).unwrap();
+    let view_exit_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    engine.queue_leader_exit_assessment(ProcessViewId(61), None);
+    engine.queue_leader_exit_assessment(ProcessViewId(61), Some(view_exit_ns));
     child.kill().unwrap();
     child.wait().unwrap();
     assert_eq!(engine.views[0].original_exited(), Ok(true));
@@ -5370,9 +5374,10 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
         .spawn()
         .unwrap();
     let view = ProcessView::open(ProcessViewId(62), child.id()).unwrap();
+    let view_exit_ns = view.admitted_ns();
     let mut engine = Engine::empty();
     engine.views.push(view);
-    engine.queue_leader_exit_assessment(ProcessViewId(62), None);
+    engine.queue_leader_exit_assessment(ProcessViewId(62), Some(view_exit_ns));
     let polled = engine.views[0].original_exited();
     assert_eq!(polled, Ok(false));
     let assessment = settle_leader_exit_view(
@@ -5398,6 +5403,174 @@ fn terminal_drain_keeps_a_counted_loss_whose_group_lives() {
     );
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// A record of `kind` from `pid`'s thread group at kernel time `hook_ts_ns`.
+fn group_record_at(kind: u8, pid: u32, hook_ts_ns: u64) -> DiscoveryRecord {
+    let mut record: DiscoveryRecord = unsafe { std::mem::zeroed() };
+    record.kind = kind;
+    record.pid_tgid = u64::from(pid) << 32;
+    record.hook_ts_ns = hook_ts_ns;
+    record
+}
+
+/// One counted leader-exit loss for a live `sleep`, with the exit hook at
+/// the view's admission time. Returns the engine, the child and that time.
+fn counted_leader_exit_loss(id: u32) -> (Engine, std::process::Child, u64) {
+    let child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(id), child.id()).unwrap();
+    let exit_ns = view.admitted_ns();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(id), Some(exit_ns));
+    let polled = engine.views[0].original_exited();
+    assert_eq!(polled, Ok(false));
+    assert_eq!(
+        settle_leader_exit_view(
+            &mut engine.pending_leader_exit_views,
+            &mut engine.counted_leader_exit_views,
+            &mut engine.task_uprobe_link_losses,
+            ProcessViewId(id),
+            polled,
+        ),
+        LeaderExitAssessment::LinkLoss
+    );
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+    (engine, child, exit_ns)
+}
+
+#[test]
+fn terminal_drain_keeps_a_loss_whose_group_was_observed_after_the_leader_exit() {
+    // A leader that left by pthread_exit while its members kept running:
+    // a record from the group after the exit hook proves a member ran
+    // userspace while the pid-bound links were dead, so a later whole-group
+    // exit cannot withdraw that loss.
+    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(63);
+    let pid = engine.views[0].pid();
+    engine
+        .apply_discovery_batch(
+            &mut ScriptedSession::default(),
+            vec![group_record_at(
+                DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+                pid,
+                exit_ns + 1,
+            )],
+            0,
+        )
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert_eq!(engine.views[0].original_exited(), Ok(true));
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(
+        engine.task_uprobe_link_losses, 1,
+        "a member observed after the leader exit keeps the loss"
+    );
+    assert!(
+        engine
+            .counted_leader_exit_views
+            .contains(&ProcessViewId(63))
+    );
+}
+
+#[test]
+fn terminal_drain_withdraws_a_loss_whose_group_was_only_observed_before_the_exit() {
+    // The healthy twin: records that precede the exit hook (even when
+    // dispatched after it) say nothing about survivors.
+    let (mut engine, mut child, exit_ns) = counted_leader_exit_loss(64);
+    let pid = engine.views[0].pid();
+    engine
+        .apply_discovery_batch(
+            &mut ScriptedSession::default(),
+            vec![group_record_at(
+                DISCOVERY_KIND_FUNCTION_LIST_RETURN,
+                pid,
+                exit_ns - 1,
+            )],
+            0,
+        )
+        .unwrap();
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 0);
+    assert!(engine.counted_leader_exit_views.is_empty());
+}
+
+#[test]
+fn terminal_drain_keeps_a_pending_assessment_observed_after_the_exit() {
+    // The pending path takes the same gate: an unanswerable assessment
+    // whose group ran after the exit hook still counts at capture end.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(65), child.id()).unwrap();
+    let exit_ns = view.admitted_ns();
+    let pid = view.pid();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(65), Some(exit_ns));
+    engine.note_group_record(&group_record_at(DISCOVERY_KIND_EXEC, pid, exit_ns + 5));
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn terminal_drain_keeps_a_loss_whose_exit_order_is_unknown() {
+    // Without a known exit hook time nothing can bound the survivor
+    // window, so the count stays.
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(66), child.id()).unwrap();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    engine.queue_leader_exit_assessment(ProcessViewId(66), None);
+    let polled = engine.views[0].original_exited();
+    settle_leader_exit_view(
+        &mut engine.pending_leader_exit_views,
+        &mut engine.counted_leader_exit_views,
+        &mut engine.task_uprobe_link_losses,
+        ProcessViewId(66),
+        polled,
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    engine.settle_terminal_drain();
+
+    assert_eq!(engine.task_uprobe_link_losses, 1);
+}
+
+#[test]
+fn leader_exit_records_never_count_as_group_observations() {
+    // The exit hooks themselves (kinds 6 and 7) are not member activity.
+    let mut engine = Engine::empty();
+    engine.note_group_record(&group_record_at(DISCOVERY_KIND_LEADER_EXIT, 7, 100));
+    engine.note_group_record(&group_record_at(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, 7, 100));
+    assert!(engine.group_last_record_ns.is_empty());
+    engine.note_group_record(&group_record_at(DISCOVERY_KIND_LOADER, 7, 0));
+    assert_eq!(
+        engine.group_last_record_ns.get(&7),
+        Some(&u64::MAX),
+        "an unstamped record has unknown order and counts as latest"
+    );
 }
 
 #[test]

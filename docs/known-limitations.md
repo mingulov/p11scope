@@ -2233,9 +2233,12 @@ The old bounds are measurements, not a product startup SLA.
   projected as `discovery subject` / `discovery unavailable`), is counted
   internally, keeps `PARTIAL` coverage (never reported complete) and is
   retried after 8 passes, doubling per repeat up to 512. It ends when the
-  process exits, execs, or its pid is reused by another process; exits
-  and reuse are only acted on after a complete process walk, so a
-  partial walk keeps the hold and its delay.
+  process exits, execs, or its pid is reused by another process. Exits
+  and reuse are acted on only after a process walk that read every scope
+  member (below or above the view cap); a walk with skipped members
+  keeps the hold and its delay. An exec record for the pid clears the
+  hold even when it reports an earlier exec, so such a process may be
+  retried before its delay ends.
 - Calls while held: the held process's provider modules are not
   discovered or attached through it, so calls through providers that
   only it maps are not observed. If it calls into a provider already

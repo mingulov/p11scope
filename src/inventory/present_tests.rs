@@ -3734,8 +3734,9 @@ fn concise_limits_line_says_watched_when_every_edge_is_uncounted() {
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 1, 1);
     assert!(!presentation.edges.is_empty(), "fixture needs edges");
     for edge in &mut presentation.edges {
-        edge.coverage =
-            UseCoverage::Unknown(UnknownReason::Uncounted("fixture pair insert failed".into()));
+        edge.coverage = UseCoverage::Unknown(UnknownReason::Uncounted(
+            "fixture pair insert failed".into(),
+        ));
     }
     presentation.budgets.endpoints_occupied = 0;
     presentation.budgets.inventory_endpoints_occupied = 213;

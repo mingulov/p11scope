@@ -2064,6 +2064,44 @@ def _reap_quietly(proc):
         pass
 
 
+def _is_zombie(pid):
+    """True when pid is a zombie (or already gone); False when running."""
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+    except OSError:
+        return True
+    try:
+        state = data.rsplit(b")", 1)[1].split()[0]
+    except (IndexError, ValueError):
+        return False
+    return state == b"Z"
+
+
+def _wait_tree_dead(pid, timeout):
+    """True once pid is gone or a zombie; False on timeout.
+
+    The termination path is asynchronous by design (the supervisor's
+    handler reaps once and exits while a killed grandchild may linger
+    as a zombie until init reaps it), and a zombie still answers
+    kill(pid, 0). Both gone and zombie mean the kill landed, so both
+    count as dead.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except PermissionError:
+            pass
+        if _is_zombie(pid):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.05)
+
+
 class BrowserReapTree(unittest.TestCase):
     """Owned-child supervisor twins: unprivileged, run everywhere (no gate).
 
@@ -2239,10 +2277,9 @@ class BrowserReapTree(unittest.TestCase):
         proc.send_signal(signal.SIGTERM)
         code = proc.wait(timeout=self.PROMPT_SECONDS)
         self.assertEqual(code, 128 + signal.SIGTERM)
-        with self.assertRaises(
-                ProcessLookupError,
-                msg="the grandchild must not outlive termination"):
-            os.kill(grandchild, 0)
+        self.assertTrue(
+            _wait_tree_dead(grandchild, timeout=10),
+            "the grandchild must not outlive termination")
 
 
 if __name__ == "__main__":

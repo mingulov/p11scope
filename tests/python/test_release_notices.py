@@ -130,6 +130,11 @@ class ReleaseNoticesTests(unittest.TestCase):
         self.report["crates"][0]["license"] = "MIT OR Apache-2.0"
         self.assertEqual(self.normalize()["packages"][0]["declared_license"], "MIT/Apache-2.0")
 
+    def test_reversed_legacy_slash_spelling_is_preserved(self):
+        self.package["license"] = "Apache-2.0/MIT"
+        self.report["crates"][0]["license"] = "Apache-2.0 OR MIT"
+        self.assertEqual(self.normalize()["packages"][0]["declared_license"], "Apache-2.0/MIT")
+
     def test_missing_notice_owner_is_rejected(self):
         self.report["licenses"][0]["used_by"] = []
         with self.assertRaisesRegex(self.mod.NoticeError, "notice coverage"):

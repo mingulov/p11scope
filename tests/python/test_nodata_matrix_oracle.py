@@ -65,7 +65,8 @@ def exact_functions():
 
 
 def trace_text(per_fn, caller='"harness"', raw_calls=None, extra="",
-               attribution_causes=()):
+               attribution_causes=(), attribution_status="withheld",
+               observation_causes=(), observation_status="exact"):
     lines = ["CAPTURE privacy=allowlisted", "identity: exact"]
     n = 0
     for index, (name, count) in enumerate(sorted(per_fn.items())):
@@ -79,11 +80,15 @@ def trace_text(per_fn, caller='"harness"', raw_calls=None, extra="",
                  "\"stats_returned\":%d,\"raw_calls\":%d}"
                  % (total, total, total))
     lines.append("EVIDENCE {\"event_loss\":0,"
-                 "\"gap_classes\":{\"observation\":{\"causes\":[],"
-                 "\"status\":\"exact\"},\"attribution\":{\"causes\":[%s],"
-                 "\"status\":\"withheld\"}}}"
-                 % ",".join(json.dumps(cause)
-                            for cause in attribution_causes))
+                 "\"gap_classes\":{\"observation\":{\"causes\":[%s],"
+                 "\"status\":%s},\"attribution\":{\"causes\":[%s],"
+                 "\"status\":%s}}}"
+                 % (",".join(json.dumps(cause)
+                             for cause in observation_causes),
+                    json.dumps(observation_status),
+                    ",".join(json.dumps(cause)
+                             for cause in attribution_causes),
+                    json.dumps(attribution_status)))
     if extra:
         lines.append(extra)
     return "\n".join(lines) + "\n"
@@ -344,6 +349,38 @@ class OracleCase(unittest.TestCase):
             stderr_body="note: /work/cells/x/libnodata.so attached\n")
         self.assertEqual(rc, 0, text)
         self.assert_result(text, "PASS")
+
+    # RED: unknown-only callers with a named cause that is not a
+    # withheld attribution (status attested) must not pass.
+    def test_trace_caller_attribution_attested_fail(self):
+        body = trace_text(
+            EXPECTED_COUNTS, caller="Unknown executable",
+            attribution_causes=["semantic_unverified_slots"],
+            attribution_status="attested").replace(
+            'exe="/work/harness" ', "")
+        rc, text = self.judge(
+            "trace", "pid", body,
+            stderr_body="note: /work/cells/x/libnodata.so attached\n")
+        self.assertEqual(rc, 1, text)
+        self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: caller 'harness' unnamed on all", text)
+        self.assertNotIn("FAIL: provider", text)
+
+    # RED: an observation-lane cause alone does not name why the
+    # caller is unknown.
+    def test_trace_caller_observation_only_fail(self):
+        body = trace_text(
+            EXPECTED_COUNTS, caller="Unknown executable",
+            observation_causes=["event_loss"],
+            observation_status="lossy").replace(
+            'exe="/work/harness" ', "")
+        rc, text = self.judge(
+            "trace", "pid", body,
+            stderr_body="note: /work/cells/x/libnodata.so attached\n")
+        self.assertEqual(rc, 1, text)
+        self.assert_result(text, "FAIL")
+        self.assertIn("FAIL: caller 'harness' unnamed on all", text)
+        self.assertNotIn("FAIL: provider", text)
 
     # RED: trace with unknown-only callers and no named cause.
     def test_trace_caller_unknown_unnamed_fail(self):

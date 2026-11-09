@@ -20527,12 +20527,23 @@ impl Engine {
                 .filter(|sha256| !sha256.is_empty())
         };
         let slot_digest = digest(slot.object);
+        let same_file = |id: PinnedObjectId| {
+            id == slot.object
+                || slot_digest.is_some_and(|slot_digest| digest(id) == Some(slot_digest))
+        };
+        // The module's own object counts as well as its table entry
+        // objects: a module first seen in this candidate has no entry
+        // objects bound yet (they bind in a later candidate), while the
+        // static pre-arm slots it supersedes sit on the module file itself.
         self.modules.iter().chain(&candidate.modules).any(|module| {
             self.owned_run_view(module.scanned.view)
-                && module.entry_objects.iter().flatten().any(|id| {
-                    *id == slot.object
-                        || slot_digest.is_some_and(|slot_digest| digest(*id) == Some(slot_digest))
-                })
+                && (same_file(module.object)
+                    || module
+                        .entry_objects
+                        .iter()
+                        .flatten()
+                        .copied()
+                        .any(same_file))
         })
     }
 

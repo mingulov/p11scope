@@ -116,6 +116,29 @@ class CombinedRefusalTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "fallback"):
                 self.check(self.observer, self.work)
 
+    def test_fallback_rejects_non_integer_passes(self):
+        fallback_document = runpy.run_path(str(SCRIPT))["fallback_document"]
+        missing = object()
+
+        def write(passes):
+            observation = {"usage_feed": False}
+            if passes is not missing:
+                observation["passes"] = passes
+            sink = self.work / "fallback.json"
+            sink.write_text(json.dumps(
+                {"schema": "p11scope/inventory/v1",
+                 "observation": observation,
+                 "gaps": [{"subject": "native usage feed unavailable",
+                           "reason": "call counts unavailable on this host: test"}]}))
+            return sink
+
+        for passes in (1, 2):
+            with self.subTest(passes=passes):
+                self.assertIsNotNone(fallback_document(write(passes)))
+        for passes in (True, False, 0, -1, 1.0, "1", None, missing):
+            with self.subTest(passes=passes):
+                self.assertIsNone(fallback_document(write(passes)))
+
     def test_guest_uses_private_disk_stage_and_caller_trust(self):
         namespace = runpy.run_path(str(SCRIPT))
         guest = namespace["guest"]

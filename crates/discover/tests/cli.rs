@@ -1378,7 +1378,12 @@ fn setflags_probe(dir: &Path) -> Result<(), String> {
     fn errno() -> i32 {
         std::io::Error::last_os_error().raw_os_error().unwrap_or(-1)
     }
-    let probe = dir.join(format!("setflags-probe-{}.tmp", std::process::id()));
+    static PROBE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let probe = dir.join(format!(
+        "setflags-probe-{}-{}.tmp",
+        std::process::id(),
+        PROBE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
     if let Err(error) = std::fs::write(&probe, b"setflags probe") {
         return Err(format!("cannot write the probe file: {error}"));
     }
@@ -1448,17 +1453,51 @@ fn dir_fstype_name(dir: &Path) -> String {
     name.to_string()
 }
 
+/// Caller tags for [`setflags_twin_dir`]: each caller needs its own tag
+/// so concurrent fallbacks land in distinct pid-tagged dirs instead of
+/// racing on one shared `setflags-fallback` dir.
+const N2_SETFLAGS_TAG: &str = "n2";
+const SELECTION_SETFLAGS_TAG: &str = "selection";
+
+/// Owned N2 twin directory: a fallback dir is removed on drop, so a panic
+/// still cleans the shared dir; the test's own scratch dir is borrowed
+/// and left in place.
+struct SetflagsTwinDir {
+    path: std::path::PathBuf,
+    fallback: bool,
+}
+
+impl SetflagsTwinDir {
+    fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn is_fallback(&self) -> bool {
+        self.fallback
+    }
+}
+
+impl Drop for SetflagsTwinDir {
+    fn drop(&mut self) {
+        if self.fallback {
+            let _ = std::fs::remove_dir_all(&self.path);
+        }
+    }
+}
+
 /// Directory that holds the N2 twin files: the test's own scratch
 /// directory when its filesystem applies FS_IOC_SETFLAGS, else a fresh
 /// pid-tagged directory on a tmpfs fallback (`/dev/shm`, then the
-/// process temp directory). Some hosted runners return EOPNOTSUPP for
+/// process temp directory), named per caller `tag` so concurrent callers
+/// never share one dir. Some hosted runners return EOPNOTSUPP for
 /// SETFLAGS on the cargo scratch disk; the fence assertions do not
 /// depend on the directory (the isolated run carries no `-o` at all),
 /// so the twins move while the positive stays a positive. Panics with
 /// the named reason SETFLAGS_TWIN_PRECONDITION_FAILED, listing every
 /// candidate with its filesystem and probe error, when no candidate
-/// applies the flag.
-fn setflags_twin_dir(scratch: &Path) -> std::path::PathBuf {
+/// applies the flag. The returned guard removes a fallback dir on drop
+/// (panic-safe); the scratch dir is borrowed and left in place.
+fn setflags_twin_dir(scratch: &Path, tag: &str) -> SetflagsTwinDir {
     if let Err(reason) = setflags_probe(scratch) {
         let mut attempts = vec![format!(
             "{} [{}]: {reason}",
@@ -1470,9 +1509,14 @@ fn setflags_twin_dir(scratch: &Path) -> std::path::PathBuf {
                 attempts.push(format!("{}: not a usable directory", root.display()));
                 continue;
             }
-            let dir = scratch_in(root, "setflags-fallback");
+            let dir = scratch_in(root, &format!("setflags-fallback-{tag}"));
             match setflags_probe(&dir) {
-                Ok(()) => return dir,
+                Ok(()) => {
+                    return SetflagsTwinDir {
+                        path: dir,
+                        fallback: true,
+                    };
+                }
                 Err(reason) => {
                     attempts.push(format!(
                         "{} [{}]: {reason}",
@@ -1488,7 +1532,10 @@ fn setflags_twin_dir(scratch: &Path) -> std::path::PathBuf {
             attempts.join("; ")
         );
     }
-    scratch.to_path_buf()
+    SetflagsTwinDir {
+        path: scratch.to_path_buf(),
+        fallback: false,
+    }
 }
 
 /// N2: inode-attribute change outside -o is denied. The constructor's
@@ -1502,9 +1549,9 @@ fn isolation_setflags_outside_the_output_is_denied() {
     const FS_NODUMP_FL: i32 = 0x40;
     let dir = scratch("isolation-setflags");
     let provider = build_isolation_probe(&dir);
-    let twins = setflags_twin_dir(&dir);
-    let trusted_target = twins.join("setflags-trusted.tmp");
-    let isolated_target = twins.join("setflags-isolated.tmp");
+    let twins = setflags_twin_dir(&dir, N2_SETFLAGS_TAG);
+    let trusted_target = twins.path().join("setflags-trusted.tmp");
+    let isolated_target = twins.path().join("setflags-isolated.tmp");
     std::fs::write(&trusted_target, b"setflags probe").unwrap();
     std::fs::write(&isolated_target, b"setflags probe").unwrap();
     assert_eq!(
@@ -1551,8 +1598,8 @@ fn isolation_setflags_outside_the_output_is_denied() {
         b"setflags probe",
         "the fenced probe must not modify the scratch file"
     );
-    if twins != dir {
-        std::fs::remove_dir_all(&twins).unwrap();
+    if twins.is_fallback() {
+        std::fs::remove_dir_all(twins.path()).unwrap();
     }
 }
 
@@ -1569,29 +1616,53 @@ fn setflags_twins_fall_back_when_the_primary_is_unusable() {
         setflags_probe(&missing).is_err(),
         "the missing primary must fail the probe"
     );
-    let twins = setflags_twin_dir(&missing);
-    assert_ne!(twins, missing, "an unusable primary must select a fallback");
-    assert!(
-        setflags_probe(&twins).is_ok(),
-        "the fallback must take the flag: {}",
-        twins.display()
+    let twins = setflags_twin_dir(&missing, SELECTION_SETFLAGS_TAG);
+    assert_ne!(
+        twins.path(),
+        missing.as_path(),
+        "an unusable primary must select a fallback"
     );
-    std::fs::remove_dir_all(&twins).unwrap();
+    assert!(
+        setflags_probe(twins.path()).is_ok(),
+        "the fallback must take the flag: {}",
+        twins.path().display()
+    );
+    std::fs::remove_dir_all(twins.path()).unwrap();
 }
 
-/// Two fallback selections must not share one directory: N2 and the
-/// selection test fall back concurrently on runners without SETFLAGS
-/// support, and a shared dir lets either test wipe the other's twins.
+/// The two `setflags_twin_dir` callers must resolve to distinct fallback
+/// dirs, or they race on shared twin files. The tag assert pins the two
+/// production tags apart; the live half proves distinct tags actually
+/// select distinct dirs (dedicated pin tags, disjoint from both
+/// production callers, so this never shares a dir with them).
 #[test]
 fn setflags_fallback_dirs_are_unique_per_caller() {
-    let dir = scratch("isolation-setflags-uniqueness");
-    let first = setflags_twin_dir(&dir.join("no-such-first"));
-    let second = setflags_twin_dir(&dir.join("no-such-second"));
     assert_ne!(
-        first, second,
-        "each caller needs its own fallback dir, or they race"
+        N2_SETFLAGS_TAG, SELECTION_SETFLAGS_TAG,
+        "N2 and the selection test must use distinct fallback tags"
     );
-    std::fs::remove_dir_all(&second).unwrap();
+    let dir = scratch("isolation-setflags-uniqueness");
+    let first = setflags_twin_dir(&dir.join("no-such-first"), "pin-first");
+    let second = setflags_twin_dir(&dir.join("no-such-second"), "pin-second");
+    assert_ne!(
+        first.path(),
+        second.path(),
+        "distinct tags must select distinct fallback dirs"
+    );
+    std::fs::remove_dir_all(first.path()).unwrap();
+    std::fs::remove_dir_all(second.path()).unwrap();
+}
+
+/// A fallback dir is removed when its guard drops, so a panic still cleans
+/// the shared dir (Drop runs on panic as well as on normal exit).
+#[test]
+fn setflags_fallback_dir_is_removed_on_drop() {
+    let dir = scratch("isolation-setflags-drop");
+    let twins = setflags_twin_dir(&dir.join("no-such-dir"), "pin-drop");
+    let path = twins.path().to_path_buf();
+    assert!(path.is_dir(), "the fallback must exist before drop");
+    drop(twins);
+    assert!(!path.exists(), "Drop must remove the fallback dir");
 }
 
 /// Whether `dir` lives on btrfs (statfs magic), for the fs-gated cell.

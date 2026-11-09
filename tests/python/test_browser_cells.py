@@ -976,6 +976,193 @@ class BrowserCells(unittest.TestCase):
                               allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
                               allowed_verdicts=_VERDICTS_NEVER_MAPPED)
 
+    def _twin_nomod_result(self, name, rows, evidence):
+        """A never-mapped-run twin document with the S1 sections present.
+
+        FF-NOMOD opts into the S1 proof with ``sessions_zero``, so the
+        twin carries empty mechanisms/logins and zeroed session counters
+        beside the given rows and evidence.
+        """
+        result = self._twin_result(name, rows, evidence)
+        doc = json.loads(result.report_path.read_text())
+        doc["mechanisms"] = []
+        doc["logins"] = {}
+        doc["sessions"] = {counter: 0 for counter in oracle.SESSION_COUNTERS}
+        result.report_path.write_text(json.dumps(doc))
+        return result
+
+    def _twin_nomod_observation(self, extra_causes=()):
+        """The live FF-NOMOD residual shape: structural/run-mode causes.
+
+        Mirrors the observed-profile evidence of the mid-flow link-loss
+        residual (zero rows, zero probes): every cause but the named
+        link loss is in _GAPS_NEVER_MAPPED_RUN; ``extra_causes`` plants
+        hostile additions.
+        """
+        return {
+            "status": "lossy",
+            "causes": ["discovery", "slots", "skipped",
+                       "task_uprobe_link_losses", "pause_partial",
+                       "loader_discovery", "pid_descendant_gaps",
+                       *extra_causes],
+        }
+
+    def test_nomod_qualified_link_loss_accepted(self):
+        """FF-NOMOD twin: the sole named link loss is qualified (ruling).
+
+        Zero rows, zero attached probes, and no other gap cause: the
+        task-level exit-tracking loss on a run-tree member does not
+        touch the asserted never-mapped property, so the cell passes.
+        """
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        evidence = self._twin_evidence(
+            attached_probes=0,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": self._twin_nomod_observation()},
+        )
+        result = self._twin_nomod_result("TWIN-NOMOD-LINK-LOSS", [], evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            self.check_report(result, store, zero=True, attached=False,
+                              allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                              allowed_verdicts=_VERDICTS_NEVER_MAPPED,
+                              s1={"sessions_zero": True},
+                              qualify_nomod_link_loss=True)
+
+    def test_nomod_qualified_link_loss_rejects_attached(self):
+        """FF-NOMOD twin: the qualification needs zero attached probes."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        evidence = self._twin_evidence(
+            attached_probes=1,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": self._twin_nomod_observation()},
+        )
+        result = self._twin_nomod_result("TWIN-NOMOD-ATTACHED", [], evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, zero=True, attached=False,
+                                  allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                                  allowed_verdicts=_VERDICTS_NEVER_MAPPED,
+                                  s1={"sessions_zero": True},
+                                  qualify_nomod_link_loss=True)
+
+    def test_nomod_qualified_link_loss_rejects_rows(self):
+        """FF-NOMOD twin: the qualification needs zero rows.
+
+        The planted row carries no calls, so the zero-count check would
+        pass on its own: only the gate's zero-rows prong fails the cell.
+        """
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_FindObjects"], 0, sha)]
+        evidence = self._twin_evidence(
+            attached_probes=0,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": self._twin_nomod_observation()},
+        )
+        result = self._twin_nomod_result("TWIN-NOMOD-ROWS", rows, evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, zero=True, attached=False,
+                                  allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                                  allowed_verdicts=_VERDICTS_NEVER_MAPPED,
+                                  s1={"sessions_zero": True},
+                                  qualify_nomod_link_loss=True)
+
+    def test_nomod_qualified_link_loss_rejects_extra_gap(self):
+        """FF-NOMOD twin: the qualification needs no other gap cause."""
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        evidence = self._twin_evidence(
+            attached_probes=0,
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": self._twin_nomod_observation(
+                ["in_flight_at_end"])},
+        )
+        result = self._twin_nomod_result("TWIN-NOMOD-EXTRA", [], evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, zero=True, attached=False,
+                                  allowed_gaps=_GAPS_NEVER_MAPPED_RUN,
+                                  allowed_verdicts=_VERDICTS_NEVER_MAPPED,
+                                  s1={"sessions_zero": True},
+                                  qualify_nomod_link_loss=True)
+
+    def test_attached_cell_still_rejects_link_loss(self):
+        """P2-3 twin: the same gap on another cell still fails closed.
+
+        An attached floor cell never passes the FF-NOMOD qualification,
+        so the named link loss fails there exactly as before.
+        """
+        sha = "0" * 64
+        store = SimpleNamespace(lib=Path("/not-opened/provider.so"))
+        rows = [self._twin_row(["C_FindObjects"], 3, sha)]
+        evidence = self._twin_evidence(
+            verdict_detail="concrete_gap",
+            gap_classes={"observation": {
+                "status": "lossy",
+                "causes": ["loader_discovery", "task_uprobe_link_losses"],
+            }},
+        )
+        result = self._twin_result("TWIN-ATTACHED-LINK-LOSS", rows, evidence)
+        with patch.object(oracle, "sha256_of", return_value=sha):
+            with self.assertRaises(AssertionError):
+                self.check_report(result, store, {"C_FindObjects": 1},
+                                  attached=True,
+                                  allowed_gaps=_GAPS_ATTACHED_FLOOR)
+
+    def test_nomod_link_loss_gate_prongs(self):
+        """Unit: each qualification prong decides on its own.
+
+        The honest report passes the gate; flipping any one prong
+        (probes, rows, an extra cause, a missing observation block)
+        fails it, independent of the surrounding cell checks.
+        """
+        def gate_report(**overrides):
+            report = {
+                "functions": [],
+                "evidence": {
+                    "attached_probes": 0,
+                    "gap_classes": {
+                        "observation": {
+                            "status": "lossy",
+                            "causes": ["discovery", "slots", "skipped",
+                                       "task_uprobe_link_losses"],
+                        },
+                    },
+                },
+            }
+            report["evidence"].update(overrides.pop("evidence", {}))
+            report.update(overrides)
+            return report
+
+        allowed = {"discovery", "slots", "skipped"}
+        self.assertEqual(
+            oracle.check_observation_gaps_nomod_qualified(
+                gate_report(), allowed), [])
+        hostile = {
+            "attached": gate_report(evidence={"attached_probes": 1,
+                "gap_classes": {"observation": {
+                    "status": "lossy",
+                    "causes": ["discovery", "slots", "skipped",
+                               "task_uprobe_link_losses"]}}}),
+            "rows": gate_report(functions=[{"names": ["C_GetInfo"]}]),
+            "extra": gate_report(evidence={"attached_probes": 0,
+                "gap_classes": {"observation": {
+                    "status": "lossy",
+                    "causes": ["discovery", "slots", "skipped",
+                               "task_uprobe_link_losses",
+                               "in_flight_at_end"]}}}),
+            "missing": gate_report(evidence={"attached_probes": 0,
+                                             "gap_classes": {}}),
+        }
+        for label, report in hostile.items():
+            with self.subTest(label):
+                self.assertNotEqual(
+                    oracle.check_observation_gaps_nomod_qualified(
+                        report, allowed), [])
+
     def test_oracle_rejects_halted_capture(self):
         """P2-3 twin: a halted capture fails even when floors are met."""
         sha = "0" * 64

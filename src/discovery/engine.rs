@@ -15157,6 +15157,16 @@ impl Engine {
         )
     }
 
+    // TEMP-DIAG-PREARM66: batch-path introspection for the 6.6 prearm race.
+    // Remove before the final commit.
+    fn batch_diag_seq() -> Option<u64> {
+        if std::env::var("P11SCOPE_BATCH_DIAG").as_deref() != Ok("1") {
+            return None;
+        }
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Some(SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+
     fn apply_candidate_with_ended(
         &mut self,
         session: &mut dyn EngineSession,
@@ -15186,6 +15196,19 @@ impl Engine {
             )
         });
         let mut outcome = ApplyOutcome::default();
+        // TEMP-DIAG-PREARM66: remove before the final commit.
+        let diag_seq = Self::batch_diag_seq();
+        if let Some(seq) = diag_seq {
+            eprintln!(
+                "BATCH-DIAG[{seq}] begin new={} replace={} retire={} pending={} views={} modules={}",
+                candidate.delta.new.len(),
+                candidate.delta.replace.len(),
+                candidate.delta.retire.len(),
+                self.pending_global_retirement.is_some(),
+                candidate.views.len(),
+                candidate.modules.len(),
+            );
+        }
         if self.continuity_deferred || self.cancellation_requested() || session.mutation_stopped() {
             *additions_allowed = false;
             // Stop-time newcomers (item 6): the terminal drain runs after
@@ -15215,6 +15238,10 @@ impl Engine {
         // A pending batch owns the whole global candidate boundary, including
         // replacement-only candidates. Never replay this candidate after close.
         if self.pending_global_retirement.is_some() {
+            // TEMP-DIAG-PREARM66: remove before the final commit.
+            if let Some(seq) = diag_seq {
+                eprintln!("BATCH-DIAG[{seq}] early-pending-defer");
+            }
             outcome.disposition = ApplyDisposition::Deferred;
             outcome
                 .unpublished_views
@@ -15394,6 +15421,52 @@ impl Engine {
                 [Some(selected.len() as u64), None, None, None],
             )
         });
+        // TEMP-DIAG-PREARM66: remove before the final commit.
+        if let Some(seq) = diag_seq {
+            eprintln!(
+                "BATCH-DIAG[{seq}] acquire owned_only={owned_only} blocking={} ended_none={} new_empty={} replace_empty={} views_empty={} selected={}",
+                session.global_retirement_blocking(),
+                ended.is_none(),
+                candidate.delta.new.is_empty(),
+                candidate.delta.replace.is_empty(),
+                candidate.views.is_empty(),
+                selected.len(),
+            );
+            for slot in &selected {
+                let sha = self
+                    .pinned
+                    .summary(slot.object)
+                    .map(|s| s.sha256.to_string())
+                    .unwrap_or_default();
+                eprintln!(
+                    "BATCH-DIAG[{seq}] selected slot={} object={:?} sha={}",
+                    slot.index,
+                    slot.object,
+                    sha.get(..12).unwrap_or(""),
+                );
+            }
+            for module in &self.modules {
+                let owned = self.owned_run_view(module.scanned.view);
+                let entries: Vec<String> = module
+                    .entry_objects
+                    .iter()
+                    .flatten()
+                    .map(|id| {
+                        let sha = self
+                            .pinned
+                            .summary(*id)
+                            .map(|s| s.sha256.to_string())
+                            .unwrap_or_default();
+                        format!("{id:?}:{}", sha.get(..12).unwrap_or(""))
+                    })
+                    .collect();
+                eprintln!(
+                    "BATCH-DIAG[{seq}] module view={:?} owned={owned} entries=[{}]",
+                    module.scanned.view,
+                    entries.join(","),
+                );
+            }
+        }
         let detach_slots_outcome = match ended.filter(|_| {
             candidate.delta.new.is_empty()
                 && candidate.delta.replace.is_empty()
@@ -15428,6 +15501,16 @@ impl Engine {
             detach_slots_start,
             crate::attach::monotonic_ns(),
         );
+        // TEMP-DIAG-PREARM66: remove before the final commit.
+        if let Some(seq) = diag_seq {
+            match &detach_slots_outcome {
+                Ok(report) => eprintln!(
+                    "BATCH-DIAG[{seq}] detached pending={}",
+                    report.pending.is_some()
+                ),
+                Err(error) => eprintln!("BATCH-DIAG[{seq}] detached err={error}"),
+            }
+        }
         if let Ok(report) = &detach_slots_outcome
             && let Some(ticket) = &report.pending
         {
@@ -15495,6 +15578,10 @@ impl Engine {
                 self.note_facts_mutated();
             }
             self.pending_global_retirement = Some(ticket.clone());
+            // TEMP-DIAG-PREARM66: remove before the final commit.
+            if let Some(seq) = diag_seq {
+                eprintln!("BATCH-DIAG[{seq}] mid-pending-defer");
+            }
             outcome.disposition = ApplyDisposition::Deferred;
             outcome
                 .unpublished_views
@@ -15509,6 +15596,10 @@ impl Engine {
             Err(_) => true,
         };
         if detach_failed {
+            // TEMP-DIAG-PREARM66: remove before the final commit.
+            if let Some(seq) = diag_seq {
+                eprintln!("BATCH-DIAG[{seq}] detach-failed-static");
+            }
             *additions_allowed = false;
             outcome.detach_failed = true;
             outcome
@@ -15888,6 +15979,16 @@ impl Engine {
             } else {
                 DiagnosticOutcome::Rejected
             });
+        }
+        // TEMP-DIAG-PREARM66: remove before the final commit.
+        if let Some(seq) = diag_seq {
+            eprintln!(
+                "BATCH-DIAG[{seq}] final required_complete={} stale={} missing={} static={}",
+                outcome.required_complete(),
+                outcome.stale_views.len(),
+                outcome.missing_contexts.len(),
+                outcome.static_failures.len(),
+            );
         }
         Ok(outcome)
     }

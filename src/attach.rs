@@ -3051,9 +3051,14 @@ impl RetainedStaticTarget {
 
 /// Test-only interim attachment generation: every successful test
 /// sealing mints the next value, so the closure generation the
-/// journal observes always names a real sealed endpoint set. Fenced
-/// from production (which mints from the mmapable attach cell): the
-/// interim counter alone never feeds production authority.
+/// journal observes always names a real sealed endpoint set. The
+/// counter holds the count minted so far; the minted generation is
+/// one-based (1, 2, ...) exactly like the production attach-cell
+/// mint (`mint_attach_cell`), because 0 names the unstamped row /
+/// ordinary seal the DEMO-4 late-attach fallback reads as
+/// predates-closure. Fenced from production (which mints from the
+/// mmapable attach cell): the interim counter alone never feeds
+/// production authority.
 #[cfg(test)]
 static ATTACHMENT_GENERATION: AtomicU64 = AtomicU64::new(0);
 
@@ -3795,8 +3800,15 @@ pub(crate) fn seal_attached_subset_with(
     };
     attached.validate_with(domain, policy, descriptors, retained, owned_sides, watched)?;
     // Only a successful sealing mints: the generation always names a
-    // complete validated endpoint set, never a refused one.
-    attached.generation = ATTACHMENT_GENERATION.fetch_add(1, Ordering::SeqCst);
+    // complete validated endpoint set, never a refused one. One-based
+    // like the production attach-cell mint: a first sealing minting 0
+    // would stamp a real closure's rows with the unstamped value the
+    // late-attach fallback reads as predates-closure. Exhaustion
+    // refuses like the failed native mint.
+    attached.generation = ATTACHMENT_GENERATION
+        .fetch_add(1, Ordering::SeqCst)
+        .checked_add(1)
+        .ok_or(crate::inventory_semantics::SemanticRefusal::Attachment)?;
     Ok(attached)
 }
 

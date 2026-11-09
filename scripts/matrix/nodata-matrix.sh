@@ -356,8 +356,23 @@ cell_live() {
     case $lc_mut in
         deleted) rm -f "$lc_mod" ;;
         copyup)
-            cp "$lc_mod" "$lc_dir/libnodata-copyup.so"
-            head -c 1024 /dev/zero >> "$lc_mod"
+            # R-41 same-bytes copy-up: a metadata-only change on the
+            # merged path copies lower->upper without touching bytes.
+            lc_sha_before=$(sha256sum "$lc_mod")
+            chmod +x "$lc_mod"
+            touch "$lc_mod"
+            lc_sha_after=$(sha256sum "$lc_mod")
+            if [ "$lc_sha_before" != "$lc_sha_after" ]; then
+                echo "copy-up changed provider bytes" >&2
+                kill -TERM "$HARNESS_PID" 2>/dev/null
+                wait "$HARNESS_PID" 2>/dev/null || true
+                record_result "$lc_cell" "$lc_mode" "$lc_scope" "$lc_fs"; return 0
+            fi
+            if [ -e "$lc_dir/upper/libnodata.so" ]; then
+                echo "copy-up present: upper/libnodata.so"
+            else
+                echo "copy-up not observed: upper/libnodata.so absent"
+            fi
             ;;
     esac
     set +e
@@ -473,8 +488,23 @@ cell_inventory() {
     case $ic_mut in
         deleted) rm -f "$ic_mod" ;;
         copyup)
-            cp "$ic_mod" "$ic_dir/libnodata-copyup.so"
-            head -c 1024 /dev/zero >> "$ic_mod"
+            # R-41 same-bytes copy-up: a metadata-only change on the
+            # merged path copies lower->upper without touching bytes.
+            ic_sha_before=$(sha256sum "$ic_mod")
+            chmod +x "$ic_mod"
+            touch "$ic_mod"
+            ic_sha_after=$(sha256sum "$ic_mod")
+            if [ "$ic_sha_before" != "$ic_sha_after" ]; then
+                echo "copy-up changed provider bytes" >&2
+                kill -TERM "$HARNESS_PID" 2>/dev/null
+                wait "$HARNESS_PID" 2>/dev/null || true
+                record_result "$ic_cell" inventory "$ic_scope" "$ic_fs"; return 0
+            fi
+            if [ -e "$ic_dir/upper/libnodata.so" ]; then
+                echo "copy-up present: upper/libnodata.so"
+            else
+                echo "copy-up not observed: upper/libnodata.so absent"
+            fi
             ;;
     esac
     ic_cgdir=

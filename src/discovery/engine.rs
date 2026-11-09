@@ -20495,6 +20495,14 @@ impl Engine {
     /// Whether this retiring slot's entry pin belongs to a module of the
     /// owned run child's current view. Slots no claimed module maps fail
     /// closed to the ordinary async global path.
+    ///
+    /// Lane-A (pre-6.8 overlay) split: the pre-arm pin and the scanned
+    /// identity are distinct pins over identical bytes, and only the
+    /// scanned identity lands in `entry_objects`. A retiring static slot
+    /// hung off the pin belongs to the same owned-view module all the
+    /// same; matching it by digest keeps the owned-only retire on the
+    /// synchronous path so the refresh tick still completes inside the
+    /// pause. An empty digest never matches: unhashed pins fail closed.
     fn slot_owned_by_run(&self, slot: &plan::Slot) -> bool {
         self.modules.iter().any(|module| {
             self.owned_run_view(module.scanned.view)
@@ -20502,8 +20510,19 @@ impl Engine {
                     .entry_objects
                     .iter()
                     .flatten()
-                    .any(|id| *id == slot.object)
+                    .any(|id| *id == slot.object || self.same_pinned_bytes(*id, slot.object))
         })
+    }
+
+    /// Whether two pins digest identical bytes. Distinct-pin/same-bytes is
+    /// the lane-A pre-arm/scan split (and the copy-up pair shape); the
+    /// digest is the only same-file key that survives it, since devices
+    /// (and on xino-off overlays, inodes) differ across the split.
+    fn same_pinned_bytes(&self, first: PinnedObjectId, second: PinnedObjectId) -> bool {
+        match (self.pinned.summary(first), self.pinned.summary(second)) {
+            (Some(a), Some(b)) => !a.sha256.is_empty() && a.sha256 == b.sha256,
+            _ => false,
+        }
     }
 
     /// Whether the ownership gate in `arm_loader_or_partial` keeps this view

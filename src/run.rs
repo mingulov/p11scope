@@ -4959,6 +4959,38 @@ const HANDOFF_STEP_PAUSE_ARM: &str = "pause arm";
 const HANDOFF_STEP_EXEC: &str = "exec handoff";
 const HANDOFF_STEP_POST_RELEASE: &str = "post-release pause revalidation";
 
+/// Finite owned-handoff gap vocabulary (schema v3): every reason the
+/// handoff seals file in `evidence.skipped[]`, so a handoff `-o` JSON
+/// validates against the published closed enum. The failed step rides
+/// in `name` (one of `HANDOFF_STEP_*`); drain and read failures ride
+/// under their own gap subjects below.
+const HANDOFF_REASON_STEP_PROFILE: &str = "the owned startup step failed before the capture loop; the report holds what was captured up to the failure";
+const HANDOFF_REASON_STEP_TRACE: &str = "the owned startup step failed before the capture loop; the trace holds what was captured up to the failure";
+const HANDOFF_REASON_IDENTITY: &str =
+    "the terminal identity recheck failed; provider sameness is unproven";
+const HANDOFF_REASON_TAIL_RETIRE: &str =
+    "the reaped child's tail could not be retired; its events may be missing or double-counted";
+const HANDOFF_REASON_TAIL_CANCELLED: &str =
+    "the reaped child's tail drain was cancelled; its events are unproven";
+const HANDOFF_REASON_TAIL_DRAIN: &str =
+    "the reaped child's tail drain failed; its events are unproven";
+const HANDOFF_REASON_EVENTS_DRAIN: &str =
+    "the terminal event drain failed; calls past the failure are unproven";
+const HANDOFF_REASON_EVENTS_OPEN: &str =
+    "the EVENTS reader could not be opened; calls are unproven";
+const HANDOFF_REASON_COUNTER: &str = "the terminal counter read failed; counts are unproven";
+const HANDOFF_REASON_RING_LOSS: &str = "the ring-loss line could not be emitted; loss is unproven";
+const HANDOFF_REASON_KERNEL: &str = "the terminal kernel evidence read failed; loss is unproven";
+/// Gap subjects the handoff seals file under (the oracle bounds these
+/// beside `discovery subject`; the failed step itself rides in `name`
+/// under one of `HANDOFF_STEP_*`).
+const HANDOFF_GAP_PROVIDER_IDENTITY: &str = "provider identity";
+const HANDOFF_GAP_ORIGINAL_ROOT_TAIL: &str = "original root tail";
+const HANDOFF_GAP_EVENTS_DRAIN: &str = "events drain";
+const HANDOFF_GAP_COUNTER_COLLECTION: &str = "counter collection";
+const HANDOFF_GAP_RING_LOSS: &str = "ring loss report";
+const HANDOFF_GAP_KERNEL_EVIDENCE: &str = "kernel evidence";
+
 /// Production context for an owned-handoff failure seal: the attached
 /// session and settled child plus the report inputs the capture loop
 /// would have carried into its terminal.
@@ -18388,9 +18420,149 @@ int main(int argc, char **argv) {
         );
     }
 
-    /// The three owned-handoff failure sites (pause arm, exec barrier
-    /// release, post-release revalidation) seal through the handoff
-    /// helper, never a bare settlement without publication.
+    /// The handoff seals file their gaps straight into
+    /// `evidence.skipped[]`, past the discovery sanitizer — so every
+    /// handoff reason must be a member of the published schema's closed
+    /// reason enum, or every handoff `-o` JSON is schema-invalid output.
+    #[test]
+    fn owned_handoff_gap_reasons_are_schema_reasons() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/docs/schema/observed-profile-v3.schema.json"
+        );
+        let schema: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+        let allowed: Vec<&str> = schema
+            .pointer("/properties/evidence/properties/skipped/items/properties/reason/enum")
+            .expect("the schema names its skip reasons")
+            .as_array()
+            .expect("skip reasons are an enum")
+            .iter()
+            .map(|reason| reason.as_str().expect("a skip reason is a string"))
+            .collect();
+        for reason in [
+            HANDOFF_REASON_STEP_PROFILE,
+            HANDOFF_REASON_STEP_TRACE,
+            HANDOFF_REASON_IDENTITY,
+            HANDOFF_REASON_TAIL_RETIRE,
+            HANDOFF_REASON_TAIL_CANCELLED,
+            HANDOFF_REASON_TAIL_DRAIN,
+            HANDOFF_REASON_EVENTS_DRAIN,
+            HANDOFF_REASON_EVENTS_OPEN,
+            HANDOFF_REASON_COUNTER,
+            HANDOFF_REASON_RING_LOSS,
+            HANDOFF_REASON_KERNEL,
+        ] {
+            assert!(
+                allowed.contains(&reason),
+                "{reason:?} is not a schema skip reason"
+            );
+        }
+    }
+
+    /// The trace handoff seal drains the reaped child's tail the way the
+    /// profile seal does: tail events at handoff stream through the trace
+    /// reducer, and every non-absent outcome retires or files its named
+    /// gap — never silently lost.
+    #[test]
+    fn owned_handoff_trace_seal_drains_the_original_root_tail() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let seal = production
+            .split_once("fn seal_owned_handoff_trace(")
+            .expect("trace handoff seal")
+            .1
+            .split_once("fn finish_capture_loop(")
+            .expect("trace handoff seal end")
+            .0;
+        assert!(
+            seal.contains("drain_original_root_events("),
+            "the trace handoff seal must drain the reaped child's tail"
+        );
+        assert!(
+            seal.contains("apply_original_root_retirement("),
+            "a completed tail must retire its processes"
+        );
+    }
+
+    /// The handoff failure happens before any loop starts, so its gap
+    /// names the failed handoff step — never the capture loop.
+    #[test]
+    fn owned_handoff_gap_names_the_step_not_the_loop() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let seal = production
+            .split_once("fn finish_owned_handoff_error(")
+            .expect("handoff error seal")
+            .1
+            .split_once("fn seal_owned_handoff_partial(")
+            .expect("handoff error seal end")
+            .0;
+        assert!(
+            seal.contains("note_handoff_failure("),
+            "the handoff gap must name the failed step"
+        );
+        assert!(
+            !seal.contains("note_capture_loop_failure()"),
+            "no loop ever ran at handoff"
+        );
+    }
+
+    /// Settlement-failure twin: when settlement itself fails, no partial
+    /// report publishes here (the child's disposition is unknown, and the
+    /// settlement-gate lane owns that report), producers still detach,
+    /// and the original handoff error returns the run nonzero.
+    #[test]
+    fn owned_handoff_settlement_failure_skips_publication() {
+        let gap = std::cell::Cell::new(false);
+        let settled = std::cell::Cell::new(false);
+        let published = std::cell::Cell::new(false);
+        let detached = std::cell::Cell::new(false);
+        let outcome = drive_owned_handoff_with(
+            &mut (),
+            "exec handoff",
+            |_| Err(anyhow::anyhow!("run: exec handoff cancelled")),
+            |_| gap.set(true),
+            |_| {
+                settled.set(true);
+                Err(anyhow::anyhow!(
+                    "run: settling the original child: test-forced"
+                ))
+            },
+            |_| panic!("a failed handoff never publishes a full report"),
+            |_| {
+                published.set(true);
+                Ok(())
+            },
+            |_| {
+                detached.set(true);
+                Ok(())
+            },
+        );
+        let error = outcome.expect_err("a failed handoff must still fail the run");
+        assert!(gap.get(), "the failed step must file its named gap");
+        assert!(settled.get(), "settlement must still run");
+        assert!(
+            !published.get(),
+            "a failed settlement must skip publication here"
+        );
+        assert!(detached.get(), "producers must still detach");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("exec handoff cancelled"),
+            "the original error must stay the outer error: {message}"
+        );
+        assert!(
+            message.contains("settling the original child"),
+            "the settlement failure must be retained: {message}"
+        );
+    }
+
+    /// The four owned-handoff failure sites (pause-arm lifecycle,
+    /// pause-arm retire, exec barrier release, post-release
+    /// revalidation) seal through the handoff helper, never a bare
+    /// settlement without publication. Each arm is pinned individually:
+    /// reverting any one arm to the bare settlement reddens this test.
     #[test]
     fn owned_handoff_failures_seal_a_partial_report() {
         let source = include_str!("run.rs");
@@ -18406,10 +18578,26 @@ int main(int argc, char **argv) {
             handoff.contains("finish_owned_handoff_error("),
             "handoff failures must seal a partial report"
         );
-        assert!(
-            handoff.matches("finish_owned_handoff_error(").count() >= 3,
-            "pause-arm, release and revalidation sites must all seal"
+        assert_eq!(
+            handoff.matches("finish_owned_handoff_error(").count(),
+            4,
+            "pause-arm lifecycle, pause-arm retire, release and revalidation sites must all seal"
         );
+        assert!(
+            !handoff.contains("finish_capture_error("),
+            "no handoff arm may settle without sealing its partial report"
+        );
+        for (step, want) in [
+            ("HANDOFF_STEP_PAUSE_ARM", 2),
+            ("HANDOFF_STEP_EXEC", 1),
+            ("HANDOFF_STEP_POST_RELEASE", 1),
+        ] {
+            assert_eq!(
+                handoff.matches(step).count(),
+                want,
+                "{step} must name its handoff arm"
+            );
+        }
     }
 
     /// A poisoned terminal discovery batch degrades to the recorded gap

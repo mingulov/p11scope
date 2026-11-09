@@ -5084,7 +5084,9 @@ fn pid_namespace_preflight(
 /// runs only after hook exports were found, or the operator named the
 /// file with `--module`. Every other non-benign skip is a mapped file
 /// the scan could not examine, whose provider-ness is exactly what
-/// cannot be determined. Verified absence (an examined file with no
+/// cannot be determined — except `capture discovery` stops (ceilings,
+/// stops, unavailable maps), which read as discovery events, never
+/// file counts. Verified absence (an examined file with no
 /// table, a hint verified absent) keeps the nothing-found hint, as
 /// does a proxy closure still awaiting publication (the start gate
 /// reads it like nothing mapped yet). Subjects and reasons are
@@ -5097,6 +5099,7 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
         .filter(|skip| !crate::plan::is_closure_awaiting_publication(&skip.reason))
         .collect();
     let mut unexamined: Vec<&Skipped> = Vec::new();
+    let mut discovery_stops: Vec<&Skipped> = Vec::new();
     for skip in &plan.skipped {
         if skip
             .reason
@@ -5109,11 +5112,15 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
             // Verified not-a-provider, or a function entry in a decoded
             // table (not a file the scan failed to use): no provider
             // count, no unexamined file.
+        } else if skip.subject == "capture discovery" {
+            // A scan ceiling, stop or unavailable map is a discovery
+            // event, not a mapped file: it never joins the file count.
+            discovery_stops.push(skip);
         } else {
             unexamined.push(skip);
         }
     }
-    if confirmed.is_empty() && unexamined.is_empty() {
+    if confirmed.is_empty() && unexamined.is_empty() && discovery_stops.is_empty() {
         return no_modules_hint(scope);
     }
     let scope_bit = match scope {
@@ -5167,6 +5174,20 @@ fn empty_plan_hint(scope: &ScopeArg, plan: &crate::plan::AttachPlan) -> String {
                 "{} mapped {noun} could not be examined: {}",
                 unexamined.len(),
                 empty_plan_pairs(&unexamined),
+            ));
+        }
+    }
+    if !discovery_stops.is_empty() {
+        if segments.is_empty() {
+            segments.push(format!(
+                "no PKCS#11 modules discovered {scope_bit}, but capture discovery stopped \
+                 before it could examine every mapping: {}",
+                empty_plan_pairs(&discovery_stops),
+            ));
+        } else {
+            segments.push(format!(
+                "capture discovery stopped early: {}",
+                empty_plan_pairs(&discovery_stops),
             ));
         }
     }

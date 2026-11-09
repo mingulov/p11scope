@@ -13462,6 +13462,63 @@ mod tests {
         );
     }
 
+    /// Non-UTF-8 twin of the replaced-copy hint match: `mapped_path`
+    /// classifies `\012`-free paths ending in ` (deleted)` as a deleted
+    /// mapping before the UTF-8 check, so the stripped comparison must run
+    /// in the OsStr/bytes domain — never through `str` — or the hint is
+    /// misreported as not mapped.
+    #[test]
+    fn non_utf8_hint_naming_a_replaced_copy_names_the_gap_not_a_miss() {
+        use std::os::unix::ffi::{OsStrExt as _, OsStringExt as _};
+        let dir = tempfile::tempdir().unwrap();
+        let hint = dir
+            .path()
+            .join(std::ffi::OsString::from_vec(b"libtok\xff.so".to_vec()));
+        std::fs::write(&hint, b"provider bytes").unwrap();
+        let mut maps = b"7f0000000000-7f0000001000 r-xp 00000000 08:01 4242 ".to_vec();
+        maps.extend_from_slice(hint.as_os_str().as_bytes());
+        maps.extend_from_slice(b" (deleted)\n");
+        let mut fixture = DeletedHintFixture { maps };
+        let view = ProcessView::open(ProcessViewId(502), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let (outcome, _, hints_examined) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&hint),
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut budget,
+            &mut fixture,
+            false,
+        )
+        .expect("the scan must complete, not error");
+        assert!(hints_examined, "the scan reached the hint loop");
+        assert!(
+            outcome.modules().is_empty(),
+            "a replaced copy is never attached, got {:?}",
+            outcome.modules()
+        );
+        let reasons: Vec<(&str, &str)> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|(subject, reason)| subject.ends_with(" (deleted)")
+                    && *reason == REPLACED_PROVIDER_REASON),
+            "the hint names the replaced-file gap, got {reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|(_, reason)| *reason == HINT_NOT_MAPPED_REASON),
+            "the replaced copy is mapped, never missed, got {reasons:?}"
+        );
+    }
+
     // Owner-approved 2026-09-27: `unsupported_version_of` and its matrix
     // test are retired with F-14's version skip — future minors walk now,
     // so there is no version refusal to classify. The version matrix lives

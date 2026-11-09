@@ -15496,6 +15496,30 @@ fn license_reuse_annotations(text: &str) -> Vec<LicenseReuseAnnotation> {
         .collect()
 }
 
+#[test]
+fn license_reuse_annotations_parse_single_line_paths() {
+    // The committed `.log` annotation uses the single-line `path = [...]`
+    // TOML shape; the reader must parse its entries instead of silently
+    // swallowing the block (precedence/license/copyright included).
+    let text = "[[annotations]]\n\
+        path = [\"tests/fixtures/**/*.log\"]\n\
+        precedence = \"aggregate\"\n\
+        SPDX-FileCopyrightText = \"2026 Denis Mingulov <denis@mingulov.com>\"\n\
+        SPDX-License-Identifier = \"GPL-3.0-or-later\"\n";
+    let annotations = license_reuse_annotations(text);
+    assert_eq!(annotations.len(), 1, "one annotation block");
+    assert_eq!(
+        annotations[0].paths,
+        vec!["tests/fixtures/**/*.log".to_string()],
+        "single-line paths must be parsed"
+    );
+    assert_eq!(annotations[0].precedence, "aggregate");
+    assert_eq!(
+        annotations[0].license, "GPL-3.0-or-later",
+        "single-line blocks must keep their license"
+    );
+}
+
 fn license_reuse_segment_matches(pattern: &str, name: &str) -> bool {
     let mut chunks = pattern.split('*');
     let first = chunks.next().unwrap_or("");

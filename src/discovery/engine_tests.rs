@@ -1182,6 +1182,38 @@ fn fresh_build_bind_loss_extends_without_aborting_and_keeps_the_gap() {
 }
 
 #[test]
+fn retired_rebuilt_slot_does_not_consume_extension_capacity_at_the_detailed_limit() {
+    let capacity = p11scope_ebpf_common::MAX_SLOTS as usize;
+    let mut committed = plan_with(capacity, 0);
+    committed.deactivate((capacity - 1) as u32);
+    assert_eq!(committed.active_slot_count(), capacity - 1);
+    let mut rebuilt = committed.clone();
+    // Bind-loss shape with a key the committed plan never indexed: the slot
+    // would count as an addition if it were active, so the old counter
+    // refused the extend at the limit.
+    rebuilt.slots[capacity - 1].file_offset = capacity as u64 * 8;
+    let result = committed.extend_exact_with_stable_module_ids(rebuilt);
+    assert!(
+        result.is_ok(),
+        "a retired rebuilt slot must not consume extension capacity: {:?}",
+        result.as_ref().err()
+    );
+    let delta = result.unwrap();
+    assert!(
+        delta.new.is_empty(),
+        "no slot is added at the limit: {:?}",
+        delta.new
+    );
+    assert!(
+        delta.retire.is_empty(),
+        "no committed slot retires: {:?}",
+        delta.retire
+    );
+    assert_eq!(committed.active_slot_count(), capacity - 1);
+    assert_eq!(committed.slots.len(), capacity);
+}
+
+#[test]
 fn retire_prunes_vanished_owners_and_retires_orphaned_dependency_slots() {
     let key_a = overlay_key(80);
     let key_b = overlay_key(81);

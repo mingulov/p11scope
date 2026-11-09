@@ -14888,7 +14888,7 @@ const LICENSE_PROVENANCE_LINES: &[(&str, &str)] = &[
     ),
     (
         "scripts/release-notices.py",
-        "816831f6bf24503c349eb59cc3963e4bd05cf6467bac885c5f91c79df7a51385",
+        "2b4a85765e6184bdeb7f929bbeb5ef226fbf499bf8f3f78fc1684ba19f1a30b7",
     ),
     (
         "tests/python/test_release_notices.py",

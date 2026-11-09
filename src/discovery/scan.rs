@@ -13307,6 +13307,21 @@ mod tests {
         }
     }
 
+    /// The replaced-file reason stays neutral: the scan skipped before it
+    /// opened the file, so it must not claim the mapping is (or is not) a
+    /// provider. Pinned byte-exactly; renderers match this text.
+    #[test]
+    fn replaced_provider_reason_stays_neutral_and_truncating() {
+        assert_eq!(
+            REPLACED_PROVIDER_REASON,
+            "replaced on disk while running; not examined, calls not counted"
+        );
+        assert!(
+            scan_skip_truncates(REPLACED_PROVIDER_REASON),
+            "the neutral wording must still truncate coverage"
+        );
+    }
+
     // Owner-approved 2026-09-27: `unsupported_version_of` and its matrix
     // test are retired with F-14's version skip — future minors walk now,
     // so there is no version refusal to classify. The version matrix lives

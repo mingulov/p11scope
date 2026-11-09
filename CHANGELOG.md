@@ -59,6 +59,10 @@ versioned separately and are opaque, exact dispatch keys.
 - A stopped pass-0 collection is kept as scan-only inventory under
   `--pid`/`--system` (modules and callers shown, counts not attached)
   instead of being discarded.
+- On hosts without usable `uprobe_multi`, `inventory --system` and
+  `inventory --cgroup` with the default `--capture auto` now exit 0 with
+  a PARTIAL scan report carrying the `native usage feed unavailable` gap
+  (was: exit 1 with no report).
 
 ### Fixed
 

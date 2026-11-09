@@ -22192,6 +22192,32 @@ mod tests {
                 if function == "capture_profile" { 3 } else { 2 },
                 "{function}: every terminal discovery arm degrades on a signalled stop"
             );
+            // The degradation only fires on an observed stop: every arm
+            // passes the live stop flag, bound once from the stop state,
+            // and the quiesce-error combiner reads the stop state too. A
+            // constant at any of these sites must fail this test.
+            assert_eq!(
+                discovery.matches("signalled_stop,").count(),
+                if function == "capture_profile" { 3 } else { 2 },
+                "{function}: every degraded arm passes the live stop flag"
+            );
+            assert_eq!(
+                body.matches("let signalled_stop = interrupted.interrupted();")
+                    .count(),
+                1,
+                "{function}: the stop flag binds once from the live stop state"
+            );
+            let quiesce_head: String = body
+                .split_once("finish_quiesce_error(")
+                .unwrap()
+                .1
+                .chars()
+                .take(400)
+                .collect();
+            assert!(
+                quiesce_head.contains("interrupted.interrupted(),"),
+                "{function}: the quiesce-error combiner reads the live stop state"
+            );
             assert!(
                 discovery.contains("note_terminal_discovery_failure()"),
                 "{function}: the gap files unfinished terminal work"

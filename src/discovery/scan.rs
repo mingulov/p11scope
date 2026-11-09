@@ -13322,6 +13322,105 @@ mod tests {
         );
     }
 
+    /// Scripted maps for the `--module`-names-a-replaced-copy shape: one
+    /// executable group rendering `<hint> (deleted)`. Memory reads stay
+    /// off; the flag is about the mapping pass, not `/proc/<pid>/mem`.
+    struct DeletedHintFixture {
+        maps: Vec<u8>,
+    }
+
+    struct DeletedHintMemory;
+
+    impl ScanMemory for DeletedHintMemory {
+        fn read_memory_at(&self, _bytes: &mut [u8], _offset: u64) -> std::io::Result<usize> {
+            Err(std::io::Error::other("memory not scripted"))
+        }
+    }
+
+    impl ScanIo for DeletedHintFixture {
+        type Memory = DeletedHintMemory;
+
+        fn open_maps(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<Box<dyn Read>> {
+            Ok(Box::new(std::io::Cursor::new(self.maps.clone())))
+        }
+
+        fn open_mem(
+            &mut self,
+            _: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> std::io::Result<DeletedHintMemory> {
+            Err(std::io::Error::other("mem not scripted"))
+        }
+
+        fn final_generation(
+            &mut self,
+            view: &ProcessView,
+            _: &mut CaptureWorkBudget,
+        ) -> Result<(), String> {
+            view.run_while_same(|| ())
+        }
+    }
+
+    /// A `--module` hint naming the replaced copy matches its still-mapped
+    /// `<path> (deleted)` group: the scan names the replaced-file gap and
+    /// never reports the hint as "not mapped in the target". The group is
+    /// still never opened or attached.
+    #[test]
+    fn module_hint_naming_a_replaced_copy_names_the_gap_not_a_miss() {
+        let dir = tempfile::tempdir().unwrap();
+        let hint = dir.path().join("libtok.so");
+        std::fs::write(&hint, b"provider bytes").unwrap();
+        let maps = format!(
+            "7f0000000000-7f0000001000 r-xp 00000000 08:01 4242 {} (deleted)\n",
+            hint.display()
+        );
+        let mut fixture = DeletedHintFixture {
+            maps: maps.into_bytes(),
+        };
+        let view = ProcessView::open(ProcessViewId(502), std::process::id()).unwrap();
+        let mut budget = CaptureWorkBudget::default();
+        let (outcome, _, hints_examined) = scan_view_with_examined(
+            &ScanRequest {
+                pid: view.pid(),
+                hints: std::slice::from_ref(&hint),
+                hooks: &HookRegistry::builtin(),
+            },
+            &view,
+            &mut budget,
+            &mut fixture,
+            false,
+        )
+        .expect("the scan must complete, not error");
+        assert!(hints_examined, "the scan reached the hint loop");
+        assert!(
+            outcome.modules().is_empty(),
+            "a replaced copy is never attached, got {:?}",
+            outcome.modules()
+        );
+        let reasons: Vec<(&str, &str)> = outcome
+            .skipped()
+            .iter()
+            .map(|skip| (skip.subject.as_str(), skip.reason.as_str()))
+            .collect();
+        assert!(
+            reasons
+                .iter()
+                .any(|(subject, reason)| subject.ends_with(" (deleted)")
+                    && *reason == REPLACED_PROVIDER_REASON),
+            "the hint names the replaced-file gap, got {reasons:?}"
+        );
+        assert!(
+            !reasons
+                .iter()
+                .any(|(_, reason)| *reason == HINT_NOT_MAPPED_REASON),
+            "the replaced copy is mapped, never missed, got {reasons:?}"
+        );
+    }
+
     // Owner-approved 2026-09-27: `unsupported_version_of` and its matrix
     // test are retired with F-14's version skip — future minors walk now,
     // so there is no version refusal to classify. The version matrix lives

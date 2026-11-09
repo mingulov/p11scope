@@ -376,6 +376,7 @@ cell_live() {
             SPID=$!
             wait_ready_loose "$lc_dir/observer.stderr" "$lc_mode" || {
                 echo "observer never ready"; wait "$SPID" 2>/dev/null
+                echo "observer exit: $?" > "$lc_dir/observer.rc"
                 : > "$lc_dir/go"; : > "$lc_dir/finish"
                 wait "$HARNESS_PID" 2>/dev/null; SPID=
                 set -e
@@ -389,21 +390,25 @@ cell_live() {
             }
             ;;
         trace)
+            # Trace readiness is the CAPTURE line, which lands on stdout
+            # (and the -o file), never stderr: combine both streams so the
+            # barrier below cannot miss it and release the workload late.
             # shellcheck disable=SC2086
             flock "$PRIVLOCK" sudo -n "$MATRIX_TIMEOUT" --foreground \
                 --signal=TERM --kill-after=5s 120s "$P11SCOPE_EXE" "$lc_mode" \
                 $lc_scopeflag --duration 10s --max-events 1000 -v -o "$lc_dir/out.txt" \
-                > "$lc_dir/observer.stdout" 2> "$lc_dir/observer.stderr" &
+                > "$lc_dir/observer.stdout" 2>&1 &
             SPID=$!
-            wait_ready_loose "$lc_dir/observer.stderr" "$lc_mode" || {
+            wait_ready_loose "$lc_dir/observer.stdout" "$lc_mode" || {
                 echo "observer never ready"; wait "$SPID" 2>/dev/null
+                echo "observer exit: $?" > "$lc_dir/observer.rc"
                 : > "$lc_dir/go"; : > "$lc_dir/finish"
                 wait "$HARNESS_PID" 2>/dev/null; SPID=
                 set -e
                 # shellcheck disable=SC2086
                 run_oracle "$lc_cell" --mode "$lc_mode" --scope "$lc_scope" \
                     --json "$lc_dir/out.txt" --stdout "$lc_dir/observer.stdout" \
-                    --stderr "$lc_dir/observer.stderr" --provider libnodata.so \
+                    --stderr "$lc_dir/observer.stdout" --provider libnodata.so \
                     --sysprovider libsofthsm2.so --min-calls 1 --caller "$CALLER_HARNESS" $lc_pidargs || true
                 record_result "$lc_cell" "$lc_mode" "$lc_scope" "$lc_fs"
                 return 0
@@ -422,15 +427,19 @@ cell_live() {
         profile) lc_json="$lc_dir/out.json" ;;
         trace) lc_json="$lc_dir/out.txt" ;;
     esac
+    case $lc_mode in
+        profile) lc_err="$lc_dir/observer.stderr" ;;
+        trace) lc_err="$lc_dir/observer.stdout" ;;
+    esac
     # shellcheck disable=SC2086
     if [ -n "$lc_exact" ]; then
         run_oracle "$lc_cell" --mode "$lc_mode" --scope "$lc_scope" --json "$lc_json" \
-            --stdout "$lc_dir/observer.stdout" --stderr "$lc_dir/observer.stderr" \
+            --stdout "$lc_dir/observer.stdout" --stderr "$lc_err" \
             --provider libnodata.so --sysprovider libsofthsm2.so --min-calls 1 \
             --exact "$EXPECTED_EXACT" --caller "$CALLER_HARNESS" $lc_pidargs || true
     else
         run_oracle "$lc_cell" --mode "$lc_mode" --scope "$lc_scope" --json "$lc_json" \
-            --stdout "$lc_dir/observer.stdout" --stderr "$lc_dir/observer.stderr" \
+            --stdout "$lc_dir/observer.stdout" --stderr "$lc_err" \
             --provider libnodata.so --sysprovider libsofthsm2.so --min-calls 1 \
             --caller "$CALLER_HARNESS" $lc_pidargs || true
     fi
@@ -548,12 +557,12 @@ run_cell() {
         run-hostfs) cell_run "$1" hostfs harness 1 ;;
         run-syspath) cell_run "$1" syspath harness 1 ;;
         run-pkcs11-tool) cell_run "$1" hostfs pkcs11-tool "" ;;
-        run-overlay) cell_run "$1" overlay harness "" ;;
-        run-tmpfs) cell_run "$1" tmpfs harness "" ;;
-        run-bind) cell_run "$1" bind harness "" ;;
+        run-overlay) cell_run "$1" overlay harness 1 ;;
+        run-tmpfs) cell_run "$1" tmpfs harness 1 ;;
+        run-bind) cell_run "$1" bind harness 1 ;;
         profile-pid-hostfs) cell_live "$1" profile pid hostfs 1 none ;;
         profile-system-hostfs) cell_live "$1" profile system hostfs "" none ;;
-        profile-pid-overlay) cell_live "$1" profile pid overlay "" none ;;
+        profile-pid-overlay) cell_live "$1" profile pid overlay 1 none ;;
         profile-pid-deleted) cell_live "$1" profile pid deleted "" deleted ;;
         profile-pid-copyup) cell_live "$1" profile pid copyup "" copyup ;;
         trace-pid-hostfs) cell_live "$1" trace pid hostfs 1 none ;;
@@ -562,8 +571,8 @@ run_cell() {
         inventory-cgroup-hostfs) cell_inventory "$1" cgroup hostfs none ;;
         inventory-cgroup-overlay) cell_inventory "$1" cgroup overlay none ;;
         inventory-pid-overlay) cell_inventory "$1" pid overlay none ;;
-        inventory-pid-tmpfs) cell_inventory "$1" tmpfs none ;;
-        inventory-pid-bind) cell_inventory "$1" bind none ;;
+        inventory-pid-tmpfs) cell_inventory "$1" pid tmpfs none ;;
+        inventory-pid-bind) cell_inventory "$1" pid bind none ;;
         inventory-pid-deleted) cell_inventory "$1" pid deleted deleted ;;
         inventory-pid-copyup) cell_inventory "$1" pid copyup copyup ;;
     esac

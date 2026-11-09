@@ -46344,6 +46344,11 @@ fn refresh_retry_preserves_newer_serial_and_first_seen() {
     // Reuse the existing bounded retirement-intent replay, which cannot
     // overtake the already-collected old-context record.
     let (_fixture, mut engine, context, record, mut session) = armed_seed_route(1);
+    // The retry asserts an in-frame re-arm: hold the tick quantum's wall
+    // clock like RefreshFairnessFixture does, so a loaded runner cannot
+    // defer the post-retirement rescan past the 200ms default and skip
+    // the arm while the (retained) request waits for the next frame.
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
     let pid = engine.views[0].pid();
     let view = engine.views[0].id();
     let mut pending = PendingViewRetirements::new();

@@ -8802,6 +8802,30 @@ fn write_json_report(file: &mut std::fs::File, j: &serde_json::Value) -> Result<
     file.sync_all().context("syncing profile output")
 }
 
+/// Factored terminal profile publication (pre-fix scaffold): mirrors
+/// today's sequential `?` publication — a frame error returns before the
+/// `-o` write runs, and a failed `-o` write loses the rendered document.
+/// The twins below pin the target behavior.
+fn publish_profile_report_with_fallback<W>(
+    _stdout: &mut dyn Write,
+    _stdout_open: &mut bool,
+    _json: &serde_json::Value,
+    out: Option<&Path>,
+    write_out: W,
+    frame_error: Option<anyhow::Error>,
+) -> Result<()>
+where
+    W: FnOnce() -> Result<()>,
+{
+    if let Some(error) = frame_error {
+        return Err(error);
+    }
+    let Some(_) = out else {
+        return Ok(());
+    };
+    write_out()
+}
+
 /// `p11scope trace`: one line per completed call, printed as it arrives,
 /// instead of `profile`'s periodic aggregate frame. A separate
 /// subcommand rather than a `--mode` — its transport (drain-and-print
@@ -26857,6 +26881,231 @@ int main(int argc, char **argv) {
         let parsed: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(parsed["schema"], "p11scope/observed-profile/v3");
+    }
+
+    /// Healthy twin: a good frame and a good `-o` write publish with no
+    /// rescue bytes on stdout. The frame result comes from the real
+    /// `write_stdout`/`flush_stdout`, like every twin below.
+    #[test]
+    fn terminal_publish_succeeds_when_frame_and_report_are_healthy() {
+        use std::cell::Cell;
+        let mut frame_sink = Vec::new();
+        let mut frame_open = true;
+        let frame_error = write_stdout(&mut frame_sink, &mut frame_open, b"frame\n")
+            .and_then(|()| flush_stdout(&mut frame_sink, &mut frame_open))
+            .err();
+        assert!(frame_error.is_none());
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let attempted = Cell::new(false);
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            Some(Path::new("observed.json")),
+            || {
+                attempted.set(true);
+                Ok(())
+            },
+            frame_error,
+        )
+        .expect("healthy sinks publish");
+        assert!(attempted.get(), "the -o write ran");
+        assert!(sink.is_empty(), "no rescue bytes on the healthy path");
+    }
+
+    /// A hard stdout failure on the live frame still attempts the `-o`
+    /// write; the frame failure surfaces after the report publishes.
+    #[test]
+    fn terminal_publish_still_attempts_the_report_after_a_hard_frame_error() {
+        use std::cell::Cell;
+        let mut broken = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_flush: false,
+        };
+        let mut frame_open = true;
+        let frame_error = write_stdout(&mut broken, &mut frame_open, b"frame\n").err();
+        assert!(frame_error.is_some(), "the injected frame write must fail");
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let attempted = Cell::new(false);
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        let error = publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            Some(Path::new("observed.json")),
+            || {
+                attempted.set(true);
+                Ok(())
+            },
+            frame_error,
+        )
+        .expect_err("the frame failure still surfaces");
+        assert!(attempted.get(), "the -o write runs despite the frame error");
+        let text = format!("{error:#}");
+        assert!(text.contains("writing stdout"), "{text}");
+    }
+
+    /// A failed `-o` write rescues the rendered document to stdout
+    /// byte-identically, and still exits nonzero naming the `-o` error.
+    #[test]
+    fn terminal_publish_rescues_the_rendered_report_to_stdout_when_output_fails() {
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3", "n": 1});
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        let error = publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            Some(Path::new("/tmp/observed.json")),
+            || Err(anyhow!("simulated disk-full on -o write")),
+            None,
+        )
+        .expect_err("the -o failure still exits nonzero");
+        let text = format!("{error:#}");
+        assert!(text.contains("simulated disk-full"), "{text}");
+        let mut expected = vec![b'\n'];
+        serde_json::to_writer_pretty(&mut expected, &json).unwrap();
+        expected.push(b'\n');
+        assert_eq!(
+            sink, expected,
+            "the rendered document is rescued byte-identically"
+        );
+        let start = sink.iter().position(|byte| *byte == b'{').unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&sink[start..]).unwrap();
+        assert_eq!(parsed, json);
+    }
+
+    /// Both sinks failing surfaces both errors; stdout just hard-failed
+    /// on the frame, so no rescue is retried to the same fd.
+    #[test]
+    fn terminal_publish_combines_frame_and_report_failures_without_a_doomed_retry() {
+        use std::cell::Cell;
+        let mut sink = FailAfterLines {
+            allowed_lines: 0,
+            bytes: Vec::new(),
+            attempts: Vec::new(),
+        };
+        let mut sink_open = true;
+        let frame_error = write_stdout(&mut sink, &mut sink_open, b"frame\n").err();
+        assert!(frame_error.is_some(), "the injected frame write must fail");
+        assert_eq!(sink.attempts.len(), 1);
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let attempted = Cell::new(false);
+        let error = publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            Some(Path::new("observed.json")),
+            || {
+                attempted.set(true);
+                Err(anyhow!("simulated disk-full on -o write"))
+            },
+            frame_error,
+        )
+        .expect_err("both failures surface");
+        assert!(attempted.get(), "the -o write runs despite the frame error");
+        assert_eq!(
+            sink.attempts.len(),
+            1,
+            "no rescue retry to the just-failed stdout"
+        );
+        let text = format!("{error:#}");
+        assert!(text.contains("simulated disk-full"), "{text}");
+        assert!(text.contains("writing stdout"), "{text}");
+    }
+
+    /// A failed `-o` write after stdout already closed (EPIPE) cannot
+    /// rescue anywhere; the error says stdout is closed.
+    #[test]
+    fn terminal_publish_reports_a_closed_stdout_when_output_fails_after_epipe() {
+        let mut broken = FailingWriter {
+            kind: std::io::ErrorKind::BrokenPipe,
+            fail_flush: false,
+        };
+        let mut sink_open = true;
+        let frame_error = write_stdout(&mut broken, &mut sink_open, b"frame\n").err();
+        assert!(frame_error.is_none(), "EPIPE is tolerated");
+        assert!(!sink_open, "EPIPE closes the sink");
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let error = publish_profile_report_with_fallback(
+            &mut broken,
+            &mut sink_open,
+            &json,
+            Some(Path::new("observed.json")),
+            || Err(anyhow!("simulated disk-full on -o write")),
+            frame_error,
+        )
+        .expect_err("the -o failure still surfaces");
+        assert!(!sink_open);
+        let text = format!("{error:#}");
+        assert!(text.contains("simulated disk-full"), "{text}");
+        assert!(text.contains("closed"), "{text}");
+    }
+
+    /// A hard failure on the stdout rescue itself combines with the `-o`
+    /// error instead of replacing it.
+    #[test]
+    fn terminal_publish_combines_a_failed_stdout_fallback_with_the_output_error() {
+        let mut sink = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_flush: false,
+        };
+        let mut sink_open = true;
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let error = publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            Some(Path::new("observed.json")),
+            || Err(anyhow!("simulated disk-full on -o write")),
+            None,
+        )
+        .expect_err("both failures surface");
+        let text = format!("{error:#}");
+        assert!(text.contains("simulated disk-full"), "{text}");
+        assert!(text.contains("stdout fallback"), "{text}");
+    }
+
+    /// Without `-o` nothing is written anywhere else: a healthy frame
+    /// publishes, a failed frame surfaces, and no rescue runs.
+    #[test]
+    fn terminal_publish_without_output_reports_only_the_frame_result() {
+        let json = serde_json::json!({"schema": "p11scope/observed-profile/v3"});
+        let mut sink = Vec::new();
+        let mut sink_open = true;
+        publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            None,
+            || -> Result<()> {
+                panic!("no -o means no -o write");
+            },
+            None,
+        )
+        .expect("a healthy frame without -o publishes");
+        let mut broken = FailingWriter {
+            kind: std::io::ErrorKind::Other,
+            fail_flush: false,
+        };
+        let mut frame_open = true;
+        let frame_error = write_stdout(&mut broken, &mut frame_open, b"frame\n").err();
+        let error = publish_profile_report_with_fallback(
+            &mut sink,
+            &mut sink_open,
+            &json,
+            None,
+            || -> Result<()> {
+                panic!("no -o means no -o write");
+            },
+            frame_error,
+        )
+        .expect_err("a frame failure without -o still surfaces");
+        assert!(format!("{error:#}").contains("writing stdout"));
+        assert!(sink.is_empty(), "no rescue without an -o failure");
     }
 
     /// The unsafe policy is refused by `CapturePolicy::from_cli` on the parsed

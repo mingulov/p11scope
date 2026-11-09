@@ -15980,6 +15980,93 @@ mod tests {
         // Dropping the child kills and reaps it.
     }
 
+    /// Settling an owned-run pause preflight: success passes the coordinator
+    /// through; an `auto` failure degrades to one counted partial attempt
+    /// with arming disabled (the child runs free); `always` and `never`
+    /// failures propagate to the caller, which fails the run.
+    #[test]
+    fn auto_preflight_failure_degrades_to_one_partial_attempt() {
+        use crate::discovery::pause::PauseCounters;
+        let fixture_dir = tempfile::tempdir().unwrap();
+        let sleeper = build_sleeper(fixture_dir.path());
+        let child = spawn(sleeper.to_str().unwrap(), &[]);
+        let mut degraded = settle_pause_preflight(
+            crate::cli::PausePolicy::Auto,
+            Err(anyhow::anyhow!("probe: no pidfd signal authority")),
+            child.pid(),
+            child.generation().get(),
+        )
+        .expect("auto degrades, never fails the child");
+        assert_eq!(
+            degraded.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            },
+            "the degrade counts one partial attempt"
+        );
+        assert_eq!(degraded.status(), PauseStatus::Partial);
+        let signals = SignalState::new();
+        let mut held = HeldPause::default();
+        let mut io = HeldPauseIo {
+            child: &child,
+            held: &mut held,
+            signals: &signals,
+        };
+        assert_eq!(
+            degraded.arm(&mut io).unwrap(),
+            ArmResult::Disabled,
+            "the degraded coordinator never arms"
+        );
+        assert_eq!(
+            child.pin().original_exited(),
+            Ok(false),
+            "the child runs free, never killed by the degrade"
+        );
+        // Dropping the child kills and reaps it.
+    }
+
+    #[test]
+    fn non_auto_preflight_failures_propagate_to_fail_the_run() {
+        for policy in [
+            crate::cli::PausePolicy::Always,
+            crate::cli::PausePolicy::Never,
+        ] {
+            match settle_pause_preflight(
+                policy,
+                Err(anyhow::anyhow!("probe: no pidfd signal authority")),
+                7,
+                9,
+            ) {
+                Ok(_) => panic!("{policy:?}: non-auto failures propagate"),
+                Err(error) => assert!(
+                    format!("{error}").contains("no pidfd signal authority"),
+                    "{policy:?}: the cause survives: {error}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn successful_preflight_passes_the_coordinator_through() {
+        use crate::discovery::pause::PauseCounters;
+        let through = PauseCoordinator::degraded_auto(7, 9);
+        let settled = settle_pause_preflight(crate::cli::PausePolicy::Auto, Ok(through), 7, 9)
+            .expect("success passes through");
+        assert_eq!(
+            settled.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 0,
+                partial: 1,
+                unavailable: 0,
+            },
+            "the coordinator passes through untouched"
+        );
+    }
+
     /// U-19: the live discovery-noise summary is flushed on every
     /// `run_loop` exit, including a failed or second-signal-abandoned
     /// capture: no `?` may return between the capture call and the flush.

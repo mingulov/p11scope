@@ -639,6 +639,24 @@ class SelectEndpoint66GapTests(unittest.TestCase):
                                allow_66_discovery_gap=True, want=1)
         self.assertEqual(result["detail"], "lossy or unknown observation gap class")
 
+    def test_wrong_gap_name_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["evidence"]["skipped"] = [
+                {"name": "WRONG subject", "reason": "discovery unavailable"}]
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
+    def test_extra_gap_key_fails_when_allowed(self):
+        def mutate(d, l, r):
+            gap_66(d, l, r)
+            d["evidence"]["skipped"] = [
+                dict(GAP_66_RECORD, extra="smuggled")]
+        result = self.run_case(mutate, cell="select-endpoint-system",
+                               allow_66_discovery_gap=True, want=1)
+        self.assertEqual(result["detail"], "lossy or unknown observation gap class")
+
     def test_extra_cause_fails_when_allowed(self):
         def mutate(d, l, r):
             gap_66(d, l, r)

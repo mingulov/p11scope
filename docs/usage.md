@@ -353,7 +353,9 @@ what the capture waits for while nothing is attached) and real warnings:
 errors, actionable warnings, the owned child's nonzero status
 (`command exited with status N`), and the outcome signals scripts match
 (lane activation, the first pass headline, `capture ended:`, the
-semantic-lane seal, the stop and cleanup-completed summaries). Progress
+semantic-lane seal, the stop and cleanup-completed summaries, and the
+inventory line saying the run deadline passed while a pass was still
+collecting). Progress
 detail — per-second cleanup progress, the detach estimate, per-pass lines
 after the first, per-PID chatter, loader readiness, clean long-run
 reports, the `p11scope: discovery:` completion summary, per-module

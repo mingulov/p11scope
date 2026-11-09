@@ -3953,6 +3953,8 @@ fn terminal_pinned_check_degrades_to_a_gap_in_profile() {
 
 /// v070r2 RED: trace pinned/prearm failures must degrade like the aggregate
 /// reads (gap plus combined error), never discard the sealed EVIDENCE.
+/// Scoped to the terminal drain region: the live tick loop keeps its own
+/// pin sweep, which fails the tick (sealed with a loop gap), not the seal.
 #[test]
 fn terminal_pinned_and_prearm_checks_degrade_to_gaps_in_trace() {
     let source = include_str!("../run.rs");
@@ -3963,21 +3965,22 @@ fn terminal_pinned_and_prearm_checks_degrade_to_gaps_in_trace() {
         .split_once("fn terminal_trace_count_line")
         .unwrap()
         .0;
+    let terminal = trace.split_once("drain_capture_terminal_with(").unwrap().1;
     assert_eq!(
-        trace.matches("degraded_pinned_check").count(),
+        terminal.matches("degraded_pinned_check").count(),
         2,
         "both trace pinned checks must degrade instead of an early `?`"
     );
     assert!(
-        trace.contains("watch_error"),
+        terminal.contains("watch_error"),
         "the trace watch-kernel read must seal from a default with its error kept"
     );
     assert!(
-        !trace.contains(".check_unchanged()"),
+        !terminal.contains(".check_unchanged()"),
         "trace terminal must not revalidate pins directly with an early return"
     );
     assert!(
-        !trace.contains("prearm_terminal_kernel(context.1)?"),
+        !terminal.contains("prearm_terminal_kernel(context.1)?"),
         "the watch-kernel read must not discard the sealed reports with `?`"
     );
 }
@@ -4149,4 +4152,50 @@ fn snapshot_fallback_seals_with_gap_and_partial() {
     .expect("a synthetic default fallback always seals");
     assert_eq!(kernel.ring_loss, 0);
     assert!(kernel_error.is_some());
+}
+
+/// v070r2: a terminal pinned-object revalidation still seals whether the
+/// pins are unchanged or changed: the bool stays discarded (the sticky
+/// `provider_changed` flag carries the evidence), only an I/O failure
+/// becomes a stored error for the caller's gap.
+#[test]
+fn terminal_pinned_check_still_seals_across_unchanged_and_changed_pins() {
+    use crate::discovery::identity::test_fixture::real_scan_pin;
+    let empty = crate::discovery::identity::PinnedObjects::empty();
+    assert!(degraded_pinned_check(&empty).is_none());
+    assert!(!empty.provider_changed());
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("provider.so");
+    std::fs::write(&path, b"original bytes").unwrap();
+    let pins = real_scan_pin(&path, None, 1, &"ab".repeat(32));
+    assert!(degraded_pinned_check(&pins).is_none());
+    assert!(!pins.provider_changed());
+
+    // A changed provider still seals (None): the report keeps the sealed
+    // snapshot with a gap, and the sticky flag names the change.
+    std::fs::write(&path, b"original bytes plus a mutation").unwrap();
+    assert!(degraded_pinned_check(&pins).is_none());
+    assert!(pins.provider_changed());
+}
+
+/// v070r2: terminal errors combine keeping every layer: nothing when all
+/// succeeded, the single failure otherwise, an `also failed` chain when
+/// several failed (with `None` entries skipped).
+#[test]
+fn terminal_errors_combine_keeping_every_layer() {
+    assert!(combine_terminal_errors([None, None]).is_none());
+    let single = combine_terminal_errors([None, Some(anyhow::anyhow!("pinned failed"))])
+        .expect("a single failure is kept");
+    assert_eq!(format!("{single:#}"), "pinned failed");
+    let both = combine_terminal_errors([
+        Some(anyhow::anyhow!("snapshot failed")),
+        None,
+        Some(anyhow::anyhow!("pinned failed")),
+    ])
+    .expect("failures combine");
+    let message = format!("{both:#}");
+    assert!(message.contains("snapshot failed"), "{message}");
+    assert!(message.contains("pinned failed"), "{message}");
+    assert!(message.contains("also failed"), "{message}");
 }

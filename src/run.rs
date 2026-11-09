@@ -6012,6 +6012,22 @@ fn terminal_identity_or_gap(
     }
 }
 
+/// Combines optional terminal errors into one, keeping every layer: `None`
+/// when all succeeded, the single failure otherwise, `also_failed` chains
+/// when several failed.
+fn combine_terminal_errors(
+    errors: impl IntoIterator<Item = Option<anyhow::Error>>,
+) -> Option<anyhow::Error> {
+    let mut combined = None;
+    for error in errors.into_iter().flatten() {
+        combined = Some(match combined {
+            None => error,
+            Some(prior) => also_failed(prior, error, "terminal seal"),
+        });
+    }
+    combined
+}
+
 /// A marker probe is not wired in this slice, so the coordinator is told the
 /// protected marker was never reached. ponytail: fixed `false` until the Gate B
 /// protected-marker probe lands; swap for the real read then.
@@ -9910,7 +9926,7 @@ fn capture_profile(
             .scheduling
             .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
         let identity_check = context.0.pinned().check_unchanged();
-        let identity_error = terminal_identity_or_gap(
+        let pinned_error = terminal_identity_or_gap(
             || context.0.note_terminal_identity_check_failed(),
             identity_check,
         )
@@ -10018,12 +10034,13 @@ fn capture_profile(
             None,
             context.1.unpublished_mechanisms(),
         );
-        // An unsettled child (settlement failed) and a failed terminal
-        // snapshot (sealed from the last good snapshot above) both force
-        // PARTIAL via the `skipped` cause with the existing generic
-        // vocabulary; the specific failure is on stderr and in the returned
-        // error. `run_tree_handed_back` stays present (it was measured
-        // before settlement) even though the child flag is absent.
+        // An unsettled child (settlement failed), a failed terminal
+        // snapshot (sealed from the last good snapshot above), and a failed
+        // pinned-object revalidation each force PARTIAL via the `skipped`
+        // cause with the existing generic vocabulary; the specific failure
+        // is on stderr and in the returned error. `run_tree_handed_back`
+        // stays present (it was measured before settlement) even though the
+        // child flag is absent.
         let settlement_unknown = context
             .2
             .as_deref()
@@ -10153,20 +10170,22 @@ fn capture_profile(
         } else if let Some(error) = frame_error {
             return Err(error);
         }
-        if let Some(error) = snapshot_error {
-            // The report above sealed from the last good snapshot; the run
-            // still exits nonzero with the snapshot failure.
-            return Err(error
-                .context("terminal snapshot failed; report sealed from the last good snapshot"));
+        // The report above sealed (from the last good snapshot when the
+        // terminal read failed); the run still exits nonzero with every
+        // terminal failure kept.
+        let snapshot_error = snapshot_error.map(|error| {
+            error.context("terminal snapshot failed; report sealed from the last good snapshot")
+        });
+        // The identity member already names its step ("revalidating
+        // pinned provider identity") and its gap was filed by the latch.
+        if let Some(error) = combine_terminal_errors([snapshot_error, pinned_error]) {
+            return Err(error);
         }
         // A degraded terminal snapshot publishes first, then fails: the
         // report names the read that never landed, and the run still
         // exits nonzero with the read error.
         if let Some(error) = snapshot.terminal_error() {
             return Err(anyhow::Error::msg(error.to_string()));
-        }
-        if let Some(error) = identity_error {
-            return Err(error);
         }
         Ok(ev)
     }
@@ -11074,7 +11093,7 @@ fn capture_trace(
                     poll_terminal_cancellation();
                     context.5.begin_tick(crate::sink::SINK_TICK_BUDGET);
                     let identity_check = context.0.pinned().check_unchanged();
-                    let mut identity_error = terminal_identity_or_gap(
+                    let pinned_before_error = terminal_identity_or_gap(
                         || context.0.note_terminal_identity_check_failed(),
                         identity_check,
                     )
@@ -11101,18 +11120,35 @@ fn capture_trace(
                         .scheduling
                         .add_phase(SchedulingPhase::Maps, maps_start.elapsed());
                     let identity_recheck = context.0.pinned().check_unchanged();
-                    if identity_error.is_none() {
-                        identity_error = terminal_identity_or_gap(
+                    // Short-circuits after the first failure: the latch
+                    // already filed the gap and failed closed.
+                    let pinned_after_error = if pinned_before_error.is_none() {
+                        terminal_identity_or_gap(
                             || context.0.note_terminal_identity_check_failed(),
                             identity_recheck,
                         )
-                        .err();
-                    }
+                        .err()
+                    } else {
+                        None
+                    };
                     // Terminal observation health is sampled beside the
                     // reports, before the watches close on it. This feeds
                     // watch health only; the publication sample stays after
                     // `settle_terminal_drain` (trace terminal-order contract).
-                    let watch_kernel = prearm_terminal_kernel(context.1)?;
+                    // A failed read seals from a default (unknown health) with
+                    // a gap instead of discarding the sealed reports.
+                    let default_watch = metrics::KernelEvidence::default();
+                    let (watch_kernel, watch_error) = seal_terminal_or_last_good(
+                        Some(&default_watch),
+                        prearm_terminal_kernel(context.1),
+                        |error| {
+                            emit_capture_diagnostic(&format!(
+                                "p11scope: terminal watch-kernel read failed; sealing the trace report with unknown watch health: {}",
+                                crate::render::escape_controls(&format!("{error:#}")),
+                            ));
+                        },
+                    )
+                    .expect("a synthetic default fallback always seals");
                     let (prearm_hold, prearm_owned_run, prearm_release_ns) =
                         owned_prearm_hold(context.2.as_deref());
                     finish_prearm_terminal(
@@ -11237,9 +11273,10 @@ fn capture_trace(
                             None,
                             context.1.unpublished_mechanisms(),
                         );
-                    // An unsettled child and failed terminal reads (sealed
-                    // with unknown counts/evidence above) force PARTIAL via
-                    // the `skipped` cause, like the profile terminal.
+                    // An unsettled child, failed terminal reads (sealed
+                    // with unknown counts/evidence above), and failed
+                    // pinned/watch reads each force PARTIAL via the `skipped`
+                    // cause, like the profile terminal.
                     let settlement_unknown = context
                         .2
                         .as_deref()
@@ -11252,6 +11289,15 @@ fn capture_trace(
                         evidence.run_tree_handed_back = Some(context.0.run_tree_handed_back());
                     }
                     if reports_error.is_some() || kernel_error.is_some() {
+                        evidence.skipped.push(crate::render::SkippedOut {
+                            name: "discovery subject".into(),
+                            reason: "discovery unavailable".into(),
+                        });
+                    }
+                    // A failed identity revalidation is already filed by the
+                    // latch through the engine gap; only the watch read
+                    // files here.
+                    if watch_error.is_some() {
                         evidence.skipped.push(crate::render::SkippedOut {
                             name: "discovery subject".into(),
                             reason: "discovery unavailable".into(),
@@ -11311,6 +11357,9 @@ fn capture_trace(
                     let summaries = timing_summary_lines(&evidence.scheduling);
                     poll_terminal_cancellation();
                     emit_timing_summaries(&evidence.scheduling, &summaries);
+                    // The EVIDENCE above sealed (with unknown counts when the
+                    // aggregate reads failed); the run still exits nonzero
+                    // with every terminal failure kept.
                     let snapshot_error = match (reports_error, kernel_error) {
                         (None, None) => None,
                         (Some(error), None) | (None, Some(error)) => Some(error),
@@ -11318,14 +11367,26 @@ fn capture_trace(
                             Some(also_failed(reports, kernel, "terminal snapshot"))
                         }
                     };
-                    if let Some(error) = snapshot_error {
-                        // The EVIDENCE above sealed with unknown counts; the
-                        // run still exits nonzero with the read failure.
-                        return Err(error.context(
+                    let pinned_error = match (pinned_before_error, pinned_after_error) {
+                        (None, None) => None,
+                        (Some(error), None) | (None, Some(error)) => Some(error),
+                        (Some(before), Some(after)) => {
+                            Some(also_failed(before, after, "terminal pinned check"))
+                        }
+                    };
+                    let snapshot_error = snapshot_error.map(|error| {
+                        error.context(
                             "terminal snapshot failed; trace report sealed with unknown counts",
-                        ));
-                    }
-                    if let Some(error) = identity_error {
+                        )
+                    });
+                    let watch_error = watch_error.map(|error| {
+                        error.context(
+                            "terminal watch-kernel read failed; trace report sealed with unknown watch health",
+                        )
+                    });
+                    if let Some(error) =
+                        combine_terminal_errors([snapshot_error, pinned_error, watch_error])
+                    {
                         return Err(error);
                     }
                     Ok(evidence)

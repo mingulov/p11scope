@@ -619,4 +619,3 @@ fails=$(awk -F'\t' '$5 == "FAIL" { n++ } END { print n + 0 }' "$RESULTS")
 if [ -n "$NO_ORACLE" ]; then fails=0; fi
 echo "cells: $(awk -F'\t' 'NR > 1' "$RESULTS" | wc -l), FAIL: $fails"
 [ "$fails" -eq 0 ]
-

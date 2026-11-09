@@ -14344,7 +14344,9 @@ mod tests {
     }
 
     /// The barrier identity check matches the unchanged path and
-    /// mismatches a replacement, an in-place rewrite and a removal.
+    /// mismatches a replacement or an in-place rewrite. A path the child
+    /// cannot stat reports its real errno (as execve would), never a
+    /// claimed script change.
     #[test]
     fn launch_path_check_detects_replacement_rewrite_and_removal() {
         let dir = tempfile::tempdir().unwrap();
@@ -14354,18 +14356,24 @@ mod tests {
         let opened = FileIdentity::of(&file.metadata().unwrap());
         let current =
             CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
-        assert!(launch_path_matches_opened(&current, opened));
+        assert_eq!(launch_path_check(&current, opened), None);
         // An in-place rewrite with a new size mismatches.
         std::fs::write(&path, "#!/bin/sh\nexit 0\n# padding line\n").unwrap();
-        assert!(!launch_path_matches_opened(&current, opened));
+        assert_eq!(
+            launch_path_check(&current, opened),
+            Some(SCRIPT_IDENTITY_MISMATCH)
+        );
         // A replacement (new inode) mismatches.
         let swap = dir.path().join("swap");
         std::fs::write(&swap, "#!/bin/sh\nexit 0\n").unwrap();
         std::fs::rename(&swap, &path).unwrap();
-        assert!(!launch_path_matches_opened(&current, opened));
-        // A removal mismatches: the path no longer stats.
+        assert_eq!(
+            launch_path_check(&current, opened),
+            Some(SCRIPT_IDENTITY_MISMATCH)
+        );
+        // A removal reports the stat errno, not a script change.
         std::fs::remove_file(&path).unwrap();
-        assert!(!launch_path_matches_opened(&current, opened));
+        assert_eq!(launch_path_check(&current, opened), Some(libc::ENOENT));
     }
 
     #[test]

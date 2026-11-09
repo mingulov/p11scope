@@ -4937,3 +4937,46 @@ fn app_hints_change_labels_only_never_counts_or_identity() {
         "counts, edges, joins and ids are identical ± hints"
     );
 }
+
+/// I1: a long replaced-file path keeps its END (the file name) on the
+/// concise gap line, not its start.
+#[test]
+fn gap_group_line_keeps_path_tail() {
+    let line = gap_group_line(
+        1,
+        "/var/tmp/p11scope-ws-tmp/replaced-holder/prov/libsofthsm2.so (deleted)",
+        "replaced on disk while running; not examined, calls not counted",
+    );
+    assert!(
+        line.starts_with("  1 × …"),
+        "the line keeps the path tail: {line}"
+    );
+    assert!(
+        line.contains("libsofthsm2.so (deleted)"),
+        "the line names the file: {line}"
+    );
+    assert!(
+        !line.contains("/var/tmp"),
+        "the line drops the path head: {line}"
+    );
+    assert!(
+        line.chars().count() <= 100,
+        "over 100 chars: {line}"
+    );
+}
+
+/// I1 twin: a prose subject still keeps its START on the concise gap
+/// line; only paths keep the tail.
+#[test]
+fn gap_group_line_keeps_prose_head() {
+    let line = gap_group_line(
+        1,
+        "native usage feed unavailable",
+        "live capture refused (missing capabilities); run 'p11scope doctor'",
+    );
+    assert_eq!(
+        line,
+        "  1 × native usage feed unavai… — live capture refused (missing capabilities); run \
+         'p11scope doctor'"
+    );
+}

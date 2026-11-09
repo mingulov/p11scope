@@ -68811,6 +68811,35 @@ fn held_back_pid_reuse_does_not_inherit_the_hold() {
     }
 }
 
+/// Above the view cap the process walk still reads every scope member,
+/// so a hold whose pid now belongs to another generation is dropped
+/// there too, not only under the cap.
+#[test]
+fn held_back_pid_reuse_is_detected_above_the_view_cap() {
+    let mut kept = sleeping_child();
+    let mut poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    write_procs(&dir, &[kept_pid, poison_pid]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.held_back_strikes_for_test(poison_pid), Some(1));
+    engine.fail_candidate_with_pid_for_test = None;
+    engine.max_scan_pids = 1; // Two members in scope, one view slot: over the cap.
+    engine.age_held_back_start_for_test(poison_pid);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(
+        engine.held_back_count_for_test(),
+        0,
+        "a reused pid drops its hold above the cap as well: {:?}",
+        engine.plan.skipped
+    );
+    for child in [&mut kept, &mut poison] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
 /// Measurement (reported, not asserted): one full candidate rebuild over
 /// a 256-view system-like scope with real provider mappings, the unit an
 /// isolation trial costs.

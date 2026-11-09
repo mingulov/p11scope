@@ -135,6 +135,13 @@ pub(crate) fn no_table_found_reason(module_path: &str, hinted: bool) -> String {
 }
 pub(crate) const HINT_NOT_MAPPED_REASON: &str = "not mapped in the target";
 pub(crate) const NO_ABSOLUTE_PATHNAME_REASON: &str = "no absolute pathname in /proc/<pid>/maps";
+/// A still-mapped executable object whose file was replaced on disk
+/// while running (the maps line reads ` (deleted)`): code the scan
+/// cannot open or identify may still execute PKCS#11 calls, so the
+/// omission is loss — never "not loss" (owner rule 2026-11-09,
+/// data-always).
+pub(crate) const REPLACED_PROVIDER_REASON: &str =
+    "provider file replaced on disk while running; calls not counted";
 pub(crate) const MAPS_CEILING_REASON: &str =
     "capture /proc maps byte ceiling reached; remaining mappings were not read";
 pub(crate) const MAPS_ENTRY_CEILING_REASON: &str =
@@ -4949,13 +4956,14 @@ fn scan_skip(subject: &str, reason: String) -> Skipped {
 ///
 /// The unusable-path reasons are `p11scope_manifest::maps` vocabulary (see
 /// `mapped_path`); a test below pins them so a drift fails loudly instead
-/// of silently stalling retirement.
+/// of silently stalling retirement. `deleted mapping` is deliberately
+/// absent: a deleted mapping may still carry executable code, so it
+/// truncates (fail closed) like any other unproven omission.
 pub(crate) fn scan_skip_truncates(reason: &str) -> bool {
     !(reason.contains(NO_TABLE_FOUND_MARKER)
         || reason == HINT_NOT_MAPPED_REASON
         || reason == NO_ABSOLUTE_PATHNAME_REASON
         || reason == "ambiguous \\012 pathname"
-        || reason == "deleted mapping"
         || reason == "non-UTF-8 pathname")
 }
 
@@ -6452,13 +6460,21 @@ fn scan_view_examined_mode(
         };
         let Some(usable) = usable else {
             if !narrowed_out {
-                skipped.push(Skipped {
-                    subject,
-                    reason: match named {
-                        Some((MappedPath::Unusable { reason }, _)) => reason,
-                        _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
-                    },
-                });
+                // A deleted mapping with executable code still mapped is
+                // a running copy the scan cannot open or identify — the
+                // file on disk was replaced while running — so the skip
+                // names the replaced file as loss, never "not loss".
+                let reason = match named {
+                    Some((MappedPath::Unusable { reason }, _))
+                        if reason == "deleted mapping"
+                            && group.iter().any(|entry| entry.permissions[2] == b'x') =>
+                    {
+                        REPLACED_PROVIDER_REASON.into()
+                    }
+                    Some((MappedPath::Unusable { reason }, _)) => reason,
+                    _ => NO_ABSOLUTE_PATHNAME_REASON.into(),
+                };
+                skipped.push(Skipped { subject, reason });
             }
             continue;
         };
@@ -10580,7 +10596,14 @@ mod tests {
             ]
         );
         for reason in reasons {
-            assert!(!scan_skip_truncates(&reason), "{reason:?} must stay benign");
+            // Owner rule 2026-11-09 (data-always): a deleted mapping may
+            // still carry executable code, so it truncates; the other two
+            // unusable spellings stay benign.
+            if reason == "deleted mapping" {
+                assert!(scan_skip_truncates(&reason), "{reason:?} must truncate");
+            } else {
+                assert!(!scan_skip_truncates(&reason), "{reason:?} must stay benign");
+            }
         }
     }
 
@@ -13250,6 +13273,11 @@ mod tests {
             "memory scan refused: process generation changed during acquisition: gone",
             "file changed while it was being scanned — retry",
             "partial snapshot of one data mapping: read 3 of 9 bytes: the read failed: gone",
+            // Owner rule 2026-11-09 (data-always): a deleted mapping may
+            // still carry executable code, so it truncates — never
+            // verified absence.
+            "deleted mapping",
+            REPLACED_PROVIDER_REASON,
             // Owner-approved 2026-09-27: F-14's version skip is retired, so
             // its constant is gone; fail-closed coverage stays via the
             // unknown-reason entry below.
@@ -13269,7 +13297,6 @@ mod tests {
             "not mapped in the target",
             "no absolute pathname in /proc/<pid>/maps",
             "ambiguous \\012 pathname",
-            "deleted mapping",
             "non-UTF-8 pathname",
         ];
         for reason in benign {

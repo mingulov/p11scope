@@ -2270,13 +2270,10 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     format!("{head}{kept}…{tail}")
 }
 
-/// Gaps that count toward PARTIAL: every retained row except deleted
-/// mappings, which read as a notes line instead (inspect treats them
-/// the same way).
+/// Gaps that count toward PARTIAL: every retained row, including a
+/// replaced provider file (owner rule 2026-11-09, data-always).
 fn loss_gap_count(gaps: &[GapView]) -> usize {
-    gaps.iter()
-        .filter(|gap| gap.reason != "deleted mapping")
-        .count()
+    gaps.len()
 }
 
 /// Concise gap groups listed before the block folds: per-PID
@@ -2310,8 +2307,8 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 /// groups; beyond that one fold line names the remainder. Plain words
 /// only (reusing `gap_plain_*`); per-gap `gap [` lines stay
 /// verbose-only. Counts distinct loss rows like the coverage line, not
-/// `repeats` (JSON carries `repeats`); deleted mappings read on the
-/// notes line instead. Empty when no loss gaps are retained;
+/// `repeats` (JSON carries `repeats`). Empty when no loss gaps are
+/// retained;
 /// suppressed-but-unretained gaps stay in the coverage line.
 /// Count-explaining subjects read first, in fixed order; then scope
 /// groups (no caller, module or pid) read before per-object groups,
@@ -2320,7 +2317,7 @@ fn count_explaining_rank(subject: &str) -> Option<u8> {
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
-    for gap in gaps.iter().filter(|gap| gap.reason != "deleted mapping") {
+    for gap in gaps.iter() {
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
         let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
@@ -2353,25 +2350,6 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
         lines.push(format!("  and {rest} more groups (--json has every item)"));
     }
     lines
-}
-
-/// Deleted mappings are unloaded libraries, not loss: one plain
-/// notes line disclosing them, beside the gaps block. `None` when no
-/// deleted mapping is retained.
-fn concise_deleted_notes_line(gaps: &[GapView]) -> Option<String> {
-    let deleted = gaps
-        .iter()
-        .filter(|gap| gap.reason == "deleted mapping")
-        .count();
-    if deleted == 0 {
-        return None;
-    }
-    if deleted == 1 {
-        return Some("notes: 1 unloaded library — mapped file was deleted (not loss)".to_string());
-    }
-    Some(format!(
-        "notes: {deleted} unloaded libraries — mapped files were deleted (not loss)"
-    ))
 }
 
 /// Concise pointer for missed short-lived processes: the gap group may
@@ -2568,7 +2546,6 @@ fn gap_plain_reason(reason: &str) -> &str {
         "no BPF image identity; scan-lane incarnations by pidfd/start-time with exe-identity exec detection" => {
             "some processes were identified from /proc only"
         }
-        "deleted mapping" => "mapped file was deleted (not loss)",
         "original_file_unproven: the kernel witness proved another file" => {
             "mapping is another file, not the held file"
         }
@@ -3077,8 +3054,7 @@ fn render_snapshot_inner(
     // One coverage format everywhere (profile, inspect, inventory):
     // `coverage: complete`, or `coverage: partial` with the nonzero
     // segments — loss gaps, refusals, suppressed-but-unretained.
-    // Zero counts stay out; deleted mappings read as notes, never
-    // forcing PARTIAL; the gaps block below names the reasons.
+    // Zero counts stay out; the gaps block below names the reasons.
     let gaps = loss_gap_count(&presentation.gaps);
     if gaps == 0 && budgets.refusals() == 0 && presentation.gaps_suppressed == 0 {
         let _ = writeln!(out, "coverage: complete");
@@ -3467,9 +3443,6 @@ fn render_snapshot_inner(
     if verbosity == crate::cli::TextVerbosity::Concise {
         render_limits_line(&mut out, budgets, &presentation.edges);
         for line in concise_gap_summary_block(&presentation.gaps) {
-            let _ = writeln!(out, "{line}");
-        }
-        if let Some(line) = concise_deleted_notes_line(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }
         if let Some(line) = concise_short_lived_pointer(&presentation.gaps) {

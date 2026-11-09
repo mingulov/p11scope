@@ -403,7 +403,7 @@ fn inventory_contract_modules_callers_edges_gaps() {
     }
 
     // The same-path pair: exactly one module record for ir-prov.so, with
-    // the LIVE (V2) bytes — A's deleted mapping is verified absence,
+    // the LIVE (V2) bytes — A's deleted mapping is uncounted loss,
     // never a second module and never conflated into B's edge.
     let prov = module_for(doc, "ir-prov.so");
     assert_eq!(prov["identity"]["sha256"], sha256_file(&fixtures.v2));

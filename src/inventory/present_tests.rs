@@ -3945,11 +3945,11 @@ fn concise_limits_line_counts_edges_not_links() {
     assert!(!limits.contains("link"), "{limits}");
 }
 
-/// Item 37: deleted mappings read as a notes line, not gaps —
-/// never in the gaps block, never forcing PARTIAL; verbose keeps
-/// each record.
+/// Item 37, re-pinned per owner rule 2026-11-09 (data-always):
+/// replaced providers read as gaps — the gaps block names each
+/// running copy and coverage counts them; verbose keeps each record.
 #[test]
-fn concise_deleted_mappings_read_as_notes_not_gaps() {
+fn concise_replaced_providers_read_as_gaps() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();
@@ -3958,24 +3958,20 @@ fn concise_deleted_mappings_read_as_notes_not_gaps() {
     presentation.budgets.modules_refused = 0;
     presentation.budgets.edges_refused = 0;
     presentation.budgets.endpoints_refused = 0;
-    presentation.gaps.push(GapView {
-        caller: None,
-        module: None,
-        pid: Some(11),
-        subject: "/usr/lib/libpcre2-8.so (deleted)".into(),
-        reason: "deleted mapping".into(),
-        budget: None,
-        repeats: 1,
-    });
-    presentation.gaps.push(GapView {
-        caller: None,
-        module: None,
-        pid: Some(12),
-        subject: "/usr/lib/libfoo.so (deleted)".into(),
-        reason: "deleted mapping".into(),
-        budget: None,
-        repeats: 1,
-    });
+    for (pid, subject) in [
+        (11, "/usr/lib/libsoftokn3.so (deleted)"),
+        (12, "/usr/lib/p11-kit-trust.so (deleted)"),
+    ] {
+        presentation.gaps.push(GapView {
+            caller: None,
+            module: None,
+            pid: Some(pid),
+            subject: subject.into(),
+            reason: "provider file replaced on disk while running; calls not counted".into(),
+            budget: None,
+            repeats: 1,
+        });
+    }
     presentation.gaps.push(GapView {
         caller: None,
         module: None,
@@ -3987,34 +3983,41 @@ fn concise_deleted_mappings_read_as_notes_not_gaps() {
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "coverage: partial — 1 gap"),
-        "deleted mappings count as notes, not gaps: {out}"
+        out.lines().any(|line| line == "coverage: partial — 3 gaps"),
+        "replaced providers count as gaps: {out}"
     );
     let lines: Vec<&str> = out.lines().collect();
     let start = lines
         .iter()
-        .position(|line| *line == "gaps: 1")
+        .position(|line| *line == "gaps: 3")
         .expect("gaps header");
-    assert_eq!(
-        &lines[start..start + 2],
-        &["gaps: 1", "  1 × fixture scope — fixture reason",],
-        "the gaps block holds the fixture gap only: {out}"
-    );
+    let block = &lines[start + 1..start + 4];
     assert!(
-        out.lines().any(
-            |line| line == "notes: 2 unloaded libraries — mapped files were deleted (not loss)"
-        ),
-        "the notes line discloses the deleted mappings: {out}"
+        block.contains(&"  1 × fixture scope — fixture reason"),
+        "the gaps block holds the fixture gap: {out}"
     );
-    assert!(!out.contains("libpcre2"), "no per-path groups: {out}");
+    for fragment in ["libsoftokn3", "p11-kit-trust"] {
+        assert!(
+            block.iter().any(|line| line.contains(fragment)
+                && line.ends_with(
+                    " — provider file replaced on disk while running; calls not counted"
+                )),
+            "the gaps block names the {fragment} running copy with its loss: {out}"
+        );
+    }
+    assert!(
+        !out.lines().any(|line| line.starts_with("notes:")),
+        "no not-loss note for replaced providers: {out}"
+    );
     let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
-    assert!(verbose.contains("libpcre2-8.so (deleted)"), "{verbose}");
+    assert!(verbose.contains("libsoftokn3.so (deleted)"), "{verbose}");
 }
 
-/// Item 37: deleted mappings alone keep coverage complete — the
-/// notes line discloses them and no gaps block prints.
+/// Item 37, re-pinned per owner rule 2026-11-09 (data-always): a
+/// replaced provider alone forces PARTIAL — the gaps block names the
+/// running copy and no notes line prints.
 #[test]
-fn deleted_only_gaps_keep_coverage_complete_with_notes() {
+fn replaced_only_gaps_force_partial_with_gaps_block() {
     let harness = varied_harness();
     let mut presentation = Presentation::capture(harness.coordinator(), "workload", 1, 2, 1);
     presentation.gaps.clear();
@@ -4027,25 +4030,26 @@ fn deleted_only_gaps_keep_coverage_complete_with_notes() {
         caller: None,
         module: None,
         pid: Some(11),
-        subject: "/usr/lib/libpcre2-8.so (deleted)".into(),
-        reason: "deleted mapping".into(),
+        subject: "/usr/lib/libsoftokn3.so (deleted)".into(),
+        reason: "provider file replaced on disk while running; calls not counted".into(),
         budget: None,
         repeats: 1,
     });
     let out = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
     assert!(
-        out.lines().any(|line| line == "coverage: complete"),
-        "deleted mappings alone keep coverage complete: {out}"
+        out.lines().any(|line| line == "coverage: partial — 1 gap"),
+        "a replaced provider alone forces PARTIAL: {out}"
     );
     assert!(
-        !out.lines().any(|line| line.starts_with("gaps:")),
-        "no gaps block for notes alone: {out}"
+        out.lines().any(|line| line == "gaps: 1"),
+        "the gaps block names the running copy: {out}"
     );
     assert!(
-        out.lines()
-            .any(|line| line == "notes: 1 unloaded library — mapped file was deleted (not loss)"),
-        "the notes line discloses the deleted mapping: {out}"
+        !out.lines().any(|line| line.starts_with("notes:")),
+        "no not-loss note for a replaced provider: {out}"
     );
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains("libsoftokn3.so (deleted)"), "{verbose}");
 }
 
 /// Audit P0-1: a replaced-provider gap forces PARTIAL coverage — the

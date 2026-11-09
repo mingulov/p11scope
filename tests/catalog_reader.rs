@@ -982,7 +982,8 @@ fn catalog_reader_finds_every_fixture_object() {
     }
 
     // A: same-path dance, V1 bytes. The kernel marks the replaced
-    // mapping deleted, so A is a verified-absence note, never a module.
+    // mapping deleted: A's running copy is uncounted loss (a skipped
+    // gap), never a module and never conflated into B's edge.
     for object in doc["objects"].as_array().unwrap() {
         for observation in object["observations"].as_array().unwrap() {
             assert_ne!(
@@ -992,17 +993,20 @@ fn catalog_reader_finds_every_fixture_object() {
             );
         }
     }
-    let a_note = doc["notes"]
+    let a_gap = doc["skipped"]
         .as_array()
         .unwrap()
         .iter()
-        .find(|note| note["pid"] == pid_of(&run.pids, "A"))
-        .expect("A must leave a deleted-mapping note");
+        .find(|gap| gap["pid"] == pid_of(&run.pids, "A"))
+        .expect("A must leave a replaced-file gap");
     assert!(
-        a_note["subject"].as_str().unwrap().contains("(deleted)"),
-        "A note must name the deleted path: {a_note}"
+        a_gap["subject"].as_str().unwrap().contains("(deleted)"),
+        "A gap must name the deleted path: {a_gap}"
     );
-    assert_eq!(a_note["reason"], "deleted mapping");
+    assert_eq!(
+        a_gap["reason"],
+        "provider file replaced on disk while running; calls not counted"
+    );
 
     // N: eight interface-linked tables (publication evidence), with 544
     // distinct physical endpoints. Default refuses the whole object;

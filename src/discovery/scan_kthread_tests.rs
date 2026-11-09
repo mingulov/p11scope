@@ -306,16 +306,18 @@ fn deleted_exec_mapping_is_a_named_replaced_file_loss() {
         exe: Err(io::ErrorKind::NotFound),
     };
     let mut budget = CaptureWorkBudget::default();
-    let (outcome, _, _) = run_examined(&mut fixture, &mut budget, &[])
-        .expect("the scan must complete, not error");
+    let (outcome, _, _) =
+        run_examined(&mut fixture, &mut budget, &[]).expect("the scan must complete, not error");
     let reasons: Vec<&str> = outcome
         .skipped()
         .iter()
         .map(|skip| skip.reason.as_str())
         .collect();
     assert!(
-        reasons.iter().any(|reason| *reason
-            == "provider file replaced on disk while running; calls not counted"),
+        reasons
+            .iter()
+            .any(|reason| *reason
+                == "provider file replaced on disk while running; calls not counted"),
         "a deleted exec mapping names the replaced-file loss, got {reasons:?}"
     );
     assert!(

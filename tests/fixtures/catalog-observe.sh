@@ -74,7 +74,7 @@ wait_ready A
 # Atomic replace: the path now resolves to V2 bytes. A's mapping still
 # names this path with V1's (dev, ino), but the kernel marks a mapping
 # whose dentry was unlinked as deleted, so the scan records A as a
-# "deleted mapping" note (verified absence, not a module) while B pins V2
+# replaced-file loss gap (uncounted, not a module) while B pins V2
 # — two views, one path, two file identities, distinguished, never
 # conflated. A same-path pair of two PINNED objects is unconstructable in
 # one mount namespace (same path string implies the same dentry implies

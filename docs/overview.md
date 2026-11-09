@@ -93,7 +93,7 @@ libp11-kit.so.0.4.8: mapped by 2 applications (cups-proxyd, cupsd); activity unk
 opensc-pkcs11.so: mapped by 1 application (gsd-smartcard); activity unknown
 p11-kit-trust.so: mapped by 1 application (gsd-smartcard); activity unknown
 limits: 179 callers, 5 provider files, 29 edges (0 refused); 19607 functions watched of 32768 (0 refused). Full budget detail: -v or --json.
-gaps: 26 × maps attribution — maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 × /home/user/.local/bin/muse-bin-1.4.14-R7309.1 — object is 414927192 bytes; limit is 268435456; 11 × maps attribution — maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 × unloaded libraries — mapped files were deleted (not loss); and 35 more (--json has every item)
+gaps: 26 × maps attribution — maps 1 shared object no deep scan examined this pass; it may be an undiscovered provider; 11 × /home/user/.local/bin/muse-bin-1.4.14-R7309.1 — object is 414927192 bytes; limit is 268435456; 11 × maps attribution — maps 3 shared objects no deep scan examined this pass; each may be an undiscovered provider; 213 × /usr/lib/… (deleted) — provider file replaced on disk while running; calls not counted; and 35 more (--json has every item)
 run with -v for details
 ```
 

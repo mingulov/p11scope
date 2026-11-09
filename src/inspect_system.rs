@@ -10239,13 +10239,20 @@ pub(crate) mod demotion_retirement_producer_tests {
                 )
             };
             assert_ne!(mapping, libc::MAP_FAILED);
-            let expected = if name == std::ffi::OsStr::new("deleted.so") {
+            // Owner rule 2026-11-09 (data-always): the unlinked
+            // executable mapping is replaced-file loss (it may still
+            // execute provider calls); the other two unusable spellings
+            // stay benign.
+            let (expected, truncates) = if name == std::ffi::OsStr::new("deleted.so") {
                 std::fs::remove_file(&path).unwrap();
-                "deleted mapping"
+                (
+                    "provider file replaced on disk while running; calls not counted",
+                    true,
+                )
             } else if name.as_encoded_bytes().contains(&b'\n') {
-                "ambiguous \\012 pathname"
+                ("ambiguous \\012 pathname", false)
             } else {
-                "non-UTF-8 pathname"
+                ("non-UTF-8 pathname", false)
             };
             let mut budget = CaptureWorkBudget::default();
             let mut noise = DiscoveryNoiseAggregator::default();
@@ -10263,9 +10270,10 @@ pub(crate) mod demotion_retirement_producer_tests {
                 member.gaps.iter().any(|gap| gap.reason == expected),
                 "actual omission must be observed: {expected}"
             );
-            assert!(
-                !crate::discovery::scan::scan_skip_truncates(expected),
-                "public completeness remains unchanged"
+            assert_eq!(
+                crate::discovery::scan::scan_skip_truncates(expected),
+                truncates,
+                "only the replaced-file loss truncates: {expected}"
             );
             assert!(
                 member.complete_scan.is_none(),

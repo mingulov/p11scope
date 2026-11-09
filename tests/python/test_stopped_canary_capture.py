@@ -2159,6 +2159,29 @@ class StoppedCanaryCaptureTests(unittest.TestCase):
         with self.assertRaisesRegex(capture.CaptureError, 'unknown workload origin'):
             capture.validate_inventory(owned_inventory('aggregate-only'), 'default', 'aggregate-only', 'cgroup')
 
+    def test_owned_discovery_pid_size_names_run_tree_degradation(self):
+        """A 64 KiB DISCOVERY report on an owned lane names the suspect.
+
+        `run` degrades an owned lane to Scope::Pid when the run cgroup is
+        not a usable scope (RUN_TREE_DEGRADED: only the started command is
+        observed); the loader then reports the 64 KiB Pid size instead of
+        the 2 MiB shared-scope size. The refusal must name that suspected
+        degradation so triage points at the cgroup, not the checker. Any
+        other size keeps the plain message; nothing is accepted.
+        """
+        with self.assertRaisesRegex(
+                capture.CaptureError,
+                r"map definition mismatch name=DISCOVERY; suspected run-tree degradation"):
+            capture.validate_inventory(self.live_inventory(), 'default', 'allowlisted', 'owned')
+        for size in (1, 65_537, 4_194_304):
+            with self.subTest(size=size):
+                maps = self.live_inventory()
+                next(item for item in maps if item['name'] == 'DISCOVERY')['max_entries'] = size
+                with self.assertRaises(capture.CaptureError) as refused:
+                    capture.validate_inventory(maps, 'default', 'allowlisted', 'owned')
+                self.assertIn('map definition mismatch name=DISCOVERY', str(refused.exception))
+                self.assertNotIn('degradation', str(refused.exception))
+
     def test_inventory_requires_the_exact_cgroup_filter_definition(self):
         """The checked-in ELF map list is the authority for CGROUP_FILTER too.
 

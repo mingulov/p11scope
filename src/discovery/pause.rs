@@ -187,6 +187,25 @@ pub(crate) enum PauseStatus {
     Partial,
 }
 
+/// Why a failed pause cycle did not hold, recorded by
+/// `note_failed_cycle` for the sealed report. Mirrors the `always`
+/// failure texts: a signalled run was interrupted, only an unsignalled
+/// one refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PauseRefusal {
+    Interrupted,
+    Refused,
+}
+
+impl PauseRefusal {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Interrupted => "interrupted",
+            Self::Refused => "refused",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct PauseCounters {
     pub(crate) attempts: u64,
@@ -455,6 +474,10 @@ pub(crate) struct PauseCoordinator {
     /// as the thread the preflight saw.
     expected_starts: BTreeMap<u32, u64>,
     counters: PauseCounters,
+    /// Why the pause did not hold, once a failed cycle records one.
+    /// `None` unless a lifecycle failure ended the run; rendered as
+    /// `evidence.pause_refused`.
+    refused: Option<PauseRefusal>,
     epoch: PauseEpoch,
     armed: bool,
     /// Monotonic clock read immediately *before* the exchange that installed
@@ -649,6 +672,7 @@ impl PauseCoordinator {
             expected_tasks,
             expected_starts: BTreeMap::new(),
             counters: PauseCounters::default(),
+            refused: None,
             epoch: PauseEpoch::default(),
             armed: false,
             armed_at_ns: None,
@@ -2284,6 +2308,12 @@ impl PauseCoordinator {
         self.counters
     }
 
+    /// Why the pause did not hold, when a failed cycle recorded one.
+    /// `None` unless a lifecycle failure ended the run.
+    pub(crate) fn refusal(&self) -> Option<PauseRefusal> {
+        self.refused
+    }
+
     /// Engine-incomplete cap retirements this run. Each is one counted
     /// partial (already in `counters`); the count is a subset
     /// annotation, not a lattice member. Rendered in JSON as
@@ -2307,11 +2337,22 @@ impl PauseCoordinator {
     /// A lifecycle failure that ends the run (`--pause always` refusal, or
     /// any fatal cycle not handed back) closes its open attempt as one
     /// partial, so the sealed report never reads a refused cycle as a
-    /// confirmed `sigstop` and the counters still add up.
-    pub(crate) fn note_failed_cycle(&mut self) {
+    /// confirmed `sigstop` and the counters still add up. It also records
+    /// why the pause did not hold — a stop was pending (`cancelled`) or
+    /// the protection could not be completed — even when no attempt is
+    /// open, so a failure after an earlier confirm still names itself.
+    /// The first record wins; repeats never rewrite it.
+    pub(crate) fn note_failed_cycle(&mut self, cancelled: bool) {
         if self.attempt_open {
             self.attempt_open = false;
             self.counters.partial = self.counters.partial.saturating_add(1);
+        }
+        if self.refused.is_none() {
+            self.refused = Some(if cancelled {
+                PauseRefusal::Interrupted
+            } else {
+                PauseRefusal::Refused
+            });
         }
         debug_assert!(self.counters.valid());
     }
@@ -10766,8 +10807,8 @@ mod tests {
                 PauseStatus::Sigstop,
                 "open attempt alone"
             );
-            coordinator.note_failed_cycle();
-            coordinator.note_failed_cycle();
+            coordinator.note_failed_cycle(false);
+            coordinator.note_failed_cycle(false);
             let counters = coordinator.counters();
             assert_eq!(
                 (counters.attempts, counters.confirmed, counters.partial),
@@ -10776,6 +10817,58 @@ mod tests {
             assert!(counters.valid());
             assert_eq!(coordinator.status(), PauseStatus::Partial, "{policy:?}");
         }
+    }
+
+    /// A failed cycle records why the pause did not hold: a stop was
+    /// pending (`interrupted`) or the protection could not be completed
+    /// (`refused`). The first record wins; a repeat call never rewrites
+    /// it, mirroring the idempotent close.
+    #[test]
+    fn failed_cycle_records_whether_a_stop_was_pending() {
+        for policy in [PausePolicy::Always, PausePolicy::Auto] {
+            for (first, second, wanted) in [
+                (true, false, PauseRefusal::Interrupted),
+                (false, true, PauseRefusal::Refused),
+            ] {
+                let mut coordinator = PauseCoordinator::for_test(policy, 41, 9, stopped());
+                assert_eq!(coordinator.refusal(), None, "{policy:?}");
+                coordinator.begin_attempt();
+                coordinator.note_failed_cycle(first);
+                coordinator.note_failed_cycle(second);
+                assert_eq!(coordinator.refusal(), Some(wanted), "{policy:?}");
+                assert!(coordinator.counters().valid(), "{policy:?}");
+            }
+        }
+        assert_eq!(PauseRefusal::Interrupted.name(), "interrupted");
+        assert_eq!(PauseRefusal::Refused.name(), "refused");
+    }
+
+    /// A lifecycle failure that lands with no attempt open (after an
+    /// earlier cycle confirmed) leaves the counters on the confirmed
+    /// shape but still records the refusal, so the sealed report never
+    /// hides a failed required pause behind `sigstop` counters alone.
+    #[test]
+    fn failed_cycle_without_an_open_attempt_still_records_the_refusal() {
+        let mut coordinator = PauseCoordinator::for_test(PausePolicy::Always, 41, 9, stopped());
+        coordinator.counters = PauseCounters {
+            attempts: 1,
+            confirmed: 1,
+            partial: 0,
+            unavailable: 0,
+        };
+        coordinator.note_failed_cycle(false);
+        assert_eq!(
+            coordinator.counters(),
+            PauseCounters {
+                attempts: 1,
+                confirmed: 1,
+                partial: 0,
+                unavailable: 0,
+            },
+            "no open attempt means no count moves"
+        );
+        assert_eq!(coordinator.status(), PauseStatus::Sigstop);
+        assert_eq!(coordinator.refusal(), Some(PauseRefusal::Refused));
     }
 
     /// Arms the SIGINT-while-held hook for one run; disarms on drop so a
@@ -10845,6 +10938,10 @@ mod tests {
         assert_eq!(outcome.evidence.pause_attempts, 1);
         assert_eq!(outcome.evidence.pause_partial, 1);
         assert_eq!(outcome.evidence.pause_confirmed, 0);
+        assert_eq!(
+            outcome.evidence.pause_refused, None,
+            "a handed-back auto cycle is a signal end, not a refusal"
+        );
         assert_eq!(
             outcome.evidence.pause_confirmed + outcome.evidence.pause_partial,
             outcome.evidence.pause_attempts,
@@ -10919,6 +11016,10 @@ mod tests {
         assert_eq!(
             evidence["pause_unavailable"], 0,
             "a refused cycle counts partial, never unavailable"
+        );
+        assert_eq!(
+            evidence["pause_refused"], "interrupted",
+            "a stop during the hold refuses as interrupted"
         );
         assert_eq!(
             evidence["pause_confirmed"]

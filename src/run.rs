@@ -17,7 +17,7 @@ use crate::discovery::caller_registry::OsProcessSource;
 use crate::discovery::engine::inventory_coordinator::InventoryCoordinator;
 use crate::discovery::engine::{Engine, EngineSession};
 use crate::discovery::pause::{
-    ArmResult, PauseCoordinator, PauseError, PauseIo, PauseStatus, SessionPauseIo,
+    ArmResult, PauseCoordinator, PauseError, PauseIo, PauseRefusal, PauseStatus, SessionPauseIo,
 };
 use crate::output::AtomicFile;
 use crate::process::{PidPin, ProcessView, ProcessViewId};
@@ -7618,7 +7618,9 @@ fn drain_discovery_tick(
             }
             let always = error.required() && !error.lifecycle();
             if error.lifecycle() {
-                owned.coordinator.note_failed_cycle();
+                owned
+                    .coordinator
+                    .note_failed_cycle(interrupted.interrupted());
             }
             retire_pause_policy(error)?;
             if always {
@@ -7659,12 +7661,13 @@ fn pending_stop_pass(
     let paused = match service_pause(coordinator, io) {
         Ok(serviced) => serviced,
         Err(error) => {
-            if hand_back_cancelled_cycle(coordinator, &error, io.cancelled().unwrap_or(false)) {
+            let cancelled = io.cancelled().unwrap_or(false);
+            if hand_back_cancelled_cycle(coordinator, &error, cancelled) {
                 return Ok((io.plan_changed(), false));
             }
             let always = error.required() && !error.lifecycle();
             if error.lifecycle() {
-                coordinator.note_failed_cycle();
+                coordinator.note_failed_cycle(cancelled);
             }
             retire_pause_policy(error)?;
             if always {
@@ -7713,12 +7716,13 @@ fn hand_back_cancelled_cycle(
 /// `always`: collected unpaused and counted unavailable).
 fn post_release_pass(coordinator: &mut PauseCoordinator, io: &mut impl PauseIo) -> Result<()> {
     if let Err(error) = coordinator.revalidate_after_release(io) {
-        if hand_back_cancelled_cycle(coordinator, &error, io.cancelled().unwrap_or(false)) {
+        let cancelled = io.cancelled().unwrap_or(false);
+        if hand_back_cancelled_cycle(coordinator, &error, cancelled) {
             return Ok(());
         }
         let always = error.required() && !error.lifecycle();
         if error.lifecycle() {
-            coordinator.note_failed_cycle();
+            coordinator.note_failed_cycle(cancelled);
         }
         retire_pause_policy(error)?;
         if always {
@@ -9060,6 +9064,9 @@ fn capture_profile(
                 owned
                     .as_deref()
                     .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
+                owned
+                    .as_deref()
+                    .and_then(|owned| owned.coordinator.refusal()),
                 owned.as_deref().map(|owned| owned.still_running),
                 capture_tracking_degraded,
                 scheduling.snapshot(crate::events::TERMINAL_DRAIN_BOUND as u64),
@@ -9837,6 +9844,10 @@ fn capture_profile(
                 .2
                 .as_deref()
                 .map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
+            context
+                .2
+                .as_deref()
+                .and_then(|owned| owned.coordinator.refusal()),
             context.2.as_deref().and_then(|owned| {
                 if owned.settlement_unknown {
                     None
@@ -11018,6 +11029,7 @@ fn capture_trace(
                             true,
                             context.2.as_deref().map_or_else(Default::default, |owned| owned.coordinator.counters()),
                             context.2.as_deref().map_or(0, |owned| owned.coordinator.engine_incomplete_retirements()),
+                            context.2.as_deref().and_then(|owned| owned.coordinator.refusal()),
                             context.2.as_deref().and_then(|owned| {
                                 if owned.settlement_unknown {
                                     None
@@ -12607,6 +12619,7 @@ pub(crate) fn evidence_for(
     include_selection: bool,
     pause: crate::discovery::pause::PauseCounters,
     pause_engine_incomplete_retirements: u64,
+    pause_refusal: Option<PauseRefusal>,
     child_still_running: Option<bool>,
     capture_tracking_degraded: bool,
     scheduling: render::SchedulingEvidence,
@@ -12724,6 +12737,7 @@ pub(crate) fn evidence_for(
         pause_partial: pause.partial,
         pause_unavailable: pause.unavailable,
         pause_engine_incomplete_retirements,
+        pause_refused: pause_refusal.map(PauseRefusal::name),
         child_still_running,
         // Run-only like the child flag beside it: `Some` exactly when an
         // owned context exists, carrying the measured survivor count.
@@ -12815,6 +12829,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         true,
         Default::default(),
         0,
+        None,
         None,
         false,
         render::SchedulingEvidence::default(),
@@ -13873,6 +13888,7 @@ mod tests {
             true,
             Default::default(),
             0,
+            None,
             None,
             false,
             scheduling,
@@ -20144,6 +20160,11 @@ int main(int argc, char **argv) {
             },
             "the cancelled attempt counts one partial"
         );
+        assert_eq!(
+            coordinator.refusal(),
+            None,
+            "a handed-back auto cycle is a signal end, not a refusal"
+        );
         assert!(
             !original_child_is_stopped(child.pin().pidfd().unwrap()),
             "the cancelled cycle resumes the held child"
@@ -20185,7 +20206,7 @@ int main(int argc, char **argv) {
     /// stranded stopped.
     #[test]
     fn a_stop_during_a_held_always_cycle_still_refuses_with_the_cancellation() {
-        use crate::discovery::pause::PauseCounters;
+        use crate::discovery::pause::{PauseCounters, PauseRefusal};
         let fixture_dir = tempfile::tempdir().unwrap();
         let sleeper = build_sleeper(fixture_dir.path());
         let mut child = spawn(sleeper.to_str().unwrap(), &[]);
@@ -20217,6 +20238,11 @@ int main(int argc, char **argv) {
                 unavailable: 0,
             },
             "the refused attempt counts one partial"
+        );
+        assert_eq!(
+            coordinator.refusal(),
+            Some(PauseRefusal::Interrupted),
+            "a stop during the hold refuses as interrupted"
         );
         assert!(
             !original_child_is_stopped(child.pin().pidfd().unwrap()),
@@ -25698,6 +25724,7 @@ int main(int argc, char **argv) {
             Default::default(),
             0,
             None,
+            None,
             false,
             scheduling,
             None,
@@ -27973,6 +28000,7 @@ int main(int argc, char **argv) {
                 Default::default(),
                 0,
                 None,
+                None,
                 false,
                 render::SchedulingEvidence::default(),
                 None,
@@ -28080,6 +28108,7 @@ int main(int argc, char **argv) {
                     true,
                     pause,
                     retirements,
+                    None,
                     child_still_running,
                     false,
                     render::SchedulingEvidence::default(),
@@ -28159,6 +28188,7 @@ int main(int argc, char **argv) {
                 PauseCounters::default(),
                 0,
                 None,
+                None,
                 false,
                 render::SchedulingEvidence::default(),
                 None,
@@ -28201,6 +28231,7 @@ int main(int argc, char **argv) {
             true,
             Default::default(),
             0,
+            None,
             None,
             false,
             render::SchedulingEvidence::default(),
@@ -28259,6 +28290,7 @@ int main(int argc, char **argv) {
             true,
             Default::default(),
             0,
+            None,
             None,
             true,
             render::SchedulingEvidence::default(),

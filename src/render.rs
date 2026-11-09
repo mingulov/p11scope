@@ -1220,6 +1220,11 @@ pub struct Evidence {
     /// counted `pause_partial`; this count is a subset annotation, not
     /// a lattice member.
     pub pause_engine_incomplete_retirements: u64,
+    /// Why the pause did not hold, when a lifecycle failure ended the
+    /// run. Absent, never null, otherwise. Annotation beside the pause
+    /// lattice, never a member of it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pause_refused: Option<&'static str>,
     /// Present only for `run`: true only when capture ended while the owned
     /// child was still alive. Absent from every `--pid`/`--cgroup` document.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3235,6 +3240,17 @@ pub fn live_scoped(
     )
 }
 
+/// One plain line naming a refused pause and why. `None` unless a
+/// lifecycle failure ended the run; an unrecognized reason still
+/// surfaces verbatim rather than vanishing.
+fn pause_refusal_line(ev: &Evidence) -> Option<String> {
+    ev.pause_refused.map(|reason| match reason {
+        "interrupted" => "pause refused: interrupted by operator stop".to_string(),
+        "refused" => "pause refused: protection could not be completed".to_string(),
+        other => format!("pause refused: {other}"),
+    })
+}
+
 /// [`live_scoped`] at an explicit verbosity: the tests' race-free
 /// handle. Concise keeps the header, totals, plain coverage reasons
 /// and the function/mechanism tables plus the `-v` hint; verbose is
@@ -3273,6 +3289,10 @@ pub fn live_scoped_with_verbosity(
         escape_controls(module),
     ));
     s.push_str(&scope_summary_with_verbosity(scope, reports, ev, verbosity));
+    if let Some(refusal) = pause_refusal_line(ev) {
+        s.push_str(&refusal);
+        s.push('\n');
+    }
     if verbosity == crate::cli::TextVerbosity::Quiet {
         return s;
     }
@@ -5376,6 +5396,7 @@ pub(crate) mod tests {
             pause_partial: 0,
             pause_unavailable: 0,
             pause_engine_incomplete_retirements: 0,
+            pause_refused: None,
             child_still_running: None,
             run_tree_handed_back: None,
             discovery_ring_loss: 0,
@@ -8706,6 +8727,67 @@ pub(crate) mod tests {
             1,
             "{out}"
         );
+    }
+
+    /// CLI text: a refused pause prints one plain line saying why, at
+    /// every verbosity, and nothing when the pause was not refused.
+    #[test]
+    fn refused_pause_prints_one_plain_line() {
+        use crate::cli::TextVerbosity;
+        for (refused, line) in [
+            ("interrupted", "pause refused: interrupted by operator stop"),
+            (
+                "refused",
+                "pause refused: protection could not be completed",
+            ),
+        ] {
+            let mut ev = evidence();
+            ev.pause = "partial";
+            ev.pause_attempts = 1;
+            ev.pause_partial = 1;
+            ev.pause_refused = Some(refused);
+            ev.verdict();
+            for verbosity in [
+                TextVerbosity::Concise,
+                TextVerbosity::Verbose,
+                TextVerbosity::Quiet,
+            ] {
+                let out = live_scoped_with_verbosity(
+                    &[],
+                    &ev,
+                    Duration::ZERO,
+                    "/opt/p11.so",
+                    "profile",
+                    CapturePolicy::Allowlisted,
+                    "pid",
+                    &BTreeMap::new(),
+                    verbosity,
+                );
+                assert!(out.contains(line), "{out}");
+                assert_eq!(
+                    out.matches("pause refused:").count(),
+                    1,
+                    "exactly one refusal line: {out}"
+                );
+            }
+        }
+        let mut ev = evidence();
+        ev.pause = "partial";
+        ev.pause_attempts = 1;
+        ev.pause_partial = 1;
+        ev.verdict();
+        let out = live_scoped_with_verbosity(
+            &[],
+            &ev,
+            Duration::ZERO,
+            "/opt/p11.so",
+            "profile",
+            CapturePolicy::Allowlisted,
+            "pid",
+            &BTreeMap::new(),
+            TextVerbosity::Concise,
+        );
+        assert!(!out.contains("pause refused:"), "{out}");
     }
 
     /// CLI text: the function table names each row's provider file, so
@@ -14125,6 +14207,49 @@ pub(crate) mod tests {
         let owned = json(&reports_fixture(), &ev, &capture_fixture());
         assert_eq!(owned["evidence"]["child_still_running"], true);
         assert_eq!(owned["evidence"]["run_tree_handed_back"], 2);
+    }
+
+    #[test]
+    fn refused_pause_annotation_rides_all_three_document_lanes() {
+        let mut ev = evidence();
+        ev.pause = "partial";
+        ev.pause_attempts = 1;
+        ev.pause_partial = 1;
+        ev.pause_refused = Some("interrupted");
+        ev.verdict();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&ev),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let metrics = json(&reports_fixture(), &ev, &capture_fixture());
+        for document in [
+            &profile["evidence"],
+            &metrics["evidence"],
+            &trace_evidence_object(&ev),
+        ] {
+            assert_eq!(document["pause_refused"], "interrupted");
+        }
+        let mut clean = evidence();
+        clean.verdict();
+        let profile = profile_json(
+            &reports_fixture(),
+            VersionedEvidence::wrap(&clean),
+            &state_fixture(),
+            &capture_fixture(),
+        );
+        let metrics = json(&reports_fixture(), &clean, &capture_fixture());
+        for document in [
+            &profile["evidence"],
+            &metrics["evidence"],
+            &trace_evidence_object(&clean),
+        ] {
+            assert!(
+                document.get("pause_refused").is_none(),
+                "absent, never null"
+            );
+        }
     }
 
     #[test]

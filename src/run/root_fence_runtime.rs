@@ -229,6 +229,7 @@ fn document(
         Default::default(),
         0,
         None,
+        None,
         initial_tracking_evidence(
             scope,
             session.process_creation_tracking_unavailable().is_some(),

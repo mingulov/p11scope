@@ -57,14 +57,16 @@ kernel.perf_event_paranoid ........ ok    4 — does not gate static uprobe-mult
 
 Why: at paranoid 3 and above every `perf_event_open` needs
 `CAP_SYS_ADMIN`; `CAP_PERFMON` does not lift it. That gates only an
-explicit `--attach-backend singles` fallback now: the static probes,
-the self-probe and the live-discovery probes all attach through
-uprobe-multi links, which paranoid does not gate (the v0.6.0 row above
-still names the self-probe and live-discovery probes; they moved to
-uprobe-multi links since). Fix: capture as root (`sudo p11scope
-...`), or grant the five-capability minimal set (`CAP_BPF`,
-`CAP_CHECKPOINT_RESTORE`, `CAP_DAC_READ_SEARCH`, `CAP_PERFMON`,
-`CAP_SYS_PTRACE` — no `CAP_SYS_ADMIN`) and re-check with `doctor` —
+explicit `--attach-backend singles` fallback now (and, on kernels
+without a proven uprobe-multi pid filter, the dynamic loader/export
+probes): the static probes, the self-probe and the live-discovery
+probes all attach through uprobe-multi links, which paranoid does not
+gate (the v0.6.0 row above still names the self-probe and
+live-discovery probes; they moved to uprobe-multi links since). Fix:
+capture as root (`sudo p11scope ...`), or grant the five-capability
+minimal set (`CAP_BPF`, `CAP_CHECKPOINT_RESTORE`,
+`CAP_DAC_READ_SEARCH`, `CAP_PERFMON`, `CAP_SYS_PTRACE` — no
+`CAP_SYS_ADMIN`) and re-check with `doctor` —
 see [Run without sudo](usage.md#run-without-sudo). The measured
 capability matrices are in
 [privileges, per environment](usage.md#privileges-per-environment).

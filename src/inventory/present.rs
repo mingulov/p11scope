@@ -2270,6 +2270,52 @@ fn gap_group_line(count: usize, subject: &str, reason: &str) -> String {
     format!("{head}{kept}…{tail}")
 }
 
+/// The neutral successor spelling of
+/// [`crate::discovery::scan::REPLACED_PROVIDER_REASON`] (the wording
+/// lane owns the constant): `present` matches it verbatim so the text
+/// disclosure below works on either side of the constant change.
+const REPLACED_FILE_REASON_NEXT: &str =
+    "replaced on disk while running; not examined, calls not counted";
+
+/// True for a gap naming a running copy whose file was replaced on
+/// disk while it runs: the current replaced-provider reason or its
+/// neutral successor. Both spellings disclose the same loss.
+fn is_replaced_file_gap(reason: &str) -> bool {
+    reason == crate::discovery::scan::REPLACED_PROVIDER_REASON
+        || reason == REPLACED_FILE_REASON_NEXT
+}
+
+/// Not-counted notices listed before the block folds: one per
+/// distinct (program, replaced file) pair on an empty view; `--json`
+/// carries every gap.
+const REPLACED_NOTICES_SHOWN: usize = 20;
+
+/// One distinct replaced-file program and the file it runs: the
+/// caller label with its pid when the gap names a caller, else the
+/// pid, else an unknown program. Sorted and deduplicated.
+fn replaced_file_notices(presentation: &Presentation) -> Vec<(String, String)> {
+    let mut seen = std::collections::BTreeSet::new();
+    for gap in &presentation.gaps {
+        if !is_replaced_file_gap(&gap.reason) {
+            continue;
+        }
+        let program = match (gap.caller, gap.pid) {
+            (Some(caller), pid) => {
+                let pid =
+                    pid.or_else(|| retained_caller(presentation, caller).map(|view| view.pid));
+                match pid {
+                    Some(pid) => format!("{} (PID {pid})", application_label(presentation, caller)),
+                    None => application_label(presentation, caller),
+                }
+            }
+            (None, Some(pid)) => format!("PID {pid}"),
+            (None, None) => "an unknown program".to_string(),
+        };
+        seen.insert((program, gap.subject.clone()));
+    }
+    seen.into_iter().collect()
+}
+
 /// Gaps that count toward PARTIAL: every retained row, including a
 /// replaced provider file (owner rule 2026-11-09, data-always).
 fn loss_gap_count(gaps: &[GapView]) -> usize {
@@ -3426,10 +3472,45 @@ fn render_snapshot_inner(
         }
     }
     if presentation.edges.is_empty() {
-        let _ = writeln!(
-            out,
-            "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
-        );
+        // An empty view with replaced files names the loss instead of
+        // the bare absence line: one not-counted notice per distinct
+        // (program, file) pair with restart advice. Text only; JSON
+        // keeps the gap rows verbatim.
+        let replaced = replaced_file_notices(presentation);
+        if replaced.is_empty() {
+            let _ = writeln!(
+                out,
+                "No application/module associations observed; this does not prove that no PKCS#11 activity occurred."
+            );
+        } else {
+            let programs: std::collections::BTreeSet<&str> = replaced
+                .iter()
+                .map(|(program, _)| program.as_str())
+                .collect();
+            let count = programs.len();
+            let _ = writeln!(
+                out,
+                "No counted associations; {count} {} {} files replaced on disk (below).",
+                if count == 1 { "program" } else { "programs" },
+                if count == 1 { "runs" } else { "run" }
+            );
+            for (program, file) in replaced.iter().take(REPLACED_NOTICES_SHOWN) {
+                let _ = writeln!(
+                    out,
+                    "not counted: {program} runs {}, a file replaced on disk while it runs; restart it to count its calls",
+                    escape_controls(file)
+                );
+            }
+            let rest = replaced.len().saturating_sub(REPLACED_NOTICES_SHOWN);
+            if rest == 1 {
+                let _ = writeln!(out, "  and 1 more replaced file (--json has every item)");
+            } else if rest > 1 {
+                let _ = writeln!(
+                    out,
+                    "  and {rest} more replaced files (--json has every item)"
+                );
+            }
+        }
     }
     render_excluded_lines(
         &mut out,

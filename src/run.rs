@@ -25115,7 +25115,7 @@ int main(int argc, char **argv) {
         }
         // Every failure below unwinds through these guards: the paused
         // intermediate and the orphan are killed and reaped, never left.
-        let mut parent_guard = ChildKillGuard::new(parent);
+        let parent_guard = ChildKillGuard::new(parent);
         drop(writer);
         let mut pid = [0u8; 4];
         let mut reader = reader;
@@ -25124,6 +25124,10 @@ int main(int argc, char **argv) {
             .expect("the probe intermediate died before reporting its stopped child");
         let orphan = u32::from_ne_bytes(pid);
         let mut orphan_guard = ChildKillGuard::new(orphan as libc::pid_t);
+        // Rebind after the orphan's guard so an unwind drops (kills and
+        // reaps) the intermediate first: the orphan is then this
+        // subreaper's child, and its own guard can reap it too.
+        let mut parent_guard = parent_guard;
         // SAFETY: signaling the exact intermediate only, then reaping it.
         assert_eq!(unsafe { libc::kill(parent, libc::SIGKILL) }, 0);
         let parent_status = reap_blocking(parent);

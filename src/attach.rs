@@ -1102,8 +1102,10 @@ pub enum Scope {
 
 impl Scope {
     /// Stable scope kind for the JSON `capture` section (`pid`, `cgroup`,
-    /// `system`). No PID number or cgroup path is published — identity stays
-    /// in diagnostics, never in the report.
+    /// `system`). The kind itself carries no PID number or cgroup path:
+    /// the pid-scope target exe is named separately in `capture.caller`
+    /// (or a named unknown reason), while the raw target pid stays in
+    /// stderr diagnostics, never in the report.
     pub const fn kind(&self) -> &'static str {
         match self {
             Self::Pid(_) => "pid",

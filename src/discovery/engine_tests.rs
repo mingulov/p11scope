@@ -36113,6 +36113,7 @@ fn an_unpinned_entry_skip_is_bounded_in_every_capture_output() {
         kernel: "test",
         policy: CapturePolicy::Allowlisted,
         scope: "pid",
+        caller: None,
         ring_bytes: p11scope_ebpf_common::RING_BYTES,
         drain_interval_ms: 1000,
     };

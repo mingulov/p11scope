@@ -2675,6 +2675,7 @@ fn canary_capture() -> crate::render::CaptureMeta<'static> {
         kernel: "6.8.0",
         policy: crate::attach::CapturePolicy::Allowlisted,
         scope: "pid",
+        caller: None,
         ring_bytes: p11scope_ebpf_common::RING_BYTES,
         drain_interval_ms: 1000,
     }

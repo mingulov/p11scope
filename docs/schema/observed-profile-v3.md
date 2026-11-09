@@ -781,6 +781,16 @@ number or cgroup path. `run` reports `cgroup` for its dedicated tree scope
 and `pid` when it degraded to its exact child. The evidence object keeps
 its closed exact key set; this addition touches the `capture` section only.
 
+`capture.caller` names the pid-scope target: `{exe, exe_unknown_reason}`
+with exactly one non-null — the `/proc/<pid>/exe` link text read when
+probes attached, or the finite reason it could not be read. It is present
+if and only if the scope is `pid` with resolved caller identity; cgroup
+and system scopes emit no key (absent, never null), since their counts
+are aggregate, not per-application. No PID number is carried: profile and
+metrics reports do not publish raw PID/TID, so the operator's own target
+pid is named on stderr diagnostics only. This is a v3-additive disclosure
+that introduces no new schema revision.
+
 ## Completeness and terminal trace
 
 Any truncation, uncovered provider, export status other than `present`,

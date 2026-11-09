@@ -134,6 +134,7 @@ fn capture(scope: &'static str) -> CaptureMeta<'static> {
         kernel: "fixture-kernel",
         policy: CapturePolicy::Allowlisted,
         scope,
+        caller: None,
         ring_bytes: 4096,
         drain_interval_ms: 100,
     }

@@ -12819,6 +12819,7 @@ fn the_real_renderer_output_satisfies_the_extended_checker_contract() {
             kernel: "6.8.0",
             policy: p11scope::attach::CapturePolicy::AggregateOnly,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         },

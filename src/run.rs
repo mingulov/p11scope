@@ -6089,6 +6089,74 @@ pub(crate) fn capture_ready_line(attached_probes: usize, owned: bool) -> String 
     )
 }
 
+/// The pid-scope target exited between attach and the exe-link read.
+pub(crate) const TARGET_CALLER_EXITED: &str = "target exited before its exe link was read";
+/// The pid-scope target answered but its exe link could not be read
+/// (hidden by a `/proc` hidepid mount, or denied).
+pub(crate) const TARGET_CALLER_EXE_UNREADABLE: &str = "target exe link unreadable";
+
+/// Resolve the pid-scope target's caller identity from
+/// `/proc/<pid>/exe`: the link text, or the finite reason it could not
+/// be read. Only a `kill(pid, 0)` `ESRCH` names the exit; a `/proc`
+/// miss on a live pid is unreadable, never presumed exited. The pid
+/// itself never enters the report — stderr diagnostics name it beside
+/// this identity. Only the exe link is read: no cwd, cmdline, or
+/// environ.
+pub(crate) fn resolve_pid_caller(pid: u32) -> render::CaptureCaller {
+    resolve_pid_caller_with(
+        pid,
+        |path| {
+            std::fs::read_link(path)
+                .ok()
+                .map(|link| link.to_string_lossy().into_owned())
+        },
+        crate::process::process_proven_exited,
+    )
+}
+
+/// [`resolve_pid_caller`] over injected readers, so every outcome is
+/// unit-testable without live `/proc` state.
+fn resolve_pid_caller_with(
+    pid: u32,
+    read_exe_link: impl Fn(&str) -> Option<String>,
+    proven_exited: impl Fn(u32) -> bool,
+) -> render::CaptureCaller {
+    let path = format!("/proc/{pid}/exe");
+    if let Some(exe) = read_exe_link(&path) {
+        return render::CaptureCaller {
+            exe: Some(exe),
+            exe_unknown_reason: None,
+        };
+    }
+    let reason = if proven_exited(pid) {
+        TARGET_CALLER_EXITED
+    } else {
+        TARGET_CALLER_EXE_UNREADABLE
+    };
+    render::CaptureCaller {
+        exe: None,
+        exe_unknown_reason: Some(reason),
+    }
+}
+
+/// The pid-scope target line, printed on stderr beside the readiness
+/// line: the operator's own target pid plus its exe, or the named
+/// reason the exe stayed unknown. Unconditional, never `-v`-gated:
+/// without it a pid-scope capture never names its target. The exe is
+/// target-controlled, so it is control-escaped at this boundary.
+pub(crate) fn target_caller_line(pid: u32, caller: &render::CaptureCaller) -> String {
+    match (&caller.exe, caller.exe_unknown_reason) {
+        (Some(exe), _) => format!(
+            "p11scope: target: pid {pid} exe {}",
+            crate::render::escape_controls(exe)
+        ),
+        (None, Some(reason)) => {
+            format!("p11scope: target: pid {pid} caller unknown: {reason}")
+        }
+        (None, None) => format!("p11scope: target: pid {pid} caller unknown: caller unresolved"),
+    }
+}
+
 fn loader_readiness_line(active_hooks: usize) -> String {
     format!("p11scope: loader readiness: {active_hooks} active hook(s)")
 }
@@ -6665,6 +6733,19 @@ fn capture_profile(
     if capture_diagnostics_on() {
         emit_capture_diagnostic(&loader_readiness_line(active_loader_hooks));
     }
+    // The pid-scope target, resolved once probes are attached (the
+    // target is alive then by construction): stderr names it beside the
+    // readiness line, and the terminal report carries the same
+    // identity. At report time the target may be long gone, so the
+    // terminal block reuses this value and never re-reads.
+    let target_caller = match scope {
+        Scope::Pid(pid) => {
+            let caller = resolve_pid_caller(*pid);
+            emit_capture_diagnostic(&target_caller_line(*pid, &caller));
+            Some(caller)
+        }
+        Scope::Cgroup { .. } | Scope::System => None,
+    };
     emit_capture_diagnostic(&capture_ready_line(
         session.attached_probes(),
         owned.is_some(),
@@ -7199,6 +7280,7 @@ fn capture_profile(
                         watch_stop_ns,
                         k0,
                         select_endpoint.map(|_| &mut selection_ledger),
+                        &target_caller,
                     )
                     .map(|_| ())
                 },
@@ -7397,6 +7479,7 @@ fn capture_profile(
                         watch_stop_ns,
                         k0,
                         select_endpoint.map(|_| &mut selection_ledger),
+                        &target_caller,
                     )
                 },
             )
@@ -7429,6 +7512,7 @@ fn capture_profile(
         stop_ns: Option<u64>,
         k0: Option<metrics::selected_detail_driver::K0Close>,
         mut selection_ledger: Option<&mut metrics::selected_detail_driver::SelectionLedger>,
+        target_caller: &Option<render::CaptureCaller>,
     ) -> Result<render::Evidence> {
         poll_terminal_cancellation();
         context.3.begin_tick(crate::sink::SINK_TICK_BUDGET);
@@ -7657,6 +7741,7 @@ fn capture_profile(
                 kernel: &kernel,
                 policy,
                 scope: scope.kind(),
+                caller: target_caller.clone(),
                 ring_bytes: resolve_ring_bytes(ring_bytes),
                 drain_interval_ms: drain.as_millis() as u64,
             };
@@ -10250,6 +10335,7 @@ pub(crate) fn physical_gap_public_evidence_for_test(engine: &Engine) -> [serde_j
         kernel: "test",
         policy: CapturePolicy::Allowlisted,
         scope: "pid",
+        caller: None,
         ring_bytes: p11scope_ebpf_common::RING_BYTES,
         drain_interval_ms: 1000,
     };
@@ -20150,6 +20236,78 @@ mod tests {
         );
     }
 
+    #[test]
+    fn target_caller_line_names_pid_and_exe() {
+        let caller = render::CaptureCaller {
+            exe: Some("/opt/target/harness".to_string()),
+            exe_unknown_reason: None,
+        };
+        assert_eq!(
+            target_caller_line(4242, &caller),
+            "p11scope: target: pid 4242 exe /opt/target/harness"
+        );
+    }
+
+    #[test]
+    fn target_caller_line_names_unknown_reason() {
+        for reason in [TARGET_CALLER_EXITED, TARGET_CALLER_EXE_UNREADABLE] {
+            let caller = render::CaptureCaller {
+                exe: None,
+                exe_unknown_reason: Some(reason),
+            };
+            assert_eq!(
+                target_caller_line(4242, &caller),
+                format!("p11scope: target: pid 4242 caller unknown: {reason}")
+            );
+        }
+    }
+
+    #[test]
+    fn target_caller_line_escapes_exe_controls() {
+        // The exe is target-controlled: control bytes are rewritten at
+        // this terminal boundary, never printed raw.
+        let caller = render::CaptureCaller {
+            exe: Some("/tmp/x\x1b[1m".to_string()),
+            exe_unknown_reason: None,
+        };
+        let line = target_caller_line(4242, &caller);
+        assert!(!line.contains('\x1b'), "{line}");
+        assert!(line.contains("pid 4242 exe /tmp/x"), "{line}");
+    }
+
+    #[test]
+    fn resolve_pid_caller_with_names_all_outcomes() {
+        // Named: the link text wins without consulting the exit proof.
+        let named = resolve_pid_caller_with(
+            7,
+            |_| Some("/bin/app".to_string()),
+            |_| panic!("a readable link never consults the exit proof"),
+        );
+        assert_eq!(named.exe.as_deref(), Some("/bin/app"));
+        assert_eq!(named.exe_unknown_reason, None);
+        // Unreadable plus proven exit: the exit is named.
+        let exited = resolve_pid_caller_with(7, |_| None, |_| true);
+        assert_eq!(exited.exe, None);
+        assert_eq!(exited.exe_unknown_reason, Some(TARGET_CALLER_EXITED));
+        // Unreadable but live: unreadable, never presumed exited.
+        let hidden = resolve_pid_caller_with(7, |_| None, |_| false);
+        assert_eq!(hidden.exe, None);
+        assert_eq!(
+            hidden.exe_unknown_reason,
+            Some(TARGET_CALLER_EXE_UNREADABLE)
+        );
+    }
+
+    #[test]
+    fn resolve_pid_caller_names_live_self() {
+        // The real reader over a pid that is certainly alive and
+        // readable: this test process names its own exe.
+        let caller = resolve_pid_caller(std::process::id());
+        let exe = caller.exe.as_deref().unwrap_or_default();
+        assert!(!exe.is_empty(), "{caller:?}");
+        assert_eq!(caller.exe_unknown_reason, None);
+    }
+
     /// CLI text: with nothing attached yet, the readiness line says
     /// what the capture waits for instead of reading as a failure.
     #[test]
@@ -22677,6 +22835,7 @@ mod tests {
             kernel: "test",
             policy: CapturePolicy::AggregateOnly,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -22782,6 +22941,7 @@ mod tests {
                         kernel: "test",
                         policy: CapturePolicy::AggregateOnly,
                         scope: "pid",
+                        caller: None,
                         ring_bytes: p11scope_ebpf_common::RING_BYTES,
                         drain_interval_ms: 1000,
                     },
@@ -22895,6 +23055,7 @@ mod tests {
             kernel: "test",
             policy: CapturePolicy::Allowlisted,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };

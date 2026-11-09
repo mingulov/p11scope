@@ -4227,6 +4227,9 @@ pub fn json(reports: &[SlotReport], ev: &Evidence, capture: &CaptureMeta<'_>) ->
         "functions": functions_out(reports, &ev.discovery.modules, &forwarding),
         "layer_totals": layer_totals_json(reports, &forwarding, &ev.discovery.modules),
     });
+    if let Some(caller) = caller_out(capture.scope, capture.caller.as_ref()) {
+        document["capture"]["caller"] = caller;
+    }
     // 7.10b: the metrics lane embeds `Evidence` directly, so the
     // skipped armed-only splits are hoisted here with the same closed
     // shapes the profile lane publishes. Present if and only if
@@ -4668,10 +4671,44 @@ pub struct CaptureMeta<'a> {
     pub policy: CapturePolicy,
     /// Capture scope kind: `pid`, `cgroup`, or `system` (`Scope::kind`).
     pub scope: &'static str,
+    /// The pid-scope target's caller identity, resolved at attach time.
+    /// `None` for aggregate scopes (cgroup/system), which name no single
+    /// caller by design. The renderer emits `capture.caller` only for
+    /// pid scope with `Some`, so a stray `Some` can never leak a caller
+    /// into an aggregate document.
+    pub caller: Option<CaptureCaller>,
     /// Effective EVENTS ringbuf size in bytes (`--ring-bytes` or default).
     pub ring_bytes: u32,
     /// Effective capture-loop tick in ms (`--drain-interval-ms` or default).
     pub drain_interval_ms: u64,
+}
+
+/// The pid-scope target's caller identity: the `/proc/<pid>/exe` link
+/// text read at attach time, or the finite reason it could not be read.
+/// Exactly one of the two is `Some`. No PID number is carried: profile
+/// and metrics reports do not publish raw PID/TID (allowlist v1); the
+/// operator's own target pid is named on stderr diagnostics only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaptureCaller {
+    /// Target executable path, verbatim from the exe link.
+    pub exe: Option<String>,
+    /// Finite reason when `exe` is `None`, else `None`.
+    pub exe_unknown_reason: Option<&'static str>,
+}
+
+/// `capture.caller`, present if and only if this is a pid-scope capture
+/// with resolved caller identity: `{exe, exe_unknown_reason}` with
+/// exactly one non-null. Aggregate scopes emit no key — absent, never
+/// null — and neither does a pid scope that resolved nothing.
+fn caller_out(scope: &str, caller: Option<&CaptureCaller>) -> Option<serde_json::Value> {
+    if scope != "pid" {
+        return None;
+    }
+    let caller = caller?;
+    Some(serde_json::json!({
+        "exe": caller.exe.as_deref(),
+        "exe_unknown_reason": caller.exe_unknown_reason,
+    }))
 }
 
 /// The v2 `observed-profile.json` document. `functions` comes from the
@@ -4797,7 +4834,7 @@ pub fn profile_json(
         Vec::new()
     };
 
-    serde_json::json!({
+    let mut document = serde_json::json!({
         "schema": "p11scope/observed-profile/v3",
         // Machine-readable lane discriminator (SYSPLAN residual F-12): the
         // profile lane carries the four versioned-only evidence fields with
@@ -4831,7 +4868,11 @@ pub fn profile_json(
             "operations": templates,
         },
         "cgroups": cgroups_out(state),
-    })
+    });
+    if let Some(caller) = caller_out(capture.scope, capture.caller.as_ref()) {
+        document["capture"]["caller"] = caller;
+    }
+    document
 }
 
 #[cfg(test)]
@@ -6015,6 +6056,7 @@ pub(crate) mod tests {
             };
             let capture = CaptureMeta {
                 scope,
+                caller: None,
                 ..capture_fixture()
             };
             let document = json(&reports_fixture(), &ev, &capture);
@@ -6736,6 +6778,10 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
             scope: "pid",
+            caller: Some(CaptureCaller {
+                exe: Some("/opt/target/harness".to_string()),
+                exe_unknown_reason: None,
+            }),
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         }
@@ -8846,6 +8892,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -8888,6 +8935,7 @@ pub(crate) mod tests {
                 kernel: "6.8.0",
                 policy: CapturePolicy::AggregateOnly,
                 scope: "pid",
+                caller: None,
                 ring_bytes: p11scope_ebpf_common::RING_BYTES,
                 drain_interval_ms: 1000,
             },
@@ -11159,6 +11207,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::Allowlisted,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -12665,6 +12714,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -12782,6 +12832,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::Allowlisted,
             scope: "pid",
+            caller: None,
             ring_bytes: 4096,
             drain_interval_ms: 1000,
         };
@@ -12805,6 +12856,7 @@ pub(crate) mod tests {
                 kernel: "6.8.0",
                 policy: crate::attach::CapturePolicy::Allowlisted,
                 scope,
+                caller: None,
                 ring_bytes: 4096,
                 drain_interval_ms: 1000,
             };
@@ -12879,6 +12931,60 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn profile_and_metrics_pid_capture_name_unknown_caller_with_reason() {
+        // An unreadable exe is a named unknown, never a silent null or
+        // a missing key: exactly one of exe/exe_unknown_reason is set.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let capture = CaptureMeta {
+            caller: Some(CaptureCaller {
+                exe: None,
+                exe_unknown_reason: Some("target exe link unreadable"),
+            }),
+            ..capture_fixture()
+        };
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            let caller = &document["capture"]["caller"];
+            assert!(caller["exe"].is_null(), "{caller}");
+            assert_eq!(caller["exe_unknown_reason"], "target exe link unreadable");
+        }
+    }
+
+    #[test]
+    fn profile_and_metrics_pid_capture_without_caller_omit_the_key() {
+        // A pid scope that resolved nothing emits no caller key —
+        // absent, never null — in both lanes.
+        let mut ev = evidence();
+        ev.verdict();
+        let state = crate::semantics::State::with_policy(
+            &empty_plan(),
+            crate::attach::CapturePolicy::Allowlisted,
+        );
+        let capture = CaptureMeta {
+            caller: None,
+            ..capture_fixture()
+        };
+        assert_eq!(capture.scope, "pid");
+        for document in [
+            profile_json(&[], VersionedEvidence::wrap(&ev), &state, &capture),
+            json(&[], &ev, &capture),
+        ] {
+            assert!(
+                document["capture"].get("caller").is_none(),
+                "{}",
+                document["capture"]
+            );
+        }
+    }
+
+    #[test]
     fn cap_skip_forces_partial_in_profile_and_metrics() {
         // A scan-cap skip alone flips a clean evidence to PARTIAL, and the
         // public record stays categorical: no pid, path, or count details.
@@ -12921,6 +13027,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: crate::attach::CapturePolicy::AggregateOnly,
             scope: "pid",
+            caller: None,
             ring_bytes: 262_144,
             drain_interval_ms: 200,
         };
@@ -13373,6 +13480,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13419,6 +13527,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13467,6 +13576,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13496,6 +13606,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13535,6 +13646,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13580,6 +13692,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13669,6 +13782,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };
@@ -13737,6 +13851,7 @@ pub(crate) mod tests {
             kernel: "6.8.0",
             policy: CapturePolicy::UnsafeUnvalidatedMetadata,
             scope: "pid",
+            caller: None,
             ring_bytes: p11scope_ebpf_common::RING_BYTES,
             drain_interval_ms: 1000,
         };

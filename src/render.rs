@@ -1908,24 +1908,73 @@ fn never_stop_gaps_project_to_finite_reasons_without_paths() {
     }
 }
 
-/// Dropped inventory passes project to their own finite reason — in
-/// both the single and the aggregated form — instead of the generic
-/// discovery skip, without leaking the internal error chain.
+/// Every `reason` enum the published v3 schema allows for a capture's
+/// `evidence.skipped` entries.
+#[cfg(test)]
+fn schema_skip_reason_enums() -> Vec<Vec<String>> {
+    fn walk(value: &serde_json::Value, out: &mut Vec<Vec<String>>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                if let Some(reasons) = map
+                    .get("skipped")
+                    .and_then(|skipped| skipped.pointer("/items/properties/reason/enum"))
+                    .and_then(serde_json::Value::as_array)
+                {
+                    out.push(
+                        reasons
+                            .iter()
+                            .filter_map(|reason| reason.as_str().map(str::to_owned))
+                            .collect(),
+                    );
+                }
+                map.values().for_each(|child| walk(child, out));
+            }
+            serde_json::Value::Array(items) => items.iter().for_each(|child| walk(child, out)),
+            _ => {}
+        }
+    }
+    let path = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/docs/schema/observed-profile-v3.schema.json"
+    );
+    let schema: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap();
+    let mut out = Vec::new();
+    walk(&schema, &mut out);
+    out
+}
+
+/// Dropped inventory passes project to a reason the published schema
+/// and the release evidence checker accept (`discovery unavailable`),
+/// decided by the subject before any reason-text match, so an error
+/// chain that happens to quote another category is not mislabelled.
 #[cfg(test)]
 #[test]
-fn dropped_pass_gaps_project_to_their_finite_reason() {
+fn dropped_pass_gaps_project_to_a_schema_reason() {
+    let enums = schema_skip_reason_enums();
+    assert!(!enums.is_empty(), "the schema names its skip reasons");
     for reason in [
         "pass 2 dropped: test-forced apply failure",
-        "passes 2-4 dropped (3x): test-forced apply failure",
+        "pass 7 dropped: provider object 3 has no exact opened identity",
+        "pass 4 dropped: physical identity is ambiguous for object 9",
+        "pass 5 dropped: no function table was found in its file-backed data",
     ] {
         let projected = capture_skipped_out(&Skipped {
             subject: "live inventory pass".into(),
             reason: reason.into(),
         });
-        assert_eq!(projected.name, "discovery subject");
-        assert_eq!(projected.reason, "inventory pass unavailable");
+        assert_eq!(projected.name, "discovery subject", "{reason}");
+        assert_eq!(projected.reason, DISCOVERY_UNAVAILABLE, "{reason}");
+        for allowed in &enums {
+            assert!(
+                allowed.contains(&projected.reason),
+                "{:?} is not a schema skip reason",
+                projected.reason
+            );
+        }
         let json = serde_json::to_string(&projected).unwrap();
         assert!(!json.contains("test-forced"), "{json}");
+        assert!(!json.contains("object"), "{json}");
     }
 }
 

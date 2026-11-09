@@ -68181,13 +68181,46 @@ fn real_merge_ordinal_mismatch_drops_pass_with_gap() {
     child.wait().unwrap();
 }
 
-/// Repeated drops with the same error aggregate into one gap with a
-/// count and first/last pass numbers instead of flooding the gap list
-/// with one entry per tick. The loop keys off the drop count (not the
-/// round): an incidental healthy round under load only costs an extra
-/// iteration, and exact pass numbers stay load-dependent.
+/// Drives rounds until one more pass with `error` has dropped (bounded):
+/// an incidental healthy round under load only costs an extra round.
+fn drop_one_more_pass(
+    engine: &mut Engine,
+    session: &mut ScriptedSession,
+    pid: u32,
+    error: &str,
+    forced: bool,
+) {
+    let before = engine.dropped_pass_count_for_test(error);
+    for _round in 0..12 {
+        assert!(engine.request_refresh(pid, None));
+        if forced {
+            engine.fail_next_apply_for_test = true;
+        }
+        apply_ordinary_batch(engine, session, vec![]).expect("a dropped pass still returns Ok");
+        if engine.dropped_pass_count_for_test(error) > before {
+            return;
+        }
+    }
+    panic!("no pass dropped with {error:?} within twelve rounds");
+}
+
+fn published_inventory_pass_gaps(engine: &Engine) -> Vec<&Skipped> {
+    engine
+        .plan
+        .skipped
+        .iter()
+        .filter(|skip| skip.subject == "live inventory pass")
+        .collect()
+}
+
+/// However many passes drop, the published plan (which the capture JSON
+/// `evidence.skipped` maps one to one) holds exactly one dropped-pass
+/// gap, and its reason stays the first drop's text: every publishing
+/// layer keys gaps by subject plus reason and only adds, so a rewritten
+/// reason would publish one entry per drop.
 #[test]
-fn repeated_drops_with_same_error_aggregate_into_one_gap() {
+fn repeated_drops_publish_exactly_one_fixed_gap() {
+    const ERROR: &str = "test-forced apply failure";
     let mut child = std::process::Command::new("sleep")
         .arg("30")
         .die_with_parent()
@@ -68199,42 +68232,169 @@ fn repeated_drops_with_same_error_aggregate_into_one_gap() {
     apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
     assert_eq!(engine.views.len(), 1);
     engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
-    for _round in 0..12 {
-        assert!(engine.request_refresh(pid, None));
-        engine.fail_next_apply_for_test = true;
-        apply_ordinary_batch(&mut engine, &mut session, vec![])
-            .expect("a dropped pass still returns Ok");
-        if engine.dropped_pass_count_for_test("test-forced apply failure") >= 2 {
-            break;
-        }
-    }
-    assert_eq!(
-        engine.dropped_pass_count_for_test("test-forced apply failure"),
-        2,
-        "two drops recorded within twelve rounds"
+    drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    let first: Vec<Skipped> = published_inventory_pass_gaps(&engine)
+        .into_iter()
+        .cloned()
+        .collect();
+    assert_eq!(first.len(), 1, "the first drop publishes its gap: {first:?}");
+    assert!(
+        first[0].reason.starts_with("pass ")
+            && first[0].reason.ends_with(&format!("dropped: {ERROR}")),
+        "{first:?}"
     );
-    let drops: Vec<_> = engine
+    for _ in 0..3 {
+        drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    }
+    assert_eq!(engine.dropped_pass_count_for_test(ERROR), 4);
+    let published = published_inventory_pass_gaps(&engine);
+    assert_eq!(
+        published.len(),
+        1,
+        "one published gap however many passes drop: {:?}",
+        engine.plan.skipped
+    );
+    assert_eq!(
+        *published[0], first[0],
+        "the published reason is never rewritten"
+    );
+    let internal: Vec<_> = engine
         .counters
         .object_skips
         .iter()
         .filter(|skip| skip.subject == "live inventory pass")
         .collect();
-    assert_eq!(
-        drops.len(),
-        1,
-        "one gap per error text, not one per tick: {:?}",
-        engine.counters.object_skips
-    );
+    assert_eq!(internal, vec![&first[0]], "one internal gap as well");
+    let projected: Vec<_> = engine
+        .plan
+        .skipped
+        .iter()
+        .map(crate::render::capture_skipped_out)
+        .filter(|skip| skip.reason == "discovery unavailable")
+        .collect();
     assert!(
-        drops[0].reason.starts_with("passes ")
-            && drops[0]
-                .reason
-                .contains("dropped (2x): test-forced apply failure"),
-        "the gap aggregates with count and first/last passes: {:?}",
-        drops[0].reason
+        !projected.is_empty(),
+        "the gap projects to a schema reason in the capture JSON"
     );
     child.kill().unwrap();
     child.wait().unwrap();
+}
+
+/// A healthy tick resets the consecutive-drop chain: drop, healthy,
+/// drop, drop still keeps the serviced request queued for retry.
+#[test]
+fn healthy_tick_resets_the_consecutive_drop_chain() {
+    const ERROR: &str = "test-forced apply failure";
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    assert_eq!(engine.consecutive_dropped_passes, 1);
+    let mut healthy = false;
+    for _round in 0..12 {
+        assert!(engine.request_refresh(pid, None));
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        if !engine.refresh_requested.contains_key(&pid) {
+            healthy = true;
+            break;
+        }
+    }
+    assert!(healthy, "a healthy tick completes the request");
+    assert_eq!(engine.dropped_pass_count_for_test(ERROR), 1);
+    assert_eq!(
+        engine.consecutive_dropped_passes, 0,
+        "the healthy tick breaks the chain"
+    );
+    drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    drop_one_more_pass(&mut engine, &mut session, pid, ERROR, true);
+    assert_eq!(engine.consecutive_dropped_passes, 2);
+    assert!(
+        engine.refresh_requested.contains_key(&pid),
+        "two drops after a healthy tick still retain the request for retry"
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// Only tick drops count toward the consecutive-drop chain: a dropped
+/// batch-tail publication must not shorten the tick retry window.
+#[test]
+fn dropped_tail_does_not_count_toward_the_tick_drop_chain() {
+    let (mut engine, _raw) = retained_publication_engine(213, 1);
+    engine.publish_batch_tail(false).unwrap();
+    engine.manifest_ordinals.push(0); // No parallel manifest: the real merge refuses.
+    engine.note_facts_mutated(); // Force the merge attempt the drop needs.
+    engine
+        .publish_batch_tail(false)
+        .expect("a dropped tail still returns Ok");
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "live inventory pass"),
+        "the tail drop is recorded: {:?}",
+        engine.counters.object_skips
+    );
+    assert_eq!(engine.consecutive_dropped_passes, 0);
+}
+
+/// Disclosed limit pin: a not-yet-admitted process whose inputs break
+/// every tick candidate is offered again on every tick, so it is never
+/// admitted; escalation completes the other serviced requests without
+/// applying them, and the capture keeps going with one published gap.
+#[test]
+fn poisoned_newcomer_is_never_admitted_and_publishes_one_gap() {
+    const ERROR: &str = "test-forced poisoned candidate failure";
+    let mut kept = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let kept_pid = kept.id();
+    let (mut engine, dir) = engine_over_cgroup_naming(&[kept_pid]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    let mut poison = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let poison_pid = poison.id();
+    std::fs::write(
+        dir.path().join("cgroup.procs"),
+        format!("{kept_pid}\n{poison_pid}\n"),
+    )
+    .unwrap();
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    for _ in 0..4 {
+        drop_one_more_pass(&mut engine, &mut session, kept_pid, ERROR, false);
+    }
+    let pids: Vec<_> = engine.views.iter().map(ProcessView::pid).collect();
+    assert_eq!(pids, vec![kept_pid], "the poisoned newcomer stays unadmitted");
+    assert!(
+        !engine.refresh_requested.contains_key(&kept_pid),
+        "past the retain limit the unrelated request completes unapplied"
+    );
+    assert_eq!(
+        published_inventory_pass_gaps(&engine).len(),
+        1,
+        "{:?}",
+        engine.plan.skipped
+    );
+    let _ = kept.kill();
+    let _ = kept.wait();
+    let _ = poison.kill();
+    let _ = poison.wait();
 }
 
 /// The first two consecutive drops retain serviced requests for retry

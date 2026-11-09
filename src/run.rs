@@ -72,9 +72,15 @@ pub(crate) struct ExecFailure {
 
 impl std::fmt::Display for ExecFailure {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The errno in words (`Permission denied`), without std's
+        // trailing "(os error N)": the number is already named.
+        let os = io::Error::from_raw_os_error(self.errno).to_string();
+        let text = os
+            .strip_suffix(&format!(" (os error {})", self.errno))
+            .unwrap_or(&os);
         write!(
             formatter,
-            "exec failed with errno {} and exit status {}",
+            "exec failed with errno {} ({text}) and exit status {}",
             self.errno, self.exit_code
         )
     }

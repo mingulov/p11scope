@@ -11534,9 +11534,8 @@ mod tests {
                 {
                     break;
                 }
-                match child.try_wait().unwrap() {
-                    Some(status) => panic!("chroot scan child exited early: {status:?}"),
-                    None => {}
+                if let Some(status) = child.try_wait().unwrap() {
+                    panic!("chroot scan child exited early: {status:?}");
                 }
                 assert!(
                     std::time::Instant::now() < deadline,

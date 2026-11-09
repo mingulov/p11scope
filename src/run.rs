@@ -4863,6 +4863,87 @@ fn finish_capture_error(
     combine_capture_failure(error, finish, detach)
 }
 
+/// Combines an owned-handoff failure with the settlement, publication and
+/// detach outcomes behind it, in that order. Mirrors
+/// `combine_quiesce_failure`: the handoff error stays the outer error, so
+/// the run still exits nonzero with the failed step named.
+fn combine_handoff_report_failure(
+    handoff: anyhow::Error,
+    finish: Result<()>,
+    published: Option<Result<()>>,
+    detach: Result<()>,
+) -> anyhow::Error {
+    let mut capture = handoff;
+    if let Err(error) = finish {
+        capture = also_failed(capture, error, "owned cleanup/settlement");
+    }
+    if let Some(Err(error)) = published {
+        capture = also_failed(capture, error, "terminal publication");
+    }
+    if let Err(error) = detach {
+        capture = also_failed(capture, error, "detaching capture producers");
+    }
+    capture
+}
+
+/// Settles an owned-handoff failure (exec barrier release, post-release
+/// pause revalidation, pause arm) the way a capture-loop failure settles:
+/// the owned child still gets pause cleanup and policy settlement,
+/// producers still detach, and every error is retained. Settlement runs
+/// through context callbacks (like `finish_capture_with`) so ordinary
+/// tests drive the real combiner without an attach session.
+///
+/// The handoff error stays the outer error; a partial report seals from
+/// whatever was captured before the failure, naming the failed step.
+fn finish_handoff_error_with<C>(
+    error: anyhow::Error,
+    _step: &'static str,
+    context: &mut C,
+    note_gap: impl FnOnce(&mut C),
+    settle: impl FnOnce(&mut C) -> Result<()>,
+    _publish: impl FnOnce(&mut C) -> Result<()>,
+    detach: impl FnOnce(&mut C) -> Result<()>,
+) -> anyhow::Error {
+    note_gap(context);
+    let finish = settle(context);
+    let detach = detach(context);
+    combine_handoff_report_failure(error, finish, None, detach)
+}
+
+/// Drives one owned-handoff step with its report: the fault hook `handoff`
+/// runs first, and both outcomes publish — the healthy twin its full
+/// report, the failure twin a partial report naming the failed step —
+/// before the outcome returns. Production wires the failure arm to
+/// `finish_handoff_error_with`; the healthy arm proceeds to the capture
+/// loop, which seals the full report there.
+#[allow(clippy::too_many_arguments)]
+fn drive_owned_handoff_with<C>(
+    context: &mut C,
+    step: &'static str,
+    handoff: impl FnOnce(&mut C) -> Result<()>,
+    note_gap: impl FnOnce(&mut C),
+    settle: impl FnOnce(&mut C) -> Result<()>,
+    publish_full: impl FnOnce(&mut C) -> Result<()>,
+    publish_partial: impl FnOnce(&mut C) -> Result<()>,
+    detach: impl FnOnce(&mut C) -> Result<()>,
+) -> Result<()> {
+    match handoff(context) {
+        Ok(()) => {
+            publish_full(context)?;
+            Ok(())
+        }
+        Err(error) => Err(finish_handoff_error_with(
+            error,
+            step,
+            context,
+            note_gap,
+            settle,
+            publish_partial,
+            detach,
+        )),
+    }
+}
+
 fn finish_capture_loop(
     result: Result<CaptureEnd>,
     engine: &mut Engine,
@@ -17464,6 +17545,98 @@ int main(int argc, char **argv) {
         assert!(
             message.contains("loop failure") && message.contains("terminal quiescence"),
             "either error dropped: {message}"
+        );
+    }
+
+    /// Healthy handoff twin: the step succeeds, so its full report
+    /// publishes and the outcome is success. Control for the failure
+    /// twin below: the seam publishes on both arms.
+    #[test]
+    fn owned_handoff_healthy_twin_publishes() {
+        let full = std::cell::Cell::new(false);
+        let outcome = drive_owned_handoff_with(
+            &mut (),
+            "exec handoff",
+            |_| Ok(()),
+            |_| panic!("a healthy handoff files no gap"),
+            |_| panic!("a healthy handoff settles in the capture loop, not here"),
+            |_| {
+                full.set(true);
+                Ok(())
+            },
+            |_| panic!("a healthy handoff never seals a partial report"),
+            |_| panic!("a healthy handoff detaches after the loop, not here"),
+        );
+        outcome.expect("a healthy handoff succeeds");
+        assert!(full.get(), "the healthy twin must publish its report");
+    }
+
+    /// Failure handoff twin: the step fails after probes attached, so a
+    /// partial report naming the failed step still seals from whatever
+    /// was captured, and the original error returns the run nonzero.
+    /// Settlement still runs first and producers still detach.
+    #[test]
+    fn owned_handoff_failure_twin_publishes_partial_and_returns_err() {
+        let gap = std::cell::Cell::new(false);
+        let settled = std::cell::Cell::new(false);
+        let published = std::cell::Cell::new(false);
+        let detached = std::cell::Cell::new(false);
+        let outcome = drive_owned_handoff_with(
+            &mut (),
+            "exec handoff",
+            |_| Err(anyhow::anyhow!("run: exec handoff cancelled")),
+            |_| gap.set(true),
+            |_| {
+                assert!(gap.get(), "the handoff gap must be filed before settlement");
+                settled.set(true);
+                Ok(())
+            },
+            |_| panic!("a failed handoff never publishes a full report"),
+            |_| {
+                assert!(settled.get(), "settlement gates the partial seal");
+                published.set(true);
+                Ok(())
+            },
+            |_| {
+                detached.set(true);
+                Ok(())
+            },
+        );
+        let error = outcome.expect_err("a failed handoff must still fail the run");
+        assert!(gap.get(), "the failed step must file its named gap");
+        assert!(settled.get(), "the child must still settle");
+        assert!(
+            published.get(),
+            "a failed handoff must still publish its partial report: {error:#}"
+        );
+        assert!(detached.get(), "producers must still detach");
+        assert!(
+            format!("{error:#}").contains("exec handoff cancelled"),
+            "the original error must stay the outer error: {error:#}"
+        );
+    }
+
+    /// The three owned-handoff failure sites (pause arm, exec barrier
+    /// release, post-release revalidation) seal through the handoff
+    /// helper, never a bare settlement without publication.
+    #[test]
+    fn owned_handoff_failures_seal_a_partial_report() {
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        let handoff = production
+            .split_once("fn run_owned_inner_with_host(")
+            .expect("owned startup")
+            .1
+            .split_once("fn preflight_uretprobe_hazard(")
+            .expect("owned startup end")
+            .0;
+        assert!(
+            handoff.contains("finish_owned_handoff_error("),
+            "handoff failures must seal a partial report"
+        );
+        assert!(
+            handoff.matches("finish_owned_handoff_error(").count() >= 3,
+            "pause-arm, release and revalidation sites must all seal"
         );
     }
 

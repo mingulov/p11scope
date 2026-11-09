@@ -5795,10 +5795,7 @@ fn hand_back_cancelled_cycle(
 /// and the capture loop then ends on the stop with its report. A nonfatal
 /// failure is retired as a capture tick retires it (`auto`: partial;
 /// `always`: collected unpaused and counted unavailable).
-fn post_release_pass(
-    coordinator: &mut PauseCoordinator,
-    io: &mut impl PauseIo,
-) -> Result<()> {
+fn post_release_pass(coordinator: &mut PauseCoordinator, io: &mut impl PauseIo) -> Result<()> {
     if let Err(error) = coordinator.revalidate_after_release(io) {
         if hand_back_cancelled_cycle(coordinator, &error, io.cancelled().unwrap_or(false)) {
             return Ok(());
@@ -17440,8 +17437,19 @@ mod tests {
             .find("owned.prearm_release_ns = ")
             .expect("owned startup wires the pre-arm release bound");
         let revalidated = body
-            .find("revalidate_after_release(")
+            .find("post_release_pass(")
             .expect("owned startup revalidates after the release");
+        let step = source
+            .split_once("fn post_release_pass(")
+            .expect("the post-release step exists")
+            .1
+            .split_once("\n}\n")
+            .expect("the post-release step ends")
+            .0;
+        assert!(
+            step.contains(".revalidate_after_release("),
+            "the post-release step is the revalidation"
+        );
         assert!(
             released < wired && wired < revalidated,
             "prearm_release_ns is wired after release_until and before revalidate_after_release"

@@ -15172,8 +15172,8 @@ mod tests {
         );
         assert!(gap.get(), "the failure must file its named gap");
         assert!(
-            !changed.unwrap(),
-            "the seal proceeds with the committed plan"
+            changed.unwrap(),
+            "the seal syncs to the committed plan"
         );
     }
 

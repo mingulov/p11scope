@@ -15190,10 +15190,12 @@ fn license_header_checker_rejects_bad_fixtures() {
             b"/* SPDX-License-Identifier: GPL-2.0-only */\n",
         ),
         ("notes.txt", b"no header needed out of scope\n"),
-        // Exempt shapes are accepted even without headers.
+        // Test-input C fixtures are in scope since the 2026-09-27
+        // license decision: they carry the app-domain header like any
+        // other `.c` source (only out-of-scope paths go headerless).
         (
             "tests/fixtures/bpf-map-defs/mixed.c",
-            b"int probe(void *ctx) { return 0; }\n",
+            b"/* SPDX-License-Identifier: GPL-3.0-or-later */\nint probe(void *ctx) { return 0; }\n",
         ),
     ];
     let good_paths: Vec<String> = good
@@ -15241,6 +15243,12 @@ fn license_header_checker_rejects_bad_fixtures() {
             b"/* SPDX-License-Identifier: GPL-2.0-only */\n",
         ),
         ("scripts/native/fake.c", b"#define X 1\n"),
+        // A headerless test-input C fixture is rejected: the old
+        // headerless exemption is gone (see the headed good entry).
+        (
+            "tests/fixtures/bpf-map-defs/mixed.c",
+            b"int probe(void *ctx) { return 0; }\n",
+        ),
     ];
     let bad_paths: Vec<String> = bad
         .iter()

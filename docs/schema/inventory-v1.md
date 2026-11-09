@@ -494,6 +494,9 @@ and never proves an app identity. See the app identity rows of
   counts, instead of marking the edges `uncertain` and forwarding the
   pass's vacuous unexamined gaps. Members whose maps changed, and
   passes that bind a provider key, follow the ordinary rules above.
+  So do callers without established edges — retention keeps edges,
+  it never creates them — and every first pass, which has no prior
+  applied pass to prove sameness against.
   `entries` is usage
   evidence from observed entries only: cumulative `count` plus
   first/last seen, an in-flight flag, and `observation` —

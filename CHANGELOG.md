@@ -63,6 +63,11 @@ versioned separately and are opaque, exact dispatch keys.
   `inventory --cgroup` with the default `--capture auto` now exit 0 with
   a PARTIAL scan report carrying the `native usage feed unavailable` gap
   (was: exit 1 with no report).
+- Under `run`, an exhausted `--max-events` budget hands a live child back
+  running and exits 0 (was: the child was terminated and the run exited
+  143); the report carries the truncation marker. A capture error
+  likewise hands a live child back running instead of killing it, still
+  exiting 1 with the error and the surviving PID on stderr.
 
 ### Fixed
 

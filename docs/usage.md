@@ -1222,7 +1222,8 @@ Limits that matter in pods:
 - `--max-events <n>` — trace only (including `run --trace`): end the capture
   after `<n>` call events instead of running until `--duration`, interrupt, or
   target exit. Refused with a usage error on profile, which publishes one
-  aggregate document.
+  aggregate document. Under `run`, an exhausted budget hands a live child
+  back running and exits 0; the report carries the truncation marker.
 - `--exclude-module <path-or-name>` — repeatable, for `inspect`, `run`,
   `profile`, `trace` and `inventory` in every scope: the opposite of
   `--module`. Discovery stays automatic, except that excluded files get no
@@ -1869,7 +1870,8 @@ changing capture behavior, it joins the table above and the `--help` list.
 ### Exit codes
 
 - `0` — success. `--help` also exits 0. `run` exits 0 when its child exits 0,
-  when a still-running child is handed back (without `--kill-on-timeout`),
+  when a still-running child is handed back (an expired `--duration`
+  without `--kill-on-timeout`, or an exhausted `--max-events` budget),
   or when a requested `--kill-on-timeout` kill reaped a live child by the
   observer's signal at timeout. A voluntary exit keeps its own status,
   however high its code, as does a death before the observer's signal.

@@ -9992,6 +9992,104 @@ fn unreadable_scope_members_stay_loud_as_one_deduplicated_record() {
     );
 }
 
+/// Twin (guard): a candidate naming only live views applies with no
+/// generation mark and no silence note — the exited-generation fix must
+/// not misfire when nothing is stale.
+#[test]
+fn a_candidate_naming_only_live_views_marks_no_generation_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(18), child.id()).unwrap();
+    let id = view.id();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    let mut candidate = engine
+        .live_candidate(PinnedObjects::empty(), Vec::new(), Vec::new())
+        .expect("an empty candidate builds");
+    candidate.views.insert(id);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("a candidate over live views applies");
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "live views mark nothing: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .all(|line| !line.contains("candidate generation exited before mutation")),
+        "no silence note when nothing was stale: {:?}",
+        engine.counters.noise.lines()
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+/// v0.7.0 `--system` demo: a candidate that names a generation which
+/// provably exited (reaped or zombie — the ordinary end of a process,
+/// e.g. the mt_fork workload children) aborts its mutations but marks
+/// no discovery gap: every call was already counted exactly, and the
+/// terminal drain settles the links. Every mt-system capture drew
+/// exactly one redacted `discovery unavailable` skip for this; the held
+/// twin (nothing exits) stayed clean. The silence stays visible on -v.
+#[test]
+fn a_candidate_stale_only_by_exited_views_marks_no_generation_gap() {
+    let mut child = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let view = ProcessView::open(ProcessViewId(19), child.id()).unwrap();
+    let id = view.id();
+    let mut engine = Engine::empty();
+    engine.views.push(view);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(
+        !engine.views.iter().any(|view| view.id() == id && view.still_the_same()),
+        "the reaped child reads stale"
+    );
+    let mut candidate = engine
+        .live_candidate(PinnedObjects::empty(), Vec::new(), Vec::new())
+        .expect("an empty candidate builds");
+    candidate.views.insert(id);
+    let mut session = ScriptedSession::default();
+    let mut additions_allowed = true;
+    engine
+        .apply_candidate(&mut session, candidate, &mut additions_allowed, false, &[])
+        .expect("the aborted apply still returns");
+    assert!(
+        engine.counters.object_skips.iter().all(|skip| {
+            skip.reason
+                != "candidate generation changed before mutation; canonical identity, plan, and links were unchanged"
+        }),
+        "an exited generation is not a discovery loss: {:?}",
+        engine.counters.object_skips
+    );
+    assert!(
+        engine
+            .counters
+            .noise
+            .lines()
+            .iter()
+            .any(|line| line.contains("candidate generation exited before mutation")),
+        "the silent abort stays visible on the -v channel: {:?}",
+        engine.counters.noise.lines()
+    );
+}
+
 #[test]
 fn scan_pin_diagnostics_escape_target_controls() {
     let message =

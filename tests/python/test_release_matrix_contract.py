@@ -2762,11 +2762,13 @@ receipt_path.write_text(json.dumps(receipt))
 # Fast owned runuser stub for the object-matrix readability/identity probes.
 # OBJECT_EXTERNALS stays the oracle for every other external; this stub
 # handles only the exact runuser shapes run_objects emits, records the same
-# event rows, and answers the same exit codes. Every fork costs ~13 ms on a
-# loaded host, so a Python stub burns 9-17 s on the per-binding readability
-# probes alone; this hot path is one bash fork with a baked identity and the
-# builtin test, and no other subprocess. Unknown shapes are refused like
-# the sudo stub refuses unknown operations.
+# event rows for accepted shapes, and answers the same exit codes. Every
+# fork costs ~13 ms on a loaded host, so a Python stub burns 9-17 s on the
+# per-binding readability probes alone; this hot path is one bash fork with
+# a baked identity and the builtin test, and no other subprocess. Refused
+# shapes (unknown operations, control characters, foreign identity) exit
+# nonzero without a row -- fail-closed, like the sudo stub refuses unknown
+# operations; the old stub recorded every invocation before execing.
 OBJECT_RUNUSER = r'''#!/bin/bash
 set -eu
 EVENTS=@RUNUSER_EVENTS@
@@ -2938,12 +2940,13 @@ int main(int argc, char **argv) {
         return result
 
     def test_generated_inner_runs_selected_prebuilt_object_pairs(self):
-        # One dispatch per selected pair, each with the full per-cell
-        # assertions. A dispatch costs ~5 s quiet and ~15 s loaded per cell
-        # (two real C workloads plus six real oracles), so even two cells
-        # reach 29 s at load 22 and the 30 s deadlock guard cannot bound a
-        # wider dispatch robustly on shared hosts. Every pair stays covered;
-        # multi-cell dispatch itself is also exercised by live qualification.
+        # The first dispatch pairs two cells so the multi-cell run_objects
+        # loop (one shared output dir, per-cell work dirs, input re-verify
+        # after each cell) stays exercised; the remaining pairs run one
+        # cell each. With the fast runuser stub the two-cell dispatch fits
+        # the 30 s deadlock guard (15.7 s at load ~16; singles 5-14 s
+        # under the same conditions); every pair stays covered with the
+        # full per-cell assertions.
         selections = [[("full", 32), ("full", 64)], [("p0", 32)], [("p0", 64)]]
         for index, cells in enumerate(selections):
             with self.subTest(cells=cells):
@@ -2959,7 +2962,7 @@ int main(int argc, char **argv) {
                 events = [json.loads(line) for line in Path(json.loads(config_path.read_text())["events"]).read_text().splitlines()]
                 captures = [row for row in events if row["kind"] == "capture"]
                 pilots = [row["argv"] for row in events if row["kind"] == "runuser" and "--object-pilot" in row["argv"]]
-                self.assertEqual(len(pilots), 1)
+                self.assertEqual(len(pilots), len(cells))
                 for (mode, bits), argv in zip(cells, pilots):
                     self.assertEqual(argv[argv.index("--capture-mode") + 1], mode)
                     self.assertEqual(argv[argv.index("--prebuilt-dir") + 1], str(stage / f"artifacts/canary/{mode}-{bits}"))
@@ -2969,7 +2972,7 @@ int main(int argc, char **argv) {
                       ("object-ia32" if bits == 32 else "object-lp64") + suffix)
                      for mode, bits in cells for suffix in ("", "-blocked")])
                 terms = [row for row in events if row["kind"] == "signal"]
-                self.assertEqual(len(terms), 1)
+                self.assertEqual(len(terms), len(cells))
                 self.assertTrue(all(row["signal"] == "TERM" and row["real_uid"] == os.getuid() for row in terms))
                 self.assertTrue(all(Path(row["helper"]).resolve() == stage / "artifacts/source/scripts/lane-lib-oracle-1.py"
                                     if Path(row["helper"]).is_absolute() else row["helper"] == "scripts/lane-lib-oracle-1.py" for row in terms))

@@ -15092,9 +15092,9 @@ mod tests {
                 },
             );
             assert!(detached, "loop_failed={loop_failed}");
-            // A clean loop end publishes from partial state; a failed loop
-            // keeps settle-and-detach without a report.
-            assert_eq!(published.get(), !loop_failed, "loop_failed={loop_failed}");
+            // Every settled end publishes from partial state, a failed
+            // loop included: the report names what is unknown.
+            assert!(published.get(), "loop_failed={loop_failed}");
             let message = format!("{error:#}");
             if loop_failed {
                 assert!(
@@ -15147,11 +15147,12 @@ mod tests {
         );
     }
 
-    /// Without an observed stop, a quiesce failure behind a failed
-    /// loop keeps settle-and-detach with no report: nothing asked
-    /// for partial state.
+    /// Without an observed stop (the child exited by itself, a live
+    /// tick failed), a quiesce failure behind a failed loop still
+    /// seals what was captured: calls happened, so the view shows
+    /// them and names the failure. Both errors stay in the chain.
     #[test]
-    fn quiesce_error_behind_a_failed_loop_without_a_signal_keeps_no_report() {
+    fn quiesce_error_behind_a_failed_loop_without_a_signal_still_publishes() {
         let published = std::cell::Cell::new(false);
         let error = finish_quiesce_error(
             anyhow::anyhow!("terminal quiescence failed"),
@@ -15166,8 +15167,13 @@ mod tests {
             |_| Ok(()),
         );
         assert!(
-            !published.get(),
-            "an unsignalled failed loop must not publish: {error:#}"
+            published.get(),
+            "an unsignalled failed loop must still publish: {error:#}"
+        );
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("loop failure") && message.contains("terminal quiescence"),
+            "either error dropped: {message}"
         );
     }
 
@@ -15186,21 +15192,20 @@ mod tests {
         assert!(changed.unwrap(), "the seal syncs to the committed plan");
     }
 
-    /// Without an observed stop, a terminal discovery failure still
-    /// propagates: only a signal turns it into a gap.
+    /// Without an observed stop (the child exited by itself), a
+    /// poisoned terminal discovery batch degrades the same way: calls
+    /// happened, so the report is sealed with the named gap instead of
+    /// ending the view with no document.
     #[test]
-    fn terminal_discovery_failure_without_a_signal_still_propagates() {
+    fn terminal_discovery_failure_without_a_signal_degrades_to_a_gap() {
         let gap = std::cell::Cell::new(false);
-        let changed: Result<bool> = seal_terminal_discovery_or_gap(
+        let changed = seal_terminal_discovery_or_gap(
             false,
             || gap.set(true),
             || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
         );
-        assert!(!gap.get(), "no signal, no gap");
-        assert!(
-            format!("{:#}", changed.unwrap_err()).contains("unknown candidate module"),
-            "the failure must propagate unchanged"
-        );
+        assert!(gap.get(), "the failure must file its named gap");
+        assert!(changed.unwrap(), "the seal syncs to the committed plan");
     }
 
     #[test]

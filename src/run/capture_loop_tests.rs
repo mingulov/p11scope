@@ -378,6 +378,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
     #[derive(Clone, Copy)]
     enum Case {
         LoopError,
+        LoopErrorSettleFails,
         FinishError,
         ErrorEnd,
         Success,
@@ -386,6 +387,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
 
     for case in [
         Case::LoopError,
+        Case::LoopErrorSettleFails,
         Case::FinishError,
         Case::ErrorEnd,
         Case::Success,
@@ -394,7 +396,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
         let mut phases = Vec::new();
         let mut observed = None;
         let loop_result = match case {
-            Case::LoopError => Err(anyhow::anyhow!("loop failure")),
+            Case::LoopError | Case::LoopErrorSettleFails => Err(anyhow::anyhow!("loop failure")),
             Case::ErrorEnd => Ok(CaptureEnd::Error),
             _ => Ok(CaptureEnd::DurationExpired),
         };
@@ -404,7 +406,7 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
             |phases, result| {
                 phases.push("finish");
                 let end = result?;
-                if matches!(case, Case::FinishError) {
+                if matches!(case, Case::FinishError | Case::LoopErrorSettleFails) {
                     anyhow::bail!("finish failure");
                 }
                 Ok(end)
@@ -425,7 +427,23 @@ fn finish_capture_preserves_settlement_detach_and_terminal_attempt_boundaries() 
 
         match case {
             Case::LoopError => {
-                assert_eq!(result.unwrap_err().to_string(), "loop failure");
+                // A failed capture loop still seals the report from
+                // what was captured: settle as an error end, publish,
+                // then detach. The loop error stays the outer error.
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(message.contains("loop failure"), "{message}");
+                assert_eq!(observed, Some((CaptureEnd::Error, false)));
+                assert_eq!(phases, ["finish", "terminal", "detach"]);
+            }
+            Case::LoopErrorSettleFails => {
+                // The settled disposition gates the seal: no report on a
+                // guessed child state, and both errors are kept.
+                let message = format!("{:#}", result.unwrap_err());
+                assert!(
+                    message.contains("loop failure") && message.contains("finish failure"),
+                    "{message}"
+                );
+                assert_eq!(observed, None);
                 assert_eq!(phases, ["finish"]);
             }
             Case::FinishError => {

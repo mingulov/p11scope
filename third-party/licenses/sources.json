@@ -76,6 +76,51 @@
         }
       ]
     },
+    "jsonschema-regex": {
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "rust-toolchain-MIT.txt"
+            }
+          ],
+          "version": "0.60.2"
+        }
+      ]
+    },
+    "jsonschema-value": {
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "rust-toolchain-MIT.txt"
+            }
+          ],
+          "version": "0.60.2"
+        }
+      ]
+    },
+    "num-cmp": {
+      "license": "MIT/Apache-2.0",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "rust-toolchain-MIT.txt"
+            }
+          ],
+          "version": "0.1.0"
+        }
+      ]
+    },
     "pkcs11-abi": {
       "license": "Apache-2.0 OR MIT",
       "source": "registry+https://github.com/rust-lang/crates.io-index",
@@ -154,6 +199,36 @@
             }
           ],
           "version": "6.0.0"
+        }
+      ]
+    },
+    "uuid-simd": {
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "rust-toolchain-MIT.txt"
+            }
+          ],
+          "version": "0.8.0"
+        }
+      ]
+    },
+    "vsimd": {
+      "license": "MIT",
+      "source": "registry+https://github.com/rust-lang/crates.io-index",
+      "versions": [
+        {
+          "files": [
+            {
+              "license": "MIT",
+              "path": "rust-toolchain-MIT.txt"
+            }
+          ],
+          "version": "0.8.0"
         }
       ]
     },
@@ -537,6 +612,11 @@
       "bytes": 7502,
       "sha256": "444fa70e52ca158fb7d4bad560637790bbf8f72e80b82fff840dd66fa83091e3",
       "url": "https://raw.githubusercontent.com/rust-lang/rust/1.98.1/src/ci/docker/scripts/musl-cve-2026-6042.diff"
+    },
+    "rust-toolchain-MIT.txt": {
+      "bytes": 1078,
+      "sha256": "b85dcd3e453d05982552c52b5fc9e0bdd6d23c6f8e844b984a88af32570b0cc0",
+      "source": "rust toolchains 1.99.1 and nightly-2026-05-20 share/doc/rust/licenses/MIT.txt (same bytes as pinned under toolchains[])"
     },
     "windows-link-0.2.1-apache.txt": {
       "bytes": 11351,

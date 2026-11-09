@@ -21,6 +21,12 @@ class NoticeError(ValueError):
     pass
 
 
+# Cargo's historical slash spellings and their SPDX OR forms. This exact
+# alias pair is not a general SPDX parser or a license selection.
+LEGACY_SLASH_ALIASES = {"MIT/Apache-2.0": "MIT OR Apache-2.0",
+                        "Apache-2.0/MIT": "Apache-2.0 OR MIT"}
+
+
 def digest(data):
     return hashlib.sha256(data).hexdigest()
 
@@ -92,9 +98,7 @@ def normalize_report(report, metadata, root, inputs, feature_disabled=frozenset(
             normalized[ident] = package_id(package, root)
             continue
         # Cargo accepts this historical spelling; cargo-about canonicalizes it.
-        # This exact alias is not a general SPDX parser or a license selection.
-        canonical = {"MIT/Apache-2.0": "MIT OR Apache-2.0",
-                     "Apache-2.0/MIT": "Apache-2.0 OR MIT"}.get(package["license"], package["license"])
+        canonical = LEGACY_SLASH_ALIASES.get(package["license"], package["license"])
         if actual[ident]["license"] != canonical:
             raise NoticeError(f"declared license expression changed: {package['name']}")
         normalized[ident] = package_id(package, root)
@@ -272,7 +276,8 @@ def make_config(metadata, root, recipe):
                     checked_bytes(path, expected)
                     files.append((path, entry["license"], expected))
         if files:
-            text += f'\n[{name}.clarify]\nlicense = {json.dumps(expression)}\n'
+            clarified_expression = LEGACY_SLASH_ALIASES.get(expression, expression)
+            text += f'\n[{name}.clarify]\nlicense = {json.dumps(clarified_expression)}\n'
             for path, license_id, sha in files:
                 text += f'[[{name}.clarify.files]]\npath = {json.dumps(str(path))}\nlicense = {json.dumps(license_id)}\nchecksum = "{sha}"\n'
     return text

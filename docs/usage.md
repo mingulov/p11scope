@@ -460,11 +460,17 @@ the rendered lines name that gap instead of printing an empty section.
 > search permission on its path and a later path replacement cannot change the
 > selected inode. If that descriptor path is unavailable, `run` reports the exec
 > failure and refuses to retry the command's original path. A script runs by
-> its path instead, so the target account needs search permission on it, and
-> the path is re-verified at the barrier rather than pinned: a script whose
-> path no longer names the opened file is refused at the barrier instead of
-> running unchecked. A path replacement landing between that check and
-> `execve` is not covered; only ELF execution stays descriptor-pinned.
+> its path instead, so the target account needs search permission on every
+> directory of that path and read permission on the script itself (the
+> interpreter opens it by path); without them the run fails with the exec
+> error, for example `Permission denied`. The script runs by its resolved
+> path: a symlinked script sees the link target as `$0`, not the spelling
+> typed on the command line, which matters only for tools that dispatch on
+> their own name. The path is re-verified at the barrier rather than pinned:
+> a script whose path no longer names the opened file is refused at the
+> barrier instead of running unchecked. A path replacement landing between
+> that check and `execve` is not covered; only ELF execution stays
+> descriptor-pinned.
 > The sudo path runs
 > the child as the invoker with the invoker's supplementary groups from the
 > account database (glibc may return only the primary group) and home
@@ -842,7 +848,13 @@ sudo p11scope run --pause auto --module /usr/lib/x86_64-linux-gnu/softhsm/libsof
   sh -c 'pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L'
 
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
-file written) instead of aborting it. A stop that arrives during `profile` or
+file written) instead of aborting it. A capture that fails internally still
+writes its `-o` report from what was captured, whether the stop was a signal,
+the command's own exit or `--duration`, and names the failing step as a gap
+with `PARTIAL` coverage. A failed final discovery batch is the
+`terminal discovery drain` gap (also counted as one discovery truncation) and
+the run otherwise ends as usual; a failed capture loop is the `capture loop`
+gap, and p11scope then exits nonzero with the error on stderr. A stop that arrives during `profile` or
 `trace` startup, before anything is attached (discovery can take seconds),
 is honoured once discovery returns: exit 1 with `interrupted by SIGINT during
 startup`, no report, no temporary file left behind, and a previous trace

@@ -65,6 +65,17 @@ impl MultiHostRefusal {
         self.cause == MultiHostCause::Denied
     }
 
+    /// Whether `inventory --capture auto` may fall back to the scan
+    /// lane on this refusal: an explicit unsupported answer
+    /// (`Unavailable`) or a pre-Multi shape. Live capture cannot run
+    /// there, but the scan still answers which providers are mapped, so
+    /// the run continues with a named gap instead of refusing. Denied
+    /// and other unproven shapes stay fatal outside the PID fallback:
+    /// they may come from a capable but confined host.
+    pub(crate) fn scan_fallback_eligible(&self) -> bool {
+        self.cause == MultiHostCause::Unavailable || self.is_premulti_kernel()
+    }
+
     /// Whether the probe shape proves the kernel itself lacks Multi: the
     /// scratch self-link refusal observed on 6.1, an explicit unsupported
     /// answer at load or link time, or a load refusal for the unknown
@@ -171,16 +182,16 @@ impl std::fmt::Display for MultiHostRefusal {
                 write!(
                     out,
                     "live capture unavailable: {doing} is not supported on this host{reason}; \
-                     run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' \
-                     for a scan without capture."
+                     run 'p11scope doctor' for host readiness, or use 'p11scope inventory \
+                     --capture scan' or 'p11scope inspect --pid N' for a scan without capture."
                 )
             }
             MultiHostCause::Unproven => {
                 write!(
                     out,
                     "live capture did not start: {doing} failed{reason}; run 'p11scope doctor' \
-                     for host readiness, or use 'p11scope inspect --pid N' for a scan \
-                     without capture."
+                     for host readiness, or use 'p11scope inventory --capture scan' or 'p11scope \
+                     inspect --pid N' for a scan without capture."
                 )
             }
         }
@@ -616,6 +627,51 @@ mod tests {
         ] {
             let refusal = MultiHostRefusal::at(stage, errno);
             assert_eq!(refusal.is_premulti_kernel(), premulti, "{refusal}");
+        }
+    }
+
+    #[test]
+    fn scan_fallback_covers_unsupported_and_premulti_shapes_only() {
+        for (stage, errno, eligible) in [
+            // Explicit unsupported answers and pre-Multi shapes: live
+            // capture cannot run, but the scan still answers.
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP), true),
+            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP), true),
+            (MultiHostStage::ProgramLoad, Some(libc::ENOSYS), true),
+            (MultiHostStage::SelfLink, Some(libc::ENOSYS), true),
+            (MultiHostStage::ProgramLoad, Some(libc::EINVAL), true),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL), true),
+            // Denied and other unproven shapes stay fatal outside the
+            // PID fallback: a capable but confined host.
+            (MultiHostStage::ProgramLoad, Some(libc::EPERM), false),
+            (MultiHostStage::SelfLink, Some(libc::EACCES), false),
+            (MultiHostStage::ProgramLoad, Some(libc::EACCES), false),
+            (MultiHostStage::SelfLink, Some(libc::EMFILE), false),
+            (MultiHostStage::Anchor, None, false),
+            (MultiHostStage::Anchor, Some(libc::EOPNOTSUPP), false),
+        ] {
+            let refusal = MultiHostRefusal::at(stage, errno);
+            assert_eq!(refusal.scan_fallback_eligible(), eligible, "{refusal}");
+        }
+    }
+
+    #[test]
+    fn unsupported_guidance_names_the_scan_commands_that_still_work() {
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::ENOSYS)),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL)),
+            (MultiHostStage::Anchor, None),
+        ] {
+            let refusal = MultiHostRefusal::at(stage, errno);
+            assert_ne!(refusal.cause, MultiHostCause::Denied);
+            let text = refusal.to_string();
+            assert!(text.contains("p11scope inventory --capture scan"), "{text}");
+            assert!(text.contains("p11scope inspect --pid N"), "{text}");
+            assert!(text.contains("for a scan without capture"), "{text}");
+            assert!(!text.contains("/"), "{text}");
+            assert_eq!(text.lines().count(), 1);
+            assert!(text.len() < 1_024, "{text}");
         }
     }
 

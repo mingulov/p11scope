@@ -1478,11 +1478,14 @@ fn run_with_terminal_budget(
     {
         // An auto PID capture without root falls back to the scan lane
         // (never-stop) instead of failing here: the native opening
-        // below records the named fallback gap. Other scopes and modes
-        // keep the fatal host refusal before any sink exists.
+        // below records the named fallback gap. An auto capture on a
+        // host without live support (old kernels) falls back on every
+        // scope the same way. Other scopes, modes and causes keep the
+        // fatal host refusal before any sink exists.
         let pid_auto_fallback =
             capture == CaptureMode::Auto && matches!(scope, InventoryRunScope::Pid(_));
-        if !pid_auto_fallback {
+        let old_kernel_fallback = capture == CaptureMode::Auto && refusal.scan_fallback_eligible();
+        if !(pid_auto_fallback || old_kernel_fallback) {
             return Err(refusal.into());
         }
     }
@@ -7190,6 +7193,18 @@ fn open_native_lane_with(
                 };
                 return unavailable(coordinator, reason);
             }
+            // An auto capture on a host without live support (old
+            // kernels) falls back on every scope: counting is
+            // impossible there, but the inventory still answers.
+            if mode == CaptureMode::Auto
+                && error
+                    .downcast_ref::<crate::attach::MultiHostRefusal>()
+                    .is_some_and(|refusal| refusal.scan_fallback_eligible())
+            {
+                let summary = crate::attach::summarize_native_preparation_error(&error);
+                let reason = format!("call counts unavailable on this kernel: {summary}");
+                return unavailable(coordinator, reason);
+            }
             return Err(error);
         }
         Err(error) => {
@@ -9691,70 +9706,77 @@ mod tests {
         let report = dir.path().join("report.json");
         let events = dir.path().join("events.jsonl");
         let diagnostics = dir.path().join("diagnostics.jsonl");
-        for mode in [CaptureMode::Auto, CaptureMode::Native] {
+        // Only refusals that stay fatal: denied auto, and every native
+        // refusal. Auto on a host without live support (EOPNOTSUPP,
+        // EINVAL) falls back to the scan lane instead (see the
+        // system_auto fallback tests).
+        for (mode, errno) in [
+            (CaptureMode::Auto, libc::EPERM),
+            (CaptureMode::Native, libc::EOPNOTSUPP),
+            (CaptureMode::Native, libc::EPERM),
+            (CaptureMode::Native, libc::EINVAL),
+        ] {
             for backend in [
                 BackendSelection::Auto,
                 BackendSelection::Multi,
                 BackendSelection::Singles,
             ] {
-                for errno in [libc::EOPNOTSUPP, libc::EPERM, libc::EINVAL] {
-                    for path in [&report, &events, &diagnostics] {
-                        std::fs::write(path, b"keep existing sink\n").unwrap();
-                    }
-                    let attempted = std::cell::Cell::new(false);
-                    let mut stdout = Vec::new();
-                    let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
-                    let error = run_with_terminal_budget(
-                        InspectScope::System,
-                        &[],
-                        &[],
-                        &[],
-                        &[],
-                        &[],
-                        &HookRegistry::builtin(),
-                        true,
-                        Some(1),
-                        None,
-                        inventory_endpoint_budget(None).unwrap(),
-                        None,
-                        Some(&report),
-                        false,
-                        Some(&events),
-                        None,
-                        None,
-                        None,
-                        mode,
-                        backend,
-                        None,
-                        false,
-                        &|| false,
-                        &|| attempted.set(true),
-                        false,
-                        &mut WriterStdout(&mut stdout),
-                        &DashboardIo::stdio(),
-                        DiagnosticRequest {
-                            path: Some(&diagnostics),
-                            pid_filter: None,
-                            second_signal: &|| false,
-                        },
-                        None,
-                        &|| Err(refusal),
-                        None,
-                        None,
-                        false,
-                    )
-                    .unwrap_err();
-                    assert_eq!(
-                        error.downcast_ref::<MultiHostRefusal>(),
-                        Some(&refusal),
-                        "{error:#}"
-                    );
-                    assert!(!attempted.get() && stdout.is_empty());
-                    for path in [&report, &events, &diagnostics] {
-                        assert_eq!(std::fs::read(path).unwrap(), b"keep existing sink\n");
-                    }
-                    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
+                for path in [&report, &events, &diagnostics] {
+                    std::fs::write(path, b"keep existing sink\n").unwrap();
                 }
+                let attempted = std::cell::Cell::new(false);
+                let mut stdout = Vec::new();
+                let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(errno));
+                let error = run_with_terminal_budget(
+                    InspectScope::System,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    Some(&report),
+                    false,
+                    Some(&events),
+                    None,
+                    None,
+                    None,
+                    mode,
+                    backend,
+                    None,
+                    false,
+                    &|| false,
+                    &|| attempted.set(true),
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest {
+                        path: Some(&diagnostics),
+                        pid_filter: None,
+                        second_signal: &|| false,
+                    },
+                    None,
+                    &|| Err(refusal),
+                    None,
+                    None,
+                    false,
+                )
+                .unwrap_err();
+                assert_eq!(
+                    error.downcast_ref::<MultiHostRefusal>(),
+                    Some(&refusal),
+                    "{error:#}"
+                );
+                assert!(!attempted.get() && stdout.is_empty());
+                for path in [&report, &events, &diagnostics] {
+                    assert_eq!(std::fs::read(path).unwrap(), b"keep existing sink\n");
+                }
+                assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 3);
             }
         }
     }

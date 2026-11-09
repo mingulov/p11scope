@@ -2610,7 +2610,8 @@ mod tests {
         let reason = errno_name
             .map(|name| format!(" ({name})"))
             .unwrap_or_default();
-        let scan = "use 'p11scope inspect --pid N' for a scan without capture.";
+        let scan = "use 'p11scope inventory --capture scan' or 'p11scope inspect --pid N' \
+            for a scan without capture.";
         match cause {
             // The denied wording reads the runner's own mask, exactly
             // like the producer's `Display` it mirrors.

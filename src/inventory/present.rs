@@ -2548,6 +2548,15 @@ fn gap_plain_reason(reason: &str) -> &str {
         }
         return "live capture refused (see 'p11scope doctor')";
     }
+    if reason
+        .strip_prefix("call counts unavailable on this kernel:")
+        .is_some()
+    {
+        // The old-kernel auto-fallback gap carries the full host
+        // summary (JSON and verbose keep it); concise folds it to one
+        // short clause naming what is missing.
+        return "call counts unavailable on this kernel (see 'p11scope doctor')";
+    }
     match reason {
         "joint_birth_unoffered" => "no key session was offered to track",
         "joint_image_refused" | "joint_birth_claim_ImageTainted" => {

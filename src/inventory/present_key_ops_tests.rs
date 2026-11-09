@@ -694,6 +694,41 @@ fn concise_gap_summary_folds_unproven_capture_refusal() {
     assert!(verbose.contains(stored), "{verbose}");
 }
 
+/// The old-kernel auto-fallback gap folds to one short clause naming
+/// the missing counts; the full host summary stays verbose-only.
+#[test]
+fn concise_gap_summary_folds_old_kernel_counts_gap() {
+    let mut presentation =
+        key_ops_presentation(ObjectObservations::unavailable(7, "journal_unavailable"));
+    presentation.gaps.clear();
+    let stored = "call counts unavailable on this kernel: live capture unavailable: attaching \
+        p11scope's probes is not supported on this host (Invalid argument); run 'p11scope \
+        doctor' for host readiness, or use 'p11scope inventory --capture scan' or 'p11scope \
+        inspect --pid N' for a scan without capture.";
+    presentation
+        .gaps
+        .push(named_gap("native usage feed unavailable", stored));
+    let concise = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Concise);
+    let block = gaps_block(&concise);
+    assert_eq!(
+        block,
+        vec![
+            "gaps: 1",
+            "  1 × native usage feed unavailable — call counts unavailable on this kernel (see \
+             'p11scope doctor')",
+        ],
+        "the concise gaps block:\n{concise}"
+    );
+    assert!(
+        block[1].chars().count() <= 100,
+        "over 100 chars: {:?}",
+        block[1]
+    );
+    assert!(!concise.contains("Invalid argument"), "{concise}");
+    let verbose = render_snapshot_with_verbosity(&presentation, crate::cli::TextVerbosity::Verbose);
+    assert!(verbose.contains(stored), "{verbose}");
+}
+
 #[test]
 fn key_ops_line_manifest_path_refusal_without_single_module_stays_generic() {
     // Manifest-path refusal, zero or several modules: no single

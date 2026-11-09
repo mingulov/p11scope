@@ -11639,8 +11639,8 @@ mod tests {
         assert!(view.still_the_same());
         let mut budget = CaptureWorkBudget::default();
         // Primitive-level precondition, unchanged by the fix: opening a
-        // mapped path inside the retained target root fails, because the
-        // mapping predates the chroot.
+        // mapped path inside the retained target root fails, because maps
+        // paths render host-absolute to the observer.
         view.with_filesystem(&mut budget, |filesystem, _| {
             let error = filesystem
                 .open_rooted_detailed(&exe)
@@ -11667,7 +11667,7 @@ mod tests {
             "the chrooted scan must complete its mapping bracket: {:#?}",
             outcome.skipped()
         );
-        // Every retained-root failure must at least attempt the verified host
+        // Every retained-root failure must at least attempt the gated host
         // fallback (this test binary itself exceeds the shared object size
         // cap, so its own mapping keeps a fallback-attempted row while the
         // libraries resolve).
@@ -11682,13 +11682,45 @@ mod tests {
             .collect();
         assert!(
             unattempted.is_empty(),
-            "chrooted mappings must resolve via the verified host root: {unattempted:#?}"
+            "chrooted mappings must resolve via the gated host-root fallback: {unattempted:#?}"
         );
         assert!(
             !examined.is_empty(),
             "the chrooted child's libraries must be examined: {:#?}",
             outcome.skipped()
         );
+        // The positive check names real libraries: libc and ld-linux from
+        // the child's own maps (host paths, no hard-coded location) must
+        // resolve to examined keys, and no examined file may hide an
+        // identity mismatch or a missing mount-table row.
+        let maps_after = std::fs::read_to_string(format!("/proc/{pid}/maps")).unwrap();
+        for want in ["libc.so.6", "ld-linux"] {
+            let path = maps_after
+                .lines()
+                .filter(|line| line.contains(want))
+                .filter_map(|line| line.split_whitespace().last())
+                .find(|path| path.starts_with('/'))
+                .unwrap_or_else(|| panic!("the chrooted child must map {want}"));
+            let file =
+                std::fs::File::open(path).unwrap_or_else(|_| panic!("host must open {path}"));
+            let key = p11scope_manifest::identity::mapping_file_key(&file)
+                .unwrap_or_else(|_| panic!("host must key {path}"));
+            assert!(
+                examined.iter().any(|object| {
+                    object.key.device.major == key.device_major
+                        && object.key.device.minor == key.device_minor
+                        && object.key.inode == key.inode
+                }),
+                "the chrooted child's {want} ({path}) must be examined: {examined:#?}"
+            );
+        }
+        for skip in outcome.skipped() {
+            assert!(
+                !skip.reason.contains("does not match mapped object")
+                    && !skip.reason.contains("missing from the mount table"),
+                "no examined file hides a mismatch or missing mount: {skip:#?}"
+            );
+        }
     }
 
     /// Twin: when the target root is foreign AND the mount namespace differs

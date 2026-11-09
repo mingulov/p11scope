@@ -2324,7 +2324,8 @@ impl PauseCoordinator {
     /// policy returns `false` and changes nothing: a required (`always`)
     /// pause keeps refusing, so the caller must propagate the failure.
     /// Only the run loop's cancelled conversion calls this; every other
-    /// lifecycle failure still aborts before any report renders.
+    /// lifecycle failure propagates: the failed loop still seals its
+    /// report with an Error end and the error stays outer.
     #[must_use]
     pub(crate) fn note_cancelled_cycle(&mut self) -> bool {
         if self.policy != PausePolicy::Auto {

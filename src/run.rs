@@ -17029,6 +17029,19 @@ mod tests {
         assert!(!text.contains("/bin/sh"), "{text}");
     }
 
+    /// The invoker mapping behind the runnable pre-check is fail-closed:
+    /// a `--user` that resolves nowhere leaves no invoker, so the
+    /// snap-starting refusal hides the interpreter token. Deterministic
+    /// under any credentials: an unknown account errors both as root
+    /// (unknown account) and without root (`--user` needs root).
+    #[test]
+    fn runnable_check_invoker_mapping_hides_the_token_for_an_unknown_user() {
+        assert_eq!(
+            invoker_for_runnable_check(Some(OsStr::new("p11scope-definitely-no-such-user"))),
+            None
+        );
+    }
+
     fn snap_probes<'a>(
         exists: &'a dyn Fn(&Path) -> bool,
         is_runnable: &'a dyn Fn(&Path) -> bool,

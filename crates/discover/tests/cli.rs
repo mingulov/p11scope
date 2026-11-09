@@ -1494,14 +1494,17 @@ fn setflags_twin_dir(scratch: &Path) -> std::path::PathBuf {
 /// N2: inode-attribute change outside -o is denied. The constructor's
 /// FS_IOC_SETFLAGS from an O_RDONLY fd sets FS_NODUMP_FL when trusted
 /// (twin proves the probe applies) and fails with EACCES under the fence
-/// with the flags and bytes untouched.
+/// with the flags and bytes untouched. The twin files live on the first
+/// candidate that takes the flag (cargo scratch, then a tmpfs fallback),
+/// since some hosted runners return EOPNOTSUPP on the scratch disk.
 #[test]
 fn isolation_setflags_outside_the_output_is_denied() {
     const FS_NODUMP_FL: i32 = 0x40;
     let dir = scratch("isolation-setflags");
     let provider = build_isolation_probe(&dir);
-    let trusted_target = dir.join("setflags-trusted.tmp");
-    let isolated_target = dir.join("setflags-isolated.tmp");
+    let twins = setflags_twin_dir(&dir);
+    let trusted_target = twins.join("setflags-trusted.tmp");
+    let isolated_target = twins.join("setflags-isolated.tmp");
     std::fs::write(&trusted_target, b"setflags probe").unwrap();
     std::fs::write(&isolated_target, b"setflags probe").unwrap();
     assert_eq!(
@@ -1548,6 +1551,9 @@ fn isolation_setflags_outside_the_output_is_denied() {
         b"setflags probe",
         "the fenced probe must not modify the scratch file"
     );
+    if twins != dir {
+        std::fs::remove_dir_all(&twins).unwrap();
+    }
 }
 
 /// The N2 twins run where the flag applies: an unusable primary (a path

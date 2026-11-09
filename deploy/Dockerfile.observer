@@ -75,7 +75,6 @@ RUN set -eu; \
     for applet in $APPLETS; do /bin/busybox ln -s busybox "/bin/$applet"; test -x "/bin/$applet" || exit 1; done; \
     rm /bin/ash; \
     [ "$(/bin/busybox ls /bin | grep -c .)" -eq 17 ] || { echo "unexpected /bin contents:" >&2; /bin/busybox ls -la /bin >&2; exit 1; }; \
-    [ "$(/bin/busybox ls /bin | grep -c .)" -eq 17 ] || { echo "unexpected /bin contents:" >&2; /bin/busybox ls -la /bin >&2; exit 1; }; \
     BUSYBOX_LINE=$(/bin/busybox | /bin/busybox sed -n '1p'); \
     case $BUSYBOX_LINE in 'BusyBox v1.37.0 '*) ;; *) echo "busybox version drifted: $BUSYBOX_LINE" >&2; exit 1;; esac; \
     mkdir -p /usr/share/licenses/p11scope/notices /tmp; \

@@ -5,7 +5,7 @@ All notable changes to p11scope are recorded here. Versions follow
 [Semantic Versioning](https://semver.org/). Report schema identifiers are
 versioned separately and are opaque, exact dispatch keys.
 
-## [0.7.0] - Unreleased
+## [0.7.0] - 2026-11-09
 
 ### Added
 

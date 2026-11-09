@@ -6,10 +6,11 @@ how to run it, and what its output actually proves. Measured examples below
 name the script that produced them so they can be reproduced; fixed
 implementation limits are code contracts, not measurements.
 
-> **Status: v0.6.0.** This source provides `doctor`,
+> **Status: v0.7.0.** This source provides `doctor`,
 > `inspect`, `profile` (including `--mode metrics`),
 > `trace`, `run` and `inventory` (with PID, cgroup and system scopes, offline `diff`
-> comparison and diagnostics, and opt-in live key operations), with memory-scan discovery,
+> comparison and diagnostics, opt-in live key operations, and event-log streaming
+> to stdout with `--event-log -`), with memory-scan discovery,
 > `C_GetInterface`, multi-module capture, owned-child live discovery,
 > per-edge entry counts, FULL object-attribute capture in release builds
 > (P0 stays an explicit option), repeatable `--exclude-module`, and schema v3; its

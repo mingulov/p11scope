@@ -217,12 +217,18 @@ running can, intermittently, end without per-key operation tracking
 (reported as `bootstrap_unavailable`). Its calls and counts are still
 recorded. The fix is planned for 0.7.1.
 
-### Exiting multi-threaded program counted as a lost load link
+### Main thread exits first: a later library load can go unreported
 
-On a busy host, a multi-threaded program that exits during a
-`--system` capture may be counted as one lost library-load link
-(`task_uprobe_link_losses`); the count errs on the side of reporting a
-loss. The fix is planned for 0.7.1.
+When a program's main thread ends on its own (`pthread_exit`) while
+its other threads keep running, p11scope stops seeing that program's
+library loads. This is counted as a lost load link
+(`task_uprobe_link_losses`). The count is withdrawn at capture end
+when the whole program has exited by then and none of its threads was
+observed after the main thread ended, because an ordinary exit looks
+the same. So a provider loaded in that window, by threads that then
+did nothing else p11scope watches, can go unreported. Calls to providers
+p11scope already watches are still counted. Seeing those later loads
+needs a kernel-side witness and is 0.7.x work.
 
 ### Test-only: overlay-witness flake
 

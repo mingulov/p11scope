@@ -5563,7 +5563,11 @@ fn leader_exit_records_never_count_as_group_observations() {
     // The exit hooks themselves (kinds 6 and 7) are not member activity.
     let mut engine = Engine::empty();
     engine.note_group_record(&group_record_at(DISCOVERY_KIND_LEADER_EXIT, 7, 100));
-    engine.note_group_record(&group_record_at(DISCOVERY_KIND_LEADER_EXIT_MAPPINGS, 7, 100));
+    engine.note_group_record(&group_record_at(
+        DISCOVERY_KIND_LEADER_EXIT_MAPPINGS,
+        7,
+        100,
+    ));
     assert!(engine.group_last_record_ns.is_empty());
     engine.note_group_record(&group_record_at(DISCOVERY_KIND_LOADER, 7, 0));
     assert_eq!(

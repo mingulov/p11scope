@@ -737,6 +737,14 @@ pub struct Engine {
     // None means at least one pending EXIT has unknown ordering.
     pending_leader_exit_order: BTreeMap<ProcessViewId, Option<u64>>,
     counted_leader_exit_views: BTreeSet<ProcessViewId>,
+    /// Earliest known leader-exit hook time per view with a queued
+    /// assessment (`None`: some exit of the view has unknown order). Kernel
+    /// lifecycle timestamps only, pruned when the view is released.
+    leader_exit_hook_ns: BTreeMap<ProcessViewId, Option<u64>>,
+    /// Latest kernel hook time of any dispatched record from each thread
+    /// group other than its own leader-exit hooks (`u64::MAX`: an unstamped
+    /// record, unknown order). Bounded by retained pids plus one batch.
+    group_last_record_ns: BTreeMap<u32, u64>,
     /// Views with a matched EXEC whose PID-bound static links may be dead
     /// while still recorded as attached. At most one marker per retained
     /// view: the next refresh rearms even an unchanged plan, ordinary-delta
@@ -11208,6 +11216,8 @@ impl Engine {
             pending_leader_exit_views: BTreeSet::new(),
             pending_leader_exit_order: BTreeMap::new(),
             counted_leader_exit_views: BTreeSet::new(),
+            leader_exit_hook_ns: BTreeMap::new(),
+            group_last_record_ns: BTreeMap::new(),
             exec_rearm_views: BTreeMap::new(),
             pid_descendant_gaps: 0,
             run_tree_handed_back: 0,
@@ -12957,6 +12967,7 @@ impl Engine {
         self.pending_loader_arm_scans.retain(|key| key.view != id);
         self.exec_rearm_views.remove(&id);
         self.pending_leader_exit_order.remove(&id);
+        self.leader_exit_hook_ns.remove(&id);
         if let Some(seed) = self.trace_by_view.get(&id).copied() {
             if let Some(proof) = &self.trace_owner
                 && let Some(candidate) = self.trace_seeds.get(&seed)
@@ -20873,10 +20884,14 @@ impl Engine {
         // Terminal re-poll: mid-capture settlement samples the retained
         // pidfd once, so a group torn down across the sample counts
         // eagerly as a link loss. At capture end the same pidfd answers
-        // definitively: a group that provably fully exited left no
-        // surviving member, so its assessment resolves as an ordinary
-        // whole-group exit. Still-live, unanswerable, and already-removed
-        // views keep the fail-closed count. Bounded: one poll per view.
+        // definitively. An assessment resolves as an ordinary whole-group
+        // exit only when the group provably fully exited AND no record from
+        // the group carries a stamp at or after its leader-exit hook: a
+        // later record proves a member ran userspace while the pid-bound
+        // links were dead (a leader that left by pthread_exit), so that
+        // loss stays. Still-live, unanswerable, unknown-order and
+        // already-removed views keep the fail-closed count. Bounded: at
+        // most two timeout-0 polls per retained view, at finish only.
         self.prune_exited_pending_leader_exit_views();
         finalize_pending_leader_exit_views(
             &mut self.pending_leader_exit_views,
@@ -20900,15 +20915,15 @@ impl Engine {
     }
 
     /// Drops terminal pending assessments whose retained generation
-    /// provably fully exited: an ordinary whole-group exit discovered at
-    /// capture end, not a lost link. The fail-closed terminalizer then
-    /// counts only what is still live or unanswerable.
+    /// provably fully exited with no member observed after the leader
+    /// exit: an ordinary whole-group exit discovered at capture end, not a
+    /// lost link. The fail-closed terminalizer then counts the rest.
     fn prune_exited_pending_leader_exit_views(&mut self) {
         let exited: Vec<ProcessViewId> = self
             .pending_leader_exit_views
             .iter()
             .copied()
-            .filter(|view| self.retained_view_exited(*view))
+            .filter(|view| self.leader_exit_withdrawable(*view))
             .collect();
         for view in exited {
             self.pending_leader_exit_views.remove(&view);
@@ -20917,32 +20932,45 @@ impl Engine {
     }
 
     /// Withdraws eagerly counted link losses whose retained generation
-    /// provably fully exited by capture end: no member survived to escape
-    /// observation, so the teardown sample was a transient. The counted
-    /// set and the counter move together, so a withdrawn view frees
-    /// exactly one count and can never double-withdraw.
+    /// provably fully exited by capture end with no member observed after
+    /// the leader exit, so the teardown sample was a transient. This
+    /// includes views counted by the unanswerable-assessment write-off: a
+    /// later proven exit is the same basis as a mid-capture whole-group
+    /// exit. The counted set and the counter move together, so a withdrawn
+    /// view frees exactly one count and can never double-withdraw.
     fn withdraw_exited_counted_leader_exit_losses(&mut self) {
         let exited: Vec<ProcessViewId> = self
             .counted_leader_exit_views
             .iter()
             .copied()
-            .filter(|view| self.retained_view_exited(*view))
+            .filter(|view| self.leader_exit_withdrawable(*view))
             .collect();
         for view in exited {
             if self.counted_leader_exit_views.remove(&view) {
                 self.task_uprobe_link_losses = self.task_uprobe_link_losses.saturating_sub(1);
+                self.leader_exit_hook_ns.remove(&view);
             }
         }
     }
 
-    /// True only when the view is still retained and its original
-    /// generation provably exited (retained pidfd poll). Missing views
-    /// and poll errors stay fail-closed.
-    fn retained_view_exited(&self, view: ProcessViewId) -> bool {
+    /// True only when the view is still retained, its leader-exit hook
+    /// time is known, no record from its thread group is stamped at or
+    /// after that time, and its original generation provably exited
+    /// (retained pidfd poll). Missing views, unknown order, post-exit
+    /// activity and poll errors stay fail-closed.
+    fn leader_exit_withdrawable(&self, view: ProcessViewId) -> bool {
+        let Some(Some(exit_ns)) = self.leader_exit_hook_ns.get(&view).copied() else {
+            return false;
+        };
         self.views
             .iter()
             .find(|candidate| candidate.id() == view)
-            .is_some_and(|retained| retained.original_exited() == Ok(true))
+            .is_some_and(|retained| {
+                self.group_last_record_ns
+                    .get(&retained.pid())
+                    .is_none_or(|last| *last < exit_ns)
+                    && retained.original_exited() == Ok(true)
+            })
     }
 
     fn terminal_owner(&self) -> Option<LoaderContextId> {
@@ -22767,6 +22795,26 @@ impl Engine {
         }
     }
 
+    /// Records that `record`'s thread group ran in a kernel hook at its
+    /// stamp. Any kind counts except the group's own leader-exit hooks: a
+    /// later stamp proves a member executed after the leader exited.
+    fn note_group_record(&mut self, record: &DiscoveryRecord) {
+        if matches!(
+            record.kind,
+            DISCOVERY_KIND_LEADER_EXIT | DISCOVERY_KIND_LEADER_EXIT_MAPPINGS
+        ) {
+            return;
+        }
+        let pid = (record.pid_tgid >> 32) as u32;
+        let stamp = if record.hook_ts_ns == 0 {
+            u64::MAX
+        } else {
+            record.hook_ts_ns
+        };
+        let latest = self.group_last_record_ns.entry(pid).or_insert(stamp);
+        *latest = (*latest).max(stamp);
+    }
+
     fn queue_leader_exit_assessment(&mut self, view: ProcessViewId, hook_ts_ns: Option<u64>) {
         let known = hook_ts_ns.filter(|timestamp| *timestamp != 0);
         let newly_pending = self.pending_leader_exit_views.insert(view);
@@ -22776,6 +22824,11 @@ impl Engine {
             self.collected_assessment_lap.dirty = true;
             self.collected_assessment_lap.clean = 0;
         }
+        let earliest = self.leader_exit_hook_ns.entry(view).or_insert(known);
+        *earliest = match (*earliest, known) {
+            (Some(previous), Some(next)) => Some(previous.min(next)),
+            _ => None,
+        };
         let order = self
             .pending_leader_exit_order
             .entry(view)
@@ -22957,6 +23010,7 @@ impl Engine {
         deferred_mismatches: &mut Vec<ProcessViewId>,
     ) -> Result<DiscoveryRecordOutcome> {
         let record = queued.record;
+        self.note_group_record(&record);
         match record.kind {
             DISCOVERY_KIND_FUNCTION_LIST_RETURN | DISCOVERY_KIND_INTERFACE_LIST_ELEMENT_RETURN => {
                 self.process_export_record(&record, session, additions_allowed, pending_views)
@@ -30748,6 +30802,8 @@ impl Engine {
             }
         };
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
+        self.group_last_record_ns
+            .retain(|pid, _| retained_pids.contains(pid));
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             deferred_exits.extend(queued.extract_if(.., |queued| {
@@ -30968,6 +31024,8 @@ impl Engine {
         let mut records = queued;
 
         let retained_pids: BTreeSet<_> = self.views.iter().map(ProcessView::pid).collect();
+        self.group_last_record_ns
+            .retain(|pid, _| retained_pids.contains(pid));
         let mut deferred_exits = Vec::new();
         if self.admits_generations() {
             // Move-only: the deferred exits move out in encounter order;

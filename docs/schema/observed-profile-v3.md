@@ -440,9 +440,11 @@ here proves a process did not map a watched provider.
 records whose retained process generation proved that a member of the process
 group remained live. It is settled from the generation-bound process view, not
 from an independent process probe, and is counted at most once per process
-view. A nonzero value closes that view's owned selection coverage and forces
-`PARTIAL`; it is not merged into process-tracking or generic discovery-loss
-counters.
+view. It is assessed at capture end: a matched record whose retained generation
+provably fully exited by capture end, with no discovery record from its thread
+group stamped at or after its leader-exit hook, contributes 0. A nonzero value
+closes that view's owned selection coverage and forces `PARTIAL`; it is not
+merged into process-tracking or generic discovery-loss counters.
 
 `abi_refusals` is a u64 count of scoped probe processing refused because the
 execution-mode selector is unsupported or does not match the target-width

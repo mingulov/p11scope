@@ -4636,6 +4636,32 @@ fn combine_detach<T>(terminal: Result<T>, detach: Result<()>) -> Result<T> {
     }
 }
 
+/// Names a handed-back survivor on stderr with the note the settlement
+/// stored when it committed the handoff. Takes the note, so each
+/// committed handoff prints at most once whichever path reaches here
+/// first (an error path, a quiesce-error settle, an error-end loop
+/// settlement or the terminal block). A handoff that is only staged
+/// (a duration expiry awaiting its outer commit) prints nothing yet:
+/// its child is not handed back until that commit succeeds.
+fn emit_stored_handoff_note(owned: &mut Owned) {
+    if let Some(note) = take_committed_handoff_note(&owned.pending_handoff, &mut owned.handoff_note)
+    {
+        emit_capture_diagnostic(&note);
+    }
+}
+
+/// The stored note, taken, once its handoff is committed; `None` while a
+/// handoff is still staged (the note stays for the commit's print).
+fn take_committed_handoff_note(
+    pending_handoff: &Option<OwnedChild>,
+    handoff_note: &mut Option<String>,
+) -> Option<String> {
+    if pending_handoff.is_some() {
+        return None;
+    }
+    handoff_note.take()
+}
+
 fn finish_capture_error(
     error: anyhow::Error,
     engine: &mut Engine,
@@ -4648,9 +4674,7 @@ fn finish_capture_error(
             let finish = owned.finish(engine, session, CaptureEnd::Error, signals);
             // The error path never reaches the terminal print: name the
             // handed-back survivor here, before the error surfaces.
-            if let Some(note) = owned.handoff_note.as_deref() {
-                emit_capture_diagnostic(note);
-            }
+            emit_stored_handoff_note(owned);
             finish
         }
         None => Ok(()),
@@ -4673,16 +4697,20 @@ fn finish_capture_loop(
         Ok(end) => end,
         Err(error) => return Err(finish_capture_error(error, engine, session, owned, signals)),
     };
-    if let Some(owned) = owned.take()
-        && let Err(error) = owned.finish(engine, session, end, signals)
-    {
-        // A handoff the settlement committed before the failure must
-        // still name its survivor: the `None` error path below cannot
-        // print the stored note.
-        if let Some(note) = owned.handoff_note.as_deref() {
-            emit_capture_diagnostic(note);
+    if let Some(owned) = owned.take() {
+        if let Err(error) = owned.finish(engine, session, end, signals) {
+            // A handoff the settlement committed before the failure must
+            // still name its survivor: the `None` error path below cannot
+            // print the stored note.
+            emit_stored_handoff_note(owned);
+            return Err(finish_capture_error(error, engine, session, None, signals));
         }
-        return Err(finish_capture_error(error, engine, session, None, signals));
+        // An error end may never reach the terminal block (a sealed
+        // failed-loop report returns an error after publication), so
+        // its survivor is named at settlement.
+        if end == CaptureEnd::Error {
+            emit_stored_handoff_note(owned);
+        }
     }
     Ok(end)
 }
@@ -5335,9 +5363,7 @@ fn run_owned_inner_with_host(
     // The note is the one the settlement stored when it committed the
     // handoff, so an event-budget handoff never prints the duration text.
     // Still exit 0 — a deliberate handoff is observer success.
-    if let Some(note) = owned.handoff_note.as_deref() {
-        emit_capture_diagnostic(note);
-    }
+    emit_stored_handoff_note(&mut owned);
     // A nonzero child status is named on stderr: the observer exits
     // with it, and that exit must never be silent about whose status
     // it is. A clean exit needs no line; a handed-back child has none.
@@ -7856,7 +7882,13 @@ fn capture_profile(
                 &mut settle_context,
                 |context| context.0.note_capture_loop_failure(),
                 |context, end| match context.2.as_deref_mut() {
-                    Some(owned) => owned.finish(context.0, context.1, end, interrupted),
+                    Some(owned) => {
+                        let settled = owned.finish(context.0, context.1, end, interrupted);
+                        // A quiesce failure never reaches the terminal
+                        // print: name a handed-back survivor here.
+                        emit_stored_handoff_note(owned);
+                        settled
+                    }
                     None => Ok(()),
                 },
                 |context| {
@@ -8959,7 +8991,13 @@ fn capture_trace(
                 &mut settle_context,
                 |context| context.0.note_capture_loop_failure(),
                 |context, end| match context.2.as_deref_mut() {
-                    Some(owned) => owned.finish(context.0, context.1, end, interrupted),
+                    Some(owned) => {
+                        let settled = owned.finish(context.0, context.1, end, interrupted);
+                        // A quiesce failure never reaches the terminal
+                        // print: name a handed-back survivor here.
+                        emit_stored_handoff_note(owned);
+                        settled
+                    }
                     None => Ok(()),
                 },
                 // Trace `-o` is a live stream, not a sealed report:
@@ -14897,13 +14935,92 @@ mod tests {
             .expect("terminal handoff block end moved")
             .0;
         assert!(
-            terminal.contains("owned.handoff_note"),
+            terminal.contains("emit_stored_handoff_note(&mut owned)"),
             "the terminal handoff note must come from the settlement"
         );
         assert!(
             !terminal.contains("format_handoff_note("),
             "the terminal path must not format its own handoff note"
         );
+    }
+
+    /// An error-end settlement hands a live child back and stores its
+    /// note; the print helper yields that note exactly once (the failed-
+    /// loop seal and the quiesce-error settle both rely on it).
+    #[test]
+    fn an_error_end_handoff_names_its_live_child_once() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        let mut note = settle_owned_child(
+            &mut retained,
+            CaptureEnd::Error,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert!(still_running, "the live child is handed back");
+        assert!(pending.is_none(), "an error-end handoff commits at once");
+        assert_eq!(
+            take_committed_handoff_note(&pending, &mut note),
+            Some(format_observer_end_handoff_note(CaptureEnd::Error, pid))
+        );
+        assert_eq!(
+            take_committed_handoff_note(&pending, &mut note),
+            None,
+            "a committed handoff prints at most once"
+        );
+        // SAFETY: signaling and reaping the exact handed-back child only.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+            pid as libc::pid_t
+        );
+    }
+
+    /// A duration handoff is only staged at settlement: no note prints
+    /// until its outer commit, so a later abort can never contradict a
+    /// "handed back" line already on stderr.
+    #[test]
+    fn a_staged_duration_handoff_prints_nothing_until_committed() {
+        let mut child = spawn("/bin/sleep", &["30"]);
+        child.release().unwrap();
+        let signals = SignalState::new();
+        let mut retained = Some(child);
+        let mut pending = None;
+        let mut exit_code = None;
+        let mut requested_kill = false;
+        let mut still_running = false;
+        let mut note = settle_owned_child(
+            &mut retained,
+            CaptureEnd::DurationExpired,
+            true,
+            false,
+            &signals,
+            &mut pending,
+            &mut exit_code,
+            &mut requested_kill,
+            &mut still_running,
+        )
+        .unwrap();
+        assert!(pending.is_some(), "a duration handoff stays staged");
+        assert!(note.is_some(), "the staged note is stored");
+        assert_eq!(take_committed_handoff_note(&pending, &mut note), None);
+        assert!(note.is_some(), "the note waits for the commit");
+        // Dropping the staged handoff SIGKILLs and reaps the sleeper.
+        drop(pending.take());
     }
 
     /// Every settlement that can commit a handoff names the survivor on

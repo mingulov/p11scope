@@ -493,11 +493,17 @@ enum StagedItem {
 /// the seal state, and collection consumes staged records first, then
 /// the ring directly once the queue runs dry. Positions and cuts stay
 /// in ring coordinates, so bounds, lineage and post-Q checks behave
-/// exactly as on the bare ring; an unstaged queue is transparent.
+/// exactly as on the bare ring for stops at or past the staged span;
+/// an unstaged queue is transparent. A bounded stop below the staged
+/// span is a caller bug and refuses loudly: production stops are
+/// producer positions taken after staging, so they never sit there.
 ///
 /// Invariants (each pinned by a unit test below):
 /// - order and exactly-once: staging appends in pull order and every
 ///   pulled byte is consumed exactly once, staged or direct;
+/// - a bounded read refuses loudly when the queue is non-empty and
+///   the stop sits below the inner cursor, instead of serving a
+///   trimmed prefix the bare ring would not serve;
 /// - the logical consumer moves only on consumption, never on staging,
 ///   so cuts chain across interleaved staging and collection;
 /// - kernel discards observed while pulling surface as markers that
@@ -701,6 +707,15 @@ impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
         &mut self,
         stop: usize,
     ) -> Result<BoundedRecord<impl Deref<Target = [u8]> + '_>> {
+        // A stop below the staged span cannot read like the bare
+        // ring: staged bytes already passed it, and per-entry spans
+        // may straddle it. Refuse loudly instead of misreading.
+        if !self.fifo.is_empty() && stop < self.inner.consumer() {
+            anyhow::bail!(
+                "bounded read stop {stop} is below the staged span (inner cursor {})",
+                self.inner.consumer()
+            );
+        }
         loop {
             match self.fifo.front() {
                 Some(StagedItem::Bytes { span, .. }) => {
@@ -735,10 +750,22 @@ impl<S: BoundedRecordSource> BoundedRecordSource for StagedEvents<S> {
             Pending,
             Reached,
         }
-        let read = match self.inner.bounded_record(stop)? {
+        // Aya may have skipped discards before refusing: convert to
+        // an owned outcome first (ending the ring borrow), then resync
+        // the cursor and the loss count exactly as a served read does
+        // before propagating the refusal.
+        let owned = self.inner.bounded_record(stop).map(|read| match read {
             BoundedRecord::Item(item) => OwnedRead::Item(item.to_vec()),
             BoundedRecord::Pending => OwnedRead::Pending,
             BoundedRecord::Reached => OwnedRead::Reached,
+        });
+        let read = match owned {
+            Ok(read) => read,
+            Err(error) => {
+                self.consumed_to = self.inner.consumer();
+                self.sync_direct_discards();
+                return Err(error);
+            }
         };
         match read {
             OwnedRead::Item(bytes) => {

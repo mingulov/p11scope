@@ -10094,7 +10094,10 @@ mod tests {
     /// `Owned::finish` requests the stop gate and cleans up before it
     /// settles, settlement has that one call site, and every other
     /// production reap precedes the first arm (setup and preflight
-    /// failures return before the coordinator exists).
+    /// failures return before the coordinator exists). Observer-side ends
+    /// settle through `settle_observer_end_without_kill`, which is called
+    /// only from `settle_owned_child`, so its reaps stay inside the same
+    /// post-cleanup funnel.
     /// The capture loops route every end (exit, error, signal, timeout,
     /// kill-on-timeout, second SIGINT) through that same finish; that
     /// routing is an audited property of `run.rs`, documented here:
@@ -10144,6 +10147,13 @@ mod tests {
             2,
             "settle_owned_child must keep its definition plus the one finish call"
         );
+        // The observer-side settlement is defined once and called from
+        // settle_owned_child only, so its reaps stay in the funnel.
+        assert_eq!(
+            offsets_of(production, "settle_observer_end_without_kill(").len(),
+            2,
+            "settle_observer_end_without_kill must keep its definition plus the one settle call"
+        );
         // No new direct reaps: every production terminate_and_reap call
         // stays in its audited function.
         let mut reapers = std::collections::BTreeSet::new();
@@ -10171,6 +10181,7 @@ mod tests {
                 "abort_pending_handoff".to_string(),
                 "combine_setup_failure".to_string(),
                 "run_owned_inner_with_host".to_string(),
+                "settle_observer_end_without_kill".to_string(),
                 "settle_owned_child".to_string(),
                 "wait_for".to_string(),
             ]),

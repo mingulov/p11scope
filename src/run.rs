@@ -3952,8 +3952,9 @@ pub(crate) fn run_profile_loop_for_test(
 #[derive(Debug, Clone)]
 pub struct OwnedRunOutcome {
     /// The child's status as a shell would report it (128 + signal when
-    /// signalled). `None` exactly when `--duration` expired without
-    /// `--kill-on-timeout` and the child was handed back still running.
+    /// signalled). `None` exactly when the child was handed back still
+    /// running: an expired `--duration` without `--kill-on-timeout`, or
+    /// an exhausted event budget.
     pub child_exit_code: Option<i32>,
     /// True when `--kill-on-timeout` was requested and the timeout kill
     /// reaped a live child by signal: a normal end, reported as

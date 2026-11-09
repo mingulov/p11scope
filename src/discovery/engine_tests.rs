@@ -49592,6 +49592,32 @@ fn quiesced_discovery_overflow_publishes_unfinished_terminal_work() {
     );
 }
 
+/// A terminal discovery drain that fails on a signalled stop files
+/// the same unfinished-work shape: the seal proceeds from partial
+/// state with a named gap instead of suppressing the report.
+#[test]
+fn terminal_discovery_failure_publishes_unfinished_terminal_work() {
+    let (mut engine, _dir) = engine_over_cgroup_naming(&[]);
+    assert_eq!(engine.discovery_truncated, 0);
+    engine.note_terminal_discovery_failure();
+    assert_eq!(
+        engine.discovery_truncated, 1,
+        "unfinished terminal work fails strict lossless"
+    );
+    assert!(
+        engine
+            .counters
+            .object_skips
+            .iter()
+            .any(|skip| skip.subject == "terminal discovery drain"
+                && skip
+                    .reason
+                    .contains("could not be published on a signalled stop")),
+        "the failure publishes explicit unfinished evidence: {:?}",
+        engine.counters.object_skips
+    );
+}
+
 /// H5 combined-cap scenario: 4,096 live credits divided among the session
 /// FIFO (1,500 staged), engine pending (2,000 deferred), an active batch
 /// tail (500 pulled) and a nested collection (96), with the 4,097th raw

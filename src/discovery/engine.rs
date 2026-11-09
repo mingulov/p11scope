@@ -30312,6 +30312,18 @@ impl Engine {
         );
     }
 
+    /// A terminal discovery drain that failed on a signalled stop
+    /// files unfinished work and keeps the committed plan: the seal
+    /// proceeds from partial state instead of suppressing the report
+    /// the signal asked for.
+    pub(crate) fn note_terminal_discovery_failure(&mut self) {
+        self.discovery_truncated = self.discovery_truncated.saturating_add(1);
+        self.mark_live_loss(
+            "terminal discovery drain",
+            "the terminal discovery batch could not be published on a signalled stop; terminal work is unfinished",
+        );
+    }
+
     /// Notes the current held occupancy (pending plus terminal plus the
     /// batch's in-flight records) into the diagnostic high-water mark.
     fn note_discovery_held_high_water(&mut self, in_flight: usize) {

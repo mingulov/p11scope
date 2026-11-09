@@ -585,8 +585,9 @@ observer's environment unchanged
 except `SUDO_*`/`P11SCOPE_*` control variables (named on stderr under -v when
 withheld), and no unrelated inherited file descriptors. Its executable is opened
 by the observer (root under sudo) before fork and executed by descriptor, so
-the target account needs no directory search permission on its path; scripts
-must be invoked through an explicit ELF interpreter such as `/bin/sh script`.
+the target account needs no directory search permission on its path; a `#!`
+script runs by its path with the kernel resolving its interpreter, after the
+child re-verifies the path still names the opened file.
 The sudo path restores the invoker's supplementary groups from the account
 database (glibc may return only the primary group) and home environment
 (`HOME`/`USER`/`LOGNAME`/`SHELL` from the passwd entry, `XDG_RUNTIME_DIR`

@@ -481,28 +481,43 @@ fn j3_nonexistent_and_exited_pids_share_one_missing_line() {
 }
 
 #[test]
-fn j3_script_target_names_interpreter_fix() {
+fn j3_script_target_runs_like_any_program() {
     let dir = std::env::temp_dir().join(format!("ux-journeys-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let script = dir.join("hello.sh");
+    // Console-script shape: executable, no extension.
+    let script = dir.join("hello-tool");
     std::fs::write(&script, "#!/bin/sh\necho hello-from-script\n").unwrap();
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let refused = run(&["run", "--", &script.to_string_lossy()]);
-    let _ = std::fs::remove_dir_all(&dir);
-    // This refusal is already specific and actionable; the pin keeps it so.
-    assert_eq!(refused.code, Some(1));
-    assert!(
-        refused.stderr.contains("must be an ELF executable"),
-        "{}",
-        refused.stderr
-    );
-    assert!(
-        refused
-            .stderr
-            .contains("invoke scripts through an interpreter"),
-        "{}",
-        refused.stderr
-    );
+    let script_arg = script.to_string_lossy().into_owned();
+    let available = capture_available();
+    if !available {
+        eprintln!("P11SCOPE_TEST_BRANCH=unavailable");
+        require_capture_positive("j3_script_target_runs_like_any_program");
+        // Without privilege the script passes the name check and reaches
+        // the same host admission as an ELF: identical stderr proves it.
+        let scripted = run(&["run", "--", script_arg.as_str()]);
+        let elf = run(&["run", "--", "/bin/true"]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(scripted.code, elf.code, "{}", scripted.stderr);
+        assert_eq!(scripted.stderr, elf.stderr, "script vs ELF admission");
+        assert!(
+            !scripted.stderr.contains("must be an ELF executable"),
+            "{}",
+            scripted.stderr
+        );
+    } else {
+        eprintln!("P11SCOPE_TEST_BRANCH=positive");
+        // With privilege the script runs under observation: its output
+        // passes through and its status is the observer's status.
+        let outcome = run(&["run", "--", script_arg.as_str()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(outcome.code, Some(0), "{}", outcome.stderr);
+        assert!(
+            outcome.stdout.contains("hello-from-script"),
+            "{}",
+            outcome.stdout
+        );
+    }
 }
 
 #[test]

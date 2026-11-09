@@ -24,7 +24,7 @@ use crate::{metrics, process, render, scope, semantics, trace, uretprobe_hazard}
 use anyhow::{Context as _, Result, anyhow};
 use p11scope_manifest::elf::{ElfAbi, ElfSnapshot};
 use std::collections::BTreeSet;
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::fs::File;
 use std::io;
 use std::io::{Seek as _, SeekFrom, Write};
@@ -400,9 +400,10 @@ fn resolve_program(program: &OsStr) -> io::Result<PathBuf> {
 /// process environment. Like `execvp`, an earlier directory's readable
 /// but non-executable shadow is skipped for a later executable
 /// candidate (Sol-full F8). Descriptor pinning stays with the callers —
-/// they open the returned path and exec through the pinned fd — and the
-/// ELF guard stays in [`check_launch_file`]. When candidates exist but
-/// none is executable, the refusal keeps `PermissionDenied` (again like
+/// they open the returned path and exec through the pinned fd (ELF) or
+/// the re-verified path (scripts) — and the launch-file guard stays in
+/// [`classify_launch_file`]. When candidates exist but none is
+/// executable, the refusal keeps `PermissionDenied` (again like
 /// `execvp`); a name found nowhere is `NotFound`.
 fn resolve_program_in_path(program: &OsStr, path: Option<&OsStr>) -> io::Result<PathBuf> {
     if program.as_bytes().contains(&b'/') {
@@ -433,11 +434,30 @@ fn resolve_program_in_path(program: &OsStr, path: Option<&OsStr>) -> io::Result<
     Err(io::Error::from(io::ErrorKind::NotFound))
 }
 
-/// The launch-file checks: a regular executable file, and ELF (scripts
-/// must go through an interpreter). Shared by the fail-fast pre-fork
-/// refusal and `OwnedChild::spawn`'s own guard, so the early refusal
-/// never weakens the guard at the fork.
-fn check_launch_file(launch_file: &File) -> io::Result<()> {
+/// What an owned launch file is: a directly-executable ELF, or a
+/// `#!` script the kernel runs through its interpreter. Anything else
+/// cannot run here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LaunchKind {
+    Elf,
+    Script,
+}
+
+/// Whether `launch_file` starts with a `#!` line: a bounded two-byte
+/// sniff, so only the magic is read, never the token or the body.
+fn is_script_launch(launch_file: &File) -> bool {
+    use std::os::unix::fs::FileExt as _;
+    let mut magic = [0u8; 2];
+    launch_file.read_at(&mut magic, 0).is_ok() && magic == *b"#!"
+}
+
+/// The launch-file checks: a regular executable file, and either ELF
+/// or a `#!` script. The single metadata read also yields the opened
+/// identity a script exec re-verifies at the barrier, so the kind and
+/// the identity describe the same file. Shared by the fail-fast
+/// pre-fork refusal and `OwnedChild::spawn`'s own guard, so the early
+/// refusal never weakens the guard at the fork.
+fn classify_launch_file(launch_file: &File) -> io::Result<(LaunchKind, FileIdentity)> {
     let metadata = launch_file.metadata()?;
     if !metadata.is_file() || metadata.mode() & 0o111 == 0 {
         return Err(io::Error::new(
@@ -445,15 +465,38 @@ fn check_launch_file(launch_file: &File) -> io::Result<()> {
             "owned command must be a regular executable file",
         ));
     }
-    if let Err(error) = ElfSnapshot::read(launch_file) {
-        return Err(io::Error::new(
+    let identity = FileIdentity::of(&metadata);
+    match ElfSnapshot::read(launch_file) {
+        Ok(_) => Ok((LaunchKind::Elf, identity)),
+        Err(_) if is_script_launch(launch_file) => Ok((LaunchKind::Script, identity)),
+        Err(error) => Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            format!(
-                "owned command must be an ELF executable: {error}; invoke scripts through an interpreter"
-            ),
-        ));
+            format!("owned command must be an ELF executable or a #! script: {error}"),
+        )),
     }
-    Ok(())
+}
+
+/// The exec-frame errno the pre-exec child sends when a script's path
+/// no longer names the file the observer opened. Negative, so it can
+/// never be confused with a kernel errno from execve itself.
+const SCRIPT_IDENTITY_MISMATCH: i32 = -1;
+
+/// Whether `path` still names the file the observer opened: device,
+/// inode, size and ctime all equal the opened identity. Raw syscalls
+/// only, so the pre-exec child can call it after dropping privileges
+/// and before exec. Any failure — an unstatable path included —
+/// mismatches: fail-closed, matching what execve itself would do.
+fn launch_path_matches_opened(path: &CStr, opened: FileIdentity) -> bool {
+    // SAFETY: stat writes only its output struct; the path pointer lives.
+    let mut current: libc::stat = unsafe { std::mem::zeroed() };
+    if unsafe { libc::stat(path.as_ptr(), &mut current) } != 0 {
+        return false;
+    }
+    current.st_dev == opened.device
+        && current.st_ino == opened.inode
+        && current.st_size as u64 == opened.size
+        && current.st_ctime == opened.ctime
+        && current.st_ctime_nsec == opened.ctime_ns
 }
 
 /// Where snapd installs its command launchers: symlinks to `/usr/bin/snap`,
@@ -666,36 +709,35 @@ fn invoker_can_read_file(meta_uid: u32, meta_gid: u32, mode: u32, uid: u32, gid:
     }
 }
 
-/// A script launch file refused with its interpreter and the attach
-/// alternative. `token` is `None` when the invoker could not read the
-/// file: the refusal then names no interpreter. Control bytes in the
-/// token and the path render escaped: the refusal is printed to a
-/// terminal.
-fn script_refusal_error(resolved: &Path, token: Option<&str>, error: &io::Error) -> io::Error {
-    let resolved_text = resolved.display().to_string();
-    let resolved = crate::render::escape_controls(&resolved_text);
-    let message = match token {
-        Some(token) => {
-            let token = crate::render::escape_controls(token);
-            format!(
-                "{error}. {resolved} is a script for {token}: run `p11scope run -- {token} \
-                 {resolved}` (a script that starts a snap application still cannot run here), \
-                 or {ATTACH_HINT}"
-            )
-        }
-        None => format!(
-            "{error}. {resolved} is a script: run `p11scope run -- <interpreter> {resolved}` \
-             with its interpreter (the `#!` line is not shown because the invoking user \
-             cannot read this file; a script that starts a snap application still cannot run \
-             here), or {ATTACH_HINT}"
-        ),
-    };
-    io::Error::new(error.kind(), message)
+/// The `#!` interpreter token of a script launch file, when the
+/// invoker could read the file itself. The refusal runs as the
+/// observer (possibly root via sudo): an unknown invoker or unreadable
+/// metadata hides the token (fail-closed). Only the first
+/// whitespace-delimited word is ever shown, never flag values.
+fn visible_script_token(launch_file: &File, invoker: Option<(u32, u32)>) -> Option<String> {
+    let token = script_interpreter(launch_file)?;
+    let visible = launch_file
+        .metadata()
+        .ok()
+        .and_then(|meta| {
+            let (uid, gid) = invoker?;
+            Some(invoker_can_read_file(
+                meta.uid(),
+                meta.gid(),
+                meta.mode(),
+                uid,
+                gid,
+            ))
+        })
+        .unwrap_or(false);
+    visible.then_some(token)
 }
 
 /// A script that starts a snap application, refused with the snap reason.
-/// The token is dropped (and every interpolated field escaped) exactly
-/// like [`script_refusal_error`].
+/// `token` is `None` when the invoker could not read the file: the
+/// refusal then names no interpreter. Control bytes in the token, the
+/// name, the launcher and the path render escaped: the refusal is
+/// printed to a terminal.
 fn script_snap_refusal_error(
     resolved: &Path,
     token: Option<&str>,
@@ -726,8 +768,8 @@ fn script_snap_refusal_error(
 }
 
 /// Refuses a command that cannot run as an owned target by name, before
-/// anything is forked. Name errors precede hazard errors: a script is
-/// told about its interpreter before any kernel verdict is consulted.
+/// anything is forked. Name errors precede hazard errors: what cannot
+/// run is refused before any kernel verdict is consulted.
 fn check_owned_target_runnable(
     program: &OsStr,
     args: &[OsString],
@@ -767,50 +809,30 @@ fn check_owned_target_runnable_with(
     }
     let resolved = resolve_program_in_path(program, path)?;
     let launch_file = File::open(&resolved)?;
-    let error = match check_launch_file(&launch_file) {
-        Ok(()) => return Ok(()),
-        Err(error) => error,
-    };
-    let token = if error.kind() == io::ErrorKind::InvalidInput {
-        script_interpreter(&launch_file)
-    } else {
-        None
-    };
-    let Some(token) = token else {
-        return Err(error);
-    };
-    // The refusal runs as the observer (possibly root via sudo): the
-    // token is only shown when the invoker could read the file itself.
-    // An unknown invoker or unreadable metadata hides it (fail-closed).
-    let visible = launch_file
-        .metadata()
-        .ok()
-        .and_then(|meta| {
-            let (uid, gid) = invoker?;
-            Some(invoker_can_read_file(
-                meta.uid(),
-                meta.gid(),
-                meta.mode(),
-                uid,
-                gid,
-            ))
-        })
-        .unwrap_or(false);
-    let token = visible.then_some(token.as_str());
+    // Anything but a runnable ELF or script refuses here, by name,
+    // before anything is forked.
+    let (kind, _) = classify_launch_file(&launch_file)?;
     // A script that starts a snap application (Ubuntu's /usr/bin/firefox
-    // wrapper): the snap reason, not the interpreter detour that would
-    // fail later inside snap-confine. Lstat only: the launcher is a
-    // symlink, and its target's state is irrelevant to the refusal.
-    if let Some(file_name) = resolved.file_name() {
+    // wrapper) still cannot run here: snap-confine needs its file
+    // capabilities, which the owned child's no_new_privs withholds. Lstat
+    // only: the launcher is a symlink, and its target's state is
+    // irrelevant to the refusal.
+    if kind == LaunchKind::Script
+        && let Some(file_name) = resolved.file_name()
+    {
         let launcher = Path::new(SNAP_LAUNCHER_DIR).join(file_name);
         if (probes.exists)(&launcher) {
             let name = file_name.to_string_lossy();
+            let token = visible_script_token(&launch_file, invoker);
             return Err(script_snap_refusal_error(
-                &resolved, token, &name, &launcher,
+                &resolved,
+                token.as_deref(),
+                &name,
+                &launcher,
             ));
         }
     }
-    Err(script_refusal_error(&resolved, token, &error))
+    Ok(())
 }
 
 /// The credential selection for the owned child, before any account
@@ -2084,7 +2106,18 @@ impl OwnedChild {
     ) -> io::Result<Self> {
         let resolved = resolve_program(&program)?;
         let launch_file = File::open(&resolved)?;
-        check_launch_file(&launch_file)?;
+        let (launch_kind, opened_identity) = classify_launch_file(&launch_file)?;
+        // A script runs by path — the kernel resolves its `#!`, which a
+        // descriptor path cannot carry — so the child re-verifies the
+        // path still names this opened file after the barrier hold.
+        let script_exec: Option<(CString, FileIdentity)> = if launch_kind == LaunchKind::Script {
+            let path = CString::new(resolved.as_os_str().as_bytes()).map_err(|_| {
+                io::Error::new(io::ErrorKind::InvalidInput, "script path contains NUL")
+            })?;
+            Some((path, opened_identity))
+        } else {
+            None
+        };
         let prepared = PreparedExecutable::resolve(resolved.as_os_str())
             .ok()
             .flatten();
@@ -2236,7 +2269,17 @@ impl OwnedChild {
                         child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                     }
                 }
-                libc::execve(launch_proc_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                if let Some((script_path, opened)) = script_exec.as_ref() {
+                    // A script runs by path so the kernel resolves its
+                    // `#!` exactly as a direct launch would; the path must
+                    // still name the opened file after the barrier hold.
+                    if !launch_path_matches_opened(script_path, *opened) {
+                        child_exec_failure_errno(exec_writer.as_raw_fd(), SCRIPT_IDENTITY_MISMATCH);
+                    }
+                    libc::execve(script_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                } else {
+                    libc::execve(launch_proc_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
+                }
                 child_exec_failure_errno(exec_writer.as_raw_fd(), last_errno());
             }
         }
@@ -2400,6 +2443,16 @@ impl OwnedChild {
                 }
             })?;
             match drained {
+                ExecDrain::Errno(errno) if errno == SCRIPT_IDENTITY_MISMATCH => {
+                    return Err(ExecHandoffError::Io {
+                        phase: "script identity",
+                        source: io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "the script changed between the observer's check and exec; \
+                             refusing to run a file the observer did not check",
+                        ),
+                    });
+                }
                 ExecDrain::Errno(errno) => {
                     return Err(ExecHandoffError::Exec(ExecFailure {
                         errno,
@@ -4445,9 +4498,6 @@ fn finish_quiesce_error<C>(
     publish: impl FnOnce(&mut C) -> Result<()>,
     detach: impl FnOnce(&mut C) -> Result<()>,
 ) -> anyhow::Error {
-    // Scaffolding: the signalled-stop publish decision lands with the F3
-    // fix; until then the quiesce combiner keeps today's behavior.
-    let _ = signalled;
     match loop_result {
         Ok(end) => {
             let finish = settle(context, end);
@@ -4467,26 +4517,47 @@ fn finish_quiesce_error<C>(
         Err(loop_error) => {
             let combined = also_failed(loop_error, error, "terminal quiescence");
             let finish = settle(context, CaptureEnd::Error);
+            if !signalled {
+                let detach = detach(context);
+                return combine_capture_failure(combined, finish, detach);
+            }
+            // A signalled stop seals from partial state even behind a
+            // failed loop: the signal asked for whatever was captured,
+            // not for silence. Settlement still gates the seal, exactly
+            // as above; both errors stay in the returned chain.
+            let published = match &finish {
+                Ok(()) => Some(publish(context)),
+                Err(_) => None,
+            };
             let detach = detach(context);
-            combine_capture_failure(combined, finish, detach)
+            combine_quiesce_failure(combined, finish, published, detach)
         }
     }
 }
 
 /// A terminal discovery batch that degrades to a named gap on a
 /// signalled stop: a poisoned terminal batch must not suppress the
-/// report the signal asked for. The caller records the gap and the
-/// terminal seal proceeds with the committed plan.
-///
-/// Scaffolding: always propagates; the signalled-stop degradation
-/// lands with the F3 fix.
-#[allow(dead_code)]
+/// report the signal asked for. The caller files the gap through
+/// `note_gap` (the engine keeps the committed plan) and the terminal
+/// seal proceeds. Without a signal the failure propagates unchanged.
 fn seal_terminal_discovery_or_gap(
-    _signalled: bool,
-    _note_gap: impl FnMut(),
+    signalled: bool,
+    mut note_gap: impl FnMut(),
     apply: impl FnOnce() -> Result<bool>,
 ) -> Result<bool> {
-    apply()
+    match apply() {
+        Ok(changed) => Ok(changed),
+        Err(error) if signalled => {
+            note_gap();
+            emit_capture_diagnostic(&format!(
+                "p11scope: terminal discovery failed on a signalled stop; sealing the report \
+                 from partial state: {}",
+                crate::render::escape_controls(&format!("{error:#}")),
+            ));
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
 }
 
 /// A marker probe is not wired in this slice, so the coordinator is told the
@@ -4697,9 +4768,9 @@ fn run_owned_inner_with_host(
     let resolved_command = resolve_program(&program)
         .map_err(|error| anyhow!("run: exec {}: {error}", Path::new(&program).display()))?;
     let owned_command = resolved_command.to_string_lossy();
-    // Name errors precede hazard errors: a script (or a non-executable)
-    // is refused with its interpreter fix before any kernel verdict is
-    // consulted, exactly as `spawn` would refuse it at the fork.
+    // Name errors precede hazard errors: what cannot run is refused
+    // by name before any kernel verdict is consulted, exactly as
+    // `spawn` would refuse it at the fork.
     check_owned_target_runnable(&program, &args.command[1..], args.user.as_deref())
         .map_err(|error| anyhow!("run: starting the owned child: {error}"))?;
     let _host = host()?;
@@ -7662,28 +7733,47 @@ fn capture_profile(
                     poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
+                    let signalled_stop = interrupted.interrupted();
+                    let mut terminal_gap_due = false;
                     let plan_changed = match quiesced {
-                        Some(q) if k0_terminal_active => {
-                            context.0.drain_discovery_terminal_to_position_observed(
-                                context.1,
-                                q.discovery_q,
-                                &mut post_q_discovery,
-                                &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
-                                    k0_tail_records.borrow_mut().push(*record);
-                                },
-                                &mut |count: u64| {
-                                    k0_tail_malformed
-                                        .set(k0_tail_malformed.get().saturating_add(count));
-                                },
-                            )?
-                        }
-                        Some(q) => context.0.drain_discovery_terminal_to_position(
-                            context.1,
-                            q.discovery_q,
-                            &mut post_q_discovery,
+                        Some(q) if k0_terminal_active => seal_terminal_discovery_or_gap(
+                            signalled_stop,
+                            || terminal_gap_due = true,
+                            || {
+                                context.0.drain_discovery_terminal_to_position_observed(
+                                    context.1,
+                                    q.discovery_q,
+                                    &mut post_q_discovery,
+                                    &mut |record: &p11scope_ebpf_common::DiscoveryRecord| {
+                                        k0_tail_records.borrow_mut().push(*record);
+                                    },
+                                    &mut |count: u64| {
+                                        k0_tail_malformed
+                                            .set(k0_tail_malformed.get().saturating_add(count));
+                                    },
+                                )
+                            },
                         )?,
-                        None => context.0.drain_discovery_terminal(context.1)?,
+                        Some(q) => seal_terminal_discovery_or_gap(
+                            signalled_stop,
+                            || terminal_gap_due = true,
+                            || {
+                                context.0.drain_discovery_terminal_to_position(
+                                    context.1,
+                                    q.discovery_q,
+                                    &mut post_q_discovery,
+                                )
+                            },
+                        )?,
+                        None => seal_terminal_discovery_or_gap(
+                            signalled_stop,
+                            || terminal_gap_due = true,
+                            || context.0.drain_discovery_terminal(context.1),
+                        )?,
                     };
+                    if terminal_gap_due {
+                        context.0.note_terminal_discovery_failure();
+                    }
                     note_post_q_record(
                         &mut consumers.stop_quiescence.post_q_discovery,
                         "DISCOVERY",
@@ -8690,14 +8780,29 @@ fn capture_trace(
                     poll_terminal_cancellation();
                     let phase_start = Instant::now();
                     let mut post_q_discovery = false;
+                    let signalled_stop = interrupted.interrupted();
+                    let mut terminal_gap_due = false;
                     let plan_changed = match quiesced {
-                        Some(q) => context.0.drain_discovery_terminal_to_position(
-                            context.1,
-                            q.discovery_q,
-                            &mut post_q_discovery,
+                        Some(q) => seal_terminal_discovery_or_gap(
+                            signalled_stop,
+                            || terminal_gap_due = true,
+                            || {
+                                context.0.drain_discovery_terminal_to_position(
+                                    context.1,
+                                    q.discovery_q,
+                                    &mut post_q_discovery,
+                                )
+                            },
                         )?,
-                        None => context.0.drain_discovery_terminal(context.1)?,
+                        None => seal_terminal_discovery_or_gap(
+                            signalled_stop,
+                            || terminal_gap_due = true,
+                            || context.0.drain_discovery_terminal(context.1),
+                        )?,
                     };
+                    if terminal_gap_due {
+                        context.0.note_terminal_discovery_failure();
+                    }
                     note_post_q_record(
                         &mut consumers.stop_quiescence.post_q_discovery,
                         "DISCOVERY",
@@ -14114,16 +14219,18 @@ mod tests {
     }
 
     #[test]
-    fn owned_child_launch_errors_preserve_elf_reason_and_script_guidance() {
+    fn owned_child_launch_errors_preserve_the_elf_reason() {
         let directory = tempfile::tempdir().unwrap();
         let x32 = [
             0x7f, b'E', b'L', b'F', 1, 1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 2, 0, 62, 0, 1, 0, 0, 0, 0,
             0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 52, 0, 32, 0, 0, 0, 40, 0, 0, 0, 0, 0,
         ];
+        // Scripts spawn (pinned separately); only what is neither ELF
+        // nor script refuses here, with the ELF reason intact.
         for (name, bytes) in [
             ("x32", x32.as_slice()),
             ("malformed-elf", b"\x7fELF".as_slice()),
-            ("script", b"#!/bin/sh\nexit 0\n".as_slice()),
+            ("blob", b"not an executable\n".as_slice()),
         ] {
             let command = directory.path().join(name);
             std::fs::write(&command, bytes).unwrap();
@@ -14138,14 +14245,12 @@ mod tests {
                 .expect("unsupported executable must be refused before fork");
             assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
             assert!(error.to_string().contains(&reason), "{name}: {error}");
-            if name == "script" {
-                assert!(
-                    error
-                        .to_string()
-                        .contains("invoke scripts through an interpreter"),
-                    "{error}"
-                );
-            }
+            assert!(
+                error
+                    .to_string()
+                    .contains("must be an ELF executable or a #! script"),
+                "{name}: {error}"
+            );
         }
     }
 
@@ -14208,6 +14313,31 @@ mod tests {
                 .contains("the script changed between the observer's check and exec"),
             "{failure}"
         );
+    }
+
+    /// The barrier identity check matches the unchanged path and
+    /// mismatches a replacement, an in-place rewrite and a removal.
+    #[test]
+    fn launch_path_check_detects_replacement_rewrite_and_removal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("tool");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let file = File::open(&path).unwrap();
+        let opened = FileIdentity::of(&file.metadata().unwrap());
+        let current =
+            CString::new(std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str())).unwrap();
+        assert!(launch_path_matches_opened(&current, opened));
+        // An in-place rewrite with a new size mismatches.
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n# padding line\n").unwrap();
+        assert!(!launch_path_matches_opened(&current, opened));
+        // A replacement (new inode) mismatches.
+        let swap = dir.path().join("swap");
+        std::fs::write(&swap, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::rename(&swap, &path).unwrap();
+        assert!(!launch_path_matches_opened(&current, opened));
+        // A removal mismatches: the path no longer stats.
+        std::fs::remove_file(&path).unwrap();
+        assert!(!launch_path_matches_opened(&current, opened));
     }
 
     #[test]
@@ -15041,9 +15171,8 @@ mod tests {
             || Err(anyhow::anyhow!("slot 0 refers to unknown candidate module")),
         );
         assert!(gap.get(), "the failure must file its named gap");
-        assert_eq!(
-            changed.unwrap(),
-            false,
+        assert!(
+            !changed.unwrap(),
             "the seal proceeds with the committed plan"
         );
     }
@@ -16838,70 +16967,51 @@ mod tests {
     // ---- Slice 1b-2 error taxonomy (design §10.3) -----------------------
 
     /// Name errors precede hazard errors: the fail-fast target check
-    /// refuses a script with its interpreter fix before any kernel
+    /// refuses what is neither ELF nor script before any kernel
     /// verdict is consulted, exactly as `spawn` would at the fork.
+    /// Scripts pass (pinned separately); a runnable ELF passes too.
     #[test]
     fn unrunnable_targets_are_refused_by_name_before_the_preflight() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("hello.sh");
-        std::fs::write(&script, "#!/bin/sh\necho hello\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let error = check_owned_target_runnable(script.as_os_str(), &[], None).unwrap_err();
+        let blob = dir.path().join("blob");
+        std::fs::write(&blob, "not an executable\n").unwrap();
+        std::fs::set_permissions(&blob, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let error = check_owned_target_runnable(blob.as_os_str(), &[], None).unwrap_err();
         let text = format!("{error}");
-        assert!(text.contains("must be an ELF executable"), "{text}");
         assert!(
-            text.contains("invoke scripts through an interpreter"),
+            text.contains("must be an ELF executable or a #! script"),
             "{text}"
         );
         assert!(check_owned_target_runnable(std::ffi::OsStr::new("/bin/true"), &[], None).is_ok());
     }
 
-    /// A `#!` launcher (Ubuntu's `/usr/bin/firefox`) is named as a script,
-    /// with its interpreter and the attach alternative, not just "unknown
-    /// file magic".
+    /// An unknown invoker (a `--user` that resolves nowhere leaves
+    /// none) hides the interpreter token of a snap-starting script
+    /// refusal (fail-closed) while still naming the snap application.
     #[test]
-    fn script_refusal_names_the_interpreter_and_the_attach_alternative() {
+    fn runnable_check_without_an_invoker_hides_the_token() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("browser");
-        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
+        let script = dir.path().join("firefox");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/firefox \"$@\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let text = check_owned_target_runnable(script.as_os_str(), &[], None)
-            .unwrap_err()
-            .to_string();
-        assert!(
-            text.contains("invoke scripts through an interpreter"),
-            "{text}"
-        );
-        assert!(
-            text.contains(&format!(
-                "{} is a script for /bin/sh: run `p11scope run -- /bin/sh {}`",
-                script.display(),
-                script.display()
-            )),
-            "{text}"
-        );
-        assert!(text.contains("p11scope profile --pid <pid>"), "{text}");
-    }
-
-    /// A `--user` that resolves nowhere leaves the invoker unknown, so the
-    /// script refusal hides the interpreter token (fail-closed) while still
-    /// naming the script and its fix.
-    #[test]
-    fn runnable_check_with_an_unresolvable_user_hides_the_token() {
-        let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("browser");
-        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/browser \"$@\"\n").unwrap();
-        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let text = check_owned_target_runnable(
+        // An unresolvable `--user` leaves no invoker identity; the
+        // snap-starting shape keeps the token-hiding rule under test.
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/firefox");
+        let is_runnable = |_: &Path| false;
+        let resolve_none = |_: &Path| None;
+        let probes = snap_probes(&exists, &is_runnable, &resolve_none);
+        let text = check_owned_target_runnable_with(
             script.as_os_str(),
             &[],
-            Some(OsStr::new("p11scope-definitely-no-such-user")),
+            Some(std::ffi::OsStr::new("")),
+            Path::new("/"),
+            None,
+            &probes,
         )
         .unwrap_err()
         .to_string();
-        assert!(text.contains("is a script: run"), "{text}");
         assert!(
-            text.contains("is not shown because the invoking user"),
+            text.contains("is a script that starts the snap application firefox"),
             "{text}"
         );
         assert!(!text.contains("/bin/sh"), "{text}");
@@ -17198,10 +17308,11 @@ mod tests {
         );
     }
 
-    /// The refusal is printed to a terminal: control bytes in the `#!`
-    /// token and in the resolved path render escaped, never raw.
+    /// The snap-starting script refusal is printed to a terminal:
+    /// control bytes in the `#!` token and in the resolved path render
+    /// escaped, never raw.
     #[test]
-    fn script_refusal_escapes_control_bytes_in_token_and_path() {
+    fn snap_script_refusal_escapes_control_bytes_in_token_and_path() {
         let dir = tempfile::tempdir().unwrap();
         let script = dir.path().join("we\x11ird");
         std::fs::write(&script, "#!bad\x07interp --flag\n").unwrap();
@@ -17209,7 +17320,7 @@ mod tests {
         let invoker = ChildIdentity::for_invoker()
             .ok()
             .map(|identity| (identity.uid, identity.gid));
-        let exists = |_: &Path| false;
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/we\x11ird");
         let is_runnable = |_: &Path| false;
         let resolve_none = |_: &Path| None;
         let probes = snap_probes(&exists, &is_runnable, &resolve_none);
@@ -17241,14 +17352,15 @@ mod tests {
         );
     }
 
-    /// The refusal runs as the observer (possibly root via sudo) but the
-    /// `#!` token is only shown when the invoker could read the file
-    /// itself: owner, primary group, or other read bits decide.
+    /// The snap-starting script refusal runs as the observer (possibly
+    /// root via sudo) but the `#!` token is only shown when the invoker
+    /// could read the file itself: owner, primary group, or other read
+    /// bits decide.
     #[test]
-    fn script_token_is_hidden_from_an_invoker_who_cannot_read_it() {
+    fn snap_script_token_is_hidden_from_an_invoker_who_cannot_read_it() {
         let dir = tempfile::tempdir().unwrap();
-        let script = dir.path().join("guarded.sh");
-        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        let script = dir.path().join("guarded");
+        std::fs::write(&script, "#!/bin/sh\nexec /snap/bin/guarded \"$@\"\n").unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).unwrap();
         let meta = std::fs::metadata(&script).unwrap();
         let (owner, group) = (meta.uid(), meta.gid());
@@ -17256,7 +17368,7 @@ mod tests {
         let other_group = group.wrapping_add(1);
         assert_ne!(other, owner);
         assert_ne!(other_group, group);
-        let exists = |_: &Path| false;
+        let exists = |candidate: &Path| candidate == Path::new("/snap/bin/guarded");
         let is_runnable = |_: &Path| false;
         let resolve_none = |_: &Path| None;
         let probes = snap_probes(&exists, &is_runnable, &resolve_none);
@@ -17277,7 +17389,7 @@ mod tests {
         assert!(text.contains("is a script for /bin/sh"), "{text}");
         let text = refusal(Some((other, other_group)));
         assert!(
-            text.contains("is not shown because the invoking user cannot read this file"),
+            text.contains("is a script that starts the snap application guarded"),
             "{text}"
         );
         assert!(!text.contains("is a script for"), "{text}");
@@ -17287,7 +17399,7 @@ mod tests {
         assert!(text.contains("is a script for /bin/sh"), "{text}");
         let text = refusal(Some((other, other_group)));
         assert!(
-            text.contains("is not shown because the invoking user cannot read this file"),
+            text.contains("is a script that starts the snap application guarded"),
             "{text}"
         );
         // Other-readable: everyone sees the token.
@@ -17456,9 +17568,10 @@ mod tests {
         let resolved =
             resolve_program_in_path(shadow.file_name().unwrap(), Some(path.as_os_str())).unwrap();
         assert_eq!(resolved, std::fs::canonicalize(&tool).unwrap());
-        // Descriptor pinning and the ELF guard are unchanged: the found
-        // candidate still opens and passes the launch-file checks.
-        check_launch_file(&std::fs::File::open(&resolved).unwrap()).unwrap();
+        // Descriptor pinning and the launch-file guard are unchanged:
+        // the found candidate still opens and classifies as ELF.
+        let (kind, _) = classify_launch_file(&std::fs::File::open(&resolved).unwrap()).unwrap();
+        assert_eq!(kind, LaunchKind::Elf);
     }
 
     /// Sol-full F8 twin: with no executable candidate anywhere, a
@@ -22066,10 +22179,23 @@ mod tests {
             assert!(proven.contains("Some(q) =>"));
             assert!(proven.contains("drain_discovery_terminal_to_position("));
             assert!(!proven.contains("drain_discovery_terminal(context.1)"));
-            assert!(after_none.contains("context.0.drain_discovery_terminal(context.1)?"));
+            assert!(after_none.contains("context.0.drain_discovery_terminal(context.1)"));
             assert!(!after_none.contains("to_position"));
             assert!(discovery.contains("note_post_q_record("));
             assert!(discovery.contains("consumers.stop_quiescence.post_q_discovery"));
+            // A signalled stop degrades a poisoned terminal batch to a
+            // named gap instead of suppressing the report: every arm
+            // routes through the shared degradation wrapper, and the
+            // gap files unfinished terminal work.
+            assert_eq!(
+                discovery.matches("seal_terminal_discovery_or_gap(").count(),
+                if function == "capture_profile" { 3 } else { 2 },
+                "{function}: every terminal discovery arm degrades on a signalled stop"
+            );
+            assert!(
+                discovery.contains("note_terminal_discovery_failure()"),
+                "{function}: the gap files unfinished terminal work"
+            );
         }
     }
 

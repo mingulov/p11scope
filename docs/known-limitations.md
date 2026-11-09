@@ -99,27 +99,32 @@ control run. The guests are virtme-ng virtual machines. No 6.9 kernel
 was available in the test cache, so 6.9.12 was not run and the
 fixed-filter boundary there stays unverified; 6.7, 6.8, 6.10 and 6.11
 were not run either. Each item below names its measured kernel range.
+The `inventory --system/--cgroup/--pid` rows below predate the scan
+fallback: at `79108a1c7` they refused with the live gate; current
+builds fall back to scan (exit 0) there.
 
 #### 5.15 and 6.1 refuse live capture
 
-- What the user sees: every live capture — `profile` (including
-  `--mode metrics`), `trace`, `run`, `--system`/`--cgroup` scopes,
-  counter modes and `--select-endpoint` — exits 1 with one line and
-  writes no report:
+- What the user sees: every live capture except default
+  `inventory --capture auto` — `profile` (including `--mode metrics`),
+  `trace`, `run`, `inventory --capture native`, counter modes and
+  `--select-endpoint` — exits 1 with one line and writes no report:
 
   ```
-  p11scope: live capture did not start: attaching p11scope's probes failed (Invalid argument); run 'p11scope doctor' for host readiness, or use 'p11scope inspect --pid N' for a scan without capture.
+  p11scope: live capture did not start: attaching p11scope's probes failed (Invalid argument); run 'p11scope doctor' for host readiness, or use 'p11scope inventory --capture scan' or 'p11scope inspect --pid N' for a scan without capture.
   ```
 
-  Inventory scopes prefix the command (`p11scope: inventory --system:
-  live capture did not start: ...`, same for `--cgroup`). A `run`
+  Native inventory scopes prefix the command (`p11scope: inventory
+  --system: live capture did not start: ...` under `--capture native`,
+  same for `--cgroup`). A `run`
   workload never starts: a guarded `touch` file was never created in
   the 5.15 test run, and on 6.1 the suite recorded the same failing
   checks with no report file either (the stderr text above is the
   retained 5.15 sample).
-- Kernels/conditions: 5.15.221 and 6.1.188 behaved identically: all
-  26 live-capture checks of the guest suite refuse this way on both,
-  plus the `doctor` unready diagnosis (exit 1).
+- Kernels/conditions: 5.15.221 and 6.1.188 behaved identically at
+  `79108a1c7`: all 26 live-capture checks of the guest suite refused
+  this way on both (predating the scan fallback), plus the `doctor`
+  unready diagnosis (exit 1).
 - Why: the functional host probe cannot link uprobe-multi (`Invalid
   argument`), so admission refuses before capture, output changes or
   workload start.
@@ -131,10 +136,11 @@ were not run either. Each item below names its measured kernel range.
 
 #### 5.15 and 6.1 keep scan-only paths
 
-- What the user sees: `inspect --pid N` exits 0; `inventory --pid N`
-  exits 0 with a PARTIAL scan report carrying the gap `native usage
-  feed unavailable` (`p11scope: native usage feed unavailable,
-  continuing with the scan lane: live capture refused (...)`);
+- What the user sees: `inspect --pid N` exits 0; default
+  `inventory --pid N`, `--system` and `--cgroup` exit 0 with a PARTIAL
+  scan report carrying the gap `native usage feed unavailable`
+  (`p11scope: native usage feed unavailable, continuing with the scan
+  lane: call counts unavailable on this host: ...`);
   `doctor` exits 1 with the honest unready diagnosis
   (`Doctor: requested lane unavailable.` and `Next: use a host with
   uprobe-multi (normally Linux 6.6+) for live capture; ...`).

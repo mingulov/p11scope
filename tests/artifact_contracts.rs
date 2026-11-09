@@ -9847,6 +9847,34 @@ fn allowlist_v3_names_the_caller_launcher_chain_row() {
     }
 }
 
+/// The pid-scope caller executable has its own allowlist-v3 row: the
+/// status paragraph lists the section, its anchor matches the heading,
+/// and the row names the published field, the pin binding, the two
+/// failure reasons and the mid-capture exec limitation.
+#[test]
+fn allowlist_v3_names_the_pid_scope_caller_row() {
+    let text = read("docs/privacy/allowlist-v3.md");
+    let heading = "## Pid-scope caller executable (v0.7.0)";
+    assert!(
+        text.lines().any(|line| line == heading),
+        "allowlist-v3 lost the pid-scope caller executable section"
+    );
+    assert!(
+        text.contains("[pid-scope caller executable](#pid-scope-caller-executable-v070)"),
+        "the status paragraph must list the pid-scope caller executable section"
+    );
+    let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    for marker in [
+        "capture.caller",
+        "still_the_same",
+        "target exe link unreadable",
+        "target exited before its exe link was read",
+        "mid-capture exec",
+    ] {
+        assert!(flat.contains(marker), "the caller row must name {marker:?}");
+    }
+}
+
 /// F16 residual (review item 1): the allowlist-v3 PQC section states the
 /// implemented publication rule — the field publishes the classified code
 /// `1..=12` whenever the word is in range, whatever the key type, and only

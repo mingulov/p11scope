@@ -10829,6 +10829,46 @@ mod tests {
     }
 
     #[test]
+    fn old_kernel_gap_names_the_host_without_scan_advice() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        // ENOSYS may be a seccomp mask rather than kernel age, so the
+        // gap names the host; and a run that already fell back to scan
+        // must not advise running the scan lane.
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL)),
+        ] {
+            let mut coordinator = coordinator();
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let lane = open_native_lane_with(
+                CaptureMode::Auto,
+                BackendSelection::Auto,
+                Scope::System,
+                &mut coordinator,
+                |_, _, _| Err(refusal.into()),
+            )
+            .expect("system auto falls back to scan on old-kernel host refusal");
+            assert!(lane.is_none(), "fallback leaves no native lane");
+            coordinator.registry_mut().publish();
+            let reason = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .find(|gap| gap.subject == "native usage feed unavailable")
+                .map(|gap| gap.reason.clone())
+                .expect("fallback records a named gap");
+            assert!(
+                reason.contains("call counts unavailable on this host:"),
+                "{reason}"
+            );
+            assert!(
+                !reason.contains("inventory --capture scan"),
+                "a run that already fell back must not advise scan: {reason}"
+            );
+        }
+    }
+
+    #[test]
     fn system_auto_run_falls_back_to_scan_on_unavailable_host() {
         use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
         let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP));

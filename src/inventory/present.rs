@@ -2285,18 +2285,38 @@ fn loss_gap_count(gaps: &[GapView]) -> usize {
 /// header count stays exact; `--json` carries every item.
 const GAP_GROUPS_SHOWN: usize = 20;
 
+/// Fixed rank of the gap subjects that explain missing counts: they
+/// read before every other group (scope or per-object), in this
+/// order, so the run-wide reason never folds out under pid-less
+/// per-object groups. `None` for every other subject.
+fn count_explaining_rank(subject: &str) -> Option<u8> {
+    const NATIVE_FEED_UNAVAILABLE: &str = "native usage feed unavailable";
+    const CAPTURE_FAILED: &str = "inventory capture failed";
+    if subject == crate::inventory::capture::STOPPED_BEFORE_ATTACH_SUBJECT {
+        Some(0)
+    } else if subject == crate::inventory::capture::ZERO_PASS_GAP_SUBJECT {
+        Some(1)
+    } else if subject == NATIVE_FEED_UNAVAILABLE {
+        Some(2)
+    } else if subject == CAPTURE_FAILED {
+        Some(3)
+    } else {
+        None
+    }
+}
+
 /// The concise gap summary (F1): a `gaps: N` header plus one indented
-/// line per plain subject/reason group, most frequent first, up to
-/// [`GAP_GROUPS_SHOWN`] groups; beyond that one fold line names the
-/// remainder. Plain words only (reusing `gap_plain_*`); per-gap
-/// `gap [` lines stay verbose-only. Counts distinct loss rows like the
-/// coverage line, not `repeats` (JSON carries `repeats`); deleted
-/// mappings read on the notes line instead. Empty when no loss gaps
-/// are retained; suppressed-but-unretained gaps stay in the coverage
-/// line. Scope groups (no caller, module or pid — the run-wide gaps
-/// that explain missing counts) read before per-object groups, so a
-/// single scope row is never buried under frequent object rows; within
-/// each tier the most frequent group still reads first.
+/// line per plain subject/reason group, up to [`GAP_GROUPS_SHOWN`]
+/// groups; beyond that one fold line names the remainder. Plain words
+/// only (reusing `gap_plain_*`); per-gap `gap [` lines stay
+/// verbose-only. Counts distinct loss rows like the coverage line, not
+/// `repeats` (JSON carries `repeats`); deleted mappings read on the
+/// notes line instead. Empty when no loss gaps are retained;
+/// suppressed-but-unretained gaps stay in the coverage line.
+/// Count-explaining subjects read first, in fixed order; then scope
+/// groups (no caller, module or pid) read before per-object groups,
+/// so a single scope row is never buried under frequent object rows;
+/// within each tier the most frequent group still reads first.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
@@ -2313,10 +2333,9 @@ fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
     }
     let mut ranked: Vec<((String, String), (usize, bool))> = groups.into_iter().collect();
     ranked.sort_by(|left, right| {
-        right
-            .1
-            .1
-            .cmp(&left.1.1)
+        count_explaining_rank(&left.0.0)
+            .cmp(&count_explaining_rank(&right.0.0))
+            .then_with(|| right.1.1.cmp(&left.1.1))
             .then_with(|| right.1.0.cmp(&left.1.0))
             .then_with(|| left.0.cmp(&right.0))
     });

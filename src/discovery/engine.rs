@@ -12870,14 +12870,14 @@ impl Engine {
         self.consecutive_dropped_passes = self.consecutive_dropped_passes.saturating_add(1);
         let key = format!("{error:#}");
         let (previous_count, previous_last, first_pass) = {
-            let aggregate = self
-                .dropped_pass_gaps
-                .entry(key.clone())
-                .or_insert(DroppedPassAggregate {
-                    count: 0,
-                    first_pass: pass,
-                    last_pass: pass,
-                });
+            let aggregate =
+                self.dropped_pass_gaps
+                    .entry(key.clone())
+                    .or_insert(DroppedPassAggregate {
+                        count: 0,
+                        first_pass: pass,
+                        last_pass: pass,
+                    });
             let previous = (aggregate.count, aggregate.last_pass, aggregate.first_pass);
             aggregate.count = aggregate.count.saturating_add(1);
             aggregate.last_pass = pass;

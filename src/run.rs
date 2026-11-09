@@ -24914,11 +24914,22 @@ int main(int argc, char **argv) {
     /// this runs in a fork child that shares the test binary's address
     /// space, so every failure exits with a distinct code instead of
     /// unwinding into the harness. Diverges (until SIGKILLed) on success.
-    fn sigkill_probe_intermediate(mut writer: File, sleeper: &Path) -> ! {
+    fn sigkill_probe_intermediate(mut writer: File, sleeper: &Path, test_pid: libc::pid_t) -> ! {
         let exit = |code: i32| -> ! {
             // SAFETY: _exit runs no destructors and flushes nothing.
             unsafe { libc::_exit(code) };
         };
+        // Die with the test: a killed test binary must not leave this
+        // intermediate paused forever, holding the sleeper stopped where
+        // its alarm can never fire. The getppid check closes the race
+        // with a test that died before the prctl.
+        // SAFETY: prctl and getppid with only integer arguments.
+        if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL as libc::c_ulong) } != 0 {
+            exit(10);
+        }
+        if unsafe { libc::getppid() } != test_pid {
+            exit(10);
+        }
         // As a release build spawns: this probe observes production
         // parent-death behaviour, which the test-only signal would change.
         let mut child = match super::spawn_with_production_parent_death(
@@ -24976,6 +24987,8 @@ int main(int argc, char **argv) {
         let fixture_dir = tempfile::tempdir().unwrap();
         let sleeper = build_bounded_sleeper(fixture_dir.path(), 120);
         let (reader, writer) = pipe_pair();
+        // SAFETY: getpid has no arguments.
+        let test_pid = unsafe { libc::getpid() };
         // SAFETY: fork in a test thread; the child never touches a lock
         // (spawn takes none) and exits via _exit on every failure path.
         let parent = unsafe { libc::fork() };
@@ -24983,7 +24996,7 @@ int main(int argc, char **argv) {
         if parent == 0 {
             drop(reader);
             close_inherited_in_test_fork(&writer);
-            sigkill_probe_intermediate(writer, &sleeper);
+            sigkill_probe_intermediate(writer, &sleeper, test_pid);
         }
         // Every failure below unwinds through these guards: the paused
         // intermediate and the orphan are killed and reaped, never left.

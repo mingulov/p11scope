@@ -228,6 +228,16 @@ class ReleaseNoticesTests(unittest.TestCase):
         with self.assertRaisesRegex(self.mod.NoticeError, "identity changed"):
             self.mod.make_config(metadata, self.root, recipe)
 
+    def test_clarify_emission_canonicalizes_slash_spelling(self):
+        # cargo-about parses the clarify license as SPDX, so the raw
+        # historical slash spelling must be emitted canonicalized.
+        recipe, metadata, _bodies = self.clarification_fixture()
+        for package in metadata["packages"]:
+            package["license"] = "Apache-2.0/MIT"
+        recipe["clarifications"]["example"]["license"] = "Apache-2.0/MIT"
+        config = self.mod.make_config(metadata, self.root, recipe)
+        self.assertIn('[example.clarify]\nlicense = "Apache-2.0 OR MIT"\n', config)
+
     def test_accepted_licenses_cover_mit_no_attribution(self):
         # MIT-0 (MIT minus attribution, as declared by borrow-or-share in
         # the jsonschema dev-tree) is accepted alongside MIT; dropping it

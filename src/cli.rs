@@ -5710,8 +5710,11 @@ mod tests {
         // 2740/0xba5954dfb55f7904 pin is exactly the `inventory cbom`
         // task line (+64), its usage line (+81) and `, inventory cbom`
         // on the live-gate line (+15); no other drift.
-        assert_eq!(USAGE.len(), 2900);
-        assert_eq!(hash, 0x503e1b5b770a1434);
+        // 2913 / 0x10e2dd34bc1280dd (paused run example): diff vs the
+        // 2900/0x503e1b5b770a1434 pin is exactly ` --pause auto` on the
+        // run example line (+13); no other drift.
+        assert_eq!(USAGE.len(), 2913);
+        assert_eq!(hash, 0x10e2dd34bc1280dd);
         assert_eq!(HelpTopic::Global.text(), USAGE.to_string());
     }
 

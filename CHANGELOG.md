@@ -96,6 +96,10 @@ The v0.7.0 limits live in
   intermittently, end without per-key operation tracking (reported as
   `bootstrap_unavailable`); its calls and counts are still recorded.
   Planned for 0.7.1.
+- On a busy host, a multi-threaded program that exits during a
+  `--system` capture may be counted as one lost library-load link
+  (`task_uprobe_link_losses`); the count errs on the side of reporting
+  a loss. Planned for 0.7.1.
 
 ## [0.6.0] - 2026-11-06
 

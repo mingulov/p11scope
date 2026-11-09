@@ -216,6 +216,13 @@ running can, intermittently, end without per-key operation tracking
 (reported as `bootstrap_unavailable`). Its calls and counts are still
 recorded. The fix is planned for 0.7.1.
 
+### Exiting multi-threaded program counted as a lost load link
+
+On a busy host, a multi-threaded program that exits during a
+`--system` capture may be counted as one lost library-load link
+(`task_uprobe_link_losses`); the count errs on the side of reporting a
+loss. The fix is planned for 0.7.1.
+
 ### Test-only: overlay-witness flake
 
 `witness_every_keep_reason_keeps_todays_window_when_mapped` fails

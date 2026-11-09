@@ -2188,7 +2188,7 @@ The old bounds are measurements, not a product startup SLA.
 - Planned: v0.3.0 (per-pid/per-subject fair retention; busy-host cell must
   retain owned gaps).
 
-### A persistently failing inventory pass degrades, then unblocks (v0.7.0)
+### A persistently failing inventory pass degrades per pass or per process (v0.7.0)
 
 - What the user sees: one failing inventory pass no longer aborts the
   capture: the pass's delta is dropped, the earlier committed
@@ -2199,8 +2199,9 @@ The old bounds are measurements, not a product startup SLA.
   stays for the rest of the capture, even after later passes succeed.
 - Retry and escalation: the first two consecutive dropped ticks keep
   their serviced refresh requests queued for retry. From the third
-  consecutive dropped tick on, every request serviced in that tick
-  completes without being applied, including requests for unrelated
+  consecutive dropped tick on, every serviced request in that tick that
+  did not itself fail completes without being applied (already-failed
+  ones stay queued for retry), including requests for unrelated
   processes, so later ticks can serve other work. Those processes
   refresh again only on their next loader event, poll or reconcile
   pass. A tick that completes without dropping resets the count;
@@ -2212,17 +2213,25 @@ The old bounds are measurements, not a product startup SLA.
   existing gap rendering; capture JSON projects it as
   `discovery subject` / `discovery unavailable`) and `PARTIAL` coverage
   for the rest of the capture.
-- Not unblocked: a not-yet-admitted process whose own data breaks the
-  candidate is offered again on every tick, so every later tick drops
-  and no new process is admitted for the rest of the capture; already
-  admitted processes keep their last committed state. The same holds
-  for a poison that breaks every candidate regardless of its inputs
-  (committed-state corruption). The capture still runs to its report
-  with the one gap and the last committed state.
+- One broken process: when a not-yet-admitted process's own data breaks
+  the pass, that process alone is held back from admission and the pass
+  commits everything else, so other processes keep being admitted and
+  observed. The hold carries one named gap (`live process admission`,
+  projected as `discovery subject` / `discovery unavailable`), keeps
+  `PARTIAL` coverage (never reported complete) and is retried after 8
+  passes, doubling per repeat up to 512; it ends when the process exits.
+  The process's calls stay unobserved while it is held.
+- Not isolated: a failure caused by already-admitted processes, by
+  several newcomers only in combination, by the apply step rather than
+  the candidate, or by committed-state corruption still drops whole
+  passes as above while the cause persists; admission resumes once it
+  is gone (for example when the breaking process exits). The capture
+  still runs to its report with the one gap and the last committed
+  state.
 - Workaround: none needed for transient faults; restart the capture
   after a persistent failure.
-- Planned: v0.7.x (hold back the breaking newcomer with its own counted
-  gap instead of dropping every later tick).
+- Planned: none for the isolated case (this is the intended per-process
+  degradation); the non-isolated cases have no fix planned yet.
 
 ### PID-scope coverage after leader exit or exec stays Unknown (DR-C3-2)
 

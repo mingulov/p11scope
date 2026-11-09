@@ -3922,3 +3922,231 @@ fn terminal_identity_degradation_is_wired_at_every_revalidation_site() {
         "the trace seal must degrade both revalidations"
     );
 }
+
+/// v070r2 RED: a pinned-object revalidation failure after the profile
+/// snapshot sealed must degrade to a gap plus a combined error, never an
+/// early return that discards the sealed report (data-always).
+#[test]
+fn terminal_pinned_check_degrades_to_a_gap_in_profile() {
+    let source = include_str!("../run.rs");
+    let profile = source
+        .split_once("fn capture_profile(")
+        .unwrap()
+        .1
+        .split_once("fn write_json_report")
+        .unwrap()
+        .0;
+    let terminal = profile.split_once("fn run_terminal(").unwrap().1;
+    assert!(
+        terminal.contains("degraded_pinned_check"),
+        "run_terminal must degrade the pinned check instead of an early `?`"
+    );
+    assert!(
+        terminal.contains("pinned_error"),
+        "run_terminal must keep the pinned failure for its gap and error"
+    );
+    assert!(
+        !terminal.contains(".check_unchanged()"),
+        "run_terminal must not revalidate pins directly with an early return"
+    );
+}
+
+/// v070r2 RED: trace pinned/prearm failures must degrade like the aggregate
+/// reads (gap plus combined error), never discard the sealed EVIDENCE.
+#[test]
+fn terminal_pinned_and_prearm_checks_degrade_to_gaps_in_trace() {
+    let source = include_str!("../run.rs");
+    let trace = source
+        .split_once("fn capture_trace(")
+        .unwrap()
+        .1
+        .split_once("fn terminal_trace_count_line")
+        .unwrap()
+        .0;
+    assert_eq!(
+        trace.matches("degraded_pinned_check").count(),
+        2,
+        "both trace pinned checks must degrade instead of an early `?`"
+    );
+    assert!(
+        trace.contains("watch_error"),
+        "the trace watch-kernel read must seal from a default with its error kept"
+    );
+    assert!(
+        !trace.contains(".check_unchanged()"),
+        "trace terminal must not revalidate pins directly with an early return"
+    );
+    assert!(
+        !trace.contains("prearm_terminal_kernel(context.1)?"),
+        "the watch-kernel read must not discard the sealed reports with `?`"
+    );
+}
+
+/// v070r2: the settlement-unknown terminal mapping through the real
+/// evidence wiring: absent child and handoff, one gap, present run tree,
+/// PARTIAL with a concrete gap. The healthy twin keeps the child with no
+/// settlement gap and no `skipped` verdict cause.
+#[test]
+fn settlement_unknown_maps_to_absent_child_with_gap_and_partial() {
+    let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+    let state = semantics::State::new(engine.plan());
+    let build = |child: Option<bool>, handoff: Option<u32>| {
+        evidence_for(
+            &engine,
+            engine.capture_facts(),
+            0,
+            false,
+            false,
+            Default::default(),
+            crate::render::ObjectCaptureEvidence::for_build(cfg!(
+                feature = "stub-object-attributes"
+            )),
+            &[],
+            &[],
+            crate::metrics::KernelEvidence::default(),
+            crate::process::TrackingEvidence::default(),
+            0,
+            &state,
+            false,
+            true,
+            Default::default(),
+            0,
+            child,
+            false,
+            crate::render::SchedulingEvidence::default(),
+            None,
+            handoff,
+            None,
+            0,
+        )
+    };
+    // Healthy twin: a settled running child handed back, no settlement gap.
+    let mut healthy = build(Some(true), Some(1234));
+    assert_eq!(healthy.child_still_running, Some(true));
+    assert_eq!(healthy.handoff_child_pid, Some(1234));
+    assert_eq!(
+        healthy.run_tree_handed_back,
+        Some(engine.run_tree_handed_back())
+    );
+    healthy.apply_stop_quiescence(crate::render::StopQuiescence::default());
+    healthy.settle_terminal(true);
+    assert!(healthy.skipped.is_empty());
+    assert_eq!(healthy.completeness, "PARTIAL");
+    assert!(
+        !healthy.gap_classes.observation.causes.contains(&"skipped"),
+        "no settlement gap without an unsettled child: {:?}",
+        healthy.gap_classes.observation.causes
+    );
+
+    // Failure twin: the terminal mapping for an unsettled child.
+    let mut unknown = build(None, None);
+    // `evidence_for` derives no run tree from an absent child; the terminal
+    // restores the count measured before settlement.
+    assert_eq!(unknown.run_tree_handed_back, None);
+    unknown.skipped.push(crate::render::SkippedOut {
+        name: "discovery subject".into(),
+        reason: "discovery unavailable".into(),
+    });
+    unknown.run_tree_handed_back = Some(engine.run_tree_handed_back());
+    unknown.apply_stop_quiescence(crate::render::StopQuiescence::default());
+    unknown.settle_terminal(true);
+    assert_eq!(unknown.child_still_running, None);
+    assert_eq!(unknown.handoff_child_pid, None);
+    assert_eq!(
+        unknown.run_tree_handed_back,
+        Some(engine.run_tree_handed_back())
+    );
+    assert_eq!(unknown.skipped.len(), 1);
+    assert_eq!(unknown.completeness, "PARTIAL");
+    assert_eq!(unknown.verdict_detail, crate::render::VERDICT_CONCRETE_GAP);
+    assert!(
+        unknown.gap_classes.observation.causes.contains(&"skipped"),
+        "the settlement gap must land as a verdict cause: {:?}",
+        unknown.gap_classes.observation.causes
+    );
+    let json = serde_json::to_value(&unknown).expect("evidence serializes");
+    assert!(json.get("child_still_running").is_none());
+    assert_eq!(
+        json["run_tree_handed_back"],
+        serde_json::json!(engine.run_tree_handed_back())
+    );
+    assert_eq!(json["completeness"], "PARTIAL");
+}
+
+/// v070r2: the snapshot fallbacks through the real seal-plus-gap wiring:
+/// profile seals stale from the last good snapshot, trace seals unknown
+/// from empty reports and default kernel evidence, each with a gap and a
+/// concrete PARTIAL.
+#[test]
+fn snapshot_fallback_seals_with_gap_and_partial() {
+    use p11scope_ebpf_common::CounterMode;
+    // Profile: a failed terminal read seals from the last good snapshot.
+    let mut fixture = crate::metrics::ConsumerFixture::new();
+    let last_good = fixture.fresh(CounterMode::Counts, 1, 5, None).unwrap();
+    let diagnosed = std::cell::Cell::new(false);
+    let (snapshot, error) = seal_terminal_or_last_good(
+        Some(&last_good),
+        Err(anyhow::anyhow!("STATS map gone")),
+        |_| diagnosed.set(true),
+    )
+    .expect("a last good value always seals");
+    assert_eq!(snapshot.reports()[0].calls, 5);
+    assert!(error.is_some());
+    assert!(diagnosed.get());
+    let (engine, _) = crate::discovery::engine::tests::selection_output_engines();
+    let state = semantics::State::new(engine.plan());
+    let mut ev = evidence_for(
+        &engine,
+        engine.capture_facts(),
+        0,
+        false,
+        false,
+        Default::default(),
+        crate::render::ObjectCaptureEvidence::for_build(cfg!(feature = "stub-object-attributes")),
+        &[],
+        &[],
+        crate::metrics::KernelEvidence::default(),
+        crate::process::TrackingEvidence::default(),
+        0,
+        &state,
+        false,
+        true,
+        Default::default(),
+        0,
+        None,
+        false,
+        crate::render::SchedulingEvidence::default(),
+        None,
+        None,
+        None,
+        0,
+    );
+    ev.skipped.push(crate::render::SkippedOut {
+        name: "discovery subject".into(),
+        reason: "discovery unavailable".into(),
+    });
+    ev.apply_stop_quiescence(crate::render::StopQuiescence::default());
+    ev.settle_terminal(true);
+    assert_eq!(ev.completeness, "PARTIAL");
+    assert_eq!(ev.verdict_detail, crate::render::VERDICT_CONCRETE_GAP);
+
+    // Trace: failed aggregate reads seal unknown with a gap.
+    let empty_reports: Vec<crate::metrics::SlotReport> = Vec::new();
+    let (reports, reports_error) = seal_terminal_or_last_good(
+        Some(&empty_reports),
+        Err(anyhow::anyhow!("STATS map gone")),
+        |_| {},
+    )
+    .expect("a synthetic empty fallback always seals");
+    assert!(reports.is_empty());
+    assert!(reports_error.is_some());
+    let default_kernel = crate::metrics::KernelEvidence::default();
+    let (kernel, kernel_error) = seal_terminal_or_last_good(
+        Some(&default_kernel),
+        Err(anyhow::anyhow!("kernel evidence gone")),
+        |_| {},
+    )
+    .expect("a synthetic default fallback always seals");
+    assert_eq!(kernel.ring_loss, 0);
+    assert!(kernel_error.is_some());
+}

@@ -15090,9 +15090,10 @@ mod tests {
         pending.take().unwrap().terminate_and_reap().unwrap();
     }
 
-    /// A staged duration handoff the error path aborts is handed back
-    /// live and reported as such; a staged child that already exited is
-    /// reaped and reported as not handed back.
+    /// Aborting a staged duration handoff reports what it did: a live
+    /// staged child is handed back (`true`), a staged child that exited
+    /// before the abort is reaped and reported as not handed back
+    /// (`false`), and an empty slot reports `false`.
     #[test]
     fn aborting_a_staged_handoff_reports_whether_it_handed_back() {
         let mut child = spawn("/bin/sleep", &["30"]);
@@ -15119,6 +15120,120 @@ mod tests {
             !abort_pending_handoff(&mut pending).unwrap(),
             "nothing staged"
         );
+
+        // A staged child that exits before the abort is reaped, never
+        // reported as handed back live.
+        let mut child = spawn("/bin/sleep", &["30"]);
+        let pid = child.pid();
+        child.release().unwrap();
+        assert_eq!(
+            stage_handoff(&mut Some(child), &mut pending).unwrap(),
+            ChildOutcome::TimedOutRunning
+        );
+        // SAFETY: signaling the exact staged child only; the abort reaps it.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+        wait_until(
+            || !pending.as_ref().unwrap().still_running(),
+            "the staged child never died",
+        );
+        assert!(
+            !abort_pending_handoff(&mut pending).unwrap(),
+            "an exited staged child is reaped, not handed back"
+        );
+        assert!(pending.is_none(), "the reaped child leaves the slot");
+        // SAFETY: probing the exact pid; the abort already reaped it.
+        let mut status = 0;
+        assert_eq!(
+            unsafe { libc::waitpid(pid as libc::pid_t, &mut status, libc::WNOHANG) },
+            -1,
+            "the abort left the exited staged child unreaped"
+        );
+    }
+
+    /// The exit-1 flag follows the settlement it reads: only a capture
+    /// error that handed a live child back sets it. Settlement returns a
+    /// note exactly for a live handback, so the setter's inputs are
+    /// driven here for a live and an exited child on both observer-side
+    /// ends, and the setter and the abort's note clearing are pinned to
+    /// their exact predicates.
+    #[test]
+    fn the_error_handoff_flag_and_abort_note_follow_the_settlement() {
+        for end in [CaptureEnd::Error, CaptureEnd::LimitReached] {
+            for live in [true, false] {
+                let case = format!("{end:?}/live={live}");
+                let mut child = spawn("/bin/sleep", &["30"]);
+                let pid = child.pid();
+                child.release().unwrap();
+                wait_until(
+                    || child.exec_confirmed || !child.still_running(),
+                    "exec never confirmed",
+                );
+                if !live {
+                    // SAFETY: signaling the exact owned child only.
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+                    wait_until(|| !child.still_running(), "the child never died");
+                }
+                let signals = SignalState::new();
+                let mut retained = Some(child);
+                let mut pending = None;
+                let mut exit_code = None;
+                let mut requested_kill = false;
+                let mut still_running = false;
+                let note = settle_owned_child(
+                    &mut retained,
+                    end,
+                    true,
+                    false,
+                    &signals,
+                    &mut pending,
+                    &mut exit_code,
+                    &mut requested_kill,
+                    &mut still_running,
+                )
+                .unwrap();
+                let error_handoff = end == CaptureEnd::Error && note.is_some();
+                assert_eq!(note.is_some(), live, "{case}: a note means a live handback");
+                assert_eq!(still_running, live, "{case}");
+                assert_eq!(
+                    error_handoff,
+                    end == CaptureEnd::Error && live,
+                    "{case}: only a capture error that handed back exits 1"
+                );
+                if live {
+                    // SAFETY: signaling and reaping the exact handed-back child.
+                    assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) }, 0);
+                    let mut status = 0;
+                    assert_eq!(
+                        unsafe { libc::waitpid(pid as libc::pid_t, &mut status, 0) },
+                        pid as libc::pid_t,
+                        "{case}"
+                    );
+                } else {
+                    assert_eq!(exit_code, Some(128 + libc::SIGKILL), "{case}");
+                }
+            }
+        }
+        let source = include_str!("run.rs");
+        let production = source.split_once("#[cfg(test)]\nmod tests").unwrap().0;
+        assert_eq!(
+            production
+                .matches("self.error_handoff = end == CaptureEnd::Error && note.is_some();")
+                .count(),
+            1,
+            "the setter must read exactly the settlement predicate driven above"
+        );
+        let abort = production
+            .split_once("fn abort_pending_and_name(owned: &mut Owned) -> Result<()> {")
+            .unwrap()
+            .1;
+        let abort = abort.split_once("\n}\n").unwrap().0;
+        let clear = abort
+            .find("if had_pending && !matches!(aborted, Ok(true)) {\n        owned.handoff_note = None;")
+            .expect("a staged child the abort did not hand back drops its note");
+        let emit = abort
+            .find("emit_stored_handoff_note(owned);")
+            .expect("the abort names what survived");
+        assert!(clear < emit, "the note is dropped before it can print");
     }
 
     /// A handed-back child after a capture error is an observer failure:

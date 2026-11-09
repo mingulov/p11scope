@@ -1148,17 +1148,36 @@ fn fresh_build_bind_loss_extends_without_aborting_and_keeps_the_gap() {
         "the gap names the dropped slot: {:?}",
         skip.reason
     );
-    let mut committed = plan::AttachPlan::from_slots(vec![]);
+    let mut committed = plan_with(1, 0);
     let result = committed.extend_exact_with_stable_module_ids(rebuilt);
     assert!(
         result.is_ok(),
         "a bind loss on the fresh-build path must degrade with a gap, not abort: {:?}",
-        result.err()
+        result.as_ref().err()
     );
+    let delta = result.unwrap();
     assert_eq!(
         committed.active_slot_count(),
         0,
         "the dropped slot stays retired, not resurrected as active"
+    );
+    assert!(
+        !committed.is_active(0),
+        "the dropped slot retires in the committed plan"
+    );
+    assert_eq!(
+        delta.retire.len(),
+        1,
+        "the extend retires the dropped slot instead of dropping it silently"
+    );
+    assert_eq!(
+        delta.retire[0].index, 0,
+        "the extend retires the dropped slot"
+    );
+    assert!(
+        delta.new.is_empty(),
+        "the dropped slot is not resurrected as a new slot: {:?}",
+        delta.new
     );
 }
 

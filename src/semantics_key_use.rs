@@ -392,9 +392,12 @@ impl JointStaging {
 
     /// Select Joint at registration: only with the current H8
     /// birth/closure receipt already present. Without it, S1Only
-    /// immediately — never a bootstrap-wait queue, never a later
-    /// upgrade. The receipt evidences selection only; every seal
-    /// still verifies birth independently.
+    /// immediately — never a bootstrap-wait queue. A pristine
+    /// never-Joint feed may still upgrade once on a retry birth's
+    /// valid receipt ([`Self::upgrade_to_joint`]); refused, fallen
+    /// back, degraded and tripped feeds never do. The receipt
+    /// evidences selection only; every seal still verifies birth
+    /// independently.
     pub(crate) fn select_joint(receipt: Option<&BootstrapReceipt>) -> Self {
         let mut staging = Self::select_s1_only();
         if let Some(receipt) = receipt {
@@ -455,6 +458,38 @@ impl JointStaging {
         } else {
             false
         }
+    }
+
+    /// Whether a retry birth may upgrade this never-Joint feed: no
+    /// selection or segment history yet, no watchdog trip, nothing
+    /// staged. Pre-birth direct reductions stay counted under their
+    /// unattributed reason; the upgrade never replays them.
+    pub(crate) fn upgrade_eligible(&self) -> bool {
+        self.mode == FeedMode::S1Only
+            && self.selected_receipt.is_none()
+            && !self.fell_back
+            && !self.degraded_loss
+            && !self.watchdog_tripped
+            && self.staged.is_empty()
+    }
+
+    /// Upgrade a pristine S1Only feed to Joint on a retry birth's
+    /// valid receipt, fencing the replay frontier at the granting
+    /// birth's cut so pre-birth calls can never replay as proved.
+    /// One-shot: the retained receipt makes a second upgrade refuse.
+    /// Returns whether the mode changed.
+    pub(crate) fn upgrade_to_joint(
+        &mut self,
+        receipt: &crate::semantics_objects::journal::BootstrapReceipt,
+        cut: u64,
+    ) -> bool {
+        if !self.upgrade_eligible() {
+            return false;
+        }
+        self.mode = FeedMode::Joint;
+        self.selected_receipt = Some(*receipt);
+        self.frontier = self.frontier.max(cut);
+        true
     }
 
     /// Calls replayed through the one reducer (seal or fallback).

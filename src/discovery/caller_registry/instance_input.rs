@@ -215,7 +215,10 @@ impl JointRegistrationPlan<'_> {
                 return Err(JointReceiptInstallRefusal::SubjectMismatch);
             }
         }
-        if !row.fits {
+        // A pristine registered row holds its slot already: the
+        // retry grant upgrades it in place instead of minting, so
+        // the fits gate admits it without consuming capacity.
+        if !row.fits && !self.registry.joint_upgrade_eligible(&input.key) {
             self.registry.latch_birth_capacity("fits");
             return Err(JointReceiptInstallRefusal::Capacity);
         }
@@ -308,7 +311,11 @@ impl JointReceiptReservation<'_> {
         }
         // The exclusive borrow prevents registration/removal while native I/O
         // runs, but keep these actual state checks at the final mutation too.
-        if self.registry.instance_state.by_key.contains_key(&input.key) {
+        // A pristine registered key still accepts its retry grant (the
+        // drain upgrades it in place); every other re-install refuses.
+        if self.registry.instance_state.by_key.contains_key(&input.key)
+            && !self.registry.joint_upgrade_eligible(&input.key)
+        {
             return Err((self, JointReceiptInstallRefusal::AlreadySelected));
         }
         if self.registry.joint_grants.contains_key(&input.key) {
@@ -1369,9 +1376,10 @@ pub(crate) struct InstanceSemanticRecord {
     pub(crate) lossy: bool,
     pub(crate) semantics: Option<EdgeSemantics>,
     authority_exhausted: bool,
-    /// The instance's H9 feed, selected once at registration from an
-    /// installed Joint receipt (S1Only without one — the production
-    /// default, since no live grants exist).
+    /// The instance's H9 feed, selected at registration from an
+    /// installed Joint receipt (S1Only without one). A pristine
+    /// never-Joint feed may upgrade once on a retry birth's valid
+    /// grant; refused, fallen back, degraded and tripped feeds stay.
     pub(crate) feed: JointStaging,
 }
 
@@ -1896,6 +1904,43 @@ impl CallerRegistry {
         registry.reserve_joint_receipt_at(input, position)
     }
 
+    /// Whether a retry birth's grant may still select Joint for an
+    /// already-registered key: the record is an observed,
+    /// non-exhausted, bound instance with no blocking negative, and
+    /// its feed is pristine never-Joint (no selection, segment,
+    /// fallback, loss or trip history, nothing staged). A first
+    /// registration whose sighting preceded coverage applies S1Only
+    /// before any candidate exists; without this the AdmittedFirst
+    /// retry refuses and the key stays S1Only for the run.
+    fn joint_upgrade_eligible(&self, key: &InstanceKey) -> bool {
+        let Some(id) = self.instance_state.by_key.get(key).copied() else {
+            return false;
+        };
+        let Some(record) = self.instance_state.records.get(&id) else {
+            return false;
+        };
+        if record.state != InstanceLifecycle::Observed {
+            return false;
+        }
+        if self.retired.contains_key(&record.caller) {
+            return false;
+        }
+        let Some(semantics) = self.instance_state.semantics.get(&id) else {
+            return false;
+        };
+        if semantics.authority_exhausted {
+            return false;
+        }
+        for negative in &self.instance_state.negatives {
+            if negative.matches(key, semantics.module)
+                && (negative.authority_exhausted || negative.retirement.is_some())
+            {
+                return false;
+            }
+        }
+        semantics.feed.upgrade_eligible()
+    }
+
     fn reserve_joint_receipt_at(
         &mut self,
         input: &AdmittedInstanceCall,
@@ -1905,7 +1950,9 @@ impl CallerRegistry {
             .collected_origin()
             .filter(|origin| origin.position() == input.h0_ordinal())
             .ok_or(JointReceiptInstallRefusal::SubjectMismatch)?;
-        if self.instance_state.by_key.contains_key(&input.key) {
+        if self.instance_state.by_key.contains_key(&input.key)
+            && !self.joint_upgrade_eligible(&input.key)
+        {
             return Err(JointReceiptInstallRefusal::AlreadySelected);
         }
         if self.joint_grants.contains_key(&input.key) {
@@ -2732,6 +2779,30 @@ impl CallerRegistry {
                 return;
             }
             let last_seen_ns = record.last_seen_ns.max(input.observed_ns);
+            if let Some(grant) = installed.as_ref() {
+                // A retry birth's validated grant upgrades a pristine
+                // S1Only feed in place. Unlinked attachments route
+                // through the backstop exactly as at first
+                // registration; a feed that stopped being pristine
+                // keeps its mode and drops the grant.
+                if !self.journal_linked() {
+                    self.instance_state.joint_backstop_routed =
+                        self.instance_state.joint_backstop_routed.saturating_add(1);
+                    self.disclose_joint_journal_unavailable_once();
+                } else if self.joint_upgrade_eligible(&input.key) {
+                    let upgraded = self
+                        .instance_state
+                        .semantics
+                        .get_mut(&id)
+                        .expect("retained edge")
+                        .feed
+                        .upgrade_to_joint(&grant.receipt, grant.receipt.birth_cut());
+                    if upgraded {
+                        self.joint_feeds = self.joint_feeds.saturating_add(1);
+                        self.joint_accounting = true;
+                    }
+                }
+            }
             self.instance_state
                 .records
                 .get_mut(&id)

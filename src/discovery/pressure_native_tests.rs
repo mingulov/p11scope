@@ -3650,6 +3650,134 @@ fn pressure_live256_genuine_episode_admits_late_then_head() {
     );
 }
 
+/// Cgroup-scope sensitivity probe: out-of-scope EXECs never enter the
+/// batch while an in-scope non-owned EXEC is still flagged. One owned
+/// sleeper, one in-cgroup ambient sleeper (excluded from the owned
+/// set) and one out-of-cgroup sleeper (spawned after the move-out)
+/// exec under a cgroup-scoped capture; the batch must hold exactly the
+/// two in-scope EXECs, and the ambient gate must flag exactly the
+/// ambient one. Fast sleeper stimulus (no LEDGERs, no pressure
+/// episode); pins the scope-leak detector's sensitivity for the
+/// cgroup-scoped episode cells — the fixed gate is not blind, just
+/// deaf to unrelated hosts.
+#[test]
+#[ignore = "privileged: live BPF cgroup-scope sensitivity probe; run as root with --ignored --test-threads=1 under the privileged lane"]
+fn cgroup_scope_probe_flags_in_scope_ambient_only() {
+    const WHAT: &str = "scope-probe";
+    assert_privileged_lane(WHAT);
+    let sleep_bin = ["/usr/bin/sleep", "/bin/sleep"]
+        .into_iter()
+        .map(PathBuf::from)
+        .find(|path| path.is_file())
+        .unwrap_or_else(|| panic!("{WHAT}: no sleep binary to spawn"));
+
+    // One hint keeps discovery shaped like production (the quota
+    // cell's shape); nothing maps it, so nothing arms. The batch is
+    // collected but never applied: EXEC delivery is the whole probe.
+    let fixtures = FixtureBuild::compile_all("scope-probe");
+    let hints = vec![fixtures.early.clone()];
+    let cgroup = OwnedCgroup::create("scopeprobe", WHAT);
+    let scope = crate::scope::capture_cgroup(&cgroup.path)
+        .unwrap_or_else(|error| panic!("{WHAT}: cgroup scope failed: {error:#}"));
+    let mut engine = Engine::discover(&cgroup_args(hints, cgroup.path.clone()), &scope, None)
+        .expect("live cgroup discovery");
+    let mut session = engine
+        .start_session(
+            CapturePolicy::Allowlisted,
+            None,
+            BackendSelection::default(),
+        )
+        .unwrap_or_else(|error| panic!("{WHAT}: start_session failed: {error:#}"));
+
+    // Owned + ambient born inside; unrelated born outside after move-out.
+    let spawn_sleeper = |what: &str| {
+        Command::new(&sleep_bin)
+            .arg("30")
+            .env_clear()
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .die_with_parent()
+            .spawn()
+            .unwrap_or_else(|error| panic!("{WHAT}: spawn {what} sleeper: {error}"))
+    };
+    let this = std::process::id();
+    cgroup.move_in(this, WHAT);
+    let mut move_out = CgroupMoveOutGuard::arm(this, PathBuf::from("/sys/fs/cgroup/cgroup.procs"));
+    let mut owned_child = spawn_sleeper("owned");
+    let owned_pid = owned_child.id();
+    let mut ambient_child = spawn_sleeper("in-scope ambient");
+    let ambient_pid = ambient_child.id();
+    std::fs::write("/sys/fs/cgroup/cgroup.procs", this.to_string())
+        .unwrap_or_else(|error| panic!("{WHAT}: moving {this} back out failed: {error}"));
+    move_out.disarm();
+    let owned: BTreeSet<u32> = [owned_pid].into_iter().collect();
+    assert_eq!(
+        cgroup.members(WHAT),
+        [owned_pid, ambient_pid]
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        "{WHAT}: the cgroup holds exactly the two sleepers"
+    );
+    let mut unrelated_child = spawn_sleeper("unrelated");
+    let unrelated_pid = unrelated_child.id();
+
+    // All three EXECs land in the ring before the collect; every
+    // sleeper is still asleep then, so no pid can be reused.
+    std::thread::sleep(Duration::from_secs(2));
+    for (label, child) in [
+        ("owned", &mut owned_child),
+        ("ambient", &mut ambient_child),
+        ("unrelated", &mut unrelated_child),
+    ] {
+        assert!(
+            child
+                .try_wait()
+                .expect("try_wait on probe sleeper")
+                .is_none(),
+            "{WHAT}: the {label} sleeper is still asleep at collect"
+        );
+    }
+    let (records, malformed, _) = engine
+        .collect_frame_discovery(&mut session)
+        .unwrap_or_else(|error| panic!("{WHAT}: probe collect failed: {error:#}"));
+    assert_eq!(malformed, 0, "{WHAT}: the probe batch must be clean");
+    let exec_pids: BTreeSet<u32> = records
+        .iter()
+        .filter(|record| record.kind == DISCOVERY_KIND_EXEC)
+        .map(record_pid)
+        .collect();
+    assert!(
+        exec_pids.contains(&owned_pid),
+        "{WHAT}: the owned EXEC is collected"
+    );
+    assert!(
+        exec_pids.contains(&ambient_pid),
+        "{WHAT}: the in-scope ambient EXEC is collected (the gate is not blind)"
+    );
+    assert!(
+        !records
+            .iter()
+            .any(|record| record_pid(record) == unrelated_pid),
+        "{WHAT}: the unrelated EXEC never enters the batch"
+    );
+    assert_eq!(
+        ambient_exec_pids(&records, &owned),
+        vec![ambient_pid],
+        "{WHAT}: the gate flags exactly the in-scope ambient"
+    );
+
+    for child in [&mut owned_child, &mut ambient_child, &mut unrelated_child] {
+        child.kill().ok();
+        child.wait().ok();
+    }
+    drop(session);
+    drop(engine);
+    drop(fixtures);
+    cgroup.remove(WHAT);
+    println!("scope-probe: PASS: in-scope ambient flagged, unrelated filtered");
+}
+
 /// The all-blocked fail-control (deterministic, unprivileged): the
 /// twin's exact map shape — 256 consumed requests through the same
 /// `request_refresh_consumed` seam — minus the live contexts. With

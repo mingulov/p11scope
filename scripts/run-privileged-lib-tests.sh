@@ -319,6 +319,11 @@ discovery::engine::pressure_native_tests::pressure_live256_unparked_head_control
 # scope-leak detectors, not quiet-window lotteries.
 discovery::engine::pressure_native_tests::pressure_live256_genuine_episode_admits_late_then_head
 discovery::engine::pressure_native_tests::pressure_live256_all_blocked_twin_refuses_once
+# T8 scope-sensitivity probe: out-of-scope EXECs never enter a
+# cgroup-scoped batch while an in-scope non-owned EXEC is still
+# flagged by the ambient gate (fast sleeper stimulus; pins the
+# scope-leak detector's sensitivity for the cgroup-scoped episodes).
+discovery::engine::pressure_native_tests::cgroup_scope_probe_flags_in_scope_ambient_only
 # T8 FIRST live control: quiet window arms nothing, then a 3-child owned
 # probe spends exactly tickets 1..=3 with zero loss (short; needs root,
 # host vmlinux BTF, gcc-built fixtures, and a quiet window — any ambient

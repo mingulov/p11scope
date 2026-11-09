@@ -2293,22 +2293,35 @@ const GAP_GROUPS_SHOWN: usize = 20;
 /// coverage line, not `repeats` (JSON carries `repeats`); deleted
 /// mappings read on the notes line instead. Empty when no loss gaps
 /// are retained; suppressed-but-unretained gaps stay in the coverage
-/// line.
+/// line. Scope groups (no caller, module or pid — the run-wide gaps
+/// that explain missing counts) read before per-object groups, so a
+/// single scope row is never buried under frequent object rows; within
+/// each tier the most frequent group still reads first.
 fn concise_gap_summary_block(gaps: &[GapView]) -> Vec<String> {
-    let mut groups: std::collections::BTreeMap<(String, String), usize> =
+    let mut groups: std::collections::BTreeMap<(String, String), (usize, bool)> =
         std::collections::BTreeMap::new();
     for gap in gaps.iter().filter(|gap| gap.reason != "deleted mapping") {
         let subject = escape_controls(gap_plain_subject(&gap.subject)).into_owned();
         let reason = escape_controls(gap_plain_reason(&gap.reason)).into_owned();
-        *groups.entry((subject, reason)).or_insert(0) += 1;
+        let scope = gap.caller.is_none() && gap.module.is_none() && gap.pid.is_none();
+        let entry = groups.entry((subject, reason)).or_insert((0, true));
+        entry.0 += 1;
+        entry.1 = entry.1 && scope;
     }
     if groups.is_empty() {
         return Vec::new();
     }
-    let mut ranked: Vec<((String, String), usize)> = groups.into_iter().collect();
-    ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let mut ranked: Vec<((String, String), (usize, bool))> = groups.into_iter().collect();
+    ranked.sort_by(|left, right| {
+        right
+            .1
+            .1
+            .cmp(&left.1.1)
+            .then_with(|| right.1.0.cmp(&left.1.0))
+            .then_with(|| left.0.cmp(&right.0))
+    });
     let mut lines = vec![format!("gaps: {}", loss_gap_count(gaps))];
-    for ((subject, reason), count) in ranked.iter().take(GAP_GROUPS_SHOWN) {
+    for ((subject, reason), (count, _)) in ranked.iter().take(GAP_GROUPS_SHOWN) {
         lines.push(gap_group_line(*count, subject, reason));
     }
     let rest = ranked.len().saturating_sub(GAP_GROUPS_SHOWN);
@@ -2369,13 +2382,16 @@ fn concise_short_lived_pointer(gaps: &[GapView]) -> Option<String> {
 /// The full budget dump stays verbose-only; `--json` carries `budgets`.
 /// Watched functions count against the real inventory endpoint budget
 /// (the attach set's `--max-endpoints` limit), never the registry's
-/// internal endpoint ceiling.
-fn render_limits_line(out: &mut String, budgets: &BudgetView) {
+/// internal endpoint ceiling. A scan-only inventory (kept first pass,
+/// scan fallback) records endpoints without attaching any: with no
+/// usage feed the line says recorded with 0 attached, never watched.
+fn render_limits_line(out: &mut String, budgets: &BudgetView, usage_feed: bool) {
     use std::fmt::Write as _;
     let plural = |count: usize| if count == 1 { "" } else { "s" };
+    let scan_only = !usage_feed && budgets.inventory_endpoints_occupied > 0;
     let _ = writeln!(
         out,
-        "limits: {} caller{}, {} provider file{}, {} edge{} ({} refused); {} function{} watched of {} ({} refused). Full budget detail: -v or --json.",
+        "limits: {} caller{}, {} provider file{}, {} edge{} ({} refused); {} function{} {} of {} ({} refused). Full budget detail: -v or --json.",
         budgets.callers_occupied,
         plural(budgets.callers_occupied),
         budgets.modules_occupied,
@@ -2385,6 +2401,11 @@ fn render_limits_line(out: &mut String, budgets: &BudgetView) {
         budgets.refusals(),
         budgets.inventory_endpoints_occupied,
         plural(budgets.inventory_endpoints_occupied),
+        if scan_only {
+            "recorded, 0 attached"
+        } else {
+            "watched"
+        },
         budgets.inventory_endpoints_limit,
         budgets.inventory_endpoints_refused,
     );
@@ -3395,7 +3416,7 @@ fn render_snapshot_inner(
         return out;
     }
     if verbosity == crate::cli::TextVerbosity::Concise {
-        render_limits_line(&mut out, budgets);
+        render_limits_line(&mut out, budgets, presentation.usage_feed);
         for line in concise_gap_summary_block(&presentation.gaps) {
             let _ = writeln!(out, "{line}");
         }

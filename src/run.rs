@@ -14921,7 +14921,7 @@ mod tests {
             "one helper takes the stored note"
         );
         assert_eq!(
-            production.matches("owned.handoff_note").count(),
+            production.matches("handoff_note.as_deref()").count(),
             0,
             "no site reads the stored note directly"
         );

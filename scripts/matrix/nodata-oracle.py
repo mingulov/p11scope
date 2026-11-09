@@ -255,17 +255,23 @@ def check_trace(verdict, body, text_blobs, args):
     gap_classes = evidence.get("gap_classes", {})
     if not isinstance(gap_classes, dict):
         gap_classes = {}
-    causes = []
-    for lane in ("observation", "attribution"):
-        lane_info = gap_classes.get(lane, {})
-        if isinstance(lane_info, dict):
-            causes.extend(lane_info.get("causes", []) or [])
-    if causes:
+    attribution = gap_classes.get("attribution", {})
+    if not isinstance(attribution, dict):
+        attribution = {}
+    # Caller identity is an attribution question (a withheld name), never
+    # an observation one: only a withheld attribution with a named cause
+    # excuses unknown-only callers. No caller-specific cause exists in
+    # current EVIDENCE (per-event identity reasons never leave the trace
+    # renderer), so any withheld-attribution cause is a deliberate
+    # approximation.
+    causes = attribution.get("causes", []) or []
+    if attribution.get("status") == "withheld" and causes:
         verdict.caller = "unknown-named"
-        verdict.info("caller unknown with named gap causes: %s" % (causes,))
+        verdict.info("caller unknown with named attribution causes: %s"
+                     % (causes,))
     else:
         verdict.bad("caller '%s' unnamed on all %d events and no "
-                    "observation/attribution cause names why"
+                    "withheld attribution cause names why"
                     % (args.caller, total))
 
 

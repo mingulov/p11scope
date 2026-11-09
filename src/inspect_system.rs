@@ -171,6 +171,18 @@ pub(crate) fn stage_timings_requested() -> bool {
     std::env::var_os("P11SCOPE_STAGE_TIMINGS").is_some_and(|value| value == "1")
 }
 
+/// Whether the `index`-th tick of a `len`-process deep scan prints.
+/// Seam for the progress sampling; currently always visible.
+fn deep_scan_progress_visible(_index: usize, _len: usize) -> bool {
+    true
+}
+
+/// The completion line for a sampled deep scan, if `len` sampled.
+/// Seam for the progress sampling; currently never sampled.
+fn deep_scan_progress_summary(_len: usize) -> Option<String> {
+    None
+}
+
 /// One gap record with optional member attribution. Scope-level gaps
 /// (enumeration, sweep, cap) carry no pid; member gaps carry theirs.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -727,11 +739,13 @@ fn collect_members_identity(
     let mut members = Vec::with_capacity(selected.len());
     let deep_start = monotonic_ns();
     for (index, pid) in selected.iter().enumerate() {
-        progress!(
-            "p11scope: deep-scanning {}/{} (pid {pid})...",
-            index + 1,
-            selected.len()
-        );
+        if deep_scan_progress_visible(index, selected.len()) {
+            progress!(
+                "p11scope: deep-scanning {}/{} (pid {pid})...",
+                index + 1,
+                selected.len()
+            );
+        }
         // Monotonic view ids in scan order, like capture discovery: one id
         // owns every result of its member.
         let Ok(view_index) = u32::try_from(index) else {
@@ -746,6 +760,9 @@ fn collect_members_identity(
             &mut noise,
             custody.as_mut(),
         ));
+    }
+    if let Some(summary) = deep_scan_progress_summary(selected.len()) {
+        progress!("{summary}");
     }
     timings.span(StageKind::Scan, "deep_scan", deep_start, monotonic_ns());
     noise.report();

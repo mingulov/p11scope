@@ -2188,6 +2188,31 @@ The old bounds are measurements, not a product startup SLA.
 - Planned: v0.3.0 (per-pid/per-subject fair retention; busy-host cell must
   retain owned gaps).
 
+### A persistently failing inventory pass degrades, then unblocks (v0.7.0)
+
+- What the user sees: one failing inventory pass no longer aborts the
+  capture: the pass's delta is dropped, the earlier committed
+  plan/pins/modules stay, and a `live inventory pass` gap names the
+  dropped pass. Repeats with the same error aggregate into one gap
+  (`passes A-B dropped (Nx): <error>`). The first two consecutive
+  drops keep serviced refresh requests queued for retry; from the
+  third consecutive drop on, serviced requests complete so later
+  ticks can serve other processes — a process whose data keeps
+  breaking the candidate goes stale until a loader event or a poll
+  re-queues it.
+- Kernels/conditions: all kernels; any capture whose tick candidate
+  or apply fails. Transient faults recover on the next tick.
+- Disclosure: the `live inventory pass` gap (concise/`-v`/JSON via the
+  existing gap rendering; capture JSON projects it as
+  `discovery subject` / `inventory pass unavailable`), `PARTIAL`
+  coverage while drops stand.
+- Workaround: none needed for transient faults. A poison that breaks
+  every candidate regardless of its inputs (committed-state
+  corruption, not one process's data) still stalls tick commits; the
+  capture runs to its report with the aggregated gap and the last
+  committed state.
+- Planned: none; this is the intended degradation policy.
+
 ### PID-scope coverage after leader exit or exec stays Unknown (DR-C3-2)
 
 - What the user sees: after a `--pid` target's leader exits or execs, there

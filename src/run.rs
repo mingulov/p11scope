@@ -14827,7 +14827,10 @@ mod tests {
             );
             if end == CaptureEnd::LimitReached {
                 assert!(
-                    !note.as_deref().unwrap_or_default().contains("duration expired"),
+                    !note
+                        .as_deref()
+                        .unwrap_or_default()
+                        .contains("duration expired"),
                     "{end:?} printed the duration note: {note:?}"
                 );
             }

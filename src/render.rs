@@ -11566,7 +11566,7 @@ pub(crate) mod tests {
         let mechanisms: BTreeMap<u64, crate::semantics::MechStat> = BTreeMap::new();
         let row = report("C_Sign", 2, 0, false);
         let concise = live_scoped_with_verbosity(
-            &[row.clone()],
+            std::slice::from_ref(&row),
             &ev,
             Duration::ZERO,
             "/opt/p11.so",

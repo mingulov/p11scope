@@ -40,11 +40,12 @@ sudo p11scope doctor
 with no interim output; that is normal.)
 
 System packages, the discovery helper and local builds are in [Install](docs/install.md#install).
-Container: once 0.7.0 ships, the release will publish `ghcr.io/mingulov/p11scope:0.7.0`;
-the tag appears when the release is published. Run `doctor` through it ([privileges](deploy/k8s/README.md)):
+Container: once 0.7.0 ships, the release will publish `ghcr.io/mingulov/p11scope:latest`;
+the tags appear when the release is published (`:0.7.0` pins the exact version).
+Run `doctor` through it ([privileges](deploy/k8s/README.md)):
 
 ```sh
-docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:0.7.0 doctor
+docker run --rm --pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro ghcr.io/mingulov/p11scope:latest doctor
 ```
 
 ## First commands

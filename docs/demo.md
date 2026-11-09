@@ -133,19 +133,44 @@ already-running browser, earlier operations are counted in named gaps
 
 ## With the container image
 
-The same demo commands run through `ghcr.io/mingulov/p11scope:0.7.0`
-(the tag appears when the release is published), with the documented
-container flags and no extra mounts:
+The same demo commands run through `ghcr.io/mingulov/p11scope:latest`
+(the tags appear when the release is published; `:0.7.0` pins the exact
+0.7.0 version), with the documented container flags and no extra mounts:
 
 ```sh
 FLAGS="--pid=host --cap-add SYS_ADMIN --cap-add SYS_PTRACE --cap-add DAC_READ_SEARCH -v /sys/fs/cgroup:/sys/fs/cgroup:ro"
-IMG=ghcr.io/mingulov/p11scope:0.7.0
+IMG=ghcr.io/mingulov/p11scope:latest
 docker run --rm $FLAGS $IMG doctor
 docker run --rm $FLAGS $IMG inventory --system --duration 15s
 docker run --rm $FLAGS $IMG profile --system --duration 30s
 ```
 
 (Add `--security-opt apparmor=unconfined` where AppArmor is enforcing.)
+
+### What the container needs
+
+The image carries no privileges of its own; Docker grants them at
+`docker run` time through the flags above. Without them captures fail
+or see nothing: no `--pid=host` finds no modules and exits 0 (looks
+like success); no `SYS_ADMIN` fails BPF loading (`map create EPERM`,
+exit 1); no `SYS_PTRACE` cannot read process memory
+(`/proc/<pid>/mem` EACCES, 0 modules); no `DAC_READ_SEARCH` leaves
+providers in private directories invisible. The read-only cgroup mount
+names pod cgroups from the node view. Details:
+[Container privileges](../deploy/k8s/README.md#privileges-and-why).
+
+A user in the `docker` group needs no sudo: on this dev host (Ubuntu
+26.04.1, rootful Docker, AppArmor enforcing) `doctor` exited 0 and
+`inventory --system` scanned 175 callers with the flags above plus the
+AppArmor opt. Without the opt, `inventory` still exits 0 but sees almost
+nothing (2 callers, 0 providers), while `doctor` still passes — so where
+AppArmor is enforcing, the opt is what makes captures see processes.
+
+Rootless Docker or Podman cannot work: BPF loading and uprobes need real
+host capabilities, which a rootless container cannot grant. Use rootful
+Docker — as a `docker`-group user, or with sudo. The host needs Linux
+6.6+ with BTF (`uprobe_multi`); under Docker Desktop `--pid=host` sees
+the Desktop VM, not your laptop.
 
 `doctor` (trimmed real output, Ubuntu 26.04):
 

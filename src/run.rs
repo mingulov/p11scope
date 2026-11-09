@@ -26225,8 +26225,11 @@ int main(int argc, char **argv) {
         let replaced = skip("/opt/r.so (deleted)", REPLACED_PROVIDER_REASON);
         let other = skip("capture discovery", "some other reason");
         let scope = ScopeArg::Pid(42);
-        let empty =
-            capture_start_hint_lines(Some(no_modules_hint(&scope)), false, &[replaced.clone()]);
+        let empty = capture_start_hint_lines(
+            Some(no_modules_hint(&scope)),
+            false,
+            std::slice::from_ref(&replaced),
+        );
         assert_eq!(empty.len(), 2, "{empty:?}");
         assert!(
             empty[0].contains("no PKCS#11 modules discovered in pid 42"),
@@ -26236,7 +26239,7 @@ int main(int argc, char **argv) {
             empty[1].contains("/opt/r.so (deleted)"),
             "the empty capture names the file: {empty:?}"
         );
-        let attached = capture_start_hint_lines(None, false, &[replaced.clone()]);
+        let attached = capture_start_hint_lines(None, false, std::slice::from_ref(&replaced));
         assert_eq!(attached.len(), 1, "{attached:?}");
         assert!(
             attached[0].contains("/opt/r.so (deleted)"),
@@ -26251,8 +26254,12 @@ int main(int argc, char **argv) {
             "other skips stay silent when modules attached"
         );
         assert!(
-            capture_start_hint_lines(Some(no_modules_hint(&scope)), true, &[replaced.clone()])
-                .is_empty(),
+            capture_start_hint_lines(
+                Some(no_modules_hint(&scope)),
+                true,
+                std::slice::from_ref(&replaced)
+            )
+            .is_empty(),
             "a dead named pid stays silent on the empty path"
         );
         assert!(

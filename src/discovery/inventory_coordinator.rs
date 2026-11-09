@@ -6043,7 +6043,13 @@ impl<Source: ProcessSource> InventoryCoordinator<Source> {
                 continue;
             };
             if !process.status.attributable() {
+                // Live members only: an exited member's caller endpoint
+                // has ended, so a kept `Mapped` edge would be
+                // live-looking. Exits retire through the adapter's
+                // reconcile, not the scan status; until then the
+                // ordinary uncertain path below is the honest read.
                 if !bound_provider_key
+                    && !matches!(process.status, MemberStatus::Exited)
                     && self.maps_identity_unchanged(process.pid, catalog)
                     && self.registry.edges_of(caller).next().is_some()
                 {

@@ -68529,6 +68529,262 @@ fn poisoned_newcomer_is_held_back_and_a_healthy_late_process_is_admitted() {
     let _ = healthy.wait();
 }
 
+fn sleeping_child() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap()
+}
+
+fn write_procs(dir: &tempfile::TempDir, pids: &[u32]) {
+    let listing: String = pids.iter().map(|pid| format!("{pid}\n")).collect();
+    std::fs::write(dir.path().join("cgroup.procs"), listing).unwrap();
+}
+
+fn settled_engine_over(kept: u32) -> (Engine, tempfile::TempDir, ScriptedSession) {
+    let (mut engine, dir) = engine_over_cgroup_naming(&[kept]);
+    let mut session = ScriptedSession::with_records([], 0);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.views.len(), 1);
+    engine.scheduler.set_tick_quantum_ns_for_test(u64::MAX);
+    (engine, dir, session)
+}
+
+fn view_pids(engine: &Engine) -> Vec<u32> {
+    engine.views.iter().map(ProcessView::pid).collect()
+}
+
+/// The isolation path proper: a healthy and a broken newcomer arrive in
+/// the same enumeration, so one failing pass holds back the broken one
+/// and commits the healthy one in that same pass.
+#[test]
+fn same_pass_isolation_admits_the_healthy_newcomer_and_holds_the_broken_one() {
+    let mut kept = sleeping_child();
+    let mut healthy = sleeping_child();
+    let mut poison = sleeping_child();
+    let (kept_pid, healthy_pid, poison_pid) = (kept.id(), healthy.id(), poison.id());
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    write_procs(&dir, &[kept_pid, healthy_pid, poison_pid]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).expect("the pass commits");
+    let pids = view_pids(&engine);
+    assert!(
+        pids.contains(&healthy_pid),
+        "the healthy newcomer commits in the failing pass: {pids:?} {:?}",
+        engine.plan.skipped
+    );
+    assert!(!pids.contains(&poison_pid), "{pids:?}");
+    assert_eq!(engine.held_back_strikes_for_test(poison_pid), Some(1));
+    assert_eq!(engine.held_back_strikes_for_test(healthy_pid), None);
+    assert_eq!(engine.held_back_total_for_test(), 1);
+    assert_eq!(
+        admission_gaps(&engine).len(),
+        1,
+        "{:?}",
+        engine.plan.skipped
+    );
+    assert!(
+        published_inventory_pass_gaps(&engine).is_empty(),
+        "{:?}",
+        engine.plan.skipped
+    );
+    for child in [&mut kept, &mut healthy, &mut poison] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// A held process is retried after its delay: a second isolation
+/// doubles the strike count and keeps the one gap; once its data stops
+/// breaking the pass it is admitted and the hold is removed.
+#[test]
+fn held_back_process_is_retried_and_admitted_once_healthy() {
+    let mut kept = sleeping_child();
+    let mut poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    write_procs(&dir, &[kept_pid, poison_pid]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.held_back_strikes_for_test(poison_pid), Some(1));
+    let mut retried = false;
+    for _round in 0..24 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        if engine.held_back_strikes_for_test(poison_pid) == Some(2) {
+            retried = true;
+            break;
+        }
+    }
+    assert!(retried, "the hold is retried after its delay");
+    assert!(!view_pids(&engine).contains(&poison_pid));
+    assert_eq!(
+        admission_gaps(&engine).len(),
+        1,
+        "{:?}",
+        engine.plan.skipped
+    );
+    assert_eq!(
+        engine.held_back_total_for_test(),
+        1,
+        "one process, counted once"
+    );
+    engine.fail_candidate_with_pid_for_test = None;
+    let mut admitted = false;
+    for _round in 0..48 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        if view_pids(&engine).contains(&poison_pid) {
+            admitted = true;
+            break;
+        }
+    }
+    assert!(admitted, "the healed process is admitted on its next retry");
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    assert_eq!(engine.held_back_count_for_test(), 0, "the hold is removed");
+    assert_eq!(admission_gaps(&engine).len(), 1, "the gap stays as history");
+    for child in [&mut kept, &mut poison] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// The no-newcomer baseline takes the same full rebuild the trials take:
+/// when every full rebuild fails for a reason unrelated to newcomers,
+/// nobody is held back and the pass drops with its gap, instead of the
+/// unchanged-tick fast path vouching for a rebuild the trials cannot make.
+#[test]
+fn isolation_baseline_uses_the_full_rebuild() {
+    let mut kept = sleeping_child();
+    let mut healthy = sleeping_child();
+    let (kept_pid, healthy_pid) = (kept.id(), healthy.id());
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    write_procs(&dir, &[kept_pid, healthy_pid]);
+    engine.fail_full_candidate_rebuild_for_test = true;
+    let mut dropped = false;
+    for _round in 0..12 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        assert_eq!(
+            engine.held_back_count_for_test(),
+            0,
+            "a newcomer is never held for a failure that is not its own: {:?}",
+            engine.plan.skipped
+        );
+        if !published_inventory_pass_gaps(&engine).is_empty() {
+            dropped = true;
+            break;
+        }
+    }
+    assert!(dropped, "the pass drops with its gap");
+    assert!(
+        admission_gaps(&engine).is_empty(),
+        "{:?}",
+        engine.plan.skipped
+    );
+    engine.fail_full_candidate_rebuild_for_test = false;
+    for child in [&mut kept, &mut healthy] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Isolation trials are charged to the pass time budget: once it is
+/// spent, the untried newcomers are deferred under the pending-newcomer
+/// gap (never held), and later passes resolve them.
+#[test]
+fn isolation_trials_stop_when_the_pass_budget_is_spent() {
+    let mut kept = sleeping_child();
+    let mut first = sleeping_child();
+    let mut second = sleeping_child();
+    let mut poison = sleeping_child();
+    let (kept_pid, poison_pid) = (kept.id(), poison.id());
+    let healthy = [first.id(), second.id()];
+    let (mut engine, dir, mut session) = settled_engine_over(kept_pid);
+    engine.fail_candidate_with_pid_for_test = Some(poison_pid);
+    engine.isolation_trial_budget_for_test = Some(1);
+    write_procs(&dir, &[kept_pid, healthy[0], healthy[1], poison_pid]);
+    apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+    let after_one = view_pids(&engine);
+    let resolved = healthy.iter().filter(|pid| after_one.contains(pid)).count()
+        + usize::from(engine.held_back_strikes_for_test(poison_pid).is_some());
+    assert_eq!(
+        resolved, 1,
+        "one trial resolves one newcomer; the rest wait: {after_one:?} {:?}",
+        engine.plan.skipped
+    );
+    assert!(
+        engine
+            .plan
+            .skipped
+            .iter()
+            .any(|skip| skip.subject == "live discovery tick" && skip.reason.contains("pending")),
+        "untried newcomers are deferred under the pending-newcomer gap: {:?}",
+        engine.plan.skipped
+    );
+    for _round in 0..12 {
+        apply_ordinary_batch(&mut engine, &mut session, vec![]).unwrap();
+        let pids = view_pids(&engine);
+        if healthy.iter().all(|pid| pids.contains(pid))
+            && engine.held_back_strikes_for_test(poison_pid).is_some()
+        {
+            break;
+        }
+    }
+    let pids = view_pids(&engine);
+    assert!(healthy.iter().all(|pid| pids.contains(pid)), "{pids:?}");
+    assert!(!pids.contains(&poison_pid), "{pids:?}");
+    assert!(engine.held_back_strikes_for_test(poison_pid).is_some());
+    for child in [&mut kept, &mut first, &mut second, &mut poison] {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+/// Measurement (reported, not asserted): one full candidate rebuild over
+/// a 256-view system-like scope with real provider mappings, the unit an
+/// isolation trial costs.
+#[test]
+fn full_candidate_rebuild_at_256_views_is_measured() {
+    let dir = tempfile::tempdir().expect("a fixture directory");
+    let provider_a = system_scope_build_fixture(dir.path(), "measure-a");
+    let provider_c = system_scope_build_fixture_variant(dir.path(), "measure-c");
+    let driver = system_scope_build_driver(dir.path());
+    let hints = vec![provider_a.clone(), provider_c.clone()];
+    let providers: Vec<SystemScopeChildGuard> =
+        [&provider_a, &provider_a, &provider_c, &provider_c]
+            .into_iter()
+            .map(|provider| system_scope_spawn_loaded(&driver, provider))
+            .collect();
+    let guards = e06_spawn_sleeps(252);
+    let mut pids: Vec<u32> = providers.iter().map(|guard| guard.pid()).collect();
+    pids.extend(guards.iter().map(|guard| guard.pid()));
+    let scope_dir = tempfile::tempdir().expect("a scope directory");
+    e06_write_listing(scope_dir.path(), &pids);
+    let scope = crate::scope::cgroup(scope_dir.path()).expect("open scope directory");
+    let args = e06_cgroup_args(scope_dir.path(), hints, None);
+    let mut engine = Engine::discover(&args, &scope, None).expect("the capture starts");
+    assert_eq!(engine.views.len(), 256);
+    engine.set_disable_empty_tick_fast_path_for_test(true);
+    let none = BTreeSet::new();
+    let mut samples = Vec::new();
+    for _ in 0..5 {
+        let start = std::time::Instant::now();
+        engine
+            .inventory_candidate(&none, &[], &[], Vec::new(), &none)
+            .expect("the full rebuild succeeds at scale");
+        samples.push(start.elapsed());
+    }
+    samples.sort();
+    eprintln!(
+        "full candidate rebuild at {} views / {} modules / {} active slots: median {:?} (min {:?}, max {:?})",
+        engine.views.len(),
+        engine.modules.len(),
+        engine.plan.active_slot_count(),
+        samples[2],
+        samples[0],
+        samples[4]
+    );
+}
+
 /// When the broken process leaves, its hold is released and the gap
 /// stays as history.
 #[test]

@@ -879,6 +879,15 @@ pub struct Engine {
     /// candidate. Stays armed until cleared.
     #[cfg(test)]
     fail_candidate_with_pid_for_test: Option<u32>,
+    /// Test-only: every full candidate rebuild fails (the unchanged-tick
+    /// fast path is untouched), modelling committed reuse state that a
+    /// fresh rebuild cannot use whatever the newcomers.
+    #[cfg(test)]
+    fail_full_candidate_rebuild_for_test: bool,
+    /// Test-only: newcomer isolation trials allowed before the pass time
+    /// budget counts as spent.
+    #[cfg(test)]
+    isolation_trial_budget_for_test: Option<usize>,
     #[cfg(test)]
     loader_arm_scan_after_scan: Option<fn(&mut Engine)>,
     /// Test-only one-shot: force the next record-path loader scan to
@@ -11124,6 +11133,10 @@ impl Engine {
             #[cfg(test)]
             fail_candidate_with_pid_for_test: None,
             #[cfg(test)]
+            fail_full_candidate_rebuild_for_test: false,
+            #[cfg(test)]
+            isolation_trial_budget_for_test: None,
+            #[cfg(test)]
             loader_arm_scan_after_scan: None,
             #[cfg(test)]
             loader_force_record_scan_incomplete: false,
@@ -12988,6 +13001,18 @@ impl Engine {
     #[cfg(test)]
     fn held_back_count_for_test(&self) -> usize {
         self.held_back.len()
+    }
+
+    /// Test-only: isolation strikes recorded for one held-back pid.
+    #[cfg(test)]
+    fn held_back_strikes_for_test(&self, pid: u32) -> Option<u32> {
+        self.held_back.get(&pid).map(|hold| hold.strikes)
+    }
+
+    /// Test-only: processes held back over the capture.
+    #[cfg(test)]
+    fn held_back_total_for_test(&self) -> u64 {
+        self.held_back_total
     }
 
     /// A dropped tick pass: counts toward the consecutive-drop chain
@@ -23643,6 +23668,10 @@ impl Engine {
             }
             // A fold would change the pins: fall through to the full path,
             // which canonicalizes identically.
+        }
+        #[cfg(test)]
+        if self.fail_full_candidate_rebuild_for_test {
+            bail!("test-forced full rebuild failure");
         }
         let assemble_start = crate::attach::monotonic_ns();
         let refreshed_ids: BTreeSet<_> = refreshed.iter().map(|(view, _, _)| *view).collect();

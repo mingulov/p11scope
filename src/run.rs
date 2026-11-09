@@ -6348,11 +6348,14 @@ pub(crate) const TARGET_CALLER_EXE_UNREADABLE: &str = "target exe link unreadabl
 /// be read. The read is bound to the target's retained pin when one is
 /// held: a generation change under the read discards even a readable
 /// path, so a recycled pid never misattaches an unrelated program's
-/// exe. Without a pin, only a proven exit (`kill(pid, 0)` `ESRCH`, or
-/// a zombie/dead `/proc` stat) names the exit; a `/proc` miss on a
-/// live pid is unreadable, never presumed exited. The pid itself never
-/// enters the report — stderr diagnostics name it beside this identity.
-/// Only the exe link is read: no cwd, cmdline, or environ.
+/// exe. Without a pin, only a proven exit (`kill(pid, 0)` `ESRCH`, a
+/// zombie/dead `/proc` stat, or a stat `NotFound`) names the exit; the
+/// `NotFound` arm counts as an exit only because pid scope already
+/// refused an invisible pid when the view opened. A `/proc` miss on a
+/// live pid stays unreadable, never presumed exited. The pid itself
+/// never enters the report — stderr diagnostics name it beside this
+/// identity. No cwd, cmdline, environ, argument, or payload read; the
+/// exit proof reuses the existing signal and stat checks.
 pub(crate) fn resolve_pid_caller(
     pid: u32,
     pin: Option<&crate::process::PidPin>,

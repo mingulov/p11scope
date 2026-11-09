@@ -87,6 +87,16 @@ versioned separately and are opaque, exact dispatch keys.
   "found no PKCS#11 modules", and the discovery-stop hint lists stop
   reasons without repeating the subject.
 
+### Known limitations
+
+The v0.7.0 limits live in
+[docs/known-limitations.md](docs/known-limitations.md#known-limitations-in-070).
+
+- A browser started after a background PKCS#11 process can,
+  intermittently, end without per-key operation tracking (reported as
+  `bootstrap_unavailable`); its calls and counts are still recorded.
+  Planned for 0.7.1.
+
 ## [0.6.0] - 2026-11-06
 
 v0.6.0 answers "which application used which key, and how": inventory

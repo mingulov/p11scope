@@ -209,6 +209,13 @@ the end-of-capture executable is 0.7.x work.
 Key-operation rows keep the v0.6.0 ceiling: exact rows at 6,250
 calls/s for 60 s, plain counts exact at 10,000 calls/s.
 
+### Browser after a background caller: per-key tracking may not start
+
+A browser started after a background PKCS#11 process is already
+running can, intermittently, end without per-key operation tracking
+(reported as `bootstrap_unavailable`). Its calls and counts are still
+recorded. The fix is planned for 0.7.1.
+
 ### Test-only: overlay-witness flake
 
 `witness_every_keep_reason_keeps_todays_window_when_mapped` fails

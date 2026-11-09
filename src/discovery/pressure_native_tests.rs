@@ -1,5 +1,6 @@
 //! SPDX-License-Identifier: GPL-3.0-or-later
-//! T8/G18 live256 native pressure suite (System scope).
+//! T8/G18 live256 native pressure suite (cgroup-scoped episodes;
+//! ticket-spend and quota controls stay System scope).
 //!
 //! This module drives the genuine live256 construction: 255 retained
 //! provider-bearing children plus the eligible late owner plus one genuine

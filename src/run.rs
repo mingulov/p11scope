@@ -481,22 +481,27 @@ fn classify_launch_file(launch_file: &File) -> io::Result<(LaunchKind, FileIdent
 /// never be confused with a kernel errno from execve itself.
 const SCRIPT_IDENTITY_MISMATCH: i32 = -1;
 
-/// Whether `path` still names the file the observer opened: device,
-/// inode, size and ctime all equal the opened identity. Raw syscalls
-/// only, so the pre-exec child can call it after dropping privileges
-/// and before exec. Any failure — an unstatable path included —
-/// mismatches: fail-closed, matching what execve itself would do.
-fn launch_path_matches_opened(path: &CStr, opened: FileIdentity) -> bool {
+/// Checks that `path` still names the file the observer opened: device,
+/// inode, size and ctime all equal the opened identity (`None`). Raw
+/// syscalls only, so the pre-exec child can call it after dropping
+/// privileges and before exec. Fail-closed either way: a path the
+/// dropped child cannot stat returns its errno (what execve itself would
+/// report, e.g. `EACCES` for a directory the target account cannot
+/// search), and a different file returns `SCRIPT_IDENTITY_MISMATCH`.
+fn launch_path_check(path: &CStr, opened: FileIdentity) -> Option<i32> {
     // SAFETY: stat writes only its output struct; the path pointer lives.
     let mut current: libc::stat = unsafe { std::mem::zeroed() };
     if unsafe { libc::stat(path.as_ptr(), &mut current) } != 0 {
-        return false;
+        // SAFETY: errno is thread-local and read right after the failure.
+        let errno = unsafe { last_errno() };
+        return Some(if errno > 0 { errno } else { libc::EACCES });
     }
-    current.st_dev == opened.device
+    let same = current.st_dev == opened.device
         && current.st_ino == opened.inode
         && current.st_size as u64 == opened.size
         && current.st_ctime == opened.ctime
-        && current.st_ctime_nsec == opened.ctime_ns
+        && current.st_ctime_nsec == opened.ctime_ns;
+    (!same).then_some(SCRIPT_IDENTITY_MISMATCH)
 }
 
 /// Where snapd installs its command launchers: symlinks to `/usr/bin/snap`,
@@ -2281,8 +2286,8 @@ impl OwnedChild {
                     // A script runs by path so the kernel resolves its
                     // `#!` exactly as a direct launch would; the path must
                     // still name the opened file after the barrier hold.
-                    if !launch_path_matches_opened(script_path, *opened) {
-                        child_exec_failure_errno(exec_writer.as_raw_fd(), SCRIPT_IDENTITY_MISMATCH);
+                    if let Some(errno) = launch_path_check(script_path, *opened) {
+                        child_exec_failure_errno(exec_writer.as_raw_fd(), errno);
                     }
                     libc::execve(script_path.as_ptr(), argv.as_ptr(), envp.as_ptr());
                 } else {

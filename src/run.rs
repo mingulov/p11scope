@@ -15232,6 +15232,20 @@ mod tests {
         assert!(changed.unwrap(), "the seal syncs to the committed plan");
     }
 
+    /// An exec failure names the errno in words, so a script the
+    /// target account cannot reach reads `Permission denied`.
+    #[test]
+    fn exec_failure_names_the_errno_text() {
+        let failure = ExecFailure {
+            errno: libc::EACCES,
+            exit_code: 127,
+        };
+        assert_eq!(
+            failure.to_string(),
+            "exec failed with errno 13 (Permission denied) and exit status 127"
+        );
+    }
+
     #[test]
     fn signal_observed_before_handoff_rejects_the_handoff_boundary() {
         let signals = SignalState::new();
@@ -22266,7 +22280,25 @@ mod tests {
                 discovery.contains("note_terminal_discovery_failure()"),
                 "{function}: the gap files unfinished terminal work"
             );
+            // A failed loop behind a quiesce failure also seals, so it
+            // must file the same named gap before its publication.
+            let quiesce_head: String = body
+                .split_once("finish_quiesce_error(")
+                .unwrap()
+                .1
+                .chars()
+                .take(300)
+                .collect();
+            assert!(
+                quiesce_head.contains("|context| context.0.note_capture_loop_failure(),"),
+                "{function}: a failed loop behind a quiesce failure files its named gap"
+            );
         }
+        // K0 never closes clean behind a failed capture loop.
+        assert!(
+            profile.contains("&& end != CaptureEnd::Error,"),
+            "the K0 close must not claim a clean window behind an error end"
+        );
     }
 
     /// I4: the operator-visible line for unproven quiescence names the

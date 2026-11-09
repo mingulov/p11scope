@@ -5790,13 +5790,19 @@ fn hand_back_cancelled_cycle(
 /// The post-release revalidation step of an owned run, generic over the
 /// pause I/O so `run_owned` and the held-child tests run the same code. A
 /// lifecycle failure ends the run (the caller finishes the capture with the
-/// error); a nonfatal one is retired as a capture tick retires it (`auto`:
-/// partial; `always`: collected unpaused and counted unavailable).
+/// error), except a stop-cancelled `auto` cycle: the first hold right after
+/// release is serviced here, so the same hand-back as a capture tick applies
+/// and the capture loop then ends on the stop with its report. A nonfatal
+/// failure is retired as a capture tick retires it (`auto`: partial;
+/// `always`: collected unpaused and counted unavailable).
 fn post_release_pass(
     coordinator: &mut PauseCoordinator,
     io: &mut impl PauseIo,
 ) -> Result<()> {
     if let Err(error) = coordinator.revalidate_after_release(io) {
+        if hand_back_cancelled_cycle(coordinator, &error, io.cancelled().unwrap_or(false)) {
+            return Ok(());
+        }
         let always = error.required() && !error.lifecycle();
         retire_pause_policy(error)?;
         if always {

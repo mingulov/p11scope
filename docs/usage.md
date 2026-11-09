@@ -848,16 +848,25 @@ sudo p11scope run --pause auto --module /usr/lib/x86_64-linux-gnu/softhsm/libsof
   sh -c 'pkcs11-tool --module /usr/lib/x86_64-linux-gnu/softhsm/libsofthsm2.so -L'
 
 Ctrl-C, SIGTERM, or SIGHUP ends a capture cleanly (final frame printed, `-o`
-file written) instead of aborting it. A capture that fails internally still
-writes its `-o` report from what was captured, whether the stop was a signal,
-the command's own exit or `--duration`, and names the failing step as a gap
-with `PARTIAL` coverage. A failed final discovery batch is the
-`terminal discovery drain` gap (also counted as one discovery truncation) and
-the run otherwise ends as usual; a failed capture loop is the `capture loop`
-gap, and p11scope then exits nonzero with the error on stderr. A stop that arrives during `profile` or
-`trace` startup, before anything is attached (discovery can take seconds),
-is honoured once discovery returns: exit 1 with `interrupted by SIGINT during
-startup`, no report, no temporary file left behind, and a previous trace
+file written) instead of aborting it. When a step of the capture fails
+internally, p11scope still tries to write the `-o` report from what was
+captured, whether the stop was a signal, the command's own exit or
+`--duration`, and the report reads `PARTIAL`:
+
+- A failed final discovery batch is the `terminal discovery drain` gap (also
+  counted as one discovery truncation); the run otherwise ends as usual.
+- A failed capture loop is the `capture loop` gap; p11scope then exits
+  nonzero with the error on stderr.
+- A failure while waiting for in-flight calls to finish at the stop seals the
+  report with stop quiescence `unproven` rather than a named gap.
+
+The report is not written when the child's final status cannot be settled,
+or when the final snapshot itself fails; the error then names every failed
+step.
+
+A stop that arrives during `profile` or `trace` startup, before anything is
+attached (discovery can take seconds), is honoured once discovery returns:
+exit 1 with `interrupted by SIGINT during startup`, no report, no temporary file left behind, and a previous trace
 `-o` file left as it was. Under `run`, a child the pause holds
 stopped is resumed before the observer signals it or hands it back. The stop
 signal is forwarded to the child's process group; a child still alive gets

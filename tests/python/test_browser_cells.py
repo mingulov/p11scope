@@ -2127,8 +2127,13 @@ class BrowserReapTree(unittest.TestCase):
     #: supervisor must finish well before it (kill+reap, not waiting).
     STRAGGLER_SLEEP_SECONDS = 30
     #: How long the flow-completion child would linger past its
-    #: screenshot; the supervisor must kill at completion, not wait.
-    POST_SHOT_SLEEP_SECONDS = 10
+    #: screenshot; it exceeds the prompt bound, so a supervisor that
+    #: ignores the completion trigger times out instead of passing.
+    POST_SHOT_SLEEP_SECONDS = 30
+    #: How long past its screenshot the flow-completion child waits
+    #: before writing its lingered sentinel; the supervisor must kill
+    #: the tree at completion, well before that.
+    LINGERED_AFTER_SECONDS = 8
     #: Promptness bound for the supervisor (loaded-CI margin included).
     PROMPT_SECONDS = 20
 
@@ -2227,6 +2232,7 @@ class BrowserReapTree(unittest.TestCase):
         tmp = Path(tempfile.mkdtemp(prefix="g33-reap-flow-"))
         self.addCleanup(shutil.rmtree, tmp, True)
         shot = tmp / "flow.png"
+        lingered = tmp / "lingered"
         child = (
             "import subprocess, sys, time; "
             "grandchild = subprocess.Popen([sys.executable, '-c', "
@@ -2235,6 +2241,8 @@ class BrowserReapTree(unittest.TestCase):
             "time.sleep(0.5); "
             f"__import__('pathlib').Path({str(shot)!r}).write_bytes(bytes.fromhex("
             "'89504e470d0a1a0a0000000049454e44ae426082')); "
+            f"time.sleep({self.LINGERED_AFTER_SECONDS}); "
+            f"__import__('pathlib').Path({str(lingered)!r}).write_bytes(b'lingered'); "
             f"time.sleep({self.POST_SHOT_SLEEP_SECONDS})"
         )
         argv = [sys.executable, self.supervisor, "--flow-done", str(shot),
@@ -2248,6 +2256,8 @@ class BrowserReapTree(unittest.TestCase):
         self.assertEqual(code, 0, "a completed flow exits 0")
         self.assertLess(elapsed, self.PROMPT_SECONDS,
                         "the kill lands at completion, not at child exit")
+        self.assertFalse(lingered.exists(),
+                         "the tree must die at completion, before it can linger")
         ready, _, _ = select.select([proc.stdout], [], [], self.PROMPT_SECONDS)
         self.assertTrue(ready, "the supervisor never relayed its child's output")
         grandchild = int(proc.stdout.readline().strip())

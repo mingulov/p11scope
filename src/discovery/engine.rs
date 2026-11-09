@@ -10920,6 +10920,25 @@ fn stale_process_views(
         .collect()
 }
 
+/// True when every stale view names a pid with no live generation right
+/// now (reaped, zombie, or dead): the ordinary end of those processes.
+/// Reuse-safe: a pid reused by a live process reads live, and an
+/// unreadable pid or an unknown view reads unproven — both fail closed
+/// (loud). The caller holds a non-empty stale set.
+fn stale_views_all_dead(
+    stale: &BTreeSet<ProcessViewId>,
+    views: &[ProcessView],
+    extra_views: &[&ProcessView],
+) -> bool {
+    stale.iter().all(|id| {
+        views
+            .iter()
+            .chain(extra_views.iter().copied())
+            .find(|view| view.id() == *id)
+            .is_some_and(|view| process::generation_dead(view.pid()))
+    })
+}
+
 fn validate_loader_record_context<'a>(
     registry: &'a mut LoaderRegistry,
     terminal_owner: Option<LoaderContextId>,
@@ -15323,10 +15342,23 @@ impl Engine {
         if generation_stale {
             outcome.static_failures = target_modules;
             *additions_allowed = false;
-            self.mark_partial(
-                "live discovery generation",
-                "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
-            );
+            // An apply aborted only by proven exits is the ordinary end
+            // of those processes, not a discovery loss: every call was
+            // already counted exactly, and the terminal drain settles the
+            // links. Loud in -v, silent in the report. Anything with a
+            // live generation — including a pid reused by a new process —
+            // keeps the loud mark.
+            if stale_views_all_dead(&outcome.stale_views, &self.views, extra_views) {
+                self.counters.noise.note_skip(
+                    "live discovery generation",
+                    "candidate generation exited before mutation; canonical identity, plan, and links were unchanged",
+                );
+            } else {
+                self.mark_partial(
+                    "live discovery generation",
+                    "candidate generation changed before mutation; canonical identity, plan, and links were unchanged",
+                );
+            }
             return Ok(outcome);
         }
         if !admission.targets_ok {

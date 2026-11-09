@@ -62,6 +62,7 @@ pub fn classify_discovery_noise(subject: &str, reason: &str) -> DiscoveryNoiseCl
     } else if reason.contains("No such process")
         || reason.contains("os error 3")
         || reason.contains("exited before discovery")
+        || reason.contains("exited before mutation")
         || reason.contains("generation changed")
         || reason.contains("ESRCH")
     {
@@ -568,6 +569,13 @@ mod tests {
                 "accepted process generation changed during attach preparation; its discovery claims were removed"
             ),
             DiscoveryNoiseClass::StaleView
+        );
+        assert_eq!(
+            classify_discovery_noise(
+                "live discovery generation",
+                "candidate generation exited before mutation; canonical identity, plan, and links were unchanged"
+            ),
+            DiscoveryNoiseClass::ProcessEnded
         );
         for class in [
             DiscoveryNoiseClass::ProcessEnded,

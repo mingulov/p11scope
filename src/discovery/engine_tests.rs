@@ -10058,7 +10058,10 @@ fn a_candidate_stale_only_by_exited_views_marks_no_generation_gap() {
     child.kill().unwrap();
     child.wait().unwrap();
     assert!(
-        !engine.views.iter().any(|view| view.id() == id && view.still_the_same()),
+        !engine
+            .views
+            .iter()
+            .any(|view| view.id() == id && view.still_the_same()),
         "the reaped child reads stale"
     );
     let mut candidate = engine
@@ -10088,6 +10091,52 @@ fn a_candidate_stale_only_by_exited_views_marks_no_generation_gap() {
         "the silent abort stays visible on the -v channel: {:?}",
         engine.counters.noise.lines()
     );
+}
+
+/// The H2 silence gate, case by case: all-dead reads silent; anything
+/// live, mixed, or unknown reads loud (fail-closed). Direct unit cover
+/// for the predicate the candidate test above wires through the apply.
+#[test]
+fn stale_views_all_dead_fails_closed_on_any_live_or_unknown_view() {
+    let mut live = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let live_view = ProcessView::open(ProcessViewId(20), live.id()).unwrap();
+    let mut dead = std::process::Command::new("sleep")
+        .arg("30")
+        .die_with_parent()
+        .spawn()
+        .unwrap();
+    let dead_view = ProcessView::open(ProcessViewId(21), dead.id()).unwrap();
+    dead.kill().unwrap();
+    dead.wait().unwrap();
+    let views = [live_view, dead_view];
+    let extra: [&ProcessView; 0] = [];
+    let set = |ids: &[ProcessViewId]| ids.iter().copied().collect::<BTreeSet<_>>();
+    assert!(
+        stale_views_all_dead(&set(&[ProcessViewId(21)]), &views, &extra),
+        "a reaped generation reads dead"
+    );
+    assert!(
+        !stale_views_all_dead(&set(&[ProcessViewId(20)]), &views, &extra),
+        "a live generation reads live"
+    );
+    assert!(
+        !stale_views_all_dead(
+            &set(&[ProcessViewId(20), ProcessViewId(21)]),
+            &views,
+            &extra
+        ),
+        "one live generation keeps the set loud"
+    );
+    assert!(
+        !stale_views_all_dead(&set(&[ProcessViewId(22)]), &views, &extra),
+        "an unknown view reads unproven"
+    );
+    live.kill().unwrap();
+    live.wait().unwrap();
 }
 
 #[test]

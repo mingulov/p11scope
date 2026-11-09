@@ -10701,6 +10701,149 @@ mod tests {
         }
     }
 
+    #[test]
+    fn system_auto_falls_back_to_scan_on_old_kernel_host_refusal() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        for (stage, errno) in [
+            (MultiHostStage::ProgramLoad, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP)),
+            (MultiHostStage::ProgramLoad, Some(libc::EINVAL)),
+            (MultiHostStage::SelfLink, Some(libc::EINVAL)),
+        ] {
+            let mut coordinator = coordinator();
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let lane = open_native_lane_with(
+                CaptureMode::Auto,
+                BackendSelection::Auto,
+                Scope::System,
+                &mut coordinator,
+                |_, _, _| Err(refusal.into()),
+            )
+            .expect("system auto falls back to scan on old-kernel host refusal");
+            assert!(lane.is_none(), "fallback leaves no native lane");
+            coordinator.registry_mut().publish();
+            let gaps: Vec<(String, String)> = coordinator
+                .registry()
+                .gaps()
+                .iter()
+                .map(|gap| (gap.subject.clone(), gap.reason.clone()))
+                .collect();
+            let (_, reason) = gaps
+                .iter()
+                .find(|(subject, _)| subject == "native usage feed unavailable")
+                .expect("fallback records a named gap");
+            assert!(
+                reason.contains("call counts unavailable on this kernel"),
+                "{reason}"
+            );
+        }
+        for (mode, stage, errno) in [
+            (
+                CaptureMode::Auto,
+                MultiHostStage::SelfLink,
+                Some(libc::EPERM),
+            ),
+            (
+                CaptureMode::Native,
+                MultiHostStage::SelfLink,
+                Some(libc::EOPNOTSUPP),
+            ),
+            (
+                CaptureMode::Native,
+                MultiHostStage::SelfLink,
+                Some(libc::EINVAL),
+            ),
+        ] {
+            let refusal = MultiHostRefusal::for_test(stage, errno);
+            let error = open_native_lane_with(
+                mode,
+                BackendSelection::Auto,
+                Scope::System,
+                &mut coordinator(),
+                |_, _, _| Err(refusal.into()),
+            )
+            .err()
+            .expect("denied/native host refusal stays fatal");
+            assert_eq!(
+                error.downcast_ref::<MultiHostRefusal>(),
+                Some(&refusal),
+                "{error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn system_auto_run_falls_back_to_scan_on_unavailable_host() {
+        use crate::attach::{BackendSelection, MultiHostRefusal, MultiHostStage};
+        let refusal = MultiHostRefusal::for_test(MultiHostStage::SelfLink, Some(libc::EOPNOTSUPP));
+        let mut stdout = Vec::new();
+        let code = super::native_preparation_test::with(
+            move |_, _, _| Err(refusal.into()),
+            || {
+                run_with_terminal_budget(
+                    InspectScope::System,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    &HookRegistry::builtin(),
+                    true,
+                    Some(1),
+                    None,
+                    inventory_endpoint_budget(None).unwrap(),
+                    None,
+                    None,
+                    false,
+                    None,
+                    None,
+                    None,
+                    None,
+                    CaptureMode::Auto,
+                    BackendSelection::Singles,
+                    None,
+                    false,
+                    &|| false,
+                    &|| {},
+                    false,
+                    &mut WriterStdout(&mut stdout),
+                    &DashboardIo::stdio(),
+                    DiagnosticRequest::disabled(),
+                    None,
+                    &|| {
+                        Err(MultiHostRefusal::for_test(
+                            MultiHostStage::SelfLink,
+                            Some(libc::EOPNOTSUPP),
+                        ))
+                    },
+                    None,
+                    None,
+                    false,
+                )
+            },
+        )
+        .expect("system auto run falls back to scan on unavailable host");
+        assert_eq!(code, 0);
+        let document: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+        assert_scan_fallback(&document);
+        let gaps = document["gaps"].as_array().cloned().unwrap_or_default();
+        let gap = gaps
+            .iter()
+            .find(|gap| gap["subject"] == "native usage feed unavailable")
+            .expect("fallback records a named gap");
+        assert!(
+            gap["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("call counts unavailable on this kernel"),
+            "{}",
+            gap["reason"]
+        );
+        assert!(document.get("modules").is_some());
+        assert!(document.get("callers").is_some());
+        assert!(document.get("edges").is_some());
+    }
+
     /// The native lane sheds the transient startup grant once attach
     /// completes, mirroring the profile/trace/run post-setup drop: a
     /// multi lane drops `CAP_SYS_ADMIN`, a singles lane keeps it for

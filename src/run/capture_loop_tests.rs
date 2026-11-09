@@ -618,8 +618,8 @@ fn quiesce_error_after_loop_failure_keeps_both_errors_and_settles_as_error() {
         },
     );
     assert_eq!(settled_end, Some(CaptureEnd::Error));
-    // A failed loop keeps settle-and-detach without a report.
-    assert_eq!(phases, ["settle", "detach"]);
+    // A failed loop still seals what was captured, unsignalled too.
+    assert_eq!(phases, ["settle", "publish", "detach"]);
     let message = format!("{error:#}");
     assert!(
         message.contains("loop failure"),
